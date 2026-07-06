@@ -2155,6 +2155,58 @@ def test_watch_cycle_actionable_failed_descendant_still_spawns_recovery_worker(t
     assert recovery_children[0].trigger_source == "watch"
 
 
+def test_watch_cycle_logs_undispatched_transient_recovery_decision(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store, owner, failed_rebase = _setup_watch_owner_with_failed_rebase(tmp_path, failure_reason="INFRASTRUCTURE_ERROR")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    real_determine_recovery_lane_action = watch_module._determine_recovery_lane_action
+
+    def _force_undispatched_recovery(*, failed_task, **kwargs):
+        if failed_task.id == failed_rebase.id:
+            return {
+                "type": "needs_discussion",
+                "description": "SKIP: forced manual park for mismatch regression",
+                "reason": "forced-mismatch",
+                "needs_attention_reason": "rebase-failed-needs-manual-resolution",
+            }
+        return real_determine_recovery_lane_action(failed_task=failed_task, **kwargs)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch.determine_next_action",
+            return_value={"type": "wait_review", "description": "SKIP: waiting for review"},
+        ),
+        patch("gza.cli.watch._determine_recovery_lane_action", side_effect=_force_undispatched_recovery),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("recovery worker should not launch")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("recovery worker should not launch")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            restart_failed=True,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is False
+    text = log_path.read_text()
+    assert (
+        f"START_UNDISPATCHED {failed_rebase.id}: recovery retry via worker was not dispatchable "
+        f"(owner={owner.id}, action=needs_discussion, reason=forced-mismatch)"
+    ) in text
+    assert "ATTENTION" not in text
+
+
 def test_watch_cycle_show_skipped_keeps_manual_failed_recovery_on_attention_channel(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store, impl, failed_rebase = _setup_watch_owner_with_failed_rebase(tmp_path, failure_reason="MERGE_CONFLICT")

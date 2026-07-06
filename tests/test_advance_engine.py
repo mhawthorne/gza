@@ -12693,6 +12693,43 @@ def test_failed_rebase_without_review_still_requires_manual_resolution(tmp_path:
     assert "failed, needs manual resolution" in action["description"]
 
 
+def test_transient_failed_rebase_without_review_does_not_park_manual_resolution(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feat/transient-failed-rebase"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    failed_rebase.status = "failed"
+    failed_rebase.completed_at = datetime.now(UTC)
+    failed_rebase.branch = impl.branch
+    failed_rebase.failure_reason = "WORKER_DIED"
+    store.update(failed_rebase)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            can_merge_by_ref={("origin/feat/transient-failed-rebase", "main"): True},
+            existing_refs={"origin/feat/transient-failed-rebase"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge task (no review yet)"
+
+
 def test_failed_rebase_clears_when_merge_unit_is_merged(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)

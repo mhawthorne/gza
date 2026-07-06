@@ -61,6 +61,7 @@ from gza.recovery_engine import (
     classify_failure_reason,
     decide_failed_task_recovery,
     get_failed_recovery_needs_attention_reason,
+    rebase_failure_requires_manual_resolution,
 )
 from gza.recovery_read_context import RecoveryReadContext
 from gza.resume_policy import is_resumable_failed_task as _is_resumable_failed_task
@@ -4133,6 +4134,8 @@ def _failed_rebase_still_blocks_advance(ctx: AdvanceContext) -> bool:
     """
     failed_rebase = ctx.rebase_failed
     if failed_rebase is None:
+        return False
+    if not rebase_failure_requires_manual_resolution(ctx.store, failed_rebase):
         return False
     if (
         ctx.post_merge_rebase_state is not None

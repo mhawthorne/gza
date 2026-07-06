@@ -278,6 +278,10 @@ state to win over already-mergeable fresh code.
   signal.
 - Non-human skips and hidden recovery decisions MAY remain silent or appear only in
   ordinary skipped diagnostics, as the shared recovery policy requires.
+- A shared recovery decision that selects `resume`, `retry`, or another actionable
+  recovery step MUST either enter dispatch planning or emit an explicit undispatched
+  supervisor log explaining why that decided action was not dispatchable. Watch MUST NOT
+  silently discard a decided recovery action before dispatch.
 
 ### 3. Concurrency uses live-slot accounting
 

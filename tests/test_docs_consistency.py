@@ -319,6 +319,43 @@ def test_stale_completed_rebase_spec_only_parks_when_current_target_tip_is_alrea
     ) in workflow
 
 
+def test_failed_rebase_docs_distinguish_manual_parking_from_transient_recovery() -> None:
+    """Lifecycle spec and workflow docs must keep transient rebase failures on the shared recovery path."""
+    repo_root = Path(__file__).resolve().parents[1]
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+    lifecycle_flat = " ".join(lifecycle.split())
+    workflow_flat = " ".join(workflow.split())
+
+    assert (
+        "shared recovery classification says the failure is manual (for example a real "
+        "`REBASE_CONFLICT`) → `needs_discussion` (rebase-failed)."
+    ) in lifecycle_flat
+    assert (
+        "shared recovery classification says the failure is retryable/transient (for "
+        "example `WORKER_DIED`, `NO_ACTIVITY`, or infrastructure-normalized `GIT_ERROR`) "
+        "→ follow the shared recovery decision first."
+    ) in lifecycle_flat
+    assert "`recovery-preflight-rebase`" in lifecycle_flat
+    assert (
+        "it MUST NOT park that transient failed rebase as "
+        "`rebase-failed-needs-manual-resolution`."
+    ) in lifecycle_flat
+    assert (
+        "Manual/conflict failed rebases are not cleared just because the latest implementation "
+        "tip becomes mergeable again."
+    ) in workflow_flat
+    assert (
+        "Retryable/transient failed rebases instead stay on the shared recovery path first; "
+        "if recovery picks `resume` or `retry`, lifecycle follows that shared decision"
+    ) in workflow_flat
+    assert (
+        "| Branch cannot merge into the resolved target branch AND rebase child is `failed`, "
+        "and shared recovery classification says that failure is manual/conflict | "
+        "`needs_discussion`"
+    ) in workflow
+
+
 def test_plan_review_schema_version_contract_stays_aligned_across_spec_and_workflow_docs() -> None:
     """Spec and internal workflow docs should preserve integer-like schema-version normalization."""
     repo_root = Path(__file__).resolve().parents[1]

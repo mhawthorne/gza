@@ -219,9 +219,17 @@ Conflict is decided against the canonical local target (see
   `needs_discussion`, **not** delegated to a sandboxed rebase task — task sandboxes
   cannot reach remote-tracking refs, and worker rebase targets MUST stay local.
 - Branch cannot merge AND the latest rebase child `failed`, with no later proof the work
-  landed → `needs_discussion` (rebase-failed). The proof set is intentionally narrow: the
-  merge unit is recorded `merged`, the branch tip equals the target tip, or the branch
-  already contains the target tip.
+  landed, AND shared recovery classification says the failure is manual (for example a
+  real `REBASE_CONFLICT`) → `needs_discussion` (rebase-failed). The proof set is
+  intentionally narrow: the merge unit is recorded `merged`, the branch tip equals the
+  target tip, or the branch already contains the target tip.
+- Branch cannot merge AND the latest rebase child `failed`, but shared recovery
+  classification says the failure is retryable/transient (for example `WORKER_DIED`,
+  `NO_ACTIVITY`, or infrastructure-normalized `GIT_ERROR`) → follow the shared recovery
+  decision first. Lifecycle MAY still require the local-target-only
+  `recovery-preflight-rebase` before that recovery action when the branch does not yet
+  contain the current target tip, but it MUST NOT park that transient failed rebase as
+  `rebase-failed-needs-manual-resolution`.
 - Branch cannot merge AND a same-branch rebase already `completed`, the branch still
   conflicts, AND the branch already contains the current local target tip →
   `needs_discussion` (reason `rebase-did-not-unblock-merge`). This park rule applies
@@ -236,9 +244,11 @@ Conflict is decided against the canonical local target (see
   `needs_discussion` (surface the real blocker rather than spawn a guaranteed-no-op
   rebase).
 
-A failed rebase is **not** cleared merely because the tip became mergeable again; the
-engine MUST keep surfacing the rebase blocker until a later approved/cleared review or one
-of the narrow local proofs exists.
+A manual/conflict failed rebase is **not** cleared merely because the tip became
+mergeable again; the engine MUST keep surfacing the rebase blocker until a later
+approved/cleared review or one of the narrow local proofs exists. Retryable/transient
+failed rebases remain governed by the shared recovery decision before any manual park is
+considered.
 
 **Rebase outcome → review impact.** A completed rebase records whether it changed the
 normalized implementation patch. If unchanged, a prior approval MUST be carried across the
@@ -667,7 +677,7 @@ is a spec change. The accompanying human message is free text.
 | `project-scope-unverified` | needs_discussion | §3 diff could not be inspected (fail closed) |
 | `merge-source-needs-manual-resolution` † | HumanParked | §4 host-side merge-source divergence needs manual resolution |
 | `reconcile-needs-manual-resolution` † | HumanParked | §4 execution-time reconcile outcome needs manual resolution |
-| `rebase-failed-needs-manual-resolution` | HumanParked | §4 rebase failed, no landing proof |
+| `rebase-failed-needs-manual-resolution` | HumanParked | §4 manual/conflict rebase failed, no landing proof after shared recovery classification |
 | `rebase-did-not-unblock-merge` | HumanParked | §4 rebase completed, still conflicts |
 | `rebase-failure-circuit-breaker` | HumanParked | §4 repeated rebase failures, no progress |
 | `branch-already-rebased-lineage-incomplete` | needs_discussion | §4 branch contains target tip, lineage unresolved |

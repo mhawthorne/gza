@@ -4292,6 +4292,7 @@ class _WatchCycleAnalysis:
     action_plan: tuple[tuple[LineageOwnerRow, DbTask, dict[str, Any]], ...]
     recovery_attention_rows: tuple[tuple[DbTask, FailedRecoveryDecision, dict[str, Any]], ...]
     recovery_visible_skips: tuple[tuple[DbTask, DbTask, FailedRecoveryDecision, dict[str, Any]], ...]
+    recovery_undispatched_rows: tuple[tuple[DbTask, DbTask, FailedRecoveryDecision, dict[str, Any]], ...] = ()
     active_recovery_subject_ids: frozenset[str] = frozenset()
     actionable_failed: tuple[
         tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask],
@@ -5057,6 +5058,7 @@ def _analyze_watch_cycle(
         pending_recovery_task_ids: set[str] = set()
         recovery_attention_rows: list[tuple[DbTask, FailedRecoveryDecision, dict[str, Any]]] = []
         recovery_visible_skips: list[tuple[DbTask, DbTask, FailedRecoveryDecision, dict[str, Any]]] = []
+        recovery_undispatched_rows: list[tuple[DbTask, DbTask, FailedRecoveryDecision, dict[str, Any]]] = []
         active_recovery_subject_ids: set[str] = set()
         actionable_failed: list[
             tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]
@@ -5089,6 +5091,8 @@ def _analyze_watch_cycle(
             if recovery_action_class == "actionable" and isinstance(recovery_task_id, str) and recovery_task_id:
                 pending_recovery_task_ids.add(recovery_task_id)
             if recovery_action_class == "needs_attention":
+                if decision.action in {"resume", "retry", "reconcile"}:
+                    recovery_undispatched_rows.append((row.owner_task, failed, decision, recovery_action))
                 if should_hide_failed_recovery_decision(decision):
                     continue
                 recovery_entry = recovery_lane_entry_by_failed_id.get(str(failed.id))
@@ -5168,6 +5172,7 @@ def _analyze_watch_cycle(
             action_plan=tuple(action_plan),
             recovery_attention_rows=tuple(recovery_attention_rows),
             recovery_visible_skips=tuple(recovery_visible_skips),
+            recovery_undispatched_rows=tuple(recovery_undispatched_rows),
             active_recovery_subject_ids=frozenset(active_recovery_subject_ids),
             actionable_failed=tuple(actionable_failed),
             pending_recovery_task_ids=frozenset(pending_recovery_task_ids),
@@ -6961,6 +6966,18 @@ def _run_cycle(
             and decision.reason_code == "rebase-failed-needs-manual-resolution"
         ):
             work_done = True
+    for owner_task, failed, decision, recovery_action in getattr(analysis, "recovery_undispatched_rows", ()):
+        owner_id = owner_task.id or "unknown"
+        action_type = str(recovery_action.get("type", "needs_attention"))
+        reason = str(recovery_action.get("reason", decision.reason_code or "undispatched"))
+        log.emit(
+            "START_UNDISPATCHED",
+            (
+                f"{failed.id}: recovery {decision.action} via {decision.launch_mode} was not dispatchable "
+                f"(owner={owner_id}, action={action_type}, reason={reason})"
+            ),
+            dedupe_key=f"recovery-undispatched:{failed.id}:{decision.action}:{reason}",
+        )
     for owner_task, failed, decision, recovery_action in analysis.recovery_visible_skips:
         if (
             not restart_failed

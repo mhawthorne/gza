@@ -1147,6 +1147,16 @@ def _normalize_failed_rebase_reason(store: SqliteTaskStore, task: DbTask, reason
     return reason
 
 
+def rebase_failure_requires_manual_resolution(store: SqliteTaskStore, task: DbTask) -> bool:
+    """Return whether a failed rebase must stay parked for manual resolution."""
+    if task.task_type != "rebase" or task.status != "failed":
+        return False
+    normalized_reason = _normalize_failed_rebase_reason(store, task, task.failure_reason or "UNKNOWN")
+    if normalized_reason == "REBASE_CONFLICT":
+        return True
+    return classify_failure_reason(normalized_reason) == "manual"
+
+
 def _task_lineage_branch_keys(
     store: SqliteTaskStore,
     task: DbTask,
