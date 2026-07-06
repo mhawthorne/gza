@@ -4395,6 +4395,52 @@ def _filter_watch_dispatch_preview_entries(
     return tuple(filtered)
 
 
+def _map_planned_recovery_entries_to_actionable_failed(
+    planned_entries: Sequence[DispatchPreviewEntry],
+    *,
+    actionable_failed: Sequence[
+        tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]
+    ],
+    known_non_actionable_failed_ids: frozenset[str] = frozenset(),
+) -> tuple[tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask], ...]:
+    """Preserve preview-plan order when watch launches recovery work."""
+    actionable_by_failed_id: dict[
+        str, tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]
+    ] = {}
+    for actionable_entry in actionable_failed:
+        _row, failed, _decision, _action, _worker_consuming, _action_task = actionable_entry
+        if failed.id is None:
+            continue
+        actionable_by_failed_id[str(failed.id)] = actionable_entry
+
+    mapped_entries: list[tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]] = []
+    missing_failed_ids: list[str] = []
+    seen_failed_ids: set[str] = set()
+    for planned_entry in planned_entries:
+        if planned_entry.lane != "recovery" or planned_entry.task.id is None:
+            continue
+        failed_id = str(planned_entry.task.id)
+        if failed_id in seen_failed_ids:
+            continue
+        seen_failed_ids.add(failed_id)
+        resolved_actionable_entry = actionable_by_failed_id.get(failed_id)
+        if resolved_actionable_entry is None:
+            if failed_id in known_non_actionable_failed_ids:
+                continue
+            missing_failed_ids.append(failed_id)
+            continue
+        mapped_entries.append(resolved_actionable_entry)
+
+    if missing_failed_ids:
+        missing_list = ", ".join(missing_failed_ids)
+        raise RuntimeError(
+            "watch dispatch preview drift: planned recovery tasks missing actionable rows: "
+            f"{missing_list}"
+        )
+
+    return tuple(mapped_entries)
+
+
 def allocate_watch_slots(
     *,
     slots: int,
@@ -7106,13 +7152,6 @@ def _run_cycle(
                 is not None
             ):
                 active_backoff_recovery_subject_ids.add(str(failed.id))
-    launchable_recovery_subject_ids = {
-        str(failed.id)
-        for _row, failed, _decision, _action, _worker_consuming, _action_task in actionable_failed
-        if str(failed.id) in dispatch_recovery_task_ids
-        if str(failed.id) not in parked_recovery_subject_ids
-        and str(failed.id) not in active_backoff_recovery_subject_ids
-    }
     dispatch_launchable_entries = tuple(
         entry
         for entry in dispatch_candidate_entries
@@ -7132,16 +7171,51 @@ def _run_cycle(
         selection_mode=dispatch_selection_mode,
         include_pending=scoped_owner_ids is None,
     )
+    planned_dispatch_entries = tuple(getattr(dispatch_plan, "entries", dispatch_launchable_entries))
     reserved_recovery_slots = dispatch_plan.recovery_worker_slots
     if remaining_new_worker_starts is not None:
         reserved_recovery_slots = min(reserved_recovery_slots, remaining_new_worker_starts)
     pending_slots = 0 if scoped_owner_ids is not None else dispatch_plan.pending_slots
+    known_non_actionable_recovery_subject_ids = frozenset(
+        str(failed.id)
+        for _owner_task, failed, _decision, _action in (
+            (*getattr(analysis, "recovery_undispatched_rows", ()), *analysis.recovery_visible_skips)
+        )
+        if failed.id is not None
+    )
+    planned_recovery_actionable_failed = _map_planned_recovery_entries_to_actionable_failed(
+        planned_dispatch_entries,
+        actionable_failed=actionable_failed,
+        known_non_actionable_failed_ids=known_non_actionable_recovery_subject_ids,
+    )
+    recovery_dispatch_actionable_failed = list(planned_recovery_actionable_failed)
+    launchable_recovery_subject_ids = {
+        str(failed.id)
+        for _row, failed, _decision, _action, _worker_consuming, _action_task in recovery_dispatch_actionable_failed
+        if failed.id is not None
+        and str(failed.id) not in parked_recovery_subject_ids
+        and str(failed.id) not in active_backoff_recovery_subject_ids
+    }
     nonparked_recovery_subject_ids = set(launchable_recovery_subject_ids) | set(analysis.active_recovery_subject_ids)
-    for row, failed, decision, recovery_action, worker_consuming_recovery, action_task in actionable_failed:
+    if not dry_run:
+        for _row, failed, _decision, recovery_action, _worker_consuming, _action_task in actionable_failed:
+            if failed.id is None:
+                continue
+            if str(failed.id) not in dispatch_recovery_task_ids:
+                continue
+            if str(failed.id) not in active_backoff_recovery_subject_ids:
+                continue
+            _maybe_emit_active_watch_recovery_backoff(
+                store=store,
+                log=log,
+                subject_task=failed,
+                action=recovery_action,
+            )
+    for row, failed, decision, recovery_action, worker_consuming_recovery, action_task in recovery_dispatch_actionable_failed:
         if failed.id is None:
             continue
         recovery_action_type = str(recovery_action.get("type", ""))
-        if str(failed.id) not in dispatch_recovery_task_ids:
+        if str(failed.id) not in launchable_recovery_subject_ids:
             continue
         if str(failed.id) in parked_recovery_subject_ids:
             if not dry_run:

@@ -110,6 +110,7 @@ from gza.db import DuplicateActiveChildError, Task, Task as DbTask, WatchProgres
 from gza.dispatch_preview import (
     DispatchPreview,
     DispatchPreviewEntry,
+    WatchDispatchPlan,
     build_dispatch_preview,
     plan_watch_dispatch_entries,
 )
@@ -3505,6 +3506,210 @@ def test_watch_cycle_default_recovery_slot_caps_pending_implement_starts(tmp_pat
     assert len(pending_calls) == 2
 
 
+def test_watch_cycle_executes_only_planned_recovery_ids_and_preserves_pending_slot(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    first_failed = store.add("First failed implement", task_type="implement")
+    second_failed = store.add("Second failed implement", task_type="implement")
+    assert first_failed.id is not None
+    assert second_failed.id is not None
+    for task in (first_failed, second_failed):
+        task.status = "failed"
+        task.failure_reason = "PROVIDER_ERROR"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+    first_retry_child = store.add(first_failed.prompt, task_type="implement", based_on=first_failed.id, recovery_origin="retry")
+    second_retry_child = store.add(
+        second_failed.prompt,
+        task_type="implement",
+        based_on=second_failed.id,
+        recovery_origin="retry",
+    )
+    pending_plan = store.add("Pending plan", task_type="plan")
+    assert first_retry_child.id is not None
+    assert second_retry_child.id is not None
+    assert pending_plan.id is not None
+
+    first_row = LineageOwnerRow(
+        owner_task=first_failed,
+        members=(first_failed,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(first_failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=first_failed,
+        recovery_leaf_task=first_failed,
+    )
+    second_row = LineageOwnerRow(
+        owner_task=second_failed,
+        members=(second_failed,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(second_failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=second_failed,
+        recovery_leaf_task=second_failed,
+    )
+    first_decision = FailedRecoveryDecision(
+        task_id=first_failed.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry first failed implementation",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=first_retry_child.id,
+        reuse_existing=True,
+    )
+    second_decision = FailedRecoveryDecision(
+        task_id=second_failed.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry second failed implementation",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=second_retry_child.id,
+        reuse_existing=True,
+    )
+    precomputed_plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=1,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=2,
+        slots=2,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(first_row, second_row),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(),
+            recovery_rows=(first_row, second_row),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=(),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            actionable_failed=(
+                (first_row, first_failed, first_decision, {"type": "retry", "description": "Retry first"}, True, first_failed),
+                (
+                    second_row,
+                    second_failed,
+                    second_decision,
+                    {"type": "retry", "description": "Retry second"},
+                    True,
+                    second_failed,
+                ),
+            ),
+            active_recovery_subject_ids=(),
+        ),
+    )
+
+    def build_preview(*_args: object, **kwargs: object) -> DispatchPreview:
+        include_recovery = bool(kwargs.get("include_recovery", True))
+        if include_recovery:
+            return DispatchPreview(
+                entries=(
+                    DispatchPreviewEntry(
+                        lane="recovery",
+                        task=first_failed,
+                        owner_task=first_failed,
+                        runnable=True,
+                        worker_consuming=True,
+                        decision=first_decision,
+                        advance_action={"type": "retry"},
+                        lineage_row=first_row,
+                    ),
+                    DispatchPreviewEntry(
+                        lane="recovery",
+                        task=second_failed,
+                        owner_task=second_failed,
+                        runnable=True,
+                        worker_consuming=True,
+                        decision=second_decision,
+                        advance_action={"type": "retry"},
+                        lineage_row=second_row,
+                    ),
+                    DispatchPreviewEntry(
+                        lane="pending",
+                        task=pending_plan,
+                        runnable=True,
+                        worker_consuming=True,
+                    ),
+                )
+            )
+        return DispatchPreview(
+            entries=(
+                DispatchPreviewEntry(
+                    lane="pending",
+                    task=pending_plan,
+                    runnable=True,
+                    worker_consuming=True,
+                ),
+            )
+        )
+
+    started_task_ids: list[str] = []
+
+    def spawn_worker(
+        _args: argparse.Namespace,
+        _config: Config,
+        *,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        started_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _config, task, **_kwargs: task),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("retry worker should stay on plain worker path")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("retry worker should not use resume path")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=spawn_worker),
+        patch(
+            "gza.cli.watch._settle_watch_dispatch_starts",
+            side_effect=lambda *, pending_starts, **_kwargs: _live_settle_results(pending_starts, store=store),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            recovery_slots=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            max_recovery_attempts=config.max_resume_attempts,
+            precomputed_plan=precomputed_plan,
+        )
+
+    assert result.work_done is True
+    assert started_task_ids == [first_retry_child.id, pending_plan.id]
+    log_text = log_path.read_text()
+    assert second_retry_child.id not in started_task_ids
+    assert not any(
+        line.split(maxsplit=2)[1] == "START" and second_retry_child.id in line
+        for line in log_text.splitlines()
+    )
+    assert any(line.split(maxsplit=2)[1] == "START" and pending_plan.id in line for line in log_text.splitlines())
+
+
 def test_watch_dispatch_preview_recovery_preflight_rebase_is_runnable_and_consumes_only_recovery_slot(
     tmp_path: Path,
 ) -> None:
@@ -3723,6 +3928,337 @@ def test_watch_cycle_dry_run_caps_pending_nonimplement_preview_to_allocated_slot
     assert any(str(pending_plans[1].id) in line for line in start_lines)
     assert all(str(pending_plans[2].id) not in line for line in start_lines)
     assert all(str(pending_plans[3].id) not in line for line in start_lines)
+
+
+def test_watch_cycle_default_mode_no_pending_uses_only_planned_recovery_entries(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    first_failed = store.add("First failed implement", task_type="implement")
+    assert first_failed.id is not None
+    first_failed.status = "failed"
+    first_failed.failure_reason = "PROVIDER_ERROR"
+    first_failed.completed_at = datetime.now(UTC)
+    store.update(first_failed)
+
+    second_failed = store.add("Second failed implement", task_type="implement")
+    assert second_failed.id is not None
+    second_failed.status = "failed"
+    second_failed.failure_reason = "PROVIDER_ERROR"
+    second_failed.completed_at = datetime.now(UTC)
+    store.update(second_failed)
+
+    first_row = LineageOwnerRow(
+        owner_task=first_failed,
+        members=(first_failed,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(first_failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=first_failed,
+        recovery_leaf_task=first_failed,
+    )
+    second_row = LineageOwnerRow(
+        owner_task=second_failed,
+        members=(second_failed,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(second_failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=second_failed,
+        recovery_leaf_task=second_failed,
+    )
+    first_decision = FailedRecoveryDecision(
+        task_id=first_failed.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry first failed task",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=None,
+        reuse_existing=False,
+    )
+    second_decision = FailedRecoveryDecision(
+        task_id=second_failed.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry second failed task",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=None,
+        reuse_existing=False,
+    )
+    precomputed_plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(first_row, second_row),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(),
+            recovery_rows=(first_row, second_row),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=(),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            actionable_failed=(
+                (
+                    first_row,
+                    first_failed,
+                    first_decision,
+                    {"type": "retry", "description": "Retry first failed task"},
+                    True,
+                    first_failed,
+                ),
+                (
+                    second_row,
+                    second_failed,
+                    second_decision,
+                    {"type": "retry", "description": "Retry second failed task"},
+                    True,
+                    second_failed,
+                ),
+            ),
+            active_recovery_subject_ids=(),
+        ),
+    )
+    preview_entries = (
+        DispatchPreviewEntry(
+            lane="recovery",
+            task=first_failed,
+            owner_task=first_failed,
+            runnable=True,
+            worker_consuming=True,
+            decision=first_decision,
+            advance_action={"type": "retry"},
+            lineage_row=first_row,
+        ),
+        DispatchPreviewEntry(
+            lane="recovery",
+            task=second_failed,
+            owner_task=second_failed,
+            runnable=True,
+            worker_consuming=True,
+            decision=second_decision,
+            advance_action={"type": "retry"},
+            lineage_row=second_row,
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.build_dispatch_preview", return_value=DispatchPreview(entries=preview_entries)),
+        patch(
+            "gza.cli.watch.plan_watch_dispatch_entries",
+            return_value=WatchDispatchPlan(
+                entries=(preview_entries[1],),
+                recovery_worker_slots=1,
+                pending_slots=0,
+            ),
+        ),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("dry-run should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            recovery_slots=1,
+            max_recovery_attempts=config.max_resume_attempts,
+            precomputed_plan=precomputed_plan,
+        )
+
+    assert result.work_done is True
+    log_text = log_path.read_text()
+    recovery_lines = [line for line in log_text.splitlines() if "RECOVR" in line and "[dry-run]" in line]
+    assert len(recovery_lines) == 1
+    assert second_failed.id in recovery_lines[0]
+    assert first_failed.id not in log_text
+
+
+def test_watch_cycle_recovery_only_no_pending_uses_only_planned_recovery_entries(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    first_failed = store.add("First recovery-only failed implement", task_type="implement")
+    assert first_failed.id is not None
+    first_failed.status = "failed"
+    first_failed.failure_reason = "PROVIDER_ERROR"
+    first_failed.completed_at = datetime.now(UTC)
+    store.update(first_failed)
+
+    second_failed = store.add("Second recovery-only failed implement", task_type="implement")
+    assert second_failed.id is not None
+    second_failed.status = "failed"
+    second_failed.failure_reason = "PROVIDER_ERROR"
+    second_failed.completed_at = datetime.now(UTC)
+    store.update(second_failed)
+
+    first_row = LineageOwnerRow(
+        owner_task=first_failed,
+        members=(first_failed,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(first_failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=first_failed,
+        recovery_leaf_task=first_failed,
+    )
+    second_row = LineageOwnerRow(
+        owner_task=second_failed,
+        members=(second_failed,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(second_failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=second_failed,
+        recovery_leaf_task=second_failed,
+    )
+    first_decision = FailedRecoveryDecision(
+        task_id=first_failed.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry first failed task",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=None,
+        reuse_existing=False,
+    )
+    second_decision = FailedRecoveryDecision(
+        task_id=second_failed.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry second failed task",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=None,
+        reuse_existing=False,
+    )
+    precomputed_plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(first_row, second_row),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(),
+            recovery_rows=(first_row, second_row),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=(),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            actionable_failed=(
+                (
+                    first_row,
+                    first_failed,
+                    first_decision,
+                    {"type": "retry", "description": "Retry first failed task"},
+                    True,
+                    first_failed,
+                ),
+                (
+                    second_row,
+                    second_failed,
+                    second_decision,
+                    {"type": "retry", "description": "Retry second failed task"},
+                    True,
+                    second_failed,
+                ),
+            ),
+            active_recovery_subject_ids=(),
+        ),
+    )
+    preview_entries = (
+        DispatchPreviewEntry(
+            lane="recovery",
+            task=first_failed,
+            owner_task=first_failed,
+            runnable=True,
+            worker_consuming=True,
+            decision=first_decision,
+            advance_action={"type": "retry"},
+            lineage_row=first_row,
+        ),
+        DispatchPreviewEntry(
+            lane="recovery",
+            task=second_failed,
+            owner_task=second_failed,
+            runnable=True,
+            worker_consuming=True,
+            decision=second_decision,
+            advance_action={"type": "retry"},
+            lineage_row=second_row,
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.build_dispatch_preview", return_value=DispatchPreview(entries=preview_entries)),
+        patch(
+            "gza.cli.watch.plan_watch_dispatch_entries",
+            return_value=WatchDispatchPlan(
+                entries=(preview_entries[1],),
+                recovery_worker_slots=1,
+                pending_slots=0,
+            ),
+        ),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("dry-run should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            recovery_mode="recovery_only",
+            recovery_slots=1,
+            max_recovery_attempts=config.max_resume_attempts,
+            precomputed_plan=precomputed_plan,
+        )
+
+    assert result.work_done is True
+    log_text = log_path.read_text()
+    recovery_lines = [line for line in log_text.splitlines() if "RECOVR" in line and "[dry-run]" in line]
+    assert len(recovery_lines) == 1
+    assert second_failed.id in recovery_lines[0]
+    assert first_failed.id not in log_text
 
 
 def test_watch_cycle_pending_only_dry_run_skips_reconcile_preview_and_shows_pending(tmp_path: Path) -> None:
@@ -4276,7 +4812,7 @@ def test_watch_cycle_recovery_only_direct_reconcile_blocks_pending_pickup(
     assert str(pending_plan.id) not in log_text
 
 
-def test_watch_cycle_reuses_recovery_slot_when_needs_rebase_result_is_non_consuming(
+def test_watch_cycle_needs_rebase_followup_does_not_start_unplanned_retry(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -4307,6 +4843,9 @@ def test_watch_cycle_reuses_recovery_slot_when_needs_rebase_result_is_non_consum
         recovery_origin="retry",
     )
     assert retry_child.id is not None
+
+    rebase_child = store.add("Generated rebase task", task_type="rebase", based_on=failed_rebase.id)
+    assert rebase_child.id is not None
 
     def _recovery_row(task: Task) -> LineageOwnerRow:
         return LineageOwnerRow(
@@ -4385,20 +4924,22 @@ def test_watch_cycle_reuses_recovery_slot_when_needs_rebase_result_is_non_consum
         ),
     )
 
-    started_task_ids: list[str] = []
-
     def _fake_execute_advance_action(*, task, action, context):
         del context
         assert task.id == failed_rebase.id
         assert action["type"] == "needs_rebase"
+        rebase_child.status = "in_progress"
+        rebase_child.session_id = f"session-{rebase_child.id}"
+        store.update(rebase_child)
         return AdvanceActionExecutionResult(
             action_type="needs_rebase",
             status="success",
-            message="Existing rebase already covers this retry path",
-            success_message="Existing rebase already covers this retry path",
+            message="Created rebase task for retry path",
+            success_message="Created rebase task for retry path",
             worker_label="rebase",
             worker_consuming=False,
             work_done=True,
+            created_task=rebase_child,
         )
 
     def _fake_spawn_background_worker(
@@ -4408,7 +4949,7 @@ def test_watch_cycle_reuses_recovery_slot_when_needs_rebase_result_is_non_consum
         task_id: str,
         **_kwargs: object,
     ) -> int:
-        started_task_ids.append(task_id)
+        pytest.fail(f"needs_rebase follow-up should settle via execute_advance_action, not spawn worker {task_id}")
         return 0
 
     with (
@@ -4466,7 +5007,13 @@ def test_watch_cycle_reuses_recovery_slot_when_needs_rebase_result_is_non_consum
         )
 
     assert result.work_done is True
-    assert started_task_ids == [retry_child.id]
+    assert result.confirmed_start_count == 1
+    refreshed_rebase_child = store.get(rebase_child.id)
+    refreshed_retry_child = store.get(retry_child.id)
+    assert refreshed_rebase_child is not None
+    assert refreshed_retry_child is not None
+    assert refreshed_rebase_child.status == "in_progress"
+    assert refreshed_retry_child.status == "pending"
 
 
 def test_watch_cycle_terminal_recovery_start_releases_reserved_slot_for_same_cycle_pending(
