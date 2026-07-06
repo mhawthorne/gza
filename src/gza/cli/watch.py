@@ -2961,6 +2961,13 @@ class _WatchBatchStagedMerge:
     staged: _StagedIsolatedMergeAction
 
 
+@dataclass(frozen=True)
+class _CandidateReworkBatchContext:
+    green_prefix: tuple[tuple[str, str | None], ...]
+    failing_position: int
+    batch_size: int
+
+
 def _candidate_rework_identity(display_task: DbTask, check: CandidateIntegrationVerifyCheck) -> str:
     evidence = check.evidence
     gate_identity = (
@@ -2996,17 +3003,40 @@ def _candidate_rework_prompt(
     check: CandidateIntegrationVerifyCheck,
     *,
     identity: str,
+    batch_context: _CandidateReworkBatchContext | None = None,
 ) -> str:
     evidence = check.evidence
     verify_command = evidence.verify_command or "(verify_command unavailable)"
     failing_phase = evidence.failing_phase or "unknown"
     failure = evidence.failure or "verify gate failed without a structured failure message"
     fingerprint = evidence.tree_fingerprint or "unavailable"
+    batch_context_lines: list[str] = []
+    if batch_context is not None:
+        batch_context_lines.append(
+            f"Batch position: {batch_context.failing_position} of {batch_context.batch_size}"
+        )
+        if batch_context.green_prefix:
+            green_prefix_summary = ", ".join(
+                (
+                    f"{owner_id} ({branch})"
+                    if branch
+                    else owner_id
+                )
+                for owner_id, branch in batch_context.green_prefix
+            )
+            batch_context_lines.append(
+                "Verified green prefix before this failure: "
+                f"{green_prefix_summary}"
+            )
+    batch_context_block = ""
+    if batch_context_lines:
+        batch_context_block = "Batch context:\n" + "\n".join(batch_context_lines) + "\n\n"
     return (
         f"Pre-merge integration verify rework for {display_task.id}.\n\n"
         f"Identity: {identity}\n"
         f"The staged isolated merge result for branch `{display_task.branch or 'unknown'}` was not landed because "
         f"the local-target verify gate failed before promotion.\n"
+        f"{batch_context_block}"
         f"Tree fingerprint: {fingerprint}\n"
         f"Verify command: {verify_command}\n"
         f"Failing phase: {failing_phase}\n"
@@ -3021,12 +3051,18 @@ def _queue_candidate_rework_task(
     store: SqliteTaskStore,
     owner_task: DbTask,
     check: CandidateIntegrationVerifyCheck,
+    batch_context: _CandidateReworkBatchContext | None = None,
     tags: tuple[str, ...] | None,
     any_tag: bool,
 ) -> DbTask:
     identity = _candidate_rework_identity(owner_task, check)
     desired_tags = tuple(dict.fromkeys(("system", MAIN_INTEGRATION_VERIFY_TAG, *(tags or ()))))
-    desired_prompt = _candidate_rework_prompt(owner_task, check, identity=identity)
+    desired_prompt = _candidate_rework_prompt(
+        owner_task,
+        check,
+        identity=identity,
+        batch_context=batch_context,
+    )
     existing_match: DbTask | None = None
     for candidate in store.get_all():
         if candidate.id is None:
@@ -3248,6 +3284,7 @@ def _run_isolated_merge_batch(
     )
     first_red_entry: _WatchBatchStagedMerge | None = None
     first_red_check: CandidateIntegrationVerifyCheck | None = None
+    green_prefix: list[tuple[str, str | None]] = []
     for staged_entry in staged_batch:
         def _replay_staged_merge() -> _StagedIsolatedMergeAction | _MergeActionResult:
             return _stage_isolated_merge_action(
@@ -3283,6 +3320,7 @@ def _run_isolated_merge_batch(
             first_red_entry = staged_entry
             first_red_check = prefix_check
             break
+        green_prefix.append((str(staged_entry.display_task.id), staged_entry.display_task.branch))
     merge_git = _run_with_optional_stdout_suppressed(
         quiet,
         lambda: ensure_watch_main_checkout(config, git, target_branch),
@@ -3304,11 +3342,17 @@ def _run_isolated_merge_batch(
         merge_result=synthetic_result,
     )
     if _should_queue_candidate_rework(synthetic_result.candidate_verify):
+        batch_context = _CandidateReworkBatchContext(
+            green_prefix=tuple(green_prefix),
+            failing_position=staged_batch.index(first_red_entry) + 1,
+            batch_size=len(staged_batch),
+        )
         rework_task = _queue_candidate_rework_task(
             config=config,
             store=store,
             owner_task=first_red_entry.display_task,
             check=synthetic_result.candidate_verify,
+            batch_context=batch_context,
             tags=tags,
             any_tag=any_tag,
         )

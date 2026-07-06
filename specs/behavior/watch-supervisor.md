@@ -166,9 +166,13 @@ Each watch cycle MUST execute these phases in order:
    red-producing merge unit is identified; watch MUST route only that merge unit to
    blocked-candidate attention plus one queued rework task, keep later candidates
    eligible for future cycles, and MUST NOT convert that candidate-red state into a
-   global canonical-main freeze. Before watch considers any later merge candidate in that
-   same cycle, it MUST refresh or rebuild the isolated checkout back to the canonical
-   target, or stop the merge lane for the cycle.
+   global canonical-main freeze. When one or more earlier staged prefixes verified green
+   before that first red was isolated, the queued rework prompt or equivalent queued
+   metadata MUST include compact staged-prefix context sufficient to reproduce the exact
+   interaction tree, at minimum the prior green-prefix owner identity or identities plus
+   the failing unit's position within the staged batch. Before watch considers any later
+   merge candidate in that same cycle, it MUST refresh or rebuild the isolated checkout
+   back to the canonical target, or stop the merge lane for the cycle.
 4. **Blind parked auto-rearm phase.** After the direct non-worker lifecycle phase has
    reconciled the freshest target state for this cycle, watch MAY run one conservative
    parked-owner auto-rearm pass before any worker dispatch. This phase MUST stay

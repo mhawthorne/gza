@@ -9775,6 +9775,11 @@ def test_watch_cycle_isolated_batch_red_leaves_main_untouched_and_files_one_cand
     assert len(rework_tasks) == 1
     assert rework_tasks[0].based_on in {first.id, second.id}
     assert rework_tasks[0].queue_position == 1
+    assert "Batch context:" in rework_tasks[0].prompt
+    assert "Batch position: 2 of 2" in rework_tasks[0].prompt
+    assert "Verified green prefix before this failure:" in rework_tasks[0].prompt
+    assert str(first.id) in rework_tasks[0].prompt
+    assert str(first.branch) in rework_tasks[0].prompt
     log_text = log_path.read_text()
     assert (
         f"{rework_tasks[0].based_on}: candidate verify blocked promotion on fp-prefix-red; "
