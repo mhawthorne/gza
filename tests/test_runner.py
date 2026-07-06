@@ -59,6 +59,7 @@ from gza.runner import (
     _capture_noop_improve_review_verify_result,
     _check_dependency_merge_precondition,
     _complete_code_task,
+    _complete_failed_code_task_after_pr_publication,
     _compute_slug_override,
     _copy_learnings_to_worktree,
     _create_and_run_review_task,
@@ -15539,6 +15540,56 @@ class TestExtractedRunInnerHelpers:
         assert refreshed.output_content == "summary"
         log_text = ops_log_path_for(log_file).read_text()
         assert f'Outcome: failed ({BRANCH_UNPUSHABLE_FAILURE_REASON})' in log_text
+
+    def test_complete_failed_code_task_after_pr_publication_skips_pr_work_when_create_pr_disabled(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement without PR continuation", task_type="implement", create_pr=False)
+        task.slug = "20260627-reconcile-no-pr-continuation"
+        task.status = "failed"
+        task.failure_reason = BRANCH_UNPUSHABLE_FAILURE_REASON
+        task.branch = "feature/reconcile-no-pr-continuation"
+        task.has_commits = True
+        task.log_file = "logs/reconcile-no-pr-continuation.log"
+        task.output_content = "summary"
+        task.diff_files_changed = 1
+        task.diff_lines_added = 2
+        task.diff_lines_removed = 0
+        store.update(task)
+
+        config = self._make_config(tmp_path)
+        git = Mock(spec=Git)
+
+        with (
+            patch("gza.runner.ensure_task_pr", side_effect=AssertionError("ensure_task_pr should not run")),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = _complete_failed_code_task_after_pr_publication(
+                task=task,
+                config=config,
+                store=store,
+                git=git,
+                branch_name=task.branch,
+                stats=TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                log_file=tmp_path / "logs" / "reconcile-no-pr-continuation.log",
+                output_content=task.output_content,
+                diff_files=task.diff_files_changed or 0,
+                diff_added=task.diff_lines_added or 0,
+                diff_removed=task.diff_lines_removed or 0,
+                head_sha="head123",
+                base_sha="base456",
+                target_branch="main",
+            )
+
+        assert rc == 0
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.failure_reason is None
 
     def test_run_can_retry_pr_required_failure_via_work_pr(self, tmp_path: Path):
         """`gza work <task> --pr` should recover failed PR_REQUIRED tasks without rerunning provider."""
