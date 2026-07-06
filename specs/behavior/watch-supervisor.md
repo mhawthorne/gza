@@ -104,9 +104,9 @@ Each watch cycle MUST execute these phases in order:
    rerun-before-halt sequence owned by
    [main-verify-self-heal.md](main-verify-self-heal.md). A flaky red that turns green in
    that sequence MUST clear the halt for the current cycle and MUST create or reuse
-   exactly one open de-flake remediation task for that failure identity. A deterministic
+   exactly one active de-flake remediation attempt for that failure identity. A deterministic
    red that stays red across the full bounded sequence MUST halt further merges for the
-   current cycle, MUST create or reuse exactly one open fix-remediation task for that
+   current cycle, MUST create or reuse exactly one active fix-remediation attempt for that
    failure identity, and MUST emit one visible durable attention row with reason
    `main-integration-verify-red` naming the failing target SHA and, when structured phase
    output exists, the failing phase. The convergence requirements for how that red state

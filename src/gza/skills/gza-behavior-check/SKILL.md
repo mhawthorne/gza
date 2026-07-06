@@ -80,8 +80,17 @@ the assertion inventory first. Examples:
   off actionable lineage/recovery surfaces unless unique unmerged work remains visible.
 - `MV-MV2-RERUN-BEFORE-REUSE` — red verdicts MUST be re-verified before automation acts.
 - `MV-MV4-REMEDIATE-DEDUP-BUMP` — confirmed red verify failures MUST create or reuse
-  one remediation task per failure signature and bump it to the front of the runnable
-  queue.
+  one active remediation attempt per failure identity, including reuse of
+  completed-but-unmerged remediation tasks for that identity, and bump it to the front
+  of the runnable queue.
+- `MV-MV4-REMEDIATE-ATTEMPT-BOUND` — main-verify remediation MUST enforce a configurable
+  maximum consumed-attempt budget per failure identity.
+- `MV-MV4-REMEDIATE-POST-MERGE-CONSUME` — a merged remediation that still leaves the same
+  failure identity red on post-merge verify MUST consume one attempt and leave the active
+  set.
+- `MV-MV4-REMEDIATE-EXHAUSTION-STOP` — after the attempt budget is exhausted for one
+  identity, automation MUST stop creating or reusing remediation tasks for that identity
+  and leave a visible human-required stop.
 - `MV-MV5-NO-LAUNCH-STALL` — red merge freezes MUST NOT hard-park downstream work.
 - `MV-MV6-FORCE-REFRESH` — operators MUST have a first-class force-refresh rerun path
   that ignores a cached red checkpoint and leaves behind fresh evidence.

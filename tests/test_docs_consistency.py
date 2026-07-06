@@ -421,20 +421,23 @@ def test_main_verify_remediation_identity_docs_match_signature_only_runtime_cont
     """Specs and operator docs should describe signature-only remediation dedup consistently."""
     repo_root = Path(__file__).resolve().parents[1]
     contract = (repo_root / "specs" / "behavior" / "main-verify-self-heal.md").read_text()
-    contract_flat = " ".join(contract.split())
     supervisor = (repo_root / "specs" / "behavior" / "watch-supervisor.md").read_text()
-    supervisor_flat = " ".join(supervisor.split())
     config_docs = (repo_root / "docs" / "configuration.md").read_text()
     contract_flat = _normalize_whitespace(contract)
     supervisor_flat = _normalize_whitespace(supervisor)
 
     assert "the normalized failure signature only" in contract
+    assert "exactly one active remediation attempt for that failure identity" in contract_flat
+    assert "backed by a remediation task" in contract_flat
+    assert "completed-but-unmerged remediation tasks all qualify as that one active attempt" in contract_flat
     assert "different, newly available, stale, or unavailable fingerprint MUST reuse" in contract_flat
     assert "allow the merge of the one completed remediation implement task" in contract_flat
     assert "Only a green rerun clears the freeze." in contract_flat
 
     assert "dedup is by failure identity: normalized" in supervisor
     assert "failure signature only" in supervisor
+    assert "exactly one active de-flake remediation attempt for that failure identity" in supervisor_flat
+    assert "exactly one active fix-remediation attempt for that failure identity" in supervisor_flat
     assert "fingerprint changes, becomes available later, or is unavailable" in supervisor_flat
     assert "unknown/unavailable" in contract_flat
     assert "unknown/unavailable" in supervisor_flat
@@ -532,6 +535,9 @@ def test_behavior_check_skill_tracks_main_verify_assertion_namespace() -> None:
         "- `MV` — `main-verify-self-heal.md`",
         "`MV-MV2-RERUN-BEFORE-REUSE`",
         "`MV-MV4-REMEDIATE-DEDUP-BUMP`",
+        "`MV-MV4-REMEDIATE-ATTEMPT-BOUND`",
+        "`MV-MV4-REMEDIATE-POST-MERGE-CONSUME`",
+        "`MV-MV4-REMEDIATE-EXHAUSTION-STOP`",
         "`MV-MV5-NO-LAUNCH-STALL`",
         "`MV-MV6-FORCE-REFRESH`",
         "`WS-S7-BOUNDED-WORK-CREATION`",
@@ -542,6 +548,9 @@ def test_behavior_check_skill_tracks_main_verify_assertion_namespace() -> None:
 
     assert "Current tracked behavior-spec prefixes:" in behavior_check
     assert "stable short prefix for the source behavior spec" in behavior_check_flat
+    assert "one active remediation attempt per failure identity" in behavior_check_flat
+    assert "completed-but-unmerged remediation tasks for that identity" in behavior_check_flat
+    assert "one remediation task per failure signature" not in behavior_check_flat
     assert (
         "If a new behavior spec is added, assign it a stable doc prefix before reporting findings "
         "from it."

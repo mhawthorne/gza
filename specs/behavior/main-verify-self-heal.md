@@ -100,11 +100,12 @@ The repair path MUST distinguish flaky from deterministic verify failures:
 
 - A verdict that turns green during the bounded rerun sequence is **flaky**. Automation
   MUST NOT keep merges halted for that failure, and the supervisor MUST create or reuse
-  exactly one open remediation task for that failure identity that aims to de-flake it.
+  exactly one active remediation attempt for that failure identity, backed by a
+  remediation task that aims to de-flake it.
 - A verdict that stays red across the full bounded rerun sequence is **deterministic**.
   Automation MUST halt merges for that failure, and the supervisor MUST create or reuse
-  exactly one open remediation task for that failure identity that aims to fix the
-  failing phase or gate.
+  exactly one active remediation attempt for that failure identity, backed by a
+  remediation task that aims to fix the failing phase or gate.
 - That automatic remediation path MUST also be representative of the observed failing
   verify environment. The bounded rerun evidence MUST carry the observed environment
   identity (at minimum runner class plus host/container-relevant runtime traits) into
@@ -129,17 +130,23 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   the bounded rerun evidence remains prompt context and freshness evidence, but it MUST
   NOT decide whether the supervisor creates a new remediation row. Re-observing the
   same unresolved signature with a different, newly available, stale, or unavailable
-  fingerprint MUST reuse the existing open remediation task instead of filing another
-  copy. If the current bounded rerun evidence changes the required remediation kind,
-  fingerprint context, or other prompt evidence for that same signature, the reused
-  task MUST be updated in place so its prompt still matches the current classification,
-  except that a row already `in_progress` MUST keep the prompt evidence, tags, urgency,
-  and queue state the running worker actually received. If a same-signature non-live row
-  also exists, watch MUST prefer that non-live row for refresh or requeue and leave the
-  live duplicate untouched until worker-aware reconciliation can retire it. If the live
-  row is the only same-signature match, watch MUST keep it as the signature-owned open
-  row but limit any updates to safe freshness bookkeeping that does not misrepresent the
-  running worker.
+  fingerprint MUST reuse the existing active remediation attempt for that identity
+  instead of filing another copy. Pending, in-progress, and completed-but-unmerged
+  remediation tasks all qualify as that one active attempt until post-merge verify
+  classifies the outcome. If the current bounded rerun evidence changes the required
+  remediation kind, fingerprint context, or other prompt evidence for that same
+  signature, the reused task MUST be updated in place so its prompt still matches the
+  current classification, except that a row already `in_progress` MUST keep the prompt
+  evidence, tags, urgency, and queue state the running worker actually received. If a
+  same-signature non-live row also exists, watch MUST prefer that non-live row for
+  refresh or requeue and leave the live duplicate untouched until worker-aware
+  reconciliation can retire it. If the live row is the only same-signature match, watch
+  MUST keep it as the signature-owned open row but limit any updates to safe freshness
+  bookkeeping that does not misrepresent the running worker.
+  A post-merge verify rerun that turns green for the same remediation identity MUST clear
+  the active attempt without consuming the budget. A post-merge rerun that is red for a
+  different identity or lacks a trustworthy identity match MUST fail closed on reuse for
+  the old task, but MUST NOT consume that old task's attempt budget.
 - Reused or newly created remediation tasks for this gate MUST be bumped to the front of
   the runnable queue, because a red or flaky local-target verify is pipeline-critical
   system work.
