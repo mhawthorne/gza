@@ -2575,6 +2575,11 @@ class TestGetReviewsForTask:
             sync_last_synced_at=datetime(2026, 1, 3, 11, 4, tzinfo=UTC),
         )
         store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+        store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id=task.id,
+        )
 
         with sqlite3.connect(db_path) as conn:
             conn.execute(
@@ -2649,6 +2654,20 @@ class TestGetReviewsForTask:
                 """,
                 ("2026-01-03T11:05:00", unit.id, task.id),
             )
+            conn.execute(
+                """
+                UPDATE main_verify_remediation_consumed_task_ids
+                SET consumed_at = ?
+                WHERE project_id = ? AND signature = ? AND tree_fingerprint = ? AND task_id = ?
+                """,
+                (
+                    "2026-01-03T11:06:00",
+                    "default",
+                    "phase:functional",
+                    "fp-functional-a",
+                    task.id,
+                ),
+            )
             conn.execute("UPDATE schema_version SET version = 43")
             conn.commit()
 
@@ -2706,6 +2725,14 @@ class TestGetReviewsForTask:
                 """,
                 (unit.id, task.id),
             ).fetchone()
+            remediation_consumed_row = conn.execute(
+                """
+                SELECT consumed_at
+                FROM main_verify_remediation_consumed_task_ids
+                WHERE project_id = ? AND signature = ? AND tree_fingerprint = ? AND task_id = ?
+                """,
+                ("default", "phase:functional", "fp-functional-a", task.id),
+            ).fetchone()
 
         assert version == SCHEMA_VERSION
         assert project_row is not None
@@ -2732,6 +2759,7 @@ class TestGetReviewsForTask:
             "2026-01-03T11:04:00+00:00",
         )
         assert attachment_row == ("2026-01-03T11:05:00+00:00",)
+        assert remediation_consumed_row == ("2026-01-03T11:06:00+00:00",)
 
     def test_get_reviews_for_task_returns_empty_when_no_reviews(self, tmp_path: Path):
         """Test that an empty list is returned when no reviews exist."""

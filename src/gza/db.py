@@ -1044,6 +1044,7 @@ _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
         "greenlit_while_in_progress_at",
         "updated_at",
     ),
+    "main_verify_remediation_consumed_task_ids": ("consumed_at",),
     "behavior_check_findings": ("first_seen", "last_seen"),
     "parked_task_rearms": ("manual_rearmed_at", "last_auto_attempt_at"),
     "project_leases": ("acquired_at",),
