@@ -4766,6 +4766,39 @@ def _map_planned_recovery_entries_to_actionable_failed(
     return tuple(planned_actionable_failed), tuple(unmapped_entries)
 
 
+def _map_planned_pending_entries_to_launchable_tasks(
+    planned_entries: Sequence[DispatchPreviewEntry],
+    *,
+    pending_entries: Sequence[DispatchPreviewEntry],
+) -> tuple[tuple[DbTask, ...], tuple[DispatchPreviewEntry, ...]]:
+    pending_by_task_id = {
+        str(entry.task.id): entry.task
+        for entry in pending_entries
+        if entry.lane == "pending" and entry.task.id is not None
+    }
+    ordered_pending_tasks: list[DbTask] = []
+    planned_task_ids: set[str] = set()
+    unmapped_entries: list[DispatchPreviewEntry] = []
+    for entry in planned_entries:
+        if entry.lane != "pending" or entry.task.id is None:
+            continue
+        task_id = str(entry.task.id)
+        task = pending_by_task_id.get(task_id)
+        if task is None:
+            unmapped_entries.append(entry)
+            continue
+        ordered_pending_tasks.append(task)
+        planned_task_ids.add(task_id)
+    for entry in pending_entries:
+        if entry.lane != "pending" or entry.task.id is None:
+            continue
+        task_id = str(entry.task.id)
+        if task_id in planned_task_ids:
+            continue
+        ordered_pending_tasks.append(entry.task)
+    return tuple(ordered_pending_tasks), tuple(unmapped_entries)
+
+
 def allocate_watch_slots(
     *,
     slots: int,
@@ -8224,9 +8257,23 @@ def _run_cycle(
                 allow_replan=False,
             )
 
-    def _recompute_pending_dispatch() -> tuple[list[DbTask], int]:
+    def _fail_closed_for_planned_pending_entry(
+        entry: DispatchPreviewEntry,
+        *,
+        reason: str,
+    ) -> None:
+        task_id = str(entry.task.id) if entry.task.id is not None else "unknown"
+        log.emit_attention(
+            attention_key=f"planned-pending-dispatch-invariant:{task_id}:{reason}",
+            message=(
+                f"{task_id}: planned pending entry could not be dispatched "
+                f"(reason={reason}); watch stopped further pending dispatch for this pass"
+            ),
+        )
+
+    def _recompute_pending_dispatch() -> tuple[list[DbTask], int, bool]:
         if scoped_owner_ids is not None:
-            return [], 0
+            return [], 0, False
         pending_preview = build_dispatch_preview(
             store,
             config=config,
@@ -8256,16 +8303,25 @@ def _run_cycle(
             selection_mode="pending_only",
             include_pending=True,
         )
-        return (
-            [entry.task for entry in pending_entries if entry.lane == "pending" and entry.task.id is not None],
-            pending_plan.pending_slots,
+        planned_pending_entries = tuple(getattr(pending_plan, "entries", pending_entries))
+        pending_tasks, unmapped_pending_entries = _map_planned_pending_entries_to_launchable_tasks(
+            planned_pending_entries,
+            pending_entries=pending_entries,
         )
+        if unmapped_pending_entries:
+            for entry in unmapped_pending_entries:
+                _fail_closed_for_planned_pending_entry(entry, reason="missing-pending-task")
+            return [], 0, True
+        return list(pending_tasks), pending_plan.pending_slots, False
 
     if planned_recovery_dispatch_failed_closed:
         pending_slots = 0
         pending_tasks = []
+        pending_dispatch_failed_closed = False
     elif scoped_owner_ids is None and recovery_mode != "recovery_only":
-        pending_tasks, pending_slots = _recompute_pending_dispatch()
+        pending_tasks, pending_slots, pending_dispatch_failed_closed = _recompute_pending_dispatch()
+    else:
+        pending_dispatch_failed_closed = False
 
     if (
         scoped_owner_ids is None
@@ -8274,7 +8330,7 @@ def _run_cycle(
         and not recovery_started_this_cycle
     ):
         if not nonparked_recovery_subject_ids:
-            pending_tasks, pending_slots = _recompute_pending_dispatch()
+            pending_tasks, pending_slots, pending_dispatch_failed_closed = _recompute_pending_dispatch()
 
     # 3) Start new queued tasks (consumes slots)
     def consume_pending_slot() -> None:
@@ -8337,9 +8393,9 @@ def _run_cycle(
             dedupe_key=f"quiet:{quiet_task.id}:{quiet_available_at.astimezone(UTC).isoformat()}",
         )
 
-    if pending_slots > 0:
+    if pending_slots > 0 and not pending_dispatch_failed_closed:
         log.emit("QUEUE", "pending queue active")
-    if pending_slots > 0:
+    if pending_slots > 0 and not pending_dispatch_failed_closed:
         pending_task_index = 0
         while pending_slots > 0 and pending_task_index < len(pending_tasks):
             wave_budget = pending_slots

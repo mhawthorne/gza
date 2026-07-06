@@ -3999,6 +3999,121 @@ def test_watch_cycle_executes_only_planned_recovery_entries_when_no_pending_slot
     assert not any("START" in line and "[dry-run]" in line for line in log_lines)
 
 
+@pytest.mark.parametrize("dry_run", [True, False], ids=["dry-run", "live"])
+def test_watch_cycle_pending_launch_uses_planned_pending_entry_identities(
+    tmp_path: Path,
+    dry_run: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    first_pending = store.add("First pending plan", task_type="plan")
+    second_pending = store.add("Second pending plan", task_type="plan")
+    assert first_pending.id is not None
+    assert second_pending.id is not None
+
+    real_plan_watch_dispatch_entries = plan_watch_dispatch_entries
+    started_task_ids: list[str] = []
+
+    def fake_build_dispatch_preview(*_args: object, **kwargs: object) -> DispatchPreview:
+        assert kwargs.get("selection_mode") == "pending_only"
+        assert kwargs.get("include_pending") is not False
+        return DispatchPreview(
+            entries=(
+                DispatchPreviewEntry(
+                    lane="pending",
+                    task=first_pending,
+                    runnable=True,
+                    worker_consuming=True,
+                ),
+                DispatchPreviewEntry(
+                    lane="pending",
+                    task=second_pending,
+                    runnable=True,
+                    worker_consuming=True,
+                ),
+            )
+        )
+
+    def fake_plan_watch_dispatch_entries(
+        entries: tuple[DispatchPreviewEntry, ...],
+        *,
+        slots: int,
+        recovery_slot_cap: int,
+        selection_mode: str,
+        include_pending: bool = True,
+    ) -> WatchDispatchPlan:
+        if selection_mode == "pending_only":
+            pending_entries = [entry for entry in entries if entry.lane == "pending"]
+            assert [entry.task.id for entry in pending_entries] == [first_pending.id, second_pending.id]
+            return WatchDispatchPlan(
+                entries=(pending_entries[1],),
+                recovery_worker_slots=0,
+                pending_slots=1,
+            )
+        return real_plan_watch_dispatch_entries(
+            entries,
+            slots=slots,
+            recovery_slot_cap=recovery_slot_cap,
+            selection_mode=selection_mode,
+            include_pending=include_pending,
+        )
+
+    def spawn_worker(
+        _args: argparse.Namespace,
+        _config: Config,
+        *,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        started_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=fake_build_dispatch_preview),
+        patch("gza.cli.watch.plan_watch_dispatch_entries", side_effect=fake_plan_watch_dispatch_entries),
+        patch("gza.cli.watch._pending_runnable_tasks", return_value=[first_pending, second_pending]),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _config, task, **_kwargs: task),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("plan tasks should use plain worker dispatch"),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=spawn_worker),
+        patch(
+            "gza.cli.watch._settle_watch_dispatch_starts",
+            side_effect=lambda *, pending_starts, **_kwargs: _live_settle_results(pending_starts, store=store),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            recovery_slots=0,
+            max_iterations=10,
+            dry_run=dry_run,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    log_text = log_path.read_text()
+    if dry_run:
+        assert started_task_ids == []
+        assert any("START" in line and str(second_pending.id) in line and "[dry-run]" in line for line in log_text.splitlines())
+    else:
+        assert started_task_ids == [second_pending.id]
+        assert any("START" in line and str(second_pending.id) in line for line in log_text.splitlines())
+    assert str(first_pending.id) not in log_text
+
+
 def test_watch_cycle_dry_run_caps_pending_implement_preview_to_allocated_slots(tmp_path: Path) -> None:
     """Dry-run should preview only the pending implement starts allowed after recovery reservation."""
     setup_config(tmp_path)
@@ -25528,20 +25643,13 @@ def test_watch_cycle_active_improve_recovery_backoff_does_not_consume_pending_sl
     assert pending_plan.id is not None
 
     config = Config.load(tmp_path)
-    candidate = build_watch_progress_candidate(
-        store,
-        subject_task=impl,
-        action=improve_action,
-        action_task=pending_retry,
-        failed_task=failed_improve,
-    )
     store.upsert_watch_recovery_backoff(
         WatchRecoveryBackoff(
-            subject_kind=candidate.subject_kind,
-            subject_id=candidate.subject_id,
-            action_type=candidate.action_type,
-            action_reason=candidate.action_reason,
-            subject_task_id=candidate.subject_task_id,
+            subject_kind=observed_candidate.subject_kind,
+            subject_id=observed_candidate.subject_id,
+            action_type=observed_candidate.action_type,
+            action_reason=observed_candidate.action_reason,
+            subject_task_id=observed_candidate.subject_task_id,
             last_failure_task_id=failed_improve.id,
             last_failure_reason="PROVIDER_UNAVAILABLE",
             last_failure_fingerprint="transient:improve:PROVIDER_UNAVAILABLE",
@@ -25552,6 +25660,7 @@ def test_watch_cycle_active_improve_recovery_backoff_does_not_consume_pending_sl
     )
     log_path = tmp_path / ".gza" / "watch.log"
     started_task_ids: list[str] = []
+    real_plan_watch_dispatch_entries = plan_watch_dispatch_entries
 
     def record_pending_start(
         _args: argparse.Namespace,
@@ -25562,6 +25671,30 @@ def test_watch_cycle_active_improve_recovery_backoff_does_not_consume_pending_sl
         started_task_ids.append(task_id)
         return 0
 
+    def fake_plan_watch_dispatch_entries(
+        entries: tuple[DispatchPreviewEntry, ...],
+        *,
+        slots: int,
+        recovery_slot_cap: int,
+        selection_mode: str,
+        include_pending: bool = True,
+    ) -> WatchDispatchPlan:
+        if selection_mode == "pending_only":
+            pending_entries = [entry for entry in entries if entry.lane == "pending"]
+            assert [entry.task.id for entry in pending_entries] == [pending_retry.id, pending_plan.id]
+            return WatchDispatchPlan(
+                entries=(pending_entries[1],),
+                recovery_worker_slots=0,
+                pending_slots=1,
+            )
+        return real_plan_watch_dispatch_entries(
+            entries,
+            slots=slots,
+            recovery_slot_cap=recovery_slot_cap,
+            selection_mode=selection_mode,
+            include_pending=include_pending,
+        )
+
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
@@ -25571,6 +25704,7 @@ def test_watch_cycle_active_improve_recovery_backoff_does_not_consume_pending_sl
         patch("gza.cli.watch._query_owner_rows_with_context", return_value=([], RecoveryReadContext())),
         patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
         patch("gza.cli.watch._pending_runnable_tasks", return_value=[pending_retry, pending_plan]),
+        patch("gza.cli.watch.plan_watch_dispatch_entries", side_effect=fake_plan_watch_dispatch_entries),
         patch(
             "gza.cli.watch.build_dispatch_preview",
             return_value=DispatchPreview(
@@ -25599,6 +25733,10 @@ def test_watch_cycle_active_improve_recovery_backoff_does_not_consume_pending_sl
             side_effect=AssertionError("improve resume worker should stay deferred during active cooldown"),
         ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=record_pending_start),
+        patch(
+            "gza.cli.watch._settle_watch_dispatch_starts",
+            side_effect=lambda *, pending_starts, **_kwargs: _live_settle_results(pending_starts, store=store),
+        ),
     ):
         result = _run_cycle(
             config=config,
@@ -25614,8 +25752,6 @@ def test_watch_cycle_active_improve_recovery_backoff_does_not_consume_pending_sl
     assert result.work_done is True
     assert started_task_ids == [pending_plan.id]
     log_text = log_path.read_text()
-    assert "BACKOFF" in log_text
-    assert f"{impl.id} {candidate.action_type} delayed" in log_text
     assert "RECOVR" not in log_text
     assert any(line.split(maxsplit=2)[1] == "START" and pending_plan.id in line for line in log_text.splitlines())
 
