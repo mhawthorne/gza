@@ -7556,6 +7556,26 @@ class SqliteTaskStore:
         last_observed_failure: str | None = None,
     ) -> MainVerifyRemediationAttemptState | None:
         """Persist or refresh the active remediation task pointer for one failure identity."""
+        return self._record_main_verify_remediation_active_task(
+            signature=signature,
+            tree_fingerprint=tree_fingerprint,
+            task_id=task_id,
+            last_observed_head_sha=last_observed_head_sha,
+            last_observed_failure=last_observed_failure,
+            clear_exhausted=False,
+        )
+
+    def _record_main_verify_remediation_active_task(
+        self,
+        *,
+        signature: str,
+        tree_fingerprint: str | None,
+        task_id: str | None,
+        last_observed_head_sha: str | None = None,
+        last_observed_failure: str | None = None,
+        clear_exhausted: bool,
+    ) -> MainVerifyRemediationAttemptState | None:
+        """Persist or refresh the active remediation task pointer for one failure identity."""
         if not self.supports_main_verify_remediation_attempts():
             return None
         normalized_fingerprint = _normalize_main_verify_tree_fingerprint(tree_fingerprint)
@@ -7584,6 +7604,7 @@ class SqliteTaskStore:
                     active_task_id = excluded.active_task_id,
                     exhausted_at = CASE
                         WHEN excluded.active_task_id IS NULL
+                            OR ? = 0
                             THEN main_verify_remediation_attempts.exhausted_at
                         ELSE NULL
                     END,
@@ -7611,6 +7632,7 @@ class SqliteTaskStore:
                     last_observed_head_sha,
                     last_observed_failure,
                     updated_at,
+                    1 if clear_exhausted else 0,
                 ),
             )
             row = conn.execute(
@@ -7625,6 +7647,25 @@ class SqliteTaskStore:
             ).fetchone()
         return self._row_to_main_verify_remediation_attempt_state(row)
 
+    def reset_main_verify_remediation_exhaustion(
+        self,
+        *,
+        signature: str,
+        tree_fingerprint: str | None,
+        task_id: str,
+        last_observed_head_sha: str | None = None,
+        last_observed_failure: str | None = None,
+    ) -> MainVerifyRemediationAttemptState | None:
+        """Explicitly reopen a remediation identity and clear its exhaustion marker."""
+        return self._record_main_verify_remediation_active_task(
+            signature=signature,
+            tree_fingerprint=tree_fingerprint,
+            task_id=task_id,
+            last_observed_head_sha=last_observed_head_sha,
+            last_observed_failure=last_observed_failure,
+            clear_exhausted=True,
+        )
+
     def clear_main_verify_remediation_active_task(
         self,
         *,
@@ -7634,12 +7675,13 @@ class SqliteTaskStore:
         last_observed_failure: str | None = None,
     ) -> MainVerifyRemediationAttemptState | None:
         """Clear the active remediation task pointer for one failure identity."""
-        return self.record_main_verify_remediation_active_task(
+        return self._record_main_verify_remediation_active_task(
             signature=signature,
             tree_fingerprint=tree_fingerprint,
             task_id=None,
             last_observed_head_sha=last_observed_head_sha,
             last_observed_failure=last_observed_failure,
+            clear_exhausted=False,
         )
 
     def record_main_verify_remediation_consumed_attempt(

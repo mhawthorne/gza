@@ -11378,7 +11378,7 @@ class TestSharedDbIsolationAndImportGating:
         assert second.last_observed_head_sha == "def456"
         assert second.last_observed_failure == "failed remediation exhausted"
 
-    def test_main_verify_remediation_active_task_clears_exhausted_state(self, tmp_path: Path) -> None:
+    def test_main_verify_remediation_active_task_preserves_exhausted_state(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path, prefix="gza")
 
@@ -11392,6 +11392,43 @@ class TestSharedDbIsolationAndImportGating:
         assert exhausted is not None
         assert exhausted.exhausted_at is not None
         reactivated = store.record_main_verify_remediation_active_task(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            task_id="gza-101",
+            last_observed_head_sha="def456",
+            last_observed_failure="ordinary active-pointer refresh",
+        )
+
+        assert reactivated is not None
+        assert reactivated.active_task_id == "gza-101"
+        assert reactivated.exhausted_at is not None
+        assert reactivated.last_observed_head_sha == "def456"
+        assert reactivated.last_observed_failure == "ordinary active-pointer refresh"
+
+        persisted = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+        )
+
+        assert persisted == reactivated
+        assert persisted is not None
+        assert persisted.active_task_id == "gza-101"
+        assert persisted.exhausted_at is not None
+
+    def test_main_verify_remediation_reset_exhaustion_clears_exhausted_state(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path, prefix="gza")
+
+        exhausted = store.mark_main_verify_remediation_exhausted(
+            signature="phase:functional",
+            tree_fingerprint="fp-functional-a",
+            last_observed_head_sha="abc123",
+            last_observed_failure="budget exhausted",
+        )
+
+        assert exhausted is not None
+        assert exhausted.exhausted_at is not None
+        reactivated = store.reset_main_verify_remediation_exhaustion(
             signature="phase:functional",
             tree_fingerprint="fp-functional-a",
             task_id="gza-101",
