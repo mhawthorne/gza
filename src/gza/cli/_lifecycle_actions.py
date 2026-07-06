@@ -16,7 +16,7 @@ from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_ow
 from ..pickup import is_worker_consuming_advance_action
 from ..recovery_read_context import RecoveryReadContext
 from ..task_query import normalize_tag_filters
-from .advance_engine import classify_advance_action, determine_next_action
+from .advance_engine import classify_advance_action, determine_next_action, prime_lifecycle_git_facts
 
 ADVANCE_ACTION_ORDER: dict[str, int] = {"merge": 0, "merge_with_followups": 0}
 T = TypeVar("T")
@@ -85,6 +85,18 @@ def collect_lifecycle_action_entries(
         )
     else:
         owner_rows = tuple(owner_rows)
+
+    prime_lifecycle_git_facts(
+        config=config,
+        store=store,
+        git=git,
+        tasks=tuple(
+            action_task
+            for row in owner_rows
+            if (action_task := row.lifecycle_action_task) is not None
+        ),
+        target_branch=target_branch,
+    )
 
     entries: list[LifecycleActionEntry] = []
     for row in owner_rows:

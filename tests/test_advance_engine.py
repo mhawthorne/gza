@@ -30,6 +30,7 @@ from gza.advance_engine import (
     failed_recovery_decision_to_action,
     get_action_subject_task_id,
     needs_attention_recommended_next_step,
+    prime_lifecycle_git_facts,
     require_needs_attention_subject,
     resolve_advance_context,
     resolve_closing_review_action,
@@ -218,6 +219,43 @@ def _set_subdir_project_boundary(config: Config, tmp_path: Path) -> None:
             local_dependencies=(),
         ),
     )
+
+
+def test_prime_lifecycle_git_facts_primes_merge_and_diff_probes(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.branch = "feature/prime-cache"
+    task.has_commits = True
+    store.update(task)
+
+    git = _FakeGit(
+        can_merge_by_ref={("feature/prime-cache", "main"): True},
+        merge_source_result=("feature/prime-cache", None),
+        ref_shas={
+            "feature/prime-cache": "a" * 40,
+            "main": "b" * 40,
+        },
+        ancestor_pairs={("main", "feature/prime-cache"): False},
+        name_status_by_range={"main...feature/prime-cache": "M\tfeature.txt\n"},
+    )
+
+    prime_lifecycle_git_facts(
+        config=config,
+        store=store,
+        git=git,
+        tasks=(task,),
+        target_branch="main",
+    )
+
+    assert git.can_merge_calls == [("feature/prime-cache", "main")]
+    assert git.name_status_calls
+    assert set(git.name_status_calls) == {"main...feature/prime-cache"}
+    assert {"feature/prime-cache", "main"} <= set(git.rev_parse_calls)
+    assert git.is_ancestor_calls == [("main", "feature/prime-cache")]
 
 
 def _approved_plan_review_manifest(source_task_id: str) -> dict[str, object]:

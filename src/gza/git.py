@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from collections.abc import Iterable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -301,23 +302,34 @@ class Git:
     def __init__(self, repo_dir: Path):
         self.repo_dir = repo_dir
         self._cache: dict[tuple[Any, ...], Any] | None = None
+        self._cache_lock = threading.RLock()
+
+    def _get_cache_lock(self) -> threading.RLock:
+        lock = getattr(self, "_cache_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._cache_lock = lock
+        return lock
 
     @contextmanager
     def cached(self):
         """Enable a per-invocation cache for repeated read-only probes."""
-        created_cache = self._cache is None
-        if created_cache:
-            self._cache = {}
+        with self._get_cache_lock():
+            created_cache = self._cache is None
+            if created_cache:
+                self._cache = {}
         try:
             yield self
         finally:
             if created_cache:
-                self._cache = None
+                with self._get_cache_lock():
+                    self._cache = None
 
     def clear_cache(self) -> None:
         """Drop the active per-invocation cache, if any."""
-        if self._cache is not None:
-            self._cache.clear()
+        with self._get_cache_lock():
+            if self._cache is not None:
+                self._cache.clear()
 
     @staticmethod
     def _git_executable() -> str:
@@ -342,13 +354,15 @@ class Git:
         return (args, check, ("stdin-id", id(stdin)) if stdin is not None else None)
 
     def _lookup_cached_value(self, key: tuple[Any, ...]) -> tuple[bool, Any]:
-        if self._cache is None or key not in self._cache:
-            return (False, None)
-        return (True, self._cache[key])
+        with self._get_cache_lock():
+            if self._cache is None or key not in self._cache:
+                return (False, None)
+            return (True, self._cache[key])
 
     def _store_cached_value(self, key: tuple[Any, ...], value: Any) -> Any:
-        if self._cache is not None:
-            self._cache[key] = value
+        with self._get_cache_lock():
+            if self._cache is not None:
+                self._cache[key] = value
         return value
 
     def _resolved_ref_cache_key(self, ref: str, peel: str) -> tuple[Any, ...]:

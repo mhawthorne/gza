@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
@@ -5410,6 +5411,129 @@ def _resolve_post_closing_review_git_context(
         review_blocker_adjudication_candidate=review_blocker_adjudication_candidate,
         duplicate_blocker_streak=duplicate_blocker_streak,
     )
+
+
+def _prime_pre_closing_review_git_facts_for_task(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    task: DbTask,
+    target_branch: str,
+) -> None:
+    """Warm the shared git cache for one branch-bearing lifecycle task."""
+    if not task.branch:
+        return
+
+    review_root_task = _resolve_review_root_task(store, task)
+    merge_source = _resolve_current_merge_source(git, task.branch)
+    if merge_source.warning is not None:
+        return
+
+    post_merge_rebase_state = resolve_post_merge_rebase_state(
+        store,
+        git,
+        task,
+        target_branch,
+        merge_source=merge_source,
+    )
+    merge_state = resolve_task_merge_state_for_target(
+        store=store,
+        task=task,
+        git=git,
+        target_branch=target_branch,
+    )
+    strict_scope_inspection = _resolve_strict_scope_inspection(
+        config,
+        git,
+        task,
+        merge_source_ref=merge_source.ref,
+        target_branch=target_branch,
+    )
+    can_merge = (
+        post_merge_rebase_state.already_merged
+        or merge_state_is_terminal_for_lifecycle(merge_state)
+        or (bool(merge_source.ref) and git.can_merge(merge_source.ref, target_branch))
+    )
+
+    review_head_branch = review_root_task.branch or task.branch
+    if review_head_branch:
+        _resolve_branch_head_sha(git, review_head_branch)
+
+    if (
+        strict_scope_inspection.inspection_error is not None
+        or strict_scope_inspection.violation_paths
+        or post_merge_rebase_state.already_merged
+        or merge_state_is_terminal_for_lifecycle(merge_state)
+        or not can_merge
+    ):
+        return
+
+    _resolve_spec_coherence_inspection(
+        config,
+        git,
+        review_root_task,
+        merge_source_ref=merge_source.ref,
+        target_branch=target_branch,
+    )
+
+
+def prime_lifecycle_git_facts(
+    *,
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    tasks: tuple[DbTask, ...],
+    target_branch: str,
+) -> None:
+    """Concurrently prewarm expensive git read facts for lifecycle planning."""
+    branch_tasks: list[DbTask] = []
+    seen_task_ids: set[str] = set()
+    seen_branch_keys: set[tuple[str, str]] = set()
+    for task in tasks:
+        if not task.branch or task.status == "failed":
+            continue
+        task_id = task.id or ""
+        branch_key = (task.task_type, task.branch)
+        if task_id:
+            if task_id in seen_task_ids:
+                continue
+            seen_task_ids.add(task_id)
+        elif branch_key in seen_branch_keys:
+            continue
+        seen_branch_keys.add(branch_key)
+        branch_tasks.append(task)
+    branch_tasks_tuple = tuple(branch_tasks)
+    if not branch_tasks_tuple:
+        return
+    max_workers = min(8, len(branch_tasks_tuple))
+    if max_workers <= 1:
+        for task in branch_tasks_tuple:
+            _prime_pre_closing_review_git_facts_for_task(
+                config=config,
+                store=store,
+                git=git,
+                task=task,
+                target_branch=target_branch,
+            )
+        return
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(
+                    _prime_pre_closing_review_git_facts_for_task,
+                    config=config,
+                    store=store,
+                    git=git,
+                    task=task,
+                    target_branch=target_branch,
+                )
+                for task in branch_tasks_tuple
+            ]
+            for future in futures:
+                future.result()
+    except Exception:
+        _LOG.warning("Failed to prewarm lifecycle git facts", exc_info=True)
 
 
 def _matches_rule_before_closing_review_invariant(ctx: AdvanceContext) -> bool:

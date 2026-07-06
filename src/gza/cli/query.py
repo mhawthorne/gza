@@ -810,33 +810,37 @@ def cmd_next(args: argparse.Namespace) -> int:
         return 1
 
     git = Git(config.project_dir)
-    target_branch = git.default_branch()
-    recovery_entries = collect_recovery_lane_entries(
-        store,
-        tags=tag_filters,
-        any_tag=any_tag,
-        max_recovery_attempts=config.max_resume_attempts,
-        git=git,
-        target_branch=target_branch,
-    )
-    lifecycle_entries = collect_lifecycle_action_entries(
-        store,
-        config=config,
-        git=git,
-        target_branch=target_branch,
-        tags=tag_filters,
-        any_tag=any_tag,
-        max_recovery_attempts=config.max_resume_attempts,
-        persist_post_merge_rebase_state=False,
-    )
-    queue_rows = [
-        row
-        for row in service.run(
-            _TaskQueryPresets.queue_listing(limit=None, tags=tag_filters, any_tag=any_tag),
+    cache_scope = git.cached() if hasattr(git, "cached") else contextlib.nullcontext(git)
+    with cache_scope:
+        target_branch = git.default_branch()
+        recovery_entries = collect_recovery_lane_entries(
+            store,
+            tags=tag_filters,
+            any_tag=any_tag,
+            max_recovery_attempts=config.max_resume_attempts,
+            git=git,
+            target_branch=target_branch,
+        )
+        lifecycle_entries = collect_lifecycle_action_entries(
+            store,
             config=config,
-        ).rows
-        if isinstance(row, _TaskRow)
-    ]
+            git=git,
+            target_branch=target_branch,
+            tags=tag_filters,
+            any_tag=any_tag,
+            max_recovery_attempts=config.max_resume_attempts,
+            persist_post_merge_rebase_state=False,
+        )
+        queue_rows = [
+            row
+            for row in service.run(
+                _TaskQueryPresets.queue_listing(limit=None, tags=tag_filters, any_tag=any_tag),
+                config=config,
+                git=git,
+                target_branch=target_branch,
+            ).rows
+            if isinstance(row, _TaskRow)
+        ]
     runnable_rows, quiet_rows, blocked_rows = _partition_queue_rows(queue_rows)
 
     # Check for orphaned/stale tasks once, regardless of whether pending tasks exist

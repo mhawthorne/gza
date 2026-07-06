@@ -133,6 +133,41 @@ def test_behavior_check_fingerprint_changes_when_assertion_id_changes() -> None:
     assert original != changed_assertion
 
 
+def test_read_session_child_indexes_serve_based_on_queries_and_retry_lookup_without_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    parent = store.add("Failed implementation", task_type="implement")
+    assert parent.id is not None
+    parent.status = "failed"
+    parent.failure_reason = "INFRASTRUCTURE_ERROR"
+    store.update(parent)
+
+    pending_child = store.add(parent.prompt, task_type="implement", based_on=parent.id, recovery_origin="retry")
+    assert pending_child.id is not None
+    pending_child.status = "pending"
+    store.update(pending_child)
+
+    completed_child = store.add(parent.prompt, task_type="implement", based_on=parent.id, recovery_origin="retry")
+    assert completed_child.id is not None
+    completed_child.status = "completed"
+    store.update(completed_child)
+
+    with store.use_read_session_child_indexes(based_on_children={parent.id: (pending_child, completed_child)}):
+        monkeypatch.setattr(store, "_connect", lambda: (_ for _ in ()).throw(AssertionError("should not hit sqlite")))
+
+        assert [task.id for task in store.get_based_on_children(parent.id)] == [pending_child.id, completed_child.id]
+        assert [task.id for task in store.get_based_on_children_by_type(parent.id, "implement")] == [
+            pending_child.id,
+            completed_child.id,
+        ]
+        resolved_retry = store._find_successful_retry_task(parent.id)
+        assert resolved_retry is not None
+        assert resolved_retry.id == completed_child.id
+
+
 def test_behavior_check_fingerprint_separates_distinct_field_tuples() -> None:
     first = behavior_check_finding_fingerprint(
         check_name="ab",

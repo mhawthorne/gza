@@ -7,8 +7,9 @@ import re
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -4187,6 +4188,9 @@ class SqliteTaskStore:
         self._default_merge_target_cache: str | None = None
         self._read_session_conn: sqlite3.Connection | None = None
         self._read_session_depth = 0
+        self._read_session_based_on_children: dict[str, tuple[Task, ...]] | None = None
+        self._read_session_based_on_children_by_type: dict[tuple[str, str], tuple[Task, ...]] | None = None
+        self._read_session_index_lock = threading.RLock()
         if self._open_mode == "query_only":
             self._ensure_db_query_only()
         else:
@@ -4862,8 +4866,41 @@ class SqliteTaskStore:
             if self._read_session_depth == 0:
                 conn = self._read_session_conn
                 self._read_session_conn = None
+                with self._read_session_index_lock:
+                    self._read_session_based_on_children = None
+                    self._read_session_based_on_children_by_type = None
                 if conn is not None:
                     conn.close()
+
+    @contextmanager
+    def use_read_session_child_indexes(
+        self,
+        *,
+        based_on_children: Mapping[str, Iterable[Task]],
+    ):
+        """Install one in-memory based_on index for the active read_session scope."""
+        previous_children = self._read_session_based_on_children
+        previous_children_by_type = self._read_session_based_on_children_by_type
+        normalized_children = {
+            task_id: tuple(children)
+            for task_id, children in based_on_children.items()
+        }
+        normalized_children_by_type: dict[tuple[str, str], tuple[Task, ...]] = {}
+        for task_id, children in normalized_children.items():
+            grouped: dict[str, list[Task]] = {}
+            for child in children:
+                grouped.setdefault(child.task_type, []).append(child)
+            for task_type, typed_children in grouped.items():
+                normalized_children_by_type[(task_id, task_type)] = tuple(typed_children)
+        with self._read_session_index_lock:
+            self._read_session_based_on_children = normalized_children
+            self._read_session_based_on_children_by_type = normalized_children_by_type
+        try:
+            yield
+        finally:
+            with self._read_session_index_lock:
+                self._read_session_based_on_children = previous_children
+                self._read_session_based_on_children_by_type = previous_children_by_type
 
     def _open_connection(self, *, close_on_exit: bool) -> sqlite3.Connection:
         """Create a database connection with the store's standard pragmas and mode."""
@@ -6054,6 +6091,10 @@ class SqliteTaskStore:
 
     def get_based_on_children(self, task_id: str) -> list[Task]:
         """Return tasks where based_on = task_id (direct lineage descendants)."""
+        with self._read_session_index_lock:
+            indexed_children = self._read_session_based_on_children
+            if indexed_children is not None:
+                return list(indexed_children.get(task_id, ()))
         with self._connect() as conn:
             cur = conn.execute(
                 "SELECT * FROM tasks WHERE project_id = ? AND based_on = ? ORDER BY created_at ASC",
@@ -6063,6 +6104,10 @@ class SqliteTaskStore:
 
     def get_based_on_children_by_type(self, task_id: str, task_type: str) -> list[Task]:
         """Return tasks where based_on = task_id and task_type matches."""
+        with self._read_session_index_lock:
+            indexed_children_by_type = self._read_session_based_on_children_by_type
+            if indexed_children_by_type is not None:
+                return list(indexed_children_by_type.get((task_id, task_type), ()))
         with self._connect() as conn:
             cur = conn.execute(
                 """
@@ -10296,6 +10341,23 @@ class SqliteTaskStore:
         successful retries. A dropped task means the work was deliberately abandoned,
         not completed. Only status='completed' unblocks a dependency chain.
         """
+        with self._read_session_index_lock:
+            indexed_children = self._read_session_based_on_children
+        if indexed_children is not None:
+            indexed_visited: set[str] = set()
+            indexed_queue: list[str] = [task_id]
+            while indexed_queue:
+                current_id = indexed_queue.pop(0)
+                if current_id in indexed_visited:
+                    continue
+                indexed_visited.add(current_id)
+                for child in indexed_children.get(current_id, ()):
+                    if child.status == "completed":
+                        return child
+                    if child.id is not None:
+                        indexed_queue.append(child.id)
+            return None
+
         visited: set[str] = set()
         queue: list[str] = [task_id]
         while queue:

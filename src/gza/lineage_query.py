@@ -1319,460 +1319,461 @@ def _query_lineage_owner_rows_with_context(
             tag_matcher=task_matches_tag_filters,
         ),
     )
-    if isinstance(git, Git) and target_branch is not None:
-        read_context.merge_context = build_merge_context_from_git(git, target_branch)
-    owner_ids_filter = set(query.owner_task_ids) if query.owner_task_ids is not None else None
-    task_ids_filter = set(query.task_ids) if query.task_ids is not None else None
-    candidate_owner_rows = _candidate_owner_rows(
-        indexes,
-        query,
-        owner_ids_filter=owner_ids_filter,
-        task_ids_filter=task_ids_filter,
-    )
-    drop_excluded_task_ids = frozenset(
-        task.id
-        for task in indexes.tasks
-        if task.id is not None
-        and query.exclude_dropped_from_planning
-        and _task_is_excluded_from_dropped_planning(
-            task,
-            merge_units_by_task_id=indexes.merge_units_by_task_id,
-            historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
+    with store.use_read_session_child_indexes(based_on_children=indexes.based_on_children):
+        if isinstance(git, Git) and target_branch is not None:
+            read_context.merge_context = build_merge_context_from_git(git, target_branch)
+        owner_ids_filter = set(query.owner_task_ids) if query.owner_task_ids is not None else None
+        task_ids_filter = set(query.task_ids) if query.task_ids is not None else None
+        candidate_owner_rows = _candidate_owner_rows(
+            indexes,
+            query,
+            owner_ids_filter=owner_ids_filter,
+            task_ids_filter=task_ids_filter,
         )
-    )
-    visible_failed_tasks = [
-        task for task in list_failed_tasks_for_recovery(store, read_context=read_context) if task.id is not None
-    ]
-    visible_failed_ids = {task.id for task in visible_failed_tasks if task.id is not None}
-    visible_failed_order = {
-        task.id: index
-        for index, task in enumerate(visible_failed_tasks)
-        if task.id is not None
-    }
-    source_followup_cache: dict[str, SourceFollowupState] = {}
-    prime_advance_planning_refs(
-        git,
-        branch_names=(
-            task.branch
-            for _owner_id, _owner, owner_members, _root in candidate_owner_rows
-            for task in owner_members
-            if task.branch
-        ),
-        target_branch=target_branch,
-        warning_logger=_LOG,
-    )
-
-    rows: list[LineageOwnerRow] = []
-    for owner_id, owner, owner_members, root in candidate_owner_rows:
-        merge_units_by_member = {
-            task.id: indexes.merge_units_by_task_id[task.id]
-            for task in owner_members
-            if task.id is not None and task.id in indexes.merge_units_by_task_id
-        }
-        failed_leaves: list[DbTask] = []
-        matching_failed_leaves: list[DbTask] = []
-        recovery_completed_by_failed_id: dict[str, DbTask] = {}
-        unresolved_tasks: list[DbTask] = []
-        orphaned_same_branch_tasks: list[DbTask] = []
-        skipped_same_branch_members = indexes.skipped_same_branch_members_by_root_id.get(owner_id, ())
-        owner_merge_unit = _resolve_owner_merge_unit(owner, merge_units_by_member=merge_units_by_member)
-
-        merged_owner_branch = any(
-            _task_is_effectively_merged(task, merge_units_by_task_id=merge_units_by_member)
-            for task in owner_members
-        )
-
-        for task in sorted(owner_members, key=lambda item: (_task_event_time(item), task_id_numeric_key(item.id))):
-            if task.id is None:
-                continue
-            empty_prereq_block = blocked_by_empty_prereq_label(store, task, read_context=read_context)
-            if task.status not in {"failed", "completed", "unmerged", "dropped"} and empty_prereq_block is None:
-                continue
-            if query.exclude_dropped_from_planning and _task_is_excluded_from_dropped_planning(
+        drop_excluded_task_ids = frozenset(
+            task.id
+            for task in indexes.tasks
+            if task.id is not None
+            and query.exclude_dropped_from_planning
+            and _task_is_excluded_from_dropped_planning(
                 task,
                 merge_units_by_task_id=indexes.merge_units_by_task_id,
                 historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
-            ):
-                continue
-            merge_unit = merge_units_by_member.get(task.id)
-            matches = _matches_task_filters(
-                task,
-                query,
-                tag_matcher=task_matches_tag_filters,
-                include_tag_filters=False,
-                merge_unit=merge_unit,
             )
-            if task.task_type in IMPLEMENTATION_SOURCE_TASK_TYPES and task.status == "completed":
-                followup_state = _source_followup_state(indexes, task, source_followup_cache)
-                needs_followup = source_task_needs_implementation_followup(
-                    task,
-                    followup_state,
-                    non_dropped_implement_source_ids=indexes.non_dropped_impl_source_ids,
-                )
-                has_blocked_review_dependents = held_plan_has_blocked_awaiting_review_dependents(
-                    task,
-                    get_dependents=lambda task_id: indexes.depends_on_children.get(task_id, ()),
-                    get_dependency_readiness=lambda dependent: store.get_dependency_readiness(dependent),
-                )
-                if not needs_followup and not has_blocked_review_dependents:
+        )
+        visible_failed_tasks = [
+            task for task in list_failed_tasks_for_recovery(store, read_context=read_context) if task.id is not None
+        ]
+        visible_failed_ids = {task.id for task in visible_failed_tasks if task.id is not None}
+        visible_failed_order = {
+            task.id: index
+            for index, task in enumerate(visible_failed_tasks)
+            if task.id is not None
+        }
+        source_followup_cache: dict[str, SourceFollowupState] = {}
+        prime_advance_planning_refs(
+            git,
+            branch_names=(
+                task.branch
+                for _owner_id, _owner, owner_members, _root in candidate_owner_rows
+                for task in owner_members
+                if task.branch
+            ),
+            target_branch=target_branch,
+            warning_logger=_LOG,
+        )
+
+        rows: list[LineageOwnerRow] = []
+        for owner_id, owner, owner_members, root in candidate_owner_rows:
+            merge_units_by_member = {
+                task.id: indexes.merge_units_by_task_id[task.id]
+                for task in owner_members
+                if task.id is not None and task.id in indexes.merge_units_by_task_id
+            }
+            failed_leaves: list[DbTask] = []
+            matching_failed_leaves: list[DbTask] = []
+            recovery_completed_by_failed_id: dict[str, DbTask] = {}
+            unresolved_tasks: list[DbTask] = []
+            orphaned_same_branch_tasks: list[DbTask] = []
+            skipped_same_branch_members = indexes.skipped_same_branch_members_by_root_id.get(owner_id, ())
+            owner_merge_unit = _resolve_owner_merge_unit(owner, merge_units_by_member=merge_units_by_member)
+
+            merged_owner_branch = any(
+                _task_is_effectively_merged(task, merge_units_by_task_id=merge_units_by_member)
+                for task in owner_members
+            )
+
+            for task in sorted(owner_members, key=lambda item: (_task_event_time(item), task_id_numeric_key(item.id))):
+                if task.id is None:
                     continue
-                if matches or has_blocked_review_dependents:
-                    unresolved_tasks.append(task)
-                continue
-            if empty_prereq_block is not None:
+                empty_prereq_block = blocked_by_empty_prereq_label(store, task, read_context=read_context)
+                if task.status not in {"failed", "completed", "unmerged", "dropped"} and empty_prereq_block is None:
+                    continue
+                if query.exclude_dropped_from_planning and _task_is_excluded_from_dropped_planning(
+                    task,
+                    merge_units_by_task_id=indexes.merge_units_by_task_id,
+                    historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
+                ):
+                    continue
+                merge_unit = merge_units_by_member.get(task.id)
+                matches = _matches_task_filters(
+                    task,
+                    query,
+                    tag_matcher=task_matches_tag_filters,
+                    include_tag_filters=False,
+                    merge_unit=merge_unit,
+                )
+                if task.task_type in IMPLEMENTATION_SOURCE_TASK_TYPES and task.status == "completed":
+                    followup_state = _source_followup_state(indexes, task, source_followup_cache)
+                    needs_followup = source_task_needs_implementation_followup(
+                        task,
+                        followup_state,
+                        non_dropped_implement_source_ids=indexes.non_dropped_impl_source_ids,
+                    )
+                    has_blocked_review_dependents = held_plan_has_blocked_awaiting_review_dependents(
+                        task,
+                        get_dependents=lambda task_id: indexes.depends_on_children.get(task_id, ()),
+                        get_dependency_readiness=lambda dependent: store.get_dependency_readiness(dependent),
+                    )
+                    if not needs_followup and not has_blocked_review_dependents:
+                        continue
+                    if matches or has_blocked_review_dependents:
+                        unresolved_tasks.append(task)
+                    continue
+                if empty_prereq_block is not None:
+                    if matches:
+                        unresolved_tasks.append(task)
+                    continue
+                if task.status == "failed":
+                    if _has_completed_same_type_descendant(indexes, task):
+                        continue
+                    if _has_merged_descendant(indexes, task, merge_units_by_member=merge_units_by_member):
+                        continue
+                    completed_recovery = get_completed_recovery_descendant(store, task, read_context=read_context)
+                    if completed_recovery is not None:
+                        recovery_completed_by_failed_id[task.id] = completed_recovery
+                        continue
+                    completed_sibling_recovery = get_completed_sibling_recovery(store, task, read_context=read_context)
+                    if completed_sibling_recovery is not None:
+                        recovery_completed_by_failed_id[task.id] = completed_sibling_recovery
+                        continue
+                    completed_same_slice_sibling = get_completed_same_slice_sibling_attempt(
+                        store,
+                        task,
+                        read_context=read_context,
+                    )
+                    if completed_same_slice_sibling is not None:
+                        recovery_completed_by_failed_id[task.id] = completed_same_slice_sibling
+                        continue
+                    keep_failed_leaf_visible = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+                        failed_task=task,
+                        owner_merge_unit=owner_merge_unit,
+                        leaf_merge_unit=merge_unit,
+                        git=git,
+                    )
+                    if task.id == owner.id and task.id in visible_failed_ids:
+                        keep_failed_leaf_visible = True
+                    if merged_owner_branch and not keep_failed_leaf_visible:
+                        continue
+                    if task.id not in visible_failed_ids and not (merged_owner_branch and keep_failed_leaf_visible):
+                        continue
+                    failed_leaves.append(task)
+                    if matches:
+                        matching_failed_leaves.append(task)
+                        unresolved_tasks.append(task)
+                    continue
+                if merged_owner_branch:
+                    continue
+                explicit_merge_state = _effective_merge_state(task, merge_unit=merge_unit)
+                if task.status in {"completed", "unmerged"} and explicit_merge_state == "unmerged":
+                    if matches:
+                        unresolved_tasks.append(task)
+                    continue
+                if is_lineage_complete(task, store=store):
+                    continue
                 if matches:
                     unresolved_tasks.append(task)
-                continue
-            if task.status == "failed":
-                if _has_completed_same_type_descendant(indexes, task):
+
+            for task in sorted(
+                skipped_same_branch_members,
+                key=lambda item: (_task_event_time(item), task_id_numeric_key(item.id)),
+            ):
+                if task.id is None:
                     continue
-                if _has_merged_descendant(indexes, task, merge_units_by_member=merge_units_by_member):
-                    continue
-                completed_recovery = get_completed_recovery_descendant(store, task, read_context=read_context)
-                if completed_recovery is not None:
-                    recovery_completed_by_failed_id[task.id] = completed_recovery
-                    continue
-                completed_sibling_recovery = get_completed_sibling_recovery(store, task, read_context=read_context)
-                if completed_sibling_recovery is not None:
-                    recovery_completed_by_failed_id[task.id] = completed_sibling_recovery
-                    continue
-                completed_same_slice_sibling = get_completed_same_slice_sibling_attempt(
-                    store,
+                merge_unit = indexes.merge_units_by_task_id.get(task.id)
+                if not _matches_task_filters(
                     task,
+                    query,
+                    tag_matcher=task_matches_tag_filters,
+                    include_tag_filters=False,
+                    merge_unit=merge_unit,
+                ):
+                    continue
+                explicit_merge_state = _effective_merge_state(task, merge_unit=merge_unit)
+                if task.status in {"completed", "unmerged"} and explicit_merge_state == "unmerged":
+                    orphaned_same_branch_tasks.append(task)
+
+            snapshot = LineageOwnerSnapshot(
+                owner_task=owner,
+                root_task=root,
+                members=tuple(owner_members),
+                merge_units_by_task_id=merge_units_by_member,
+                failed_leaves=tuple(failed_leaves),
+                recovery_completed_by_failed_id=recovery_completed_by_failed_id,
+            )
+            has_empty_prereq_blocked_pending = any(
+                blocked_by_empty_prereq_label(store, task, read_context=read_context) is not None for task in unresolved_tasks
+            )
+            if (
+                owner_merge_unit is not None
+                and merge_state_is_terminal_for_lifecycle(owner_merge_unit.state)
+                and not matching_failed_leaves
+                and not has_empty_prereq_blocked_pending
+            ):
+                continue
+            if target_branch and owner_merge_unit is not None and owner_merge_unit.target_branch != target_branch:
+                continue
+            unresolved_tasks = list(
+                filter_display_unresolved_tasks_for_incomplete(
+                    unresolved_tasks,
+                    merge_units_by_task_id=merge_units_by_member,
+                    exclude_dropped=query.exclude_dropped_from_planning,
+                )
+            )
+
+            if not unresolved_tasks and not matching_failed_leaves and not orphaned_same_branch_tasks:
+                continue
+            resolution = is_lineage_resolved(snapshot)
+            has_unimplemented_source = (
+                owner.id is not None
+                and owner.task_type in IMPLEMENTATION_SOURCE_TASK_TYPES
+                and owner.status == "completed"
+                and (
+                    source_task_needs_implementation_followup(
+                        owner,
+                        _source_followup_state(indexes, owner, source_followup_cache),
+                        non_dropped_implement_source_ids=indexes.non_dropped_impl_source_ids,
+                    )
+                    or held_plan_has_blocked_awaiting_review_dependents(
+                        owner,
+                        get_dependents=lambda task_id: indexes.depends_on_children.get(task_id, ()),
+                        get_dependency_readiness=lambda dependent: store.get_dependency_readiness(dependent),
+                    )
+                )
+            )
+            resolved_in_query = any(
+                reason == "recovery_chain_completed"
+                for reason in resolution.reasons
+            ) or (
+                "branch_merged" in resolution.reasons
+                and not failed_leaves
+            ) or (
+                "lineage_complete" in resolution.reasons
+                and not has_unimplemented_source
+                and not unresolved_tasks
+            )
+            if resolved_in_query:
+                continue
+
+            lifecycle_action_task = _select_representative_completed_task(
+                store,
+                snapshot,
+                unresolved_tasks,
+                include_dropped=not query.exclude_dropped_from_planning,
+            )
+            planning_task = lifecycle_action_task
+            recovery_action_task: DbTask | None = None
+            recovery_leaf_task: DbTask | None = None
+            max_recovery_attempts = query.max_recovery_attempts if query.max_recovery_attempts is not None else 1
+            failed_action_candidate: DbTask | None = None
+            failed_action_candidate_decision = None
+            recovery_merge_context = None
+            if reuse_recovery_merge_context:
+                from .recovery_engine import _MergeContext
+
+                if isinstance(read_context.merge_context, _MergeContext):
+                    recovery_merge_context = read_context.merge_context
+            for failed_task in sorted(
+                failed_leaves,
+                key=lambda task: (
+                    visible_failed_order.get(task.id or "", len(visible_failed_order)),
+                    _task_event_time(task),
+                    task_id_numeric_key(task.id),
+                ),
+            ):
+                decision = decide_failed_task_recovery(
+                    store,
+                    failed_task,
+                    max_recovery_attempts=max_recovery_attempts,
+                    merge_context=recovery_merge_context,
                     read_context=read_context,
                 )
-                if completed_same_slice_sibling is not None:
-                    recovery_completed_by_failed_id[task.id] = completed_same_slice_sibling
-                    continue
-                keep_failed_leaf_visible = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
-                    failed_task=task,
-                    owner_merge_unit=owner_merge_unit,
-                    leaf_merge_unit=merge_unit,
-                    git=git,
+                attention_action = failed_recovery_decision_to_attention_action(
+                    store,
+                    failed_task,
+                    decision,
+                    max_recovery_attempts=max_recovery_attempts,
+                    read_context=read_context,
                 )
-                if task.id == owner.id and task.id in visible_failed_ids:
-                    keep_failed_leaf_visible = True
-                if merged_owner_branch and not keep_failed_leaf_visible:
+                if decision.reason_code == "recovery_has_newer_unresolved_descendant":
                     continue
-                if task.id not in visible_failed_ids and not (merged_owner_branch and keep_failed_leaf_visible):
+                if failed_task.task_type == "improve" and lifecycle_action_task is not None:
                     continue
-                failed_leaves.append(task)
-                if matches:
-                    matching_failed_leaves.append(task)
-                    unresolved_tasks.append(task)
-                continue
-            if merged_owner_branch:
-                continue
-            explicit_merge_state = _effective_merge_state(task, merge_unit=merge_unit)
-            if task.status in {"completed", "unmerged"} and explicit_merge_state == "unmerged":
-                if matches:
-                    unresolved_tasks.append(task)
-                continue
-            if is_lineage_complete(task, store=store):
-                continue
-            if matches:
-                unresolved_tasks.append(task)
-
-        for task in sorted(
-            skipped_same_branch_members,
-            key=lambda item: (_task_event_time(item), task_id_numeric_key(item.id)),
-        ):
-            if task.id is None:
-                continue
-            merge_unit = indexes.merge_units_by_task_id.get(task.id)
-            if not _matches_task_filters(
-                task,
-                query,
-                tag_matcher=task_matches_tag_filters,
-                include_tag_filters=False,
-                merge_unit=merge_unit,
+                if decision.action != "skip" or attention_action is not None:
+                    failed_action_candidate = failed_task
+                    failed_action_candidate_decision = decision
+                    break
+            if failed_action_candidate is not None:
+                recovery_action_task = failed_action_candidate
+                recovery_leaf_task = failed_action_candidate
+            elif lifecycle_action_task is None and failed_leaves:
+                recovery_leaf_task = max(
+                    failed_leaves,
+                    key=lambda task: (_task_event_time(task), task_id_numeric_key(task.id)),
+                )
+                recovery_action_task = recovery_leaf_task
+            if planning_task is None:
+                planning_task = recovery_action_task
+            action: dict[str, Any] | None = None
+            if (
+                failed_action_candidate is not None
+                and failed_action_candidate_decision is not None
+                and failed_action_candidate.id is not None
+                and failed_action_candidate_decision.action in {"resume", "retry"}
             ):
-                continue
-            explicit_merge_state = _effective_merge_state(task, merge_unit=merge_unit)
-            if task.status in {"completed", "unmerged"} and explicit_merge_state == "unmerged":
-                orphaned_same_branch_tasks.append(task)
-
-        snapshot = LineageOwnerSnapshot(
-            owner_task=owner,
-            root_task=root,
-            members=tuple(owner_members),
-            merge_units_by_task_id=merge_units_by_member,
-            failed_leaves=tuple(failed_leaves),
-            recovery_completed_by_failed_id=recovery_completed_by_failed_id,
-        )
-        has_empty_prereq_blocked_pending = any(
-            blocked_by_empty_prereq_label(store, task, read_context=read_context) is not None for task in unresolved_tasks
-        )
-        if (
-            owner_merge_unit is not None
-            and merge_state_is_terminal_for_lifecycle(owner_merge_unit.state)
-            and not matching_failed_leaves
-            and not has_empty_prereq_blocked_pending
-        ):
-            continue
-        if target_branch and owner_merge_unit is not None and owner_merge_unit.target_branch != target_branch:
-            continue
-        unresolved_tasks = list(
-            filter_display_unresolved_tasks_for_incomplete(
-                unresolved_tasks,
-                merge_units_by_task_id=merge_units_by_member,
-                exclude_dropped=query.exclude_dropped_from_planning,
-            )
-        )
-
-        if not unresolved_tasks and not matching_failed_leaves and not orphaned_same_branch_tasks:
-            continue
-        resolution = is_lineage_resolved(snapshot)
-        has_unimplemented_source = (
-            owner.id is not None
-            and owner.task_type in IMPLEMENTATION_SOURCE_TASK_TYPES
-            and owner.status == "completed"
-            and (
-                source_task_needs_implementation_followup(
-                    owner,
-                    _source_followup_state(indexes, owner, source_followup_cache),
-                    non_dropped_implement_source_ids=indexes.non_dropped_impl_source_ids,
-                )
-                or held_plan_has_blocked_awaiting_review_dependents(
-                    owner,
-                    get_dependents=lambda task_id: indexes.depends_on_children.get(task_id, ()),
-                    get_dependency_readiness=lambda dependent: store.get_dependency_readiness(dependent),
-                )
-            )
-        )
-        resolved_in_query = any(
-            reason == "recovery_chain_completed"
-            for reason in resolution.reasons
-        ) or (
-            "branch_merged" in resolution.reasons
-            and not failed_leaves
-        ) or (
-            "lineage_complete" in resolution.reasons
-            and not has_unimplemented_source
-            and not unresolved_tasks
-        )
-        if resolved_in_query:
-            continue
-
-        lifecycle_action_task = _select_representative_completed_task(
-            store,
-            snapshot,
-            unresolved_tasks,
-            include_dropped=not query.exclude_dropped_from_planning,
-        )
-        planning_task = lifecycle_action_task
-        recovery_action_task: DbTask | None = None
-        recovery_leaf_task: DbTask | None = None
-        max_recovery_attempts = query.max_recovery_attempts if query.max_recovery_attempts is not None else 1
-        failed_action_candidate: DbTask | None = None
-        failed_action_candidate_decision = None
-        recovery_merge_context = None
-        if reuse_recovery_merge_context:
-            from .recovery_engine import _MergeContext
-
-            if isinstance(read_context.merge_context, _MergeContext):
-                recovery_merge_context = read_context.merge_context
-        for failed_task in sorted(
-            failed_leaves,
-            key=lambda task: (
-                visible_failed_order.get(task.id or "", len(visible_failed_order)),
-                _task_event_time(task),
-                task_id_numeric_key(task.id),
-            ),
-        ):
-            decision = decide_failed_task_recovery(
-                store,
-                failed_task,
-                max_recovery_attempts=max_recovery_attempts,
-                merge_context=recovery_merge_context,
-                read_context=read_context,
-            )
-            attention_action = failed_recovery_decision_to_attention_action(
-                store,
-                failed_task,
-                decision,
-                max_recovery_attempts=max_recovery_attempts,
-                read_context=read_context,
-            )
-            if decision.reason_code == "recovery_has_newer_unresolved_descendant":
-                continue
-            if failed_task.task_type == "improve" and lifecycle_action_task is not None:
-                continue
-            if decision.action != "skip" or attention_action is not None:
-                failed_action_candidate = failed_task
-                failed_action_candidate_decision = decision
-                break
-        if failed_action_candidate is not None:
-            recovery_action_task = failed_action_candidate
-            recovery_leaf_task = failed_action_candidate
-        elif lifecycle_action_task is None and failed_leaves:
-            recovery_leaf_task = max(
-                failed_leaves,
-                key=lambda task: (_task_event_time(task), task_id_numeric_key(task.id)),
-            )
-            recovery_action_task = recovery_leaf_task
-        if planning_task is None:
-            planning_task = recovery_action_task
-        action: dict[str, Any] | None = None
-        if (
-            failed_action_candidate is not None
-            and failed_action_candidate_decision is not None
-            and failed_action_candidate.id is not None
-            and failed_action_candidate_decision.action in {"resume", "retry"}
-        ):
-            recovery_action = {
-                "type": failed_action_candidate_decision.action,
-                "description": failed_action_candidate_decision.reason_text,
-                "recovery_task_id": failed_action_candidate_decision.recovery_task_id,
-            }
-            candidate = build_watch_progress_candidate(
-                store,
-                subject_task=failed_action_candidate,
-                action=recovery_action,
-                action_task=failed_action_candidate,
-                failed_task=failed_action_candidate,
-            )
-            action = get_active_watch_no_progress_attention(store, candidate=candidate)
-        if planning_task is None:
-            blocked_pending = next(
-                (task for task in unresolved_tasks if blocked_by_empty_prereq_label(store, task, read_context=read_context) is not None),
-                None,
-            )
-            if blocked_pending is not None:
-                action = {
-                    "type": "awaiting_human",
-                    "description": blocked_by_empty_prereq_label(store, blocked_pending, read_context=read_context),
-                    "needs_attention_reason": "awaiting-human-review",
-                    "subject_task_id": blocked_pending.id,
+                recovery_action = {
+                    "type": failed_action_candidate_decision.action,
+                    "description": failed_action_candidate_decision.reason_text,
+                    "recovery_task_id": failed_action_candidate_decision.recovery_task_id,
                 }
-        if planning_task is None and _requires_impl_branch_manual_resolution(
-            owner,
-            unresolved_tasks,
-            orphaned_same_branch_tasks,
-            include_dropped=not query.exclude_dropped_from_planning,
-        ):
-            action = {
-                "type": "needs_discussion",
-                "description": "SKIP: no descendant on the impl branch; manual resolution required",
-                "needs_attention_reason": "no-descendant-on-the-impl-branch",
-                "subject_task_id": owner.id,
-            }
-        if planning_task is None and action is None:
-            continue
-
-        displayed_unresolved_tasks = tuple(unresolved_tasks)
-        if action is not None and action.get("needs_attention_reason") == "no-descendant-on-the-impl-branch":
-            displayed_unresolved_tasks = tuple([*unresolved_tasks, *orphaned_same_branch_tasks])
-
-        if action is None and config is not None and git is not None and target_branch:
-            assert planning_task is not None
-            action = determine_next_action(
-                config,
-                store,
-                git,
-                planning_task,
-                target_branch,
-                impl_based_on_ids=indexes.non_dropped_impl_source_ids,
-                max_resume_attempts=query.max_recovery_attempts,
-                persist_post_merge_rebase_state=persist_post_merge_rebase_state,
-                persist_review_clearance=persist_review_clearance,
-                read_context=read_context,
-            )
-            if lifecycle_action_task is not None and lifecycle_action_task.id is not None:
                 candidate = build_watch_progress_candidate(
                     store,
-                    subject_task=owner,
-                    action=action,
-                    action_task=lifecycle_action_task,
-                    failed_task=None,
+                    subject_task=failed_action_candidate,
+                    action=recovery_action,
+                    action_task=failed_action_candidate,
+                    failed_task=failed_action_candidate,
                 )
-                parked_attention = get_active_watch_no_progress_attention(store, candidate=candidate)
-                if parked_attention is not None:
-                    action = parked_attention
-        lineage_status = _classify_lineage_status(action) if action is not None else "actionable"
-        if not query.include_skipped and lineage_status == "skipped":
-            continue
-        if not _owner_matches_tag_filters(owner, query, tag_matcher=task_matches_tag_filters):
-            continue
+                action = get_active_watch_no_progress_attention(store, candidate=candidate)
+            if planning_task is None:
+                blocked_pending = next(
+                    (task for task in unresolved_tasks if blocked_by_empty_prereq_label(store, task, read_context=read_context) is not None),
+                    None,
+                )
+                if blocked_pending is not None:
+                    action = {
+                        "type": "awaiting_human",
+                        "description": blocked_by_empty_prereq_label(store, blocked_pending, read_context=read_context),
+                        "needs_attention_reason": "awaiting-human-review",
+                        "subject_task_id": blocked_pending.id,
+                    }
+            if planning_task is None and _requires_impl_branch_manual_resolution(
+                owner,
+                unresolved_tasks,
+                orphaned_same_branch_tasks,
+                include_dropped=not query.exclude_dropped_from_planning,
+            ):
+                action = {
+                    "type": "needs_discussion",
+                    "description": "SKIP: no descendant on the impl branch; manual resolution required",
+                    "needs_attention_reason": "no-descendant-on-the-impl-branch",
+                    "subject_task_id": owner.id,
+                }
+            if planning_task is None and action is None:
+                continue
 
-        tree, rendered_members = _build_owner_tree(
-            root_task=root,
-            owner_task=owner,
-            unresolved_tasks=tuple(unresolved_tasks),
-            based_on_children=indexes.based_on_children,
-            depends_on_children=indexes.depends_on_children,
-            drop_excluded_task_ids=drop_excluded_task_ids,
-        )
-        summaries = tuple(
-            UnresolvedLeafSummary(
-                task_id=task.id or "unknown",
-                status=task.status,
-                task_type=task.task_type,
-                reason=task.failure_reason or task.completion_reason,
-            )
-            for task in displayed_unresolved_tasks
-            if task.id is not None
-        )
-        rows.append(
-            LineageOwnerRow(
+            displayed_unresolved_tasks = tuple(unresolved_tasks)
+            if action is not None and action.get("needs_attention_reason") == "no-descendant-on-the-impl-branch":
+                displayed_unresolved_tasks = tuple([*unresolved_tasks, *orphaned_same_branch_tasks])
+
+            if action is None and config is not None and git is not None and target_branch:
+                assert planning_task is not None
+                action = determine_next_action(
+                    config,
+                    store,
+                    git,
+                    planning_task,
+                    target_branch,
+                    impl_based_on_ids=indexes.non_dropped_impl_source_ids,
+                    max_resume_attempts=query.max_recovery_attempts,
+                    persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+                    persist_review_clearance=persist_review_clearance,
+                    read_context=read_context,
+                )
+                if lifecycle_action_task is not None and lifecycle_action_task.id is not None:
+                    candidate = build_watch_progress_candidate(
+                        store,
+                        subject_task=owner,
+                        action=action,
+                        action_task=lifecycle_action_task,
+                        failed_task=None,
+                    )
+                    parked_attention = get_active_watch_no_progress_attention(store, candidate=candidate)
+                    if parked_attention is not None:
+                        action = parked_attention
+            lineage_status = _classify_lineage_status(action) if action is not None else "actionable"
+            if not query.include_skipped and lineage_status == "skipped":
+                continue
+            if not _owner_matches_tag_filters(owner, query, tag_matcher=task_matches_tag_filters):
+                continue
+
+            tree, rendered_members = _build_owner_tree(
+                root_task=root,
                 owner_task=owner,
-                members=rendered_members,
-                tree=tree,
-                lineage_status=lineage_status,
-                next_action=action,
-                next_action_reason=str(action.get("description", "")) if action is not None else "",
-                unresolved_tasks=displayed_unresolved_tasks,
-                unresolved_leaf_summary=summaries,
-                lifecycle_action_task=lifecycle_action_task,
-                recovery_action_task=recovery_action_task,
-                recovery_leaf_task=recovery_leaf_task,
+                unresolved_tasks=tuple(unresolved_tasks),
+                based_on_children=indexes.based_on_children,
+                depends_on_children=indexes.depends_on_children,
+                drop_excluded_task_ids=drop_excluded_task_ids,
             )
-        )
-
-    rows.sort(
-        key=lambda row: (
-            max((_task_event_time(task) for task in row.unresolved_tasks), default=_task_event_time(row.owner_task)),
-            task_id_numeric_key(row.owner_task.id),
-        ),
-        reverse=True,
-    )
-    if git is not None and config is not None and _main_integration_alert_matches_query(query):
-        main_alert = current_main_integration_verify_alert(store, git, config)
-        if main_alert is not None and main_alert.task.id is not None:
-            action = {
-                "type": "needs_discussion",
-                "description": f"SKIP: {main_alert.alert_message or 'main verify is red; merges halted'}",
-                "needs_attention_reason": MAIN_INTEGRATION_VERIFY_REASON,
-                "subject_task_id": main_alert.task.id,
-            }
-            rows.insert(
-                0,
+            summaries = tuple(
+                UnresolvedLeafSummary(
+                    task_id=task.id or "unknown",
+                    status=task.status,
+                    task_type=task.task_type,
+                    reason=task.failure_reason or task.completion_reason,
+                )
+                for task in displayed_unresolved_tasks
+                if task.id is not None
+            )
+            rows.append(
                 LineageOwnerRow(
-                    owner_task=main_alert.task,
-                    members=(main_alert.task,),
-                    tree=None,
-                    lineage_status="needs_attention",
+                    owner_task=owner,
+                    members=rendered_members,
+                    tree=tree,
+                    lineage_status=lineage_status,
                     next_action=action,
-                    next_action_reason=str(action["description"]),
-                    unresolved_tasks=(main_alert.task,),
-                    unresolved_leaf_summary=(
-                        UnresolvedLeafSummary(
-                            task_id=main_alert.task.id,
-                            status=main_alert.task.status,
-                            task_type=main_alert.task.task_type,
-                            reason=main_alert.failure or main_alert.verify_exit_status,
-                        ),
-                    ),
-                    lifecycle_action_task=None,
-                    recovery_action_task=None,
-                    recovery_leaf_task=None,
-                ),
+                    next_action_reason=str(action.get("description", "")) if action is not None else "",
+                    unresolved_tasks=displayed_unresolved_tasks,
+                    unresolved_leaf_summary=summaries,
+                    lifecycle_action_task=lifecycle_action_task,
+                    recovery_action_task=recovery_action_task,
+                    recovery_leaf_task=recovery_leaf_task,
+                )
             )
-    if query.limit is not None:
-        rows = rows[: query.limit]
-    if read_context.allow_reconcile_mutation:
-        apply_pending_recovery_reconciliations(store, read_context=read_context)
-    return (tuple(rows), read_context)
+
+        rows.sort(
+            key=lambda row: (
+                max((_task_event_time(task) for task in row.unresolved_tasks), default=_task_event_time(row.owner_task)),
+                task_id_numeric_key(row.owner_task.id),
+            ),
+            reverse=True,
+        )
+        if git is not None and config is not None and _main_integration_alert_matches_query(query):
+            main_alert = current_main_integration_verify_alert(store, git, config)
+            if main_alert is not None and main_alert.task.id is not None:
+                action = {
+                    "type": "needs_discussion",
+                    "description": f"SKIP: {main_alert.alert_message or 'main verify is red; merges halted'}",
+                    "needs_attention_reason": MAIN_INTEGRATION_VERIFY_REASON,
+                    "subject_task_id": main_alert.task.id,
+                }
+                rows.insert(
+                    0,
+                    LineageOwnerRow(
+                        owner_task=main_alert.task,
+                        members=(main_alert.task,),
+                        tree=None,
+                        lineage_status="needs_attention",
+                        next_action=action,
+                        next_action_reason=str(action["description"]),
+                        unresolved_tasks=(main_alert.task,),
+                        unresolved_leaf_summary=(
+                            UnresolvedLeafSummary(
+                                task_id=main_alert.task.id,
+                                status=main_alert.task.status,
+                                task_type=main_alert.task.task_type,
+                                reason=main_alert.failure or main_alert.verify_exit_status,
+                            ),
+                        ),
+                        lifecycle_action_task=None,
+                        recovery_action_task=None,
+                        recovery_leaf_task=None,
+                    ),
+                )
+        if query.limit is not None:
+            rows = rows[: query.limit]
+        if read_context.allow_reconcile_mutation:
+            apply_pending_recovery_reconciliations(store, read_context=read_context)
+        return (tuple(rows), read_context)
 
 
 __all__ = [
