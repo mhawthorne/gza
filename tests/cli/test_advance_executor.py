@@ -4294,6 +4294,90 @@ def test_reconcile_branch_divergence_completes_failed_branch_unpushable_task(tmp
     assert refreshed.pr_number is None
 
 
+def test_reconcile_branch_divergence_skips_pr_publication_when_open_pr_known(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement", create_pr=True)
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "BRANCH_UNPUSHABLE"
+    task.branch = "feature/reconcile-open-pr"
+    task.has_commits = True
+    task.output_content = "summary"
+    task.diff_files_changed = 2
+    task.diff_lines_added = 5
+    task.diff_lines_removed = 1
+    task.pr_state = "open"
+    task.pr_number = 17
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+
+    config = Config.load(tmp_path)
+    git = SimpleNamespace(
+        default_branch=lambda: "main",
+        count_commits_ahead=lambda *_args: 1,
+        rev_parse_if_exists=lambda ref: {
+            "feature/reconcile-open-pr": "head123",
+            "main": "base456",
+        }.get(ref),
+    )
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        reconcile_diverged_branch=lambda _task: BranchDivergenceReconcileResult(
+            status="reconciled",
+            message="Reconciled 'feature/reconcile-open-pr' with --force-with-lease",
+        ),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.runner.ensure_task_pr", side_effect=AssertionError("ensure_task_pr should not run")) as ensure_pr,
+        patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        patch("gza.runner.task_footer"),
+    ):
+        result = execute_advance_action(
+            task=task,
+            action={
+                "type": "reconcile_branch_divergence",
+                "decision": FailedRecoveryDecision(
+                    task_id=task.id,
+                    action="reconcile",
+                    reason_code="BRANCH_UNPUSHABLE",
+                    reason_text="branch publication failed; reconcile local/origin refs",
+                    launch_mode="none",
+                    attempt_index=1,
+                    attempt_limit=1,
+                ),
+            },
+            context=context,
+        )
+
+    assert result.status == "success"
+    ensure_pr.assert_not_called()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "completed"
+    assert refreshed.failure_reason is None
+    assert refreshed.pr_state == "open"
+    assert refreshed.pr_number == 17
+
+
 def test_reconcile_branch_divergence_completes_with_nonfatal_pr_creation_note(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
