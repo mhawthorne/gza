@@ -5073,6 +5073,45 @@ def test_branch_unpushable_failed_recovery_lowers_to_reconcile_action(tmp_path: 
     assert classify_advance_action(action) == "actionable"
 
 
+def test_evaluate_rules_routes_failed_branch_unpushable_stale_wip_divergence_to_reconcile(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    failed = store.add("Recover stale remote WIP savepoint", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "BRANCH_UNPUSHABLE"
+    failed.branch = "feat/stale-wip-reconcile"
+    failed.has_commits = True
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            existing_branches={"main", "feat/stale-wip-reconcile"},
+            existing_refs={"origin/feat/stale-wip-reconcile"},
+            merge_source_result=(
+                None,
+                "Local branch 'feat/stale-wip-reconcile' and remote-tracking ref "
+                "'origin/feat/stale-wip-reconcile' diverged. Push, fetch, or reconcile "
+                "them before advancing or merging.",
+            ),
+            ahead_count=1,
+            behind_count=1,
+        ),
+        failed,
+        "main",
+    )
+
+    assert action["type"] == "reconcile_branch_divergence"
+    assert action["reason_code"] == "BRANCH_UNPUSHABLE"
+    assert action["description"] == "Reconcile branch publication (BRANCH_UNPUSHABLE)"
+
+
 def test_legacy_pr_required_failed_recovery_normalizes_before_reconcile_action(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
 

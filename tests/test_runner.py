@@ -15541,6 +15541,78 @@ class TestExtractedRunInnerHelpers:
         log_text = ops_log_path_for(log_file).read_text()
         assert f'Outcome: failed ({BRANCH_UNPUSHABLE_FAILURE_REASON})' in log_text
 
+    def test_complete_code_task_stale_wip_push_rejection_marks_branch_unpushable(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ):
+        """A stale remote WIP savepoint that rejects pre-PR publish should persist BRANCH_UNPUSHABLE."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement stale WIP regression", task_type="implement", create_review=True)
+        task.slug = "20260706-stale-wip-branch-unpushable"
+        store.mark_in_progress(task)
+
+        config = self._make_config(tmp_path)
+        log_dir = tmp_path / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{task.slug}.log"
+        log_file.write_text("")
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/foo.py")}
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/foo.py\n"
+        worktree_git.count_commits_ahead.return_value = 1
+        worktree_git.needs_push.return_value = True
+        worktree_git.push_branch.side_effect = GitError(
+            "push rejected: origin/feature/stale-wip still points to "
+            "'WIP: gza task interrupted'"
+        )
+
+        summary_dir = tmp_path / ".gza" / "summaries"
+        summary_path = summary_dir / f"{task.slug}.md"
+        worktree_summary_path = tmp_path / "worktree" / ".gza" / "summaries" / f"{task.slug}.md"
+        worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+        worktree_summary_path.write_text("summary")
+
+        ensure_mock_result = Mock(ok=False, status="lookup_failed", error="gh auth failed", pr_url=None)
+
+        with (
+            patch("gza.runner._squash_wip_commits"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch("gza.runner._create_and_run_review_task") as run_review,
+            patch("gza.runner.ensure_task_pr", return_value=ensure_mock_result),
+            patch("gza.runner.task_footer") as footer,
+        ):
+            rc = _complete_code_task(
+                task,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                "feature/stale-wip",
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+                0,
+                pre_run_status=set(),
+                worktree_summary_path=worktree_summary_path,
+                summary_path=summary_path,
+                summary_dir=summary_dir,
+                create_pr=True,
+            )
+
+        assert rc == 1
+        footer.assert_not_called()
+        run_review.assert_not_called()
+        worktree_git.push_branch.assert_called_once_with("feature/stale-wip")
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == BRANCH_UNPUSHABLE_FAILURE_REASON
+        output = capsys.readouterr().out
+        assert "WIP: gza task interrupted" in output
+        assert "failed (BRANCH_UNPUSHABLE)" in ops_log_path_for(log_file).read_text()
+
     def test_complete_failed_code_task_after_pr_publication_skips_pr_work_when_create_pr_disabled(
         self,
         tmp_path: Path,

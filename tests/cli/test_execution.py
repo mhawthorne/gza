@@ -90,6 +90,8 @@ def _background_work_status_error(tmp_path: Path) -> tuple[list[str], str]:
     )
 
 
+
+
 def test_format_iterate_terminal_merge_state_message_distinguishes_redundant(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -495,6 +497,79 @@ def test_run_with_recovery_reconcile_push_failure_does_not_spawn_retry(tmp_path:
     assert run_calls == [task.id]
     assert final_task.status == "failed"
     assert final_task.failure_reason == "BRANCH_UNPUSHABLE"
+
+
+def test_run_with_recovery_stale_wip_reconcile_completes_without_manual_intervention(tmp_path: Path) -> None:
+    from gza.cli._common import run_with_recovery
+
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Recover stale WIP divergence", task_type="implement", create_pr=True)
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "BRANCH_UNPUSHABLE"
+    task.branch = "feature/run-with-recovery-stale-wip"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+
+    terminal_skip_calls: list[str] = []
+
+    def _run_task(current_task, _resume):
+        refreshed = store.get(current_task.id)
+        assert refreshed is not None
+        return 1
+
+    def _complete_after_reconcile(*, config, store, git, task):
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        refreshed.status = "completed"
+        refreshed.failure_reason = None
+        store.update(refreshed)
+        return 0
+
+    decision = _recovery_engine_module.FailedRecoveryDecision(
+        task_id=task.id,
+        action="reconcile",
+        reason_code="BRANCH_UNPUSHABLE",
+        reason_text="branch publication failed; reconcile local/origin refs",
+        launch_mode="none",
+        attempt_index=1,
+        attempt_limit=2,
+    )
+
+    with (
+        patch("gza.cli._common.decide_failed_task_recovery", return_value=decision),
+        patch("gza.cli.git_ops._reconcile_diverged_branch_with_origin", return_value=SimpleNamespace(
+            status="reconciled",
+            message=(
+                "Reconciled 'feature/run-with-recovery-stale-wip' with force-with-lease "
+                "over stale 'WIP: gza task interrupted' savepoint"
+            ),
+        )),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.git.Git.branch_exists", return_value=True),
+        patch("gza.git.Git.ref_exists", return_value=False),
+        patch(
+            "gza.cli.git_ops.complete_branch_unpushable_after_reconcile",
+            side_effect=_complete_after_reconcile,
+        ) as complete_after_reconcile,
+    ):
+        final_task, rc = run_with_recovery(
+            config,
+            store,
+            task,
+            run_task=_run_task,
+            max_resume_attempts=2,
+            on_terminal_skip=lambda failed_task, _decision, _rc: terminal_skip_calls.append(failed_task.id or ""),
+        )
+
+    assert rc == 0
+    assert terminal_skip_calls == []
+    complete_after_reconcile.assert_called_once()
+    assert final_task.status == "completed"
+    assert final_task.failure_reason is None
 
 
 class TestAddCommand:

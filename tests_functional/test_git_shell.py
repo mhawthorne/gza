@@ -3,23 +3,156 @@
 import argparse
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
 from gza import advance_engine as advance_engine_module
 from gza.advance_engine import evaluate_advance_rules, resolve_advance_context
+from gza.cli._common import run_with_recovery
+from gza.cli.advance_engine import determine_next_action
+from gza.cli.advance_executor import (
+    AdvanceActionExecutionContext,
+    execute_advance_action,
+    resolve_execution_needs_attention,
+)
 from gza.cli.git_ops import _merge_single_task, _run_task_backed_rebase
 from gza.config import Config
-from gza.db import SCHEMA_VERSION, SqliteTaskStore, check_migration_status
+from gza.db import SCHEMA_VERSION, SqliteTaskStore, TaskStats, check_migration_status
 from gza.git import Git, GitError, active_worktree_path_for_branch, cleanup_worktree_for_branch
+from gza.github import PullRequest
+from gza.log_paths import ops_log_path_for
+from gza.recovery_engine import FailedRecoveryDecision
 from gza.review_verdict import ParsedReviewReport
-from gza.runner import WIP_DIR, _restore_wip_changes, _save_wip_changes, _squash_wip_commits
+from gza.runner import WIP_DIR, _complete_code_task, _restore_wip_changes, _save_wip_changes, _squash_wip_commits
 from tests.cli.conftest import make_store, setup_config
 from tests.test_advance_engine import _make_store
 from tests.test_db import _make_v24_db
 from tests_functional.git_helpers import init_repo_with_remote_tracking_only_feature
 from tests_functional.helpers.cli import run_gza_subprocess
+
+
+class _FakeAvailableGitHub:
+    def __init__(self, create_calls: list[tuple[str, str, str, str, bool]]) -> None:
+        self._create_calls = create_calls
+
+    @classmethod
+    def cached_pr_support(cls) -> bool | None:
+        return None
+
+    def is_available(self) -> bool:
+        return True
+
+    def get_pr_details(self, _number: int):
+        return None
+
+    def discover_pr_by_branch(self, _branch: str):
+        return None
+
+    def create_pr(self, head: str, base: str, title: str, body: str, draft: bool = False) -> PullRequest:
+        self._create_calls.append((head, base, title, body, draft))
+        return PullRequest(url=f"https://example.test/{head}", number=len(self._create_calls))
+
+
+def _init_repo_with_origin(tmp_path: Path) -> tuple[Config, SqliteTaskStore, Git, Path]:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    git = Git(tmp_path)
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    (tmp_path / "README.md").write_text("initial\n", encoding="utf-8")
+    git._run("add", "README.md")
+    git._run("commit", "-m", "Initial commit")
+
+    remote_dir = tmp_path / "origin.git"
+    git._run("init", "--bare", str(remote_dir))
+    git._run("remote", "add", "origin", str(remote_dir))
+    git._run("push", "-u", "origin", "main")
+    return config, store, git, remote_dir
+
+
+def _prepare_stale_wip_branch_publication_failure(
+    tmp_path: Path,
+    *,
+    branch: str,
+    prompt: str,
+    slug: str,
+) -> tuple[Config, SqliteTaskStore, Git, object, Path, str, list[tuple[str, str, str, str, bool]]]:
+    config, store, git, remote_dir = _init_repo_with_origin(tmp_path)
+    git._run("checkout", "-b", branch)
+    git._run("push", "-u", "origin", branch)
+
+    (tmp_path / "feature.txt").write_text("local final\n", encoding="utf-8")
+    git._run("add", "feature.txt")
+    git._run("commit", "-m", "Feature final")
+    local_tip = git.rev_parse("HEAD")
+
+    remote_checkout = tmp_path / f"{branch.replace('/', '-')}-remote"
+    git._run("clone", str(remote_dir), str(remote_checkout))
+    remote_git = Git(remote_checkout)
+    remote_git._run("config", "user.name", "Remote User")
+    remote_git._run("config", "user.email", "remote@example.com")
+    remote_git._run("checkout", branch)
+    (remote_checkout / "wip.txt").write_text("stale savepoint\n", encoding="utf-8")
+    remote_git._run("add", "wip.txt")
+    remote_git._run("commit", "-m", "WIP: gza task interrupted")
+    remote_git._run("push", "origin", branch)
+
+    git.fetch("origin")
+    assert git.count_commits_ahead(branch, f"origin/{branch}") == 1
+    assert git.count_commits_ahead(f"origin/{branch}", branch) == 1
+
+    task = store.add(prompt, task_type="implement", create_pr=True)
+    assert task.id is not None
+    task.slug = slug
+    store.mark_in_progress(task)
+    task = store.get(task.id)
+    assert task is not None
+    task.slug = slug
+    store.update(task)
+
+    log_file = tmp_path / "logs" / f"{slug}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("", encoding="utf-8")
+    summary_dir = tmp_path / ".gza" / "summaries"
+    summary_path = summary_dir / f"{slug}.md"
+    worktree_summary_path = tmp_path / ".gza" / "worktree-summaries" / f"{slug}.md"
+    worktree_summary_path.parent.mkdir(parents=True, exist_ok=True)
+    worktree_summary_path.write_text("summary\n", encoding="utf-8")
+
+    create_pr_calls: list[tuple[str, str, str, str, bool]] = []
+    with (
+        patch("gza.pr_ops.GitHub", side_effect=lambda: _FakeAvailableGitHub(create_pr_calls)),
+        patch("gza.runner.build_task_pr_content", return_value=("Test PR", "PR body")),
+        patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+    ):
+        rc = _complete_code_task(
+            task,
+            config,
+            store,
+            git,
+            log_file,
+            branch,
+            TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+            0,
+            pre_run_status=set(),
+            worktree_summary_path=worktree_summary_path,
+            summary_path=summary_path,
+            summary_dir=summary_dir,
+            skip_commit=True,
+            create_pr=True,
+        )
+
+    assert rc == 1
+    failed_task = store.get(task.id)
+    assert failed_task is not None
+    assert failed_task.status == "failed"
+    assert failed_task.failure_reason == "BRANCH_UNPUSHABLE"
+    assert failed_task.output_content == "summary\n"
+    assert create_pr_calls == []
+    return config, store, git, failed_task, log_file, local_tip, create_pr_calls
 
 
 def test_v24_to_v27_chains_via_gza_migrate(tmp_path: Path) -> None:
@@ -182,6 +315,239 @@ def test_run_task_backed_rebase_clean_rebase_updates_origin_and_clears_merge_sou
     git.fetch("origin")
     assert git.rev_parse(f"origin/{branch}") == rebased_sha
     assert git.resolve_fresh_merge_source(branch).warning is None
+
+
+def test_real_git_stale_wip_publication_reconcile_retries_pr_and_reaches_merge_gate(
+    tmp_path: Path,
+) -> None:
+    from gza.cli.git_ops import _reconcile_diverged_branch_with_origin
+
+    (
+        config,
+        store,
+        git,
+        failed_task,
+        log_file,
+        local_tip,
+        create_pr_calls,
+    ) = _prepare_stale_wip_branch_publication_failure(
+        tmp_path,
+        branch="feature/stale-wip-e2e",
+        prompt="Implement stale WIP reconcile",
+        slug="20260706-stale-wip-e2e",
+    )
+
+    git._run("checkout", "main")
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        reconcile_diverged_branch=lambda current_task: _reconcile_diverged_branch_with_origin(
+            config,
+            git,
+            current_task,
+            target_branch="main",
+        ),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.pr_ops.GitHub", side_effect=lambda: _FakeAvailableGitHub(create_pr_calls)),
+        patch("gza.runner.build_task_pr_content", return_value=("Test PR", "PR body")),
+        patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+    ):
+        result = execute_advance_action(
+            task=failed_task,
+            action={
+                "type": "reconcile_branch_divergence",
+                "decision": FailedRecoveryDecision(
+                    task_id=failed_task.id,
+                    action="reconcile",
+                    reason_code="BRANCH_UNPUSHABLE",
+                    reason_text="branch publication failed; reconcile local/origin refs",
+                    launch_mode="none",
+                    attempt_index=1,
+                    attempt_limit=2,
+                ),
+            },
+            context=context,
+        )
+
+    assert result.status == "success"
+    assert "force-with-lease" in result.message
+    refreshed = store.get(failed_task.id)
+    assert refreshed is not None
+    assert refreshed.status == "completed"
+    assert refreshed.failure_reason is None
+    assert create_pr_calls == [("feature/stale-wip-e2e", "main", "Test PR", "PR body", False)]
+    assert git.rev_parse("feature/stale-wip-e2e") == local_tip
+    git.fetch("origin")
+    assert git.rev_parse("origin/feature/stale-wip-e2e") == local_tip
+
+    config.require_review_before_merge = False
+    config.advance_create_reviews = False
+    next_action = determine_next_action(
+        config,
+        store,
+        git,
+        refreshed,
+        "main",
+        selected_for_merge=True,
+    )
+    assert next_action["type"] == "merge"
+    assert "failed (BRANCH_UNPUSHABLE)" in ops_log_path_for(log_file).read_text()
+
+
+def test_real_git_run_with_recovery_stale_wip_reconcile_completes_without_manual_intervention(
+    tmp_path: Path,
+) -> None:
+    (
+        config,
+        store,
+        git,
+        failed_task,
+        _log_file,
+        local_tip,
+        create_pr_calls,
+    ) = _prepare_stale_wip_branch_publication_failure(
+        tmp_path,
+        branch="feature/run-with-recovery-stale-wip",
+        prompt="Recover stale WIP divergence",
+        slug="20260706-run-with-recovery-stale-wip",
+    )
+
+    git._run("checkout", "main")
+    terminal_skip_calls: list[str] = []
+    run_calls: list[str] = []
+
+    def _run_task(current_task, _resume):
+        run_calls.append(current_task.id or "")
+        return 1
+
+    with (
+        patch("gza.pr_ops.GitHub", side_effect=lambda: _FakeAvailableGitHub(create_pr_calls)),
+        patch("gza.runner.build_task_pr_content", return_value=("Test PR", "PR body")),
+        patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+    ):
+        final_task, rc = run_with_recovery(
+            config,
+            store,
+            failed_task,
+            run_task=_run_task,
+            max_resume_attempts=2,
+            on_terminal_skip=lambda failed, _decision, _rc: terminal_skip_calls.append(failed.id or ""),
+        )
+
+    assert rc == 0
+    assert run_calls == [failed_task.id]
+    assert terminal_skip_calls == []
+    assert final_task.status == "completed"
+    assert final_task.failure_reason is None
+    assert create_pr_calls == [("feature/run-with-recovery-stale-wip", "main", "Test PR", "PR body", False)]
+    assert git.rev_parse("feature/run-with-recovery-stale-wip") == local_tip
+    git.fetch("origin")
+    assert git.rev_parse("origin/feature/run-with-recovery-stale-wip") == local_tip
+
+
+def test_real_git_non_benign_remote_divergence_parks_manual_resolution_without_pr_required(
+    tmp_path: Path,
+) -> None:
+    from gza.cli.git_ops import _reconcile_diverged_branch_with_origin
+
+    config, store, git, remote_dir = _init_repo_with_origin(tmp_path)
+    branch = "feature/non-benign-conflict"
+
+    (tmp_path / "conflict.txt").write_text("base\n", encoding="utf-8")
+    git._run("add", "conflict.txt")
+    git._run("commit", "-m", "Add conflict base")
+    git._run("push", "origin", "main")
+
+    git._run("checkout", "-b", branch)
+    git._run("push", "-u", "origin", branch)
+    (tmp_path / "conflict.txt").write_text("local branch change\n", encoding="utf-8")
+    git._run("add", "conflict.txt")
+    git._run("commit", "-m", "Local branch change")
+
+    remote_checkout = tmp_path / "remote-non-benign"
+    git._run("clone", str(remote_dir), str(remote_checkout))
+    remote_git = Git(remote_checkout)
+    remote_git._run("config", "user.name", "Remote User")
+    remote_git._run("config", "user.email", "remote@example.com")
+    remote_git._run("checkout", branch)
+    (remote_checkout / "conflict.txt").write_text("remote branch change\n", encoding="utf-8")
+    remote_git._run("add", "conflict.txt")
+    remote_git._run("commit", "-m", "Remote branch change")
+    remote_git._run("push", "origin", branch)
+
+    git._run("checkout", "main")
+    (tmp_path / "conflict.txt").write_text("main branch change\n", encoding="utf-8")
+    git._run("add", "conflict.txt")
+    git._run("commit", "-m", "Main branch change")
+    git.fetch("origin")
+    assert git.count_commits_ahead(branch, f"origin/{branch}") == 1
+    assert git.count_commits_ahead(f"origin/{branch}", branch) == 1
+
+    task = store.add("Recover genuine remote conflict", task_type="implement")
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "BRANCH_UNPUSHABLE"
+    task.branch = branch
+    task.has_commits = True
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        create_targeted_rebase_task=lambda _task, _target: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        reconcile_diverged_branch=lambda current_task: _reconcile_diverged_branch_with_origin(
+            config,
+            git,
+            current_task,
+            target_branch="main",
+        ),
+        config=config,
+        git=git,
+    )
+
+    result = execute_advance_action(
+        task=task,
+        action={"type": "reconcile_branch_divergence"},
+        context=context,
+    )
+
+    assert result.status == "skip"
+    assert result.attention_reason == "reconcile-needs-manual-resolution"
+    assert "PR_REQUIRED" not in result.message
+    assert "hit conflicts" in result.message
+    attention = resolve_execution_needs_attention(task, result)
+    assert attention is not None
+    assert attention.action["needs_attention_reason"] == "reconcile-needs-manual-resolution"
 
 
 def test_squash_merge_without_remote_tracking_ref_stays_local_only(tmp_path: Path) -> None:

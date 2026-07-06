@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -62,6 +62,7 @@ from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recov
 from gza.review_tasks import OffTopicVerifyPersistenceError
 from gza.review_verdict import ReviewFinding
 from gza.runner import CROSS_PROJECT_TAG, _make_review_verify_result
+from gza.git import Git, GitError, ResolvedMergeSourceRef
 
 from .conftest import make_store, setup_config
 
@@ -4378,6 +4379,125 @@ def test_reconcile_branch_divergence_skips_pr_publication_when_open_pr_known(tmp
     assert refreshed.pr_number == 17
 
 
+def test_reconcile_branch_divergence_stale_wip_savepoint_becomes_pushable_and_completes(
+    tmp_path: Path,
+) -> None:
+    from gza.cli.git_ops import _reconcile_diverged_branch_with_origin
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Implement stale WIP reconcile", task_type="implement", create_pr=True)
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "BRANCH_UNPUSHABLE"
+    task.branch = "feature/stale-wip-e2e"
+    task.has_commits = True
+    task.log_file = "logs/stale-wip-e2e.log"
+    task.output_content = "summary"
+    task.diff_files_changed = 2
+    task.diff_lines_added = 5
+    task.diff_lines_removed = 1
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+
+    config = Config.load(tmp_path)
+    git = MagicMock(spec=Git)
+    git.branch_exists.return_value = True
+    git.default_branch.return_value = "main"
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "origin/feature/stale-wip-e2e": "remote-wip-tip",
+        "feature/stale-wip-e2e": "local-final-tip",
+        "main": "base456",
+    }.get(ref)
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(
+        None,
+        (
+            "Local branch 'feature/stale-wip-e2e' and remote-tracking ref "
+            "'origin/feature/stale-wip-e2e' diverged. Push, fetch, or reconcile them "
+            "before advancing or merging."
+        ),
+    )
+    git.count_commits_ahead.side_effect = [1, 1, 1]
+    git.is_merged.side_effect = [True, False]
+    git._run.side_effect = [
+        SimpleNamespace(returncode=0, stdout="merge-base-oid\n"),
+        SimpleNamespace(returncode=0, stdout="WIP: gza task interrupted\n"),
+    ]
+    ensure_result = SimpleNamespace(ok=True, status="created", error=None, pr_url="https://example.test/pr/4492")
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        reconcile_diverged_branch=lambda current_task: _reconcile_diverged_branch_with_origin(
+            config,
+            git,
+            current_task,
+            target_branch="main",
+        ),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.runner.ensure_task_pr", return_value=ensure_result) as ensure_pr,
+        patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        patch("gza.runner.task_footer"),
+    ):
+        result = execute_advance_action(
+            task=task,
+            action={
+                "type": "reconcile_branch_divergence",
+                "decision": FailedRecoveryDecision(
+                    task_id=task.id,
+                    action="reconcile",
+                    reason_code="BRANCH_UNPUSHABLE",
+                    reason_text="branch publication failed; reconcile local/origin refs",
+                    launch_mode="none",
+                    attempt_index=1,
+                    attempt_limit=2,
+                ),
+            },
+            context=context,
+        )
+
+    assert result.status == "success"
+    assert "force-with-lease" in result.message
+    git.push_ref_force_with_lease.assert_called_once_with(
+        "feature/stale-wip-e2e",
+        "feature/stale-wip-e2e",
+        remote="origin",
+        expected_remote_oid="remote-wip-tip",
+    )
+    ensure_pr.assert_called_once()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "completed"
+    assert refreshed.failure_reason is None
+    assert git._run.call_args_list == [
+        call("merge-base", "feature/stale-wip-e2e", "origin/feature/stale-wip-e2e", check=False),
+        call(
+            "log",
+            "--format=%s",
+            "merge-base-oid..origin/feature/stale-wip-e2e",
+            "--not",
+            "feature/stale-wip-e2e",
+            check=False,
+        ),
+    ]
+
+
 def test_reconcile_branch_divergence_completes_with_nonfatal_pr_creation_note(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -4976,6 +5096,98 @@ def test_reconcile_branch_divergence_local_target_conflict_returns_needs_attenti
     assert attention is not None
     assert attention.task.id == impl.id
     assert attention.action["subject_task_id"] == impl.id
+    assert attention.action["needs_attention_reason"] == "reconcile-needs-manual-resolution"
+
+
+def test_reconcile_branch_divergence_non_benign_remote_conflict_parks_without_pr_required(
+    tmp_path: Path,
+) -> None:
+    from gza.cli.git_ops import _reconcile_diverged_branch_with_origin
+    from gza.rebase_diff import RebaseDiffBaseline
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Recover genuine remote conflict", task_type="implement")
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "BRANCH_UNPUSHABLE"
+    task.branch = "feature/non-benign-conflict"
+    task.has_commits = True
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+
+    config = Config.load(tmp_path)
+    git = MagicMock(spec=Git)
+    git.branch_exists.return_value = True
+    git.default_branch.return_value = "main"
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "origin/feature/non-benign-conflict": "remote-tip",
+        "feature/non-benign-conflict": "local-tip",
+    }.get(ref)
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(
+        None,
+        (
+            "Local branch 'feature/non-benign-conflict' and remote-tracking ref "
+            "'origin/feature/non-benign-conflict' diverged. Push, fetch, or reconcile them "
+            "before advancing or merging."
+        ),
+    )
+    git.count_commits_ahead.side_effect = [1, 1]
+    git.is_merged.side_effect = [True, False]
+    git._run.side_effect = [
+        SimpleNamespace(returncode=0, stdout="merge-base-oid\n"),
+        SimpleNamespace(returncode=0, stdout="External commit\n"),
+    ]
+
+    worktree_git = MagicMock(spec=Git)
+    worktree_git.rebase.side_effect = GitError("conflict")
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        create_targeted_rebase_task=lambda _task, _target: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        reconcile_diverged_branch=lambda current_task: _reconcile_diverged_branch_with_origin(
+            config,
+            git,
+            current_task,
+            target_branch="main",
+        ),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=worktree_git),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline("old", "target", "base"),
+        ),
+    ):
+        result = execute_advance_action(
+            task=task,
+            action={"type": "reconcile_branch_divergence"},
+            context=context,
+        )
+
+    assert result.status == "skip"
+    assert result.attention_reason == "reconcile-needs-manual-resolution"
+    assert "PR_REQUIRED" not in result.message
+    attention = resolve_execution_needs_attention(task, result)
+    assert attention is not None
     assert attention.action["needs_attention_reason"] == "reconcile-needs-manual-resolution"
 
 
