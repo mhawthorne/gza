@@ -999,6 +999,21 @@ def test_configuration_docs_include_comment_command_reference() -> None:
     assert incomplete_section.count("| `--all-tags` |") == 1
 
 
+def test_configuration_docs_and_registry_describe_main_verify_remediation_attempt_budget() -> None:
+    """Config docs and registry should describe both counted main-verify remediation attempt paths."""
+    repo_root = Path(__file__).resolve().parents[1]
+    config_docs = (repo_root / "docs" / "configuration.md").read_text()
+    config_schema = (repo_root / "src" / "gza" / "config_schema.py").read_text()
+
+    for content in (config_docs, config_schema):
+        assert "failed remediation row requeues" in content
+        assert (
+            "merged-but-still-red" in content
+            or "merged remediation attempts that still leave main verify red" in content
+            or "merged remediation attempts later proven ineffective" in content
+        )
+
+
 def test_review_scope_resolution_order_docs_and_spec_stay_aligned() -> None:
     """Review-scope docs/spec must advertise the same fallback order and plan-context role."""
     repo_root = Path(__file__).resolve().parents[1]

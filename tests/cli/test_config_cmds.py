@@ -1664,7 +1664,8 @@ class TestLocalConfigOverrides:
             in result.stdout
         )
         assert "watch.main_verify_remediation_max_attempts" in result.stdout
-        assert "Maximum consumed automatic remediation attempts" in result.stdout
+        assert "failed remediation row requeues" in result.stdout
+        assert "merged-but-still-red consumed attempts" in result.stdout
 
     def test_config_keys_json_emits_valid_machine_readable_registry(self, tmp_path: Path):
         """`gza config keys --json` should emit a full machine-readable registry payload."""
@@ -1706,6 +1707,8 @@ class TestLocalConfigOverrides:
         assert "Deprecated alias" in keyed_entries["watch.restart_failed_batch"]["description"]
         assert "silent registered worker for a pending or in-progress task" in keyed_entries["watch.no_activity_timeout"]["description"]
         assert keyed_entries["watch.main_verify_remediation_max_attempts"]["default"] == 2
+        assert "failed remediation row requeues" in keyed_entries["watch.main_verify_remediation_max_attempts"]["description"]
+        assert "merged-but-still-red consumed attempts" in keyed_entries["watch.main_verify_remediation_max_attempts"]["description"]
         assert "requires human intervention" in keyed_entries["watch.main_verify_remediation_max_attempts"]["description"]
         assert "effective watch batch" in keyed_entries["max_concurrent"]["description"]
         assert "including `--batch`" in keyed_entries["max_concurrent"]["description"]

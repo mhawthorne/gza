@@ -148,6 +148,7 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   can filter main-verify state rows and remediation work together.
 - Reused or newly created remediation tasks for this gate MUST include bounded rerun
   evidence in the prompt: the failure signature, the observed tree fingerprint context,
+  the spent-attempt metadata line `Remediation attempts spent: N/2`,
   a persisted verify artifact reference only when the referenced artifact file is still
   readable and yields content-bearing output, parsed failing pytest node IDs when
   available from existing verify evidence, and a trimmed verify-output excerpt. If the
@@ -176,7 +177,13 @@ The repair path MUST distinguish flaky from deterministic verify failures:
 - When main verify later turns green and automation can safely identify the cleared
   failure signature, watch MUST retire matching open remediation rows for that signature
   as moot so stale main-verify fixes do not remain runnable after the gate has already
-  recovered.
+  recovered. If a matching remediation row is still `in_progress` during the green
+  transition, watch MUST preserve the live worker's prompt and queue metadata, persist
+  a durable signature-scoped retire marker outside the prompt, and apply that
+  retirement before later lifecycle merge handling once the worker exits. A same-
+  signature red dedupe pass MUST NOT rewrite prompt evidence or queue position for a
+  live `in_progress` remediation row unless watch actually restarts that worker with
+  the new prompt.
 - While that deterministic red freeze is active, watch MUST continue skipping unrelated
   merge actions for the cycle, but it MUST allow the merge of the one completed
   remediation implement task that is the active `system-main-verify` **fix** for the

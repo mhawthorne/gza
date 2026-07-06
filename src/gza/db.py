@@ -134,6 +134,20 @@ _MAIN_VERIFY_REMEDIATION_ATTEMPTS_REQUIRED_COLUMNS: tuple[str, ...] = (
     "last_consumed_task_id",
     "last_observed_head_sha",
     "last_observed_failure",
+    "greenlit_while_in_progress_task_id",
+    "greenlit_while_in_progress_at",
+    "updated_at",
+)
+_MAIN_VERIFY_REMEDIATION_ATTEMPTS_PRE_V65_REQUIRED_COLUMNS: tuple[str, ...] = (
+    "project_id",
+    "signature",
+    "tree_fingerprint",
+    "consumed_attempt_count",
+    "active_task_id",
+    "exhausted_at",
+    "last_consumed_task_id",
+    "last_observed_head_sha",
+    "last_observed_failure",
     "updated_at",
 )
 _MAIN_VERIFY_REMEDIATION_CONSUMED_TASK_IDS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -910,6 +924,8 @@ class MainVerifyRemediationAttemptState:
     last_consumed_task_id: str | None = None
     last_observed_head_sha: str | None = None
     last_observed_failure: str | None = None
+    greenlit_while_in_progress_task_id: str | None = None
+    greenlit_while_in_progress_at: datetime | None = None
     updated_at: datetime | None = None
 
 
@@ -1004,7 +1020,11 @@ _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "task_artifacts": ("created_at",),
     "watch_progress_observations": ("observed_at",),
     "watch_recovery_backoffs": ("next_retry_at", "updated_at"),
-    "main_verify_remediation_attempts": ("exhausted_at", "updated_at"),
+    "main_verify_remediation_attempts": (
+        "exhausted_at",
+        "greenlit_while_in_progress_at",
+        "updated_at",
+    ),
     "behavior_check_findings": ("first_seen", "last_seen"),
     "parked_task_rearms": ("manual_rearmed_at", "last_auto_attempt_at"),
     "project_leases": ("acquired_at",),
@@ -1448,6 +1468,8 @@ CREATE TABLE IF NOT EXISTS main_verify_remediation_attempts (
     last_consumed_task_id TEXT,
     last_observed_head_sha TEXT,
     last_observed_failure TEXT,
+    greenlit_while_in_progress_task_id TEXT,
+    greenlit_while_in_progress_at TEXT,
     updated_at TEXT NOT NULL,
     PRIMARY KEY(project_id, signature, tree_fingerprint)
 );
@@ -1484,8 +1506,16 @@ FROM main_verify_remediation_attempts
 WHERE last_consumed_task_id IS NOT NULL;
 """
 
+# Migration from v64 to v65: durable signature-scoped green retirement marker
+MIGRATION_V64_TO_V65 = """
+ALTER TABLE main_verify_remediation_attempts
+    ADD COLUMN greenlit_while_in_progress_task_id TEXT;
+ALTER TABLE main_verify_remediation_attempts
+    ADD COLUMN greenlit_while_in_progress_at TEXT;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 64
+SCHEMA_VERSION = 65
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -2283,7 +2313,34 @@ _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
 )
 
 _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
-    {40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64}
+    {
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48,
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62,
+        63,
+        64,
+        65,
+    }
 )
 
 _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
@@ -2327,6 +2384,15 @@ def _supports_main_verify_remediation_attempts_table(conn: sqlite3.Connection) -
             _MAIN_VERIFY_REMEDIATION_CONSUMED_TASK_IDS_REQUIRED_COLUMNS,
         )
     )
+
+
+def _main_verify_remediation_attempt_required_columns_for_version(
+    target_version: int,
+) -> tuple[str, ...]:
+    """Return the remediation-attempt column set required at a given schema version."""
+    if target_version >= 65:
+        return _MAIN_VERIFY_REMEDIATION_ATTEMPTS_REQUIRED_COLUMNS
+    return _MAIN_VERIFY_REMEDIATION_ATTEMPTS_PRE_V65_REQUIRED_COLUMNS
 
 
 def _rebuild_task_comments_table(conn: sqlite3.Connection) -> None:
@@ -2553,6 +2619,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         59: ("parked_task_rearms", "last_auto_attempt_target_sha"),
         63: ("main_verify_remediation_attempts", "updated_at"),
         64: ("main_verify_remediation_consumed_task_ids", "consumed_at"),
+        65: ("main_verify_remediation_attempts", "greenlit_while_in_progress_at"),
     }
     requirement = required_columns_by_version.get(target_version)
     if requirement is not None:
@@ -2659,7 +2726,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         missing_columns = _missing_required_columns(
             conn,
             "main_verify_remediation_attempts",
-            _MAIN_VERIFY_REMEDIATION_ATTEMPTS_REQUIRED_COLUMNS,
+            _main_verify_remediation_attempt_required_columns_for_version(target_version),
         )
         if missing_columns:
             raise RuntimeError(
@@ -2810,6 +2877,18 @@ def _ensure_required_auto_migration_artifacts(
             "ALTER TABLE watch_progress_observations ADD COLUMN launch_evidence_fingerprint TEXT",
         ),
         (57, "tasks", "last_edited_at", "ALTER TABLE tasks ADD COLUMN last_edited_at TEXT"),
+        (
+            65,
+            "main_verify_remediation_attempts",
+            "greenlit_while_in_progress_task_id",
+            "ALTER TABLE main_verify_remediation_attempts ADD COLUMN greenlit_while_in_progress_task_id TEXT",
+        ),
+        (
+            65,
+            "main_verify_remediation_attempts",
+            "greenlit_while_in_progress_at",
+            "ALTER TABLE main_verify_remediation_attempts ADD COLUMN greenlit_while_in_progress_at TEXT",
+        ),
     )
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
@@ -3219,6 +3298,8 @@ def _ensure_required_auto_migration_artifacts(
                         last_consumed_task_id TEXT,
                         last_observed_head_sha TEXT,
                         last_observed_failure TEXT,
+                        greenlit_while_in_progress_task_id TEXT,
+                        greenlit_while_in_progress_at TEXT,
                         updated_at TEXT NOT NULL,
                         PRIMARY KEY(project_id, signature, tree_fingerprint)
                     )
@@ -3237,7 +3318,7 @@ def _ensure_required_auto_migration_artifacts(
         missing_columns = _missing_required_columns(
             conn,
             "main_verify_remediation_attempts",
-            _MAIN_VERIFY_REMEDIATION_ATTEMPTS_REQUIRED_COLUMNS,
+            _main_verify_remediation_attempt_required_columns_for_version(target_version),
         )
         if missing_columns:
             raise SchemaIntegrityError(
@@ -3611,6 +3692,8 @@ CREATE TABLE IF NOT EXISTS main_verify_remediation_attempts (
     last_consumed_task_id TEXT,
     last_observed_head_sha TEXT,
     last_observed_failure TEXT,
+    greenlit_while_in_progress_task_id TEXT,
+    greenlit_while_in_progress_at TEXT,
     updated_at TEXT NOT NULL,
     PRIMARY KEY(project_id, signature, tree_fingerprint)
 );
@@ -3938,6 +4021,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (62, MIGRATION_V61_TO_V62),
     (63, MIGRATION_V62_TO_V63),
     (64, MIGRATION_V63_TO_V64),
+    (65, MIGRATION_V64_TO_V65),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -6232,6 +6316,12 @@ class SqliteTaskStore:
             last_observed_failure=(
                 str(row["last_observed_failure"]) if row["last_observed_failure"] is not None else None
             ),
+            greenlit_while_in_progress_task_id=(
+                str(row["greenlit_while_in_progress_task_id"])
+                if row["greenlit_while_in_progress_task_id"] is not None
+                else None
+            ),
+            greenlit_while_in_progress_at=_parse_db_timestamp(row["greenlit_while_in_progress_at"]),
             updated_at=_parse_db_timestamp(row["updated_at"]),
         )
 
@@ -7415,6 +7505,26 @@ class SqliteTaskStore:
             ).fetchone()
         return self._row_to_main_verify_remediation_attempt_state(row)
 
+    def list_main_verify_remediation_attempt_states(self) -> tuple[MainVerifyRemediationAttemptState, ...]:
+        """Return all persisted main-verify remediation attempt rows for this project."""
+        if not self.supports_main_verify_remediation_attempts():
+            return ()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM main_verify_remediation_attempts
+                WHERE project_id = ?
+                ORDER BY updated_at DESC, signature ASC
+                """,
+                (self._project_id,),
+            ).fetchall()
+        return tuple(
+            state
+            for row in rows
+            if (state := self._row_to_main_verify_remediation_attempt_state(row)) is not None
+        )
+
     def record_main_verify_remediation_active_task(
         self,
         *,
@@ -7443,9 +7553,11 @@ class SqliteTaskStore:
                     last_consumed_task_id,
                     last_observed_head_sha,
                     last_observed_failure,
+                    greenlit_while_in_progress_task_id,
+                    greenlit_while_in_progress_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, 0, ?, NULL, NULL, ?, ?, ?)
+                VALUES (?, ?, ?, 0, ?, NULL, NULL, ?, ?, NULL, NULL, ?)
                 ON CONFLICT(project_id, signature, tree_fingerprint)
                 DO UPDATE SET
                     active_task_id = excluded.active_task_id,
@@ -7453,6 +7565,18 @@ class SqliteTaskStore:
                         WHEN excluded.active_task_id IS NULL
                             THEN main_verify_remediation_attempts.exhausted_at
                         ELSE NULL
+                    END,
+                    greenlit_while_in_progress_task_id = CASE
+                        WHEN excluded.active_task_id IS NULL
+                            OR excluded.active_task_id != main_verify_remediation_attempts.active_task_id
+                            THEN NULL
+                        ELSE main_verify_remediation_attempts.greenlit_while_in_progress_task_id
+                    END,
+                    greenlit_while_in_progress_at = CASE
+                        WHEN excluded.active_task_id IS NULL
+                            OR excluded.active_task_id != main_verify_remediation_attempts.active_task_id
+                            THEN NULL
+                        ELSE main_verify_remediation_attempts.greenlit_while_in_progress_at
                     END,
                     last_observed_head_sha = excluded.last_observed_head_sha,
                     last_observed_failure = excluded.last_observed_failure,
@@ -7585,9 +7709,11 @@ class SqliteTaskStore:
                         last_consumed_task_id,
                         last_observed_head_sha,
                         last_observed_failure,
+                        greenlit_while_in_progress_task_id,
+                        greenlit_while_in_progress_at,
                         updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
                     """,
                     (
                         self._project_id,
@@ -7612,6 +7738,8 @@ class SqliteTaskStore:
                         last_consumed_task_id = ?,
                         last_observed_head_sha = ?,
                         last_observed_failure = ?,
+                        greenlit_while_in_progress_task_id = NULL,
+                        greenlit_while_in_progress_at = NULL,
                         updated_at = ?
                     WHERE project_id = ?
                       AND signature = ?
@@ -7687,9 +7815,11 @@ class SqliteTaskStore:
                         last_consumed_task_id,
                         last_observed_head_sha,
                         last_observed_failure,
+                        greenlit_while_in_progress_task_id,
+                        greenlit_while_in_progress_at,
                         updated_at
                     )
-                    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL, ?)
                     """,
                     (
                         self._project_id,
@@ -7713,6 +7843,8 @@ class SqliteTaskStore:
                         last_consumed_task_id = ?,
                         last_observed_head_sha = ?,
                         last_observed_failure = ?,
+                        greenlit_while_in_progress_task_id = NULL,
+                        greenlit_while_in_progress_at = NULL,
                         updated_at = ?
                     WHERE project_id = ?
                       AND signature = ?
@@ -7730,6 +7862,59 @@ class SqliteTaskStore:
                         normalized_fingerprint,
                     ),
                 )
+            row = conn.execute(
+                """
+                SELECT *
+                FROM main_verify_remediation_attempts
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                """,
+                (self._project_id, signature, normalized_fingerprint),
+            ).fetchone()
+        return self._row_to_main_verify_remediation_attempt_state(row)
+
+    def mark_main_verify_remediation_greenlit_while_in_progress(
+        self,
+        *,
+        signature: str,
+        tree_fingerprint: str | None,
+        task_id: str,
+        last_observed_head_sha: str | None = None,
+        last_observed_failure: str | None = None,
+    ) -> MainVerifyRemediationAttemptState | None:
+        """Persist a signature-scoped green marker for an active in-progress remediation row."""
+        if not self.supports_main_verify_remediation_attempts():
+            return None
+        normalized_fingerprint = _normalize_main_verify_tree_fingerprint(tree_fingerprint)
+        updated_at = _format_db_timestamp(datetime.now(UTC))
+        assert updated_at is not None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE main_verify_remediation_attempts
+                SET greenlit_while_in_progress_task_id = ?,
+                    greenlit_while_in_progress_at = ?,
+                    last_observed_head_sha = ?,
+                    last_observed_failure = ?,
+                    updated_at = ?
+                WHERE project_id = ?
+                  AND signature = ?
+                  AND tree_fingerprint = ?
+                  AND active_task_id = ?
+                """,
+                (
+                    task_id,
+                    updated_at,
+                    last_observed_head_sha,
+                    last_observed_failure,
+                    updated_at,
+                    self._project_id,
+                    signature,
+                    normalized_fingerprint,
+                    task_id,
+                ),
+            )
             row = conn.execute(
                 """
                 SELECT *

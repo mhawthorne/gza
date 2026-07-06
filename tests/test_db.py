@@ -10660,6 +10660,34 @@ class TestSharedDbIsolationAndImportGating:
         assert duplicate.consumed_attempt_count == 1
         assert duplicate.last_consumed_task_id == "gza-100"
 
+    def test_auto_migration_v64_to_v65_adds_greenlit_retire_marker_columns(
+        self, tmp_path: Path
+    ) -> None:
+        import sqlite3
+
+        db_path = tmp_path / "test.db"
+        SqliteTaskStore(db_path, prefix="gza")
+        _drop_main_verify_remediation_attempts_column(db_path, "greenlit_while_in_progress_at")
+        _drop_main_verify_remediation_attempts_column(
+            db_path, "greenlit_while_in_progress_task_id"
+        )
+
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE schema_version SET version = 64")
+            conn.commit()
+
+        SqliteTaskStore(db_path, prefix="gza")
+
+        with sqlite3.connect(db_path) as conn:
+            version = conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(main_verify_remediation_attempts)")
+            }
+
+        assert version == SCHEMA_VERSION
+        assert "greenlit_while_in_progress_task_id" in columns
+        assert "greenlit_while_in_progress_at" in columns
+
     def test_auto_migration_v56_to_v57_adds_last_edited_at(self, tmp_path: Path) -> None:
         import sqlite3
 

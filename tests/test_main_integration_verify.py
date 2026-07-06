@@ -1922,6 +1922,76 @@ def test_check_main_integration_verify_watch_red_rerun_classifies_flake_without_
     assert check.resolved_red_signature == "phase:unit"
     assert check.remediation.tree_fingerprint == "fp-verified"
     assert check.remediation.failing_phase == "unit"
+    assert check.resolved_signature == "phase:unit"
+
+
+def test_check_main_integration_verify_force_green_carries_resolved_signature_without_remediation(
+    tmp_path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+    )
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    green_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 23, 0, 35, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", side_effect=["fp-verified", "fp-verified"]),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=green_result) as run_verify,
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+        patch("gza.main_integration_verify.datetime") as mocked_datetime,
+    ):
+        mocked_datetime.now.return_value = datetime(2026, 6, 23, 0, 29, tzinfo=UTC)
+        mocked_datetime.fromisoformat.side_effect = datetime.fromisoformat
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="operator-main-verify",
+            force=True,
+            red_reruns=0,
+        )
+
+    run_verify.assert_called_once()
+    assert check.performed_verify is True
+    assert check.merges_halted is False
+    assert check.remediation is None
+    assert check.resolved_signature == "phase:unit"
 
 
 def test_check_main_integration_verify_watch_red_rerun_retries_fresh_red_and_classifies_flake(tmp_path) -> None:

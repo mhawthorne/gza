@@ -88,8 +88,13 @@ class MainIntegrationVerifyCheck:
     merges_halted: bool
     needs_attention: bool = False
     remediation: MainIntegrationVerifyRemediation | None = None
-    resolved_red_signature: str | None = None
     verify_runs: int = 0
+    resolved_signature: str | None = None
+
+    @property
+    def resolved_red_signature(self) -> str | None:
+        """Backward-compatible alias for callers migrated to resolved_signature."""
+        return self.resolved_signature
 
 
 @dataclass(frozen=True)
@@ -1332,6 +1337,20 @@ def check_main_integration_verify(
     current_head_sha = _coerce_optional_str(git.rev_parse_if_exists("HEAD"))
     current_gate = _current_gate_identity(config, runner_class=runner_class)
     state = load_main_integration_verify_state(store)
+    prior_red_signature = (
+        _verify_failure_signature(
+            failing_phase=state.failing_phase,
+            verify_status=state.verify_status,
+            verify_exit_status=state.verify_exit_status,
+        )
+        if state is not None
+        and _verify_result_halts_merges(
+            status=state.verify_status,
+            gate_enabled=state.gate_enabled,
+            exit_status=state.verify_exit_status,
+        )
+        else None
+    )
     checkpoint_is_current = state is not None and _checkpoint_is_current(
         state,
         config=config,
@@ -1388,15 +1407,15 @@ def check_main_integration_verify(
         runner_class=runner_class,
         prior_red_state=state if checkpoint_is_current else None,
     )
-    resolved_red_signature = None
+    resolved_signature = None
     if not _verify_result_halts_merges(
         status=refreshed.verify_status,
         gate_enabled=refreshed.gate_enabled,
         exit_status=refreshed.verify_exit_status,
     ):
-        resolved_red_signature = prior_red_signature
-        if resolved_red_signature is None and remediation is not None and remediation.kind == "deflake":
-            resolved_red_signature = remediation.signature
+        resolved_signature = prior_red_signature
+        if resolved_signature is None and remediation is not None and remediation.kind == "deflake":
+            resolved_signature = remediation.signature
     return MainIntegrationVerifyCheck(
         state=refreshed,
         performed_verify=True,
@@ -1414,8 +1433,8 @@ def check_main_integration_verify(
             alert_message=refreshed.alert_message,
         ),
         remediation=remediation,
-        resolved_red_signature=resolved_red_signature,
         verify_runs=verify_runs,
+        resolved_signature=resolved_signature,
     )
 
 
