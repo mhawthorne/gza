@@ -1979,6 +1979,8 @@ def _query_owner_rows_with_context(
     task_ids: tuple[str, ...] | None = None,
     max_recovery_attempts: int,
     include_skipped: bool,
+    persist_post_merge_rebase_state: bool = True,
+    persist_review_clearance: bool = True,
 ) -> tuple[list[LineageOwnerRow], RecoveryReadContext]:
     rows, read_context = query_lineage_owner_rows_in_read_session(
         store,
@@ -1995,6 +1997,8 @@ def _query_owner_rows_with_context(
         config=config,
         git=git,
         target_branch=target_branch,
+        persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+        persist_review_clearance=persist_review_clearance,
     )
     return list(rows), read_context
 
@@ -2011,6 +2015,8 @@ def _query_owner_rows(
     task_ids: tuple[str, ...] | None = None,
     max_recovery_attempts: int,
     include_skipped: bool,
+    persist_post_merge_rebase_state: bool = True,
+    persist_review_clearance: bool = True,
 ) -> list[LineageOwnerRow]:
     rows, _ = _query_owner_rows_with_context(
         store=store,
@@ -2023,6 +2029,8 @@ def _query_owner_rows(
         task_ids=task_ids,
         max_recovery_attempts=max_recovery_attempts,
         include_skipped=include_skipped,
+        persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+        persist_review_clearance=persist_review_clearance,
     )
     return rows
 
@@ -9489,31 +9497,67 @@ def cmd_queue(args: argparse.Namespace) -> int:
     blocked_pending: list[TaskRow] = []
     preview_git: Git | None = None
     queue_target_branch: str | None = None
+    queue_owner_rows: tuple[LineageOwnerRow, ...] = ()
+    queue_read_context: RecoveryReadContext | None = None
     if show_recovery or show_lifecycle:
         queue_git = Git(config.project_dir)
         preview_git = queue_git
-        queue_target_branch = queue_git.default_branch()
-        scope_gaps = collect_scoped_tag_scope_gaps(
-            store,
-            tag_filters=normalized_tag_filters,
-            any_tag=any_tag,
-            config=config,
-            git=queue_git,
-            target_branch=queue_target_branch,
-        )
-        if show_lifecycle:
-            lifecycle_entries = collect_lifecycle_action_entries(
-                store,
+        cache_scope = queue_git.cached() if hasattr(queue_git, "cached") else contextlib.nullcontext(queue_git)
+        with cache_scope:
+            queue_target_branch = queue_git.default_branch()
+            queue_owner_rows_list, queue_read_context = _query_owner_rows_with_context(
+                store=store,
                 config=config,
                 git=queue_git,
                 target_branch=queue_target_branch,
                 tags=normalized_tag_filters,
                 any_tag=any_tag,
                 max_recovery_attempts=config.max_resume_attempts,
+                include_skipped=True,
                 persist_post_merge_rebase_state=False,
+                persist_review_clearance=False,
             )
+            queue_owner_rows = tuple(queue_owner_rows_list)
+            scope_gaps = collect_scoped_tag_scope_gaps(
+                store,
+                tag_filters=normalized_tag_filters,
+                any_tag=any_tag,
+                config=config,
+                git=queue_git,
+                target_branch=queue_target_branch,
+                owner_rows=queue_owner_rows,
+                read_context=queue_read_context,
+            )
+            if show_lifecycle:
+                lifecycle_entries = collect_lifecycle_action_entries(
+                    store,
+                    config=config,
+                    git=queue_git,
+                    target_branch=queue_target_branch,
+                    tags=normalized_tag_filters,
+                    any_tag=any_tag,
+                    max_recovery_attempts=config.max_resume_attempts,
+                    persist_post_merge_rebase_state=False,
+                    owner_rows=queue_owner_rows,
+                    read_context=queue_read_context,
+                )
+            if show_recovery or show_pending:
+                dispatch_preview = build_dispatch_preview(
+                    store,
+                    tags=normalized_tag_filters,
+                    any_tag=any_tag,
+                    max_recovery_attempts=config.max_resume_attempts,
+                    selection_mode=dispatch_mode,
+                    include_recovery=show_recovery,
+                    include_pending=show_pending,
+                    quiet_seconds=config.quiet_period_seconds,
+                    git=preview_git,
+                    target_branch=queue_target_branch,
+                    owner_rows=queue_owner_rows,
+                    read_context=queue_read_context,
+                )
     quiet_rows: list[TaskRow] = []
-    if show_recovery or show_pending:
+    if dispatch_preview is None and (show_recovery or show_pending):
         dispatch_preview = build_dispatch_preview(
             store,
             tags=normalized_tag_filters,
@@ -9526,6 +9570,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
             git=preview_git,
             target_branch=queue_target_branch,
         )
+    if dispatch_preview is not None:
         if show_recovery:
             recovery_entries = [
                 adapted

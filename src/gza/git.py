@@ -1262,7 +1262,7 @@ class Git:
         if paths:
             args.append("--")
             args.extend(paths)
-        result = self._run(*args, check=False)
+        result = self._run_readonly_cached(*args, check=False)
         if check and result.returncode != 0:
             error_output = result.stderr or result.stdout
             raise GitError(f"git diff --name-status {revision_range} failed:\n{error_output}")
@@ -1463,7 +1463,7 @@ class Git:
             return False
 
         # git merge-tree returns 0 for clean merge, 1 for conflicts
-        result = self._run("merge-tree", "--write-tree", into, branch, check=False)
+        result = self._run_readonly_cached("merge-tree", "--write-tree", into, branch, check=False)
         return result.returncode == 0
 
     def merge(self, branch: str, squash: bool = False, commit_message: str | None = None) -> None:

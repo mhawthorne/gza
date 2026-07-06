@@ -15,9 +15,11 @@ from gza import dependency_preconditions as dependency_preconditions_module
 from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.dispatch_preview import DispatchPreview
 from gza.git import Git, GitError, ResolvedMergeSourceRef
 from gza.lineage_query import (
     LineageOwnerQuery,
+    LineageOwnerRow,
     _load_indexes,
     _query_lineage_owner_rows_with_context,
     collect_stale_unmerged_sweep_candidates,
@@ -4927,3 +4929,52 @@ def test_collect_recovery_lane_entries_does_not_call_load_merge_context_when_git
 
     # Must not raise — _load_merge_context was not called.
     assert isinstance(entries, list)
+
+
+def test_collect_recovery_lane_entries_reuses_supplied_owner_rows_and_read_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Failed implement", task_type="implement")
+    assert owner.id is not None
+    owner.status = "failed"
+    owner.failure_reason = "MAX_TURNS"
+    owner.branch = "feature/recovery-lane"
+    owner.completed_at = datetime(2026, 6, 16, 9, 0, tzinfo=UTC)
+    store.update(owner)
+
+    owner_row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="",
+        unresolved_tasks=(owner,),
+        unresolved_leaf_summary=(),
+        recovery_action_task=owner,
+        recovery_leaf_task=owner,
+    )
+    read_context = RecoveryReadContext()
+
+    def _fake_build_dispatch_preview(*args, owner_rows=None, read_context=None, **kwargs):
+        assert owner_rows == (owner_row,)
+        assert read_context is supplied_read_context
+        return DispatchPreview(entries=(), owner_rows=(owner_row,), read_context=read_context)
+
+    supplied_read_context = read_context
+    monkeypatch.setattr("gza.cli._recovery_lane.build_dispatch_preview", _fake_build_dispatch_preview)
+
+    entries = collect_recovery_lane_entries(
+        store,
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=1,
+        owner_rows=(owner_row,),
+        read_context=read_context,
+    )
+
+    assert entries == []

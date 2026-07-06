@@ -10,11 +10,12 @@ from types import SimpleNamespace
 import pytest
 
 import gza.recovery_engine as recovery_engine
+import gza.task_query as task_query
 from gza.cli._queue_render import partition_queue_rows
 from gza.cli.advance_engine import determine_next_action
 from gza.config import Config
 from gza.db import SqliteTaskStore
-from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
+from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows, query_lineage_owner_rows_in_read_session
 from gza.query import TaskLineageNode
 from gza.task_query import (
     DateFilter,
@@ -542,6 +543,59 @@ def test_collect_scoped_tag_scope_gaps_uses_one_read_session_connection(
 
     assert len(gaps) == 1
     assert len([conn for close_on_exit, conn in opened_connections if close_on_exit is False]) == 1
+
+
+def test_collect_scoped_tag_scope_gaps_reuses_supplied_owner_rows_and_read_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    plan = store.add(
+        "Scoped owner",
+        task_type="plan",
+        tags=("202606-recovery", "v0.5.0"),
+        auto_implement=False,
+    )
+    assert plan.id is not None
+    plan.status = "completed"
+    plan.completed_at = datetime(2026, 6, 12, 12, 0, tzinfo=UTC)
+    store.update(plan)
+
+    child = store.add(
+        "Scope-less orphan child",
+        task_type="implement",
+        based_on=plan.id,
+        tags=(),
+    )
+    assert child.id is not None
+
+    owner_rows, read_context = query_lineage_owner_rows_in_read_session(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            tags=("202606-recovery",),
+            any_tag=False,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+        ),
+    )
+
+    def _must_not_query(*args, **kwargs):
+        raise AssertionError("collect_scoped_tag_scope_gaps should reuse supplied owner rows")
+
+    monkeypatch.setattr(task_query, "query_lineage_owner_rows_in_read_session", _must_not_query)
+    monkeypatch.setattr(store, "get_all", lambda: (_ for _ in ()).throw(AssertionError("store.get_all should not run")))
+
+    gaps = collect_scoped_tag_scope_gaps(
+        store,
+        tag_filters=("202606-recovery",),
+        any_tag=False,
+        owner_rows=owner_rows,
+        read_context=read_context,
+    )
+
+    assert len(gaps) == 1
+    assert gaps[0].owner_id == plan.id
 
 
 def test_collect_scoped_tag_scope_gaps_any_tag_suggests_single_matching_tag(tmp_path: Path) -> None:

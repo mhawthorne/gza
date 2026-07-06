@@ -32,10 +32,11 @@ from gza.cli._common import clear_task_queue_position_scoped, set_task_queue_pos
 from gza.config import Config
 from gza.console import truncate
 from gza.db import Task
-from gza.dispatch_preview import build_dispatch_preview
+from gza.dispatch_preview import DispatchPreview, build_dispatch_preview
 from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerRow
 from gza.pr_ops import LookupTaskPrResult
+from gza.recovery_read_context import RecoveryReadContext
 from gza.review_verdict import ParsedReviewReport
 from gza.sync_ops import BranchSyncResult
 
@@ -1035,6 +1036,61 @@ def test_collect_lifecycle_action_entries_forwards_persist_override(tmp_path: Pa
     )
 
     assert calls == [True, False]
+
+
+def test_collect_lifecycle_action_entries_reuses_supplied_owner_rows_and_read_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Lifecycle owner", task_type="plan")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    store.update(owner)
+
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="",
+        unresolved_tasks=(owner,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=owner,
+    )
+    read_context = RecoveryReadContext()
+
+    def _must_not_query(*args, **kwargs):
+        raise AssertionError("collect_lifecycle_action_entries should reuse supplied owner rows")
+
+    monkeypatch.setattr(lifecycle_actions_cli, "query_lineage_owner_rows_in_read_session", _must_not_query)
+
+    def _fake_determine_next_action(*args, read_context: RecoveryReadContext | None = None, **kwargs):
+        assert read_context is not None
+        assert read_context is supplied_read_context
+        return {"type": "create_implement", "description": "Create implementation task"}
+
+    supplied_read_context = read_context
+    monkeypatch.setattr(lifecycle_actions_cli, "determine_next_action", _fake_determine_next_action)
+
+    entries = lifecycle_actions_cli.collect_lifecycle_action_entries(
+        store,
+        config=config,
+        git=_mock_unmerged_git(),
+        target_branch="main",
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=1,
+        owner_rows=(row,),
+        read_context=read_context,
+    )
+
+    assert [entry.owner_task.id for entry in entries] == [owner.id]
 
 
 def _seed_same_branch_merge_owner_and_improve(tmp_path: Path) -> tuple[Task, Task]:
@@ -3746,6 +3802,108 @@ class TestQueueCommand:
                         dispatch_mode=None,
                     )
                 )
+
+    def test_queue_default_reuses_one_cached_owner_read_context(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        config = Config.load(tmp_path)
+
+        owner = store.add("Owner", task_type="plan")
+        assert owner.id is not None
+        owner.status = "completed"
+        owner.completed_at = datetime.now(UTC)
+        store.update(owner)
+        owner_row = LineageOwnerRow(
+            owner_task=owner,
+            members=(owner,),
+            tree=None,
+            lineage_status="actionable",
+            next_action=None,
+            next_action_reason="",
+            unresolved_tasks=(owner,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=owner,
+        )
+        read_context = RecoveryReadContext()
+        cache_state = {"active": False}
+        phases: list[str] = []
+
+        class _TrackedGit:
+            def cached(self):
+                @contextlib.contextmanager
+                def _scope():
+                    assert cache_state["active"] is False
+                    cache_state["active"] = True
+                    phases.append("cache-enter")
+                    try:
+                        yield self
+                    finally:
+                        phases.append("cache-exit")
+                        cache_state["active"] = False
+
+                return _scope()
+
+            def default_branch(self) -> str:
+                assert cache_state["active"] is True
+                phases.append("default-branch")
+                return "main"
+
+        def _fake_query_owner_rows_with_context(**kwargs):
+            assert cache_state["active"] is True
+            phases.append("owner-query")
+            return [owner_row], read_context
+
+        def _fake_collect_scope_gaps(*args, owner_rows=None, read_context=None, **kwargs):
+            assert cache_state["active"] is True
+            assert owner_rows == (owner_row,)
+            assert read_context is supplied_read_context
+            phases.append("scope-gaps")
+            return []
+
+        def _fake_collect_lifecycle_entries(*args, owner_rows=None, read_context=None, **kwargs):
+            assert cache_state["active"] is True
+            assert owner_rows == (owner_row,)
+            assert read_context is supplied_read_context
+            phases.append("lifecycle")
+            return []
+
+        def _fake_build_dispatch_preview(*args, owner_rows=None, read_context=None, **kwargs):
+            assert cache_state["active"] is True
+            assert owner_rows == (owner_row,)
+            assert read_context is supplied_read_context
+            phases.append("dispatch-preview")
+            return DispatchPreview(entries=(), owner_rows=(owner_row,), read_context=read_context)
+
+        supplied_read_context = read_context
+        monkeypatch.setattr(watch_cli.Config, "load", lambda _project_dir: config)
+        monkeypatch.setattr(watch_cli, "Git", lambda _project_dir: _TrackedGit())
+        monkeypatch.setattr(watch_cli, "_query_owner_rows_with_context", _fake_query_owner_rows_with_context)
+        monkeypatch.setattr(watch_cli, "collect_scoped_tag_scope_gaps", _fake_collect_scope_gaps)
+        monkeypatch.setattr(watch_cli, "collect_lifecycle_action_entries", _fake_collect_lifecycle_entries)
+        monkeypatch.setattr(watch_cli, "build_dispatch_preview", _fake_build_dispatch_preview)
+
+        exit_code = watch_cli.cmd_queue(
+            argparse.Namespace(
+                project_dir=tmp_path,
+                queue_action=None,
+                limit=10,
+                all=False,
+                tags=["v0.5.0"],
+                all_tags=False,
+                dispatch_mode="default",
+            )
+        )
+
+        assert exit_code == 0
+        assert phases == [
+            "cache-enter",
+            "default-branch",
+            "owner-query",
+            "scope-gaps",
+            "lifecycle",
+            "dispatch-preview",
+            "cache-exit",
+        ]
 
     def test_queue_lists_pending_in_urgent_then_fifo_order(self, tmp_path: Path):
         setup_config(tmp_path)

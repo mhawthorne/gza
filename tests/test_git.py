@@ -2328,6 +2328,45 @@ class TestGitCached:
 
         assert mock_run.call_count == 3
 
+    def test_cached_scope_reuses_can_merge_merge_tree_probe(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with (
+            patch.object(git, "branch_exists", return_value=True),
+            patch.object(git, "_run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+
+            with git.cached():
+                assert git.can_merge("feature", "main") is True
+                assert git.can_merge("feature", "main") is True
+
+        mock_run.assert_called_once_with("merge-tree", "--write-tree", "main", "feature", check=False)
+
+    def test_cached_scope_reuses_diff_name_status_probe(self, tmp_path: Path) -> None:
+        repo_dir = tmp_path / "repo"
+        repo_dir.mkdir()
+        git = Git(repo_dir)
+
+        with patch.object(git, "_run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="M\tfile.py\n", stderr="")
+
+            with git.cached():
+                assert git.get_diff_name_status("main...feature", check=True) == "M\tfile.py"
+                assert git.get_diff_name_status("main...feature", check=True) == "M\tfile.py"
+
+        mock_run.assert_called_once_with(
+            "diff",
+            "--name-status",
+            "--find-renames",
+            "--find-copies",
+            "--find-copies-harder",
+            "main...feature",
+            check=False,
+        )
+
     def test_mutation_clears_active_cache(self, tmp_path: Path) -> None:
         repo_dir = tmp_path / "repo"
         repo_dir.mkdir()

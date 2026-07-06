@@ -8,7 +8,9 @@ from typing import Any
 from ..db import SqliteTaskStore, Task as DbTask
 from ..dispatch_preview import build_dispatch_preview
 from ..git import Git
+from ..lineage_query import LineageOwnerRow
 from ..recovery_engine import FailedRecoveryDecision
+from ..recovery_read_context import RecoveryReadContext
 from .advance_engine import failed_recovery_decision_to_action, failed_recovery_decision_to_attention_action
 
 
@@ -31,6 +33,8 @@ def collect_recovery_lane_entries(
     max_recovery_attempts: int,
     git: Git | None = None,
     target_branch: str | None = None,
+    owner_rows: tuple[LineageOwnerRow, ...] | None = None,
+    read_context: RecoveryReadContext | None = None,
 ) -> list[RecoveryLaneEntry]:
     """Return visible recovery-lane entries in deterministic watch order."""
     preview = build_dispatch_preview(
@@ -42,6 +46,8 @@ def collect_recovery_lane_entries(
         include_pending=False,
         git=git,
         target_branch=target_branch,
+        owner_rows=owner_rows,
+        read_context=read_context,
     )
     entries: list[RecoveryLaneEntry] = []
     for preview_entry in preview.recovery_entries:

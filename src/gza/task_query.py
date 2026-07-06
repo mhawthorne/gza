@@ -10,9 +10,10 @@ from typing import Any, Literal, TypeVar
 from . import lineage, metrics
 from .db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeric_key
 from .lifecycle_completion import task_is_complete_for_lifecycle
-from .lineage_query import LineageOwnerQuery, query_lineage_owner_rows_in_read_session
+from .lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows_in_read_session
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 from .pickup import effective_edit_time, is_in_quiet_period
+from .recovery_read_context import RecoveryReadContext
 
 QueryScope = Literal["tasks", "lineages"]
 DateField = Literal["created", "completed", "effective"]
@@ -1227,6 +1228,8 @@ def collect_scoped_tag_scope_gaps(
     config: Any | None = None,
     git: Any | None = None,
     target_branch: str | None = None,
+    owner_rows: Sequence[LineageOwnerRow] | None = None,
+    read_context: RecoveryReadContext | None = None,
 ) -> list[ScopedTagScopeGap]:
     """Return in-scope owners blocked by detectable out-of-scope derived children."""
     normalized = normalize_tag_filters(tag_filters)
@@ -1295,19 +1298,24 @@ def collect_scoped_tag_scope_gaps(
 
     gaps: list[ScopedTagScopeGap] = []
     seen_blocking_child_ids: set[str] = set()
-    owner_rows, _read_context = query_lineage_owner_rows_in_read_session(
-        store,
-        LineageOwnerQuery(
-            limit=None,
-            tags=normalized,
-            any_tag=any_tag,
-            include_skipped=True,
-            exclude_dropped_from_planning=True,
-        ),
-        config=config,
-        git=git,
-        target_branch=target_branch,
-    )
+    if owner_rows is None or read_context is None:
+        owner_rows, read_context = query_lineage_owner_rows_in_read_session(
+            store,
+            LineageOwnerQuery(
+                limit=None,
+                tags=normalized,
+                any_tag=any_tag,
+                include_skipped=True,
+                exclude_dropped_from_planning=True,
+            ),
+            config=config,
+            git=git,
+            target_branch=target_branch,
+        )
+    else:
+        owner_rows = tuple(owner_rows)
+
+    all_tasks = tuple(read_context.tasks) if read_context is not None and read_context.tasks is not None else tuple(store.get_all())
     members_by_owner_id = {}
     for row in owner_rows:
         owner_id = row.owner_task.id
@@ -1318,13 +1326,18 @@ def collect_scoped_tag_scope_gaps(
             if task.id is None or task.id == owner_id or task.task_type == "internal":
                 continue
             merged_candidates[task.id] = task
-        for task in lineage.walk_lineage_descendants(store, row.owner_task):
+        descendant_tasks = (
+            read_context.build_lineage(row.owner_task)
+            if read_context is not None and row.owner_task.id is not None
+            else tuple(lineage.walk_lineage_descendants(store, row.owner_task))
+        )
+        for task in descendant_tasks:
             if task.id is None or task.id == owner_id or task.task_type == "internal":
                 continue
             merged_candidates[task.id] = task
         members_by_owner_id[owner_id] = tuple(merged_candidates.values())
     candidate_owners_by_id: dict[str, DbTask] = {}
-    for task in store.get_all():
+    for task in all_tasks:
         if (
             task.id is None
             or task.task_type == "internal"
@@ -1355,7 +1368,11 @@ def collect_scoped_tag_scope_gaps(
         else:
             candidate_members = tuple(
                 task
-                for task in lineage.walk_lineage_descendants(store, owner)
+                for task in (
+                    read_context.build_lineage(owner)
+                    if read_context is not None and owner.id is not None
+                    else tuple(lineage.walk_lineage_descendants(store, owner))
+                )
                 if task.id is not None and task.id != owner_id and task.task_type != "internal"
             )
 

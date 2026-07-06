@@ -12,8 +12,9 @@ from ..colors import pink
 from ..console import prompt_available_width, shorten_prompt
 from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git
-from ..lineage_query import LineageOwnerQuery, query_lineage_owner_rows_in_read_session
+from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows_in_read_session
 from ..pickup import is_worker_consuming_advance_action
+from ..recovery_read_context import RecoveryReadContext
 from ..task_query import normalize_tag_filters
 from .advance_engine import classify_advance_action, determine_next_action
 
@@ -60,25 +61,30 @@ def collect_lifecycle_action_entries(
     any_tag: bool,
     max_recovery_attempts: int,
     persist_post_merge_rebase_state: bool = True,
+    owner_rows: tuple[LineageOwnerRow, ...] | None = None,
+    read_context: RecoveryReadContext | None = None,
 ) -> list[LifecycleActionEntry]:
     """Return actionable lifecycle rows in deterministic advance order."""
-    owner_rows, read_context = query_lineage_owner_rows_in_read_session(
-        store,
-        LineageOwnerQuery(
-            limit=None,
-            statuses=("completed", "unmerged", "dropped"),
-            tags=normalize_tag_filters(tags),
-            any_tag=any_tag,
-            include_skipped=True,
-            exclude_dropped_from_planning=True,
-            max_recovery_attempts=max_recovery_attempts,
-        ),
-        config=config,
-        git=git,
-        target_branch=target_branch,
-        persist_post_merge_rebase_state=persist_post_merge_rebase_state,
-        persist_review_clearance=persist_post_merge_rebase_state,
-    )
+    if owner_rows is None or read_context is None:
+        owner_rows, read_context = query_lineage_owner_rows_in_read_session(
+            store,
+            LineageOwnerQuery(
+                limit=None,
+                statuses=("completed", "unmerged", "dropped"),
+                tags=normalize_tag_filters(tags),
+                any_tag=any_tag,
+                include_skipped=True,
+                exclude_dropped_from_planning=True,
+                max_recovery_attempts=max_recovery_attempts,
+            ),
+            config=config,
+            git=git,
+            target_branch=target_branch,
+            persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+            persist_review_clearance=persist_post_merge_rebase_state,
+        )
+    else:
+        owner_rows = tuple(owner_rows)
 
     entries: list[LifecycleActionEntry] = []
     for row in owner_rows:
