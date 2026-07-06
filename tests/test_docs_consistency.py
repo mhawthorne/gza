@@ -420,7 +420,8 @@ def test_main_verify_remediation_attempt_budget_docs_match_consumed_attempt_runt
     config_docs = " ".join((repo_root / "docs" / "configuration.md").read_text().split())
 
     assert "consumed automatic remediation-attempt budget for one main-verify failure identity" in config_docs
-    assert "failed remediation rows before watch requeues them" in config_docs
+    assert "failed remediation row requeues" in config_docs
+    assert "failed-row requeue" in config_docs
     assert "merged remediation attempts later proven ineffective" in config_docs
     assert "caps how many merged-and-proven-ineffective automatic remediation attempts" not in config_docs
 
