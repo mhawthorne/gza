@@ -127,8 +127,9 @@ def _render_one_line(result: TaskQueryResult) -> str:
         if isinstance(row, LineageRow):
             lineage_row: LineageRow = row
             owner = lineage_row.owner_task
-            owner_id = owner.id or "unknown"
-            owner_prompt = _headline_prompt(owner.prompt)
+            values = lineage_row.values
+            owner_id = str(values.get("id", owner.id or "unknown"))
+            owner_prompt = _headline_prompt(str(values.get("prompt", owner.prompt)))
             reason = lineage_row.values.get("next_action_reason")
             unresolved_text = _render_unresolved_summary(lineage_row.unresolved_tasks)
 

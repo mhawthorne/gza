@@ -108,6 +108,7 @@ def build_dispatch_preview(
     store: SqliteTaskStore,
     *,
     config: Config | None = None,
+    quiet_seconds: int | None = None,
     git: Git | None = None,
     target_branch: str | None = None,
     owner_rows: tuple[LineageOwnerRow, ...] | None = None,
@@ -144,13 +145,18 @@ def build_dispatch_preview(
         )
 
     if include_pending and selection_mode != "recovery_only":
+        effective_quiet_seconds = (
+            int(getattr(config, "quiet_period_seconds", 0) or 0)
+            if quiet_seconds is None and config is not None
+            else int(quiet_seconds or 0)
+        )
         pending_entries = _build_pending_preview_entries(
             store,
             tags=normalized_tags,
             any_tag=any_tag,
             selection_mode=selection_mode,
             pending_limit=pending_limit,
-            quiet_seconds=int(getattr(config, "quiet_period_seconds", 0) or 0) if config is not None else 0,
+            quiet_seconds=effective_quiet_seconds,
         )
 
     return DispatchPreview(

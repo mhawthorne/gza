@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gza import recovery_engine
+from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.config import Config
 from gza.dispatch_preview import build_dispatch_preview, plan_watch_dispatch_entries
 from gza.pickup import get_runnable_pending_tasks
@@ -47,7 +48,7 @@ def test_build_dispatch_preview_orders_recovery_then_pending_and_preserves_pendi
 
     with patch(
         "gza.recovery_engine._load_merge_context",
-        return_value=recovery_engine._MergeContext(git=None, default_branch=None),
+        return_value=recovery_engine._MergeContext(git=None, default_branch="main"),
     ):
         preview = build_dispatch_preview(
             store,
@@ -95,7 +96,7 @@ def test_build_dispatch_preview_keeps_manual_only_recovery_visible_but_non_runna
 
     with patch(
         "gza.recovery_engine._load_merge_context",
-        return_value=recovery_engine._MergeContext(git=None, default_branch=None),
+        return_value=recovery_engine._MergeContext(git=None, default_branch="main"),
     ):
         preview = build_dispatch_preview(
             store,
@@ -114,6 +115,55 @@ def test_build_dispatch_preview_keeps_manual_only_recovery_visible_but_non_runna
     assert entry.manual_only is True
     assert entry.action == "skip"
     assert entry.reason_code == "manual_failure_reason"
+
+
+def test_collect_recovery_lane_entries_matches_preview_for_branch_unpushable_reconcile(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    store._default_merge_target_cache = "main"  # noqa: SLF001 - avoid real git in unit test
+    store._project_root = None  # noqa: SLF001 - avoid real git fallback in unit test
+
+    failed = store.add("Branch publish failed", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "BRANCH_UNPUSHABLE"
+    failed.branch = "feature/reconcile-preview"
+    failed.completed_at = datetime(2026, 6, 24, 11, 30, 0, tzinfo=UTC)
+    store.update(failed)
+
+    with patch(
+        "gza.recovery_engine._load_merge_context",
+        return_value=recovery_engine._MergeContext(git=None, default_branch="main"),
+    ):
+        preview = build_dispatch_preview(
+            store,
+            tags=None,
+            any_tag=False,
+            max_recovery_attempts=1,
+            selection_mode="recovery_only",
+            include_pending=False,
+        )
+        lane_entries = collect_recovery_lane_entries(
+            store,
+            tags=None,
+            any_tag=False,
+            max_recovery_attempts=1,
+        )
+
+    assert [entry.task.id for entry in preview.recovery_entries] == [failed.id]
+    preview_entry = preview.recovery_entries[0]
+    assert preview_entry.runnable is True
+    assert preview_entry.decision is not None
+    assert preview_entry.decision.action == "reconcile"
+
+    assert [entry.task.id for entry in lane_entries] == [failed.id]
+    lane_entry = lane_entries[0]
+    assert lane_entry.decision.action == preview_entry.decision.action
+    assert lane_entry.action is not None
+    assert lane_entry.action["type"] == "reconcile_branch_divergence"
+    assert lane_entry.attention_action is None
 
 
 def test_build_dispatch_preview_recovery_first_explicit_filters_pending_to_explicit_positions(

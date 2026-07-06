@@ -942,7 +942,7 @@ def test_configuration_docs_describe_recovery_vs_pending_operating_surface() -> 
         "Lifecycle-action entries belong to `advance` / `watch`, not `work`.",
         "Pending lane entries belong to `work` / `watch`.",
         "`gza next` now renders three distinct sections:",
-        "`uv run gza queue` shows the pending lane by default; add `--full`, `--recovery`, or `--recovery-first` for broader dispatch previews.",
+        "`uv run gza queue` shows the shared dispatch preview by default; use `--pending` for the pending-only view, `--recovery` for recovery-only, or `--recovery-first` to limit pending rows to explicit queue positions.",
     ]
 
     for snippet in required_snippets:
@@ -994,6 +994,9 @@ def test_configuration_docs_include_comment_command_reference() -> None:
     ]
     for snippet in required_snippets:
         assert snippet in config_content
+    incomplete_section = config_content.split("### incomplete", 1)[1].split("### ", 1)[0]
+    assert incomplete_section.count("| `--tag TAG` |") == 1
+    assert incomplete_section.count("| `--all-tags` |") == 1
 
 
 def test_review_scope_resolution_order_docs_and_spec_stay_aligned() -> None:
@@ -1036,7 +1039,8 @@ def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
         "### incomplete",
         "gza incomplete [options]",
         "Show unresolved task lineages that still need attention.",
-        "| `--tag TAG` | Only show unresolved lineage owners matching tag filters (repeatable) |",
+        "| `--tree` | Render unresolved lineages as trees rooted at the live shared recovery subject when applicable |",
+        "| `--tag TAG` | Only show unresolved rows matching tag filters (repeatable); recovery rows use the same shared preview scope as `queue`, `watch`, and `advance` |",
         "| `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |",
         "| `--blocked-by-dropped` | Switch to pending tasks blocked by dropped dependencies instead of unresolved lineages |",
         "### tv",
@@ -1400,7 +1404,7 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "`uv run gza watch --recovery-only --dry-run` is the recovery inspection surface" in watch_section
     assert "default `watch.recovery_slots = 1` means each watch pass allocates up to one slot to worker-consuming failed-task recovery before pending pickup" in watch_section
     assert "suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot" in watch_section
-    assert "use `uv run gza queue --tag TAG` to preview the matching pending pickup order, or add `--full` to also preview matching recovery candidates and lifecycle actions" in watch_section
+    assert "use `uv run gza queue --tag TAG --pending` to preview the matching pending pickup order" in watch_section
     assert "Scoped watch reports out-of-scope derived blockers but does not start them" in watch_section
     assert "watch.parked_auto_rearm.enabled" in watch_section
     assert "watch.parked_auto_rearm.require_target_advanced" in watch_section
@@ -1414,8 +1418,8 @@ def test_recovery_docs_use_uv_run_gza_on_touched_recovery_surfaces() -> None:
     assert "fresh `retry-limit` clear records one durable manual rearm epoch" in unstick_section
     assert "not currently parked" in unstick_section
     assert "missing branch cannot prove unresolved" in unstick_section
-    assert "add `--full` to preview matching recovery candidates and lifecycle actions too" in config_content
-    assert "Only list pending tasks matching tag filters by default" in config_content
+    assert "use `--pending` for the pending-only view" in config_content
+    assert "Only preview dispatch rows matching tag filters" in config_content
     assert "Only list recovery, lifecycle, and pending lanes matching tag filters" not in config_content
 
     assert "\ngza advance [task_id] [options]\n" not in advance_section

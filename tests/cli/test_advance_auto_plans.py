@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from gza.cli.git_ops import cmd_advance
+from gza.dispatch_preview import build_dispatch_preview
 from gza.git import GitError
 from gza.recovery_engine import _MergeContext
 from tests.cli.conftest import make_store, setup_config
@@ -34,6 +35,8 @@ def _advance_args(tmp_path: Path, **overrides) -> argparse.Namespace:
         new=False,
         max_review_cycles=None,
         squash_threshold=None,
+        tags=None,
+        all_tags=False,
     )
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -53,6 +56,29 @@ def _create_completed_plan(store, prompt="Design the feature"):
     plan.completed_at = datetime.now(UTC)
     store.update(plan)
     return plan
+
+
+def _create_mixed_owner_recovery_fixture(store):
+    plan = _create_completed_plan(store, "Scoped completed plan")
+    plan.tags = ("release",)
+    store.update(plan)
+    assert plan.id is not None
+
+    failed_review = store.add(
+        "Scoped failed review leaf",
+        task_type="review",
+        based_on=plan.id,
+        tags=("release",),
+    )
+    assert failed_review.id is not None
+    failed_review.status = "failed"
+    failed_review.failure_reason = "MAX_TURNS"
+    failed_review.session_id = "sess-mixed-review"
+    failed_review.completed_at = datetime(2026, 6, 24, 9, 5, tzinfo=UTC)
+    failed_review.branch = "feature/scoped-failed-review"
+    failed_review.has_commits = True
+    store.update(failed_review)
+    return plan, failed_review
 
 
 def _create_completed_implement(store, prompt="Implement feature", based_on=None):
@@ -501,6 +527,154 @@ def test_advance_no_resume_failed_keeps_lifecycle_merge_rows_and_filters_recover
     assert str(failed_impl.id) not in captured.out
     assert "Rebase before failed-task recovery" not in captured.out
     assert "No eligible tasks to advance" not in captured.out
+
+
+def test_advance_dry_run_tag_scope_matches_shared_recovery_preview_ids(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    store._default_merge_target_cache = "main"  # noqa: SLF001
+    store._project_root = None  # noqa: SLF001
+
+    release_retry = store.add("Release retry", task_type="plan", tags=("release",))
+    assert release_retry.id is not None
+    release_retry.status = "failed"
+    release_retry.failure_reason = "INFRASTRUCTURE_ERROR"
+    release_retry.completed_at = datetime(2026, 6, 24, 10, 0, tzinfo=UTC)
+    store.update(release_retry)
+
+    ops_retry = store.add("Ops retry", task_type="plan", tags=("ops",))
+    assert ops_retry.id is not None
+    ops_retry.status = "failed"
+    ops_retry.failure_reason = "INFRASTRUCTURE_ERROR"
+    ops_retry.completed_at = datetime(2026, 6, 24, 10, 5, tzinfo=UTC)
+    store.update(ops_retry)
+
+    release_manual = store.add("Release manual", task_type="plan", tags=("release", "ops"))
+    assert release_manual.id is not None
+    release_manual.status = "failed"
+    release_manual.failure_reason = "TEST_FAILURE"
+    release_manual.completed_at = datetime(2026, 6, 24, 10, 10, tzinfo=UTC)
+    store.update(release_manual)
+
+    with patch(
+        "gza.recovery_engine._load_merge_context",
+        return_value=_MergeContext(git=None, default_branch="main"),
+    ):
+        preview = build_dispatch_preview(
+            store,
+            tags=("release", "missing"),
+            any_tag=True,
+            max_recovery_attempts=1,
+            selection_mode="recovery_only",
+            include_pending=False,
+        )
+
+    preview_ids = [entry.task.id for entry in preview.recovery_entries]
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch(
+            "gza.recovery_engine._load_merge_context",
+            return_value=_MergeContext(git=None, default_branch="main"),
+        ),
+    ):
+        rc = cmd_advance(
+            _advance_args(
+                tmp_path,
+                dry_run=True,
+                tags=["release", "missing"],
+                all_tags=False,
+            )
+        )
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert preview_ids == [release_retry.id, release_manual.id]
+    for task_id in preview_ids:
+        assert str(task_id) in captured.out
+    assert str(ops_retry.id) not in captured.out
+
+
+def test_advance_dry_run_mixed_owner_recovery_row_shows_recovery_leaf_and_lifecycle_owner(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    store._default_merge_target_cache = "main"  # noqa: SLF001
+    store._project_root = None  # noqa: SLF001
+    plan, failed_review = _create_mixed_owner_recovery_fixture(store)
+
+    with patch(
+        "gza.recovery_engine._load_merge_context",
+        return_value=_MergeContext(git=None, default_branch="main"),
+    ):
+        preview = build_dispatch_preview(
+            store,
+            tags=("release",),
+            any_tag=True,
+            max_recovery_attempts=1,
+            selection_mode="recovery_only",
+            include_pending=False,
+        )
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
+        patch(
+            "gza.recovery_engine._load_merge_context",
+            return_value=_MergeContext(git=None, default_branch="main"),
+        ),
+    ):
+        rc = cmd_advance(
+            _advance_args(
+                tmp_path,
+                dry_run=True,
+                tags=["release"],
+                all_tags=False,
+            )
+        )
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert [entry.task.id for entry in preview.recovery_entries] == [failed_review.id]
+    assert "Recovery subset (shared preview):" in captured.out
+    assert failed_review.id in captured.out
+    assert "Resume failed task (MAX_TURNS)" in captured.out
+    assert f"Would advance 1 task(s):" in captured.out
+    assert plan.id in captured.out
+    assert "Create and start plan review task" in captured.out
+
+
+def test_advance_explicit_task_fails_closed_when_tag_scope_excludes_it(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Ops-only task", task_type="plan", tags=("ops",))
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+    assert task.id is not None
+
+    with patch("gza.cli.git_ops.Git", return_value=_mock_git()):
+        rc = cmd_advance(
+            _advance_args(
+                tmp_path,
+                task_id=task.id,
+                dry_run=True,
+                tags=["release"],
+                all_tags=False,
+            )
+        )
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert f"Task {task.id} does not match the requested advance scope" in captured.out
 
 
 def test_advance_create_implement_respects_batch_limit(tmp_path: Path, capsys) -> None:

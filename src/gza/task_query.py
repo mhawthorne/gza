@@ -94,6 +94,7 @@ class TaskQuery:
     exclude_tag_filters: tuple[str, ...] | None = None
     any_tag: bool = True
     pickup_only: bool = False
+    max_recovery_attempts: int | None = None
     date_filter: DateFilter | None = None
     sort: SortSpec = DEFAULT_SORT
     projection: ProjectionSpec = ProjectionSpec()
@@ -338,6 +339,7 @@ class TaskQueryPresets:
         task_types: tuple[str, ...] | None = None,
         tags: tuple[str, ...] | None = None,
         any_tag: bool = True,
+        max_recovery_attempts: int | None = None,
         date_filter: DateFilter | None = None,
         mode: PresentationMode = "one_line",
     ) -> TaskQuery:
@@ -348,6 +350,7 @@ class TaskQueryPresets:
             lifecycle_state=("incomplete",),
             tag_filters=normalize_tag_filters(tags),
             any_tag=any_tag,
+            max_recovery_attempts=max_recovery_attempts,
             date_filter=date_filter,
             projection=ProjectionSpec(preset=TaskProjectionPreset.INCOMPLETE_SUMMARY),
             presentation=PresentationSpec(mode=mode),
@@ -541,6 +544,7 @@ class TaskQueryService:
                     exclude_task_types=query.exclude_task_types,
                     tags=query.tag_filters,
                     any_tag=query.any_tag,
+                    max_recovery_attempts=query.max_recovery_attempts,
                     date_filter=query.date_filter,
                     include_skipped=True,
                     exclude_dropped_from_planning=True,

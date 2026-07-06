@@ -147,8 +147,8 @@ class TestHelpOutput:
         assert "recovery, lifecycle, and pending lanes separately" in next_help.stdout
         assert queue_help.returncode == 0
         queue_help_text = " ".join(queue_help.stdout.split())
-        assert "Preview the pending lane by default" in queue_help.stdout
-        assert "Use --full, --recovery, or --recovery-first for broader dispatch previews." in queue_help_text
+        assert "Preview the shared dispatch order by default" in queue_help.stdout
+        assert "Use --pending or --recovery for narrower views." in queue_help_text
         assert work_help.returncode == 0
         assert "does not run recovery or review/merge lifecycle work" in work_help.stdout
         assert advance_help.returncode == 0
@@ -451,9 +451,12 @@ class TestHelpOutput:
         assert "--fields" in result.stdout
         assert "--list-fields" in result.stdout
         assert "--json" in result.stdout
+        assert "--tree" in result.stdout
         assert "--tag TAG" in result.stdout
         assert "--all-tags" in result.stdout
         assert "--blocked-by-dropped" in result.stdout
+        assert "--tag" in result.stdout
+        assert "--any-tag" in result.stdout
         assert "live shared lifecycle planner" in result.stdout
         assert "deprecated and no longer supported" not in result.stdout
         assert "incomplete --blocked-by-dropped --list-fields" in Path("docs/configuration.md").read_text()
@@ -498,6 +501,8 @@ class TestHelpOutput:
 
         assert "Skip automatic failed-task recovery decisions (resume/retry/manual-review)" in help_text
         assert "Override max_resume_attempts (0 disables automatic failed-task recovery; any positive value enables the fixed bounded shared recovery policy)" in help_text
+        assert "--tag TAG" in help_result.stdout
+        assert "--any-tag" in help_result.stdout
         assert "Skip auto-resume of resumable failed tasks" not in help_text
 
         assert "shared automatic failed-task recovery (resume/retry)" in docs_text
@@ -779,17 +784,17 @@ class TestHelpOutput:
         queue_text = " ".join(queue_help.stdout.split())
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
-        assert "use 'uv run gza queue --tag TAG' to preview the matching pending pickup order" in watch_text
+        assert "use 'uv run gza queue --tag TAG --pending' to preview the matching pending pickup order" in watch_text
         assert "derived blockers" in watch_text
         assert "does not start them" in watch_text
         assert "pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'" in queue_text
-        assert "Add '--full' to preview matching recovery candidates and lifecycle actions too" in queue_text
+        assert "Use '--pending' for the pending-only view" in queue_text
         assert "--recovery-first" in queue_text
         assert "use 'gza queue --tag TAG' to preview scoped pickup order" not in watch_text
         assert "same scoped pickup order used by 'gza watch --tag TAG'" not in queue_text
-        assert "Only list pending tasks matching tag filters by default" in docs_text
-        assert "use `uv run gza queue --tag TAG` to preview the matching pending pickup order" in docs_text
-        assert "add `--full` to preview matching recovery candidates and lifecycle actions too" in docs_text
+        assert "Only preview dispatch rows matching tag filters" in docs_text
+        assert "use `uv run gza queue --tag TAG --pending` to preview the matching pending pickup order" in docs_text
+        assert "use `--pending` for the pending-only view" in docs_text
         assert "canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order" in docs_text
 
     def test_watch_help_mentions_recovery_lane_flags(self, tmp_path):
@@ -918,10 +923,10 @@ class TestHelpOutput:
         help_text = " ".join(queue_help.stdout.split())
         docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
-        assert "Show first N runnable tasks (default: 10; blocked tasks are always shown; use 0, -1, or --all for all runnable tasks)" in help_text
-        assert "Show all runnable tasks (blocked tasks are always shown)" in help_text
-        assert "Show first N runnable tasks (default: 10; blocked tasks are always shown; use `0`, `-1`, or `--all` for all runnable tasks)" in docs_text
-        assert "By default, `gza queue` shows the first 10 runnable tasks plus all blocked tasks." in docs_text
+        assert "Show first N runnable dispatch rows in preview order (default: 10; blocked pending and needs-human recovery rows are always shown; use 0, -1, or --all for all runnable rows)" in help_text
+        assert "Show all runnable dispatch rows (blocked pending and needs-human recovery rows are always shown)" in help_text
+        assert "Show first N runnable dispatch rows in preview order (default: 10; blocked pending and needs-human recovery rows are always shown; use `0`, `-1`, or `--all` for all runnable rows)" in docs_text
+        assert "By default, `gza queue` shows the first 10 runnable dispatch rows in shared preview order, while blocked pending rows and needs-human recovery rows always remain visible." in docs_text
 
     def test_queue_ordering_language_is_consistent_between_help_docs_and_tag_scope_behavior(self, tmp_path):
         """Queue docs/help should consistently describe tag-scoped explicit ordering semantics."""

@@ -475,7 +475,7 @@ def main() -> int:
         ),
     )
     add_common_args(incomplete_parser)
-    incomplete_parser.set_defaults(last=5)
+    incomplete_parser.set_defaults(last=5, all_tags=False)
     incomplete_parser.add_argument(
         "--json",
         action="store_true",
@@ -485,6 +485,11 @@ def main() -> int:
         "--verbose",
         action="store_true",
         help="Show owner task details under each unresolved lineage entry",
+    )
+    incomplete_parser.add_argument(
+        "--tree",
+        action="store_true",
+        help="Render unresolved lineages as trees rooted at the live shared recovery subject when applicable",
     )
     incomplete_parser.add_argument(
         "--blocked-by-dropped",
@@ -518,19 +523,6 @@ def main() -> int:
         help="Date field used by --days filters (default: effective)",
     )
     incomplete_parser.add_argument(
-        "--tag",
-        action="append",
-        dest="tags",
-        metavar="TAG",
-        help="Only show unresolved lineage owners matching tag filters (repeatable)",
-    )
-    incomplete_parser.add_argument(
-        "--all-tags",
-        action="store_true",
-        dest="all_tags",
-        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
-    )
-    incomplete_parser.add_argument(
         "--fields",
         metavar="CSV",
         help="Projection fields override (comma-separated; works in text or JSON mode)",
@@ -539,6 +531,26 @@ def main() -> int:
         "--list-fields",
         action="store_true",
         help="List valid --fields values for this command and exit",
+    )
+    incomplete_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Only show unresolved rows matching tag filters (repeatable); recovery rows use the same shared preview scope as queue/watch/advance",
+    )
+    incomplete_tag_mode = incomplete_parser.add_mutually_exclusive_group()
+    incomplete_tag_mode.add_argument(
+        "--all-tags",
+        action="store_true",
+        dest="all_tags",
+        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
+    )
+    incomplete_tag_mode.add_argument(
+        "--any-tag",
+        action="store_false",
+        dest="all_tags",
+        help="With repeated --tag values, match any requested tag (default)",
     )
 
     # unstick command
@@ -887,6 +899,7 @@ def main() -> int:
         description="Run recovery plus review/merge lifecycle work; use --new to also start pending tasks.",
     )
     add_common_args(advance_parser)
+    advance_parser.set_defaults(all_tags=False)
     advance_parser.add_argument(
         "task_id",
         type=str,
@@ -987,6 +1000,26 @@ def main() -> int:
             "Squash-merge branches with N or more commits. "
             "0 disables auto-squash. Default: from gza.yaml."
         ),
+    )
+    advance_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Only advance, recover, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG' to preview the shared scoped recovery subset",
+    )
+    advance_tag_mode = advance_parser.add_mutually_exclusive_group()
+    advance_tag_mode.add_argument(
+        "--all-tags",
+        action="store_true",
+        dest="all_tags",
+        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
+    )
+    advance_tag_mode.add_argument(
+        "--any-tag",
+        action="store_false",
+        dest="all_tags",
+        help="With repeated --tag values, match any requested tag (default)",
     )
 
     # watch command
@@ -1123,7 +1156,7 @@ def main() -> int:
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG' to preview the matching pending pickup order, or add '--full' to also preview matching recovery candidates and lifecycle actions. Add '--recovery-first' to restrict pending display to explicitly positioned tasks. Scoped watch reports out-of-scope derived blockers but does not start them",
+        help="Only advance, resume, and start tasks matching tag filters (repeatable); use 'uv run gza queue --tag TAG --pending' to preview the matching pending pickup order, or plain 'uv run gza queue --tag TAG' for the shared recovery+pending preview. Add '--recovery-first' to restrict pending display to explicitly positioned tasks. Scoped watch reports out-of-scope derived blockers but does not start them",
     )
     watch_parser.add_argument(
         "--all-tags",
@@ -1237,17 +1270,17 @@ def main() -> int:
     # queue command
     queue_parser = subparsers.add_parser(
         "queue",
-        help="Preview the pending lane by default; use --full, --recovery, or --recovery-first for broader dispatch previews; manage pending-lane ordering",
-        description="Preview the pending lane by default and manage pending-lane ordering. Use --full, --recovery, or --recovery-first for broader dispatch previews.",
+        help="Preview the shared dispatch order by default; use --pending or --recovery for narrower views; manage pending-lane ordering",
+        description="Preview the shared dispatch order by default and manage pending-lane ordering. Use --pending or --recovery for narrower views.",
     )
     add_common_args(queue_parser)
-    queue_parser.set_defaults(limit=10, all=False, dispatch_mode="pending_only")
+    queue_parser.set_defaults(limit=10, all=False)
     queue_parser.add_argument(
         "--tag",
         action="append",
         dest="tags",
         metavar="TAG",
-        help="Only list pending tasks matching tag filters by default (repeatable); pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'. Add '--full' to preview matching recovery candidates and lifecycle actions too, or '--recovery-first' to limit pending display to explicitly positioned tasks",
+        help="Only preview dispatch rows matching tag filters (repeatable); the pending lane uses the same scoped pickup order as 'uv run gza watch --tag TAG'. Use '--pending' for the pending-only view or '--recovery-first' to limit pending display to explicitly positioned tasks",
     )
     queue_parser.add_argument(
         "--all-tags",
@@ -1289,19 +1322,19 @@ def main() -> int:
         action="store_const",
         const="default",
         dest="dispatch_mode",
-        help="Compatibility alias for the default multi-lane dispatch preview",
+        help="Compatibility alias for the default shared dispatch preview",
     )
     queue_parser.add_argument(
         "-n",
         "--limit",
         type=_parse_queue_limit,
         metavar="N",
-        help="Show first N runnable tasks (default: 10; blocked tasks are always shown; use 0, -1, or --all for all runnable tasks)",
+        help="Show first N runnable dispatch rows in preview order (default: 10; blocked pending and needs-human recovery rows are always shown; use 0, -1, or --all for all runnable rows)",
     )
     queue_parser.add_argument(
         "--all",
         action="store_true",
-        help="Show all runnable tasks (blocked tasks are always shown)",
+        help="Show all runnable dispatch rows (blocked pending and needs-human recovery rows are always shown)",
     )
 
     def _add_queue_tag_scope_args(subparser: argparse.ArgumentParser, *, action: str) -> None:

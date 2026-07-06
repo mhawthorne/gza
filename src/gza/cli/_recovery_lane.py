@@ -9,7 +9,7 @@ from ..db import SqliteTaskStore, Task as DbTask
 from ..dispatch_preview import build_dispatch_preview
 from ..git import Git
 from ..recovery_engine import FailedRecoveryDecision
-from .advance_engine import classify_advance_action, failed_recovery_decision_to_attention_action
+from .advance_engine import failed_recovery_decision_to_action, failed_recovery_decision_to_attention_action
 
 
 @dataclass(frozen=True)
@@ -48,35 +48,23 @@ def collect_recovery_lane_entries(
         task = preview_entry.task
         owner_task = preview_entry.owner_task
         decision = preview_entry.decision
-        action = preview_entry.advance_action
         if task.id is None or owner_task is None or decision is None:
             continue
-        if action is not None:
-            action_class = classify_advance_action(action)
-            if action_class == "actionable":
-                entries.append(RecoveryLaneEntry(owner_task=owner_task, task=task, decision=decision, action=action))
-                continue
-            if action_class == "needs_attention":
-                entries.append(
-                    RecoveryLaneEntry(
-                        owner_task=owner_task,
-                        task=task,
-                        decision=decision,
-                        action=action,
-                        attention_action=action,
-                    )
-                )
-                continue
-        if decision.action in {"resume", "retry"}:
+
+        if preview_entry.runnable:
+            action = preview_entry.advance_action or failed_recovery_decision_to_action(task, decision)
             entries.append(RecoveryLaneEntry(owner_task=owner_task, task=task, decision=decision, action=action))
             continue
-        attention_action = failed_recovery_decision_to_attention_action(
-            store,
-            task,
-            decision,
-            max_recovery_attempts=max_recovery_attempts,
-            read_context=preview.read_context,
-        )
+
+        attention_action = preview_entry.advance_action
+        if attention_action is None:
+            attention_action = failed_recovery_decision_to_attention_action(
+                store,
+                task,
+                decision,
+                max_recovery_attempts=max_recovery_attempts,
+                read_context=preview.read_context,
+            )
         if attention_action is None:
             continue
         entries.append(
@@ -84,7 +72,7 @@ def collect_recovery_lane_entries(
                 owner_task=owner_task,
                 task=task,
                 decision=decision,
-                action=action,
+                action=preview_entry.advance_action,
                 attention_action=attention_action,
             )
         )

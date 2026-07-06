@@ -3403,6 +3403,221 @@ def test_cmd_advance_wraps_planning_in_git_cache(tmp_path: Path) -> None:
     assert cached_entries == ["entered"]
 
 
+def test_cmd_advance_dry_run_raises_unexpected_merge_context_type_error(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Advance type error should surface", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/advance-type-error"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="needs_retry",
+        next_action={"type": "retry", "description": "retry failed task"},
+        next_action_reason="retryable-provider-error",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=task,
+        recovery_leaf_task=task,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.current_branch.return_value = "main"
+    fake_git.default_branch.return_value = "main"
+    fake_git.local_branch_names.return_value = ()
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=iter([row])),
+        patch("gza.cli.git_ops.build_merge_context_from_git", side_effect=TypeError("boom")),
+    ):
+        with pytest.raises(TypeError, match="boom"):
+            cmd_advance(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=task.id,
+                    dry_run=True,
+                    auto=True,
+                    max=None,
+                    batch=None,
+                    no_docker=True,
+                    force=False,
+                    plans=False,
+                    unimplemented=False,
+                    create=False,
+                    no_resume_failed=False,
+                    max_resume_attempts=None,
+                    advance_type=None,
+                    new=False,
+                    max_review_cycles=None,
+                    squash_threshold=None,
+                )
+            )
+
+
+def test_cmd_advance_dry_run_warns_and_degrades_without_local_branch_names(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Advance degraded git compatibility", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/advance-degraded"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="skipped",
+        next_action={"type": "skip", "description": "nothing to do"},
+        next_action_reason="precomputed",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    class _CompatGit:
+        repo_dir = tmp_path
+
+        def current_branch(self) -> str:
+            return "main"
+
+        def default_branch(self) -> str:
+            return "main"
+
+        @contextmanager
+        def cached(self):
+            yield self
+
+    compat_git = _CompatGit()
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=compat_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=iter([row])),
+    ):
+        rc = cmd_advance(
+            argparse.Namespace(
+                project_dir=tmp_path,
+                task_id=task.id,
+                dry_run=True,
+                auto=True,
+                max=None,
+                batch=None,
+                no_docker=True,
+                force=False,
+                plans=False,
+                unimplemented=False,
+                create=False,
+                no_resume_failed=False,
+                max_resume_attempts=None,
+                advance_type=None,
+                new=False,
+                max_review_cycles=None,
+                squash_threshold=None,
+            )
+        )
+
+    assert rc == 0
+    assert "Warning: advance recovery preview is using a degraded git context" in capsys.readouterr().out
+
+
+def test_cmd_advance_dry_run_warns_and_degrades_when_local_branch_names_is_not_iterable(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Advance degraded git non-iterable compatibility", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/advance-degraded-mock"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="skipped",
+        next_action={"type": "skip", "description": "nothing to do"},
+        next_action_reason="precomputed",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    compat_git = MagicMock(spec=Git)
+    compat_git.repo_dir = tmp_path
+    compat_git.current_branch.return_value = "main"
+    compat_git.default_branch.return_value = "main"
+    compat_git.local_branch_names.return_value = object()
+
+    @contextmanager
+    def _cached_scope():
+        yield compat_git
+
+    compat_git.cached.side_effect = _cached_scope
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=compat_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=iter([row])),
+    ):
+        rc = cmd_advance(
+            argparse.Namespace(
+                project_dir=tmp_path,
+                task_id=task.id,
+                dry_run=True,
+                auto=True,
+                max=None,
+                batch=None,
+                no_docker=True,
+                force=False,
+                plans=False,
+                unimplemented=False,
+                create=False,
+                no_resume_failed=False,
+                max_resume_attempts=None,
+                advance_type=None,
+                new=False,
+                max_review_cycles=None,
+                squash_threshold=None,
+            )
+        )
+
+    assert rc == 0
+    assert "Warning: advance recovery preview is using a degraded git context" in capsys.readouterr().out
+
+
 def test_cmd_advance_batches_ref_preloads_during_lifecycle_planning(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

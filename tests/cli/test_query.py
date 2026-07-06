@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -31,6 +32,7 @@ from gza.cli._common import clear_task_queue_position_scoped, set_task_queue_pos
 from gza.config import Config
 from gza.console import truncate
 from gza.db import Task
+from gza.dispatch_preview import build_dispatch_preview
 from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerRow
 from gza.pr_ops import LookupTaskPrResult
@@ -141,6 +143,24 @@ def _mock_unmerged_git() -> Git:
 
         def worktree_list(self) -> list[dict[str, object]]:
             return []
+
+        def worktree_health_probe(self):
+            from gza.git_health import GitWorktreeHealthProbe
+
+            return GitWorktreeHealthProbe(
+                command="git worktree list --porcelain",
+                returncode=0,
+                stdout="",
+                stderr="",
+            )
+
+        def _run(self, *args: str, check: bool = True, stdin: bytes | None = None):
+            del check, stdin
+            if args == ("worktree", "list", "--porcelain"):
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+            if args == ("rev-parse", "--git-common-dir"):
+                return subprocess.CompletedProcess(args=args, returncode=0, stdout=".git\n", stderr="")
+            raise AssertionError(f"_mock_unmerged_git received unexpected git command: {args!r}")
 
         def is_ancestor(self, ancestor: str, descendant: str) -> bool:
             del ancestor, descendant
@@ -3213,6 +3233,108 @@ class TestNextCommand:
         pending_task_idx = result.stdout.index("Pending work")
         assert recovery_idx < pending_header_idx < pending_task_idx
 
+    def test_next_shows_reconcile_recovery_candidate(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        failed = _create_failed_recovery_candidate(
+            store,
+            prompt="Publish branch again",
+            failure_reason="BRANCH_UNPUSHABLE",
+            session_id=None,
+        )
+        failed.branch = "feature/next-reconcile"
+        store.update(failed)
+
+        class _TestGit(Git):
+            def __init__(self, repo_dir: object) -> None:
+                self.repo_dir = repo_dir  # type: ignore[assignment]
+                self._cache = None
+
+            def default_branch(self) -> str:
+                return "main"
+
+            def branch_exists(self, branch: str) -> bool:
+                return branch == failed.branch
+
+            def ref_exists(self, ref: str) -> bool:
+                del ref
+                return False
+
+            def rev_parse_if_exists(self, ref: str) -> str | None:
+                if ref == "main":
+                    return "b" * 40
+                if ref == failed.branch:
+                    return "a" * 40
+                return None
+
+            def branches_exist(self, branches) -> dict[str, bool]:
+                return {str(branch): str(branch) == failed.branch for branch in branches}
+
+            def resolve_refs(self, refs, peel: str = "commit") -> dict[str, str | None]:
+                del peel
+                return {
+                    str(ref): ("b" * 40 if str(ref) == "main" else "a" * 40 if str(ref) == failed.branch else None)
+                    for ref in refs
+                }
+
+            def refs_exist(self, refs) -> dict[str, bool]:
+                return {str(ref): False for ref in refs}
+
+            def can_merge(self, branch: str, into: str | None = None) -> bool:
+                del into
+                return branch == failed.branch
+
+            def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
+                del branch, into, use_cherry
+                return False
+
+            def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+                del ancestor, descendant
+                return False
+
+            def merge_base(self, ref1: str, ref2: str) -> str:
+                del ref1, ref2
+                return ""
+
+            def count_commits_ahead(self, branch: str, target: str) -> int:
+                del branch, target
+                return 1
+
+            def count_commits_ahead_checked(self, branch: str, target: str) -> int | None:
+                del branch, target
+                return 1
+
+            def get_diff_numstat(self, revision_range: str) -> str:
+                del revision_range
+                return ""
+
+            def get_diff_stat_parsed(self, revision_range: str) -> tuple[int, int, int]:
+                del revision_range
+                return (1, 1, 0)
+
+        monkeypatch.setattr(query_cli, "Git", _TestGit)
+
+        exit_code = query_cli.cmd_next(
+            argparse.Namespace(
+                project_dir=tmp_path,
+                tags=None,
+                any_tag=False,
+                all=False,
+            )
+        )
+        output = capsys.readouterr().out
+
+        assert exit_code == 0
+        normalized = " ".join(output.split())
+        assert "Recovery lane:" in output
+        assert f"reconcile {failed.id}" in normalized
+        assert "reason=BRANCH_UNPUSHABLE" in normalized
+
     def test_next_shows_lifecycle_actions_between_recovery_and_pending(self, tmp_path: Path):
         failed, plan = _seed_visible_lifecycle_and_recovery_fixture(tmp_path)
 
@@ -3412,7 +3534,7 @@ class TestQueueCommand:
         monkeypatch.setattr(query_cli, "Git", lambda _project_dir: fake_git)
         yield
 
-    def test_queue_defaults_to_first_ten_runnable_tasks(self, tmp_path: Path):
+    def test_queue_defaults_to_first_ten_runnable_dispatch_rows(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
 
@@ -3426,23 +3548,9 @@ class TestQueueCommand:
         assert "Task 10" in result.stdout
         assert "Task 11" not in result.stdout
         assert "Task 12" not in result.stdout
-        assert "2 more runnable tasks" in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots): 10 shown / 2 more" in result.stdout
 
-    def test_queue_shows_recovery_lane_separately_from_pending_lane(self, tmp_path: Path):
-        setup_config(tmp_path)
-        store = make_store(tmp_path)
-        failed = _create_failed_recovery_candidate(store, prompt="Retry me", task_type="plan", session_id=None, failure_reason="INFRASTRUCTURE_ERROR")
-        store.add("Pending queue task")
-
-        result = invoke_gza("queue", "--full", "--project", str(tmp_path))
-
-        assert result.returncode == 0
-        assert "Recovery lane:" in result.stdout
-        assert "Pending lane:" in result.stdout
-        assert f"retry {failed.id}" in " ".join(result.stdout.split())
-        assert "Pending queue task" in result.stdout
-
-    def test_queue_default_shows_only_pending_lane(self, tmp_path: Path):
+    def test_queue_default_shows_recovery_and_pending_from_shared_preview(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
         failed = _create_failed_recovery_candidate(store, prompt="Retry me", task_type="plan", session_id=None, failure_reason="INFRASTRUCTURE_ERROR")
@@ -3451,31 +3559,74 @@ class TestQueueCommand:
         result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Pending lane:" in result.stdout
+        assert "Runnable recovery lane (watch will run):" in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots):" in result.stdout
+        assert f"retry {failed.id}" in " ".join(result.stdout.split())
         assert "Pending queue task" in result.stdout
-        assert "Recovery lane:" not in result.stdout
+
+    def test_queue_pending_mode_shows_only_pending_lane(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        failed = _create_failed_recovery_candidate(store, prompt="Retry me", task_type="plan", session_id=None, failure_reason="INFRASTRUCTURE_ERROR")
+        store.add("Pending queue task")
+
+        result = invoke_gza("queue", "--pending", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Pending lane (watch will run after recovery policy allows slots):" in result.stdout
+        assert "Pending queue task" in result.stdout
+        assert "Runnable recovery lane (watch will run):" not in result.stdout
+        assert "Needs human - watch skips:" not in result.stdout
         assert "Lifecycle actions:" not in result.stdout
         assert failed.id not in result.stdout
 
     @pytest.mark.parametrize("flag", ["--recovery", "--recovery-only"])
-    def test_queue_recovery_only_mode_omits_lifecycle_and_pending_sections(
+    def test_queue_recovery_only_mode_shows_runnable_and_needs_human_sections(
         self,
         tmp_path: Path,
         flag: str,
     ) -> None:
-        failed, plan = _seed_visible_lifecycle_and_recovery_fixture(tmp_path)
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        first_runnable = _create_failed_recovery_candidate(
+            store,
+            prompt="Resume first",
+            task_type="implement",
+            failure_reason="MAX_TURNS",
+            session_id="resume-session-1",
+        )
+        second_runnable = _create_failed_recovery_candidate(
+            store,
+            prompt="Resume second",
+            task_type="implement",
+            failure_reason="MAX_TURNS",
+            session_id="resume-session-2",
+        )
+        manual = _create_failed_recovery_candidate(
+            store,
+            prompt="Manual follow-up",
+            task_type="plan",
+            failure_reason="TEST_FAILURE",
+            session_id=None,
+        )
+        store.add("Pending queue work")
 
         with patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()):
-            result = invoke_gza("queue", flag, "--project", str(tmp_path))
+            result = invoke_gza("queue", flag, "-n", "1", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
-        assert "Recovery lane:" in result.stdout
-        assert f"resume {failed.id}" in normalized
+        assert "Runnable recovery lane (watch will run): 1 shown / 1 more" in result.stdout
+        assert "Needs human - watch skips: 1 shown / all shown" in result.stdout
+        assert f"resume {first_runnable.id}" in normalized
+        assert first_runnable.id in result.stdout
+        assert second_runnable.id not in result.stdout
+        assert "Resume second" not in result.stdout
+        assert manual.id in result.stdout
+        assert "Manual follow-up" in result.stdout
         assert "Lifecycle actions:" not in result.stdout
-        assert "Pending lane:" not in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots):" not in result.stdout
         assert "Pending queue work" not in result.stdout
-        assert plan.id not in result.stdout
 
     def test_queue_recovery_only_empty_state_reports_no_recovery_candidates(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -3487,25 +3638,25 @@ class TestQueueCommand:
         assert result.returncode == 0
         assert "No recovery candidates" in result.stdout
         assert "No pending tasks" not in result.stdout
-        assert "Pending lane:" not in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots):" not in result.stdout
 
     def test_queue_shows_lifecycle_actions_between_recovery_and_pending(self, tmp_path: Path):
         failed, plan = _seed_visible_lifecycle_and_recovery_fixture(tmp_path)
 
         with patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()):
-            result = invoke_gza("queue", "--full", "--project", str(tmp_path))
+            result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
-        assert "Recovery lane:" in result.stdout
+        assert "Runnable recovery lane (watch will run):" in result.stdout
         assert "Lifecycle actions:" in result.stdout
-        assert "Pending lane:" in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots):" in result.stdout
         assert f"resume {failed.id}" in normalized
         assert plan.id in result.stdout
         assert "Materialize implementation slices from plan review" in result.stdout
-        recovery_idx = result.stdout.index("Recovery lane:")
+        recovery_idx = result.stdout.index("Runnable recovery lane (watch will run):")
         lifecycle_idx = result.stdout.index("Lifecycle actions:")
-        pending_idx = result.stdout.index("Pending lane:")
+        pending_idx = result.stdout.index("Pending lane (watch will run after recovery policy allows slots):")
         assert recovery_idx < lifecycle_idx < pending_idx
 
     def test_queue_preview_does_not_persist_merged_lifecycle_state(self, tmp_path: Path):
@@ -3513,7 +3664,7 @@ class TestQueueCommand:
         preview_git = _PreviewLifecycleGit(merged_branches=(merged_impl.branch or "",))
 
         with patch("gza.cli.watch.Git", return_value=preview_git):
-            result = invoke_gza("queue", "--full", "--project", str(tmp_path))
+            result = invoke_gza("queue", "--project", str(tmp_path))
 
         store = make_store(tmp_path)
         refreshed_impl = store.get(merged_impl.id)
@@ -3530,19 +3681,19 @@ class TestQueueCommand:
         failed, legacy_impl = _seed_legacy_unmerged_lifecycle_and_recovery_fixture(tmp_path)
 
         with patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()):
-            result = invoke_gza("queue", "--full", "--project", str(tmp_path))
+            result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         normalized = " ".join(result.stdout.split())
-        assert "Recovery lane:" in result.stdout
+        assert "Runnable recovery lane (watch will run):" in result.stdout
         assert "Lifecycle actions:" in result.stdout
-        assert "Pending lane:" in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots):" in result.stdout
         assert f"resume {failed.id}" in normalized
         assert legacy_impl.id in result.stdout
         assert "Merge (review APPROVED)" in result.stdout
-        recovery_idx = result.stdout.index("Recovery lane:")
+        recovery_idx = result.stdout.index("Runnable recovery lane (watch will run):")
         lifecycle_idx = result.stdout.index("Lifecycle actions:")
-        pending_idx = result.stdout.index("Pending lane:")
+        pending_idx = result.stdout.index("Pending lane (watch will run after recovery policy allows slots):")
         assert recovery_idx < lifecycle_idx < pending_idx
 
     def test_queue_pending_mode_is_git_free_but_default_mode_exercises_git_path(self, tmp_path: Path) -> None:
@@ -3577,9 +3728,9 @@ class TestQueueCommand:
             output.plain if isinstance(output, Text) else str(output)
             for output in recording_console.outputs
         )
-        assert "Pending lane:" in rendered
+        assert "Pending lane (watch will run after recovery policy allows slots):" in rendered
         assert "Pending queue task" in rendered
-        assert "Recovery lane:" not in rendered
+        assert "Runnable recovery lane (watch will run):" not in rendered
         assert "Lifecycle actions:" not in rendered
 
         with patch.object(watch_cli, "Git", lambda _project_dir: exploding_git):
@@ -3646,20 +3797,28 @@ class TestQueueCommand:
         assert "Task 12" in result.stdout
         assert "more runnable tasks" not in result.stdout
 
-    def test_queue_limit_restricts_output(self, tmp_path: Path):
+    def test_queue_limit_restricts_combined_runnable_dispatch_order(self, tmp_path: Path):
         setup_config(tmp_path)
         store = make_store(tmp_path)
-
-        for i in range(5):
-            store.add(f"Task {i + 1}")
+        failed = _create_failed_recovery_candidate(
+            store,
+            prompt="Retry first",
+            task_type="plan",
+            failure_reason="INFRASTRUCTURE_ERROR",
+            session_id=None,
+        )
+        store.add("Pending 1")
+        store.add("Pending 2")
 
         result = invoke_gza("queue", "-n", "2", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Task 1" in result.stdout
-        assert "Task 2" in result.stdout
-        assert "Task 3" not in result.stdout
-        assert "3 more runnable tasks" in result.stdout
+        normalized = " ".join(result.stdout.split())
+        assert f"retry {failed.id}" in normalized
+        assert "Pending 1" in result.stdout
+        assert "Pending 2" not in result.stdout
+        assert "Runnable recovery lane (watch will run): 1 shown / all shown" in result.stdout
+        assert "Pending lane (watch will run after recovery policy allows slots): 1 shown / 1 more" in result.stdout
 
     def test_queue_shows_quiet_lane_without_numbering_quiet_tasks(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -3678,13 +3837,62 @@ class TestQueueCommand:
         result = invoke_gza("queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Pending lane:" in result.stdout
+        assert (
+            "Pending lane (watch will run after recovery policy allows slots): "
+            "1 shown / all shown"
+        ) in result.stdout
         assert "Quiet lane:" in result.stdout
         assert f"1  {runnable.id}" in result.stdout
         assert "Fresh quiet task" in result.stdout
-        quiet_line = next(line for line in result.stdout.splitlines() if "Fresh quiet task" in line)
+        quiet_line = next(
+            line
+            for line in result.stdout.splitlines()
+            if "Fresh quiet task" in line and line.lstrip().startswith("-")
+        )
         assert quiet_line.lstrip().startswith("-")
         assert "held until" in result.stdout
+
+    def test_queue_pending_shows_quiet_lane_without_consuming_runnable_limit(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "quiet_period_seconds: 300\n")
+        store = make_store(tmp_path)
+
+        runnable = store.add("Older scoped runnable task", tags=("release",))
+        quiet = store.add("Fresh scoped quiet task", tags=("release",))
+        store.add("Other tag task", tags=("backlog",))
+        assert runnable.id is not None
+        assert quiet.id is not None
+        runnable.last_edited_at = datetime.now(UTC) - timedelta(minutes=10)
+        quiet.last_edited_at = datetime.now(UTC) - timedelta(seconds=45)
+        store.update(runnable)
+        store.update(quiet)
+
+        result = invoke_gza(
+            "queue",
+            "--pending",
+            "--tag",
+            "release",
+            "-n",
+            "1",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert (
+            "Pending lane (watch will run after recovery policy allows slots): "
+            "1 shown / all shown"
+        ) in result.stdout
+        assert "Quiet lane:" in result.stdout
+        assert f"1  {runnable.id}" in result.stdout
+        quiet_line = next(
+            line
+            for line in result.stdout.splitlines()
+            if "Fresh scoped quiet task" in line and line.lstrip().startswith("-")
+        )
+        assert quiet_line.lstrip().startswith("-")
+        assert "held until" in result.stdout
+        assert "Other tag task" not in result.stdout
 
     def test_queue_keeps_dependency_blocked_quiet_task_out_of_quiet_lane(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -4353,7 +4561,7 @@ class TestQueueCommand:
         )
 
         assert result.returncode == 0
-        assert "Recovery lane:" in result.stdout
+        assert "Runnable recovery lane (watch will run):" in result.stdout
         assert "Scope gap:" in result.stdout
         assert failed.id in result.stdout
         assert retry_child.id in result.stdout
@@ -4713,7 +4921,7 @@ class TestQueueCommand:
         lines = result.stdout.splitlines()
         runnable_line = next(i for i, line in enumerate(lines) if "Runnable" in line)
         blocker_line = next(i for i, line in enumerate(lines) if "Dependency blocker" in line)
-        blocked_line = next(i for i, line in enumerate(lines) if "Blocked pending" in line)
+        blocked_line = next(i for i, line in enumerate(lines) if blocked.id in line and "Blocked pending" in line)
         assert runnable_line < blocker_line < blocked_line
         assert lines[blocked_line].split()[0] == "-"
         assert lines[blocked_line + 1].strip() == f"blocked by {blocker.id}"
@@ -4752,7 +4960,7 @@ class TestQueueCommand:
         assert "No pending tasks" not in result.stdout
         assert "Blocked pending" in result.stdout
         lines = result.stdout.splitlines()
-        blocked_line = next(i for i, line in enumerate(lines) if "Blocked pending" in line)
+        blocked_line = next(i for i, line in enumerate(lines) if blocked.id in line and "Blocked pending" in line)
         assert lines[blocked_line].split()[0] == "-"
         assert lines[blocked_line + 1].strip() == f"blocked by {blocker.id}"
 
@@ -4865,7 +5073,8 @@ class TestQueueCommand:
         assert result.returncode == 0
         lines = result.stdout.splitlines()
         task_line = next(i for i, line in enumerate(lines) if "Vanilla task" in line)
-        assert task_line == len(lines) - 1
+        if task_line + 1 < len(lines):
+            assert not lines[task_line + 1].startswith(" ")
 
     def test_queue_shows_urgent_and_blocked_metadata_on_same_second_line(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -15616,6 +15825,38 @@ class TestIncompleteCommand:
         return first_line.split()[1]
 
     @staticmethod
+    def _ids_present_in_output(output: str, *tasks: Task) -> set[str]:
+        return {
+            task.id
+            for task in tasks
+            if task.id is not None and task.id in output
+        }
+
+    @staticmethod
+    def _advance_recovery_subset_ids(output: str, *tasks: Task) -> set[str]:
+        if "Recovery subset (shared preview):" not in output:
+            return set()
+        recovery_section = output.split("Recovery subset (shared preview):", 1)[1]
+        recovery_section = recovery_section.split("Would advance", 1)[0]
+        return TestIncompleteCommand._ids_present_in_output(recovery_section, *tasks)
+
+    @staticmethod
+    def _watch_recovery_report_ids(output: str, *tasks: Task) -> set[str]:
+        candidate_ids = [task.id for task in tasks if task.id is not None]
+        matched: set[str] = set()
+        for line in output.splitlines():
+            stripped = line.strip()
+            line_ids = [task_id for task_id in candidate_ids if task_id in stripped]
+            if not line_ids:
+                continue
+            if stripped.startswith(("resume ", "retry ", "reconcile ", "skip ")):
+                matched.add(line_ids[-1])
+                continue
+            if any(stripped.startswith(f"{task_id} ") for task_id in candidate_ids):
+                matched.add(line_ids[0])
+        return matched
+
+    @staticmethod
     def _setup_merged_owner_with_live_descendant_fixture(tmp_path: Path) -> tuple[Task, Task]:
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -15763,6 +16004,36 @@ class TestIncompleteCommand:
         store.update(completed_retry)
 
         return failed, completed_retry
+
+    @staticmethod
+    def _setup_mixed_owner_recovery_fixture(tmp_path: Path) -> tuple[Task, Task]:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001
+        store._project_root = None  # noqa: SLF001
+
+        plan = store.add("Scoped completed plan", task_type="plan", tags=("release",))
+        plan.status = "completed"
+        plan.completed_at = datetime(2026, 6, 24, 9, 0, tzinfo=UTC)
+        store.update(plan)
+        assert plan.id is not None
+
+        failed_review = store.add(
+            "Scoped failed review leaf",
+            task_type="review",
+            based_on=plan.id,
+            tags=("release",),
+        )
+        failed_review.status = "failed"
+        failed_review.failure_reason = "MAX_TURNS"
+        failed_review.session_id = "sess-mixed-review"
+        failed_review.branch = "feature/scoped-failed-review"
+        failed_review.has_commits = True
+        failed_review.completed_at = datetime(2026, 6, 24, 9, 5, tzinfo=UTC)
+        store.update(failed_review)
+        assert failed_review.id is not None
+
+        return plan, failed_review
 
     def test_incomplete_text_fields_multi_field_uses_generic_blocks(
         self,
@@ -16324,11 +16595,17 @@ class TestIncompleteCommand:
             config: Config,
             git: object,
             target_branch: str | None,
+            max_recovery_attempts: int,
+            recovery_preview_entries_by_task_id: dict[str, object],
+            recovery_preview_read_context: object,
         ) -> query_cli._TaskQueryResult:  # noqa: SLF001
-            del service, store, config
+            del service, store
             assert cache_state["active"] is True
             assert git is not None
             assert target_branch == "main"
+            assert max_recovery_attempts == config.max_resume_attempts
+            assert recovery_preview_entries_by_task_id == {}
+            assert recovery_preview_read_context is not None
             phases.append("normalize")
             return result
 
@@ -16417,6 +16694,506 @@ class TestIncompleteCommand:
                 "next_action_reason": "Rebase before failed-task recovery",
             }
         ]
+
+    def test_incomplete_tag_scope_matches_shared_recovery_preview_ids(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001
+        store._project_root = None  # noqa: SLF001
+
+        release_only = store.add("Release only", task_type="plan", tags=("release",))
+        release_only.status = "failed"
+        release_only.failure_reason = "INFRASTRUCTURE_ERROR"
+        release_only.completed_at = datetime(2026, 6, 24, 9, 0, tzinfo=UTC)
+        store.update(release_only)
+        assert release_only.id is not None
+
+        release_ops = store.add("Release and ops", task_type="plan", tags=("release", "ops"))
+        release_ops.status = "failed"
+        release_ops.failure_reason = "TEST_FAILURE"
+        release_ops.completed_at = datetime(2026, 6, 24, 9, 5, tzinfo=UTC)
+        store.update(release_ops)
+        assert release_ops.id is not None
+
+        ops_only = store.add("Ops only", task_type="plan", tags=("ops",))
+        ops_only.status = "failed"
+        ops_only.failure_reason = "INFRASTRUCTURE_ERROR"
+        ops_only.completed_at = datetime(2026, 6, 24, 9, 10, tzinfo=UTC)
+        store.update(ops_only)
+        assert ops_only.id is not None
+
+        with patch(
+            "gza.recovery_engine._load_merge_context",
+            return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+        ):
+            preview = build_dispatch_preview(
+                store,
+                tags=("release", "ops"),
+                any_tag=True,
+                max_recovery_attempts=1,
+                selection_mode="recovery_only",
+                include_pending=False,
+            )
+
+        args = self._incomplete_args(tmp_path, fields="id", json=True)
+        args.tags = ["release", "ops"]
+        args.all_tags = False
+        result = query_cli.cmd_incomplete(args)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert {row["id"] for row in json.loads(captured.out)} == {
+            release_only.id,
+            release_ops.id,
+            ops_only.id,
+        }
+        assert {entry.task.id for entry in preview.recovery_entries} == {
+            release_only.id,
+            release_ops.id,
+            ops_only.id,
+        }
+
+    def test_incomplete_all_tags_scope_matches_shared_recovery_preview_ids(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001
+        store._project_root = None  # noqa: SLF001
+
+        both = store.add("Both tags", task_type="plan", tags=("release", "ops"))
+        both.status = "failed"
+        both.failure_reason = "INFRASTRUCTURE_ERROR"
+        both.completed_at = datetime(2026, 6, 24, 9, 0, tzinfo=UTC)
+        store.update(both)
+        assert both.id is not None
+
+        release_only = store.add("Release only", task_type="plan", tags=("release",))
+        release_only.status = "failed"
+        release_only.failure_reason = "INFRASTRUCTURE_ERROR"
+        release_only.completed_at = datetime(2026, 6, 24, 9, 5, tzinfo=UTC)
+        store.update(release_only)
+
+        with patch(
+            "gza.recovery_engine._load_merge_context",
+            return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+        ):
+            preview = build_dispatch_preview(
+                store,
+                tags=("release", "ops"),
+                any_tag=False,
+                max_recovery_attempts=1,
+                selection_mode="recovery_only",
+                include_pending=False,
+            )
+
+        args = self._incomplete_args(tmp_path, fields="id", json=True)
+        args.tags = ["release", "ops"]
+        args.all_tags = True
+        result = query_cli.cmd_incomplete(args)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert json.loads(captured.out) == [{"id": both.id}]
+        assert [entry.task.id for entry in preview.recovery_entries] == [both.id]
+
+    def test_incomplete_tag_scope_respects_configured_max_resume_attempts_in_recovery_preview(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "max_resume_attempts: 0\n")
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001
+        store._project_root = None  # noqa: SLF001
+
+        failed = store.add("Release recovery disabled", task_type="plan", tags=("release",))
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.completed_at = datetime(2026, 6, 24, 9, 0, tzinfo=UTC)
+        store.update(failed)
+
+        with patch(
+            "gza.recovery_engine._load_merge_context",
+            return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+        ):
+            preview = build_dispatch_preview(
+                store,
+                tags=("release",),
+                any_tag=True,
+                max_recovery_attempts=0,
+                selection_mode="recovery_only",
+                include_pending=False,
+            )
+
+        args = self._incomplete_args(
+            tmp_path,
+            fields="id,next_action,next_action_reason",
+            json=True,
+        )
+        args.tags = ["release"]
+        args.all_tags = False
+        result = query_cli.cmd_incomplete(args)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert json.loads(captured.out) == [
+            {
+                "id": failed.id,
+                "next_action": "skip",
+                "next_action_reason": "SKIP: automatic recovery is disabled",
+            }
+        ]
+        assert [(entry.task.id, entry.reason_code, entry.runnable) for entry in preview.recovery_entries] == [
+            (failed.id, "automatic_recovery_disabled", False)
+        ]
+
+    def test_incomplete_mixed_owner_recovery_row_uses_shared_recovery_leaf_identity(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        plan, failed_review = self._setup_mixed_owner_recovery_fixture(tmp_path)
+        config = query_cli.Config.load(tmp_path)
+        store = query_cli.get_store(config, open_mode="query_only")
+
+        with patch(
+            "gza.recovery_engine._load_merge_context",
+            return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+        ):
+            preview = build_dispatch_preview(
+                store,
+                tags=("release",),
+                any_tag=True,
+                max_recovery_attempts=1,
+                selection_mode="recovery_only",
+                include_pending=False,
+            )
+
+        args = self._incomplete_args(tmp_path, fields="id,next_action,next_action_owner_id,unresolved_ids", json=True)
+        args.tags = ["release"]
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = query_cli.cmd_incomplete(args)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        payload = json.loads(captured.out)
+        assert [entry.task.id for entry in preview.recovery_entries] == [failed_review.id]
+        assert payload == [
+            {
+                "id": failed_review.id,
+                "next_action": "resume",
+                "next_action_owner_id": failed_review.id,
+                "unresolved_ids": [plan.id, failed_review.id],
+            }
+        ]
+
+        args = self._incomplete_args(tmp_path, fields=None)
+        args.tags = ["release"]
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = query_cli.cmd_incomplete(args)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        assert captured.out.splitlines()[0].startswith(f"{failed_review.id}: Resume failed task (MAX_TURNS)")
+        assert plan.id not in self._one_line_row_id(captured.out)
+
+        args = self._incomplete_args(tmp_path, fields=None, tree=True)
+        args.tags = ["release"]
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = query_cli.cmd_incomplete(args)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        tree_text = captured.out
+        assert tree_text.splitlines()[0].startswith("failed")
+        assert failed_review.id in tree_text.splitlines()[0]
+        assert self._tree_root_id(tree_text) == failed_review.id
+        assert plan.id not in tree_text
+
+    def test_incomplete_mixed_owner_recovery_row_keeps_plan_blocked_dependents_after_reroot(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        plan, failed_review = self._setup_mixed_owner_recovery_fixture(tmp_path)
+        store = make_store(tmp_path)
+        blocked = store.add(
+            "Blocked by mixed recovery plan",
+            task_type="implement",
+            depends_on=plan.id,
+            tags=("release",),
+        )
+        assert blocked.id is not None
+        plan = store.get(plan.id)
+        assert plan is not None
+        plan.auto_implement = False
+        store.update(plan)
+
+        args = self._incomplete_args(tmp_path, fields=None)
+        args.tags = ["release"]
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = query_cli.cmd_incomplete(args)
+
+        captured = capsys.readouterr()
+        assert result == 0
+        lines = captured.out.splitlines()
+        assert lines[0].startswith(f"{failed_review.id}: Resume failed task (MAX_TURNS)")
+        assert plan.id not in self._one_line_row_id(captured.out)
+        assert "Blocked dependents:" in captured.out
+        blocked_output = " ".join(captured.out.split())
+        assert blocked.id in blocked_output
+        assert f"blocked: awaiting plan review for {plan.id}" in blocked_output
+        assert f"release with uv run gza implement {plan.id}" in blocked_output
+
+    def test_recovery_ids_match_queue_watch_advance_and_incomplete_for_unscoped_mixed_owner_row(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        plan, failed_review = self._setup_mixed_owner_recovery_fixture(tmp_path)
+
+        with (
+            patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.git_ops.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.query.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+            patch(
+                "gza.recovery_engine._load_merge_context",
+                return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+            ),
+        ):
+            queue_result = invoke_gza("queue", "--recovery", "--all", "--project", str(tmp_path))
+            watch_result = invoke_gza(
+                "watch",
+                "--dry-run",
+                "--recovery-only",
+                "--show-skipped",
+                "--yes",
+                "--quiet",
+                "--project",
+                str(tmp_path),
+            )
+            advance_result = invoke_gza("advance", "--dry-run", "--project", str(tmp_path))
+            incomplete_result = invoke_gza(
+                "incomplete",
+                "--json",
+                "--fields",
+                "id,next_action_owner_id",
+                "--last",
+                "0",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert queue_result.returncode == 0
+        assert watch_result.returncode == 0
+        assert advance_result.returncode == 0
+        assert incomplete_result.returncode == 0
+
+        candidate_tasks = (plan, failed_review)
+        expected_ids = {failed_review.id}
+        assert self._ids_present_in_output(queue_result.stdout, *candidate_tasks) == expected_ids
+        assert self._watch_recovery_report_ids(watch_result.stdout, *candidate_tasks) == expected_ids
+        assert self._advance_recovery_subset_ids(advance_result.stdout, *candidate_tasks) == expected_ids
+        assert json.loads(incomplete_result.stdout) == [
+            {
+                "id": failed_review.id,
+                "next_action_owner_id": failed_review.id,
+            }
+        ]
+
+    def test_recovery_ids_match_queue_watch_advance_and_incomplete_for_any_tag_scope(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001
+        store._project_root = None  # noqa: SLF001
+
+        release_only = store.add("Release only", task_type="plan", tags=("release",))
+        release_only.status = "failed"
+        release_only.failure_reason = "INFRASTRUCTURE_ERROR"
+        release_only.completed_at = datetime(2026, 6, 24, 9, 0, tzinfo=UTC)
+        store.update(release_only)
+        assert release_only.id is not None
+
+        release_ops = store.add("Release and ops", task_type="plan", tags=("release", "ops"))
+        release_ops.status = "failed"
+        release_ops.failure_reason = "TEST_FAILURE"
+        release_ops.completed_at = datetime(2026, 6, 24, 9, 5, tzinfo=UTC)
+        store.update(release_ops)
+        assert release_ops.id is not None
+
+        ops_only = store.add("Ops only", task_type="plan", tags=("ops",))
+        ops_only.status = "failed"
+        ops_only.failure_reason = "INFRASTRUCTURE_ERROR"
+        ops_only.completed_at = datetime(2026, 6, 24, 9, 10, tzinfo=UTC)
+        store.update(ops_only)
+        assert ops_only.id is not None
+
+        with (
+            patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.git_ops.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.query.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+            patch(
+                "gza.recovery_engine._load_merge_context",
+                return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+            ),
+        ):
+            queue_result = invoke_gza(
+                "queue", "--recovery", "--all", "--tag", "release", "--tag", "ops", "--project", str(tmp_path)
+            )
+            watch_result = invoke_gza(
+                "watch",
+                "--dry-run",
+                "--recovery-only",
+                "--show-skipped",
+                "--yes",
+                "--quiet",
+                "--tag",
+                "release",
+                "--tag",
+                "ops",
+                "--project",
+                str(tmp_path),
+            )
+            advance_result = invoke_gza(
+                "advance",
+                "--dry-run",
+                "--tag",
+                "release",
+                "--tag",
+                "ops",
+                "--project",
+                str(tmp_path),
+            )
+            incomplete_result = invoke_gza(
+                "incomplete",
+                "--json",
+                "--fields",
+                "id",
+                "--last",
+                "0",
+                "--tag",
+                "release",
+                "--tag",
+                "ops",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert queue_result.returncode == 0
+        assert watch_result.returncode == 0
+        assert advance_result.returncode == 0
+        assert incomplete_result.returncode == 0
+
+        candidate_tasks = (release_only, release_ops, ops_only)
+        expected_ids = {release_only.id, release_ops.id, ops_only.id}
+        assert self._ids_present_in_output(queue_result.stdout, *candidate_tasks) == expected_ids
+        assert self._watch_recovery_report_ids(watch_result.stdout, *candidate_tasks) == expected_ids
+        assert self._ids_present_in_output(advance_result.stdout, *candidate_tasks) == expected_ids
+        assert {row["id"] for row in json.loads(incomplete_result.stdout)} == expected_ids
+
+    def test_recovery_ids_match_queue_watch_advance_and_incomplete_for_all_tag_scope(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        store._default_merge_target_cache = "main"  # noqa: SLF001
+        store._project_root = None  # noqa: SLF001
+
+        both = store.add("Both tags", task_type="plan", tags=("release", "ops"))
+        both.status = "failed"
+        both.failure_reason = "INFRASTRUCTURE_ERROR"
+        both.completed_at = datetime(2026, 6, 24, 9, 0, tzinfo=UTC)
+        store.update(both)
+        assert both.id is not None
+
+        release_only = store.add("Release only", task_type="plan", tags=("release",))
+        release_only.status = "failed"
+        release_only.failure_reason = "INFRASTRUCTURE_ERROR"
+        release_only.completed_at = datetime(2026, 6, 24, 9, 5, tzinfo=UTC)
+        store.update(release_only)
+        assert release_only.id is not None
+
+        with (
+            patch("gza.cli.watch.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.git_ops.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.query.Git", return_value=_mock_unmerged_git()),
+            patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+            patch(
+                "gza.recovery_engine._load_merge_context",
+                return_value=_recovery_engine_module._MergeContext(git=None, default_branch="main"),
+            ),
+        ):
+            queue_result = invoke_gza(
+                "queue", "--recovery", "--all", "--tag", "release", "--tag", "ops", "--all-tags", "--project", str(tmp_path)
+            )
+            watch_result = invoke_gza(
+                "watch",
+                "--dry-run",
+                "--recovery-only",
+                "--show-skipped",
+                "--yes",
+                "--quiet",
+                "--tag",
+                "release",
+                "--tag",
+                "ops",
+                "--all-tags",
+                "--project",
+                str(tmp_path),
+            )
+            advance_result = invoke_gza(
+                "advance",
+                "--dry-run",
+                "--tag",
+                "release",
+                "--tag",
+                "ops",
+                "--all-tags",
+                "--project",
+                str(tmp_path),
+            )
+            incomplete_result = invoke_gza(
+                "incomplete",
+                "--json",
+                "--fields",
+                "id",
+                "--last",
+                "0",
+                "--tag",
+                "release",
+                "--tag",
+                "ops",
+                "--all-tags",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert queue_result.returncode == 0
+        assert watch_result.returncode == 0
+        assert advance_result.returncode == 0
+        assert incomplete_result.returncode == 0
+
+        candidate_tasks = (both, release_only)
+        expected_ids = {both.id}
+        assert self._ids_present_in_output(queue_result.stdout, *candidate_tasks) == expected_ids
+        assert self._watch_recovery_report_ids(watch_result.stdout, *candidate_tasks) == expected_ids
+        assert self._ids_present_in_output(advance_result.stdout, *candidate_tasks) == expected_ids
+        assert json.loads(incomplete_result.stdout) == [{"id": both.id}]
 
     def test_incomplete_keeps_failed_owner_visible_until_completed_recovery_code_is_merged(
         self,
@@ -17170,12 +17947,13 @@ class TestIncompleteCommand:
 
 class TestLineageOwnerParity:
     @staticmethod
-    def _incomplete_args(tmp_path: Path, *, fields: str | None, json: bool = False):
+    def _incomplete_args(tmp_path: Path, *, fields: str | None, json: bool = False, tree: bool = False):
         return argparse.Namespace(
             project_dir=tmp_path,
             last=0,
             list_fields=False,
             blocked_by_dropped=False,
+            tree=tree,
             type=None,
             days=None,
             date_field="effective",
