@@ -35,19 +35,25 @@ from ..recovery_engine import FailedRecoveryDecision, get_failed_recovery_needs_
 from ..review_tasks import (
     DuplicateReviewError,
     OffTopicVerifyPersistenceError,
+    VerifyFixContextError,
     build_review_blocker_dispute_metadata,
+    create_or_reuse_verify_fix_task,
     create_resolution_review_task,
     create_spec_coherence_review_task,
     persist_review_clearance_artifact,
 )
+from ..review_verify_state import VerifyEpoch, resolve_verify_gate_decision
 from ..runner import (
+    LifecycleVerifyExecution,
     ProjectReviewVerifyResult,
     _capture_review_verify_result,
     _format_review_verify_result,
     _make_review_verify_result,
+    _persist_lifecycle_verify_execution,
     _project_boundary,
     _resolve_review_verify_base_sha,
     _resolve_review_verify_timeout_settings,
+    _run_lifecycle_verify,
     _run_review_verify_command,
     _run_review_verify_commands_for_projects,
     _task_is_cross_project,
@@ -187,6 +193,9 @@ _WORKER_ACTIONS = frozenset(
         "materialize_plan_slices",
         "clear_off_topic_verify_blocker",
         "recover_verify_only_noop_review",
+        "verify_gate",
+        "create_verify_fix",
+        "run_verify_fix",
         "create_review",
         "run_review",
         "create_review_adjudication",
@@ -847,6 +856,309 @@ def _cleanup_verify_only_noop_worktree(
     return None
 
 
+def _execute_verify_gate(
+    *,
+    task: DbTask,
+    action_type: str,
+    action: dict[str, Any],
+    context: AdvanceActionExecutionContext,
+) -> AdvanceActionExecutionResult:
+    owner_task = action.get("verify_owner_task")
+    if not isinstance(owner_task, DbTask):
+        owner_task = task
+    if owner_task.id is None or context.config is None or context.git is None:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message="missing verify gate inputs",
+        )
+    if context.dry_run:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="dry_run",
+            message=action.get("description", "Run verify gate"),
+            work_done=True,
+            handled_task_id=owner_task.id,
+        )
+
+    phase = str(action.get("verify_gate_phase") or "pre_review")
+    phase_label = "review" if phase == "pre_review" else "merge"
+    decision = resolve_verify_gate_decision(
+        context.store,
+        owner_task,
+        config=context.config,
+        git=context.git,
+    )
+    if decision.state == "passed":
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="success",
+            success_message=f"Verify gate already passed for the current tip before {phase_label}.",
+            handled_task_id=owner_task.id,
+        )
+    if decision.state in {"failed", "unavailable"}:
+        status_word = "red" if decision.state == "failed" else "unavailable"
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=f"SKIP: current verify gate is {status_word}; {phase_label} is blocked.",
+            attention_type="needs_discussion",
+            attention_reason="verify-gate-blocked",
+            handled_task_id=owner_task.id,
+        )
+    current_epoch = decision.current_epoch
+    if current_epoch is None or not current_epoch.reviewed_head_sha or not current_epoch.reviewed_branch:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=f"SKIP: current verify epoch is unavailable; {phase_label} is blocked.",
+            attention_type="needs_discussion",
+            attention_reason="verify-gate-blocked",
+            handled_task_id=owner_task.id,
+        )
+
+    worktree_path: Path | None = None
+    added_worktree = False
+    try:
+        tmp_root = Path(context.config.project_dir) / "tmp"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+        worktree_path = Path(tempfile.mkdtemp(prefix=f"verify-gate-{owner_task.id}-", dir=tmp_root))
+        context.git.worktree_add_existing(worktree_path, current_epoch.reviewed_head_sha, detach=True)
+        added_worktree = True
+        worktree_git = Git(worktree_path)
+    except (GitError, OSError, RuntimeError, ValueError) as exc:
+        cleanup_failure = _cleanup_verify_only_noop_worktree(
+            context=context,
+            worktree_path=worktree_path,
+            added_worktree=added_worktree,
+        )
+        detail = f"SKIP: could not prepare the verify-gate worktree; {phase_label} is blocked. Setup failure: {exc}"
+        if cleanup_failure:
+            detail = f"{detail}. Cleanup failure: {cleanup_failure}"
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=detail,
+            attention_type="needs_discussion",
+            attention_reason="verify-gate-blocked",
+            handled_task_id=owner_task.id,
+        )
+
+    try:
+        timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(context.config)
+        provider_cwd = _worktree_execution_dir(worktree_git.repo_dir, _project_boundary(context.config))
+        reviewed_base_sha = _resolve_review_verify_base_sha(worktree_git, worktree_git.default_branch())
+        execution = _run_lifecycle_verify(
+            config=context.config,
+            task=owner_task,
+            worktree_git=worktree_git,
+            worktree_path=worktree_git.repo_dir,
+            cwd=provider_cwd,
+            timeout_seconds=timeout_seconds,
+            timeout_grace_seconds=timeout_grace_seconds,
+            reviewed_branch=current_epoch.reviewed_branch,
+            reviewed_head_sha=current_epoch.reviewed_head_sha,
+            reviewed_base_sha=reviewed_base_sha,
+        )
+        if execution is None:
+            unavailable_result = _make_review_verify_result(
+                str(getattr(context.config, "verify_command", "")).strip() or "(verify gate unavailable)",
+                status="unavailable",
+                exit_status="not configured",
+                captured_at=datetime.now(UTC),
+                reviewed_branch=current_epoch.reviewed_branch,
+                reviewed_head_sha=current_epoch.reviewed_head_sha,
+                reviewed_base_sha=reviewed_base_sha,
+                working_directory=str(provider_cwd),
+                failure="verify_command is not configured for lifecycle verify gating",
+            )
+            execution = LifecycleVerifyExecution(
+                markdown=_format_review_verify_result(unavailable_result),
+                aggregate_result=unavailable_result,
+                project_results=(),
+            )
+        persisted_result, _artifact_path = _persist_lifecycle_verify_execution(
+            context.config,
+            context.store,
+            owner_task,
+            execution,
+            producer="advance_verify_gate",
+            timeout_seconds=timeout_seconds,
+            timeout_grace_seconds=timeout_grace_seconds,
+            artifact_task=owner_task,
+        )
+        live_head_after = context.git.rev_parse_if_exists(current_epoch.reviewed_branch)
+        if live_head_after != current_epoch.reviewed_head_sha:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message="SKIP: verify gate finished on a stale tip; rerun lifecycle on the current head.",
+                attention_type="needs_discussion",
+                attention_reason="verify-gate-blocked",
+                handled_task_id=owner_task.id,
+            )
+        refreshed_decision = resolve_verify_gate_decision(
+            context.store,
+            owner_task,
+            config=context.config,
+            git=context.git,
+        )
+        if refreshed_decision.state == "passed":
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="success",
+                success_message=f"Verify gate passed for the current tip before {phase_label}.",
+                work_done=True,
+                handled_task_id=owner_task.id,
+                created_task=context.store.get(owner_task.id) or owner_task,
+            )
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=(
+                f"SKIP: verify gate remained {persisted_result.status}; {phase_label} is blocked."
+            ),
+            attention_type="needs_discussion",
+            attention_reason="verify-gate-blocked",
+            handled_task_id=owner_task.id,
+        )
+    finally:
+        _cleanup_verify_only_noop_worktree(
+            context=context,
+            worktree_path=worktree_path,
+            added_worktree=added_worktree,
+        )
+
+
+def _execute_create_verify_fix(
+    *,
+    task: DbTask,
+    action_type: str,
+    action: dict[str, Any],
+    context: AdvanceActionExecutionContext,
+) -> AdvanceActionExecutionResult:
+    impl_task = action.get("impl_task")
+    based_on_task = action.get("based_on_task")
+    verify_epoch = action.get("verify_epoch")
+    if (
+        not isinstance(impl_task, DbTask)
+        or impl_task.id is None
+        or not isinstance(based_on_task, DbTask)
+        or based_on_task.id is None
+        or not isinstance(verify_epoch, VerifyEpoch)
+        or context.config is None
+    ):
+        return AdvanceActionExecutionResult(action_type=action_type, status="skip", message="missing verify_fix inputs")
+
+    if context.dry_run:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="dry_run",
+            message=action.get("description", "Create verify_fix"),
+            worker_consuming=True,
+            work_done=True,
+            handled_task_id=impl_task.id,
+        )
+
+    permit, blocked = _reserve_background_launch(
+        action_type=action_type,
+        context=context,
+        worker_label="verify_fix",
+    )
+    if blocked is not None:
+        return blocked
+    try:
+        verify_fix_task, _created = create_or_reuse_verify_fix_task(
+            context.store,
+            context.config,
+            impl_task=impl_task,
+            based_on_task=based_on_task,
+            verify_epoch=verify_epoch,
+            trigger_source=context.trigger_source,
+        )
+    except (ValueError, VerifyFixContextError) as exc:
+        if permit is not None:
+            permit.release()
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="error",
+            message=str(exc),
+        )
+
+    prepared_verify_fix_task, prepare_error = _prepare_background_start(
+        context=context,
+        action_type=action_type,
+        task=verify_fix_task,
+        worker_label="verify_fix",
+        rollback_on_failure=True,
+        permit=permit,
+    )
+    if prepared_verify_fix_task is None:
+        assert prepare_error is not None
+        return prepare_error
+    assert prepared_verify_fix_task.id is not None
+    rc = context.spawn_worker(prepared_verify_fix_task, "verify_fix")
+    _release_reserved_launch_if_left(prepared_verify_fix_task)
+    return _spawn_result(
+        action_type=action_type,
+        rc=rc,
+        handled_task_id=prepared_verify_fix_task.id,
+        worker_label="verify_fix",
+        created_task=prepared_verify_fix_task,
+    )
+
+
+def _execute_run_verify_fix(
+    *,
+    action_type: str,
+    action: dict[str, Any],
+    context: AdvanceActionExecutionContext,
+) -> AdvanceActionExecutionResult:
+    verify_fix_task = action.get("verify_fix_task")
+    if not isinstance(verify_fix_task, DbTask) or verify_fix_task.id is None:
+        return AdvanceActionExecutionResult(action_type=action_type, status="skip", message="missing verify_fix task")
+
+    if context.dry_run:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="dry_run",
+            message=action.get("description", "Run verify_fix"),
+            worker_consuming=True,
+            work_done=True,
+            handled_task_id=verify_fix_task.id,
+            created_task=verify_fix_task,
+        )
+
+    permit, blocked = _reserve_background_launch(
+        action_type=action_type,
+        context=context,
+        worker_label="verify_fix",
+    )
+    if blocked is not None:
+        return blocked
+    prepared_verify_fix_task, prepare_error = _prepare_background_start(
+        context=context,
+        action_type=action_type,
+        task=verify_fix_task,
+        worker_label="verify_fix",
+        rollback_on_failure=False,
+        permit=permit,
+    )
+    if prepared_verify_fix_task is None:
+        assert prepare_error is not None
+        return prepare_error
+    assert prepared_verify_fix_task.id is not None
+    rc = context.spawn_worker(prepared_verify_fix_task, "verify_fix")
+    _release_reserved_launch_if_left(prepared_verify_fix_task)
+    return _spawn_result(
+        action_type=action_type,
+        rc=rc,
+        handled_task_id=prepared_verify_fix_task.id,
+        worker_label="verify_fix",
+        created_task=prepared_verify_fix_task,
+    )
+
+
 def _execute_recover_verify_only_noop_review(
     *,
     task: DbTask,
@@ -1046,6 +1358,11 @@ def _execute_recover_verify_only_noop_review(
                 markdown=markdown,
                 project_results=project_results,
                 producer="advance_verify_only_noop_recovery",
+                artifact_task=task,
+                metadata={
+                    "timeout_seconds": timeout_seconds,
+                    "timeout_grace_seconds": timeout_grace_seconds,
+                },
             )
 
         live_head_after = context.git.rev_parse_if_exists(task.branch)
@@ -1187,6 +1504,29 @@ def execute_advance_action(
     )
     if iterate_routed_result is not None:
         return iterate_routed_result
+
+    if action_type == "verify_gate":
+        return _execute_verify_gate(
+            task=task,
+            action_type=action_type,
+            action=action,
+            context=context,
+        )
+
+    if action_type == "create_verify_fix":
+        return _execute_create_verify_fix(
+            task=task,
+            action_type=action_type,
+            action=action,
+            context=context,
+        )
+
+    if action_type == "run_verify_fix":
+        return _execute_run_verify_fix(
+            action_type=action_type,
+            action=action,
+            context=context,
+        )
 
     if action_type == "create_plan_review":
         if task.id is None:

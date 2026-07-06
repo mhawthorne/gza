@@ -60,6 +60,13 @@ from gza.plan_review_materialization import (
 from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.review_tasks import OffTopicVerifyPersistenceError
+from gza.review_verify_state import (
+    VerifyEpoch,
+    VERIFY_GATE_ARTIFACT_KIND,
+    latest_verify_result_for_epoch,
+    owner_task_verify_epoch,
+    persist_verify_gate_artifact,
+)
 from gza.review_verdict import ReviewFinding
 from gza.runner import CROSS_PROJECT_TAG, _make_review_verify_result
 from gza.git import Git, GitError, ResolvedMergeSourceRef
@@ -863,6 +870,7 @@ def test_recover_verify_only_noop_review_persists_clearance_without_creating_rev
     refreshed_impl = store.get(impl.id)
     refreshed_improve = store.get(improve.id)
     artifacts = store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND)
+    verify_gate_artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
 
     assert result.status == "success"
     assert result.success_message.startswith("Fresh verify passed")
@@ -874,6 +882,18 @@ def test_recover_verify_only_noop_review_persists_clearance_without_creating_rev
     assert artifacts[0].metadata is not None
     assert artifacts[0].metadata["clearance_kind"] == VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND
     assert artifacts[0].metadata["review_task_id"] == review.id
+    assert len(verify_gate_artifacts) == 1
+    assert store.list_artifacts(improve.id, kind=VERIFY_GATE_ARTIFACT_KIND) == []
+
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_impl,
+        current_epoch=owner_task_verify_epoch(refreshed_impl, config, git),
+    )
+    assert lookup.source == "owner_artifact"
+    assert lookup.is_current is True
+    assert lookup.result is not None
+    assert lookup.result.reviewed_head_sha == "same-head"
 
 
 def test_recover_verify_only_noop_review_failed_verify_returns_attention(tmp_path: Path) -> None:
@@ -1375,7 +1395,7 @@ def test_recover_verify_only_noop_review_clearance_persistence_failure_returns_s
     refreshed_impl = store.get(impl.id)
     refreshed_improve = store.get(improve.id)
     clearance_artifacts = store.list_artifacts(impl.id, kind=REVIEW_CLEARANCE_ARTIFACT_KIND)
-    verify_artifacts = store.list_artifacts(improve.id, kind="verify_command_output")
+    verify_artifacts = store.list_artifacts(impl.id, kind="verify_command_output")
 
     assert result.status == "error"
     assert result.noop_improve_kind == NOOP_IMPROVE_KIND_VERIFY_ONLY
@@ -1389,6 +1409,7 @@ def test_recover_verify_only_noop_review_clearance_persistence_failure_returns_s
     assert refreshed_improve.review_verify_status == "passed"
     assert clearance_artifacts == []
     assert len(verify_artifacts) == 1
+    assert store.list_artifacts(improve.id, kind="verify_command_output") == []
     parked = store.list_artifacts(improve.id, kind=VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND)
     assert len(parked) == 1
     assert parked[0].metadata["outcome_kind"] == "clearance_persistence_failure"
@@ -3275,6 +3296,237 @@ def test_execute_advance_action_rejects_retired_noop_verify_action(tmp_path: Pat
 
     assert result.status == "unsupported"
     assert result.message == "unsupported action: verify_" "noop_improve_then_review"
+
+
+def test_verify_gate_execution_persists_current_passing_owner_artifact(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement verify gate", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-gate")
+    store.update(impl)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda _ref: "head-1",
+        worktree_add_existing=lambda *_args, **_kwargs: None,
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    worktree_git = SimpleNamespace(
+        repo_dir=tmp_path / "tmp-worktree",
+        default_branch=lambda: "main",
+        rev_parse_if_exists=lambda ref: "base-1" if ref in {"main", "origin/main"} else "head-1",
+    )
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch(
+            "gza.cli.advance_executor._run_lifecycle_verify",
+            return_value=SimpleNamespace(
+                markdown="verify markdown",
+                aggregate_result=verify_result,
+                project_results=(),
+            ),
+        ),
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_owner_task": impl,
+            },
+            context=context,
+        )
+
+    refreshed_impl = store.get(impl.id)
+    assert refreshed_impl is not None
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_impl,
+        current_epoch=owner_task_verify_epoch(refreshed_impl, config, git),
+    )
+    assert result.status == "success"
+    assert lookup.is_current is True
+    assert lookup.result is not None
+    assert lookup.result.status == "passed"
+
+
+def test_verify_gate_execution_blocks_current_red_evidence_without_rerun(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement red verify gate", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/red-verify-gate")
+    store.update(impl)
+    review = store.add("Review red verify gate", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=_make_review_verify_result(
+            "./bin/tests",
+            status="failed",
+            exit_status="7",
+            captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda _ref: "head-1",
+        worktree_add_existing=lambda *_args, **_kwargs: pytest.fail("worktree should not be prepared"),
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "verify_gate",
+                "description": "SKIP: current verify gate is red; merge is blocked",
+                "verify_gate_phase": "pre_merge",
+                "verify_owner_task": impl,
+            },
+            context=context,
+        )
+
+    assert result.status == "skip"
+    assert result.attention_reason == "verify-gate-blocked"
+    assert "current verify gate is red" in result.message
+
+
+def test_create_verify_fix_action_creates_and_spawns_worker(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement verify_fix", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/create-verify-fix")
+    store.update(impl)
+    verify_fix = DbTask(
+        id="testproject-verify-fix",
+        prompt="Fix verify failures",
+        status="pending",
+        task_type="verify_fix",
+        based_on=impl.id,
+    )
+    spawned: list[str] = []
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda task, _kind: spawned.append(task.id) or 0,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=SimpleNamespace(),
+    )
+
+    with (
+        patch("gza.cli.advance_executor.create_or_reuse_verify_fix_task", return_value=(verify_fix, True)),
+        patch(
+            "gza.cli.advance_executor._prepare_background_start",
+            return_value=(verify_fix, None),
+        ),
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "create_verify_fix",
+                "description": "Create verify_fix task",
+                "impl_task": impl,
+                "based_on_task": impl,
+                "verify_epoch": VerifyEpoch(
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="head-1",
+                    verify_command="./bin/tests",
+                    verify_timeout_seconds=120,
+                    verify_timeout_grace_seconds=5.0,
+                ),
+            },
+            context=context,
+        )
+
+    assert result.status == "success"
+    assert result.created_task is not None
+    assert result.created_task.task_type == "verify_fix"
+    assert spawned == [result.created_task.id]
 
 
 def test_create_review_skip_propagates_message_without_spawning(tmp_path: Path) -> None:

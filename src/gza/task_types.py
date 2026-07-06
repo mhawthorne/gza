@@ -12,6 +12,7 @@ TASK_TYPE_PLAN_IMPROVE: Final = "plan_improve"
 TASK_TYPE_IMPLEMENT: Final = "implement"
 TASK_TYPE_REVIEW: Final = "review"
 TASK_TYPE_IMPROVE: Final = "improve"
+TASK_TYPE_VERIFY_FIX: Final = "verify_fix"
 TASK_TYPE_FIX: Final = "fix"
 TASK_TYPE_REBASE: Final = "rebase"
 TASK_TYPE_INTERNAL: Final = "internal"
@@ -25,6 +26,7 @@ ALL_TASK_TYPES: Final[tuple[str, ...]] = (
     TASK_TYPE_IMPLEMENT,
     TASK_TYPE_REVIEW,
     TASK_TYPE_IMPROVE,
+    TASK_TYPE_VERIFY_FIX,
     TASK_TYPE_FIX,
     TASK_TYPE_REBASE,
     TASK_TYPE_INTERNAL,
@@ -38,6 +40,7 @@ CLI_FILTER_TASK_TYPES: Final[tuple[str, ...]] = (
     TASK_TYPE_IMPLEMENT,
     TASK_TYPE_REVIEW,
     TASK_TYPE_IMPROVE,
+    TASK_TYPE_VERIFY_FIX,
     TASK_TYPE_FIX,
     TASK_TYPE_REBASE,
     TASK_TYPE_INTERNAL,
@@ -50,6 +53,7 @@ CLI_ADD_TASK_TYPES: Final[tuple[str, ...]] = (
     TASK_TYPE_PLAN_IMPROVE,
     TASK_TYPE_IMPLEMENT,
     TASK_TYPE_REVIEW,
+    TASK_TYPE_VERIFY_FIX,
     TASK_TYPE_IMPROVE,
 )
 

@@ -47,7 +47,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "advance_off_topic_verify_unblock",
         "bool",
         False,
-        "Allow lifecycle to clear a verify-only blocked review through the off-topic verify classifier; when false, the verify-only blocker remains conservative and stays blocking.",
+        "Allow the narrow legacy compatibility lane for persisted verify-only review blockers to consult the off-topic verify classifier; when false, lifecycle keeps that historical review state blocking and current two-gate work still requires fresh lifecycle verify plus a merge-permitting review.",
     ),
     ConfigKeySpec(
         "advance_create_plan_reviews",
@@ -108,6 +108,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "int",
         60,
         "Seconds to wait for Docker daemon startup or wake-up before treating Docker as unavailable.",
+    ),
+    ConfigKeySpec(
+        "unit_verify_command",
+        "str",
+        "",
+        "Optional preferred unit-scope verification command for code tasks; when unset, prompts fall back to `inner_verify_command`, then targeted checks.",
     ),
     ConfigKeySpec("inner_verify_command", "str", "", "Optional fast inner-loop verification command for code tasks; `verify_command` remains the required final gate."),
     ConfigKeySpec("interactive_worktree_dir", "str", "", "Base path for interactive worktree operations."),
@@ -194,7 +200,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "review_verify_timeout_grace_seconds",
         "float",
         5,
-        "Grace period in seconds after SIGTERM before autonomous review verification escalates to SIGKILL.",
+        "Grace period in seconds after SIGTERM before autonomous lifecycle verification escalates to SIGKILL.",
     ),
     ConfigKeySpec(
         "main_integration_verify_red_ttl_minutes",

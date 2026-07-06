@@ -46,15 +46,15 @@ Timed-out runs also persist best-effort token and cost stats from streamed
 provider transcript usage when the outer timeout wrapper kills the process
 before a final provider summary is emitted.
 
-Autonomous review verification has a second timeout layer aimed at diagnostics,
-not longer budgets:
+Autonomous lifecycle verification has a second timeout layer aimed at
+diagnostics, not longer budgets:
 
 - the runner enforces `autonomous_verify_timeout_seconds`;
 - on timeout it sends SIGTERM to the verify process group;
 - it waits `review_verify_timeout_grace_seconds` for the harness to flush
   diagnostics such as slow-test summaries or faulthandler dumps;
 - if the process tree is still alive, it escalates to SIGKILL and persists the
-  captured stdout/stderr as review-verify evidence.
+  captured stdout/stderr as lifecycle verify evidence.
 
 - Phase fingerprints are recorded against the tree state that produced each
   successful verify phase.

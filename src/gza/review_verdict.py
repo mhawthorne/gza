@@ -146,13 +146,11 @@ class ReviewBlockerSummary:
 
     @property
     def is_verify_timeout_only(self) -> bool:
-        return self.blocker_count > 0 and self.verify_timeout_count == self.blocker_count
+        return False
 
     @property
     def is_verify_blocked_only(self) -> bool:
-        return self.blocker_count > 0 and (
-            self.verify_timeout_count + self.verify_failure_count == self.blocker_count
-        )
+        return False
 
 
 @dataclass(frozen=True)
@@ -770,39 +768,17 @@ def _title_names_verify_command_as_subject(title: str | None) -> bool:
 
 
 def _classify_blocker_finding(finding: ReviewFinding) -> str:
-    text = "\n".join(
-        part
-        for part in (
-            finding.title,
-            finding.body,
-            finding.evidence,
-            finding.impact,
-            finding.fix_or_followup,
-            finding.tests,
-        )
-        if part
-    )
-    if _contains_verify_timeout_marker(text):
-        # A blocker is only timeout-eligible when its title names verify_command as
-        # the subject. A code-focused title with body-only mentions of a timeout
-        # symptom (e.g. "Worker loop ... until verify_command timeout") describes a
-        # code defect with a timeout symptom, not a verify_command failure.
-        if _title_names_verify_command_as_subject(finding.title) and _has_explicit_verify_timeout_subject_in_structured_fields(
-            finding
-        ):
-            if _structured_fields_have_product_code_citation(finding):
-                return "code"
-            return "verify_timeout"
-    if _contains_verify_failure_marker(text):
-        if _structured_fields_have_product_code_citation(finding):
-            return "code"
-        return "verify_failure"
+    del finding
     return "code"
 
 
 def classify_review_blocker_finding(finding: ReviewFinding) -> str:
-    """Classify a blocker as code, verify failure, or verify timeout."""
-    return _classify_blocker_finding(finding)
+    """Classify a blocker for review surfaces.
+
+    Review tasks are code-only, so verify-shaped prose remains an ordinary code
+    blocker here instead of a separate review classification.
+    """
+    return "code"
 
 
 def normalize_review_finding_title(title: str) -> str:
@@ -892,7 +868,7 @@ def _raw_verify_timeout_only_blocker(content: str, report: ParsedReviewReport) -
 
 
 def summarize_review_blockers(content: str | None) -> ReviewBlockerSummary:
-    """Classify review blockers conservatively for lifecycle decisions."""
+    """Summarize blockers without treating verify prose as a review signal."""
     if not content:
         return ReviewBlockerSummary(0, 0, 0, 0)
 
@@ -902,41 +878,24 @@ def summarize_review_blockers(content: str | None) -> ReviewBlockerSummary:
 
     blockers = [finding for finding in report.findings if finding.severity == "BLOCKER"]
     if blockers:
-        verify_timeout_count = 0
-        verify_failure_count = 0
-        unknown_or_code_count = 0
-        for blocker in blockers:
-            kind = _classify_blocker_finding(blocker)
-            if kind == "verify_timeout":
-                verify_timeout_count += 1
-            elif kind == "verify_failure":
-                verify_failure_count += 1
-            else:
-                unknown_or_code_count += 1
         return ReviewBlockerSummary(
             blocker_count=len(blockers),
-            verify_timeout_count=verify_timeout_count,
-            verify_failure_count=verify_failure_count,
-            unknown_or_code_count=unknown_or_code_count,
-        )
-
-    if _raw_verify_timeout_only_blocker(content, report):
-        return ReviewBlockerSummary(
-            blocker_count=1,
-            verify_timeout_count=1,
+            verify_timeout_count=0,
             verify_failure_count=0,
-            unknown_or_code_count=0,
+            unknown_or_code_count=len(blockers),
         )
 
     return ReviewBlockerSummary(0, 0, 0, 0)
 
 
 def is_verify_timeout_only_review(content: str | None) -> bool:
-    return summarize_review_blockers(content).is_verify_timeout_only
+    del content
+    return False
 
 
 def is_verify_blocked_only_review(content: str | None) -> bool:
-    return summarize_review_blockers(content).is_verify_blocked_only
+    del content
+    return False
 
 
 def parse_review_verdict(content: str | None) -> str | None:

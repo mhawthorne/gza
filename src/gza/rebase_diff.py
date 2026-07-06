@@ -49,6 +49,18 @@ class ResolutionDeltaContext:
     range_diff: str | None = None
 
 
+def resolution_delta_provenance_is_complete(provenance: RebaseDiffProvenance) -> bool:
+    """Return whether persisted provenance retains the irrecoverable pre-rebase proof."""
+    if provenance.recovered:
+        return False
+    return all(
+        (
+            provenance.old_tip,
+            provenance.merge_base_at_start,
+        )
+    )
+
+
 def capture_rebase_diff_baseline(
     git: Git,
     *,
@@ -194,13 +206,10 @@ def compute_resolution_delta_context(
                 "prove the original pre-rebase delta; fail closed and review manually"
             ),
         )
-    if not all(
-        (
-            provenance.old_tip,
-            provenance.merge_base_at_start,
-            provenance.resolved_head_sha,
-            provenance.resolved_target_sha,
-        )
+    if not (
+        resolution_delta_provenance_is_complete(provenance)
+        and provenance.resolved_head_sha
+        and provenance.resolved_target_sha
     ):
         return ResolutionDeltaContext(
             available=False,

@@ -5,7 +5,9 @@ from unittest.mock import patch
 
 import pytest
 
+from gza.config import Config
 from gza.cli.git_ops import _collect_advance_completed_tasks
+from gza.review_verify_state import persist_verify_gate_artifact
 from tests.cli.conftest import make_store, setup_config
 from tests.helpers.cli import invoke_gza
 
@@ -53,11 +55,28 @@ class _MergeGit:
     def ref_exists(self, ref: str) -> bool:
         return False
 
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        if ref == self._default_branch:
+            return "base-head"
+        if ref.startswith("feature/") or ref.startswith("origin/feature/"):
+            return "same-head"
+        return None
+
     def can_merge(self, branch: str, into: str | None = None) -> bool:
         return True
 
     def get_diff_numstat(self, revision_range: str) -> str:
         return "1\t0\tfeature.txt\n"
+
+    def get_diff_name_status(
+        self,
+        revision_range: str,
+        paths: tuple[str, ...] | list[str] = (),
+        *,
+        check: bool = False,
+    ) -> str:
+        del revision_range, paths, check
+        return ""
 
     def get_diff_stat_parsed(self, revision_range: str) -> tuple[int, int, int]:
         return (1, 1, 0)
@@ -127,15 +146,74 @@ def _add_completed_legacy_impl(store, prompt: str, branch: str):
     return task
 
 
+def _persist_current_green_verify(
+    tmp_path: Path,
+    store,
+    *,
+    owner_task,
+    source_task,
+    head_sha: str = "same-head",
+    base_sha: str = "base-head",
+) -> None:
+    config_path = tmp_path / "gza.yaml"
+    config_text = config_path.read_text(encoding="utf-8")
+    if "verify_command:" not in config_text:
+        config_path.write_text(config_text + "verify_command: ./bin/tests\n", encoding="utf-8")
+    config = Config.load(tmp_path)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=owner_task,
+        source_task=source_task,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch=owner_task.branch,
+            reviewed_head_sha=head_sha,
+            reviewed_base_sha=base_sha,
+            working_directory="/tmp/merge-unit-verify",
+            failure=None,
+        ),
+        verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+        verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+        producer="review_verify",
+    )
+
+
+def _add_completed_approved_review(
+    store,
+    *,
+    based_on_task,
+    depends_on_task,
+):
+    review = store.add(
+        f"Review {depends_on_task.id}",
+        task_type="review",
+        based_on=based_on_task.id,
+        depends_on=depends_on_task.id,
+    )
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: APPROVED**"
+    store.update(review)
+    return review
+
+
 def test_merge_all_deduplicates_same_branch_merge_unit(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
     impl = store.add("Implement shared branch", task_type="implement")
     store.mark_completed(impl, has_commits=True, branch="feature/shared")
+    assert impl.id is not None
 
     improve = store.add("Improve shared branch", task_type="improve", based_on=impl.id, same_branch=True)
     store.mark_completed(improve, has_commits=True, branch="feature/shared")
+    assert improve.id is not None
+    review = _add_completed_approved_review(store, based_on_task=impl, depends_on_task=improve)
+    _persist_current_green_verify(tmp_path, store, owner_task=impl, source_task=review)
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
@@ -401,8 +479,10 @@ def test_merge_review_task_id_resolves_branchless_review_to_implementation_unit(
     review = next(task for task in store.get_all() if task.task_type == "review")
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: APPROVED**"
     store.update(review)
     assert review.id is not None
+    _persist_current_green_verify(tmp_path, store, owner_task=impl, source_task=review)
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
@@ -478,6 +558,9 @@ def test_merge_all_backfills_legacy_unmerged_owner_when_units_exist(tmp_path: Pa
     legacy.has_commits = True
     legacy.merge_status = "unmerged"
     store.update(legacy)
+    assert legacy.id is not None
+    review = _add_completed_approved_review(store, based_on_task=legacy, depends_on_task=legacy)
+    _persist_current_green_verify(tmp_path, store, owner_task=legacy, source_task=review)
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
@@ -508,6 +591,8 @@ def test_merge_all_uses_completed_retry_when_merge_unit_owner_failed(tmp_path: P
     retry = store.add("Completed retry", task_type="implement", based_on=failed.id)
     store.mark_completed(retry, has_commits=True, branch="feature/merge-retry")
     assert retry.id is not None
+    review = _add_completed_approved_review(store, based_on_task=retry, depends_on_task=retry)
+    _persist_current_green_verify(tmp_path, store, owner_task=retry, source_task=review)
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
@@ -533,6 +618,8 @@ def test_merge_explicit_retry_task_id_uses_actionable_member_when_owner_failed(t
     retry = store.add("Completed retry", task_type="implement", based_on=failed.id)
     store.mark_completed(retry, has_commits=True, branch="feature/explicit-retry")
     assert retry.id is not None
+    review = _add_completed_approved_review(store, based_on_task=retry, depends_on_task=retry)
+    _persist_current_green_verify(tmp_path, store, owner_task=retry, source_task=review)
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):
@@ -556,6 +643,8 @@ def test_merge_explicit_improve_task_uses_owner_for_provenance_and_squash_subjec
     improve = store.add("Improve shared branch", task_type="improve", based_on=impl.id, same_branch=True)
     store.mark_completed(improve, has_commits=True, branch="feature/explicit-improve")
     assert improve.id is not None
+    review = _add_completed_approved_review(store, based_on_task=impl, depends_on_task=improve)
+    _persist_current_green_verify(tmp_path, store, owner_task=impl, source_task=review)
 
     fake_git = _MergeGit(tmp_path)
     with patch("gza.cli.git_ops.Git", lambda project_dir: fake_git):

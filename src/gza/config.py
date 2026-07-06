@@ -50,6 +50,7 @@ DEFAULT_DB_FILE = f".{APP_NAME}/{APP_NAME}.db"
 DEFAULT_LOG_DIR = f".{APP_NAME}/logs"
 DEFAULT_WORKERS_DIR = f".{APP_NAME}/workers"
 DEFAULT_TIMEOUT_MINUTES = 10
+DEFAULT_UNIT_VERIFY_COMMAND = ""
 DEFAULT_INNER_VERIFY_COMMAND = ""
 DEFAULT_USE_DOCKER = True
 DEFAULT_DOCKER_STARTUP_TIMEOUT = 60
@@ -143,7 +144,7 @@ VALID_CONFIG_FIELDS = {
     "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps",
     "max_turns", "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
     "reasoning_effort", "defaults", "task_types", "providers", "branch_strategy", "chat_text_display_length",
-    "verify_command", "inner_verify_command",
+    "verify_command", "unit_verify_command", "inner_verify_command",
     "advance_create_reviews", "advance_create_plan_reviews", "require_review_before_merge",
     "require_plan_review_before_implement", "pr_integration", "advance_mode", "max_resume_attempts",
     "max_review_cycles", "max_plan_review_cycles", "max_failed_plan_review_retries",
@@ -223,6 +224,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     },
     "chat_text_display_length": None,
     "verify_command": None,
+    "unit_verify_command": None,
     "inner_verify_command": None,
     "advance_create_reviews": None,
     "advance_create_plan_reviews": None,
@@ -359,6 +361,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     },
     "chat_text_display_length": None,
     "verify_command": None,
+    "unit_verify_command": None,
     "inner_verify_command": None,
     "advance_create_reviews": None,
     "advance_create_plan_reviews": None,
@@ -1146,6 +1149,7 @@ class Config:
     chat_text_display_length: int = DEFAULT_CHAT_TEXT_DISPLAY_LENGTH  # 0 = unlimited
     docker_setup_command: str = ""  # Pre-warm command run synchronously before provider CLI starts
     verify_command: str = ""  # Command to run before finishing (e.g., mypy + pytest)
+    unit_verify_command: str = DEFAULT_UNIT_VERIFY_COMMAND
     inner_verify_command: str = DEFAULT_INNER_VERIFY_COMMAND
     advance_create_reviews: bool = DEFAULT_ADVANCE_CREATE_REVIEWS
     advance_create_plan_reviews: bool = DEFAULT_ADVANCE_CREATE_PLAN_REVIEWS
@@ -1718,6 +1722,11 @@ class Config:
         elif not isinstance(reasoning_effort, str):
             raise ConfigError("'reasoning_effort' must be a string")
         verify_command = _validate_optional_string_field(data.get("verify_command"), "verify_command")
+        unit_verify_command = _validate_optional_string_field(
+            data.get("unit_verify_command"),
+            "unit_verify_command",
+            default=DEFAULT_UNIT_VERIFY_COMMAND,
+        )
         inner_verify_command = _validate_optional_string_field(
             data.get("inner_verify_command"),
             "inner_verify_command",
@@ -2642,6 +2651,7 @@ class Config:
             branch_strategy=branch_strategy,
             chat_text_display_length=chat_text_display_length,
             verify_command=verify_command,
+            unit_verify_command=unit_verify_command,
             inner_verify_command=inner_verify_command,
             advance_create_reviews=advance_create_reviews,
             advance_off_topic_verify_unblock=advance_off_topic_verify_unblock,
@@ -3109,6 +3119,8 @@ class Config:
 
         if "verify_command" in data and not isinstance(data["verify_command"], str):
             errors.append("'verify_command' must be a string")
+        if "unit_verify_command" in data and not isinstance(data["unit_verify_command"], str):
+            errors.append("'unit_verify_command' must be a string")
         if "inner_verify_command" in data and not isinstance(data["inner_verify_command"], str):
             errors.append("'inner_verify_command' must be a string")
 

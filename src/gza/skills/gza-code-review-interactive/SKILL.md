@@ -108,8 +108,10 @@ Keep this review stack-agnostic. If project verification instructions are missin
 <Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.>
 <Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.>
 <Improve-lineage context may justify a narrow current-source anti-regression check for repeated blocker shapes the latest improve was expected to close, but it is only a pointer to inspect the current code/diff. It is not independent blocker evidence and must not substitute for current proof on this diff.>
-<If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`; use the trimmed failing output as Evidence and keep doing the normal code review in the same review.>
-<If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.>
+<Review current code, diff, and scope only.>
+<Do not run or evaluate `verify_command`; verification is handled elsewhere.>
+<Do not create blockers because verification failed, timed out, was skipped, or was unavailable.>
+<If code has a test-quality issue, cite the concrete code/test issue directly rather than runner verify status.>
 <Severity shorthand: `BLOCKER` means merge-blocking; `FOLLOWUP` means non-gating but task-worthy; `NIT` is omitted from canonical output.>
 <Do not add a per-finding `Severity:` line; the `## Blockers` and `## Follow-Ups` sections are the severity field.>
 <Derive the final verdict from the findings:>

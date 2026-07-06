@@ -296,8 +296,8 @@ class TestSkillsInstallClaudeTarget:
         assert "(updated)" in result2.stdout
         assert skill_file.read_text() == original_content
 
-    def test_update_flag_refreshes_gza_task_review_verify_workflow(self, tmp_path: Path):
-        """--update should refresh gza-task-review to the bundled verify-first workflow."""
+    def test_update_flag_refreshes_gza_task_review_code_only_workflow(self, tmp_path: Path):
+        """--update should refresh gza-task-review to the bundled code-only review workflow."""
         from gza.skills_utils import get_skills_source_path
 
         setup_config(tmp_path)
@@ -335,8 +335,9 @@ class TestSkillsInstallClaudeTarget:
         bundled = (get_skills_source_path() / "gza-task-review" / "SKILL.md").read_text()
         assert refreshed == bundled
         assert "Bash(git:*)" not in refreshed
-        assert "Run `verify_command` from `gza.yaml` as part of every review iteration." in refreshed
-        assert "Pass the result forward as a `## verify_command result` section." in refreshed
+        assert "Run `verify_command` from `gza.yaml` as part of every review iteration." not in refreshed
+        assert "## verify_command result" not in refreshed
+        assert "Do not run or evaluate `verify_command`" in refreshed
 
     def test_update_flag_refreshes_gza_rebase_verify_contract(self, tmp_path: Path):
         """--update should restore the bundled gza-rebase verify-command contract."""
@@ -1466,33 +1467,29 @@ class TestSkillContentValidation:
         assert "After a successful commit and push" in content
         assert "Push: pushed to <IMPL_BRANCH>" in content
 
-    def test_manual_review_skill_requires_verify_command_every_cycle(self):
-        """gza-task-review should always run verify alongside the code review and fold failures into blockers."""
+    def test_manual_review_skill_is_code_only(self):
+        """gza-task-review should explicitly keep verification out of review execution."""
         from gza.skills_utils import get_skills_source_path
 
         skill_file = get_skills_source_path() / "gza-task-review" / "SKILL.md"
         content = skill_file.read_text()
 
-        assert "Every review iteration must do both the normal code review work and an independent `verify_command` run" in content
-        assert "This is required even when the diff already has obvious code-review blockers; do not skip verify" in content
-        assert "If verify passed, do not add findings just because verify ran." in content
-        assert "If verify failed, synthesize one or more blocking findings" in content
-        assert "verify_command failure" in content
-        assert "Treat verify failures as blocking even if the code review itself would otherwise approve the diff." in content
+        assert "Run an interactive code-only review" in content
+        assert "Do not run or evaluate `verify_command`" in content
+        assert "Do not create blockers because verification failed, timed out, was skipped, or was unavailable." in content
 
-    def test_manual_review_skill_passes_verify_result_to_subagent(self):
-        """gza-task-review should hand off verify output to the reviewer in canonical context."""
+    def test_manual_review_skill_omits_verify_result_from_subagent_context(self):
+        """gza-task-review should hand off only code-review context to the reviewer."""
         from gza.skills_utils import get_skills_source_path
 
         skill_file = get_skills_source_path() / "gza-task-review" / "SKILL.md"
         content = skill_file.read_text()
 
-        assert "Pass the result forward as a `## verify_command result` section." in content
-        assert "Independently evaluate the provided `## verify_command result` section in addition to the normal code review." in content
-        assert "Pass the branch name, authoritative diff context, the `## verify_command result` section" in content
+        assert "## verify_command result" not in content
+        assert "Pass the branch name, authoritative diff context, the `## Review scope:` section" in content
 
     def test_manual_review_skill_forbids_manual_checkout_switching(self):
-        """gza-task-review should avoid forbidden manual checkout/switch instructions while keeping verify guidance."""
+        """gza-task-review should avoid forbidden manual checkout/switch instructions while staying code-only."""
         from gza.skills_utils import get_skills_source_path
 
         skill_file = get_skills_source_path() / "gza-task-review" / "SKILL.md"
@@ -1504,8 +1501,8 @@ class TestSkillContentValidation:
         assert "git checkout <START_CHECKOUT>" not in content
         assert "git checkout --detach <START_CHECKOUT>" not in content
         assert "Do not run `git checkout`, `git switch`, or other manual branch-switching commands as part of this skill." in content
-        assert "Run `verify_command` from `gza.yaml` as part of every review iteration." in content
-        assert "Pass the result forward as a `## verify_command result` section." in content
+        assert "Run `verify_command` from `gza.yaml` as part of every review iteration." not in content
+        assert "## verify_command result" not in content
 
     def test_gza_task_run_no_longer_documents_manual_mark_completed_recovery(self):
         """gza-task-run should route only through run-inline, without manual completion recovery steps."""

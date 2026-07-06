@@ -7458,6 +7458,8 @@ def _run_cycle(
             ),
             dedupe_key=f"recovery-undispatched:{failed.id}:{decision.action}:{reason}",
         )
+        if failed.id is not None and str(failed.id) not in seen_active_recovery_subject_ids:
+            work_done = True
     explicitly_undispatched_recovery_subject_ids = {
         str(failed.id)
         for _owner_task, failed, _decision, _recovery_action in getattr(analysis, "recovery_undispatched_rows", ())

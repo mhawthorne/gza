@@ -28,6 +28,7 @@ from gza.lineage_query import (
 from gza.operator_state import blocked_by_empty_prereq_label
 from gza.recovery_engine import list_failed_tasks_for_recovery
 from gza.recovery_read_context import RecoveryReadContext
+from gza.review_verify_state import persist_verify_gate_artifact
 from tests.cli.conftest import make_store, setup_config
 
 
@@ -81,6 +82,41 @@ def _read_context_for_store(store: SqliteTaskStore) -> RecoveryReadContext:
         merge_units_by_task_id=indexes.merge_units_by_task_id,
         historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
         allow_reconcile_mutation=False,
+    )
+
+
+def _persist_current_green_verify(
+    store: SqliteTaskStore,
+    config: Config,
+    *,
+    owner_task,
+    source_task,
+    head_sha: str,
+    base_sha: str = "target-sha",
+) -> None:
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=owner_task,
+        source_task=source_task,
+        result=type(
+            "VerifyResult",
+            (),
+            {
+                "command": "./bin/tests",
+                "status": "passed",
+                "exit_status": "0",
+                "captured_at": datetime(2026, 5, 10, 13, 30, tzinfo=UTC),
+                "reviewed_branch": owner_task.branch,
+                "reviewed_head_sha": head_sha,
+                "reviewed_base_sha": base_sha,
+                "working_directory": str(config.project_dir),
+                "failure": None,
+            },
+        )(),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
     )
 
 
@@ -256,8 +292,22 @@ def _plan_review_slice_prompt(*, plan_id: str, review_id: str, slice_id: str, ti
 def test_query_lineage_owner_rows_tag_filter_keeps_merge_unit_representative(tmp_path: Path) -> None:
     store, tag, owner_id, rebase_id = _build_tag_filtered_merge_unit_case(tmp_path)
     config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
     git = MagicMock()
     git.can_merge.return_value = True
+    git.rev_parse_if_exists.side_effect = (
+        lambda ref: "same-head" if ref == "feature/tag-filtered-merge-unit" else "target-sha" if ref == "main" else None
+    )
+
+    rebase = store.get(rebase_id)
+    assert rebase is not None
+    improve = store.get(rebase.based_on) if rebase.based_on is not None else None
+    assert improve is not None
+    impl = store.get(improve.based_on) if improve.based_on is not None else None
+    assert impl is not None
+    _persist_current_green_verify(store, config, owner_task=impl, source_task=rebase, head_sha="same-head")
 
     rows = query_lineage_owner_rows(
         store,
@@ -533,8 +583,22 @@ def test_collect_stale_unmerged_sweep_candidates_ignore_resolved_external_depend
 def test_query_lineage_owner_rows_without_tag_filter_keeps_merge_unit_representative(tmp_path: Path) -> None:
     store, _tag, owner_id, rebase_id = _build_tag_filtered_merge_unit_case(tmp_path)
     config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
     git = MagicMock()
     git.can_merge.return_value = True
+    git.rev_parse_if_exists.side_effect = (
+        lambda ref: "same-head" if ref == "feature/tag-filtered-merge-unit" else "target-sha" if ref == "main" else None
+    )
+
+    rebase = store.get(rebase_id)
+    assert rebase is not None
+    improve = store.get(rebase.based_on) if rebase.based_on is not None else None
+    assert improve is not None
+    impl = store.get(improve.based_on) if improve.based_on is not None else None
+    assert impl is not None
+    _persist_current_green_verify(store, config, owner_task=impl, source_task=rebase, head_sha="same-head")
 
     rows = query_lineage_owner_rows(
         store,
@@ -1575,6 +1639,9 @@ def test_query_lineage_owner_rows_prefers_impl_branch_over_orphan_rebase_owner(t
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
 
     impl = store.add("Implement feature", task_type="implement")
     assert impl.id is not None
@@ -1624,6 +1691,10 @@ def test_query_lineage_owner_rows_prefers_impl_branch_over_orphan_rebase_owner(t
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.rev_parse_if_exists.side_effect = (
+        lambda ref: "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
+    )
+    _persist_current_green_verify(store, config, owner_task=impl, source_task=review, head_sha="same-head")
 
     rows = query_lineage_owner_rows(
         store,
@@ -1699,6 +1770,9 @@ def test_query_lineage_owner_rows_excludes_orphan_rebase_descendant_from_actiona
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
 
     impl = store.add("Implement feature", task_type="implement")
     assert impl.id is not None
@@ -1732,6 +1806,10 @@ def test_query_lineage_owner_rows_excludes_orphan_rebase_descendant_from_actiona
 
     git = MagicMock()
     git.can_merge.return_value = False
+    git.rev_parse_if_exists.side_effect = (
+        lambda ref: "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
+    )
+    _persist_current_green_verify(store, config, owner_task=impl, source_task=impl, head_sha="same-head")
 
     rows = query_lineage_owner_rows(
         store,
@@ -1756,6 +1834,9 @@ def test_query_lineage_owner_rows_planning_excludes_dropped_descendant_rebase(tm
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
 
     impl = store.add("Implement feature", task_type="implement")
     assert impl.id is not None
@@ -1788,6 +1869,10 @@ def test_query_lineage_owner_rows_planning_excludes_dropped_descendant_rebase(tm
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.rev_parse_if_exists.side_effect = (
+        lambda ref: "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
+    )
+    _persist_current_green_verify(store, config, owner_task=impl, source_task=impl, head_sha="same-head")
 
     rows = query_lineage_owner_rows(
         store,
@@ -2212,6 +2297,9 @@ def test_query_lineage_owner_rows_keeps_legitimate_impl_branch_rebase_descendant
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
 
     impl = store.add("Implement feature", task_type="implement")
     assert impl.id is not None
@@ -2245,6 +2333,10 @@ def test_query_lineage_owner_rows_keeps_legitimate_impl_branch_rebase_descendant
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.rev_parse_if_exists.side_effect = (
+        lambda ref: "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
+    )
+    _persist_current_green_verify(store, config, owner_task=impl, source_task=review, head_sha="same-head")
 
     rows = query_lineage_owner_rows(
         store,
@@ -2267,6 +2359,9 @@ def test_query_lineage_owner_rows_planning_keeps_completed_and_failed_live_tasks
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
 
     completed_impl = store.add("Completed implement", task_type="implement")
     assert completed_impl.id is not None
@@ -2291,6 +2386,10 @@ def test_query_lineage_owner_rows_planning_keeps_completed_and_failed_live_tasks
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.rev_parse_if_exists.side_effect = (
+        lambda ref: "same-head" if ref == "feature/completed-live" else "base-head" if ref == "main" else None
+    )
+    _persist_current_green_verify(store, config, owner_task=completed_impl, source_task=completed_impl, head_sha="same-head")
 
     rows = query_lineage_owner_rows(
         store,
@@ -2398,6 +2497,9 @@ def test_query_lineage_owner_rows_mergeable_behind_branch_projects_normal_action
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
 
     impl = store.add("Implement stale lineage", task_type="implement")
     assert impl.id is not None
@@ -2412,8 +2514,12 @@ def test_query_lineage_owner_rows_mergeable_behind_branch_projects_normal_action
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.rev_parse_if_exists.side_effect = (
+        lambda ref: "same-head" if ref == "feature/stale-lineage" else "base-head" if ref == "main" else None
+    )
     git.resolve_fresh_merge_source.return_value = ("origin/feature/stale-lineage", None)
     git.count_commits_behind.return_value = 1
+    _persist_current_green_verify(store, config, owner_task=impl, source_task=impl, head_sha="same-head")
 
     rows = query_lineage_owner_rows(
         store,
@@ -2436,6 +2542,9 @@ def test_query_lineage_owner_rows_projects_merge_for_approved_behind_branch(tmp_
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
 
     impl = store.add("Implement approved stale lineage", task_type="implement")
     assert impl.id is not None
@@ -2462,11 +2571,15 @@ def test_query_lineage_owner_rows_projects_merge_for_approved_behind_branch(tmp_
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.rev_parse_if_exists.side_effect = (
+        lambda ref: "same-head" if ref == "feature/approved-stale-lineage" else "base-head" if ref == "main" else None
+    )
     git.resolve_fresh_merge_source.return_value = (
         "origin/feature/approved-stale-lineage",
         None,
     )
     git.count_commits_behind.return_value = 1
+    _persist_current_green_verify(store, config, owner_task=impl, source_task=review, head_sha="same-head")
 
     rows = query_lineage_owner_rows(
         store,
@@ -4545,6 +4658,9 @@ def test_query_lineage_owner_rows_keeps_auto_refreshable_stale_review_out_of_att
     improve.has_commits = True
     improve.changed_diff = True
     store.update(improve)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
 
     git = MagicMock(spec=Git)
     git.default_branch.return_value = "main"
@@ -4552,6 +4668,7 @@ def test_query_lineage_owner_rows_keeps_auto_refreshable_stale_review_out_of_att
     git.can_merge.return_value = True
     git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(impl.branch)
     git.rev_parse_if_exists.side_effect = lambda ref: "current-sha" if ref == impl.branch else None
+    _persist_current_green_verify(store, config, owner_task=impl, source_task=improve, head_sha="current-sha")
 
     rows = query_lineage_owner_rows(
         store,

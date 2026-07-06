@@ -119,11 +119,11 @@ In practice:
 
 ## Verify commands must flush diagnostics on timeout
 
-Autonomous review verification treats timeout diagnostics as part of the
+Autonomous lifecycle verification treats timeout diagnostics as part of the
 contract, not optional nice-to-have logging. The lifecycle runner sends
 SIGTERM to the verify process group before escalating to SIGKILL, and it
 persists whatever stdout/stderr the harness flushes during that grace period
-as review evidence.
+as verify evidence.
 
 A good `verify_command` therefore does three things:
 

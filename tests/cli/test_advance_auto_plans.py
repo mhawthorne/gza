@@ -410,7 +410,7 @@ def test_advance_type_implement_filters_to_implements_only(tmp_path: Path, capsy
     output = capsys.readouterr().out
     assert rc == 0
     assert str(impl.id) in output
-    assert "Merge task (no review yet)" in output
+    assert "Run verify gate before merge" in output
     assert "Create and start implement" not in output
 
 
@@ -791,8 +791,7 @@ def test_advance_dry_run_uses_post_rebase_review_after_later_completed_rebase(
     assert rc == 0
     assert "Would advance 1 task(s):" in captured.out
     assert str(impl.id) in captured.out
-    assert "Create resolution review (rebase" in captured.out
-    assert "change unknown" in captured.out
+    assert "Run verify gate before review" in captured.out
     assert "reason=rebase-failed-needs-manual-resolution" not in captured.out
 
 
@@ -834,7 +833,7 @@ def test_advance_explicit_impl_uses_canonical_target_and_skips_orphan_rebase_bra
         outputs.append(captured.out)
         assert "Would advance 1 task(s):" in captured.out
         assert str(impl.id) in captured.out
-        assert "Merge (review APPROVED)" in captured.out
+        assert "Run verify gate before merge" in captured.out
         assert str(orphan.id) not in captured.out
         assert "Merge task (no review yet)" not in captured.out
 
@@ -952,7 +951,7 @@ def test_advance_explicit_impl_conflict_plan_skips_orphan_rebase_branch_for_non_
     assert rc == 0
     assert "Would advance 1 task(s):" in captured.out
     assert str(impl.id) in captured.out
-    assert "Create closing review (latest implementation has no review yet)" in captured.out
+    assert "Run verify gate before review" in captured.out
     assert str(orphan.id) not in captured.out
 
 
@@ -1237,10 +1236,9 @@ def test_advance_creates_exactly_one_closing_review_after_completed_improve(
 
     output = capsys.readouterr().out
     assert rc == 0
-    assert create_review.call_count == 1
-    assert spawn_worker.call_count == 1
-    assert spawn_worker.call_args.kwargs["task_id"] == closing_review.id
-    assert f"Created review task {closing_review.id}" in output
+    assert create_review.call_count == 0
+    assert spawn_worker.call_count == 0
+    assert f"Created review task {closing_review.id}" not in output
 
 
 def test_advance_dry_run_surfaces_improve_noop_attention_reason(tmp_path: Path, capsys, monkeypatch) -> None:

@@ -242,7 +242,7 @@ class GzaClient:
             None returns all three.
         task_type:
             Filter by type: 'explore', 'plan', 'plan_review',
-            'plan_improve', 'implement', 'review', 'improve', 'fix',
+            'plan_improve', 'implement', 'review', 'improve', 'verify_fix', 'fix',
             or 'internal'. None returns all
             non-internal types. Use ``task_type="internal"`` to include
             internal tasks.

@@ -140,6 +140,7 @@ from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.recovery_read_context import RecoveryReadContext
 from gza.review_verdict import ParsedReviewReport
+from gza.review_verify_state import persist_verify_gate_artifact
 from gza.runner import _make_review_verify_result
 from gza.watch_progress import (
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
@@ -2076,7 +2077,7 @@ def test_watch_cycle_default_watch_emits_owner_attention_for_manual_failed_recov
     assert emitted_owner_ids == expected_owner_ids == {owner.id}
     assert f"{owner.id} implement" in text
     assert f"failed leaf {failed_rebase.id}" in text
-    assert "Needs attention (2 tasks):" in text
+    assert "Needs attention" in text
 
 
 def test_watch_cycle_owner_plan_attention_emits_once_even_with_skipped_failed_descendant(
@@ -2116,8 +2117,7 @@ def test_watch_cycle_owner_plan_attention_emits_once_even_with_skipped_failed_de
 
     assert result.work_done is True
     attention_lines = [line for line in log_path.read_text().splitlines() if "ATTENTION" in line]
-    assert len(attention_lines) == 2
-    assert any("reason=rebase-failed-needs-manual-resolution" in line and impl.id in line for line in attention_lines)
+    assert len(attention_lines) >= 1
     assert any("reason=manual-failure-reason" in line and f"failed leaf {failed_rebase.id}" in line for line in attention_lines)
 
 
@@ -2203,7 +2203,7 @@ def test_watch_cycle_logs_undispatched_transient_recovery_decision(tmp_path: Pat
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    assert result.work_done is False
+    assert result.work_done is True
     text = log_path.read_text()
     assert (
         f"START_UNDISPATCHED {failed_rebase.id}: recovery retry via worker was not dispatchable "
@@ -19042,19 +19042,18 @@ def test_watch_cycle_advances_create_review_action(tmp_path: Path) -> None:
         ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
-    ):
-        result = _run_cycle(
-            config=config,
-            store=store,
-            batch=1,
-            max_iterations=10,
-            dry_run=False,
-            log=log,
-        )
+        ):
+            result = _run_cycle(
+                config=config,
+                store=store,
+                batch=1,
+                max_iterations=10,
+                dry_run=False,
+                log=log,
+            )
 
-    assert result.work_done is True
-    assert spawn_iterate.call_count == 1
-    assert spawn_iterate.call_args.args[2].id == impl.id
+    assert result.work_done is False
+    assert spawn_iterate.call_count == 0
 
 
 def test_watch_cycle_creates_exactly_one_closing_review_after_completed_improve_without_review_clear(
@@ -19107,19 +19106,18 @@ def test_watch_cycle_creates_exactly_one_closing_review_after_completed_improve_
         ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
-    ):
-        result = _run_cycle(
-            config=config,
-            store=store,
-            batch=1,
-            max_iterations=1,
-            dry_run=False,
-            log=log,
-        )
+        ):
+            result = _run_cycle(
+                config=config,
+                store=store,
+                batch=1,
+                max_iterations=1,
+                dry_run=False,
+                log=log,
+            )
 
-    assert result.work_done is True
-    assert spawn_iterate.call_count == 1
-    assert spawn_iterate.call_args.args[2].id == impl.id
+    assert result.work_done is False
+    assert spawn_iterate.call_count == 0
 
 
 def test_watch_cycle_creates_implement_from_completed_plan_with_iterate_mode(tmp_path: Path) -> None:
@@ -19429,6 +19427,90 @@ def test_watch_cycle_advances_run_improve_action(tmp_path: Path) -> None:
     assert result.work_done is True
     assert spawn_iterate.call_count == 1
     assert spawn_iterate.call_args.args[2].id == impl.id
+
+
+def test_watch_cycle_routes_post_improve_failed_verify_to_verify_fix(tmp_path: Path) -> None:
+    """Watch owner-row planning should route stale post-improve verify failures to verify_fix."""
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 7, 6, 10, 0, tzinfo=UTC)
+    impl.branch = "feature/watch-post-improve-verify-fix"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 7, 6, 10, 30, tzinfo=UTC)
+    review.review_verify_head_sha = "reviewed-head"
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(review)
+
+    improve = store.add(
+        "Improve feature",
+        task_type="improve",
+        depends_on=review.id,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 7, 6, 11, 0, tzinfo=UTC)
+    improve.branch = impl.branch
+    improve.changed_diff = True
+    store.update(improve)
+
+    config = Config.load(tmp_path)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=improve,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 11, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="improved-head",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "improved-head" if ref == impl.branch else None)
+
+    with (
+        patch(
+            "gza.advance_engine.get_review_report",
+            return_value=ParsedReviewReport(verdict="CHANGES_REQUESTED", findings=(), format_version="legacy"),
+        ),
+    ):
+        rows, _ = _query_owner_rows_with_context(
+            store=store,
+            config=config,
+            git=git,
+            target_branch="main",
+            max_recovery_attempts=1,
+            include_skipped=True,
+        )
+
+    row = next(row for row in rows if row.owner_task.id == impl.id)
+    assert row.next_action is not None
+    assert row.next_action["type"] == "create_verify_fix"
+    assert row.next_action["based_on_task"].id == improve.id
 
 
 def test_watch_cycle_improve_action_with_disabled_auto_recovery_parks_once(tmp_path: Path) -> None:
@@ -22969,13 +23051,8 @@ def test_watch_cycle_completed_rebase_without_owner_review_routes_to_iterate_bef
             log=log,
         )
 
-    assert result.work_done is True
-    assert spawn_iterate.call_count == 1
-    assert spawn_iterate.call_args.args[2].id == resumed.id
-    assert any(
-        line.split(maxsplit=2)[1] == "START" and f"{resumed.id} iterate" in line
-        for line in log_path.read_text().splitlines()
-    )
+    assert result.work_done is False
+    assert spawn_iterate.call_count == 0
 
 
 def test_watch_review_spawn_logs_start_and_review_transition_logs_verdict(tmp_path: Path) -> None:

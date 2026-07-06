@@ -100,7 +100,6 @@ from ..review_verdict import (
     ReviewFinding,
     get_review_content,
     get_review_report,
-    is_verify_blocked_only_review,
     summarize_review_blockers,
 )
 from ..review_verify_state import refresh_preserved_rebase_review_verify_heads
@@ -368,13 +367,6 @@ def _classify_manual_merge_blockers(
         )
 
     if defer_blockers:
-        return _MergeDeferredBlockerDecision(
-            review_task=review_task,
-            blockers=blockers,
-            should_materialize=True,
-        )
-
-    if is_verify_blocked_only_review(review_content):
         return _MergeDeferredBlockerDecision(
             review_task=review_task,
             blockers=blockers,
@@ -1597,6 +1589,56 @@ def _merge_single_task(
                 print(f"FOLLOW {followup_task.id} reused from {merge_subject.id}")
         print(f"✓ Marked task {merge_subject.id} as merged (branch '{merge_branch}' preserved)")
         return _MergeSingleTaskResult(rc=0)
+
+    planned_action = determine_next_action(
+        config,
+        store,
+        git,
+        execution_task,
+        target_branch,
+        selected_for_merge=True,
+    )
+    if planned_action.get("type") == "verify_gate":
+        verify_context = AdvanceActionExecutionContext(
+            store=store,
+            trigger_source="manual",
+            dry_run=False,
+            max_resume_attempts=getattr(config, "max_resume_attempts", 0),
+            use_iterate_for_create_implement=False,
+            use_iterate_for_needs_rebase=False,
+            prepare_task_for_background_start=lambda task, _rollback: task,
+            prepare_create_review=lambda _task: (_ for _ in ()).throw(AssertionError("unused")),
+            create_resume_task=lambda _task: (_ for _ in ()).throw(AssertionError("unused")),
+            create_rebase_task=lambda _task: (_ for _ in ()).throw(AssertionError("unused")),
+            create_implement_task=lambda _task: (_ for _ in ()).throw(AssertionError("unused")),
+            spawn_worker=lambda _task, _kind: (_ for _ in ()).throw(AssertionError("unused")),
+            spawn_resume_worker=lambda _task, _kind: (_ for _ in ()).throw(AssertionError("unused")),
+            spawn_iterate_worker=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unused")),
+            config=config,
+            git=git,
+        )
+        verify_result = execute_advance_action(
+            task=execution_task,
+            action=planned_action,
+            context=verify_context,
+        )
+        message = verify_result.success_message or verify_result.message or planned_action.get("description", "")
+        if message:
+            print(message)
+        if verify_result.status != "success":
+            return _MergeSingleTaskResult(rc=1)
+        planned_action = determine_next_action(
+            config,
+            store,
+            git,
+            execution_task,
+            target_branch,
+            selected_for_merge=True,
+        )
+    if planned_action.get("type") not in {"merge", "merge_with_followups"}:
+        description = str(planned_action.get("description") or "merge is blocked")
+        print(f"Error: {description}")
+        return _MergeSingleTaskResult(rc=1)
 
     # Check if branch already merged
     if git.is_merged(merge_source_ref, current_branch):

@@ -8,7 +8,7 @@ from .db import SqliteTaskStore, Task as DbTask
 from .lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from .recovery_read_context import RecoveryReadContext
 
-MERGE_REQUIRED_DEPENDENCY_TASK_TYPES = frozenset({"task", "implement", "improve", "fix", "rebase"})
+MERGE_REQUIRED_DEPENDENCY_TASK_TYPES = frozenset({"task", "implement", "improve", "verify_fix", "fix", "rebase"})
 TERMINAL_NO_WORK_MERGE_STATES = frozenset({"empty", "redundant"})
 DIRECT_DEPENDENCY_SELF_SATISFYING_MERGE_STATES = TERMINAL_NO_WORK_MERGE_STATES | frozenset({"merged"})
 

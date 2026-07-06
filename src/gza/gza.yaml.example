@@ -82,6 +82,11 @@ project_name: my-project
 # Default: 10
 # timeout_minutes: 10
 
+# Optional preferred unit-scope verification command for code tasks; when unset, prompts fall back
+# to `inner_verify_command`, then targeted checks.
+# Default: ""
+# unit_verify_command: ""
+
 # Run providers in Docker.
 # Default: true
 # use_docker: true
@@ -438,8 +443,10 @@ project_name: my-project
 
 # --- Review ---
 
-# Allow lifecycle to clear a verify-only blocked review through the off-topic verify classifier;
-# when false, the verify-only blocker remains conservative and stays blocking.
+# Allow the narrow legacy compatibility lane for persisted verify-only review blockers to consult
+# the off-topic verify classifier; when false, lifecycle keeps that historical review state
+# blocking and current two-gate work still requires fresh lifecycle verify plus a merge-permitting
+# review.
 # Default: false
 # advance_off_topic_verify_unblock: false
 
@@ -468,7 +475,7 @@ project_name: my-project
 # Default: 500
 # review_diff_small_threshold: 500
 
-# Grace period in seconds after SIGTERM before autonomous review verification escalates to
+# Grace period in seconds after SIGTERM before autonomous lifecycle verification escalates to
 # SIGKILL.
 # Default: 5
 # review_verify_timeout_grace_seconds: 5

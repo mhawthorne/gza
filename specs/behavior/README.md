@@ -40,7 +40,7 @@ Additional rules for authors:
 |------|------|
 | [00-overview.md](00-overview.md) | Shared model for the whole set: vocabulary, system-wide invariants, lifecycle diagram, and the consolidated human-escalation table. |
 | [lifecycle-engine.md](lifecycle-engine.md) | Engine-only decision rules: ordered rule set, policy knobs, parked reason codes, and ratified decisions. |
-| [off-topic-verify-failures.md](off-topic-verify-failures.md) | Verify-only off-topic unblock contract: opt-in policy, conservative classification preconditions, fingerprint-bound clearance, and the non-blocking investigation lane. |
+| [off-topic-verify-failures.md](off-topic-verify-failures.md) | Legacy verify-only compatibility contract: the opt-in audited off-topic lane for historical review-coupled verify blockers, including conservative classification preconditions, fingerprint-bound clearance, and the non-blocking investigation lane. |
 | [main-verify-self-heal.md](main-verify-self-heal.md) | North-star convergence contract for red local-target integration verify: rerun-before-reuse, bounded red lifetime, deterministic-red repair, and no merge-stall-to-launch-stall cascade. |
 | [isolated-merge-checkout.md](isolated-merge-checkout.md) | Watch-time default-branch merge staging and promotion when `main_checkout_isolate` is enabled, including dirty attached-checkout handling. |
 | [lineage.md](lineage.md) | Task-graph operations: dependency satisfaction, owner/merge-unit resolution, latest-node resolution, and recovery-target attachment. |

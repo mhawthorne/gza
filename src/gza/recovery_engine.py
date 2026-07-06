@@ -62,7 +62,7 @@ _REBASE_INFRA_LOG_MARKERS = (
 )
 RETRY_LIMIT_REACHED_ATTENTION_REASON = "retry-limit-reached"
 
-_ACTIONABLE_TYPES = {"implement", "plan", "explore", "fix", "internal", "review", "improve", "rebase"}
+_ACTIONABLE_TYPES = {"implement", "plan", "explore", "fix", "internal", "review", "improve", "verify_fix", "rebase"}
 _MANUAL_ONLY_REASONS = {
     "CONFIG_ERROR",
     "REBASE_CONFLICT",

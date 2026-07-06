@@ -31,6 +31,7 @@ from gza.rebase_diff import RebaseDiffBaseline
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.recovery_transients import classify_transient_recovery_terminal
 from gza.review_clearance import VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS
+from gza.review_verify_state import VERIFY_GATE_ARTIFACT_KIND
 from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
 from gza.review_verdict import ParsedReviewReport, ReviewFinding, parse_review_report
 from gza.runner import (
@@ -56,6 +57,8 @@ from gza.runner import (
     _build_code_task_commit_subject,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
+    _build_timeout_resume_context,
+    _capture_review_verify_result,
     _capture_noop_improve_review_verify_result,
     _check_dependency_merge_precondition,
     _complete_code_task,
@@ -149,11 +152,11 @@ class TestGetTaskOutputPaths:
         return task
 
     def test_code_task_types_return_summary_path(self, tmp_path: Path):
-        """Code task types (task, implement, improve, fix, rebase) return a summary_path."""
+        """Code task types (task, implement, improve, verify_fix, fix, rebase) return a summary_path."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
-        for task_type in ("task", "implement", "improve", "fix", "rebase"):
+        for task_type in ("task", "implement", "improve", "verify_fix", "fix", "rebase"):
             task = self._make_task(store, task_type)
             report_path, summary_path = get_task_output_paths(task, tmp_path)
             assert summary_path is not None, f"{task_type} should have summary_path"
@@ -1521,6 +1524,44 @@ class TestReviewContextFromChain:
         assert "Parser error: resolution review metadata is missing required fields" in context
         assert "## Implementation Diff Context" not in context
 
+    def test_resolution_review_with_missing_provenance_emits_unavailable_delta_and_skips_full_impl_diff(
+        self,
+        tmp_path: Path,
+    ):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl_task = store.add("Implement task gza-1", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.branch = "feature/resolution-review-missing-provenance"
+        store.update(impl_task)
+
+        review_task = store.add(
+            prompt="Review rebased implementation",
+            task_type="review",
+            depends_on=impl_task.id,
+            review_scope=(
+                "Review mode: resolution\n"
+                f"Implementation task: {impl_task.id}\n"
+                "Rebase task: gza-2\n"
+                "Pre-rebase head SHA: \n"
+                "Pre-rebase target SHA: old-target\n"
+                "Pre-rebase merge-base SHA: \n"
+                "Resolved head SHA: rebased-head\n"
+                "Resolved target SHA: target-head\n"
+            ),
+        )
+
+        git = MagicMock(spec=Git)
+        git.default_branch.side_effect = AssertionError("full implementation diff should be skipped")
+
+        context = _build_context_from_chain(review_task, store, tmp_path, git=git)
+
+        assert "## Resolution review ask:" in context
+        assert "Resolution delta status: unavailable" in context
+        assert "resolution delta unavailable: missing pre/post rebase provenance refs" in context
+        assert "## Implementation Diff Context" not in context
+
     def test_resolution_review_context_uses_persisted_rebase_target_even_if_target_has_moved(
         self,
         tmp_path: Path,
@@ -1603,8 +1644,8 @@ class TestReviewContextFromChain:
         assert "## Implementation Diff Context" in context
         assert "--- diff body ---" in context
 
-    def test_review_context_includes_verify_result_when_provided(self, tmp_path: Path):
-        """Autonomous review context should thread structured verify output into the prompt."""
+    def test_review_context_omits_verify_result_when_provided(self, tmp_path: Path):
+        """Review context remains code-only even if verify output is passed in."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -1634,7 +1675,8 @@ class TestReviewContextFromChain:
             review_verify_result=verify_result,
         )
 
-        assert verify_result in context
+        assert verify_result not in context
+        assert "## verify_command result" not in context
         assert "## Original request:" in context
 
     def test_review_context_omits_ask_sections_when_no_plan_or_prompt(self, tmp_path: Path):
@@ -2915,7 +2957,7 @@ class TestReviewContextFromChain:
         assert checklist_start < review_start
         assert "Review blocker B1 [code]: Missing stale-review guard" in context
         assert "Open-state citation: `src/gza/advance_engine.py:1994`" in context
-        assert "Review blocker B2 [verify_failure]: verify_command failure: resume review regression" in context
+        assert "Review blocker B2 [code]: verify_command failure: resume review regression" in context
         assert "Required tests: rerun verify_command." in context
         assert "Unresolved comment #" in context
         assert "Also tighten the follow-up validation path." in context
@@ -3000,7 +3042,7 @@ class TestReviewContextFromChain:
         assert "legacy report is not parseable into structured findings" in context
         assert "Review blocker B1" not in context
 
-    def test_improve_context_includes_verify_timeout_guidance_for_timeout_only_review(self, tmp_path: Path):
+    def test_improve_context_omits_verify_timeout_guidance_for_timeout_only_review(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
 
@@ -3038,17 +3080,11 @@ class TestReviewContextFromChain:
 
         context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
 
-        assert "## Verify Timeout Guidance" in context
-        assert "Treat this as a test-performance investigation first" in context
-        assert "Inspect the captured `## verify_command result`, trimmed output, and any referenced `verify_command_output` artifact" in context
-        assert "run a narrower configured subset or harness-specific diagnostic mode" in context
-        assert "Use diagnostics that fit the configured harness for this project" in context
-        assert "do not silently relax suite-wide guardrails or change `verify_timeout`" in context
-        assert "pytest" not in context
-        assert "--durations" not in context
-        assert "uv run pytest" not in context
+        assert "## Verify Timeout Guidance" not in context
+        assert "Treat this as a test-performance investigation first" not in context
+        assert "Inspect the captured `## verify_command result`" not in context
 
-    def test_improve_context_includes_verify_timeout_guidance_for_evidence_only_timeout_review(
+    def test_improve_context_omits_verify_timeout_guidance_for_evidence_only_timeout_review(
         self, tmp_path: Path
     ):
         db_path = tmp_path / "test.db"
@@ -3088,14 +3124,9 @@ class TestReviewContextFromChain:
 
         context = _build_context_from_chain(improve_task, store, tmp_path, git=None)
 
-        assert "## Verify Timeout Guidance" in context
-        assert "Treat this as a test-performance investigation first" in context
-        assert "Captured stdout/stderr may already include slow-phase summaries or SIGTERM-triggered stack dumps" in context
-        assert "Inspect the captured `## verify_command result`" in context
-        assert "run a narrower configured subset or harness-specific diagnostic mode" in context
-        assert "pytest" not in context
-        assert "--durations" not in context
-        assert "uv run pytest" not in context
+        assert "## Verify Timeout Guidance" not in context
+        assert "Treat this as a test-performance investigation first" not in context
+        assert "Inspect the captured `## verify_command result`" not in context
 
     def test_improve_context_excludes_verify_timeout_guidance_for_code_blocker_review(self, tmp_path: Path):
         db_path = tmp_path / "test.db"
@@ -12890,7 +12921,7 @@ class TestExtractedRunInnerHelpers:
         output = capsys.readouterr().out
         assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
 
-    def test_post_complete_noop_improve_clears_verify_only_review_block_with_current_green_verify_evidence(
+    def test_post_complete_noop_improve_does_not_clear_verify_only_review_block_with_current_green_verify_evidence(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -12972,25 +13003,10 @@ class TestExtractedRunInnerHelpers:
 
         refreshed_impl = store.get(impl.id)
         assert refreshed_impl is not None
-        assert refreshed_impl.review_cleared_at == recorded_at
-        clearance_artifacts = store.list_artifacts(impl.id, kind="review_clearance")
-        assert len(clearance_artifacts) == 1
-        assert clearance_artifacts[0].created_at == recorded_at
-        assert clearance_artifacts[0].status == VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS
-        assert clearance_artifacts[0].head_sha == "abc1234"
-        assert clearance_artifacts[0].metadata == {
-            "clearance_kind": "verify_only_noop_recovered",
-            "clearance_status": VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
-            "review_task_id": review.id,
-            "source_task_id": improve.id,
-            "noop_improve_kind": "verify_only",
-            "reviewed_head_sha": "abc1234",
-        }
-        assert json.loads((tmp_path / clearance_artifacts[0].path).read_text())["captured_at"] == (
-            improve.review_verify_captured_at.isoformat()
-        )
+        assert refreshed_impl.review_cleared_at is None
+        assert store.list_artifacts(impl.id, kind="review_clearance") == []
         output = capsys.readouterr().out
-        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" in output
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
 
         next_action = determine_next_action(
             config,
@@ -12999,7 +13015,7 @@ class TestExtractedRunInnerHelpers:
             refreshed_impl,
             "main",
         )
-        assert next_action["type"] in {"merge", "merge_with_followups"}
+        assert next_action["type"] not in {"merge", "merge_with_followups"}
 
     def test_post_complete_noop_improve_clearance_does_not_merge_after_head_changes(
         self,
@@ -13075,7 +13091,7 @@ class TestExtractedRunInnerHelpers:
         assert rc == 0
         sync_branch.assert_not_called()
         run_review.assert_not_called()
-        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" in capsys.readouterr().out
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in capsys.readouterr().out
 
         refreshed_impl = store.get(impl.id)
         assert refreshed_impl is not None
@@ -13146,25 +13162,21 @@ class TestExtractedRunInnerHelpers:
                 "gza.runner.compute_improve_changed_diff",
                 return_value=ImproveDiffResult(changed_diff=False, detail="no (no tracked improve changes)"),
             ),
-            patch(
-                "gza.runner.persist_review_clearance_artifact",
-                side_effect=RuntimeError("disk full"),
-            ),
             patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
             patch("gza.runner._create_and_run_review_task") as run_review,
             patch("gza.runner.task_footer"),
             patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
         ):
-            with pytest.raises(RuntimeError, match="disk full"):
-                _post_complete_code_task(
-                    improve,
-                    config,
-                    store,
-                    worktree_git,
-                    improve.branch,
-                    TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
-                )
+            rc = _post_complete_code_task(
+                improve,
+                config,
+                store,
+                worktree_git,
+                improve.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=2, cost_usd=0.02),
+            )
 
+        assert rc == 0
         sync_branch.assert_not_called()
         run_review.assert_not_called()
 
@@ -13328,7 +13340,7 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0, label
-        capture_verify.assert_called_once()
+        capture_verify.assert_not_called()
         run_verify.assert_not_called()
         sync_branch.assert_not_called()
         run_review.assert_not_called()
@@ -13340,7 +13352,7 @@ class TestExtractedRunInnerHelpers:
         output = capsys.readouterr().out
         assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
 
-    def test_post_complete_noop_improve_clears_report_file_verify_only_review_block_with_current_green_verify_evidence(
+    def test_post_complete_noop_improve_does_not_clear_report_file_verify_only_review_block_with_current_green_verify_evidence(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -13427,14 +13439,10 @@ class TestExtractedRunInnerHelpers:
 
         refreshed_impl = store.get(impl.id)
         assert refreshed_impl is not None
-        assert refreshed_impl.review_cleared_at is not None
-        assert refreshed_impl.review_cleared_at >= review.completed_at
-        clearance_artifacts = store.list_artifacts(impl.id, kind="review_clearance")
-        assert len(clearance_artifacts) == 1
-        assert clearance_artifacts[0].status == VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS
-        assert clearance_artifacts[0].head_sha == "abc1234"
+        assert refreshed_impl.review_cleared_at is None
+        assert store.list_artifacts(impl.id, kind="review_clearance") == []
         output = capsys.readouterr().out
-        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" in output
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
 
     def test_post_complete_noop_improve_keeps_current_green_verify_evidence_when_recapture_would_overwrite_it(
         self,
@@ -13540,16 +13548,8 @@ class TestExtractedRunInnerHelpers:
 
         refreshed_impl = store.get(impl.id)
         assert refreshed_impl is not None
-        assert refreshed_impl.review_cleared_at is not None
-        clearance_artifacts = store.list_artifacts(impl.id, kind="review_clearance")
-        assert len(clearance_artifacts) == 1
-        assert clearance_artifacts[0].status == VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS
-        assert clearance_artifacts[0].head_sha == "abc1234"
-        assert refreshed_impl.review_cleared_at >= review.completed_at
-        clearance_artifacts = store.list_artifacts(impl.id, kind="review_clearance")
-        assert len(clearance_artifacts) == 1
-        assert clearance_artifacts[0].status == VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS
-        assert clearance_artifacts[0].head_sha == "abc1234"
+        assert refreshed_impl.review_cleared_at is None
+        assert store.list_artifacts(impl.id, kind="review_clearance") == []
 
         refreshed_improve = store.get(improve.id)
         assert refreshed_improve is not None
@@ -13559,9 +13559,9 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_improve.review_verify_captured_at == review.completed_at + timedelta(seconds=1)
 
         output = capsys.readouterr().out
-        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" in output
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
 
-    def test_post_complete_noop_improve_captures_passing_verify_evidence_clears_review_and_becomes_mergeable(
+    def test_post_complete_noop_improve_captures_passing_verify_evidence_but_does_not_clear_verify_only_review(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -13670,44 +13670,22 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
-        assert mock_review_verify.call_args.kwargs["timeout_grace_seconds"] == 9.0
-        capture_verify.assert_called_once()
+        capture_verify.assert_not_called()
+        mock_review_verify.assert_not_called()
         sync_branch.assert_not_called()
         run_review.assert_not_called()
 
         refreshed_impl = store.get(impl.id)
         assert refreshed_impl is not None
-        assert refreshed_impl.review_cleared_at is not None
-        clearance_artifacts = store.list_artifacts(impl.id, kind="review_clearance")
-        assert len(clearance_artifacts) == 1
-        assert clearance_artifacts[0].status == VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS
-        assert clearance_artifacts[0].head_sha == "abc1234"
+        assert refreshed_impl.review_cleared_at is None
+        assert store.list_artifacts(impl.id, kind="review_clearance") == []
 
         refreshed_improve = store.get(improve.id)
         assert refreshed_improve is not None
-        assert refreshed_improve.review_verify_status == "passed"
-        assert refreshed_improve.review_verify_branch == impl.branch
-        assert refreshed_improve.review_verify_head_sha == "abc1234"
-        assert refreshed_improve.review_verify_captured_at == captured_at
-        assert refreshed_improve.review_verify_artifact_file is not None
-        artifacts = store.list_artifacts(impl.id, kind="verify_command_output")
-        assert len(artifacts) == 1
+        assert refreshed_improve.review_verify_status is None
+        assert refreshed_improve.review_verify_artifact_file is None
+        assert store.list_artifacts(impl.id, kind="verify_command_output") == []
         assert store.list_artifacts(improve.id, kind="verify_command_output") == []
-        assert artifacts[0].producer == "noop_review_verify"
-        assert artifacts[0].status == "passed"
-        assert artifacts[0].path == refreshed_improve.review_verify_artifact_file
-        assert artifacts[0].metadata == {
-            "review_task_id": review.id,
-            "reviewed_base_sha": "cafebabe",
-            "reviewed_branch": impl.branch,
-            "reviewed_head_sha": "abc1234",
-            "timeout_seconds": 120,
-            "tree_fingerprint": None,
-            "working_directory": None,
-        }
-        assert artifacts[0].path.startswith(f".gza/artifacts/{impl.id}/")
-        assert (tmp_path / artifacts[0].path).read_text(encoding="utf-8") == "all good\n"
-        assert not str((tmp_path / artifacts[0].path).resolve()).startswith(str(detached_worktree.resolve()))
         reviews = [task for task in store.get_all() if task.task_type == "review" and task.depends_on == impl.id]
         assert len(reviews) == 1
 
@@ -13724,12 +13702,12 @@ class TestExtractedRunInnerHelpers:
         lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
 
         action = evaluate_advance_rules(config, store, lifecycle_git, refreshed_impl, "main")
-        assert action["type"] == "merge"
+        assert action["type"] != "merge"
 
         output = capsys.readouterr().out
-        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" in output
+        assert "cleared verify-origin blocker from persisted passing no-op improve verify evidence" not in output
 
-    def test_post_complete_noop_improve_chain_persists_verify_artifact_on_root_implementation(
+    def test_post_complete_noop_improve_chain_persists_verify_artifact_on_root_implementation_without_clearing_review(
         self,
         tmp_path: Path,
     ) -> None:
@@ -13849,21 +13827,17 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
-        capture_verify.assert_called_once()
+        capture_verify.assert_not_called()
 
         refreshed_improve = store.get(improve.id)
         assert refreshed_improve is not None
-        assert refreshed_improve.review_verify_status == "passed"
-        assert refreshed_improve.review_verify_artifact_file is not None
+        assert refreshed_improve.review_verify_status is None
+        assert refreshed_improve.review_verify_artifact_file is None
 
         impl_artifacts = store.list_artifacts(impl.id, kind="verify_command_output")
-        assert len(impl_artifacts) == 1
+        assert len(impl_artifacts) == 0
         assert store.list_artifacts(previous_improve.id, kind="verify_command_output") == []
         assert store.list_artifacts(improve.id, kind="verify_command_output") == []
-        assert impl_artifacts[0].producer == "noop_review_verify"
-        assert impl_artifacts[0].path == refreshed_improve.review_verify_artifact_file
-        assert impl_artifacts[0].path.startswith(f".gza/artifacts/{impl.id}/")
-        assert (tmp_path / impl_artifacts[0].path).read_text(encoding="utf-8") == "all good from chained improve\n"
 
     def test_post_complete_noop_improve_persists_fresh_failed_verify_evidence_without_clearing_review(
         self,
@@ -13967,7 +13941,7 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
-        capture_verify.assert_called_once()
+        capture_verify.assert_not_called()
         sync_branch.assert_not_called()
         run_review.assert_not_called()
 
@@ -13976,10 +13950,10 @@ class TestExtractedRunInnerHelpers:
         assert refreshed_impl.review_cleared_at is None
         refreshed_improve = store.get(improve.id)
         assert refreshed_improve is not None
-        assert refreshed_improve.review_verify_status == "failed"
-        assert refreshed_improve.review_verify_branch == impl.branch
-        assert refreshed_improve.review_verify_head_sha == "abc1234"
-        assert refreshed_improve.review_verify_captured_at == captured_at
+        assert refreshed_improve.review_verify_status is None
+        assert refreshed_improve.review_verify_branch is None
+        assert refreshed_improve.review_verify_head_sha is None
+        assert refreshed_improve.review_verify_captured_at is None
         artifacts = store.list_artifacts(impl.id, kind="verify_command_output")
         assert len(artifacts) == 0
         assert store.list_artifacts(improve.id, kind="verify_command_output") == []
@@ -14057,15 +14031,13 @@ class TestExtractedRunInnerHelpers:
             branch_name=impl.branch,
         )
 
-        assert result is not None
-        assert result.status == "unavailable"
-        assert result.exit_status == "unresolved head"
+        assert result is None
         assert store.list_artifacts(impl.id, kind="verify_command_output") == []
         assert store.list_artifacts(improve.id, kind="verify_command_output") == []
 
         refreshed_improve = store.get(improve.id)
         assert refreshed_improve is not None
-        assert refreshed_improve.review_verify_status == "unavailable"
+        assert refreshed_improve.review_verify_status is None
         assert refreshed_improve.review_verify_artifact_file is None
 
     @pytest.mark.parametrize(
@@ -14191,7 +14163,7 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
-        capture_verify.assert_called_once()
+        capture_verify.assert_not_called()
         sync_branch.assert_not_called()
         run_review.assert_not_called()
 
@@ -14282,7 +14254,7 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
-        capture_verify.assert_called_once()
+        capture_verify.assert_not_called()
         run_verify.assert_not_called()
         sync_branch.assert_not_called()
         run_review.assert_not_called()
@@ -14528,7 +14500,7 @@ class TestExtractedRunInnerHelpers:
             )
 
         assert rc == 0
-        capture_verify.assert_called_once()
+        capture_verify.assert_not_called()
         run_verify.assert_not_called()
         sync_branch.assert_not_called()
         run_review.assert_not_called()
@@ -19919,7 +19891,7 @@ class TestRunnerStoreMetadata:
 class TestProviderPromptSanitization:
     """Runner should sanitize provider-facing review/improve prompts only."""
 
-    def test_fresh_review_prompt_includes_failed_verify_result_from_runner(self, tmp_path: Path):
+    def test_fresh_review_prompt_omits_verify_result_from_runner(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl = store.add(prompt="Implement feature X", task_type="implement")
         impl.status = "completed"
@@ -19943,13 +19915,8 @@ class TestProviderPromptSanitization:
         config.model = None
         config.max_steps = 10
         config.timeout_minutes = 10
-        passed_fingerprint = "a" * 64
-        failed_fingerprint = "b" * 64
         config.verify_command = (
-            "printf 'gza-verify phase=passed name=ruff duration_seconds=1.25 "
-            f"tree_fingerprint={passed_fingerprint}\\n"
-            "gza-verify phase=failed name=pytest duration_seconds=3.5 "
-            f"tree_fingerprint={failed_fingerprint}\\n"
+            "printf 'gza-verify phase=failed name=pytest duration_seconds=3.5\\n"
             "lint failed\\n' && exit 7"
         )
         config.autonomous_verify_timeout_seconds = 120
@@ -19981,63 +19948,26 @@ class TestProviderPromptSanitization:
         git.get_diff.return_value = ""
         git.get_diff_stat.return_value = ""
 
-        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
-             patch("gza.runner.post_review_to_pr"):
+        with patch("gza.runner._run_lifecycle_verify") as run_lifecycle_verify, patch(
+            "gza.runner.post_review_to_pr"
+        ):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
+        run_lifecycle_verify.assert_not_called()
         assert len(captured_prompts) == 1
         prompt = captured_prompts[0]
-        assert "## verify_command result" in prompt
-        assert "- Status: failed" in prompt
-        assert "- Exit status: 7" in prompt
-        assert "- Reviewed head: `deadbeef`" in prompt
-        assert "lint failed" in prompt
+        assert "## verify_command result" not in prompt
+        assert "lint failed" not in prompt
         assert "## Original request:" in prompt
         refreshed = store.get(task.id)
         assert refreshed is not None
-        assert refreshed.review_verify_status == "failed"
-        assert refreshed.review_verify_exit_status == "7"
-        assert refreshed.review_verify_head_sha == "deadbeef"
-        assert refreshed.review_verify_branch == impl.branch
-        assert refreshed.review_verify_markdown is not None
-        assert "- Working directory: `" in refreshed.review_verify_markdown
-        assert refreshed.review_verify_cwd is not None
-        assert refreshed.review_verify_cwd.endswith(f"{task.slug}-{task.task_type}")
-        assert refreshed.review_verify_artifact_file is not None
+        assert refreshed.review_verify_status is None
+        assert refreshed.review_verify_markdown is None
+        assert refreshed.review_verify_artifact_file is None
+        assert store.list_artifacts(task.id, kind="verify_command_output") == []
 
-        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
-        assert len(artifacts) == 1
-        artifact = artifacts[0]
-        assert artifact.status == "failed"
-        assert artifact.exit_status == "7"
-        assert artifact.path == refreshed.review_verify_artifact_file
-        assert artifact.metadata == {
-            "cwd": refreshed.review_verify_cwd,
-            "reviewed_base_sha": None,
-            "reviewed_branch": impl.branch,
-            "reviewed_head_sha": "deadbeef",
-            "timeout_seconds": 120,
-            "tree_fingerprint": failed_fingerprint,
-            "working_directory": refreshed.review_verify_cwd,
-        }
-        assert (tmp_path / artifact.path).read_text(encoding="utf-8") == (
-            "gza-verify phase=passed name=ruff duration_seconds=1.25 "
-            f"tree_fingerprint={passed_fingerprint}\n"
-            "gza-verify phase=failed name=pytest duration_seconds=3.5 "
-            f"tree_fingerprint={failed_fingerprint}\n"
-            "lint failed"
-        )
-
-        ops_entries = [
-            json.loads(line)
-            for line in (tmp_path / "logs" / f"{task.slug}.ops.jsonl").read_text(encoding="utf-8").splitlines()
-        ]
-        verify_entry = next(entry for entry in ops_entries if entry.get("event") == "review_verify_result")
-        assert verify_entry["review_verify_status"] == "failed"
-        assert verify_entry["review_verify_artifact_file"] == refreshed.review_verify_artifact_file
-
-    def test_fresh_review_persists_passing_verify_artifact(self, tmp_path: Path):
+    def test_fresh_review_does_not_persist_passing_verify_artifact(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl = store.add(prompt="Implement feature X", task_type="implement")
         impl.status = "completed"
@@ -20088,32 +20018,22 @@ class TestProviderPromptSanitization:
         git.get_diff.return_value = ""
         git.get_diff_stat.return_value = ""
 
-        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
-             patch("gza.runner.post_review_to_pr"):
+        with patch("gza.runner._run_lifecycle_verify") as run_lifecycle_verify, patch(
+            "gza.runner.post_review_to_pr"
+        ):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
+        run_lifecycle_verify.assert_not_called()
         refreshed = store.get(task.id)
         assert refreshed is not None
-        assert refreshed.review_verify_status == "passed"
-        assert refreshed.review_verify_markdown is not None
-        assert "- Status: passed" in refreshed.review_verify_markdown
-        assert refreshed.review_verify_artifact_file is not None
-        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
-        assert len(artifacts) == 1
-        assert artifacts[0].status == "passed"
-        assert (tmp_path / artifacts[0].path).read_text(encoding="utf-8") == "all good"
-        assert artifacts[0].metadata == {
-            "cwd": refreshed.review_verify_cwd,
-            "reviewed_base_sha": None,
-            "reviewed_branch": impl.branch,
-            "reviewed_head_sha": "deadbeef",
-            "timeout_seconds": 120,
-            "tree_fingerprint": None,
-            "working_directory": refreshed.review_verify_cwd,
-        }
+        assert refreshed.review_verify_status is None
+        assert refreshed.review_verify_markdown is None
+        assert refreshed.review_verify_artifact_file is None
+        assert store.list_artifacts(task.id, kind="verify_command_output") == []
+        assert store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND) == []
 
-    def test_fresh_review_failing_verify_artifact_preserves_pytest_tail_beyond_prompt_trim(self, tmp_path: Path):
+    def test_fresh_review_does_not_persist_failed_verify_artifact(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl = store.add(prompt="Implement feature X", task_type="implement")
         impl.status = "completed"
@@ -20140,14 +20060,6 @@ class TestProviderPromptSanitization:
         config.verify_command = "./bin/tests"
         config.autonomous_verify_timeout_seconds = 120
 
-        long_output = (
-            ("collected setup noise\n" * 350)
-            + "FAILED tests/test_example.py::test_tail - AssertionError: boom\n"
-            + "=== short test summary info ===\n"
-            + "FAILED tests/test_example.py::test_tail - AssertionError: boom\n"
-            + "============================== 1 failed in 31.25s ==============================\n"
-        )
-
         def provider_run(_config, prompt, _log_file, work_dir, resume_session_id=None, on_session_id=None, on_step_count=None):
             report_dir = work_dir / ".gza" / "reviews"
             report_dir.mkdir(parents=True, exist_ok=True)
@@ -20172,42 +20084,20 @@ class TestProviderPromptSanitization:
         git.get_diff.return_value = ""
         git.get_diff_stat.return_value = ""
 
-        verify_result = ReviewVerifyResult(
-            command="./bin/tests",
-            status="failed",
-            exit_status="1",
-            captured_at=datetime(2026, 1, 1, tzinfo=UTC),
-            reviewed_branch=impl.branch,
-            reviewed_head_sha="deadbeef",
-            reviewed_base_sha=None,
-            working_directory=str(config.worktree_path / f"{task.slug}-{task.task_type}"),
-            failure="pytest failed",
-            output=long_output,
-        )
-
-        with patch("gza.runner.Git.rev_parse_if_exists", return_value="deadbeef"), \
-             patch("gza.runner._run_review_verify_command", return_value=verify_result), \
-             patch("gza.runner.post_review_to_pr"):
+        with patch("gza.runner._run_lifecycle_verify") as run_lifecycle_verify, patch(
+            "gza.runner.post_review_to_pr"
+        ):
             exit_code = _run_non_code_task(task, config, store, provider, git, resume=False)
 
         assert exit_code == 0
+        run_lifecycle_verify.assert_not_called()
         refreshed = store.get(task.id)
         assert refreshed is not None
-        assert refreshed.review_verify_markdown is not None
-        assert "Failing output (trimmed):" in refreshed.review_verify_markdown
-        assert "..." in refreshed.review_verify_markdown
-        assert "FAILED tests/test_example.py::test_tail - AssertionError: boom" in refreshed.review_verify_markdown
-        assert "=== short test summary info ===" in refreshed.review_verify_markdown
-        assert "collected setup noise" not in refreshed.review_verify_markdown
-        assert refreshed.review_verify_artifact_file is not None
-        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
-        assert len(artifacts) == 1
-        artifact_output = (tmp_path / artifacts[0].path).read_text(encoding="utf-8")
-        assert artifact_output == long_output
-        assert "FAILED tests/test_example.py::test_tail - AssertionError: boom" in artifact_output
-        assert "=== short test summary info ===" in artifact_output
+        assert refreshed.review_verify_markdown is None
+        assert refreshed.review_verify_artifact_file is None
+        assert store.list_artifacts(task.id, kind="verify_command_output") == []
 
-    def test_cross_project_review_persists_failed_aggregate_verify_state(self, tmp_path: Path):
+    def test_cross_project_review_does_not_run_or_persist_aggregate_verify_state(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl = store.add(prompt="Implement feature X", task_type="implement")
         impl.status = "completed"
@@ -20306,23 +20196,68 @@ class TestProviderPromptSanitization:
         assert exit_code == 0
         assert len(captured_prompts) == 1
         prompt = captured_prompts[0]
-        assert "### libs/bar" in prompt
-        assert "- Status: failed" in prompt
-        assert "bar failed" in prompt
-        mock_cross_project_verify.assert_called_once()
-        assert mock_cross_project_verify.call_args.kwargs["timeout_grace_seconds"] == 8.0
-        assert mock_cross_project_verify.call_args.kwargs["reviewed_branch"] == impl.branch
-        assert mock_cross_project_verify.call_args.kwargs["reviewed_head_sha"] == "deadbeef"
-        assert mock_cross_project_verify.call_args.kwargs["reviewed_base_sha"] == "cafebabe"
+        assert "### libs/bar" not in prompt
+        assert "bar failed" not in prompt
+        mock_cross_project_verify.assert_not_called()
         refreshed = store.get(task.id)
         assert refreshed is not None
-        assert refreshed.review_verify_status == "failed"
-        assert refreshed.review_verify_exit_status == "1 passed, 1 failed, 0 unavailable"
-        assert refreshed.review_verify_head_sha == "deadbeef"
-        assert refreshed.review_verify_base_sha == "cafebabe"
-        assert refreshed.review_verify_branch == impl.branch
+        assert refreshed.review_verify_status is None
+        assert refreshed.review_verify_exit_status is None
+        assert refreshed.review_verify_head_sha is None
+        assert refreshed.review_verify_base_sha is None
+        assert refreshed.review_verify_branch is None
 
-    def test_cross_project_review_artifact_persists_per_project_verify_phase_results(self, tmp_path: Path):
+    def test_capture_review_verify_result_persists_owner_artifact_for_based_on_only_review(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="Implement feature X", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "gza/20260212-implement-feature-x"
+        store.update(impl)
+
+        review = store.add(prompt="Review feature X", task_type="review", based_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        store.update(review)
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="deadbeef",
+            reviewed_base_sha="cafebabe",
+            working_directory=str(tmp_path / "worktrees" / "review"),
+            output="verify passed\n",
+        )
+
+        _capture_review_verify_result(
+            config,
+            store,
+            review,
+            result,
+            markdown="## verify_command result\n\n- Status: passed",
+        )
+
+        owner_artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+        review_artifacts = store.list_artifacts(review.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+
+        assert len(owner_artifacts) == 1
+        assert review_artifacts == []
+        assert owner_artifacts[0].metadata is not None
+        assert owner_artifacts[0].metadata["source_task_id"] == review.id
+
+    def test_cross_project_review_artifact_does_not_persist_per_project_verify_phase_results(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl = store.add(prompt="Implement feature X", task_type="implement")
         impl.status = "completed"
@@ -20465,47 +20400,10 @@ class TestProviderPromptSanitization:
         assert exit_code == 0
         refreshed = store.get(task.id)
         assert refreshed is not None
-        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
-        assert len(artifacts) == 2
-        artifacts_by_scope = {artifact.metadata["scope"]: artifact for artifact in artifacts if artifact.metadata}
-        assert set(artifacts_by_scope) == {"services/foo", "libs/bar"}
-        assert artifacts_by_scope["services/foo"].status == "passed"
-        assert artifacts_by_scope["services/foo"].metadata == {
-            "cwd": "services/foo",
-            "reviewed_base_sha": "cafebabe",
-            "reviewed_branch": impl.branch,
-            "reviewed_head_sha": "deadbeef",
-            "scope": "services/foo",
-            "skip_reason": None,
-            "timeout_seconds": 120,
-            "working_directory": "services/foo",
-        }
-        assert (tmp_path / artifacts_by_scope["services/foo"].path).read_text(encoding="utf-8") == (
-            "gza-verify phase=passed name=setup duration_seconds=0.25 "
-            f"tree_fingerprint={setup_fingerprint}\n"
-            "gza-verify phase=passed name=ruff duration_seconds=0.5 "
-            f"tree_fingerprint={passed_fingerprint}\n"
-            "gza-verify phase=failed name=pytest duration_seconds=2.75\n"
-            "bar failed"
-        )
-        assert artifacts_by_scope["libs/bar"].status == "failed"
-        assert artifacts_by_scope["libs/bar"].metadata == {
-            "cwd": "libs/bar",
-            "reviewed_base_sha": "cafebabe",
-            "reviewed_branch": impl.branch,
-            "reviewed_head_sha": "deadbeef",
-            "scope": "libs/bar",
-            "skip_reason": None,
-            "timeout_seconds": 120,
-            "working_directory": "libs/bar",
-        }
-        assert (tmp_path / artifacts_by_scope["libs/bar"].path).read_text(encoding="utf-8") == (
-            "gza-verify phase=failed name=pytest duration_seconds=2.75 "
-            f"tree_fingerprint={failed_fingerprint}\n"
-            "bar failed"
-        )
+        assert store.list_artifacts(task.id, kind="verify_command_output") == []
+        assert store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND) == []
 
-    def test_cross_project_review_persists_unavailable_aggregate_verify_state(self, tmp_path: Path):
+    def test_cross_project_review_does_not_persist_unavailable_aggregate_verify_state(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl = store.add(prompt="Implement feature X", task_type="implement")
         impl.status = "completed"
@@ -20603,17 +20501,17 @@ class TestProviderPromptSanitization:
         assert exit_code == 0
         assert len(captured_prompts) == 1
         prompt = captured_prompts[0]
-        assert "### libs/bar" in prompt
-        assert "- Status: unavailable" in prompt
+        assert "### libs/bar" not in prompt
+        assert "- Status: unavailable" not in prompt
         refreshed = store.get(task.id)
         assert refreshed is not None
-        assert refreshed.review_verify_status == "unavailable"
-        assert refreshed.review_verify_exit_status == "1 passed, 0 failed, 1 unavailable"
-        assert refreshed.review_verify_head_sha == "deadbeef"
-        assert refreshed.review_verify_base_sha == "cafebabe"
-        assert refreshed.review_verify_branch == impl.branch
+        assert refreshed.review_verify_status is None
+        assert refreshed.review_verify_exit_status is None
+        assert refreshed.review_verify_head_sha is None
+        assert refreshed.review_verify_base_sha is None
+        assert refreshed.review_verify_branch is None
 
-    def test_cross_project_review_persists_failed_aggregate_when_other_project_is_unavailable(self, tmp_path: Path):
+    def test_cross_project_review_does_not_persist_failed_aggregate_when_other_project_is_unavailable(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl = store.add(prompt="Implement feature X", task_type="implement")
         impl.status = "completed"
@@ -20722,20 +20620,18 @@ class TestProviderPromptSanitization:
         assert exit_code == 0
         assert len(captured_prompts) == 1
         prompt = captured_prompts[0]
-        assert "### libs/bar" in prompt
-        assert "### apps/baz" in prompt
-        assert "- Status: failed" in prompt
-        assert "- Status: unavailable" in prompt
+        assert "### libs/bar" not in prompt
+        assert "### apps/baz" not in prompt
         refreshed = store.get(task.id)
         assert refreshed is not None
-        assert refreshed.review_verify_status == "failed"
-        assert refreshed.review_verify_exit_status == "1 passed, 1 failed, 1 unavailable"
-        assert refreshed.review_verify_failure == "one or more affected projects failed review verification"
-        assert refreshed.review_verify_head_sha == "deadbeef"
-        assert refreshed.review_verify_base_sha == "cafebabe"
-        assert refreshed.review_verify_branch == impl.branch
+        assert refreshed.review_verify_status is None
+        assert refreshed.review_verify_exit_status is None
+        assert refreshed.review_verify_failure is None
+        assert refreshed.review_verify_head_sha is None
+        assert refreshed.review_verify_base_sha is None
+        assert refreshed.review_verify_branch is None
 
-    def test_cross_project_review_persists_unavailable_aggregate_when_project_has_no_verify_command(
+    def test_cross_project_review_does_not_persist_unavailable_aggregate_when_project_has_no_verify_command(
         self, tmp_path: Path
     ):
         store = SqliteTaskStore(tmp_path / "test.db")
@@ -20851,20 +20747,16 @@ class TestProviderPromptSanitization:
         assert exit_code == 0
         assert len(captured_prompts) == 1
         prompt = captured_prompts[0]
-        assert "### apps/baz" in prompt
-        assert "- Status: skipped" in prompt
+        assert "### apps/baz" not in prompt
+        assert "- Status: skipped" not in prompt
         refreshed = store.get(task.id)
         assert refreshed is not None
-        assert refreshed.review_verify_status == "unavailable"
-        assert refreshed.review_verify_exit_status == "1 passed, 0 failed, 0 unavailable, 1 skipped"
-        assert refreshed.review_verify_failure == "one or more affected projects could not run review verification"
-        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
-        assert len(artifacts) == 1
-        artifacts_by_scope = {artifact.metadata["scope"]: artifact for artifact in artifacts if artifact.metadata}
-        assert set(artifacts_by_scope) == {"services/foo"}
-        assert artifacts_by_scope["services/foo"].status == "passed"
+        assert refreshed.review_verify_status is None
+        assert refreshed.review_verify_exit_status is None
+        assert refreshed.review_verify_failure is None
+        assert store.list_artifacts(task.id, kind="verify_command_output") == []
 
-    def test_cross_project_review_persists_unavailable_aggregate_when_unknown_paths_are_skipped(
+    def test_cross_project_review_does_not_persist_unavailable_aggregate_when_unknown_paths_are_skipped(
         self, tmp_path: Path
     ):
         store = SqliteTaskStore(tmp_path / "test.db")
@@ -20980,17 +20872,14 @@ class TestProviderPromptSanitization:
         assert exit_code == 0
         assert len(captured_prompts) == 1
         prompt = captured_prompts[0]
-        assert "### unknown paths" in prompt
-        assert "- Status: skipped" in prompt
+        assert "### unknown paths" not in prompt
+        assert "- Status: skipped" not in prompt
         refreshed = store.get(task.id)
         assert refreshed is not None
-        assert refreshed.review_verify_status == "unavailable"
-        assert refreshed.review_verify_exit_status == "1 passed, 0 failed, 0 unavailable, 1 skipped"
-        assert refreshed.review_verify_failure == "one or more affected projects could not run review verification"
-        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
-        assert len(artifacts) == 1
-        artifacts_by_scope = {artifact.metadata["scope"]: artifact for artifact in artifacts if artifact.metadata}
-        assert set(artifacts_by_scope) == {"services/foo"}
+        assert refreshed.review_verify_status is None
+        assert refreshed.review_verify_exit_status is None
+        assert refreshed.review_verify_failure is None
+        assert store.list_artifacts(task.id, kind="verify_command_output") == []
 
     def test_fresh_review_prompt_still_runs_provider_after_verify_timeout(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
@@ -21062,26 +20951,15 @@ class TestProviderPromptSanitization:
         assert exit_code == 0
         assert len(captured_prompts) == 1
         prompt = captured_prompts[0]
-        assert "## verify_command result" in prompt
-        assert "- Status: failed" in prompt
-        assert "- Exit status: timed out" in prompt
-        assert "- Reviewed head: `deadbeef`" in prompt
-        assert "verify_command timed out after 240s" in prompt
-        assert "sent SIGTERM, waited 5s, then sent SIGKILL" in prompt
-        assert "partial pytest output" in prompt
-        assert "still running" in prompt
+        assert "## verify_command result" not in prompt
+        assert "verify_command timed out after 240s" not in prompt
+        assert "partial pytest output" not in prompt
+        assert "still running" not in prompt
         assert "## Original request:" in prompt
         refreshed = store.get(task.id)
         assert refreshed is not None
-        assert refreshed.review_verify_markdown is not None
-        assert "sent SIGTERM, waited 5s, then sent SIGKILL" in refreshed.review_verify_markdown
-        artifacts = store.list_artifacts(task.id, kind="verify_command_output")
-        assert len(artifacts) == 1
-        assert (tmp_path / artifacts[0].path).read_text(encoding="utf-8") == (
-            "verify_command exceeded 240s; sent SIGTERM, waited 5s, then sent SIGKILL\n"
-            "partial pytest output\n"
-            "still running"
-        )
+        assert refreshed.review_verify_markdown is None
+        assert store.list_artifacts(task.id, kind="verify_command_output") == []
 
     def test_review_prompt_sent_to_provider_is_sanitized(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")

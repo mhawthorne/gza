@@ -399,7 +399,9 @@ def task_owns_merge_status(task: "Task") -> bool:
     Same-branch follow-up task types update an owning implementation branch
     rather than introducing independent merge truth for their own rows.
     """
-    if task.task_type not in {"task", "implement", "improve", "fix", "rebase", "explore"}:
+    if task.task_type not in {"task", "implement", "improve", "verify_fix", "fix", "rebase", "explore"}:
+        return False
+    if task.task_type == "verify_fix":
         return False
     return not (task.task_type in {"improve", "fix", "rebase"} and task.based_on is not None)
 
@@ -455,7 +457,7 @@ def merge_unit_membership_role(task: "Task") -> str:
         return "review"
     if task.task_type in {"task", "implement"}:
         return "owner" if task_owns_merge_status(task) else "contributor"
-    if task.task_type in {"improve", "fix", "rebase"}:
+    if task.task_type in {"improve", "verify_fix", "fix", "rebase"}:
         return "contributor"
     return "context"
 
@@ -651,7 +653,7 @@ class Task:
     id: str | None  # None for unsaved tasks; project-prefixed decimal (e.g. "gza-1234")
     prompt: str
     status: str = "pending"  # pending, in_progress, completed, failed, unmerged, dropped
-    task_type: str = "implement"  # task, explore, plan, plan_review, plan_improve, implement, review, improve, fix, rebase, internal
+    task_type: str = "implement"  # task, explore, plan, plan_review, plan_improve, implement, review, improve, verify_fix, fix, rebase, internal
     slug: str | None = None  # YYYYMMDD-slug format (DB column: slug, was task_id)
     branch: str | None = None
     log_file: str | None = None
@@ -9960,6 +9962,35 @@ class SqliteTaskStore:
                 JOIN code_chain c ON c.id = t.id
                 WHERE t.project_id = ?
                   AND t.task_type = 'fix'
+                ORDER BY t.created_at DESC
+                """,
+                (self._project_id, root_task_id, self._project_id, self._project_id),
+            )
+            return self._rows_to_tasks(conn, cur.fetchall())
+
+    def get_verify_fix_tasks_by_root(self, root_task_id: str) -> list[Task]:
+        """Get verify_fix tasks transitively rooted at the given implementation."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                WITH RECURSIVE code_chain(id, task_type) AS (
+                    SELECT id, task_type
+                    FROM tasks
+                    WHERE project_id = ?
+                      AND based_on = ?
+                      AND task_type IN ('improve', 'verify_fix', 'fix', 'rebase')
+                    UNION ALL
+                    SELECT child.id, child.task_type
+                    FROM tasks child
+                    JOIN code_chain parent ON child.based_on = parent.id
+                    WHERE child.project_id = ?
+                      AND child.task_type IN ('improve', 'verify_fix', 'fix', 'rebase')
+                )
+                SELECT t.*
+                FROM tasks t
+                JOIN code_chain c ON c.id = t.id
+                WHERE t.project_id = ?
+                  AND t.task_type = 'verify_fix'
                 ORDER BY t.created_at DESC
                 """,
                 (self._project_id, root_task_id, self._project_id, self._project_id),

@@ -14,6 +14,11 @@ from .lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_own
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 from .pickup import effective_edit_time, is_in_quiet_period
 from .recovery_read_context import RecoveryReadContext
+from .review_verify_state import (
+    owner_task_verify_epoch,
+    resolve_verify_owner_task,
+    resolve_verify_read_model,
+)
 
 QueryScope = Literal["tasks", "lineages"]
 DateField = Literal["created", "completed", "effective"]
@@ -473,6 +478,7 @@ class TaskQueryService:
                     task,
                     query,
                     config=config,
+                    git=git,
                     target_branch=target_branch,
                     now=projection_now,
                 )
@@ -828,6 +834,7 @@ class TaskQueryService:
         query: TaskQuery,
         *,
         config: Any | None,
+        git: Any | None,
         target_branch: str | None,
         now: datetime,
     ) -> TaskRow:
@@ -850,6 +857,16 @@ class TaskQueryService:
             comments_count = len(self._store.get_comments(task.id))
         if task.task_type == "review":
             review_verdict = task.output_content
+        verify_read_model = None
+        if config is not None:
+            verify_owner = resolve_verify_owner_task(self._store, task) if task.task_type == "review" else branch_owner
+            current_epoch = owner_task_verify_epoch(verify_owner, config, git)
+            verify_read_model = resolve_verify_read_model(
+                self._store,
+                task,
+                owner_task=verify_owner,
+                current_epoch=current_epoch,
+            )
 
         values: dict[str, object] = {
             "id": task.id,
@@ -872,6 +889,24 @@ class TaskQueryService:
             "shares_owner_branch": _is_shared_branch_descendant_query(task, root),
             "review_verdict": review_verdict,
             "comments_count": comments_count,
+            "verify_status": verify_read_model.result.status if verify_read_model is not None else None,
+            "verify_exit_status": verify_read_model.result.exit_status if verify_read_model is not None else None,
+            "verify_captured_at": verify_read_model.result.captured_at if verify_read_model is not None else None,
+            "verify_branch": verify_read_model.result.reviewed_branch if verify_read_model is not None else None,
+            "verify_head_sha": verify_read_model.result.reviewed_head_sha if verify_read_model is not None else None,
+            "verify_base_sha": verify_read_model.result.reviewed_base_sha if verify_read_model is not None else None,
+            "verify_working_directory": (
+                verify_read_model.result.working_directory if verify_read_model is not None else None
+            ),
+            "verify_failure": verify_read_model.result.failure if verify_read_model is not None else None,
+            "verify_artifact_path": (
+                verify_read_model.result.output_artifact_path if verify_read_model is not None else None
+            ),
+            "verify_source": verify_read_model.source if verify_read_model is not None else None,
+            "verify_current": verify_read_model.is_current if verify_read_model is not None else None,
+            "verify_has_owner_artifact": (
+                verify_read_model.has_owner_artifact if verify_read_model is not None else None
+            ),
             "next_action": None,
             "next_action_reason": None,
             "next_action_owner_id": None,
@@ -945,6 +980,15 @@ class TaskQueryService:
                         fallback_task=owner,
                     ).id
 
+        verify_read_model = None
+        if config is not None:
+            verify_read_model = resolve_verify_read_model(
+                self._store,
+                owner,
+                owner_task=owner,
+                current_epoch=owner_task_verify_epoch(owner, config, git),
+            )
+
         values: dict[str, object] = {
             "id": owner.id,
             "prompt": owner.prompt,
@@ -962,6 +1006,24 @@ class TaskQueryService:
             "shares_owner_branch": False,
             "review_verdict": self._latest_review_verdict(owner),
             "comments_count": len(self._store.get_comments(owner.id)) if owner.id else 0,
+            "verify_status": verify_read_model.result.status if verify_read_model is not None else None,
+            "verify_exit_status": verify_read_model.result.exit_status if verify_read_model is not None else None,
+            "verify_captured_at": verify_read_model.result.captured_at if verify_read_model is not None else None,
+            "verify_branch": verify_read_model.result.reviewed_branch if verify_read_model is not None else None,
+            "verify_head_sha": verify_read_model.result.reviewed_head_sha if verify_read_model is not None else None,
+            "verify_base_sha": verify_read_model.result.reviewed_base_sha if verify_read_model is not None else None,
+            "verify_working_directory": (
+                verify_read_model.result.working_directory if verify_read_model is not None else None
+            ),
+            "verify_failure": verify_read_model.result.failure if verify_read_model is not None else None,
+            "verify_artifact_path": (
+                verify_read_model.result.output_artifact_path if verify_read_model is not None else None
+            ),
+            "verify_source": verify_read_model.source if verify_read_model is not None else None,
+            "verify_current": verify_read_model.is_current if verify_read_model is not None else None,
+            "verify_has_owner_artifact": (
+                verify_read_model.has_owner_artifact if verify_read_model is not None else None
+            ),
             "next_action": next_action_type,
             "next_action_reason": next_action_reason,
             "next_action_owner_id": next_action_owner_id,

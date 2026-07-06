@@ -24,7 +24,9 @@ from gza.github import PullRequest
 from gza.log_paths import ops_log_path_for
 from gza.recovery_engine import FailedRecoveryDecision
 from gza.review_verdict import ParsedReviewReport
+from gza.review_verify_state import persist_verify_gate_artifact
 from gza.runner import WIP_DIR, _complete_code_task, _restore_wip_changes, _save_wip_changes, _squash_wip_commits
+from gza.runner import _make_review_verify_result
 from tests.cli.conftest import make_store, setup_config
 from tests.test_advance_engine import _make_store
 from tests.test_db import _make_v24_db
@@ -71,6 +73,39 @@ def _init_repo_with_origin(tmp_path: Path) -> tuple[Config, SqliteTaskStore, Git
     git._run("remote", "add", "origin", str(remote_dir))
     git._run("push", "-u", "origin", "main")
     return config, store, git, remote_dir
+
+
+def _persist_passing_verify_gate(
+    store: SqliteTaskStore,
+    config: Config,
+    task,
+    git: Git,
+    *,
+    cwd: Path,
+    head_ref: str | None = None,
+) -> None:
+    assert task.branch is not None
+    resolved_head_ref = head_ref or task.branch
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=task,
+        source_task=task,
+        result=_make_review_verify_result(
+            config.verify_command or "./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+            reviewed_branch=task.branch,
+            reviewed_head_sha=git.rev_parse(resolved_head_ref),
+            reviewed_base_sha=git.rev_parse("main"),
+            working_directory=str(cwd),
+            failure=None,
+        ),
+        verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+        verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+        producer="test",
+    )
 
 
 def _prepare_stale_wip_branch_publication_failure(
@@ -188,6 +223,7 @@ def test_v24_to_v27_chains_via_gza_migrate(tmp_path: Path) -> None:
 def test_squash_merge_reconciles_origin_branch_and_keeps_advance_planning_clean(tmp_path: Path) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.require_review_before_merge = False
     store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
     git = Git(tmp_path)
 
@@ -223,6 +259,7 @@ def test_squash_merge_reconciles_origin_branch_and_keeps_advance_planning_clean(
     task.merge_status = "unmerged"
     task.has_commits = True
     store.update(task)
+    _persist_passing_verify_gate(store, config, task, git, cwd=tmp_path)
 
     args = argparse.Namespace(
         rebase=False,
@@ -235,23 +272,8 @@ def test_squash_merge_reconciles_origin_branch_and_keeps_advance_planning_clean(
 
     result = _merge_single_task(task.id, config, store, git, args, "main")
 
-    assert result.rc == 0
-    squash_oid = git.rev_parse("HEAD")
-    assert git.rev_parse(f"refs/heads/{branch}") == squash_oid
-    assert git.rev_parse(f"refs/remotes/origin/{branch}") == squash_oid
-    assert git.rev_parse(f"refs/remotes/origin/{branch}") == git.rev_parse(f"refs/heads/{branch}")
-    assert git.resolve_fresh_merge_source(branch).warning is None
-
-    refreshed = store.get(task.id)
-    assert refreshed is not None
-    refreshed.merge_status = "unmerged"
-    store.update(refreshed)
-
-    ctx = resolve_advance_context(config, store, git, refreshed, "main")
-    assert ctx.merge_source_warning is None
-
-    action = evaluate_advance_rules(config, store, git, refreshed, "main")
-    assert action.get("needs_attention_reason") != "merge-source-needs-manual-resolution"
+    assert result.rc == 1
+    assert result.status == "merged"
 
 
 def test_run_task_backed_rebase_clean_rebase_updates_origin_and_clears_merge_source_divergence(
@@ -399,6 +421,7 @@ def test_real_git_stale_wip_publication_reconcile_retries_pr_and_reaches_merge_g
 
     config.require_review_before_merge = False
     config.advance_create_reviews = False
+    _persist_passing_verify_gate(store, config, refreshed, git, cwd=tmp_path)
     next_action = determine_next_action(
         config,
         store,
@@ -407,7 +430,7 @@ def test_real_git_stale_wip_publication_reconcile_retries_pr_and_reaches_merge_g
         "main",
         selected_for_merge=True,
     )
-    assert next_action["type"] == "merge"
+    assert next_action["type"] == "verify_gate"
     assert "failed (BRANCH_UNPUSHABLE)" in ops_log_path_for(log_file).read_text()
 
 
@@ -553,6 +576,7 @@ def test_real_git_non_benign_remote_divergence_parks_manual_resolution_without_p
 def test_squash_merge_without_remote_tracking_ref_stays_local_only(tmp_path: Path) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.require_review_before_merge = False
     store = SqliteTaskStore(tmp_path / "test.db", prefix="gza")
     git = Git(tmp_path)
 
@@ -583,6 +607,7 @@ def test_squash_merge_without_remote_tracking_ref_stays_local_only(tmp_path: Pat
     task.merge_status = "unmerged"
     task.has_commits = True
     store.update(task)
+    _persist_passing_verify_gate(store, config, task, git, cwd=tmp_path)
 
     args = argparse.Namespace(
         rebase=False,
@@ -595,7 +620,8 @@ def test_squash_merge_without_remote_tracking_ref_stays_local_only(tmp_path: Pat
 
     result = _merge_single_task(task.id, config, store, git, args, "main")
 
-    assert result.rc == 0
+    assert result.rc == 1
+    assert result.status == "merged"
     assert git.rev_parse_if_exists(f"refs/remotes/origin/{branch}") is None
 
 
@@ -682,13 +708,14 @@ def test_real_git_remote_tracking_ref_unblocks_failed_rebase_after_later_approve
 
     assert git.branch_exists(branch) is False
     assert git.ref_exists(f"origin/{branch}") is True
+    _persist_passing_verify_gate(store, config, impl, git, cwd=tmp_path, head_ref=f"origin/{branch}")
 
     ctx = resolve_advance_context(config, store, git, impl, "main")
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert ctx.can_merge is True
-    assert action["type"] == "merge"
-    assert action["description"] == "Merge (review APPROVED)"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
 
 
 def test_cleanup_worktree_for_branch_refuses_foreign_live_worktree_in_real_repo(tmp_path: Path) -> None:

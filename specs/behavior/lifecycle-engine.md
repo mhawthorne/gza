@@ -25,8 +25,8 @@ are *progress* (review, improve, merge). Reordering changes behavior.
 
 ### Action vocabulary
 
-- **Worker-spawning** (subject to batch limits): create/run a `review`, `improve`,
-  `rebase`, `implement`, resume, or retry task.
+- **Worker-spawning** (subject to batch limits): create/run a `review`, `verify_fix`,
+  `improve`, `rebase`, `implement`, resume, or retry task.
 - **Direct** (not batch-limited): `merge`, `merge_with_followups`,
   `materialize_plan_slices`, and other non-worker lifecycle actions such as direct
   branch-divergence reconciliation.
@@ -62,7 +62,7 @@ as confidence grows.
 |------|---------|---------|
 | `require_review_before_merge` | on | Whether an implementation unit needs a valid review before merge (§4, §8). |
 | `advance_create_reviews` | on | Whether the engine auto-creates needed reviews, vs parking for a manual review (§4, §8). |
-| `advance_off_topic_verify_unblock` | off | Whether verify-only review blockers MAY clear through the audited off-topic-failure contract instead of parking on a fresh red reverify (§6, [off-topic-verify-failures.md](off-topic-verify-failures.md)). |
+| `advance_off_topic_verify_unblock` | off | Whether the narrow legacy compatibility lane for verify-only review blockers MAY clear through the audited off-topic-failure contract instead of parking (§6, [off-topic-verify-failures.md](off-topic-verify-failures.md)). |
 | `auto_implement` (per lineage) | — | Whether a completed plan auto-creates its implement, vs holding for a human (§1). |
 | `max_review_cycles` | 3 | Bound on review→improve cycles before escalation (§6). |
 | `max_noop_improve_cycles` | 1 | Bound on consecutive improves that change nothing (§6). |
@@ -303,17 +303,43 @@ closed and be treated as changed.
   reviewed head or other durable branch progress boundary; historical pre-boundary churn
   MUST NOT keep poisoning the lineage after that progress.
 
+### §5a — Pre-review verify gate
+
+Before lifecycle creates a first review or refreshes a stale review for an implementation
+owner, it MUST evaluate the runner-owned verify gate for that owner's current verify
+epoch.
+
+- Missing or stale verify evidence for the current owner epoch MUST select `verify_gate`
+  first. Lifecycle MUST rerun verify before it creates a review for that head.
+- Current red verify evidence before review MUST route into the `verify_fix` lane, not the
+  review/improve lane. Lifecycle MUST create, reuse, run, or wait on one same-branch
+  `verify_fix` task keyed by the exact current verify epoch and implementation owner.
+- If a same-epoch `verify_fix` is already `pending`, lifecycle MUST `run_verify_fix`. If
+  it is already `in_progress`, lifecycle MUST `wait_verify_fix`.
+- If one same-epoch `verify_fix` attempt already completed and the current verify gate is
+  still red for that epoch, lifecycle MUST park with reason `verify-fix-failed` instead
+  of spawning another `verify_fix`.
+- If the current pre-review verify gate is unavailable and lifecycle cannot safely route
+  through `verify_fix`, it MUST park with `verify-unavailable`. If that same unavailable
+  state persists after one completed same-epoch `verify_fix`, it MUST park with
+  `verify-unavailable-after-fix`.
+
 ### §6 — Review state
 
 When a current review exists for the implementation lineage:
 
 - Latest review `pending` → `run_review`. Latest review `in_progress` → `wait_review`.
   (See [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 1.)
-- Verdict `APPROVED` and still valid for the current mergeable diff → `merge`.
+- Verdict `APPROVED` and still valid for the current mergeable diff → if the current
+  pre-merge verify gate is green, `merge`; otherwise lifecycle MUST route through the
+  shared `verify_gate` / same-epoch `verify_fix` handling before merge.
 - Verdict `APPROVED_WITH_FOLLOWUPS` with ≥1 parsed follow-up, review still valid →
-  `merge_with_followups` (create/reuse follow-up implement tasks, then merge). The
-  follow-up tasks MUST be durably recorded *before* the merge completes (overview
-  invariant 3); the merge MUST NOT proceed if its follow-ups could not be persisted.
+  if the current pre-merge verify gate is green, `merge_with_followups` (create/reuse
+  follow-up implement tasks, then merge); otherwise lifecycle MUST route through the
+  shared `verify_gate` / same-epoch `verify_fix` handling before creating follow-ups and
+  merging. The follow-up tasks MUST be durably recorded *before* the merge completes
+  (overview invariant 3); the merge MUST NOT proceed if its follow-ups could not be
+  persisted.
 - Verdict `APPROVED_WITH_FOLLOWUPS` with **zero** parsed follow-ups → `needs_discussion`
   (self-contradictory output; do not guess. See
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4.)
@@ -363,59 +389,16 @@ When a current review exists for the implementation lineage:
 
 - Review→improve cycles reach `max_review_cycles` within the current durable-progress
   epoch → `max_cycles_reached`.
-- **A. Verify-only review clear invariant.** A review whose blockers are solely
-  runner-captured `verify_command` failures or timeouts MUST be cleared when the
-  subsequent no-op improve captures a passing `verify_command` in that improve's own
-  worktree at the same committed branch head. This applies to ordinary non-timeout
-  `verify_command` failures as well as timeout failures; the durable clear proof is the
-  same-head runner-owned review-fail then no-op-improve-pass evidence pair. A
-  review-preserved rebase
-  (`changed_diff = 0`) MAY refresh that persisted head provenance from the pre-rebase
-  head to the rewritten post-rebase head for the preserved review and its no-op improve
-  chain; outside that explicit preserved-rebase carry-forward, the clear MUST require
-  durable provenance recorded after the review completed, with matching branch and head
-  SHA. The runner
-  MUST persist its own `verify_command` result each time it runs a review and each time
-  it re-runs verify for a no-op improve that is eligible to clear a verify-only review
-  blocker, keyed by branch + head SHA. That no-op improve-side re-run applies only when
-  the current review row already carries runner-owned review-time failure evidence for
-  the same branch/head. A preserved rebase MAY carry that key forward to the new head
-  only when the diff-preservation proof succeeds. When lifecycle records the resulting
-  clear, the durable clearance metadata MUST be bound to that exact reviewed head SHA;
-  a generic review-cleared timestamp alone MUST NOT authorize merge of a later tip.
-  Reviewer wording MAY corroborate the
-  situation, but lifecycle MUST first conservatively classify the blocker set as
-  verify-only before same-head runner-owned evidence can clear it; prose alone MUST NOT
-  decide stale/non-stale provenance. When no current same-head green verify evidence is
-  already recorded, lifecycle MAY run one bounded fresh verify in an isolated worktree
-  for the current evaluated head; that execution path MUST fail closed on head drift,
-  MUST persist the resulting verify evidence on the no-op improve task, and MUST record
-  SHA-bound clearance metadata before the next merge decision can treat the review as
-  cleared. If same-head passing verify evidence exists for the current tip but the
-  matching structured `review_clearance` record is missing, lifecycle MUST fail closed
-  and park the lineage as `needs_discussion` with reason `improve-no-op`; it MUST NOT
-  fall back to creating another review from that residue state. If that bounded fresh
-  verify instead fails, is unavailable, or ends in any other fail-closed
-  manual-attention outcome for that same reviewed head, lifecycle MUST persist a durable
-  parked marker and, on the next evaluation, MUST park the lineage as
-  `needs_discussion` with reason `improve-no-op` instead of selecting the same recovery
-  verify action again.
-- **A2. Off-topic verify unblock contract.** When rule A does not clear a verify-only
-  review blocker because the later no-op-improve-side verify is still red, lifecycle MAY
-  consult [off-topic-verify-failures.md](off-topic-verify-failures.md) only if the latest
-  review is verify-only blocked and current trusted green verify evidence already exists
-  for the exact reviewed head SHA and exact tree fingerprint now under consideration.
-  With `advance_off_topic_verify_unblock` off, lifecycle MUST keep the blocker and follow
-  the ordinary park behavior. With the knob on, lifecycle MAY clear the blocker only when
-  the off-topic contract fully succeeds: the full failing-node set was enumerated,
-  every enumerated node classified off-topic, the result remained bound to that same
-  reviewed head SHA and exact tree fingerprint, and the required non-blocking
-  `REPRODUCE-OR-RECORD` investigation record was durably created or reused. Deterministic
-  and intermittent off-topic branches, branch-introduced failures, shared/global fail
-  closed cases, and investigation dedup rules are owned by
-  [off-topic-verify-failures.md](off-topic-verify-failures.md). If lifecycle cannot prove
-  any of those preconditions, classification steps, or audit/persistence requirements, it
-  MUST fail closed and keep the review blocking.
+- **A. Ordinary no-op improves do not bypass the two-gate model.** A no-op improve does
+  not, by itself, authorize merge. If code changed, both the review gate and verify gate
+  become stale and MUST be re-run in the normal order: verify first, then review.
+- **A2. Legacy verify-only compatibility lane.** Historical review rows that still carry
+  verify-only `CHANGES_REQUESTED` blockers MAY remain supported through a narrow
+  compatibility path, including the opt-in audited off-topic contract in
+  [off-topic-verify-failures.md](off-topic-verify-failures.md). That lane exists only to
+  adjudicate persisted historical review state; it MUST NOT be treated as the ordinary
+  merge rule for new two-gate work, and it MUST NOT replace the pre-review or pre-merge
+  verify gates in §5a and §8.
 - **B. Disputed non-verify CODE blocker adjudication.** When the latest
   `CHANGES_REQUESTED` review carries a non-verify CODE blocker and the latest completed
   improve for that `(implementation, review)` pair is a no-op with structured dispute
@@ -435,46 +418,31 @@ When a current review exists for the implementation lineage:
   dispute metadata from the repeated blocker evidence and the current reviewed branch
   state, then run the same strict `VALID | INVALID | NEEDS_HUMAN` adjudication before
   the generic `duplicate-blocker-no-progress` or `review-max-cycles` parks.
-  This lane applies only to non-verify CODE blockers. Verify-only blocker clearing remains
-  governed by the verify-only rules above: rule A for same-head runner-owned green
-  recapture and rule A2 for the audited off-topic unblock contract.
+  This lane applies only to non-verify CODE blockers. Verify-only review rows
+  remain governed by the narrow compatibility lane above; ordinary two-gate merge
+  eligibility does not flow through that compatibility path.
 - Otherwise, consecutive no-op improves reach `max_noop_improve_cycles` (unit not tagged
   `allow-noop-improve`) → `needs_discussion` (reason `improve-no-op`). This generic
   no-op park applies only after ruling out rule B adjudication-eligible disputed
-  non-verify CODE blockers. If current passing in-improve evidence has already cleared
-  the review, normal merge rules apply before the no-op limit can park. Otherwise, if
-  `verify_command` still fails, the evidence is absent, stale, lacks the required
-  structured `review_clearance`, or is recorded at a different branch/head, or the
-  blocker is not verify-only, the no-op improve limit MUST park rather than auto-clear.
-  If lifecycle cannot resolve the current branch head
-  while checking that provenance, it MUST still fail closed but surface that probe
-  failure in the parked result instead of silently degrading to a generic no-op loop.
-  When the review-time runner verify PASSED, or no runner-owned review verify exists,
-  the blocker is treated as a genuine code issue and still requires a real code change
-  before merge. When parallel sibling reviews exist on one implementation, lifecycle
-  MUST attribute this park to the review whose feedback actually remains unresolved. A
-  zero-diff improve for a verify-only sibling review MUST NOT be framed as the wasted
-  no-op when a different sibling review still carries unresolved CODE blockers; the
-  parked description MUST name that sibling review and its blocker IDs/titles. Existing
-  improves on that older sibling review are not sufficient to suppress the park:
-  pending or in-progress sibling improves still block merge, and completed sibling
-  improves suppress the sibling-review park only when current tracked resolution
-  evidence clears that sibling review's blocker set. A completed code-changing improve
-  for that older sibling review, followed by a newer current same-head review on the
-  implementation, counts as superseding that older sibling review for attribution even
-  if no explicit blocker-resolution artifact was recorded. This sibling-review guard also
-  applies when current same-head passing verify evidence cleared the latest verify-only
-  review: that latest review may be marked cleared per-review, but lifecycle MUST still
-  park instead of merging while the older sibling CODE review remains unresolved.
+  non-verify CODE blockers. A no-op improve does not create new merge authority by
+  itself: if lifecycle still lacks a current merge-permitting review plus current passing
+  verify evidence for the same head, the no-op improve limit MUST park rather than
+  auto-clear. If lifecycle cannot resolve the current branch head while checking
+  freshness, it MUST still fail closed but surface that probe failure in the parked
+  result instead of silently degrading to a generic no-op loop. When parallel sibling
+  reviews exist on one implementation, lifecycle MUST attribute this park to the review
+  whose feedback actually remains unresolved and MUST still park instead of merging while
+  an older sibling CODE review remains unresolved.
 - The same primary blocker repeats across the duplicate-blocker bound of consecutive
   review cycles with no progress after rule B has already been exhausted or the
   adjudication result was `NEEDS_HUMAN` → `needs_discussion` (reason
   `duplicate-blocker-no-progress`). The streak resets on any completed rebase between the
   compared reviews, any non-`CHANGES_REQUESTED` review, or a changed blocker.
-- Last reviews fail only on verify timeout (no code issues) →
-  `needs_discussion` (reason `verify-blocked-no-code-issues`) once the timeout-only
-  threshold is reached and no current runner-owned passing verify evidence has already
-  cleared the review; do not keep spawning improves that cannot help.
+- Verify-only reviews that fail only on verify timeout (no code issues) MAY still park
+  with `needs_discussion` (reason `verify-blocked-no-code-issues`) on the legacy
+  compatibility lane. Ordinary two-gate work MUST route current red verify
+  evidence into `verify_fix` before review instead of converting it into a review-state
+  timeout policy.
 
 **Improve chain invariant (load-bearing; source of past bugs).** An (implementation,
 review) pair can spawn a *chain* of improves (the original plus retries/resumes). To find
@@ -540,12 +508,25 @@ failure *and* actionable merge/review work remains eligible for the latter.
   longer resolvable), reconciliation MUST leave the terminal state unchanged and log the
   degraded proof. This healing pass MUST be idempotent and fail closed.
 - Reviews all cleared/addressed, with no newer rebase or closing-review requirement
-  invalidating that state → `merge`.
-- A non-implementation unit, or a unit that does not require review → `merge`.
+  invalidating that state → if the current pre-merge verify gate is green, `merge`;
+  otherwise lifecycle MUST route through the shared `verify_gate` / same-epoch
+  `verify_fix` handling before merge.
+- A non-implementation unit → `merge`.
+- For implementation-owned units whose review gate is enabled, merge eligibility remains
+  the ordinary two-gate rule even after an approved review: automation MUST have both a
+  merge-permitting current review verdict and current passing lifecycle-owned verify
+  evidence for the current implementation head/verify epoch. If the verify gate is
+  missing or stale, automation MUST rerun it; if it is red or unavailable, automation
+  MUST block merge and follow the shared verify-gate handling instead of merging on
+  review alone.
 - An implementation unit with no review and `require_review_before_merge` on →
   `create_review` when `advance_create_reviews` is on, otherwise `needs_discussion` with
   reason `review-needs-manual-creation` (never merge unreviewed). With
-  `require_review_before_merge` off → `merge`.
+  `require_review_before_merge` off → if the current pre-merge verify gate is green,
+  `merge`; otherwise lifecycle MUST route through the shared `verify_gate` / same-epoch
+  `verify_fix` handling before merge. This review-disabled branch is the only exception
+  to the ordinary implementation two-gate merge rule from
+  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules).
 - A failed implementation task is never mergeable. Timeout-style failed implementations
   with a resumable `session_id` MUST stay in recovery until that recovery resolves to a
   valid completed representative, exhausts its bounded policy, or is parked for manual
@@ -562,9 +543,10 @@ failure *and* actionable merge/review work remains eligible for the latter.
   blockers. Manual `gza merge` MUST refuse a latest completed `CHANGES_REQUESTED` review
   that still has any open non-verify `BLOCKER` finding unless the operator passes
   `--defer-blockers`.
-- For manual `gza merge`, when the latest completed `CHANGES_REQUESTED` review is blocked
-  only by verify failures/timeouts, the command MAY auto-defer those blockers without a
-  flag. Every blocker bypassed by either the verify-only path or `--defer-blockers` MUST
+- For manual `gza merge`, when the latest completed `CHANGES_REQUESTED` review is a
+  verify-only compatibility case blocked only by verify failures/timeouts, the
+  command MAY auto-defer those blockers without a flag. Every blocker bypassed by either
+  that legacy verify-only path or `--defer-blockers` MUST
   create or reuse a persisted deferred-blocker `implement` task before merge success or
   `--mark-only` merged-state mutation is recorded. If that persistence fails, the merge
   MUST fail closed.
@@ -685,8 +667,12 @@ is a spec change. The accompanying human message is free text.
 | `review-freshness-unverified` | needs_discussion | §5 live branch-head probe failed while checking whether a code-changing event made the latest completed review stale |
 | `resolution-review-metadata-invalid` | needs_discussion | §5 required resolution-review metadata is still missing, malformed, or inconsistent after live SHA re-derivation |
 | `closing-review-needs-manual-refresh` † | needs_discussion | §6/§8 closing-review requirement, manual refresh |
-| `verify-blocked-no-code-issues` | needs_discussion | §6 repeated timeout-only reviews and no current in-improve passing verify evidence clearing the verify-only review |
-| `improve-no-op` | needs_discussion | §6 consecutive no-op improves ≥ bound when current in-improve passing verify evidence did not clear the verify-only review |
+| `verify-failed-needs-fix` | needs_discussion | §5a verify gate is red before review can proceed, but lifecycle cannot safely create/continue the current `verify_fix` lane |
+| `verify-fix-failed` | needs_discussion | §5a current verify gate is still red after one completed same-epoch `verify_fix` |
+| `verify-unavailable` | needs_discussion | §5a verify gate is unavailable and lifecycle cannot safely route through `verify_fix` |
+| `verify-unavailable-after-fix` | needs_discussion | §5a verify gate remains unavailable after one completed same-epoch `verify_fix` |
+| `verify-blocked-no-code-issues` | needs_discussion | §6 legacy compatibility park for timeout-only verify-coupled reviews |
+| `improve-no-op` | needs_discussion | §6 consecutive no-op improves ≥ bound after adjudication/compatibility handling is exhausted |
 | `review-blocker-adjudication-needed` | needs_discussion | §6 adjudication for a disputed non-verify CODE blocker returned `NEEDS_HUMAN`, failed, or could not be parsed safely |
 | `duplicate-blocker-no-progress` | needs_discussion | §6 same primary blocker repeats across cycles |
 | `review-max-cycles-reached` | max_cycles_reached | §6 current-head review→improve cycles ≥ `max_review_cycles` with no stale-review refresh available |

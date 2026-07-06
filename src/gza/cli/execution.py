@@ -86,8 +86,15 @@ from ..recovery_engine import (
     resolve_pending_recovery_execution_mode,
     resolve_recovery_planning_task,
 )
-from ..review_tasks import build_review_blocker_dispute_metadata, create_spec_coherence_review_task
+from ..review_tasks import (
+    VerifyFixContextError,
+    build_review_blocker_dispute_metadata,
+    create_or_reuse_verify_fix_task,
+    create_spec_coherence_review_task,
+    resolve_latest_failed_verify_epoch,
+)
 from ..review_verdict import get_review_report
+from ..review_verify_state import VerifyEpoch, owner_task_verify_epoch
 from ..runner import (
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
     RunInvocationContext,
@@ -2409,6 +2416,79 @@ def cmd_add(args: argparse.Namespace) -> int:
             print("Error: plan_improve must be based on the same plan source reviewed by its plan_review dependency")
             return 1
 
+    if task_type == "verify_fix":
+        if based_on is None:
+            print(
+                "Error: verify_fix tasks require --based-on <implementation-lineage-task-id> "
+                "and must target an existing implementation lineage."
+            )
+            return 1
+        if not same_branch:
+            print(
+                "Error: verify_fix tasks require --same-branch so they stay attached to the implementation merge unit."
+            )
+            return 1
+        impl_owner, err = resolve_impl_task(store, based_on)
+        if impl_owner is None:
+            print(
+                "Error: verify_fix --based-on must reference an implementation-lineage task "
+                f"(implement/improve/verify_fix/fix/rebase). {err}"
+            )
+            return 1
+        based_on_task = store.get(based_on)
+        assert based_on_task is not None
+        if hasattr(args, "prompt_file") and args.prompt_file is not None:
+            print(
+                "Error: verify_fix manual creation derives its prompt from the latest failed verify evidence. "
+                "Omit --prompt-file and rerun with --based-on <implementation-lineage-task-id> --same-branch."
+            )
+            return 1
+        if args.edit or args.prompt:
+            print(
+                "Error: verify_fix manual creation derives its prompt from the latest failed verify evidence. "
+                "Omit custom prompt text/--edit and rerun with --based-on <implementation-lineage-task-id> --same-branch."
+            )
+            return 1
+        try:
+            git = Git(config.project_dir)
+            verify_epoch = resolve_latest_failed_verify_epoch(store, config, impl_owner, git)
+            task, created = create_or_reuse_verify_fix_task(
+                store,
+                config,
+                impl_task=impl_owner,
+                based_on_task=based_on_task,
+                verify_epoch=verify_epoch,
+                trigger_source="manual",
+                model=model,
+                provider=provider,
+            )
+        except VerifyFixContextError as exc:
+            current_epoch = owner_task_verify_epoch(impl_owner, config, git)
+            print(f"Error: {exc}")
+            if current_epoch is None:
+                print(
+                    "Action: verify_fix manual creation is blocked until the current implementation "
+                    "verify epoch can be resolved from branch/head provenance."
+                )
+            else:
+                print(
+                    "Action: rerun the failing verify gate on the current implementation head so the "
+                    "persisted failed evidence matches the live verify epoch, then retry."
+                )
+            return 1
+        except ValueError as exc:
+            print(f"Error: {exc}")
+            return 1
+        except DuplicateActiveChildError as exc:
+            print(format_duplicate_active_child_message(exc))
+            return 1
+        if mark_next:
+            assert task.id is not None
+            set_task_urgency(store, task.id, urgent=True)
+        status_verb = "Added" if created else "Reused"
+        print(f"✓ {status_verb} task {task.id}")
+        return 0
+
     if task_type == "implement":
         held_plan_error = _validate_new_implement_source_not_held_for_review(
             store,
@@ -3843,6 +3923,9 @@ class _AdvanceEngineConfigAdapter:
     max_failed_plan_review_retries: int = 3
     max_noop_improve_cycles: int = 1
     max_failed_closing_review_retries: int = DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES
+    verify_command: str | None = None
+    autonomous_verify_timeout_seconds: int | None = None
+    review_verify_timeout_grace_seconds: float | None = None
 
 
 def _determine_selected_iterate_action(
@@ -3901,6 +3984,10 @@ def _build_iterate_engine_config(config: Config, *, max_resume_attempts: int) ->
     def _int_config(value: object, default: int) -> int:
         return value if isinstance(value, int) else default
 
+    verify_command_raw = getattr(config, "verify_command", None)
+    timeout_seconds_raw = getattr(config, "autonomous_verify_timeout_seconds", None)
+    timeout_grace_raw = getattr(config, "review_verify_timeout_grace_seconds", None)
+
     return _AdvanceEngineConfigAdapter(
         project_dir=config.project_dir,
         require_review_before_merge=bool(getattr(config, "require_review_before_merge", True)),
@@ -3920,6 +4007,15 @@ def _build_iterate_engine_config(config: Config, *, max_resume_attempts: int) ->
         max_failed_closing_review_retries=_int_config(
             getattr(config, "max_failed_closing_review_retries", None),
             DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES,
+        ),
+        verify_command=verify_command_raw.strip() or None if isinstance(verify_command_raw, str) else None,
+        autonomous_verify_timeout_seconds=(
+            timeout_seconds_raw if isinstance(timeout_seconds_raw, int) else None
+        ),
+        review_verify_timeout_grace_seconds=(
+            float(timeout_grace_raw)
+            if isinstance(timeout_grace_raw, (int, float)) and not isinstance(timeout_grace_raw, bool)
+            else None
         ),
     )
 
@@ -5431,17 +5527,9 @@ def _cmd_iterate_impl(
         getattr(config, "max_resume_attempts", None),
         DEFAULT_MAX_RESUME_ATTEMPTS,
     )
-    engine_config = _AdvanceEngineConfigAdapter(
-        project_dir=config.project_dir,
-        require_review_before_merge=bool(getattr(config, "require_review_before_merge", True)),
-        advance_create_reviews=bool(getattr(config, "advance_create_reviews", True)),
-        max_review_cycles=_int_config(getattr(config, "max_review_cycles", None), 3),
-        max_noop_improve_cycles=_int_config(getattr(config, "max_noop_improve_cycles", None), 1),
+    engine_config = _build_iterate_engine_config(
+        config,
         max_resume_attempts=max_resume_attempts,
-        max_failed_closing_review_retries=_int_config(
-            getattr(config, "max_failed_closing_review_retries", None),
-            DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES,
-        ),
     )
 
     def _current_impl_task() -> DbTask:
@@ -5760,6 +5848,83 @@ def _cmd_iterate_impl(
                 _append_summary_row(summary_rows, iteration_index=iteration, task_type="improve", task=None, status="in_progress")
             break
 
+        if action_type == "wait_verify_fix":
+            final_status = "blocked"
+            final_stop_reason = "verify_fix_in_progress"
+            verify_fix_task = action.get("verify_fix_task")
+            if isinstance(verify_fix_task, DbTask):
+                _append_summary_row(
+                    summary_rows,
+                    iteration_index=iteration,
+                    task_type="verify_fix",
+                    task=verify_fix_task,
+                    status="in_progress",
+                )
+            else:
+                _append_summary_row(summary_rows, iteration_index=iteration, task_type="verify_fix", task=None, status="in_progress")
+            break
+
+        if action_type == "verify_gate":
+            exec_result = execute_advance_action(
+                task=impl_task,
+                action=action,
+                context=AdvanceActionExecutionContext(
+                    store=store,
+                    trigger_source="manual",
+                    dry_run=False,
+                    max_resume_attempts=effective_max_resume_attempts,
+                    use_iterate_for_create_implement=False,
+                    use_iterate_for_needs_rebase=False,
+                    prepare_task_for_background_start=lambda task, _rollback: task,
+                    prepare_create_review=lambda _task: (_ for _ in ()).throw(
+                        AssertionError("prepare_create_review should not run for verify_gate")
+                    ),
+                    create_resume_task=lambda _task: (_ for _ in ()).throw(
+                        AssertionError("create_resume_task should not run for verify_gate")
+                    ),
+                    create_rebase_task=lambda _task: (_ for _ in ()).throw(
+                        AssertionError("create_rebase_task should not run for verify_gate")
+                    ),
+                    create_implement_task=lambda _task: (_ for _ in ()).throw(
+                        AssertionError("create_implement_task should not run for verify_gate")
+                    ),
+                    spawn_worker=lambda _task, _kind: (_ for _ in ()).throw(
+                        AssertionError("spawn_worker should not run for verify_gate")
+                    ),
+                    spawn_resume_worker=lambda _task, _kind: (_ for _ in ()).throw(
+                        AssertionError("spawn_resume_worker should not run for verify_gate")
+                    ),
+                    spawn_iterate_worker=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        AssertionError("spawn_iterate_worker should not run for verify_gate")
+                    ),
+                    config=config,
+                    git=git_runtime,
+                ),
+            )
+            if exec_result.success_message:
+                print(f"  {exec_result.success_message}")
+            elif exec_result.message:
+                print(f"  {exec_result.message.removeprefix('SKIP: ')}")
+            _append_summary_row(
+                summary_rows,
+                iteration_index=iteration,
+                task_type="verify_gate",
+                task=None,
+                status="completed" if exec_result.status == "success" else "failed",
+            )
+            if exec_result.status == "success":
+                refreshed_impl = exec_result.created_task if isinstance(exec_result.created_task, DbTask) else None
+                if refreshed_impl is not None and refreshed_impl.id == impl_task.id:
+                    impl_task = refreshed_impl
+                else:
+                    impl_task = store.get(impl_task.id) if impl_task.id is not None else None
+                    if impl_task is None:
+                        raise ValueError("implementation task disappeared during verify gate execution")
+                continue
+            final_status = "blocked"
+            final_stop_reason = "verify_gate_blocked"
+            break
+
         if action_type == "recover_verify_only_noop_review":
             exec_result = execute_advance_action(
                 task=impl_task,
@@ -6073,6 +6238,70 @@ def _cmd_iterate_impl(
                 action_task = maybe_action_task
             assert action_task.id is not None
             print(f"  Running pending adjudication {action_task.id}...")
+        elif action_type == "create_verify_fix":
+            if isinstance(prepared_action_task, DbTask):
+                action_task = prepared_action_task
+            else:
+                maybe_impl_task = action.get("impl_task")
+                maybe_based_on_task = action.get("based_on_task")
+                maybe_epoch = action.get("verify_epoch")
+                assert isinstance(maybe_impl_task, DbTask)
+                assert isinstance(maybe_based_on_task, DbTask)
+                assert isinstance(maybe_epoch, VerifyEpoch)
+                permit_candidate = _reserve_iterate_launch()
+                if permit_candidate is False:
+                    final_status = "blocked"
+                    final_stop_reason = "verify_fix_failed"
+                    break
+                try:
+                    created_verify_fix_task, _created = create_or_reuse_verify_fix_task(
+                        store,
+                        config,
+                        impl_task=maybe_impl_task,
+                        based_on_task=maybe_based_on_task,
+                        verify_epoch=maybe_epoch,
+                        trigger_source="manual",
+                    )
+                except ValueError as e:
+                    if isinstance(permit_candidate, LaunchPermit):
+                        permit_candidate.release()
+                    print(f"  Error creating verify_fix task: {e}")
+                    final_status = "blocked"
+                    final_stop_reason = "verify_fix_failed"
+                    _append_summary_row(
+                        summary_rows,
+                        iteration_index=iteration,
+                        task_type="verify_fix",
+                        task=None,
+                        status="failed",
+                        failure_reason=str(e),
+                    )
+                    break
+                if isinstance(permit_candidate, LaunchPermit):
+                    prepared_verify_fix_task = _prepare_reserved_iterate_task(
+                        created_verify_fix_task,
+                        permit=permit_candidate,
+                        rollback_on_failure=True,
+                    )
+                    if prepared_verify_fix_task is None:
+                        final_status = "blocked"
+                        final_stop_reason = "verify_fix_failed"
+                        _append_summary_row(summary_rows, iteration_index=iteration, task_type="verify_fix", task=None, status="failed")
+                        break
+                    action_task = prepared_verify_fix_task
+                else:
+                    action_task = created_verify_fix_task
+            assert action_task.id is not None
+            print(f"  Running verify_fix {action_task.id}...")
+        elif action_type == "run_verify_fix":
+            if isinstance(prepared_action_task, DbTask):
+                action_task = prepared_action_task
+            else:
+                maybe_action_task = action.get("verify_fix_task")
+                assert isinstance(maybe_action_task, DbTask)
+                action_task = maybe_action_task
+            assert action_task.id is not None
+            print(f"  Running pending verify_fix {action_task.id}...")
         elif action_type == "improve":
             if isinstance(prepared_action_task, DbTask):
                 action_task = prepared_action_task
@@ -6334,6 +6563,8 @@ def _cmd_iterate_impl(
                 if action_type in {"create_review", "run_review"}
                 else "review_adjudication"
                 if action_type in {"create_review_adjudication", "run_review_adjudication"}
+                else "verify_fix"
+                if action_type in {"create_verify_fix", "run_verify_fix"}
                 else "improve" if action_type in {"improve", "run_improve"} else action_type
             )
             attention_result = None
@@ -6368,6 +6599,28 @@ def _cmd_iterate_impl(
 
         if action_task.id is not None:
             action_task = store.get(action_task.id) or action_task
+        if action_task.status not in {"completed", "failed", "dropped"}:
+            final_status = "blocked"
+            final_stop_reason = f"{action_type}_non_terminal"
+            final_non_attention_stop_message = (
+                f"{action_type} reported success but task {action_task.id or 'unknown'} "
+                f"remained {action_task.status}; stop instead of looping on stale state."
+            )
+            task_type = (
+                "improve"
+                if action_type in {"improve", "run_improve"}
+                else "review_adjudication"
+                if action_type in {"create_review_adjudication", "run_review_adjudication"}
+                else action_type
+            )
+            _append_summary_row(
+                summary_rows,
+                iteration_index=iteration,
+                task_type=task_type,
+                task=action_task,
+                status=action_task.status,
+            )
+            break
 
         if action_type in {"create_review", "run_review"}:
             verdict = get_review_verdict(config, action_task)

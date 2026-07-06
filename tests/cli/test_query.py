@@ -13,6 +13,7 @@ import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -37,6 +38,7 @@ from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerRow
 from gza.pr_ops import LookupTaskPrResult
 from gza.recovery_read_context import RecoveryReadContext
+from gza.review_verify_state import persist_verify_gate_artifact
 from gza.review_verdict import ParsedReviewReport
 from gza.sync_ops import BranchSyncResult
 
@@ -175,6 +177,79 @@ def _mock_unmerged_git() -> Git:
             return {str(ref): False for ref in refs}
 
     return _MockUnmergedGit()
+
+
+def _seed_owner_verify_evidence(
+    tmp_path: Path,
+    *,
+    prompt: str,
+    branch: str,
+    term: str,
+    verify_status: str = "passed",
+    verify_failure: str | None = None,
+    reviewed_head_sha: str = "a" * 40,
+) -> tuple[Task, Task]:
+    config_path = tmp_path / "gza.yaml"
+    config_text = config_path.read_text(encoding="utf-8")
+    if "verify_command:" not in config_text:
+        config_path.write_text(config_text + "verify_command: ./bin/tests\n", encoding="utf-8")
+
+    store = make_store(tmp_path)
+    impl = store.add(prompt, task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+    impl.branch = branch
+    store.update(impl)
+
+    review = store.add("Review canonical verify owner", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 6, 29, 12, 5, tzinfo=UTC)
+    store.update(review)
+
+    config = Config.load(tmp_path)
+    stored = store_command_output_artifact(
+        store,
+        review,
+        config,
+        kind="verify_command_output",
+        producer="review_verify",
+        label="verify_command",
+        output=f"{term} verify output\n",
+        command="./bin/tests",
+        status=verify_status,
+        exit_status="0" if verify_status == "passed" else "7",
+        head_sha=reviewed_head_sha,
+        metadata={
+            "reviewed_branch": branch,
+            "reviewed_base_sha": "base-1",
+            "working_directory": f"/tmp/{term}-verify",
+        },
+        created_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status=verify_status,
+            exit_status="0" if verify_status == "passed" else "7",
+            captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch=branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha="base-1",
+            working_directory=f"/tmp/{term}-verify",
+            failure=verify_failure,
+        ),
+        verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+        verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+        output_artifact_path=stored.path,
+        producer="review_verify",
+    )
+    return impl, review
 
 
 class _FastUnmergedGit:
@@ -945,7 +1020,10 @@ def _seed_preview_persistence_fixture(tmp_path: Path) -> tuple[Task, Task]:
 
 def _seed_legacy_unmerged_lifecycle_and_recovery_fixture(tmp_path: Path) -> tuple[Task, Task]:
     setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
     store = make_store(tmp_path)
+    config = Config.load(tmp_path)
 
     failed = _create_failed_recovery_candidate(store, prompt="Resume me")
 
@@ -958,6 +1036,26 @@ def _seed_legacy_unmerged_lifecycle_and_recovery_fixture(tmp_path: Path) -> tupl
     approved_review.completed_at = datetime.now(UTC)
     approved_review.output_content = "**Verdict: APPROVED**"
     store.update(approved_review)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=legacy_impl,
+        source_task=approved_review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch=legacy_impl.branch,
+            reviewed_head_sha="a" * 40,
+            reviewed_base_sha="b" * 40,
+            working_directory="/tmp/legacy-unmerged-verify",
+            failure=None,
+        ),
+        verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+        verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+        producer="review_verify",
+    )
 
     legacy_impl = store.get(legacy_impl.id)
     assert legacy_impl is not None
@@ -2175,6 +2273,63 @@ class TestHistoryCommand:
         assert f"id: {task.id}" in result.stdout
         assert "model: claude-opus-4-8" in result.stdout
 
+    def test_history_fields_render_owner_verify_evidence_from_canonical_artifact(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        impl, _review = _seed_owner_verify_evidence(
+            tmp_path,
+            prompt="history verify needle",
+            branch="feature/history-verify",
+            term="history",
+        )
+
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = invoke_gza(
+                "history",
+                "--fields",
+                "id,verify_status,verify_source,verify_current",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert f"id: {impl.id}" in result.stdout
+        assert "verify_status: passed" in result.stdout
+        assert "verify_source: owner_artifact" in result.stdout
+        assert "verify_current: True" in result.stdout
+
+    def test_history_fields_keep_owner_verify_evidence_when_git_probe_is_unavailable(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        impl, _review = _seed_owner_verify_evidence(
+            tmp_path,
+            prompt="history probe unavailable needle",
+            branch="feature/history-verify-probe-unavailable",
+            term="history-probe",
+            verify_status="failed",
+            verify_failure="git probe unavailable",
+        )
+
+        with patch("gza.cli.query.Git", side_effect=GitError("boom")):
+            result = invoke_gza(
+                "history",
+                "--json",
+                "--fields",
+                "id,verify_status,verify_source,verify_current",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        payload = {row["id"]: row for row in json.loads(result.stdout)}
+        assert payload[impl.id] == {
+            "id": impl.id,
+            "verify_status": "failed",
+            "verify_source": "owner_artifact",
+            "verify_current": False,
+        }
+
     def test_history_unknown_fields_list_valid_choices(self, tmp_path: Path):
         setup_config(tmp_path)
         make_store(tmp_path).add("history unknown field", task_type="implement")
@@ -3188,6 +3343,64 @@ class TestSearchCommand:
 
         assert result.returncode == 0
         assert result.stdout.strip() == task.id
+
+    def test_search_fields_render_owner_verify_evidence_from_canonical_artifact(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        impl, _review = _seed_owner_verify_evidence(
+            tmp_path,
+            prompt="needle search verify prompt",
+            branch="feature/search-verify",
+            term="needle search",
+        )
+
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = invoke_gza(
+                "search",
+                "needle search",
+                "--fields",
+                "id,verify_status,verify_source,verify_current",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert f"id: {impl.id}" in result.stdout
+        assert "verify_status: passed" in result.stdout
+        assert "verify_source: owner_artifact" in result.stdout
+        assert "verify_current: True" in result.stdout
+
+    def test_search_json_fields_render_owner_verify_evidence_from_canonical_artifact(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        impl, _review = _seed_owner_verify_evidence(
+            tmp_path,
+            prompt="needle search json prompt",
+            branch="feature/search-verify-json",
+            term="needle search json",
+        )
+
+        with patch("gza.cli.query.Git", return_value=_mock_unmerged_git()):
+            result = invoke_gza(
+                "search",
+                "needle search json",
+                "--json",
+                "--fields",
+                "id,verify_status,verify_source,verify_current",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == [
+            {
+                "id": impl.id,
+                "verify_status": "passed",
+                "verify_source": "owner_artifact",
+                "verify_current": True,
+            }
+        ]
 
     def test_search_unknown_fields_list_valid_choices(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -6230,8 +6443,8 @@ class TestShowCommand:
         assert "First note" in result.stdout
         assert "Second note" in result.stdout
 
-    def test_show_displays_review_verify_evidence(self, tmp_path: Path):
-        """Show should surface persisted review verify audit fields and stored markdown."""
+    def test_show_displays_neutral_verify_evidence_from_canonical_helper(self, tmp_path: Path):
+        """Show should render canonical verify details with neutral operator-facing labels."""
         setup_config(tmp_path)
         store = make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")
@@ -6242,22 +6455,15 @@ class TestShowCommand:
         task = store.add("Review feature", task_type="review", depends_on=impl.id)
         task.slug = "20260605-review-feature"
         task.status = "completed"
+        task.review_verify_command = "./bin/tests"
         task.review_verify_status = "failed"
         task.review_verify_exit_status = "7"
         task.review_verify_branch = impl.branch
         task.review_verify_head_sha = "deadbeef"
         task.review_verify_base_sha = "cafebabe"
         task.review_verify_cwd = "/tmp/worktrees/20260605-review-feature-review"
-        task.review_verify_markdown = (
-            "## verify_command result\n\n"
-            "- Command: `./bin/tests`\n"
-            "- Status: failed\n"
-            "- Exit status: 7\n"
-            "- Working directory: `/tmp/worktrees/20260605-review-feature-review`\n"
-            "- Failure: verify failed\n\n"
-            "Failing output (trimmed):\n"
-            "```text\nmypy failed\n```"
-        )
+        task.review_verify_markdown = "legacy markdown should not win when canonical owner evidence exists"
+        task.review_verify_captured_at = datetime(2026, 6, 5, 10, 0, tzinfo=UTC)
         store.update(task)
         config = Config.load(tmp_path)
         stored = store_command_output_artifact(
@@ -6277,27 +6483,447 @@ class TestShowCommand:
                 "reviewed_base_sha": "cafebabe",
                 "working_directory": task.review_verify_cwd,
             },
+            created_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
         )
-        task.review_verify_artifact_file = stored.path
-        store.update(task)
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=task,
+            result=SimpleNamespace(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="deadbeef",
+                reviewed_base_sha="cafebabe",
+                working_directory="/tmp/canonical-verify-worktree",
+                failure=None,
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            output_artifact_path=stored.path,
+            producer="review_verify",
+        )
 
         result = invoke_gza("show", str(task.id), "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Review Verify Status:" in result.stdout
-        assert "failed" in result.stdout
-        assert "Review Verify Exit:" in result.stdout
-        assert "Review Verify Branch:" in result.stdout
-        assert "Review Verify Head:" in result.stdout
-        assert "Review Verify Base:" in result.stdout
-        assert "Review Verify Cwd:" in result.stdout
-        assert "Review Verify Artifact:" in result.stdout
+        assert "Verify Status:" in result.stdout
+        assert "passed" in result.stdout
+        assert "Verify Exit:" in result.stdout
+        assert "Verify Branch:" in result.stdout
+        assert "Verify Head:" in result.stdout
+        assert "Verify Base:" in result.stdout
+        assert "Verify Cwd:" in result.stdout
+        assert "Verify Artifact:" in result.stdout
         assert "Artifacts:" in result.stdout
         assert stored.path in result.stdout
-        assert f"Review Verify Artifact: {stored.path}" in result.stdout
-        assert "Review Verify Result:" in result.stdout
+        assert f"Verify Artifact: {stored.path}" in result.stdout
+        assert "Verify Result:" in result.stdout
+        assert "Review Verify" not in result.stdout
         assert "## verify_command result" in result.stdout
         assert "mypy failed" in result.stdout
+        assert "legacy markdown should not win" not in result.stdout
+        assert "/tmp/canonical-verify-worktree" in result.stdout
+
+    def test_show_implement_displays_owner_verify_evidence_from_canonical_helper(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/owner-verify-show"
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.review_verify_command = "./bin/tests"
+        review.review_verify_status = "failed"
+        review.review_verify_exit_status = "7"
+        review.review_verify_branch = impl.branch
+        review.review_verify_head_sha = "a" * 40
+        review.review_verify_base_sha = "cafebabe"
+        review.review_verify_captured_at = datetime(2026, 6, 5, 10, 0, tzinfo=UTC)
+        store.update(review)
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            review,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="owner artifact output\n",
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            head_sha="a" * 40,
+            metadata={
+                "reviewed_branch": impl.branch,
+                "reviewed_base_sha": "cafebabe",
+                "working_directory": "/tmp/canonical-verify-worktree",
+            },
+            created_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=SimpleNamespace(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="a" * 40,
+                reviewed_base_sha="cafebabe",
+                working_directory="/tmp/canonical-verify-worktree",
+                failure=None,
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            output_artifact_path=stored.path,
+            producer="review_verify",
+        )
+
+        git = _mock_unmerged_git()
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(impl.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=False,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Verify Status:" in output
+        assert "Verify Artifact:" in output
+        assert "Verify Result:" in output
+        assert stored.path in output
+        assert "owner artifact output" in output
+        assert "Review Verify" not in output
+
+    def test_show_implement_keeps_latest_owner_verify_evidence_when_git_probe_fails(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/owner-verify-show-git-error"
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        store.update(review)
+
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            review,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="stored owner output survives git failure\n",
+            command="./bin/tests",
+            status="failed",
+            exit_status="7",
+            head_sha="a" * 40,
+            metadata={
+                "reviewed_branch": impl.branch,
+                "reviewed_base_sha": "cafebabe",
+                "working_directory": "/tmp/canonical-verify-worktree",
+            },
+            created_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=SimpleNamespace(
+                command="./bin/tests",
+                status="failed",
+                exit_status="7",
+                captured_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="a" * 40,
+                reviewed_base_sha="cafebabe",
+                working_directory="/tmp/canonical-verify-worktree",
+                failure="git unavailable",
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            output_artifact_path=stored.path,
+            producer="review_verify",
+        )
+
+        with patch("gza.cli.query.Git", side_effect=GitError("boom")):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(impl.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=False,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Verify Status:" in output
+        assert "failed" in output
+        assert "Verify Artifact:" in output
+        assert stored.path in output
+        assert "stored owner output survives git failure" in output
+        assert "Verify Failure:" in output
+        assert "git unavailable" in output
+
+    def test_show_implement_keeps_latest_owner_verify_evidence_when_branch_probe_raises(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/owner-verify-show-probe-exception"
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        store.update(review)
+
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            review,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="stored owner output survives probe exception\n",
+            command="./bin/tests",
+            status="failed",
+            exit_status="7",
+            head_sha="a" * 40,
+            metadata={
+                "reviewed_branch": impl.branch,
+                "reviewed_base_sha": "cafebabe",
+                "working_directory": "/tmp/canonical-verify-worktree",
+            },
+            created_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=SimpleNamespace(
+                command="./bin/tests",
+                status="failed",
+                exit_status="7",
+                captured_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="a" * 40,
+                reviewed_base_sha="cafebabe",
+                working_directory="/tmp/canonical-verify-worktree",
+                failure="git unavailable",
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            output_artifact_path=stored.path,
+            producer="review_verify",
+        )
+
+        git = _mock_unmerged_git()
+        git.rev_parse_if_exists = MagicMock(side_effect=GitError("probe blew up"))
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(impl.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=False,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Verify Status:" in output
+        assert "failed" in output
+        assert "Verify Current: no" in output
+        assert "Verify Artifact:" in output
+        assert stored.path in output
+        assert "stored owner output survives probe exception" in output
+
+    def test_show_review_keeps_neutral_legacy_verify_fallback(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.review_verify_command = "./bin/tests"
+        review.review_verify_status = "failed"
+        review.review_verify_exit_status = "7"
+        review.review_verify_branch = "feature/legacy-review-verify"
+        review.review_verify_head_sha = "deadbeef"
+        review.review_verify_base_sha = "cafebabe"
+        review.review_verify_cwd = "/tmp/legacy-review-verify"
+        review.review_verify_markdown = "legacy verify markdown"
+        review.review_verify_captured_at = datetime(2026, 6, 5, 10, 0, tzinfo=UTC)
+        store.update(review)
+
+        result = invoke_gza("show", str(review.id), "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Verify Status:" in result.stdout
+        assert "Verify Exit:" in result.stdout
+        assert "Verify Result:" in result.stdout
+        assert "legacy verify markdown" in result.stdout
+        assert "Review Verify" not in result.stdout
+
+    def test_show_review_marks_owner_verify_stale_after_owner_head_moves(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
+        store = make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/review-show-stale"
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", based_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.review_verify_command = "./bin/tests"
+        review.review_verify_status = "passed"
+        review.review_verify_exit_status = "0"
+        review.review_verify_branch = impl.branch
+        review.review_verify_head_sha = "old-head"
+        review.review_verify_base_sha = "cafebabe"
+        review.review_verify_captured_at = datetime(2026, 6, 5, 10, 0, tzinfo=UTC)
+        store.update(review)
+
+        config = Config.load(tmp_path)
+        stored = store_command_output_artifact(
+            store,
+            review,
+            config,
+            kind="verify_command_output",
+            producer="review_verify",
+            label="verify_command",
+            output="stale owner artifact output\n",
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            head_sha="old-head",
+            metadata={
+                "reviewed_branch": impl.branch,
+                "reviewed_base_sha": "cafebabe",
+                "working_directory": "/tmp/canonical-verify-worktree",
+            },
+            created_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=SimpleNamespace(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 6, 5, 10, 5, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="old-head",
+                reviewed_base_sha="cafebabe",
+                working_directory="/tmp/canonical-verify-worktree",
+                failure=None,
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            output_artifact_path=stored.path,
+            producer="review_verify",
+        )
+
+        git = _mock_unmerged_git()
+        git.rev_parse_if_exists = MagicMock(
+            side_effect=lambda ref: "new-head" if ref == impl.branch else ("b" * 40 if ref == "main" else "a" * 40)
+        )
+        with patch("gza.cli.query.Git", return_value=git):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(review.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=False,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Verify Current: no" in output
+        assert "Verify Head:" in output
+        assert "old-head" in output
+        assert "new-head" not in output
+        assert stored.path in output
 
     def test_show_metadata_only_marks_missing_artifacts(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
@@ -6324,7 +6950,7 @@ class TestShowCommand:
         assert result.returncode == 0
         assert "Artifacts:" in result.stdout
         assert stored.path in result.stdout
-        assert "Review Verify Artifact:" in result.stdout
+        assert "Verify Artifact:" in result.stdout
         assert "missing" in result.stdout
 
     def test_artifact_command_prints_latest_content_and_path(self, tmp_path: Path) -> None:
@@ -6555,7 +7181,7 @@ class TestShowCommand:
         assert str(tmp_path / newer.path) not in path_result.stdout
 
         assert show_result.returncode == 0
-        assert "Review Verify Artifact:" in show_result.stdout
+        assert "Verify Artifact:" in show_result.stdout
         assert newer.path in show_result.stdout
         assert older.path in show_result.stdout
 
@@ -6640,7 +7266,7 @@ class TestShowCommand:
         assert newer.path in result.stdout
         assert "skipped" in result.stdout
         assert "missing" in result.stdout
-        assert "Review Verify Artifact:" in result.stdout
+        assert "Verify Artifact:" in result.stdout
         assert newer.path in result.stdout
 
     def test_show_warns_and_reads_when_readonly_db_is_missing_task_comments(self, tmp_path: Path):
@@ -8300,7 +8926,10 @@ class TestShowCommand:
         from gza.cli.query import cmd_show
 
         setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
         store = make_store(tmp_path)
+        config = Config.load(tmp_path)
 
         impl = store.add("Implement stale show", task_type="implement")
         assert impl.id is not None
@@ -8315,12 +8944,37 @@ class TestShowCommand:
         review.status = "pending"
         store.update(review)
 
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=SimpleNamespace(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="same-head",
+                reviewed_base_sha="base-head",
+                working_directory="/tmp/stale-show-verify",
+                failure=None,
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            producer="review_verify",
+        )
+
         git = MagicMock()
         git.default_branch.return_value = "main"
         git.can_merge.return_value = True
         git.resolve_fresh_merge_source.return_value = ("origin/feature/stale-show", None)
         git.count_commits_behind.return_value = 1
         git.worktree_list.return_value = []
+        git.rev_parse_if_exists.side_effect = (
+            lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
+        )
+        git.get_diff_name_status.return_value = ""
 
         with patch("gza.cli.query.Git", return_value=git):
             exit_code = cmd_show(
@@ -18347,7 +19001,10 @@ class TestIncompleteCommand:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
         store = make_store(tmp_path)
+        config = Config.load(tmp_path)
 
         impl = store.add("Implement dirty-checkout warning", task_type="implement")
         assert impl.id is not None
@@ -18362,6 +19019,26 @@ class TestIncompleteCommand:
         store.update(review)
         assert review.id is not None
         store.attach_task_to_merge_unit(review.id, unit.id, "review")
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=SimpleNamespace(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="a" * 40,
+                reviewed_base_sha="b" * 40,
+                working_directory="/tmp/incomplete-dirty-warning-verify",
+                failure=None,
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            producer="review_verify",
+        )
 
         git = _mock_unmerged_git()
         git.has_changes.return_value = True
@@ -18896,7 +19573,10 @@ class TestLineageOwnerParity:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(config_path.read_text() + "verify_command: ./bin/tests\n", encoding="utf-8")
         store = make_store(tmp_path)
+        config = Config.load(tmp_path)
 
         impl = store.add("Implement background mode startup errors", task_type="implement")
         impl.status = "completed"
@@ -18929,6 +19609,26 @@ class TestLineageOwnerParity:
         store.update(rebase_resolved)
         assert rebase_resolved.id is not None
         store.attach_task_to_merge_unit(rebase_resolved.id, unit.id, "rebase")
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=rebase_resolved,
+            result=SimpleNamespace(
+                command="./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC),
+                reviewed_branch=rebase_resolved.branch,
+                reviewed_head_sha="a" * 40,
+                reviewed_base_sha="b" * 40,
+                working_directory="/tmp/rebase-resolved-verify",
+                failure=None,
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            producer="review_verify",
+        )
 
         dropped_one = store.add(
             "Dropped rebase one",
@@ -18968,7 +19668,7 @@ class TestLineageOwnerParity:
         assert result == 0
         one_line_output = captured.out
         assert self._one_line_row_id(one_line_output) == impl.id
-        assert "Create closing review (latest implementation has no review yet)" in one_line_output
+        assert "Create closing review (code changed since the last review)" in one_line_output
         assert f"{dropped_one.id} (dropped)" not in one_line_output
         assert f"{dropped_two.id} (dropped)" not in one_line_output
 

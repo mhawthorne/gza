@@ -45,6 +45,7 @@ from gza.main_integration_verify import (
     load_main_integration_verify_state,
 )
 from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult
+from gza.review_verify_state import persist_verify_gate_artifact
 from gza.review_verdict import ReviewFinding
 from gza.worktree_roots import managed_worktree_root_paths
 
@@ -91,6 +92,14 @@ def _stub_candidate_integration_verify() -> object:
         patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
     ):
         yield mocked
+
+@contextmanager
+def _force_merge_planner_action():
+    with patch(
+        "gza.cli.git_ops.determine_next_action",
+        return_value={"type": "merge", "description": "Merge"},
+    ):
+        yield
 
 
 def _advance_args(tmp_path: Path, task_id: str) -> argparse.Namespace:
@@ -377,6 +386,7 @@ def test_merge_single_task_preflights_conflicts_before_merge(tmp_path, capsys) -
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
+        get_diff_name_status=MagicMock(return_value=""),
         can_merge=MagicMock(return_value=False),
         merge=MagicMock(),
     )
@@ -388,9 +398,10 @@ def test_merge_single_task_preflights_conflicts_before_merge(tmp_path, capsys) -
         remote=False,
         resolve=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
-    result = _merge_single_task(task.id, config, store, git, args, "main")
+    with _force_merge_planner_action():
+        result = _merge_single_task(task.id, config, store, git, args, "main")
 
     assert result.rc == 1
     git.can_merge.assert_called_once_with("feature/conflicts", "main")
@@ -412,11 +423,36 @@ def test_merge_single_task_returns_blocked_dirty_checkout_status(tmp_path: Path,
     task.merge_status = "unmerged"
     store.update(task)
 
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=task,
+        source_task=task,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime.now(UTC),
+            reviewed_branch=task.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
     git = SimpleNamespace(
         repo_dir=tmp_path,
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=True),
+        get_diff_name_status=MagicMock(return_value=""),
+        rev_parse_if_exists=MagicMock(return_value="head-1"),
         can_merge=MagicMock(),
         merge=MagicMock(),
     )
@@ -428,9 +464,11 @@ def test_merge_single_task_returns_blocked_dirty_checkout_status(tmp_path: Path,
         remote=False,
         resolve=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
-
-    result = _merge_single_task(task.id, config, store, git, args, "main")
+    with patch(
+        "gza.cli.git_ops.determine_next_action",
+        return_value={"type": "merge", "description": "Merge"},
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
 
     assert result.rc == 1
     assert result.status == "blocked_dirty_checkout"
@@ -439,6 +477,69 @@ def test_merge_single_task_returns_blocked_dirty_checkout_status(tmp_path: Path,
     git.merge.assert_not_called()
     output = capsys.readouterr().out
     assert "You have uncommitted changes. Please commit or stash them first." in output
+
+
+def test_merge_single_task_runs_shared_verify_gate_before_merge(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement gated merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/gated-merge"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+        no_followups=False,
+    )
+    config = Config.load(tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            side_effect=[
+                {
+                    "type": "verify_gate",
+                    "description": "Run verify gate before merge",
+                    "verify_gate_phase": "pre_merge",
+                    "verify_owner_task": task,
+                },
+                {"type": "merge", "description": "Merge (review APPROVED)"},
+            ],
+        ) as determine,
+        patch(
+            "gza.cli.git_ops.execute_advance_action",
+            return_value=AdvanceActionExecutionResult(
+                action_type="verify_gate",
+                status="success",
+                success_message="Verify gate passed for the current tip before merge.",
+                work_done=True,
+            ),
+        ) as execute_action,
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    assert determine.call_count == 2
+    assert determine.call_args.kwargs["selected_for_merge"] is True
+    execute_action.assert_called_once()
+    git.merge.assert_called_once_with("feature/gated-merge", squash=False, commit_message=None)
 
 
 def test_merge_single_task_default_keeps_merge_mechanics_output(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -469,9 +570,10 @@ def test_merge_single_task_default_keeps_merge_mechanics_output(tmp_path: Path, 
         remote=False,
         resolve=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
-    result = _merge_single_task(task.id, config, store, git, args, "main")
+    with _force_merge_planner_action():
+        result = _merge_single_task(task.id, config, store, git, args, "main")
 
     assert result.rc == 0
     output = capsys.readouterr().out
@@ -510,17 +612,18 @@ def test_merge_single_task_quiet_mechanics_suppresses_default_success_output(
         remote=False,
         resolve=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
-    result = _merge_single_task(
-        task.id,
-        config,
-        store,
-        git,
-        args,
-        "main",
-        quiet_mechanics=True,
-    )
+    with _force_merge_planner_action():
+        result = _merge_single_task(
+            task.id,
+            config,
+            store,
+            git,
+            args,
+            "main",
+            quiet_mechanics=True,
+        )
 
     assert result.rc == 0
     output = capsys.readouterr().out
@@ -561,7 +664,7 @@ def test_merge_single_task_quiet_mechanics_keeps_squash_reconcile_warning_output
         remote=False,
         resolve=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
     with patch(
         "gza.cli.git_ops._reconcile_squash_merged_branch_with_origin",
@@ -571,15 +674,16 @@ def test_merge_single_task_quiet_mechanics_keeps_squash_reconcile_warning_output
             reason="cannot lock ref 'refs/remotes/origin/feature/quiet-squash-merge-output'",
         ),
     ):
-        result = _merge_single_task(
-            task.id,
-            config,
-            store,
-            git,
-            args,
-            "main",
-            quiet_mechanics=True,
-        )
+        with _force_merge_planner_action():
+            result = _merge_single_task(
+                task.id,
+                config,
+                store,
+                git,
+                args,
+                "main",
+                quiet_mechanics=True,
+            )
 
     assert result.rc == 0
     output = capsys.readouterr().out
@@ -590,7 +694,7 @@ def test_merge_single_task_quiet_mechanics_keeps_squash_reconcile_warning_output
     assert "git fetch origin +refs/heads/feature/quiet-squash-merge-output:refs/remotes/origin/feature/quiet-squash-merge-output" in output
 
 
-def test_merge_single_task_auto_defers_verify_only_blockers_without_flag(
+def test_merge_single_task_refuses_verify_only_blockers_without_flag(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -643,26 +747,29 @@ def test_merge_single_task_auto_defers_verify_only_blockers_without_flag(
         defer_blockers=False,
         no_followups=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
     with (
         patch(
             "gza.cli.git_ops.get_review_report",
             return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
         ),
-        patch("gza.cli.git_ops.is_verify_blocked_only_review", return_value=True),
         patch("gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks", return_value=([deferred_task], [])) as materialize,
     ):
-        result = _merge_single_task(task.id, config, store, git, args, "main")
+        with _force_merge_planner_action():
+            result = _merge_single_task(task.id, config, store, git, args, "main")
 
-    assert result.rc == 0
-    git.merge.assert_called_once_with("feature/verify-only-blocker", squash=False, commit_message=None)
-    materialize.assert_called_once()
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    materialize.assert_not_called()
     output = capsys.readouterr().out
-    assert f"DEFERRED-BLOCKER {deferred_task.id} created from {task.id}" in output
+    assert (
+        f"Error: Task {task.id} has CHANGES_REQUESTED review {review.id}, "
+        "but blocker classification did not match the parsed blocker set. Refusing to guess."
+    ) in output
 
 
-def test_merge_single_task_auto_defers_verify_only_report_file_blockers_without_flag(
+def test_merge_single_task_refuses_verify_only_report_file_blockers_without_flag(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -711,24 +818,21 @@ def test_merge_single_task_auto_defers_verify_only_report_file_blockers_without_
         defer_blockers=False,
         no_followups=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
     with patch(
         "gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks",
         return_value=([deferred_task], []),
     ) as materialize:
-        result = _merge_single_task(task.id, config, store, git, args, "main")
+        with _force_merge_planner_action():
+            result = _merge_single_task(task.id, config, store, git, args, "main")
 
-    assert result.rc == 0
-    git.merge.assert_called_once_with(
-        "feature/report-file-verify-only-blocker",
-        squash=False,
-        commit_message=None,
-    )
-    materialize.assert_called_once()
-    assert materialize.call_args.kwargs["findings"][0].id == "B1"
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    materialize.assert_not_called()
     output = capsys.readouterr().out
-    assert f"DEFERRED-BLOCKER {deferred_task.id} created from {task.id}" in output
+    assert f"Error: Task {task.id} has open BLOCKER findings in review {review.id}." in output
+    assert "Use --defer-blockers to merge anyway and create urgent PR-required follow-up tasks." in output
 
 
 def test_merge_single_task_refuses_non_verify_blockers_without_flag(
@@ -783,14 +887,14 @@ def test_merge_single_task_refuses_non_verify_blockers_without_flag(
         defer_blockers=False,
         no_followups=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
     with (
         patch(
             "gza.cli.git_ops.get_review_report",
             return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
         ),
-        patch("gza.cli.git_ops.is_verify_blocked_only_review", return_value=False),
+        patch("gza.cli.git_ops.get_review_content", return_value="review content"),
         patch(
             "gza.cli.git_ops.summarize_review_blockers",
             return_value=SimpleNamespace(
@@ -801,7 +905,8 @@ def test_merge_single_task_refuses_non_verify_blockers_without_flag(
             ),
         ),
     ):
-        result = _merge_single_task(task.id, config, store, git, args, "main")
+        with _force_merge_planner_action():
+            result = _merge_single_task(task.id, config, store, git, args, "main")
 
     assert result.rc == 1
     git.merge.assert_not_called()
@@ -861,9 +966,10 @@ def test_merge_single_task_refuses_non_verify_report_file_blockers_with_normal_h
         defer_blockers=False,
         no_followups=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
-    result = _merge_single_task(task.id, config, store, git, args, "main")
+    with _force_merge_planner_action():
+        result = _merge_single_task(task.id, config, store, git, args, "main")
 
     assert result.rc == 1
     git.merge.assert_not_called()
@@ -939,7 +1045,7 @@ def test_merge_single_task_defer_blockers_flag_materializes_and_proceeds(
         defer_blockers=True,
         no_followups=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
     with (
         patch(
@@ -948,7 +1054,8 @@ def test_merge_single_task_defer_blockers_flag_materializes_and_proceeds(
         ),
         patch("gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks", return_value=([deferred_task], [])) as materialize,
     ):
-        result = _merge_single_task(task.id, config, store, git, args, "main")
+        with _force_merge_planner_action():
+            result = _merge_single_task(task.id, config, store, git, args, "main")
 
     assert result.rc == 0
     git.merge.assert_called_once()
@@ -1008,7 +1115,7 @@ def test_merge_single_task_mark_only_materializes_blockers_before_marking_merged
         defer_blockers=True,
         no_followups=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
     order: list[str] = []
     original_set_merge_status = store.set_merge_status
     original_set_merge_unit_state = store.set_merge_unit_state
@@ -1034,7 +1141,8 @@ def test_merge_single_task_mark_only_materializes_blockers_before_marking_merged
             side_effect=lambda *a, **k: (order.append("defer") or ([deferred_task], [])),
         ),
     ):
-        result = _merge_single_task(task.id, config, store, git, args, "main")
+        with _force_merge_planner_action():
+            result = _merge_single_task(task.id, config, store, git, args, "main")
 
     assert result.rc == 0
     assert order == ["defer", "mark"]
@@ -1093,7 +1201,7 @@ def test_merge_single_task_no_followups_does_not_suppress_deferred_blockers(
         defer_blockers=True,
         no_followups=True,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
     with (
         patch(
@@ -1103,7 +1211,8 @@ def test_merge_single_task_no_followups_does_not_suppress_deferred_blockers(
         patch("gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks", return_value=([deferred_task], [])),
         patch("gza.cli.git_ops._materialize_merge_followups") as materialize_followups,
     ):
-        result = _merge_single_task(task.id, config, store, git, args, "main")
+        with _force_merge_planner_action():
+            result = _merge_single_task(task.id, config, store, git, args, "main")
 
     assert result.rc == 0
     materialize_followups.assert_not_called()
@@ -1111,7 +1220,7 @@ def test_merge_single_task_no_followups_does_not_suppress_deferred_blockers(
     assert f"DEFERRED-BLOCKER {deferred_task.id} created from {task.id}" in output
 
 
-def test_merge_single_task_mark_only_reuses_existing_deferred_blocker_task(tmp_path: Path) -> None:
+def test_merge_single_task_mark_only_verify_only_blocker_without_flag_refuses(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     task = store.add("Implement idempotent mark-only blocker path", task_type="implement")
@@ -1160,26 +1269,25 @@ def test_merge_single_task_mark_only_reuses_existing_deferred_blocker_task(tmp_p
         defer_blockers=False,
         no_followups=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
     with (
         patch(
             "gza.cli.git_ops.get_review_report",
             return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
         ),
-        patch("gza.cli.git_ops.is_verify_blocked_only_review", return_value=True),
     ):
         first = _merge_single_task(task.id, config, store, git, args, "main")
         store.set_merge_status(task.id, "unmerged")
         second = _merge_single_task(task.id, config, store, git, args, "main")
 
-    assert first.rc == 0
-    assert second.rc == 0
+    assert first.rc == 1
+    assert second.rc == 1
     children = [
         child for child in store.get_based_on_children(review.id)
         if child.prompt.startswith(f"Deferred blocker {blocker.id} from review {review.id} for task {task.id}:")
     ]
-    assert len(children) == 1
+    assert len(children) == 0
 
 
 def test_merge_single_task_same_merge_unit_review_on_representative_refuses_without_flag(
@@ -1216,9 +1324,10 @@ def test_merge_single_task_same_merge_unit_review_on_representative_refuses_with
         defer_blockers=False,
         no_followups=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
-    result = _merge_single_task(representative.id, config, store, git, args, "main")
+    with _force_merge_planner_action():
+        result = _merge_single_task(representative.id, config, store, git, args, "main")
 
     assert result.rc == 1
     git.merge.assert_not_called()
@@ -1273,9 +1382,10 @@ def test_merge_single_task_same_merge_unit_review_on_representative_defer_flag_m
         defer_blockers=True,
         no_followups=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
-    result = _merge_single_task(representative.id, config, store, git, args, "main")
+    with _force_merge_planner_action():
+        result = _merge_single_task(representative.id, config, store, git, args, "main")
 
     assert result.rc == 0
     assert merge_order == ["merge"]
@@ -1286,7 +1396,7 @@ def test_merge_single_task_same_merge_unit_review_on_representative_defer_flag_m
     assert len(blockers) == 1
 
 
-def test_merge_single_task_same_merge_unit_verify_only_review_on_representative_mark_only_materializes_before_mark(
+def test_merge_single_task_same_merge_unit_verify_only_review_on_representative_mark_only_refuses(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -1341,17 +1451,17 @@ def test_merge_single_task_same_merge_unit_verify_only_review_on_representative_
         defer_blockers=False,
         no_followups=False,
     )
-    config = SimpleNamespace(project_dir=tmp_path)
+    config = Config.load(tmp_path)
 
     result = _merge_single_task(representative.id, config, store, git, args, "main")
 
-    assert result.rc == 0
-    assert order == ["mark"]
+    assert result.rc == 1
+    assert order == []
     blockers = [
         child for child in store.get_based_on_children(review.id)
         if child.prompt.startswith(f"Deferred blocker B1 from review {review.id} for task {owner.id}:")
     ]
-    assert len(blockers) == 1
+    assert len(blockers) == 0
 
 
 def test_run_task_backed_rebase_refreshes_merge_unit_provenance(tmp_path) -> None:
@@ -3257,14 +3367,11 @@ def test_advance_explicit_merge_refuses_when_checkout_does_not_match_canonical_t
         rc = cmd_advance(args)
 
     output = capsys.readouterr().out
-    assert rc == 1
+    assert rc == 0
     assert "Will advance 1 task(s):" in output
-    assert "Merge (review APPROVED)" in output
-    assert (
-        f"Error: Advance merge for task {task.id} targets 'main', but the active checkout is "
-        f"'{task.branch}'. Switch to 'main' and rerun."
-    ) in output
-    assert "1 errors" in output
+    assert "Run verify gate before merge" in output
+    assert "verify epoch is unavailable; merge is blocked" in output
+    assert "1 skipped" in output
 
     refreshed = store.get(task.id)
     assert refreshed is not None
@@ -3318,15 +3425,13 @@ def test_advance_execution_merges_remote_tracking_ref_when_local_branch_is_missi
     assert rc == 0
     refreshed = store.get(task.id)
     assert refreshed is not None
-    assert refreshed.merge_status == "merged"
+    assert refreshed.merge_status == "unmerged"
 
-    fake_git.merge.assert_called_once()
-    merge_call_args, _ = fake_git.merge.call_args
-    assert merge_call_args[0] == f"origin/{branch}"
+    fake_git.merge.assert_not_called()
 
     output = capsys.readouterr().out
-    assert f"Merging 'origin/{branch}' into 'main'" in output
-    assert "✓ Merged" in output
+    assert "Run verify gate before merge" in output
+    assert "verify epoch is unavailable; merge is blocked" in output
 
 
 def test_cmd_advance_wraps_planning_in_git_cache(tmp_path: Path) -> None:
@@ -4518,15 +4623,13 @@ def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(
     assert rc == 0
     refreshed = store.get(task.id)
     assert refreshed is not None
-    assert refreshed.merge_status == "merged"
+    assert refreshed.merge_status == "unmerged"
 
-    fake_git.merge.assert_called_once()
-    merge_call_args, _ = fake_git.merge.call_args
-    assert merge_call_args[0] == f"origin/{branch}"
+    fake_git.merge.assert_not_called()
 
     output = capsys.readouterr().out
-    assert f"Merging 'origin/{branch}' into 'main'" in output
-    assert f"Merging '{branch}' into 'main'" not in output
+    assert "Run verify gate before merge" in output
+    assert "verify epoch is unavailable; merge is blocked" in output
 
 
 def test_advance_execution_prefers_local_branch_when_origin_is_stale(
@@ -4582,15 +4685,13 @@ def test_advance_execution_prefers_local_branch_when_origin_is_stale(
     assert rc == 0
     refreshed = store.get(task.id)
     assert refreshed is not None
-    assert refreshed.merge_status == "merged"
+    assert refreshed.merge_status == "unmerged"
 
-    fake_git.merge.assert_called_once()
-    merge_call_args, _ = fake_git.merge.call_args
-    assert merge_call_args[0] == branch
+    fake_git.merge.assert_not_called()
 
     output = capsys.readouterr().out
-    assert f"Merging '{branch}' into 'main'" in output
-    assert f"Merging 'origin/{branch}' into 'main'" not in output
+    assert "Run verify gate before merge" in output
+    assert "verify epoch is unavailable; merge is blocked" in output
 
 
 def test_reconcile_diverged_branch_with_origin_force_pushes_gza_rewrite(tmp_path: Path) -> None:
@@ -5150,7 +5251,7 @@ def test_cmd_advance_uses_shared_lifecycle_execution_gate(
         rc = cmd_advance(_advance_args(tmp_path, task.id))
 
     assert rc == 0
-    assert any(action_type == "create_review" and free_worker_slots > 0 for action_type, free_worker_slots in gate_calls)
+    assert any(action_type == "verify_gate" and free_worker_slots > 0 for action_type, free_worker_slots in gate_calls)
     assert "Will advance 1 task(s):" in capsys.readouterr().out
 
 

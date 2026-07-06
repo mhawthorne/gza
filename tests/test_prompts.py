@@ -1,14 +1,18 @@
 """Tests for the PromptBuilder class in gza.prompts."""
 
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
+from gza.artifacts import store_command_output_artifact
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.prompts import PromptBuilder
+from gza.review_tasks import create_or_reuse_verify_fix_task
+from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
 
 REVIEW_CONTRACT_PARITY_CLAUSES = [
     "The provided diff is authoritative - do not use git commands to reconstruct, re-derive, or expand it.",
@@ -29,8 +33,10 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "Do not write a `BLOCKER` unless you can cite the current code or current diff proving the issue is still open.",
     "Prior review text, improve lineage, or task history are not sufficient evidence for a blocker.",
     "Improve-lineage context may justify a narrow current-source anti-regression check for repeated blocker shapes the latest improve was expected to close, but it is only a pointer to inspect the current code/diff.",
-    "If `## verify_command result` shows a failed or timed-out run, add one or more blocker items whose titles clearly include `verify_command failure`;",
-    "If `## verify_command result` shows a passing run, do not add blocker text solely because verify ran.",
+    "Review current code, diff, and scope only.",
+    "Do not run or evaluate `verify_command`; verification is handled elsewhere.",
+    "Do not create blockers because verification failed, timed out, was skipped, or was unavailable.",
+    "If code has a test-quality issue, cite the concrete code/test issue directly rather than runner verify status.",
     "Do not add a per-finding `Severity:` line; the `## Blockers` and `## Follow-Ups` sections are the severity field.",
     "Derive the final verdict from the findings:",
     "cannot classify safely -> `NEEDS_DISCUSSION`",
@@ -200,6 +206,293 @@ class TestPromptBuilderBuild:
         _assert_contains_all_clauses(result, IMPROVE_DISPUTE_CONTRACT_CLAUSES)
         _assert_contains_all_clauses(result, IMPROVE_ATOMIC_CLOSURE_CONTRACT_CLAUSES)
 
+    def test_build_verify_fix_type_with_summary(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Fix verify epoch", task_type="verify_fix")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "./bin/tests"
+        config.inner_verify_command = ""
+
+        summary_path = Path("/workspace/.gza/summaries/verify-fix-test.md")
+        result = PromptBuilder().build(task, config, store, summary_path=summary_path)
+
+        assert "This is a `verify_fix` task." in result
+        assert "same-branch contributor task" in result
+        assert "Do not weaken guardrails to make the verify pass." in result
+        assert str(summary_path) in result
+        assert "Required final verify command: `./bin/tests`" in result
+
+    def test_build_verify_fix_prompt_includes_failed_verify_context(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        improve = store.add(prompt="Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        output_artifact = store_command_output_artifact(
+            store,
+            improve,
+            config,
+            kind="verify_command_output",
+            producer="test",
+            label="verify_command_output",
+            output="setup ok\npytest failed\nAssertionError: expected green\n",
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            head_sha="deadbeef",
+        )
+        result = type(
+            "Result",
+            (),
+            {
+                "command": "./bin/tests",
+                "status": "failed",
+                "exit_status": "1",
+                "captured_at": datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+                "reviewed_branch": "feature/test",
+                "reviewed_head_sha": "deadbeef",
+                "reviewed_base_sha": "base-sha",
+                "working_directory": str(tmp_path / "worktrees" / "verify"),
+                "failure": "pytest failed",
+            },
+        )()
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=improve,
+            result=result,
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            output_artifact_id=output_artifact.id,
+            output_artifact_task_id=improve.id,
+            output_artifact_path=output_artifact.path,
+            producer="test",
+        )
+        task, created = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=epoch,
+            trigger_source="advance",
+        )
+
+        summary_path = Path("/workspace/.gza/summaries/verify-fix-test.md")
+        prompt = PromptBuilder().build(task, config, store, summary_path=summary_path)
+
+        assert created is True
+        assert "## verify_fix failed verify context" in prompt
+        assert "- Status: `failed`" in prompt
+        assert "- Command: `./bin/tests`" in prompt
+        assert "- Working directory: " in prompt
+        assert "- Reviewed branch: `feature/test`" in prompt
+        assert "- Reviewed head: `deadbeef`" in prompt
+        assert "- Reviewed base/default SHA: `base-sha`" in prompt
+        assert "- Failure: pytest failed" in prompt
+        assert f"- Output artifact path: `{output_artifact.path}`" in prompt
+        assert "AssertionError: expected green" in prompt
+
+    def test_build_verify_fix_prompt_uses_structured_epoch_for_multiline_verify_command(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        improve = store.add(prompt="Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="set -e\n./bin/tests",
+            autonomous_verify_timeout_seconds=300,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="set -e\n./bin/tests",
+            verify_timeout_seconds=300,
+            verify_timeout_grace_seconds=5.0,
+        )
+        output_artifact = store_command_output_artifact(
+            store,
+            improve,
+            config,
+            kind="verify_command_output",
+            producer="test",
+            label="verify_command_output",
+            output="setup ok\npytest failed\nAssertionError: expected green\n",
+            command=epoch.verify_command,
+            status="failed",
+            exit_status="1",
+            head_sha="deadbeef",
+        )
+        result = type(
+            "Result",
+            (),
+            {
+                "command": epoch.verify_command,
+                "status": "failed",
+                "exit_status": "1",
+                "captured_at": datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+                "reviewed_branch": "feature/test",
+                "reviewed_head_sha": "deadbeef",
+                "reviewed_base_sha": "base-sha",
+                "working_directory": str(tmp_path / "worktrees" / "verify"),
+                "failure": "pytest failed",
+            },
+        )()
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=improve,
+            result=result,
+            verify_timeout_seconds=300,
+            verify_timeout_grace_seconds=5.0,
+            output_artifact_id=output_artifact.id,
+            output_artifact_task_id=improve.id,
+            output_artifact_path=output_artifact.path,
+            producer="test",
+        )
+        task, created = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=epoch,
+            trigger_source="advance",
+        )
+
+        prompt = PromptBuilder().build(task, config, store, summary_path=Path("/workspace/.gza/summaries/verify-fix-test.md"))
+
+        assert created is True
+        assert "## verify_fix failed verify context" in prompt
+        assert "## verify_fix evidence status" not in prompt
+        assert "- Command: `set -e\n./bin/tests`" in prompt
+        assert "AssertionError: expected green" in prompt
+
+    def test_build_verify_fix_prompt_includes_failed_verify_context_when_epoch_timeout_is_unset(
+        self, tmp_path: Path
+    ):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        improve = store.add(prompt="Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=None,
+            verify_timeout_grace_seconds=None,
+        )
+        output_artifact = store_command_output_artifact(
+            store,
+            improve,
+            config,
+            kind="verify_command_output",
+            producer="test",
+            label="verify_command_output",
+            output="setup ok\npytest failed\nAssertionError: expected green\n",
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            head_sha="deadbeef",
+        )
+        result = type(
+            "Result",
+            (),
+            {
+                "command": "./bin/tests",
+                "status": "failed",
+                "exit_status": "1",
+                "captured_at": datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+                "reviewed_branch": "feature/test",
+                "reviewed_head_sha": "deadbeef",
+                "reviewed_base_sha": "base-sha",
+                "working_directory": str(tmp_path / "worktrees" / "verify"),
+                "failure": "pytest failed",
+            },
+        )()
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=improve,
+            result=result,
+            verify_timeout_seconds=None,
+            verify_timeout_grace_seconds=None,
+            output_artifact_id=output_artifact.id,
+            output_artifact_task_id=improve.id,
+            output_artifact_path=output_artifact.path,
+            producer="test",
+        )
+        task, created = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=epoch,
+            trigger_source="advance",
+        )
+
+        prompt = PromptBuilder().build(task, config, store, summary_path=Path("/workspace/.gza/summaries/verify-fix-test.md"))
+
+        assert created is True
+        assert "## verify_fix failed verify context" in prompt
+        assert "## verify_fix evidence status" not in prompt
+        assert "AssertionError: expected green" in prompt
+
+    def test_build_verify_fix_prompt_fail_closed_when_evidence_missing(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(
+            prompt=(
+                "Fix verify failures for task gza-101 "
+                "[branch=feature/test head=deadbeef command=./bin/tests timeout=120 grace=5.0]"
+            ),
+            task_type="verify_fix",
+            based_on="gza-101",
+        )
+
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        summary_path = Path("/workspace/.gza/summaries/verify-fix-test.md")
+        prompt = PromptBuilder().build(task, config, store, summary_path=summary_path)
+
+        assert "## verify_fix evidence status" in prompt
+        assert "cannot proceed automatically" in prompt
+        assert "Do not make blind edits" in prompt
+
     def test_build_improve_comments_only_context_does_not_require_must_fix_structure(
         self, tmp_path: Path
     ):
@@ -251,7 +544,7 @@ class TestPromptBuilderBuild:
             not in result
         )
 
-    def test_build_improve_prompt_includes_verify_timeout_guidance_for_timeout_only_review(
+    def test_build_improve_prompt_omits_verify_timeout_guidance_for_timeout_only_review(
         self, tmp_path: Path
     ):
         db_path = tmp_path / "test.db"
@@ -296,10 +589,8 @@ class TestPromptBuilderBuild:
         summary_path = tmp_path / ".gza" / "summaries" / "improve-timeout-only.md"
         result = PromptBuilder().build(improve_task, config, store, summary_path=summary_path)
 
-        assert "## Verify Timeout Guidance" in result
-        assert "Treat this as a test-performance investigation first" in result
-        assert "inspect its captured stdout/stderr" in result
-        assert "`verify_command_output` artifacts" in result
+        assert "## Verify Timeout Guidance" not in result
+        assert "Treat this as a test-performance investigation first" not in result
 
     def test_build_improve_prompt_omits_verify_timeout_guidance_for_timeout_shaped_review_with_product_code_citation(
         self, tmp_path: Path
@@ -683,9 +974,11 @@ class TestPromptBuilderBuild:
         assert "Required fix:" in result
         assert "Required tests:" in result
         assert "repo-rules/learnings pass" in result
-        assert "## verify_command result" in result
-        assert "verify is not a short-circuit" in result
-        assert "verify_command failure" in result
+        assert "## verify_command result" not in result
+        assert "verify is not a short-circuit" not in result
+        assert "Review current code, diff, and scope only." in result
+        assert "Do not run or evaluate `verify_command`" in result
+        assert "Do not create blockers because verification failed, timed out, was skipped, or was unavailable." in result
         assert "silent broad-exception fallbacks" in result
         assert "misleading output" in result
         assert "targeted regression tests" in result
@@ -712,8 +1005,8 @@ class TestPromptBuilderBuild:
         assert len(checklist_lines) == REVIEW_SUMMARY_CHECKLIST_COUNT
         assert "Yes/No - ..." in result
 
-    def test_build_review_prompt_includes_supplied_verify_result_context(self, tmp_path: Path):
-        """Review prompts should include structured verify output when runner provides it."""
+    def test_build_review_prompt_omits_supplied_verify_result_context(self, tmp_path: Path):
+        """Review prompts stay code-only even if callers pass verify context."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         impl_task = store.add(prompt="Implement feature", task_type="implement")
@@ -745,8 +1038,8 @@ class TestPromptBuilderBuild:
             review_verify_result=verify_result,
         )
 
-        assert verify_result in result
-        assert "verify_command failure" in result
+        assert verify_result not in result
+        assert "## verify_command result" not in result
 
     def test_code_review_interactive_skill_uses_canonical_summary_contract(self):
         """Test interactive review skill scaffolding matches canonical Summary requirements."""
@@ -779,6 +1072,8 @@ class TestPromptBuilderBuild:
             "<Treat misleading output (UI/prompt/context contradictions) as BLOCKER when it can cause incorrect operator or agent decisions.>"
             in content
         )
+        assert "<Do not run or evaluate `verify_command`; verification is handled elsewhere.>" in content
+        assert "<Do not create blockers because verification failed, timed out, was skipped, or was unavailable.>" in content
 
     def test_code_review_interactive_skill_requires_authoritative_diff_and_ask_handoff(
         self,
@@ -1333,6 +1628,33 @@ class TestVerifyCommandConfig:
         config = Config.load(tmp_path)
         assert config.inner_verify_command == "./bin/tests --quick"
 
+    def test_unit_verify_command_loaded_from_yaml(self, tmp_path: Path):
+        """Test that unit_verify_command is loaded from gza.yaml."""
+        from gza.config import Config
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "unit_verify_command: './bin/tests --unit'\n"
+        )
+
+        config = Config.load(tmp_path)
+        assert config.unit_verify_command == "./bin/tests --unit"
+
+    def test_unit_verify_command_load_rejects_non_string(self, tmp_path: Path):
+        """Config.load should reject malformed unit verify commands at runtime."""
+        from gza.config import Config, ConfigError
+
+        config_file = tmp_path / "gza.yaml"
+        config_file.write_text(
+            "project_name: testproject\n"
+            "unit_verify_command:\n"
+            "  - bad\n"
+        )
+
+        with pytest.raises(ConfigError, match="'unit_verify_command' must be a string"):
+            Config.load(tmp_path)
+
     def test_inner_verify_command_load_rejects_non_string(self, tmp_path: Path):
         """Config.load should reject malformed inner verify commands at runtime."""
         from gza.config import Config, ConfigError
@@ -1415,6 +1737,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run mypy src/ && uv run pytest tests/ -x -q"
+        config.unit_verify_command = ""
         config.inner_verify_command = "./bin/tests --quick"
 
         result = PromptBuilder().build(task, config, store)
@@ -1432,6 +1755,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/ -x -q"
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         result = PromptBuilder().build(task, config, store)
@@ -1448,6 +1772,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/"
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         result = PromptBuilder().build(task, config, store)
@@ -1469,7 +1794,7 @@ class TestVerifyCommandInjection:
         sibling_dir.mkdir(parents=True)
         skipped_dir.mkdir(parents=True)
         (project_dir / "gza.yaml").write_text(
-            "project_name: foo\nverify_command: ./bin/foo-verify\ninner_verify_command: ./bin/foo-quick\n"
+            "project_name: foo\nverify_command: ./bin/foo-verify\nunit_verify_command: ./bin/foo-unit\ninner_verify_command: ./bin/foo-quick\n"
         )
         (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
         (skipped_dir / "gza.yaml").write_text("project_name: baz\n")
@@ -1478,6 +1803,7 @@ class TestVerifyCommandInjection:
             project_dir=project_dir,
             project_name="foo",
             verify_command="./bin/foo-verify",
+            unit_verify_command="./bin/foo-unit",
             inner_verify_command="./bin/foo-quick",
         )
         config._project_boundary_cache = type(
@@ -1490,6 +1816,7 @@ class TestVerifyCommandInjection:
 
         assert "Cross-project verification policy:" in result
         assert "Project `services/foo` final verify: `./bin/foo-verify`" in result
+        assert "preferred unit verify: `./bin/foo-unit`" in result
         assert "Project `libs/bar` final verify: `./bin/bar-verify`" in result
         assert "Project `apps/baz` has no `verify_command`" in result
 
@@ -1502,6 +1829,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = ""
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         result = PromptBuilder().build(task, config, store)
@@ -1517,6 +1845,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/"
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         report_path = tmp_path / "report.md"
@@ -1533,6 +1862,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/"
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         report_path = tmp_path / "report.md"
@@ -1549,6 +1879,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "uv run pytest tests/"
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         report_path = tmp_path / "report.md"
@@ -1565,14 +1896,15 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "make test"
+        config.unit_verify_command = ""
         config.inner_verify_command = ""
 
         result = PromptBuilder().build(task, config, store)
 
         assert "`make test`" in result
 
-    def test_inner_verify_command_is_injected_when_configured(self, tmp_path: Path):
-        """Configured inner verify commands should appear in code-task prompts."""
+    def test_inner_verify_command_is_used_when_unit_verify_is_unset(self, tmp_path: Path):
+        """Code-task prompts should fall back to inner verify when unit verify is unset."""
         db_path = tmp_path / "test.db"
         store = SqliteTaskStore(db_path)
         task = store.add(prompt="Implement feature", task_type="implement")
@@ -1580,6 +1912,7 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "./bin/tests"
+        config.unit_verify_command = ""
         config.inner_verify_command = "./bin/tests --quick -- tests/test_runner.py::test_case"
 
         result = PromptBuilder().build(task, config, store)
@@ -1587,6 +1920,40 @@ class TestVerifyCommandInjection:
         assert "Preferred inner-loop verify command" in result
         assert "./bin/tests --quick -- tests/test_runner.py::test_case" in result
         assert "Required final verify command: `./bin/tests`" in result
+
+    def test_unit_verify_command_takes_precedence_over_inner_verify(self, tmp_path: Path):
+        """Code-task prompts should prefer unit verify over inner verify when both exist."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "./bin/tests"
+        config.unit_verify_command = "./bin/tests --unit"
+        config.inner_verify_command = "./bin/tests --quick"
+
+        result = PromptBuilder().build(task, config, store)
+
+        assert "Preferred unit verify command: `./bin/tests --unit`" in result
+        assert "Preferred inner-loop verify command" not in result
+        assert "./bin/tests --quick" not in result
+
+    def test_prompt_falls_back_to_targeted_checks_when_no_unit_or_inner_verify_is_configured(self, tmp_path: Path):
+        """Code-task prompts should fall back to AGENTS/project guidance when no fast verify command is configured."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "./bin/tests"
+        config.unit_verify_command = ""
+        config.inner_verify_command = ""
+
+        result = PromptBuilder().build(task, config, store)
+
+        assert "No inner-loop command is configured; use targeted tests/lint/type checks for the files you changed." in result
 
     def test_prompt_builder_rejects_non_string_inner_verify_command(self, tmp_path: Path):
         """Prompt construction must not silently treat malformed inner verify config as unset."""
@@ -1597,7 +1964,23 @@ class TestVerifyCommandInjection:
         config = Mock(spec=Config)
         config.project_dir = tmp_path
         config.verify_command = "./bin/tests"
+        config.unit_verify_command = ""
         config.inner_verify_command = ["bad"]
 
         with pytest.raises(TypeError, match=r"config\.inner_verify_command must be a string"):
+            PromptBuilder().build(task, config, store)
+
+    def test_prompt_builder_rejects_non_string_unit_verify_command(self, tmp_path: Path):
+        """Prompt construction must not silently treat malformed unit verify config as unset."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        config = Mock(spec=Config)
+        config.project_dir = tmp_path
+        config.verify_command = "./bin/tests"
+        config.unit_verify_command = ["bad"]
+        config.inner_verify_command = ""
+
+        with pytest.raises(TypeError, match=r"config\.unit_verify_command must be a string"):
             PromptBuilder().build(task, config, store)

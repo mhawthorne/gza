@@ -14,16 +14,13 @@ Review tasks run in isolated git worktrees that only contain git-tracked files.
       - `## Original plan:` when a linked plan exists
       - `## Original request:` fallback when no linked plan exists
     - If neither source exists, ask sections are intentionally omitted and reviewers should state `No plan or request provided.`
-   - `## verify_command result` when `verify_command` is configured for the project
-     - The host runner executes the literal command once per autonomous review iteration in the review worktree.
-     - For `cross-project` reviews, the host runner fans out to each affected project root discovered from the review worktree diff and renders an aggregate status/provenance block first, then one section per affected project.
-     - The prompt includes pass/fail/unavailable status, exit status, captured-at time, reviewed branch/head provenance, exact working directory, and trimmed failing output when non-zero, even when every affected project is skipped or unknown.
-     - Cross-project reviews persist an aggregate review-verify status that reflects the worst affected-project outcome: `failed` when any affected project verify fails, `unavailable` when any affected project cannot run or is skipped because it has no runnable project root/`verify_command`, and `passed` only when every affected project can run and every runnable affected project verify passes.
-     - The reviewed head SHA is captured from the detached review worktree immediately before `verify_command` runs, and that provenance is also persisted on the review task so later lifecycle rules can tell whether the verify evidence still matches the current implementation tip.
-     - The exact rendered verify section is persisted on the review task, and the full captured stdout/stderr plus parsed phase results are written to a sibling `.gza/logs/<slug>.review-verify.json` artifact for later audit.
-     - Hung autonomous verification is bounded by `autonomous_verify_timeout_seconds` (120 seconds by default). When that budget is exceeded, the runner sends SIGTERM, waits `review_verify_timeout_grace_seconds` (5 seconds by default), then escalates to SIGKILL if the process group is still alive. The failed `## verify_command result` section preserves captured timeout evidence and partial stdout/stderr so the review still runs.
-     - Gza's own `./bin/tests` opts into richer timeout diagnostics by adding `--durations=25` to the full unit and functional pytest phases, having the unit and functional pytest suite conftests call the shared `register_sigterm_faulthandler()` helper, and having `python -m gza.test_latency --summary` flush its current summary when lifecycle review verification sends SIGTERM.
-     - Reviews must keep doing the normal code review in the same iteration; verify failure is additional blocker evidence, not a short-circuit.
+   - Review prompts are code-only. They do **not** receive the lifecycle-owned verify
+     gate result, and reviewers must not create blockers from verify pass/fail/timeout
+     state.
+   - Verify is owned by lifecycle before review creation and again before merge. The
+     runner persists verify evidence for lifecycle separately from the review prompt.
+   - Reviewers may still cite test-quality or guardrail problems when they can prove them
+     from the current diff or source, but not by restating a detached verify failure.
    - Implementation diff context for `main...{impl_branch}` (small/full/excerpted depending on size thresholds)
    - Improve-lineage context when applicable
      - This is metadata-only coordination context for prior review/improve iterations.
@@ -42,6 +39,10 @@ When `## Review scope:` is present, that section is the only gradeable ask. The 
 Typed `review_scope` comments are task-attached scope data, not actionable review feedback. They can supply or override the next review's scope for a completed or otherwise non-pending implementation, but they do not appear in improve feedback context and do not participate in improve gating.
 
 Current review context logic lives in `_build_context_from_chain()` and `_build_review_diff_context()` in `src/gza/runner.py`.
+
+Current lifecycle-owned verify capture and freshness logic lives separately in
+`src/gza/review_verify_state.py` plus the verify-gate execution paths in
+`src/gza/cli/advance_executor.py`.
 
 ## Diff base
 

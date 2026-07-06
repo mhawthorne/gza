@@ -9,8 +9,8 @@
 ## What this models
 
 gza turns a request into landed code by moving a **unit of work** through a lifecycle —
-implement, review, improve, rebase, merge — spawning AI workers for each step and
-escalating to a human only when automation cannot safely proceed.
+implement, verify, review, improve, rebase, merge — spawning AI workers for each step
+and escalating to a human only when automation cannot safely proceed.
 
 This document specifies that lifecycle as a state machine. It is the answer to:
 
@@ -32,7 +32,7 @@ The contract is defined over these concepts, independent of how they are stored.
 
 - **Task** — one unit of agent execution with a type and an execution status. Tasks are
   the *atoms*; the engine spawns them and reads their results.
-  - **Types:** `plan`, `plan_review`, `plan_improve`, `explore`, `implement`, `review`, `improve`, `rebase`.
+  - **Types:** `plan`, `plan_review`, `plan_improve`, `explore`, `implement`, `review`, `improve`, `verify_fix`, `rebase`.
   - **Execution status:** `pending` → `in_progress` → `completed` | `failed`.
 - **Work unit** (a.k.a. *merge unit* / *implementation lineage*) — the *molecule*: the
   set of related tasks that together produce one mergeable change on one branch. This is
@@ -81,15 +81,22 @@ stateDiagram-v2
     Implementing --> Recovering: implement fails
 
     Implemented --> ScopeParked: touches out-of-scope paths\n(not tagged cross-project)
-    Implemented --> Reviewing: review required,\nno valid review
-    Implemented --> Mergeable: review not required
+    Implemented --> Verifying: lifecycle verify gate required
+
+    Verifying --> Reviewing: verify passed,\nreview required
+    Verifying --> Mergeable: verify passed,\nreview not required
+    Verifying --> VerifyFixing: verify red / unavailable,\nauto-fix lane available
+    Verifying --> HumanParked: verify red / unavailable,\nno safe automated route
+
+    VerifyFixing --> Verifying: verify_fix completes\n(re-run verify gate)
+    VerifyFixing --> Recovering: verify_fix fails
 
     Reviewing --> Mergeable: APPROVED (review still valid)
     Reviewing --> MergeableWithFollowups: APPROVED_WITH_FOLLOWUPS
     Reviewing --> Improving: CHANGES_REQUESTED\n(cycles < limit)
     Reviewing --> HumanParked: unknown / inconsistent verdict,\ncurrent-head max cycles, duplicate blocker,\nverify-blocked
 
-    Improving --> Reviewing: improve changed code\n(fresh review)
+    Improving --> Verifying: improve changed code\n(re-run verify, then fresh review)
     Improving --> Recovering: improve fails
     Improving --> HumanParked: no-op cycles >= limit
 
@@ -134,18 +141,19 @@ These hold across the whole machine; the detailed rules in
    state — it MUST NOT loop forever and MUST NOT silently give up. The *existence and
    enforcement* of each bound is invariant; the specific bound *values* are tunable
    policy knobs, not contract (see [lifecycle-engine.md](lifecycle-engine.md)).
-3. **Review is the universal pre-merge checkpoint** (policy `require_review_before_merge`,
-   default on). When on, an implementation work unit MUST have a current, valid review
-   *whose verdict permits merge* before it can merge. The **verdict is the gate**:
-   `CHANGES_REQUESTED` blocks unless every current blocker is later cleared by a valid
-   derived path (for example a later review, verify-only provenance clearing, superseding
-   review output, or adjudication marking a disputed blocker `INVALID` for lifecycle
-   purposes). That clearance is derived state, not a historical verdict rewrite or merge
-   bypass. `APPROVED` and `APPROVED_WITH_FOLLOWUPS` permit merge — the latter meaning the
-   reviewer judged the code mergeable now, with the follow-ups as non-blocking later
-   work. When a verdict carries follow-ups, those follow-ups MUST be durably recorded as
-   tracked work *before* the merge completes, so nothing is lost. This is the one
-   human-or-agent quality gate the whole pipeline is built around.
+3. **Merge is a two-gate decision.** For an implementation work unit whose review gate is
+   enabled, lifecycle MUST have current green evidence for both:
+   - the **code-review gate**: a current, valid review whose verdict permits merge
+     (`APPROVED` or `APPROVED_WITH_FOLLOWUPS`);
+   - the **verify gate**: current runner-owned verify evidence for the current
+     implementation head and verify-gate identity.
+   When `require_review_before_merge=false` disables the review gate for that
+   implementation-owned lineage, the verify gate remains mandatory and that no-review
+   merge path is the only exception to the ordinary two-gate rule.
+   `APPROVED_WITH_FOLLOWUPS` permits merge only when the follow-up tasks are durably
+   recorded *before* the merge completes, so nothing is lost. Historical compatibility
+   handling for older review-coupled verify blockers MUST NOT be read as widening this
+   ordinary two-gate precondition.
 4. **The local target branch is canonical.** Merge-ness MUST be proven against the local
    target branch, never against `origin/<target>`. The engine MUST NOT push the target
    branch as a side effect of merging.
@@ -182,11 +190,13 @@ time, so each row names what would let us remove it.
 | `needs_discussion` — review refresh blocked | A completed rebase changed the implementation patch or conflict-resolution delta after the latest completed review, so a narrower refresh review is required, but auto-review creation is off. Target movement alone does not trigger this row. | Refresh the review manually, then merge. | Re-enable auto-review creation for the lineage. |
 | `needs_discussion` — review freshness unverified | The engine could not verify whether the latest completed review still matches the current implementation head after a code-changing lineage event, so freshness is unknown. Target movement alone does not trigger this row. | Fix the branch-head probe problem or refresh review state manually, then re-advance. | More robust git freshness probing and better operator diagnostics. |
 | `needs_discussion` — inconsistent review | Verdict `APPROVED_WITH_FOLLOWUPS` but zero parsed follow-ups (self-contradictory output). | Re-review / correct the review output. | More reliable verdict extraction. |
-| `needs_discussion` — verify-blocked | Review keeps failing only because the verify step times out, not on code issues, once timeout-only reviews hit the threshold and no runner-owned review-fail → no-op-improve-pass transition at the same branch head has already cleared the review. Ordinary verify-failure-only stale reviews are handled by that same-head evidence-clear path or, failing that proof, by the generic no-op improve stop instead of this timeout-specific park. | Fix the environment/verify config, then re-advance. | Separate "verify infra failed" from "code rejected." |
+| `needs_discussion` — verify failed needs fix | The lifecycle-owned verify gate is red before review can proceed, but automation cannot safely create or continue the current `verify_fix` lane. | Inspect the failing verify evidence, repair the branch or environment, then re-advance. | Keep verify failures on a dedicated remediation lane instead of treating them as review blockers. |
+| `needs_discussion` — verify fix failed | One completed same-epoch `verify_fix` already ran, and the current verify gate is still red for that same implementation head / verify identity. | Inspect the failing verify evidence and the completed `verify_fix`, then take over manually. | Better targeted remediation quality and better verify diagnostics. |
+| `needs_discussion` — verify unavailable | The lifecycle-owned verify gate could not be run safely for the current implementation head, or remained unavailable after one same-epoch `verify_fix`. | Fix the environment or configuration problem, then re-advance. | More reliable verify setup and environment diagnostics. |
 | `max_cycles_reached` — review churn | Review→improve cycles within the current durable-progress epoch hit the bound (`max_review_cycles`) and no stale-review refresh path is available. Historical churn from older reviewed heads does not count once fresh durable progress has produced a new epoch. | Take over: review and fix inline, or redirect the work. | Better improve quality; raise/redesign the bound. |
 | `needs_discussion` — blocker adjudication needed | A disputed non-verify CODE blocker reached independent adjudication, but the adjudicator returned `NEEDS_HUMAN`, failed, or produced an unsafe/unparseable result. | Review the blocker, the dispute evidence, and the adjudication output; then fix, override, or restate the blocker explicitly. | Reliable adjudication worker plus durable blocker-resolution state. |
 | `needs_discussion` — duplicate blocker | The same primary blocker repeats across cycles (default bound) with no progress. | Resolve the underlying issue the agent keeps missing. | Detect and break the repeat earlier. |
-| `needs_discussion` — no-op improves | Improve completed without changing code, repeatedly (`max_noop_improve_cycles`). A verify-origin review does not park when lifecycle first classifies the blocker set as verify-only and runner-owned verify evidence shows the review FAILED and the no-op improve later PASSED at the same branch head, including ordinary verify failures as well as timeouts, and including after a review-preserved rebase that refreshes that evidence onto the rewritten head. Disputed non-verify CODE blockers instead route to adjudication first; remaining no-op cases still park. | Decide whether the feedback is actionable; fix or drop. | Detect un-actionable feedback up front. |
+| `needs_discussion` — no-op improves | Improve completed without changing code, repeatedly (`max_noop_improve_cycles`). Disputed non-verify CODE blockers route to adjudication first; remaining no-op cases still park. Legacy compatibility handling for verify-only blocked reviews does not make repeated no-op improves a normal merge path. | Decide whether the feedback is actionable; fix or drop. | Detect un-actionable feedback up front. |
 | `needs_discussion` — unknown verdict | The review verdict could not be classified. | Re-review or correct the output. | More reliable verdict extraction. |
 | `HumanParked` — recovery exhausted | Automatic resume/retry hit its limit or the recovery situation is ambiguous. | Diagnose the failure; resume, redirect, or drop. | Better failure classification & recovery. |
 

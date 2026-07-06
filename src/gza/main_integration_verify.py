@@ -1121,7 +1121,11 @@ def run_main_integration_verify(
             output=result.output,
         )
     tree_fingerprint = _verify_tree_fingerprint(result.output) or _compute_tree_fingerprint(git)
-    capture_metadata: dict[str, str] = {"reason": reason}
+    capture_metadata: dict[str, Any] = {
+        "reason": reason,
+        "timeout_seconds": gate.verify_timeout_seconds,
+        "timeout_grace_seconds": gate.verify_timeout_grace_seconds,
+    }
     if gate_enabled and result.status == "passed" and tree_fingerprint is None:
         result = _coerce_result_to_freshness_unavailable(result)
         capture_metadata["freshness_proof"] = "unavailable"

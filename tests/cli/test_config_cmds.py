@@ -180,6 +180,7 @@ class TestValidateCommand:
         config_path.write_text(
             "project_name: test\n"
             "verify_command: ./bin/tests\n"
+            "unit_verify_command: ./bin/tests --unit\n"
             "inner_verify_command: ./bin/tests --quick\n"
             "task_types:\n"
             "  implement:\n"
@@ -919,6 +920,7 @@ class TestLocalConfigOverrides:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test\n"
             "verify_command: ./bin/tests\n"
+            "unit_verify_command: ./bin/tests --unit\n"
             "inner_verify_command: ./bin/tests --quick\n"
             "code_task_diff_timeout_medium_threshold: 500\n"
             "code_task_diff_timeout_large_threshold: 1500\n"
@@ -930,6 +932,7 @@ class TestLocalConfigOverrides:
         payload = json.loads(result.stdout)
         effective = payload["effective"]
         assert effective["verify_command"] == "./bin/tests"
+        assert effective["unit_verify_command"] == "./bin/tests --unit"
         assert effective["inner_verify_command"] == "./bin/tests --quick"
         assert effective["code_task_diff_timeout_medium_threshold"] == 500
         assert effective["code_task_diff_timeout_large_threshold"] == 1500
@@ -1470,13 +1473,14 @@ class TestLocalConfigOverrides:
             Config.load(tmp_path)
 
     def test_user_config_allows_verify_profiles(self, tmp_path: Path):
-        """User config may provide shared verify_command and inner_verify_command defaults."""
+        """User config may provide shared verify_command, unit_verify_command, and inner_verify_command defaults."""
         from gza.config import Config
 
         home_dir = Path(os.environ["HOME"])
         write_user_config(
             home_dir,
             "verify_command: ./bin/tests\n"
+            "unit_verify_command: ./bin/tests --unit\n"
             "inner_verify_command: ./bin/tests --quick\n",
         )
         (tmp_path / "gza.yaml").write_text("project_name: test\n")
@@ -1484,6 +1488,7 @@ class TestLocalConfigOverrides:
         config = Config.load(tmp_path)
 
         assert config.verify_command == "./bin/tests"
+        assert config.unit_verify_command == "./bin/tests --unit"
         assert config.inner_verify_command == "./bin/tests --quick"
 
     def test_validate_fails_for_invalid_user_config(self, tmp_path: Path):

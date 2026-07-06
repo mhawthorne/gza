@@ -23,19 +23,11 @@ from gza.db import (
     task_id_numeric_key,
     task_owns_merge_status,
 )
-from gza.flaky_investigations import (
-    FlakyInvestigationEvidence,
-    derive_flaky_targeted_command,
-    normalize_flaky_investigation_dedup_key,
-)
+from gza.flaky_investigations import FlakyInvestigationEvidence
 from gza.git import ResolvedMergeSourceRef
 from gza.lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from gza.lineage import resolve_impl_task, walk_ancestors, walk_based_on_descendants
 from gza.merge_state import resolve_task_merge_state_for_target
-from gza.off_topic_verify import (
-    classify_failure_diff_scope,
-    parse_review_verify_failure_set,
-)
 from gza.operator_state import terminal_no_work_lifecycle_detail
 from gza.plan_review_materialization import (
     build_plan_review_slice_task_specs,
@@ -56,7 +48,10 @@ from gza.query import (
     resolve_lineage_root,
     resolve_same_branch_lineage_root,
 )
-from gza.rebase_diff import parse_rebase_diff_provenance
+from gza.rebase_diff import (
+    parse_rebase_diff_provenance,
+    resolution_delta_provenance_is_complete,
+)
 from gza.recovery_engine import (
     FailedRecoveryDecision,
     classify_failure_reason,
@@ -84,7 +79,9 @@ from gza.review_tasks import (
     SPEC_COHERENCE_REVIEW_SCOPE,
     build_review_blocker_dispute_metadata,
     find_existing_review_blocker_adjudication_task,
+    find_existing_verify_fix_task,
     persist_off_topic_verify_clearance,
+    resolve_verify_fix_representative_task,
     review_blocker_dispute_matches_current,
 )
 from gza.review_verdict import (
@@ -99,6 +96,7 @@ from gza.review_verdict import (
     is_verify_timeout_only_review,
     summarize_review_blockers,
 )
+from gza.review_verify_state import VerifyGateDecision, resolve_verify_gate_decision
 from gza.runner import (
     CROSS_PROJECT_TAG,
     PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
@@ -109,7 +107,6 @@ from gza.runner import (
     _find_out_of_scope_paths,
     _make_review_verify_result,
     _project_boundary,
-    _review_is_verify_only_blocked_at_head,
     _task_has_current_passing_review_verify_evidence,
     _task_is_cross_project,
 )
@@ -124,6 +121,10 @@ PARK_REASON_IMPROVE_NO_OP = "improve-no-op"
 PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE = "verify-noop-improve-branch-tip-unavailable"
 PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE = "verify-noop-improve-diff-probe-unavailable"
 PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES = "verify-blocked-no-code-issues"
+PARK_REASON_VERIFY_FAILED_NEEDS_FIX = "verify-failed-needs-fix"
+PARK_REASON_VERIFY_FIX_FAILED = "verify-fix-failed"
+PARK_REASON_VERIFY_UNAVAILABLE = "verify-unavailable"
+PARK_REASON_VERIFY_UNAVAILABLE_AFTER_FIX = "verify-unavailable-after-fix"
 PARK_REASON_REVIEW_BLOCKER_ADJUDICATION_NEEDED = "review-blocker-adjudication-needed"
 PARK_REASON_DUPLICATE_BLOCKER_NO_PROGRESS = "duplicate-blocker-no-progress"
 PARK_REASON_REVIEW_MAX_CYCLES_REACHED = "review-max-cycles-reached"
@@ -160,6 +161,10 @@ WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS = frozenset(
         "review-needs-manual-creation",
         "review-verdict-needs-manual-attention",
         "stale-review-needs-manual-refresh",
+        PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
+        PARK_REASON_VERIFY_FIX_FAILED,
+        PARK_REASON_VERIFY_UNAVAILABLE,
+        PARK_REASON_VERIFY_UNAVAILABLE_AFTER_FIX,
         PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES,
         PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE,
         PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE,
@@ -208,6 +213,8 @@ WORKER_CONSUMING_ACTIONS = frozenset(
         "run_review",
         "create_review_adjudication",
         "run_review_adjudication",
+        "create_verify_fix",
+        "run_verify_fix",
         "improve",
         "run_improve",
         "resume",
@@ -392,6 +399,7 @@ class AdvanceContext:
     current_review_head_sha: str | None = None
     current_review_head_probe_warning: str | None = None
     latest_reviewed_head_sha: str | None = None
+    verify_gate_decision: VerifyGateDecision | None = None
 
     reviews: list[DbTask] | None = None
     review_root_task: DbTask | None = None
@@ -939,17 +947,12 @@ def _latest_completed_code_changing_improve(improve_tasks: list[DbTask]) -> DbTa
 
 
 def _latest_review_is_verify_blocked_only(ctx: AdvanceContext) -> bool:
-    latest_review_blocker_summary = getattr(ctx, "latest_review_blocker_summary", None)
-    return (
-        ctx.review_verdict == "CHANGES_REQUESTED"
-        and latest_review_blocker_summary is not None
-        and latest_review_blocker_summary.is_verify_blocked_only
-    )
+    del ctx
+    return False
 
 
 def _noop_improve_kind(ctx: AdvanceContext) -> str:
-    if _latest_review_is_verify_blocked_only(ctx):
-        return NOOP_IMPROVE_KIND_VERIFY_ONLY
+    del ctx
     return NOOP_IMPROVE_KIND_REAL_BLOCKER
 
 
@@ -1380,79 +1383,18 @@ def _resolve_noop_improve_verify_clearance(
     improve_tasks: list[DbTask],
     persist: bool,
 ) -> tuple[bool, datetime | None, str | None, tuple[str, ...], tuple[str, ...]]:
-    """Return verify-only review clearance and optionally persist it."""
-    if latest_completed_review is None or task.branch is None or task.id is None:
-        return False, None, None, (), ()
-
-    branch_head = _resolve_branch_head_sha(git, task.branch)
-    if branch_head.warning is not None:
-        return False, None, branch_head.warning, (), ()
-
-    current_head_sha = branch_head.head_sha
-    if current_head_sha is None:
-        return False, None, None, (), ()
-    if not _review_is_verify_only_blocked_at_head(
-        project_dir=project_dir,
-        review_task=latest_completed_review,
-        current_branch=task.branch,
-        current_head_sha=current_head_sha,
-    ):
-        return False, None, None, (), ()
-
-    latest_completed_noop_improve = _latest_completed_noop_improve(improve_tasks)
-    if latest_completed_noop_improve is None:
-        return False, None, None, (), ()
-
-    if _task_has_current_passing_review_verify_evidence(
-        task=latest_completed_noop_improve,
-        review_task=latest_completed_review,
-        current_branch=task.branch,
-        current_head_sha=current_head_sha,
-    ):
-        matching_clearance = _latest_matching_verify_only_noop_review_clearance(
-            store=store,
-            task=task,
-            latest_completed_review=latest_completed_review,
-            current_head_sha=current_head_sha,
-        )
-        if matching_clearance is not None:
-            return True, matching_clearance.created_at, None, (), ()
-        if _latest_matching_verify_only_noop_recovery_attention(
-            store=store,
-            noop_improve_task=latest_completed_noop_improve,
-            latest_completed_review=latest_completed_review,
-            current_head_sha=current_head_sha,
-        ) is not None:
-            return False, None, None, (), ()
-        return False, None, None, (), ()
-
-    (
-        cleared_off_topic,
-        clearance_time,
-        clearance_warning,
-        created_investigation_task_ids,
-        reused_investigation_task_ids,
-    ) = _classify_off_topic_noop_improve_verify_clearance(
-        config=config,
-        store=store,
-        git=git,
-        target_branch=target_branch,
-        task=task,
-        latest_completed_review=latest_completed_review,
-        improve_tasks=improve_tasks,
-        current_head_sha=current_head_sha,
-        latest_completed_noop_improve=latest_completed_noop_improve,
-        persist=persist,
+    del (
+        config,
+        store,
+        git,
+        project_dir,
+        target_branch,
+        task,
+        latest_completed_review,
+        improve_tasks,
+        persist,
     )
-    if cleared_off_topic:
-        return (
-            True,
-            clearance_time,
-            None,
-            created_investigation_task_ids,
-            reused_investigation_task_ids,
-        )
-    return False, None, clearance_warning, (), ()
+    return False, None, None, (), ()
 
 
 def _latest_matching_verify_only_noop_review_clearance(
@@ -1545,61 +1487,7 @@ def _resolve_noop_improve_verify_recovery_attention_message(
     latest_completed_noop_improve: DbTask | None,
     current_head_sha: str | None,
 ) -> str | None:
-    """Return durable parked messaging for failed verify-only no-op recovery attempts."""
-    if (
-        latest_completed_review is None
-        or latest_completed_noop_improve is None
-        or task.branch is None
-        or not current_head_sha
-        or not _review_is_verify_only_blocked_at_head(
-            project_dir=project_dir,
-            review_task=latest_completed_review,
-            current_branch=task.branch,
-            current_head_sha=current_head_sha,
-        )
-    ):
-        return None
-    persisted_attention = _latest_matching_verify_only_noop_recovery_attention(
-        store=store,
-        noop_improve_task=latest_completed_noop_improve,
-        latest_completed_review=latest_completed_review,
-        current_head_sha=current_head_sha,
-    )
-    if persisted_attention is not None:
-        metadata = persisted_attention.metadata if isinstance(persisted_attention.metadata, dict) else None
-        message = metadata.get("message") if metadata is not None else None
-        if isinstance(message, str) and message.strip():
-            return message
-        return (
-            "SKIP: fresh verify did not clear the verify-only no-op review blocker; "
-            "manual attention is required."
-        )
-    if _task_has_current_failed_review_verify_evidence(
-        task=latest_completed_noop_improve,
-        review_task=latest_completed_review,
-        current_branch=task.branch,
-        current_head_sha=current_head_sha,
-    ):
-        return (
-            "SKIP: fresh verify did not clear the verify-only no-op review blocker; "
-            "manual attention is required."
-        )
-    if _task_has_current_passing_review_verify_evidence(
-        task=latest_completed_noop_improve,
-        review_task=latest_completed_review,
-        current_branch=task.branch,
-        current_head_sha=current_head_sha,
-    ) and _latest_matching_verify_only_noop_review_clearance(
-        store=store,
-        task=task,
-        latest_completed_review=latest_completed_review,
-        current_head_sha=current_head_sha,
-    ) is None:
-        return (
-            "SKIP: verify-only no-op recovery has current passing verify evidence for this tip, "
-            "but the required structured review_clearance is missing. "
-            "Manual attention is required before merge."
-        )
+    del store, project_dir, task, latest_completed_review, latest_completed_noop_improve, current_head_sha
     return None
 
 
@@ -1659,114 +1547,8 @@ def _resolve_off_topic_verify_clearance_candidate(
     latest_completed_review: DbTask | None,
     improve_tasks: list[DbTask],
 ) -> OffTopicVerifyClearanceCandidate | None:
-    if not getattr(config, "advance_off_topic_verify_unblock", False):
-        return None
-    if latest_completed_review is None or task.id is None or task.branch is None:
-        return None
-    if latest_completed_review.review_verify_status != "failed":
-        return None
-    if not _review_is_verify_only_blocked_at_head(
-        project_dir=project_dir,
-        review_task=latest_completed_review,
-        current_branch=task.branch,
-        current_head_sha=latest_completed_review.review_verify_head_sha,
-    ):
-        return None
-
-    latest_completed_noop_improve = _latest_completed_noop_improve(improve_tasks)
-    if latest_completed_noop_improve is None:
-        return None
-    if not _task_has_current_passing_review_verify_evidence(
-        task=latest_completed_noop_improve,
-        review_task=latest_completed_review,
-        current_branch=task.branch,
-        current_head_sha=latest_completed_review.review_verify_head_sha,
-    ):
-        return None
-
-    review_result = _load_persisted_review_verify_result(
-        project_dir=project_dir,
-        task=latest_completed_review,
-    )
-    improve_result = _load_persisted_review_verify_result(
-        project_dir=project_dir,
-        task=latest_completed_noop_improve,
-    )
-    if review_result is None or improve_result is None:
-        return None
-    review_tree_fingerprint = _review_verify_tree_fingerprint(review_result)
-    improve_tree_fingerprint = _review_verify_tree_fingerprint(improve_result)
-    if (
-        not review_tree_fingerprint
-        or not improve_tree_fingerprint
-        or review_tree_fingerprint != improve_tree_fingerprint
-    ):
-        return None
-    if review_result.reviewed_head_sha != improve_result.reviewed_head_sha:
-        return None
-
-    try:
-        name_status_output = git.get_diff_name_status(f"{target_branch}...{task.branch}", check=True)
-    except Exception:
-        return None
-    parsed_name_status = parse_name_status_project_paths(name_status_output or "")
-    if not parsed_name_status.changed_paths:
-        return None
-
-    failure_set = parse_review_verify_failure_set(review_result)
-    diff_scope = classify_failure_diff_scope(
-        failure_set,
-        changed_paths=parsed_name_status.changed_paths,
-        repo_root=project_dir,
-    )
-    if diff_scope.outcome != "off_topic" or diff_scope.shared_global_paths:
-        return None
-
-    if latest_completed_review.id is None:
-        return None
-    if review_result.reviewed_head_sha is None:
-        return None
-
-    merge_unit = store.resolve_merge_unit_for_task(task.id)
-    evidences: list[FlakyInvestigationEvidence] = []
-    for node in failure_set.failing_nodes:
-        targeted_command = derive_flaky_targeted_command(
-            verify_command=review_result.command,
-            nodeids=(node.nodeid,),
-        )
-        if not targeted_command:
-            return None
-        evidences.append(
-            FlakyInvestigationEvidence(
-                node=node,
-                dedup_key=normalize_flaky_investigation_dedup_key(
-                    node.nodeid,
-                    node.assertion_signature,
-                ),
-                review_task_id=latest_completed_review.id,
-                impl_task_id=task.id,
-                merge_unit_id=merge_unit.id if merge_unit is not None else None,
-                reviewed_head_sha=review_result.reviewed_head_sha,
-                tree_fingerprint=review_tree_fingerprint,
-                observed_branch=task.branch,
-                target_branch=target_branch,
-                verify_command=review_result.command,
-                targeted_command=targeted_command,
-                working_directory=review_result.working_directory,
-                branch_pass_fail_counts=failure_set.pass_fail_counts,
-                xdist=failure_set.xdist,
-                branch_verify_status=review_result.status,
-                branch_verify_exit_status=review_result.exit_status,
-            )
-        )
-    if not evidences:
-        return None
-    return OffTopicVerifyClearanceCandidate(
-        review_task=latest_completed_review,
-        reviewed_head_sha=review_result.reviewed_head_sha,
-        tree_fingerprint=review_tree_fingerprint,
-        evidences=tuple(evidences),
-    )
+    del config, store, git, project_dir, task, target_branch, latest_completed_review, improve_tasks
+    return None
 
 
 def _review_has_current_verify_blocker_clearance(
@@ -1778,25 +1560,8 @@ def _review_has_current_verify_blocker_clearance(
     current_branch: str | None,
     current_head_sha: str | None,
 ) -> bool:
-    """Return whether structured same-head clearance clears current verify blockers."""
-    if review_task.review_verify_status != "failed":
-        return False
-    if not current_branch or review_task.review_verify_branch != current_branch:
-        return False
-    if not current_head_sha or review_task.review_verify_head_sha != current_head_sha:
-        return False
-    blocker_summary = summarize_review_blockers(get_review_content(project_dir, review_task))
-    if blocker_summary.verify_failure_count + blocker_summary.verify_timeout_count == 0:
-        return False
-    return (
-        _latest_matching_verify_only_noop_review_clearance(
-            store=store,
-            task=impl_task,
-            latest_completed_review=review_task,
-            current_head_sha=current_head_sha,
-        )
-        is not None
-    )
+    del store, impl_task, project_dir, review_task, current_branch, current_head_sha
+    return False
 
 
 def _primary_blocker_fingerprint(
@@ -2270,7 +2035,7 @@ def _resolve_review_blocker_adjudication_state(
 
 
 def _review_blocker_status_clears_current_blocker(status: ReviewBlockerResolutionStatus) -> bool:
-    return status.state in {"invalid", "verify_cleared"}
+    return status.state == "invalid"
 
 
 def _task_id(task: DbTask | None) -> str:
@@ -2377,6 +2142,13 @@ def _resolve_resolution_review_metadata_shas(
     return rebase_task.id, resolved_head_sha, resolved_target_sha
 
 
+def _resolution_review_provenance_is_complete(rebase_task: DbTask | None) -> bool:
+    if rebase_task is None:
+        return False
+    provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
+    return provenance is not None and resolution_delta_provenance_is_complete(provenance)
+
+
 def _resolve_planned_resolution_review_metadata(ctx: AdvanceContext) -> tuple[str | None, str | None, str | None]:
     """Resolve the metadata required to create a new resolution review."""
     return _resolve_resolution_review_metadata_shas(ctx, rebase_task=ctx.review_invalidated_by_rebase)
@@ -2384,7 +2156,12 @@ def _resolve_planned_resolution_review_metadata(ctx: AdvanceContext) -> tuple[st
 
 def _planned_resolution_review_metadata_is_valid(ctx: AdvanceContext) -> bool:
     rebase_task_id, resolved_head_sha, resolved_target_sha = _resolve_planned_resolution_review_metadata(ctx)
-    return bool(rebase_task_id and resolved_head_sha and resolved_target_sha)
+    return bool(
+        rebase_task_id
+        and resolved_head_sha
+        and resolved_target_sha
+        and _resolution_review_provenance_is_complete(ctx.review_invalidated_by_rebase)
+    )
 
 
 def _stale_review_create_review_action(ctx: AdvanceContext) -> dict[str, Any]:
@@ -2419,6 +2196,9 @@ def _resolution_review_metadata_matches_context(
 ) -> bool:
     if metadata is None or impl_task.id is None or rebase_task is None or rebase_task.id is None:
         return False
+    provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
+    if provenance is None or not resolution_delta_provenance_is_complete(provenance):
+        return False
     _, resolved_head_sha, resolved_target_sha = _resolve_resolution_review_metadata_shas(
         ctx,
         rebase_task=rebase_task,
@@ -2430,6 +2210,9 @@ def _resolution_review_metadata_matches_context(
         and metadata.rebase_task_id == rebase_task.id
         and metadata.resolved_head_sha == resolved_head_sha
         and metadata.resolved_target_sha == resolved_target_sha
+        and metadata.pre_rebase_head_sha == provenance.old_tip
+        and metadata.pre_rebase_target_sha == provenance.target_at_start
+        and metadata.pre_rebase_merge_base_sha == provenance.merge_base_at_start
     )
 
 
@@ -2453,21 +2236,23 @@ def _repair_resolution_review_scope_from_context(
 ) -> ResolutionReviewScope | None:
     if impl_task.id is None or rebase_task is None or rebase_task.id is None:
         return None
+    provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
+    if provenance is None or not resolution_delta_provenance_is_complete(provenance):
+        return None
     _, resolved_head_sha, resolved_target_sha = _resolve_resolution_review_metadata_shas(
         ctx,
         rebase_task=rebase_task,
     )
     if not resolved_head_sha or not resolved_target_sha:
         return None
-    provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
     rebuilt_scope = build_resolution_review_scope(
         implementation_task_id=impl_task.id,
         rebase_task_id=rebase_task.id,
         resolved_head_sha=resolved_head_sha,
         resolved_target_sha=resolved_target_sha,
-        pre_rebase_head_sha=provenance.old_tip if provenance is not None else None,
-        pre_rebase_target_sha=provenance.target_at_start if provenance is not None else None,
-        pre_rebase_merge_base_sha=provenance.merge_base_at_start if provenance is not None else None,
+        pre_rebase_head_sha=provenance.old_tip,
+        pre_rebase_target_sha=provenance.target_at_start,
+        pre_rebase_merge_base_sha=provenance.merge_base_at_start,
     )
     if review_task.review_scope != rebuilt_scope:
         review_task.review_scope = rebuilt_scope
@@ -3483,6 +3268,7 @@ def classify_advance_action(action: Mapping[str, Any]) -> str:
         "skip",
         "wait_review",
         "wait_improve",
+        "wait_verify_fix",
         "wait_plan_review",
         "wait_plan_improve",
         "wait_review_adjudication",
@@ -4461,25 +4247,16 @@ def _resolve_review_state(
         active_improve_running = next((t for t in improve_tasks if t.status == "in_progress"), None)
         active_improve_pending = next((t for t in improve_tasks if t.status == "pending"), None)
         latest_noop_improve, consecutive_noop_improves = _count_consecutive_noop_improves(improve_tasks)
-        allow_off_topic_lane = bool(
-            getattr(config, "advance_off_topic_verify_unblock", False)
-            and latest_completed_review.review_verify_status == "failed"
-        )
         if review_cleared and review_verdict == "CHANGES_REQUESTED" and latest_review_blocker_summary is not None:
             current_head_sha: str | None = None
             if task.branch is not None:
                 current_head_sha = _resolve_branch_head_sha(git, task.branch).head_sha
-            has_matching_verify_clearance = (
-                latest_review_blocker_summary.is_verify_blocked_only
-                and _latest_matching_verify_only_noop_review_clearance(
-                    store=store,
-                    task=task,
-                    latest_completed_review=latest_completed_review,
-                    current_head_sha=current_head_sha,
-                )
-                is not None
-            )
-            if latest_review_blocker_summary.is_verify_blocked_only and not has_matching_verify_clearance:
+            if _latest_matching_verify_only_noop_review_clearance(
+                store=store,
+                task=task,
+                latest_completed_review=latest_completed_review,
+                current_head_sha=current_head_sha,
+            ) is not None:
                 review_cleared = False
                 effective_review_cleared_at = None
         if not review_cleared:
@@ -4513,18 +4290,6 @@ def _resolve_review_state(
                 if branch_head.warning is None
                 else None
             )
-        if not review_cleared and allow_off_topic_lane:
-            off_topic_verify_clearance_candidate = _resolve_off_topic_verify_clearance_candidate(
-                config=config,
-                store=store,
-                git=git,
-                project_dir=Path(config.project_dir),
-                task=task,
-                target_branch=target_branch,
-                latest_completed_review=latest_completed_review,
-                improve_tasks=improve_tasks,
-            )
-
         if latest_completed_review.completed_at is not None and latest_completed_code_change is not None:
             has_improve_after_review = (
                 _task_event_time(latest_completed_code_change)
@@ -4725,7 +4490,7 @@ def _spec_coherence_review_is_current(
 
 def _is_implementation_owned_lineage(ctx: AdvanceContext) -> bool:
     """Whether this lineage inherits merge review gating from an implementation root."""
-    return (ctx.review_root_task or ctx.task).task_type == "implement"
+    return (getattr(ctx, "review_root_task", None) or ctx.task).task_type == "implement"
 
 
 def execution_status_allows_merge(ctx: AdvanceContext) -> bool:
@@ -4738,16 +4503,6 @@ def _review_cleared_is_merge_ready(ctx: AdvanceContext) -> bool:
         return False
     if getattr(ctx, "review_blockers_invalidated", False):
         return True
-    if _latest_review_is_verify_blocked_only(ctx):
-        current_head_sha = ctx.current_review_head_sha or ctx.latest_reviewed_head_sha
-        if _latest_matching_verify_only_noop_review_clearance(
-            store=ctx.store,
-            task=ctx.task,
-            latest_completed_review=ctx.latest_completed_review,
-            current_head_sha=current_head_sha,
-        ) is not None:
-            return True
-        return False
     if ctx.effective_review_cleared_at is not None:
         return True
     return False
@@ -4770,6 +4525,199 @@ def has_valid_review_for_merge(ctx: AdvanceContext) -> bool:
     if ctx.review_cleared:
         return _review_cleared_is_merge_ready(ctx)
     return ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
+
+
+def has_current_passing_verify_for_merge(ctx: AdvanceContext) -> bool:
+    """Return whether canonical verify evidence currently permits merge."""
+    if not _is_implementation_owned_lineage(ctx):
+        return True
+    decision = ctx.verify_gate_decision
+    return decision is not None and decision.state == "passed"
+
+
+def _verify_gate_owner_task(ctx: AdvanceContext) -> DbTask | None:
+    if not _is_implementation_owned_lineage(ctx):
+        return None
+    return getattr(ctx, "review_root_task", None) or ctx.task
+
+
+def _verify_gate_blocks_closing_review(ctx: AdvanceContext) -> bool:
+    if not _is_implementation_owned_lineage(ctx):
+        return False
+    if not ctx.requires_review:
+        return False
+    if ctx.selected_for_merge and not ctx.can_merge:
+        return False
+    action = ctx.closing_review_action
+    if action is None:
+        return False
+    if action.get("type") not in {"create_review", "run_review"}:
+        return False
+    if action.get("type") == "create_review" and not ctx.create_reviews:
+        return False
+    decision = getattr(ctx, "verify_gate_decision", None)
+    return decision is not None and decision.state != "passed"
+
+
+def _pre_review_verify_fix_required(ctx: AdvanceContext) -> bool:
+    if not _verify_gate_blocks_closing_review(ctx):
+        return False
+    decision = getattr(ctx, "verify_gate_decision", None)
+    return decision is not None and decision.state in {"failed", "unavailable"}
+
+
+def _pre_review_verify_fix_action(ctx: AdvanceContext) -> dict[str, Any]:
+    decision = getattr(ctx, "verify_gate_decision", None)
+    owner_task = _verify_gate_owner_task(ctx)
+    if decision is None or owner_task is None or owner_task.id is None:
+        return with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": "SKIP: verify_fix routing is unavailable before review",
+            },
+            reason=PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
+            subject_task_id=ctx.task.id,
+        )
+
+    current_epoch = decision.current_epoch
+    if current_epoch is None:
+        return with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": "SKIP: current verify epoch is unavailable before review",
+            },
+            reason=(
+                PARK_REASON_VERIFY_FAILED_NEEDS_FIX
+                if decision.state == "failed"
+                else PARK_REASON_VERIFY_UNAVAILABLE
+            ),
+            subject_task_id=owner_task.id,
+        )
+
+    existing = find_existing_verify_fix_task(
+        ctx.store,
+        impl_task_id=owner_task.id,
+        verify_epoch=current_epoch,
+    )
+    if existing is not None:
+        if existing.status == "in_progress":
+            return {
+                "type": "wait_verify_fix",
+                "description": f"SKIP: verify_fix task {_task_id(existing)} is in_progress",
+                "verify_fix_task": existing,
+                "verify_epoch": current_epoch,
+            }
+        if existing.status == "pending":
+            return {
+                "type": "run_verify_fix",
+                "description": f"Spawn worker for pending verify_fix {_task_id(existing)}",
+                "verify_fix_task": existing,
+                "verify_epoch": current_epoch,
+            }
+        if existing.status == "completed":
+            reason = (
+                PARK_REASON_VERIFY_FIX_FAILED
+                if decision.state == "failed"
+                else PARK_REASON_VERIFY_UNAVAILABLE_AFTER_FIX
+            )
+            detail = "red" if decision.state == "failed" else "unavailable"
+            return with_needs_attention(
+                {
+                    "type": "needs_discussion",
+                    "description": (
+                        f"SKIP: verify gate is still {detail} after completed verify_fix "
+                        f"{_task_id(existing)} for the current epoch"
+                    ),
+                    "verify_fix_task": existing,
+                    "verify_epoch": current_epoch,
+                },
+                reason=reason,
+                subject_task_id=owner_task.id,
+            )
+        return with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": (
+                    f"SKIP: verify_fix task {_task_id(existing)} is {existing.status}; "
+                    "recover that task before review can continue"
+                ),
+                "verify_fix_task": existing,
+                "verify_epoch": current_epoch,
+            },
+            reason=PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
+            subject_task_id=existing.id or owner_task.id,
+        )
+
+    if decision.state != "failed":
+        return with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": "SKIP: current verify gate is unavailable before review",
+                "verify_epoch": current_epoch,
+            },
+            reason=PARK_REASON_VERIFY_UNAVAILABLE,
+            subject_task_id=owner_task.id,
+        )
+
+    try:
+        based_on_task = resolve_verify_fix_representative_task(
+            ctx.store,
+            impl_task=owner_task,
+            verify_epoch=current_epoch,
+        )
+    except ValueError as exc:
+        return with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": f"SKIP: could not resolve verify_fix representative task: {exc}",
+                "verify_epoch": current_epoch,
+            },
+            reason=PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
+            subject_task_id=owner_task.id,
+        )
+
+    return {
+        "type": "create_verify_fix",
+        "description": f"Create verify_fix task for verify epoch at head {current_epoch.reviewed_head_sha}",
+        "impl_task": owner_task,
+        "based_on_task": based_on_task,
+        "verify_epoch": current_epoch,
+    }
+
+
+def _verify_gate_blocks_merge(ctx: AdvanceContext) -> bool:
+    if not _is_implementation_owned_lineage(ctx):
+        return False
+    if not execution_status_allows_merge(ctx):
+        return False
+    if not has_valid_review_for_merge(ctx):
+        return False
+    decision = getattr(ctx, "verify_gate_decision", None)
+    return decision is not None and decision.state != "passed"
+
+
+def _verify_gate_action(ctx: AdvanceContext, *, phase: str) -> dict[str, Any]:
+    decision = getattr(ctx, "verify_gate_decision", None)
+    if decision is None:
+        return {
+            "type": "skip",
+            "description": "SKIP: verify gate context unavailable",
+        }
+    owner_task = _verify_gate_owner_task(ctx)
+    description_suffix = "review" if phase == "pre_review" else "merge"
+    if decision.state in {"missing", "stale"}:
+        description = f"Run verify gate before {description_suffix}"
+    elif decision.state == "failed":
+        description = f"SKIP: current verify gate is red; {description_suffix} is blocked"
+    else:
+        description = f"SKIP: current verify gate is unavailable; {description_suffix} is blocked"
+    return {
+        "type": "verify_gate",
+        "description": description,
+        "verify_gate_phase": phase,
+        "verify_gate_state": decision.state,
+        "verify_owner_task": owner_task,
+    }
 
 
 def _closing_review_requires_automation(ctx: AdvanceContext) -> bool:
@@ -5781,6 +5729,17 @@ def resolve_advance_context(
         target_branch,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
     )
+    verify_owner_task = _verify_gate_owner_task(ctx)
+    if verify_owner_task is not None:
+        ctx = replace(
+            ctx,
+            verify_gate_decision=resolve_verify_gate_decision(
+                store,
+                verify_owner_task,
+                config=config,
+                git=git,
+            ),
+        )
     if _resolve_db_known_wait_action(ctx) is not None or _matches_rule_before_closing_review_invariant(ctx):
         return ctx
     return _resolve_post_closing_review_git_context(
@@ -6559,6 +6518,16 @@ ADVANCE_RULES: list[AdvanceRule] = [
         ),
     ),
     AdvanceRule(
+        name="pre_review_verify_fix",
+        matches=_pre_review_verify_fix_required,
+        action=_pre_review_verify_fix_action,
+    ),
+    AdvanceRule(
+        name="pre_review_verify_gate",
+        matches=_verify_gate_blocks_closing_review,
+        action=lambda ctx: _verify_gate_action(ctx, phase="pre_review"),
+    ),
+    AdvanceRule(
         name="stale_review_wait_review",
         matches=lambda ctx: (
             _stale_review_refresh_required(ctx)
@@ -6697,6 +6666,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
             ),
             "review_task": ctx.latest_completed_review,
         },
+    ),
+    AdvanceRule(
+        name="pre_merge_verify_gate",
+        matches=_verify_gate_blocks_merge,
+        action=lambda ctx: _verify_gate_action(ctx, phase="pre_merge"),
     ),
     AdvanceRule(
         name="review_approved_with_followups",

@@ -65,6 +65,7 @@ _SECTIONS: tuple[_Section, ...] = (
             "max_turns",
             "work_count",
             "verify_command",
+            "unit_verify_command",
             "inner_verify_command",
             "code_task_diff_timeout_medium_threshold",
             "code_task_diff_timeout_large_threshold",

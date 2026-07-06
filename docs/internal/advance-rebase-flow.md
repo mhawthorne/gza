@@ -124,7 +124,7 @@ If the latest completed rebase after the latest review has `changed_diff = 0`, t
 
 That refresh review is resolution-scoped, not a whole-task refresh. The completed rebase now persists pre/post rebase provenance, and runner review prompts reconstruct a focused `git range-diff` between the pre-rebase series and the rebased series when possible. If that focused delta cannot be reconstructed from the persisted refs, the prompt fails closed with explicit `resolution delta unavailable` guidance and still suppresses the ordinary whole-implementation diff so reviewers do not accidentally grade the wrong surface.
 
-For verify-only `CHANGES_REQUESTED` reviews, that same preserved-rebase path also refreshes the persisted runner-owned review/no-op-improve verify head SHA from the pre-rebase tip to the rewritten tip. This keeps verify-blocked -> mergeable recognition keyed to the current branch head without running an extra detached verify pass.
+For legacy verify-only `CHANGES_REQUESTED` reviews, the preserved-rebase path is compatibility bookkeeping only. It does not make the rewritten head mergeable by itself, does not refresh any retired review-coupled clearance state, and does not replace the normal two-gate requirement to have current lifecycle verify evidence plus a merge-permitting current review for the rewritten head.
 
 Resumed or recovered rebase runs are intentionally fail-closed. This includes direct provider resumes and automatic failed-task recovery descendants such as retry-created rebase children. The runner records those baselines with `recovered=True`, so completion persists `changed_diff = 1` and surfaces a warning instead of claiming the diff was preserved from the original pre-rebase state.
 

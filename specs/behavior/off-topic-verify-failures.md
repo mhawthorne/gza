@@ -1,11 +1,15 @@
 # Off-topic verify failures
 
-> **Status: Draft.** This file owns the contract for the optional lifecycle path that
-> clears a verify-only review block when later red verify evidence is audited as
-> off-topic to the reviewed branch. Read [00-overview.md](00-overview.md) first for the
-> shared model, then [lifecycle-engine.md](lifecycle-engine.md) for rule ordering. This
-> file defines the classification contract only; it does not authorize runtime shortcuts
-> outside that lifecycle flow.
+> **Status: Draft.** This file owns the narrow legacy-compatibility contract for the
+> optional lifecycle path that can clear a verify-only review block when later
+> red verify evidence is audited as off-topic to the reviewed branch. In the shipped
+> two-gate model, ordinary merge eligibility is determined by a current code review gate
+> plus a current lifecycle-owned verify gate; this file exists only for the residual
+> compatibility lane around older review-coupled verify blockers. Read
+> [00-overview.md](00-overview.md) first for the shared model, then
+> [lifecycle-engine.md](lifecycle-engine.md) for rule ordering. This file defines the
+> classification contract only; it does not authorize runtime shortcuts outside that
+> lifecycle flow.
 
 ## Boundary with the lifecycle engine
 
@@ -14,8 +18,9 @@
 - This file owns what **off-topic** means, what evidence MUST exist before lifecycle may
   clear a verify-only review blocker, and what investigation record MUST be created or
   reused when it does.
-- This contract applies only to verify-only `CHANGES_REQUESTED` review blockers. Any
-  substantive review blocker remains governed by the ordinary improve/review flow.
+- This contract applies only to verify-only `CHANGES_REQUESTED` review blockers. It MUST
+  NOT be treated as the ordinary merge path for the two-gate model.
+  Any substantive review blocker remains governed by the ordinary improve/review flow.
 
 ## Policy knob
 

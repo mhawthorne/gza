@@ -255,6 +255,8 @@ def _is_shared_branch_descendant(task: Task, root_task: Task) -> bool:
         return False
     if task.task_type == "improve":
         return task.based_on is not None
+    if task.task_type == "verify_fix":
+        return task.based_on is not None or bool(task.same_branch)
     if task.task_type == "review":
         return True
     if task.task_type == "rebase":
@@ -572,6 +574,13 @@ def get_fixes_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
     return store.get_fix_tasks_by_root(root_task.id)
 
 
+def get_verify_fixes_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
+    """Get verify_fix tasks transitively based on the given root task."""
+    if root_task.id is None:
+        return []
+    return store.get_verify_fix_tasks_by_root(root_task.id)
+
+
 def get_same_branch_implement_descendants_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
     """Return same-branch implement resume/retry descendants for a root task."""
     if root_task.id is None:
@@ -585,6 +594,28 @@ def get_same_branch_implement_descendants_for_root(store: SqliteTaskStore, root_
     return descendants
 
 
+def get_same_branch_rebase_descendants_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
+    """Return same-branch rebase descendants for a root task."""
+    if root_task.id is None:
+        return []
+
+    descendants: list[Task] = []
+    for task in walk_based_on_descendants(store, root_task, task_type="rebase"):
+        if root_task.branch and task.branch and task.branch != root_task.branch:
+            continue
+        descendants.append(task)
+    return descendants
+
+
+def _is_code_changing_descendant(task: Task) -> bool:
+    """Return whether a shared-branch descendant should stale prior gate evidence."""
+    if task.task_type in {"improve", "rebase"}:
+        return task.changed_diff is not False
+    if task.task_type in {"implement", "verify_fix", "fix"}:
+        return task.has_commits is not False
+    return False
+
+
 def get_code_changing_descendants_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
     """Return same-branch code-changing descendants of a root task.
 
@@ -592,17 +623,21 @@ def get_code_changing_descendants_for_root(store: SqliteTaskStore, root_task: Ta
     review the same way an improve does, because the task ran on the impl's
     shared branch after the review was written.
     """
-    return [
+    descendants = [
         *get_same_branch_implement_descendants_for_root(store, root_task),
         *get_improves_for_root(store, root_task),
+        *get_verify_fixes_for_root(store, root_task),
         *get_fixes_for_root(store, root_task),
+        *get_same_branch_rebase_descendants_for_root(store, root_task),
     ]
+    return [task for task in descendants if _is_code_changing_descendant(task)]
 
 
 _LINEAGE_REL_LABELS: dict[str, str] = {
     "review": "review",
     "improve-from-review": "improve",
     "improve": "improve",
+    "verify_fix": "verify_fix",
     "fix-from-review": "fix",
     "fix": "fix",
     "implement-depends": "implement",
@@ -627,6 +662,8 @@ def _classify_child_relationship(parent: Task, child: Task) -> str:
     # share task_type with the parent (which would otherwise look like retry).
     if child.task_type == "rebase" and child.based_on == parent_id:
         return "rebase"
+    if child.task_type == "verify_fix" and child.based_on == parent_id:
+        return "verify_fix"
 
     # Detect resume/retry first: same task_type + based_on pointing to parent
     # indicates a re-execution of the same work, not a lifecycle transition.
@@ -1005,7 +1042,7 @@ def _resolve_branchless_rebase_owner(store: SqliteTaskStore, task: Task) -> Task
         if parent.task_type == "rebase":
             current = parent
             continue
-        if parent.task_type in {"implement", "review", "improve", "fix"}:
+        if parent.task_type in {"implement", "review", "improve", "verify_fix", "fix"}:
             impl_task, _error = resolve_impl_task(store, parent.id)
             if impl_task is None:
                 return None
@@ -1030,7 +1067,7 @@ def resolve_lineage_owner_task(store: SqliteTaskStore, task: Task) -> Task:
                 return representative
             return owner
 
-    if task.task_type in {"review", "improve", "fix"} and task.id is not None:
+    if task.task_type in {"review", "improve", "verify_fix", "fix"} and task.id is not None:
         impl_task, _error = resolve_impl_task(store, task.id)
         if impl_task is not None:
             return resolve_lineage_owner_task(store, impl_task)

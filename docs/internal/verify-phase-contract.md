@@ -1,8 +1,9 @@
 # Verify Phase Contract
 
-Autonomous review verification parses structured phase lines from verify-command
-stdout. The contract is line-oriented and append-only: wrappers may print
-additional output, but phase records must appear exactly as documented here.
+Autonomous lifecycle verification parses structured phase lines from
+verify-command stdout. The contract is line-oriented and append-only: wrappers
+may print additional output, but phase records must appear exactly as
+documented here.
 
 ## Start line
 

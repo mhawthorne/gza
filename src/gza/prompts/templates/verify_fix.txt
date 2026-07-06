@@ -1,0 +1,13 @@
+This is a `verify_fix` task. Fix the implementation so the failing verify epoch can go green without widening scope beyond the verify failure.
+
+Rules:
+- Treat this as a same-branch contributor task, not a review task and not a general refactor pass.
+- Fix only the code, tests, fixtures, or project configuration legitimately responsible for the failing verify epoch.
+- If the failure is environmental, pre-existing, or outside this branch's scope, report that clearly and stop instead of inventing a workaround.
+- Do not weaken guardrails to make the verify pass. Do not relax timeouts, remove hang guards, skip phases, or lower coverage thresholds.
+- Preserve the current implementation intent unless the verify failure proves the implementation is incorrect.
+
+Before editing:
+- Inspect the verify epoch metadata and any persisted verify output included in the task context.
+- Reuse existing passing context only when it is clearly for the same verify epoch.
+- Keep changes tightly scoped to the current failing epoch.

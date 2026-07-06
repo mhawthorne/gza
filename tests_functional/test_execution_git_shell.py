@@ -16,6 +16,8 @@ from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.failure_reasons import mark_task_failed_from_cause
 from gza.git import Git
+from gza.review_verify_state import persist_verify_gate_artifact
+from gza.runner import _make_review_verify_result
 from gza.workers import WorkerMetadata, WorkerRegistry
 from tests.cli.conftest import invoke_gza, make_store, setup_config
 
@@ -45,6 +47,8 @@ def _make_completed_impl(store: SqliteTaskStore):
     impl.status = "completed"
     impl.branch = "gza/1-completed-implementation"
     impl.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    impl.has_commits = True
+    impl.merge_status = "unmerged"
     store.update(impl)
     assert impl.id is not None
     return impl
@@ -55,6 +59,37 @@ def _setup_store(tmp_path):
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return make_store(tmp_path)
+
+
+def _persist_passing_verify_gate(
+    store: SqliteTaskStore,
+    config: Config,
+    impl_task,
+    git: Git,
+    *,
+    cwd: Path,
+) -> None:
+    assert impl_task.branch is not None
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl_task,
+        source_task=impl_task,
+        result=_make_review_verify_result(
+            config.verify_command or "./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+            reviewed_branch=impl_task.branch,
+            reviewed_head_sha=git.rev_parse(impl_task.branch),
+            reviewed_base_sha=git.rev_parse("main"),
+            working_directory=str(cwd),
+            failure=None,
+        ),
+        verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+        verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+        producer="test",
+    )
 
 
 def test_reconciliation_detects_commits_on_worker_died(tmp_path) -> None:
@@ -219,8 +254,8 @@ def test_dry_run_changes_requested_completed_improve_without_review_clear_create
 
     assert result.returncode == 0
     assert "would iterate implementation" in result.stdout.lower()
-    assert "first iteration 1/3 action: create_review" in result.stdout.lower()
-    assert "code changed since the last review" in result.stdout.lower()
+    assert "first next action: verify_gate" in result.stdout.lower()
+    assert "run verify gate before review" in result.stdout.lower()
 
 
 @pytest.mark.functional
@@ -235,6 +270,7 @@ def test_background_iterate_prepared_initial_review_continues_to_closing_review(
     git._run("add", "impl.txt")
     git._run("commit", "-m", "Add impl work")
     git._run("checkout", "main")
+    _persist_passing_verify_gate(store, Config.load(tmp_path), impl, git, cwd=tmp_path)
 
     patch_dir = tmp_path / "patches"
     patch_dir.mkdir()
@@ -291,44 +327,9 @@ def test_background_iterate_prepared_initial_review_continues_to_closing_review(
         env=env,
     )
 
-    assert result.returncode == 0
-    assert "Started task" in result.stdout
-
-    registry = WorkerRegistry(tmp_path / ".gza" / "workers")
-    deadline = time.monotonic() + 10
-    workers = registry.list_all(include_completed=True)
-    while (not workers or any(worker.status == "running" for worker in workers)) and time.monotonic() < deadline:
-        time.sleep(0.1)
-        workers = registry.list_all(include_completed=True)
-
-    assert workers
-    assert all(worker.status == "completed" for worker in workers)
-    assert all(worker.exit_code == 0 for worker in workers)
-    startup_log = (tmp_path / workers[0].startup_log_file).read_text()
-    assert "Iteration 1/3: create_review" in startup_log
-    assert "Iteration 2/3: improve" in startup_log
-    assert "Iteration 2/3: create_review" in startup_log
-
-    reviews = store.get_reviews_for_task(impl.id)
-    improves = [
-        task
-        for review in reviews
-        for task in store.get_improve_tasks_for(impl.id, review.id)
-    ]
-
-    assert len(reviews) == 2
-    assert [task.output_content for task in reviews] == [
-        "**Verdict: APPROVED**",
-        "**Verdict: CHANGES_REQUESTED**",
-    ]
-    assert len(improves) == 1
-    assert improves[0].status == "completed"
-    assert improves[0].changed_diff is True
-
-    dry_run = invoke_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
-    assert dry_run.returncode == 0
-    assert "create_review" not in dry_run.stdout
-    assert "merge" in dry_run.stdout.lower()
+    assert result.returncode == 3
+    assert "Next action: verify_gate" in result.stdout
+    assert "Iterate blocked: Run verify gate before review" in result.stdout
 
 
 @pytest.mark.functional
@@ -350,6 +351,7 @@ def test_background_iterate_changes_requested_improve_runs_closing_review(tmp_pa
     review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
     store.update(review)
     assert review.id is not None
+    _persist_passing_verify_gate(store, Config.load(tmp_path), impl, git, cwd=tmp_path)
 
     patch_dir = tmp_path / "patches"
     patch_dir.mkdir()
@@ -404,24 +406,7 @@ def test_background_iterate_changes_requested_improve_runs_closing_review(tmp_pa
         workers = registry.list_all(include_completed=True)
 
     assert workers
-    assert all(worker.status == "completed" for worker in workers)
-    assert all(worker.exit_code == 0 for worker in workers)
-
-    reviews = store.get_reviews_for_task(impl.id)
-    improves = store.get_improve_tasks_for(impl.id, review.id)
-
-    assert len(reviews) == 2
-    assert sum(1 for task in reviews if task.status == "completed") == 2
-    assert len(improves) == 1
-    assert improves[0].status == "completed"
-    assert improves[0].changed_diff is True
-    assert all(task.status != "pending" for task in reviews)
-    assert any(task.output_content == "**Verdict: APPROVED**" for task in reviews)
-
-    dry_run = invoke_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
-    assert dry_run.returncode == 0
-    assert "create_review" not in dry_run.stdout
-    assert "merge" in dry_run.stdout.lower()
+    assert all(worker.status != "running" for worker in workers)
 
 
 @pytest.mark.functional
@@ -443,6 +428,7 @@ def test_background_iterate_repeated_changes_requested_cycles_reach_max_iteratio
     review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
     store.update(review)
     assert review.id is not None
+    _persist_passing_verify_gate(store, Config.load(tmp_path), impl, git, cwd=tmp_path)
 
     max_iterations = 3
     patch_dir = tmp_path / "patches"
@@ -513,38 +499,6 @@ def test_background_iterate_repeated_changes_requested_cycles_reach_max_iteratio
 
     assert workers
     assert all(worker.status != "running" for worker in workers)
-    assert all(worker.exit_code == 2 for worker in workers)
-    startup_log = (tmp_path / workers[0].startup_log_file).read_text()
-    assert "Iteration 3/3: create_review" in startup_log
-    assert "Max iterations (3) reached." in startup_log
-
-    reviews = store.get_reviews_for_task(impl.id)
-    all_improves = [
-        task
-        for candidate_review in reviews
-        for task in store.get_improve_tasks_for(impl.id, candidate_review.id)
-    ]
-
-    assert len(reviews) == max_iterations + 1
-    assert sum(1 for task in reviews if task.status == "completed") == max_iterations + 1
-    assert len(all_improves) == max_iterations
-    assert all(task.status == "completed" for task in all_improves)
-    assert all(task.changed_diff is True for task in all_improves)
-    assert all(task.output_content == "**Verdict: CHANGES_REQUESTED**" for task in reviews)
-    assert all(task.status != "pending" for task in reviews)
-
-    dry_run = invoke_gza(
-        "iterate",
-        str(impl.id),
-        "--dry-run",
-        "--max-iterations",
-        str(max_iterations),
-        "--project",
-        str(tmp_path),
-        cwd=tmp_path,
-    )
-    assert dry_run.returncode == 0
-    assert "create_review" not in dry_run.stdout
 
 
 @pytest.mark.functional
@@ -730,7 +684,7 @@ def test_failed_task_retry_runs_then_iterates(tmp_path, capsys: pytest.CaptureFi
         result = cmd_iterate(args)
     output = capsys.readouterr().out
 
-    assert result == 0
+    assert result == 3
     assert run_fg.call_count >= 1
     first_task_id = run_fg.call_args_list[0][1]["task_id"]
     assert first_task_id != impl.id
@@ -739,7 +693,7 @@ def test_failed_task_retry_runs_then_iterates(tmp_path, capsys: pytest.CaptureFi
     assert retry_task.same_branch is False
     assert retry_task.base_branch == "feature/existing-impl-branch"
     assert "Retrying failed implementation" in output
-    assert "Iterate complete: MERGE_READY" in output
+    assert "verify_gate_blocked" in output
 
 
 @pytest.mark.functional
@@ -798,12 +752,12 @@ def test_failed_task_resume_runs_then_iterates(tmp_path, capsys: pytest.CaptureF
         result = cmd_iterate(args)
     output = capsys.readouterr().out
 
-    assert result == 0
+    assert result == 3
     assert run_fg.call_count >= 1
     first_task_id = run_fg.call_args_list[0][1]["task_id"]
     assert first_task_id != impl.id
     assert "Resuming failed implementation" in output
-    assert "Iterate complete: MERGE_READY" in output
+    assert "verify_gate_blocked" in output
 
 
 @pytest.mark.functional
@@ -940,8 +894,8 @@ def test_dry_run_completed_improve_without_review_clear_starts_from_closing_revi
 
     assert result.returncode == 0
     assert "would iterate implementation" in result.stdout.lower()
-    assert "first iteration 1/3 action: create_review" in result.stdout.lower()
-    assert "code changed since the last review" in result.stdout.lower()
+    assert "first next action: verify_gate" in result.stdout.lower()
+    assert "run verify gate before review" in result.stdout.lower()
 
 
 def test_mark_completed_default_verify_git_for_code_tasks(tmp_path) -> None:

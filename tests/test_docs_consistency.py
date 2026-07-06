@@ -100,7 +100,7 @@ def test_docs_task_type_use_internal_not_learn() -> None:
     learnings_content = (docs_root / "internal" / "learnings.md").read_text()
 
     # configuration.md should list internal in task type filters
-    assert "explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal`" in config_content
+    assert "explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `verify_fix`, `fix`, `rebase`, `internal`" in config_content
 
     # learnings doc should describe internal task mechanics
     assert "skip_learnings=True" in learnings_content
@@ -183,7 +183,7 @@ def test_main_verify_self_heal_contract_is_part_of_behavior_spec_set() -> None:
 
 
 def test_off_topic_verify_contract_is_indexed_and_cross_linked() -> None:
-    """The off-topic verify unblock contract should stay discoverable and linked from lifecycle."""
+    """The legacy off-topic verify compatibility contract should stay discoverable and linked from lifecycle."""
     repo_root = Path(__file__).resolve().parents[1]
     behavior_readme = (repo_root / "specs" / "behavior" / "README.md").read_text()
     lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
@@ -191,14 +191,11 @@ def test_off_topic_verify_contract_is_indexed_and_cross_linked() -> None:
     contract_flat = " ".join(contract.split())
 
     assert "[off-topic-verify-failures.md](off-topic-verify-failures.md)" in behavior_readme
-    assert "Verify-only off-topic unblock contract" in behavior_readme
+    assert "Legacy verify-only compatibility contract" in behavior_readme
 
     assert "[off-topic-verify-failures.md](off-topic-verify-failures.md)" in lifecycle
     assert "`advance_off_topic_verify_unblock`" in lifecycle
-    assert "With `advance_off_topic_verify_unblock` off, lifecycle MUST keep the blocker" in lifecycle
-    assert "the full failing-node set was enumerated" in lifecycle
-    assert "exact reviewed head SHA and exact tree fingerprint" in lifecycle
-    assert "`REPRODUCE-OR-RECORD` investigation record" in lifecycle
+    assert "legacy compatibility lane for verify-only review blockers" in lifecycle
 
     required_contract_snippets = [
         "The lifecycle policy knob `advance_off_topic_verify_unblock` MUST exist and MUST default to **off**.",
@@ -407,12 +404,8 @@ def test_off_topic_verify_lifecycle_wording_stays_reconciled_with_focused_contra
     ) in lifecycle_flat
     assert "The *values* above are non-normative defaults." not in lifecycle_flat
 
-    assert (
-        "Verify-only blocker clearing remains governed by the verify-only rules above: rule A "
-        "for same-head runner-owned green recapture and rule A2 for the audited off-topic "
-        "unblock contract."
-    ) in lifecycle_flat
-    assert "Verify-only blocker clearing remains governed exclusively by rule A above." not in lifecycle_flat
+    assert "Historical review rows that still carry verify-only `CHANGES_REQUESTED` blockers MAY remain supported through a narrow compatibility path" in lifecycle_flat
+    assert "ordinary merge rule for new two-gate work" in lifecycle_flat
 
     assert "The lifecycle policy knob `advance_off_topic_verify_unblock` MUST exist and MUST default to **off**." in contract_flat
 
@@ -648,8 +641,8 @@ def test_practices_document_verify_timeout_diagnostics_recipe() -> None:
         assert snippet in practices_content
 
 
-def test_noop_verify_docs_and_spec_describe_bounded_isolated_reverify_contract() -> None:
-    """Tracked lifecycle docs/spec should describe the current bounded isolated reverify contract."""
+def test_specs_and_docs_describe_two_gate_verify_fix_contract() -> None:
+    """Tracked lifecycle docs/spec should describe verify-first two-gate flow, not no-op review clearance."""
     repo_root = Path(__file__).resolve().parents[1]
     tracked_docs = {
         "advance_workflow": (repo_root / "docs" / "internal" / "advance-workflow.md").read_text(),
@@ -662,9 +655,9 @@ def test_noop_verify_docs_and_spec_describe_bounded_isolated_reverify_contract()
     }
 
     required_snippets = [
-        "lifecycle MAY run one bounded fresh verify in an isolated worktree for the current evaluated head",
-        "that execution path MUST fail closed on head drift",
-        "MUST record SHA-bound clearance metadata before the next merge decision can treat the review as cleared",
+        "Merge is a two-gate decision.",
+        "Current red verify evidence before review MUST route into the `verify_fix` lane",
+        "Route back through the two-gate flow: rerun verify first, then create/run a fresh review for the improved head",
     ]
     for snippet in required_snippets:
         assert any(snippet in content for content in normalized_docs.values())
@@ -692,8 +685,7 @@ def test_advance_workflow_has_single_noop_improve_limit_row() -> None:
     )
     action = (
         "`needs_discussion` — reason=`improve-no-op`; stop repeated no-op improve loops "
-        "unless runner-owned current passing verify evidence already cleared the review "
-        "before lifecycle evaluation"
+        "after adjudication and any narrow historical compatibility handling are exhausted"
     )
 
     assert workflow.count(condition) == 1
@@ -721,7 +713,7 @@ def test_disputed_blocker_contract_is_tracked_consistently() -> None:
         ),
     )
 
-    assert "adjudication marking a disputed blocker `INVALID` for lifecycle" in overview
+    assert "Disputed non-verify CODE blockers route to adjudication first" in overview
     assert "blocker adjudication needed" in overview
     assert "Disputed non-verify CODE blocker adjudication" in lifecycle
     assert "structured current-state evidence" in lifecycle
@@ -759,7 +751,7 @@ def test_disputed_blocker_contract_is_tracked_consistently() -> None:
     assert "lifecycle consumes those persisted outcomes immediately" in workflow
     assert "`NEEDS_HUMAN` parks with `review-blocker-adjudication-needed`" in workflow
     assert (
-        "Verify-only blockers remain governed by runner-owned same-branch, same-head verify provenance."
+        "Verify-only review rows remain a separate narrow compatibility case and do not redefine the normal two-gate merge flow."
         in workflow_flat
     )
 
@@ -781,37 +773,118 @@ def test_lifecycle_spec_preserves_typed_review_comment_contract() -> None:
     assert "Unresolved review comments newer than the latest completed review MUST be addressed" not in lifecycle_flat
 
 
-def test_verify_only_noop_improve_contract_does_not_claim_generic_recapture() -> None:
-    """Spec/report text should stay aligned with the narrowed same-head failed-review recapture path."""
+def test_two_gate_docs_replace_verify_only_recapture_as_primary_model() -> None:
+    """Specs/docs should describe verify_fix plus two-gate merge eligibility as the primary model."""
     repo_root = Path(__file__).resolve().parents[1]
     lifecycle_engine = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
-    behavior_check = (repo_root / "reviews" / "20260618084043-behavior-check.md").read_text()
     overview = (repo_root / "specs" / "behavior" / "00-overview.md").read_text()
+    workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+    review_isolation = (repo_root / "docs" / "internal" / "review-isolation.md").read_text()
+    overview_flat = " ".join(overview.split())
+    lifecycle_flat = " ".join(lifecycle_engine.split())
 
-    assert "it re-runs verify for a no-op improve that is eligible to clear a verify-only review" in lifecycle_engine
-    assert "blocker, keyed by branch + head SHA. That no-op improve-side re-run applies only when" in lifecycle_engine
-    assert "the current review row already carries runner-owned review-time failure evidence for" in lifecycle_engine
-    assert "the same branch/head." in lifecycle_engine
-    assert "lifecycle MUST first conservatively classify the blocker set as" in lifecycle_engine
-    assert "verify-only before same-head runner-owned evidence can clear it" in lifecycle_engine
-    assert "prose alone MUST NOT" in lifecycle_engine
-    assert "decide stale/non-stale provenance." in lifecycle_engine
-    assert "ordinary non-timeout" in lifecycle_engine
-    assert "review-fail then no-op-improve-pass evidence pair" in lifecycle_engine
-    assert "each time it runs a no-op improve" not in lifecycle_engine
+    assert "Merge is a two-gate decision." in overview
+    assert "verify_fix" in overview
+    assert "Historical compatibility handling for older review-coupled verify blockers MUST NOT be read as widening this ordinary two-gate precondition." in overview_flat
+    assert "ordinary merge rule for new two-gate work" in lifecycle_flat
+    assert "verify-fix-failed" in lifecycle_engine
+    assert "verify-unavailable-after-fix" in lifecycle_engine
+    assert "Completed improve exists after latest review and changed the tracked reviewable diff" in workflow
+    assert "The no-op improve does not bypass the two-gate model by itself." in workflow
+    assert "Review prompts are code-only." in review_isolation
+    assert "They do **not** receive the lifecycle-owned verify" in review_isolation
 
-    assert "LE-\u00a76-VERIFY-ONLY-CLEAR" in behavior_check
-    assert "verify-only review classification plus runner-owned review-time failure evidence" in behavior_check
-    assert "review-fail/no-op-improve-pass evidence" in behavior_check
-    assert "persists `clear_review_state(...)`" in behavior_check
-    assert "detached re-verify action" in behavior_check
-    assert "ordinary `verify_command` failures as well as timeouts" in behavior_check
-    assert "runner.py:" not in behavior_check
-    assert "advance_engine.py:" not in behavior_check
 
-    assert "review FAILED and the no-op improve later PASSED at the same branch head" in overview
-    assert "Ordinary verify-failure-only stale reviews are handled by that same-head evidence-clear path" in overview
-    assert "lifecycle first classifies the blocker set as verify-only" in overview
+def test_advance_workflow_routes_review_and_merge_paths_through_verify_gate() -> None:
+    """Advance workflow doc should describe verify-gate routing and verify-fix actions on review/merge paths."""
+    repo_root = Path(__file__).resolve().parents[1]
+    workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+    workflow_flat = " ".join(workflow.split())
+
+    for action_name in ("`verify_gate`", "`create_verify_fix`", "`run_verify_fix`", "`wait_verify_fix`"):
+        assert action_name in workflow
+
+    review_cleared_rows = _extract_markdown_table_rows(workflow, "#### 6a. Review was cleared (improve task ran after review)")
+    review_active_rows = _extract_markdown_table_rows(workflow, "#### 6b. Review is active (not cleared)")
+    no_review_rows = _extract_markdown_table_rows(workflow, "### 8. Implementation-owned lineage with no review")
+
+    _, changed_improve_condition, changed_improve_action = _find_markdown_table_row(
+        review_cleared_rows,
+        condition_contains="Completed improve exists after latest review and changed the tracked reviewable diff",
+    )
+    assert review_cleared_rows.count((changed_improve_condition, changed_improve_action)) == 1
+    assert "`verify_gate`" in changed_improve_action
+    assert "fresh review" in changed_improve_action
+
+    _, approved_action_condition, approved_action = _find_markdown_table_row(
+        review_active_rows,
+        condition_contains="Verdict = `APPROVED` and the review is still valid for the current mergeable diff",
+    )
+    assert "pre-merge verify gate" in approved_action
+    assert "`merge`" in approved_action
+    assert "`verify_gate`" in approved_action
+    assert "verify_fix" in approved_action
+
+    _, approved_followups_condition, approved_followups_action = _find_markdown_table_row(
+        review_active_rows,
+        condition_contains="Verdict = `APPROVED_WITH_FOLLOWUPS` with at least one parsed `FOLLOWUP` finding",
+    )
+    assert approved_followups_condition.startswith("Verdict = `APPROVED_WITH_FOLLOWUPS`")
+    assert "pre-merge verify gate" in approved_followups_action
+    assert "`merge_with_followups`" in approved_followups_action
+
+    _, create_review_condition, create_review_action = _find_markdown_table_row(
+        no_review_rows,
+        condition_contains="`require_review_before_merge=true` and `advance_create_reviews=true`",
+    )
+    assert create_review_condition.startswith("`require_review_before_merge=true`")
+    assert "pre-review verify gate" in create_review_action
+    assert "`create_review`" in create_review_action
+    assert "`verify_gate`" in create_review_action
+
+    _, no_review_merge_condition, no_review_merge_action = _find_markdown_table_row(
+        no_review_rows,
+        condition_contains="`require_review_before_merge=false`",
+    )
+    assert no_review_merge_condition == "`require_review_before_merge=false`"
+    assert "pre-merge verify gate" in no_review_merge_action
+    assert "`merge`" in no_review_merge_action
+    assert "`verify_gate`" in no_review_merge_action
+
+    assert "Advance only creates review tasks after the relevant pre-review verify gate is green" in workflow_flat
+    assert "Advance merges directly only after the current pre-merge verify gate and current review gate are both green" in workflow_flat
+
+
+def test_specs_and_behavior_check_document_review_disabled_merge_exception_consistently() -> None:
+    """The review-disabled implementation merge path should stay explicit and still require verify."""
+    repo_root = Path(__file__).resolve().parents[1]
+    overview = (repo_root / "specs" / "behavior" / "00-overview.md").read_text()
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+    behavior_check = (repo_root / "reviews" / "20260706190348-behavior-check.md").read_text()
+    overview_flat = _normalize_whitespace(overview)
+    lifecycle_flat = _normalize_whitespace(lifecycle)
+    behavior_check_flat = _normalize_whitespace(behavior_check)
+
+    assert "When `require_review_before_merge=false` disables the review gate" in overview
+    assert "verify gate remains mandatory" in overview_flat
+    assert "`require_review_before_merge` off → if the current pre-merge verify gate is green, `merge`" in lifecycle_flat
+    assert "This review-disabled branch is the only exception to the ordinary implementation two-gate merge rule" in lifecycle_flat
+    assert "If the current pre-merge verify gate is green, `merge`; otherwise lifecycle must route through `verify_gate`" in workflow
+    assert "when `requires_review` is false" in behavior_check_flat
+    assert "including the review-disabled branch" in behavior_check_flat
+
+
+def test_lifecycle_review_state_rules_require_pre_merge_verify_before_approved_merge() -> None:
+    """Behavior spec review-state rows should not regress to bare approved->merge wording."""
+    repo_root = Path(__file__).resolve().parents[1]
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    lifecycle_flat = _normalize_whitespace(lifecycle)
+
+    assert "Verdict `APPROVED` and still valid for the current mergeable diff → if the current pre-merge verify gate is green, `merge`" in lifecycle_flat
+    assert "Verdict `APPROVED_WITH_FOLLOWUPS` with ≥1 parsed follow-up, review still valid → if the current pre-merge verify gate is green, `merge_with_followups`" in lifecycle_flat
+    assert "Verdict `APPROVED` and still valid for the current mergeable diff → `merge`." not in lifecycle_flat
+    assert "Verdict `APPROVED_WITH_FOLLOWUPS` with ≥1 parsed follow-up, review still valid → `merge_with_followups`" not in lifecycle_flat
 
 
 def test_tests_integration_module_guidance_avoids_stale_test_paths() -> None:
@@ -1073,7 +1146,7 @@ def test_configuration_docs_keep_fix_comment_and_run_inline_surfaces() -> None:
         "gza comment <task_id> <text> [options]",
         "### fix",
         "gza fix <task_id> [options]",
-        "| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |",
+        "| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `verify_fix`, `fix`, `rebase`, `internal` |",
         "| `--status-not STATUS` | Exclude the given status |",
         "| `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |",
     ]
@@ -1108,7 +1181,7 @@ def test_merge_first_docs_and_fix_skill_schema_stay_in_sync() -> None:
 
     assert "review_verify_timeout_grace_seconds: <number >= 1>" in fix_skill
     assert (
-        "Grace period after SIGTERM before autonomous review verification escalates to SIGKILL; "
+        "Grace period after SIGTERM before autonomous lifecycle verification escalates to SIGKILL; "
         "accepts float values >= 1 second"
     ) in advance_workflow
 
@@ -1125,6 +1198,32 @@ def test_merge_first_docs_and_fix_skill_schema_stay_in_sync() -> None:
     ]
     for snippet in retired_snippets:
         assert snippet not in fix_skill
+
+
+def test_two_gate_docs_do_not_revive_retired_review_verify_phrases() -> None:
+    """Tracked lifecycle docs and generated config examples should not advertise retired review-coupled verify flows."""
+    repo_root = Path(__file__).resolve().parents[1]
+    tracked_texts = {
+        "specs/behavior/lifecycle-engine.md": (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text(),
+        "docs/internal/advance-rebase-flow.md": (repo_root / "docs" / "internal" / "advance-rebase-flow.md").read_text(),
+        "docs/internal/advance-workflow.md": (repo_root / "docs" / "internal" / "advance-workflow.md").read_text(),
+        "src/gza/config_schema.py": (repo_root / "src" / "gza" / "config_schema.py").read_text(),
+        "src/gza/gza.yaml.example": (repo_root / "src" / "gza" / "gza.yaml.example").read_text(),
+        "src/gza/gza.local.yaml.example": (repo_root / "src" / "gza" / "gza.local.yaml.example").read_text(),
+    }
+
+    retired_phrases = (
+        "verify-blocked -> mergeable",
+        "review/no-op-improve verify",
+        "autonomous review verification",
+    )
+    for path, text in tracked_texts.items():
+        for phrase in retired_phrases:
+            assert phrase not in text, f"{path} revived retired phrase: {phrase}"
+
+    legacy_clause = tracked_texts["docs/internal/advance-workflow.md"]
+    assert "does not authorize ordinary merge for current two-gate work" in legacy_clause
+    assert "does not replace the pre-review or pre-merge lifecycle verify gates" in legacy_clause
 
 
 def test_summary_docs_and_skill_use_dedicated_triage_surfaces() -> None:
@@ -1599,7 +1698,10 @@ def test_internal_advance_workflow_failed_task_recovery_is_not_resume_only() -> 
     assert "| `resume` | Creates resume task, spawns worker |" in worker_actions_section
     assert "| `retry` | Creates retry task, spawns worker |" in worker_actions_section
 
-    assert "`create_plan_review`, `create_plan_improve`, `create_review`, `create_implement`, `resume`, `retry`, `needs_rebase`" in output_section
+    assert (
+        "`create_plan_review`, `create_plan_improve`, `create_verify_fix`, `create_review`, "
+        "`create_implement`, `resume`, `retry`, `needs_rebase`"
+    ) in output_section
     assert "created/reused task ID" in output_section
     assert "`awaiting_human` — review the plan, then run `uv run gza implement <id>`" in internal_content
 
@@ -1817,7 +1919,6 @@ def test_lineage_spec_and_operator_docs_define_stale_unmerged_sweep_contract() -
     assert "re-checks those candidates against the canonical default target" in config_docs
     assert "proof error aborts the command before mutation" in config_docs
 
-
 def test_lineage_spec_ratifies_same_branch_depends_on_implement_owner_attachment() -> None:
     """The behavior spec should explicitly allow the same-branch depends_on owner-tip rule."""
     repo_root = Path(__file__).resolve().parents[1]
@@ -1828,6 +1929,21 @@ def test_lineage_spec_ratifies_same_branch_depends_on_implement_owner_attachment
     assert "Ownership / merge-unit attachment (L2) MAY additionally use a `depends_on` edge only for" in lineage_spec
     assert "a same-branch `implement` slice that explicitly continues the dependency's branch MAY" in lineage_spec
     assert "the later successful implement slice becomes the canonical `owner_task_id` for the shared unit" in lineage_flat
+
+
+def test_verify_surface_docs_describe_neutral_owner_and_projection_fields() -> None:
+    """Operator docs should describe the neutral verify surface, not review-only wording."""
+    repo_root = Path(__file__).resolve().parents[1]
+    config_docs = (repo_root / "docs" / "configuration.md").read_text()
+
+    assert "latest owner-attached `verify_gate_result` artifact" in config_docs
+    assert "implementation/lineage tasks as well as review tasks" in config_docs
+    assert "failed freshness probe still shows the latest stored evidence as stale" in config_docs
+    assert "verify_status" in config_docs
+    assert "verify_source" in config_docs
+    assert "verify_current" in config_docs
+    assert "verify_has_owner_artifact" in config_docs
+    assert "Review-verify audit fields" not in config_docs
 
 
 def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:

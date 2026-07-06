@@ -34,7 +34,8 @@ Gza reads configuration from three YAML layers:
 | `docker_setup_command` | String | `""` | Pre-warm hook run synchronously in Docker before provider CLI starts |
 | `docker_volumes` | List | `[]` | Custom Docker volume mounts (e.g., `["/host:/container:ro"]`) |
 | `timeout_minutes` | Integer | `10` | Maximum time per task in minutes |
-| `inner_verify_command` | String | `""` | Optional fast verification command for code-task edit loops; `verify_command` remains the final gate |
+| `unit_verify_command` | String | `""` | Optional preferred unit-scope verification command for code tasks; when unset, prompts fall back to `inner_verify_command`, then targeted checks |
+| `inner_verify_command` | String | `""` | Optional fast verification command for code-task edit loops when no `unit_verify_command` is configured; `verify_command` remains the final gate |
 | `branch_mode` | String | `multi` | Branch strategy: `single` or `multi` |
 | `max_steps` | Integer | `50` | Maximum conversation steps per task (preferred) |
 | `max_turns` | Integer | `50` | Legacy alias for `max_steps` |
@@ -53,7 +54,7 @@ Gza reads configuration from three YAML layers:
 | `review_diff_medium_threshold` | Integer | `2000` | Total changed-line cutoff above `review_diff_small_threshold`; larger diffs use targeted excerpts instead of full inline diff |
 | `review_context_file_limit` | Integer | `12` | Maximum number of changed files to include in targeted excerpt mode for large review diffs |
 | `autonomous_verify_timeout_seconds` | Integer | `120` | Timeout for lifecycle/automation-initiated `verify_command` runs |
-| `review_verify_timeout_grace_seconds` | Float | `5` | Grace period after SIGTERM before autonomous review verification escalates to SIGKILL; accepts values `>= 1` second |
+| `review_verify_timeout_grace_seconds` | Float | `5` | Grace period after SIGTERM before autonomous lifecycle verification escalates to SIGKILL; accepts values `>= 1` second |
 | `main_integration_verify_red_ttl_minutes` | Integer | `30` | Maximum age of a failed or unavailable local-target integration verify checkpoint before watch/advance reruns it even if the tree fingerprint is unchanged |
 | `code_task_diff_timeout_medium_threshold` | Integer | `400` | Reviewable diff-size threshold where code tasks move from the base timeout to the medium scaled timeout |
 | `code_task_diff_timeout_large_threshold` | Integer | `1200` | Reviewable diff-size threshold where code tasks move from the base timeout to the large scaled timeout; must be `>= code_task_diff_timeout_medium_threshold` after defaults and overrides are merged |
@@ -62,7 +63,7 @@ Gza reads configuration from three YAML layers:
 | `code_task_diff_timeout_cap_minutes` | Integer | `45` | Hard maximum applied to code-task budgets after base timeout resolution and diff-size scaling |
 | `pr_integration` | Boolean | `true` | Enable GitHub PR discovery/comment/create flows; set `false` to skip all `gh`-backed PR operations for the project |
 | `advance_create_plan_reviews` | Boolean | `true` | Auto-create `plan_review` tasks for completed non-held plans; when disabled, lifecycle parks for manual plan-review creation instead |
-| `advance_off_topic_verify_unblock` | Boolean | `false` | Permit the audited off-topic verify-only unblock lane after trusted same-head/tree green evidence already exists; lifecycle still fails closed unless full failing-node enumeration, exact fingerprint binding, and durable investigation-task persistence all succeed |
+| `advance_off_topic_verify_unblock` | Boolean | `false` | Permit the audited legacy compatibility lane for verify-only blocked reviews after trusted same-head/tree green evidence already exists; lifecycle still fails closed unless full failing-node enumeration, exact fingerprint binding, and durable investigation-task persistence all succeed |
 | `require_plan_review_before_implement` | Boolean | `true` | Require an approved `plan_review` before lifecycle automation materializes implementation work from a plan |
 | `max_plan_review_cycles` | Integer | `2` | Cap for repeated `CHANGES_REQUESTED` `plan_review` / `plan_improve` churn before lifecycle automation accepts the latest plan revision and continues through the direct-implement path |
 | `max_failed_plan_review_retries` | Integer | `3` | Max failed `plan_review` attempts for one plan source before lifecycle parks it as `needs_attention` instead of auto-spawning another review; set `0` to escalate after the first failure |
@@ -113,7 +114,7 @@ Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza pr
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `docker_startup_timeout`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `inner_verify_command`, `watch`, `behavior_monitor`, `spec_coherence`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_failed_plan_review_retries`, `max_noop_improve_cycles`, `advance_off_topic_verify_unblock`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `quiet_period_seconds`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `autonomous_verify_timeout_seconds`, `review_verify_timeout_grace_seconds`, `main_integration_verify_red_ttl_minutes`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
+`db_path`, `use_docker`, `docker_startup_timeout`, `enforce_project_scope`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `unit_verify_command`, `inner_verify_command`, `watch`, `behavior_monitor`, `spec_coherence`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_failed_plan_review_retries`, `max_noop_improve_cycles`, `advance_off_topic_verify_unblock`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `quiet_period_seconds`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `autonomous_verify_timeout_seconds`, `review_verify_timeout_grace_seconds`, `main_integration_verify_red_ttl_minutes`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
 
 Disallowed keys:
 `project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`
@@ -145,6 +146,7 @@ Example:
 use_docker: false
 docker_startup_timeout: 90
 timeout_minutes: 30
+unit_verify_command: ./bin/tests --unit
 inner_verify_command: ./bin/tests --quick
 docker_volumes:
   - ~/datasets:/datasets:ro
@@ -438,7 +440,7 @@ task_types:
     max_turns: 15
 ```
 
-Valid task types: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal`
+Valid task types: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `verify_fix`, `fix`, `rebase`, `internal`
 
 The generic task-type routing keys apply to plan-review work the same way they apply to existing task types:
 `task_providers.plan_review`, `task_types.plan_review`, and `providers.<provider>.task_types.plan_review` route and shape `plan_review`; `plan_improve` uses the corresponding `plan_improve` keys.
@@ -491,18 +493,20 @@ For `implement`, `improve`, `fix`, and `rebase`, the resolved base timeout can t
 
 ### Verification Profiles
 
-Code tasks support two verification tiers:
+Code tasks support a final verify gate plus optional fast-path tiers:
 
 ```yaml
 verify_command: ./bin/tests
+unit_verify_command: ./bin/tests --unit
 inner_verify_command: ./bin/tests --quick
 ```
 
 - `verify_command` remains the required final gate before a code task reports success.
-- `inner_verify_command` is optional and is intended for fast edit-loop checks during implementation.
-- When `inner_verify_command` is unset, agents should prefer targeted tests during editing and still run `verify_command` once after the last code change.
-- Autonomous review verification is separate and remains bounded by `autonomous_verify_timeout_seconds`.
-- When autonomous review verification times out, Gza sends SIGTERM to the verify process group, waits `review_verify_timeout_grace_seconds`, then escalates to SIGKILL if the process tree is still alive.
+- `unit_verify_command` is optional and takes precedence for implement-like task guidance when configured.
+- `inner_verify_command` remains the fallback fast edit-loop command when `unit_verify_command` is unset.
+- When neither `unit_verify_command` nor `inner_verify_command` is set, agents should prefer targeted tests during editing and still run `verify_command` once after the last code change.
+- Autonomous lifecycle verification is separate and remains bounded by `autonomous_verify_timeout_seconds`.
+- When autonomous lifecycle verification times out, Gza sends SIGTERM to the verify process group, waits `review_verify_timeout_grace_seconds`, then escalates to SIGKILL if the process tree is still alive.
 - Local-target integration verify reuses green checkpoints until the tree fingerprint or verify-gate identity changes. The configured-gate identity includes the verify environment identity recorded with the checkpoint, using stable semantic runtime fields like runner class, platform system/machine, and Python implementation/version instead of an exact interpreter path, so a checkpoint from a different environment, or an older checkpoint that lacks that identity, is treated as stale. Failed/unavailable checkpoints are rerun after `main_integration_verify_red_ttl_minutes` even on the same tree.
 
 ---
@@ -1079,10 +1083,14 @@ When execution provenance is known, `gza show` also includes:
 - `Execution Mode: skill_inline` for inline skill runs (for example `gza-task-run`)
 - `Provider: <provider>` and `Model: <full-model-id>` from the stored execution record (`-` when unset)
 
-For completed `review` tasks, `gza show` also includes:
+When review data is present, `gza show` also includes:
 - `Verdict: <APPROVED|CHANGES_REQUESTED|NEEDS_DISCUSSION|...>` when parseable from review output.
 - `Score: <N>/100` when a derived `review_score` is available.
-- Review-verify audit fields when autonomous review verification ran, including status, exit status, capture time, branch/head/base provenance, working directory, the persisted `## verify_command result` section, the latest `verify_command_output` artifact path, and an `Artifacts:` list covering every stored task artifact with missing-file visibility.
+
+When persisted verify evidence is available, `gza show` also includes neutral verify-state fields for the latest owner-attached `verify_gate_result` artifact when present, or a legacy review fallback when canonical owner data is absent. The rendered block may therefore appear on implementation/lineage tasks as well as review tasks, and a failed freshness probe still shows the latest stored evidence as stale rather than suppressing it entirely.
+- `Verify Status`, `Verify Exit`, `Verify Current`, `Verify At`, `Verify Branch`, `Verify Head`, `Verify Base`, `Verify Cwd`, `Verify Failure`, and the persisted `## verify_command result` section from the shared verify read model.
+- `Verify Artifact: <path>` showing the canonical `verify_command_output` artifact path when known, with invalid or missing-file markers preserved.
+- `Artifacts:` listing every stored task artifact with missing-file visibility.
 
 ### artifact
 
@@ -1312,7 +1320,7 @@ gza history [options]
 | Option | Description |
 |--------|-------------|
 | `--last N`, `-n N` | Show last N tasks (default: 5) |
-| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
+| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `verify_fix`, `fix`, `rebase`, `internal` |
 | `--type-not TYPE` | Exclude the given task type |
 | `--days N` | Show only tasks from the last N days |
 | `--start-date YYYY-MM-DD` | Show only tasks on or after this date |
@@ -1331,6 +1339,8 @@ Positive and negative filters on the same field are applied in order: include ma
 
 Default human output also shows each task's stored execution model. Projection/JSON output supports `model` (and `provider`) fields, so `gza history --fields id,status,model` and `gza history --json` include them directly.
 
+History/search/incomplete projection output also supports the neutral verify fields: `verify_status`, `verify_exit_status`, `verify_captured_at`, `verify_branch`, `verify_head_sha`, `verify_base_sha`, `verify_working_directory`, `verify_failure`, `verify_artifact_path`, `verify_source`, `verify_current`, and `verify_has_owner_artifact`. `verify_source` is `owner_artifact` for canonical owner evidence and `legacy_review` for compatibility fallback; `verify_current` reports whether that evidence matches the current verify epoch, and `verify_has_owner_artifact` tells you whether canonical owner evidence exists even when the visible row is stale.
+
 ### incomplete
 
 Show unresolved task lineages that still need attention.
@@ -1342,7 +1352,7 @@ gza incomplete [options]
 | Option | Description |
 |--------|-------------|
 | `--last N`, `-n N` | Show last N unresolved rows (default: 5; use `0` for all) |
-| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `fix`, `rebase`, `internal` |
+| `--type TYPE` | Filter by task type: `explore`, `plan`, `plan_review`, `plan_improve`, `implement`, `review`, `improve`, `verify_fix`, `fix`, `rebase`, `internal` |
 | `--days N` | Show only unresolved rows from the last N days |
 | `--date-field FIELD` | Date field for `--days`: `created`, `completed`, or `effective` (default: `effective`) |
 | `--tree` | Render unresolved lineages as trees rooted at the live shared recovery subject when applicable |
@@ -1360,6 +1370,8 @@ Use `gza incomplete` for unresolved lineage triage. Use the more specific comman
 Projected `next_action` values come from the shared live lifecycle planner. Cleanly mergeable branches continue to the normal review or merge actions even when they are behind the target branch. Completed held plan tasks surface `awaiting_human` until you run `uv run gza implement <plan-id>` or `uv run gza edit <plan-id> --no-hold-for-review` (preferred; `--auto-implement` also works). Those held-plan rows now carry `reason=awaiting-human-review`. If an approved plan review has partial implement descendants and the durable materialization record is missing, incomplete, or already complete while stale extra pending duplicate slice descendants remain outside the recorded set, lifecycle now first attempts deterministic repair when the current partial slice set is a proven safe pending subset of the validated manifest, and only parks with `reason=plan-review-materialization-repair-needed` when that state is ambiguous or unsafe. Needs-attention rows now carry an explicit subject task, so `gza incomplete` roots attention rows at the plan/explore/implementation the operator should inspect instead of inferring that identity from lineage ownership alone. If older or malformed action data is missing that subject, the shared resolver falls back conservatively and emits a warning instead of silently re-inferring identity.
 
 `uv run gza incomplete --list-fields` prints the unresolved-lineage projection set. `uv run gza incomplete --blocked-by-dropped --list-fields` prints the blocked-dropped task projection set.
+
+The explicit `verify_*` projection fields have the same meanings here as in `history`: they surface the latest canonical owner verify evidence when available, otherwise the latest legacy review fallback, with `verify_current=false` when freshness cannot be proven for the current epoch.
 
 Default text output stays to one wrapped line per lineage: the owner prompt is reduced to its first non-empty line and truncated, and `| unresolved: ...` appears only when multiple unresolved tasks remain for the same owner, summarized as task IDs plus failure/completion status.
 
@@ -1406,6 +1418,8 @@ gza search <term> [options]
 
 Text output ends with a summary footer such as `Showing results 1-9 out of 55`.
 Positive and negative filters on the same field are applied in order: include matches for the positive flag first, then drop anything matching the corresponding `--...-not` flag. If the same value appears in both, the negative filter wins and that row is excluded.
+
+Like `history`, `search` projection and JSON output expose the neutral `verify_*` fields. They report the latest shared verify read-model evidence for each row, plus freshness/provenance via `verify_source`, `verify_current`, and `verify_has_owner_artifact`.
 ### checkout
 
 Checkout a task's branch, removing any stale worktree if needed.
@@ -2192,6 +2206,7 @@ Gza supports several task types, each with distinct behavior:
 | `implement` | Build per a plan (default) | Code changes on branch |
 | `review` | Evaluate implementation | `.gza/reviews/{task_id}.md` |
 | `improve` | Address review feedback | Code changes on same branch |
+| `verify_fix` | Address a failing verify epoch on the implementation branch; manual creation requires `--based-on <implementation-lineage-task>` plus `--same-branch`, derives the prompt from the latest failed verify evidence, rejects custom prompt text / `--edit` / `--prompt-file`, and fails closed unless that failed evidence matches the current implementation branch/head/verify-command epoch | Code changes on same branch |
 | `fix` | Rescue stuck implementation lifecycle or repeated review regressions | Code changes on implementation branch |
 | `internal` | gza-owned provider workflows (for example learnings/PR drafting) | `.gza/internal/{task_id}.md` |
 
@@ -2313,6 +2328,7 @@ max_turns: 80
 autonomous_verify_timeout_seconds: 180
 review_verify_timeout_grace_seconds: 5
 verify_command: ./bin/tests
+unit_verify_command: ./bin/tests --unit
 inner_verify_command: ./bin/tests --quick
 code_task_diff_timeout_medium_threshold: 500
 code_task_diff_timeout_large_threshold: 1500
