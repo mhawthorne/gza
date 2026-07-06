@@ -1,6 +1,9 @@
 """Functional tests for execution flows that require a real git repo."""
 
 import argparse
+import os
+import textwrap
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -218,6 +221,330 @@ def test_dry_run_changes_requested_completed_improve_without_review_clear_create
     assert "would iterate implementation" in result.stdout.lower()
     assert "first iteration 1/3 action: create_review" in result.stdout.lower()
     assert "code changed since the last review" in result.stdout.lower()
+
+
+@pytest.mark.functional
+def test_background_iterate_prepared_initial_review_continues_to_closing_review(tmp_path) -> None:
+    setup_config(tmp_path)
+    _init_basic_repo(tmp_path)
+    store = make_store(tmp_path)
+    impl = _make_completed_impl(store)
+    git = Git(tmp_path)
+    git._run("checkout", "-b", impl.branch)
+    (tmp_path / "impl.txt").write_text("impl work")
+    git._run("add", "impl.txt")
+    git._run("commit", "-m", "Add impl work")
+    git._run("checkout", "main")
+
+    patch_dir = tmp_path / "patches"
+    patch_dir.mkdir()
+    (patch_dir / "sitecustomize.py").write_text(
+        textwrap.dedent(
+            f"""
+            from datetime import UTC, datetime
+
+            import gza.cli
+            from gza.db import SqliteTaskStore
+
+
+            ROOT_IMPL_ID = "{impl.id}"
+
+
+            def _fake_run(config, task_id=None, **kwargs):
+                store = SqliteTaskStore.from_config(config)
+                task = store.get(task_id)
+                assert task is not None
+                task.status = "completed"
+                task.completed_at = datetime.now(UTC)
+                if task.task_type == "review":
+                    completed_other_reviews = sum(
+                        1
+                        for candidate in store.get_reviews_for_task(ROOT_IMPL_ID)
+                        if candidate.id != task.id and candidate.status == "completed"
+                    )
+                    task.output_content = (
+                        "**Verdict: CHANGES_REQUESTED**"
+                        if completed_other_reviews == 0
+                        else "**Verdict: APPROVED**"
+                    )
+                elif task.task_type == "improve":
+                    task.changed_diff = True
+                store.update(task)
+                return 0
+
+
+            gza.cli.run = _fake_run
+            """
+        )
+    )
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(patch_dir) + os.pathsep + env.get("PYTHONPATH", "")
+
+    result = invoke_gza(
+        "iterate",
+        str(impl.id),
+        "--background",
+        "--project",
+        str(tmp_path),
+        cwd=tmp_path,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    assert "Started task" in result.stdout
+
+    registry = WorkerRegistry(tmp_path / ".gza" / "workers")
+    deadline = time.monotonic() + 10
+    workers = registry.list_all(include_completed=True)
+    while (not workers or any(worker.status == "running" for worker in workers)) and time.monotonic() < deadline:
+        time.sleep(0.1)
+        workers = registry.list_all(include_completed=True)
+
+    assert workers
+    assert all(worker.status == "completed" for worker in workers)
+    assert all(worker.exit_code == 0 for worker in workers)
+    startup_log = (tmp_path / workers[0].startup_log_file).read_text()
+    assert "Iteration 1/3: create_review" in startup_log
+    assert "Iteration 2/3: improve" in startup_log
+    assert "Iteration 2/3: create_review" in startup_log
+
+    reviews = store.get_reviews_for_task(impl.id)
+    improves = [
+        task
+        for review in reviews
+        for task in store.get_improve_tasks_for(impl.id, review.id)
+    ]
+
+    assert len(reviews) == 2
+    assert [task.output_content for task in reviews] == [
+        "**Verdict: APPROVED**",
+        "**Verdict: CHANGES_REQUESTED**",
+    ]
+    assert len(improves) == 1
+    assert improves[0].status == "completed"
+    assert improves[0].changed_diff is True
+
+    dry_run = invoke_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
+    assert dry_run.returncode == 0
+    assert "create_review" not in dry_run.stdout
+    assert "merge" in dry_run.stdout.lower()
+
+
+@pytest.mark.functional
+def test_background_iterate_changes_requested_improve_runs_closing_review(tmp_path) -> None:
+    setup_config(tmp_path)
+    _init_basic_repo(tmp_path)
+    store = make_store(tmp_path)
+    impl = _make_completed_impl(store)
+    git = Git(tmp_path)
+    git._run("checkout", "-b", impl.branch)
+    (tmp_path / "impl.txt").write_text("impl work")
+    git._run("add", "impl.txt")
+    git._run("commit", "-m", "Add impl work")
+    git._run("checkout", "main")
+
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    review.status = "completed"
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    store.update(review)
+    assert review.id is not None
+
+    patch_dir = tmp_path / "patches"
+    patch_dir.mkdir()
+    (patch_dir / "sitecustomize.py").write_text(
+        textwrap.dedent(
+            """
+            from datetime import UTC, datetime
+
+            import gza.cli.execution as execution
+
+
+            def _fake_run_foreground(config, task_id, **kwargs):
+                store = execution.get_store(config)
+                task = store.get(task_id)
+                assert task is not None
+                task.status = "completed"
+                task.completed_at = datetime.now(UTC)
+                if task.task_type == "improve":
+                    task.changed_diff = True
+                if task.task_type == "review":
+                    task.output_content = "**Verdict: APPROVED**"
+                store.update(task)
+                return 0
+
+
+            execution._run_foreground = _fake_run_foreground
+            """
+        )
+    )
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(patch_dir) + os.pathsep + env.get("PYTHONPATH", "")
+
+    result = invoke_gza(
+        "iterate",
+        str(impl.id),
+        "--background",
+        "--project",
+        str(tmp_path),
+        cwd=tmp_path,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    assert "Started task" in result.stdout
+
+    registry = WorkerRegistry(tmp_path / ".gza" / "workers")
+    deadline = time.monotonic() + 10
+    workers = registry.list_all(include_completed=True)
+    while (not workers or any(worker.status == "running" for worker in workers)) and time.monotonic() < deadline:
+        time.sleep(0.1)
+        workers = registry.list_all(include_completed=True)
+
+    assert workers
+    assert all(worker.status == "completed" for worker in workers)
+    assert all(worker.exit_code == 0 for worker in workers)
+
+    reviews = store.get_reviews_for_task(impl.id)
+    improves = store.get_improve_tasks_for(impl.id, review.id)
+
+    assert len(reviews) == 2
+    assert sum(1 for task in reviews if task.status == "completed") == 2
+    assert len(improves) == 1
+    assert improves[0].status == "completed"
+    assert improves[0].changed_diff is True
+    assert all(task.status != "pending" for task in reviews)
+    assert any(task.output_content == "**Verdict: APPROVED**" for task in reviews)
+
+    dry_run = invoke_gza("iterate", str(impl.id), "--dry-run", "--project", str(tmp_path), cwd=tmp_path)
+    assert dry_run.returncode == 0
+    assert "create_review" not in dry_run.stdout
+    assert "merge" in dry_run.stdout.lower()
+
+
+@pytest.mark.functional
+def test_background_iterate_repeated_changes_requested_cycles_reach_max_iterations(tmp_path) -> None:
+    setup_config(tmp_path)
+    _init_basic_repo(tmp_path)
+    store = make_store(tmp_path)
+    impl = _make_completed_impl(store)
+    git = Git(tmp_path)
+    git._run("checkout", "-b", impl.branch)
+    (tmp_path / "impl.txt").write_text("impl work")
+    git._run("add", "impl.txt")
+    git._run("commit", "-m", "Add impl work")
+    git._run("checkout", "main")
+
+    review = store.add("Initial review", task_type="review", depends_on=impl.id)
+    review.status = "completed"
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    store.update(review)
+    assert review.id is not None
+
+    max_iterations = 3
+    patch_dir = tmp_path / "patches"
+    patch_dir.mkdir()
+    (patch_dir / "sitecustomize.py").write_text(
+        textwrap.dedent(
+            f"""
+            from datetime import UTC, datetime
+
+            import gza.cli.execution as execution
+
+
+            MAX_ITERATIONS = {max_iterations}
+
+
+            def _fake_run_foreground(config, task_id, **kwargs):
+                store = execution.get_store(config)
+                task = store.get(task_id)
+                assert task is not None
+                task.status = "completed"
+                task.completed_at = datetime.now(UTC)
+                if task.task_type == "improve":
+                    task.changed_diff = True
+                elif task.task_type == "review":
+                    reviews = store.get_reviews_for_task("{impl.id}")
+                    completed_other_reviews = sum(
+                        1
+                        for candidate in reviews
+                        if candidate.id != task.id and candidate.status == "completed"
+                    )
+                    if completed_other_reviews <= MAX_ITERATIONS:
+                        task.output_content = "**Verdict: CHANGES_REQUESTED**"
+                    else:
+                        task.output_content = "**Verdict: APPROVED**"
+                store.update(task)
+                return 0
+
+
+            execution._run_foreground = _fake_run_foreground
+            """
+        )
+    )
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(patch_dir) + os.pathsep + env.get("PYTHONPATH", "")
+
+    result = invoke_gza(
+        "iterate",
+        str(impl.id),
+        "--background",
+        "--max-iterations",
+        str(max_iterations),
+        "--project",
+        str(tmp_path),
+        cwd=tmp_path,
+        env=env,
+    )
+
+    assert result.returncode == 0
+    assert "Started task" in result.stdout
+
+    registry = WorkerRegistry(tmp_path / ".gza" / "workers")
+    deadline = time.monotonic() + 10
+    workers = registry.list_all(include_completed=True)
+    while (not workers or any(worker.status == "running" for worker in workers)) and time.monotonic() < deadline:
+        time.sleep(0.1)
+        workers = registry.list_all(include_completed=True)
+
+    assert workers
+    assert all(worker.status != "running" for worker in workers)
+    assert all(worker.exit_code == 2 for worker in workers)
+    startup_log = (tmp_path / workers[0].startup_log_file).read_text()
+    assert "Iteration 3/3: create_review" in startup_log
+    assert "Max iterations (3) reached." in startup_log
+
+    reviews = store.get_reviews_for_task(impl.id)
+    all_improves = [
+        task
+        for candidate_review in reviews
+        for task in store.get_improve_tasks_for(impl.id, candidate_review.id)
+    ]
+
+    assert len(reviews) == max_iterations + 1
+    assert sum(1 for task in reviews if task.status == "completed") == max_iterations + 1
+    assert len(all_improves) == max_iterations
+    assert all(task.status == "completed" for task in all_improves)
+    assert all(task.changed_diff is True for task in all_improves)
+    assert all(task.output_content == "**Verdict: CHANGES_REQUESTED**" for task in reviews)
+    assert all(task.status != "pending" for task in reviews)
+
+    dry_run = invoke_gza(
+        "iterate",
+        str(impl.id),
+        "--dry-run",
+        "--max-iterations",
+        str(max_iterations),
+        "--project",
+        str(tmp_path),
+        cwd=tmp_path,
+    )
+    assert dry_run.returncode == 0
+    assert "create_review" not in dry_run.stdout
 
 
 @pytest.mark.functional
