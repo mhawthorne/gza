@@ -220,12 +220,15 @@ def make_figure():
 
 
 def _draw_merges(ax, merges):
-    """Mark merges: exact-time dots on the baseline + one per-hour box of task ids.
+    """Mark merges: exact-time dots on the baseline + quadrant boxes of task ids.
 
-    Grouping by hour collapses tight within-hour clusters into a single box. Boxes
-    are then lane-packed: each is assigned the lowest vertical lane whose previous
-    box ends (in pixels) before this one starts, so no two boxes overlap either
-    horizontally (same lane) or vertically (lanes are spaced by a box height).
+    Merges are bucketed into 15-minute quadrants (so at most four boxes per hour),
+    and the boxes are stacked in a reserved band of "fake negative" space **below**
+    the baseline. Because every data series is non-negative, hanging the boxes below
+    zero keeps them clear of the lines and makes the leaders short. Within the band,
+    boxes are lane-packed: any two that would overlap horizontally are pushed onto
+    separate stacked lanes, so no two boxes ever collide. The y-axis is extended
+    downward to make room for the band.
     """
     if not merges:
         return
@@ -235,27 +238,29 @@ def _draw_merges(ax, merges):
     ax.scatter(xs, [0] * len(xs), marker="o", s=16, color="tab:purple",
                zorder=6, label=f"merge ({len(merges)})")
 
-    groups = {}  # hour bucket -> [task_id, ...] in time order
+    # Bucket into 15-minute quadrants: at most four boxes per hour.
+    groups = {}  # quadrant-start -> [task_id, ...] in time order
     for when, tid in merges:
-        groups.setdefault(when.replace(minute=0, second=0, microsecond=0), []).append(tid)
+        start = when.replace(minute=(when.minute // 15) * 15, second=0, microsecond=0)
+        groups.setdefault(start, []).append(tid)
     ordered = sorted(groups.items())
 
     # Pixel geometry for width/height estimates (approximate; conservative is fine).
     fig = ax.figure
     fontsize = 9
     x0, x1 = ax.get_xlim()
-    ymin, ymax = ax.get_ylim()
+    dmin, dmax = ax.get_ylim()
     pos = ax.get_position()
     px_per_datex = (pos.width * fig.get_figwidth() * fig.dpi) / (x1 - x0)
-    datey_per_px = (ymax - ymin) / (pos.height * fig.get_figheight() * fig.dpi)
+    axheight_px = pos.height * fig.get_figheight() * fig.dpi
     char_px = fontsize * 0.62 * fig.dpi / 72.0
     line_px = fontsize * 1.5 * fig.dpi / 72.0
 
     # Lane-pack in display-x: first lane whose last box ends before this one starts.
     lane_right = []          # last right-edge (px) per lane
     placed = []              # (center_dt, ids, lane)
-    for hour, ids in ordered:
-        center = hour + timedelta(minutes=30)
+    for start, ids in ordered:
+        center = start + timedelta(minutes=7, seconds=30)
         cx = (mdates.date2num(center) - x0) * px_per_datex
         half = (max(len(t) for t in ids) * char_px + 12) / 2
         left, right = cx - half, cx + half
@@ -267,14 +272,22 @@ def _draw_merges(ax, merges):
             lane_right[lane] = right
         placed.append((center, ids, lane))
 
-    # Vertical: stack lanes around mid, spaced by the tallest box's height.
-    max_lines = max(len(ids) for _, ids in ordered)
-    step_y = (max_lines * line_px + 10) * datey_per_px * 1.15
-    mid = (ymin + ymax) / 2
+    # Reserve a "fake negative" band below zero and extend the y-axis downward to
+    # fit it. Solve for the new bottom so each lane gets ``lane_px`` pixels *after*
+    # the rescale (the axis grows, so lane spacing must track the final data range).
     n = len(lane_right)
+    max_lines = max(len(ids) for _, ids in ordered)
+    lane_px = max_lines * line_px + 10
+    gap = max(dmax, 1.0) * 0.05          # small gap below the baseline dots
+    c = min((n + 0.5) * lane_px / axheight_px, 0.7) if axheight_px else 0.5
+    rng = 1.05 * max(dmax, 1.0) / (1 - c)   # dmax - newmin, after the rescale
+    newmin = dmax - rng
+    ax.set_ylim(newmin, dmax)
+    step_y = lane_px * rng / axheight_px if axheight_px else lane_px
+
     for center, ids, lane in placed:
-        y = mid + (lane - (n - 1) / 2) * step_y
-        ax.plot([center, center], [0, y], color="0.8", linewidth=0.6, alpha=0.6, zorder=0)
+        y = -(gap + (lane + 0.5) * step_y)
+        ax.plot([center, center], [0, y], color="0.8", linewidth=0.6, alpha=0.5, zorder=0)
         ax.annotate(
             "\n".join(ids), (center, y), ha="center", va="center",
             fontsize=fontsize, color="tab:purple", zorder=7,
