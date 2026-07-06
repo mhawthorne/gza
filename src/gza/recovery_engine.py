@@ -1358,6 +1358,12 @@ def list_failed_tasks_for_recovery(
     if read_context is not None and read_context.merge_context is None:
         read_context.merge_context = merge_context
     failed = list(read_context.failed_tasks()) if read_context is not None else [task for task in store.get_all() if task.status == "failed"]
+    if read_context is not None and read_context.recovery_scope_task_ids is not None:
+        failed = [
+            task
+            for task in failed
+            if task.id is not None and task.id in read_context.recovery_scope_task_ids
+        ]
     if tags:
         from .task_query import normalize_tag_filters, task_matches_tag_filters
 

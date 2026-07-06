@@ -2040,6 +2040,46 @@ def test_query_lineage_owner_rows_hides_failed_root_resolved_by_completed_recove
     assert rows == ()
 
 
+def test_query_lineage_owner_rows_tag_scope_keeps_untagged_recovery_descendant_resolution(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    tag = "v0.5.0"
+
+    failed = store.add("Failed implement", task_type="implement", tags=(tag,))
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.session_id = "sess-root"
+    failed.branch = "feature/recovered-lineage-tagged"
+    failed.completed_at = datetime(2026, 5, 12, 9, 0, tzinfo=UTC)
+    store.update(failed)
+
+    resumed = store.add(failed.prompt, task_type="implement", based_on=failed.id)
+    assert resumed.id is not None
+    _set_completed(
+        resumed,
+        when=datetime(2026, 5, 12, 10, 0, tzinfo=UTC),
+        branch=failed.branch,
+        has_commits=True,
+    )
+    resumed.merge_status = "merged"
+    resumed.session_id = failed.session_id
+    store.update(resumed)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, tags=(tag,), include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=MagicMock(),
+        target_branch="main",
+    )
+
+    assert rows == ()
+
+
 def test_query_lineage_owner_rows_keeps_terminal_owner_visible_when_same_unit_leaf_is_live_unmerged(
     tmp_path: Path,
 ) -> None:
@@ -3254,6 +3294,45 @@ def test_query_lineage_owner_rows_hides_branchless_moot_prerequisite_unmerged_fa
     assert [entry.task.id for entry in entries] == []
 
 
+def test_query_lineage_owner_rows_tag_scope_keeps_untagged_dependency_resolution(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    tag = "v0.5.0"
+
+    dependency = store.add("Merged dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
+    store.update(dependency)
+
+    failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id, tags=(tag,))
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.has_commits = False
+    failed.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(failed)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, tags=(tag,), include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=MagicMock(),
+        target_branch="main",
+    )
+
+    failed_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert failed.id not in failed_leaf_ids
+
+
 def test_query_lineage_owner_rows_keeps_terminal_owner_visible_for_failed_leaf_with_unique_unmerged_work(
     tmp_path: Path,
 ) -> None:
@@ -3442,6 +3521,123 @@ def test_query_lineage_owner_rows_hides_failed_same_slice_leaf_resolved_by_lande
     }
     assert failed.id not in failed_leaf_ids
     assert failed.id not in unresolved_ids
+
+
+def test_query_lineage_owner_rows_tag_scope_keeps_untagged_merged_lineage_resolution(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    tag = "v0.5.0"
+
+    plan = store.add("Plan source", task_type="plan")
+    review = store.add("Plan review", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+
+    failed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+        tags=(tag,),
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.completed_at = datetime(2026, 6, 28, 8, 0, tzinfo=UTC)
+    store.update(failed)
+
+    landed = store.add(
+        _plan_review_slice_prompt(plan_id=plan.id, review_id=review.id, slice_id="S1"),
+        task_type="implement",
+        based_on=plan.id,
+        review_scope="Review only the parser slice.",
+    )
+    assert landed.id is not None
+    landed.status = "completed"
+    landed.branch = "feature/lineage-same-slice-landed-tagged"
+    landed.has_commits = True
+    landed.completed_at = datetime(2026, 6, 28, 9, 0, tzinfo=UTC)
+    store.update(landed)
+    landed_unit = store.create_merge_unit(
+        source_branch=landed.branch,
+        target_branch="main",
+        owner_task_id=landed.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(landed.id, landed_unit.id, "owner")
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, tags=(tag,), include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=None,
+        target_branch="main",
+    )
+
+    failed_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    unresolved_ids = {
+        task.id
+        for row in rows
+        for task in row.unresolved_tasks
+        if task.id is not None
+    }
+    assert failed.id not in failed_leaf_ids
+    assert failed.id not in unresolved_ids
+
+
+def test_query_lineage_owner_rows_tag_scope_does_not_pull_unrelated_failed_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    tag = "v0.5.0"
+
+    tagged_failed = store.add("Tagged failed implementation", task_type="implement", tags=(tag,))
+    assert tagged_failed.id is not None
+    tagged_failed.status = "failed"
+    tagged_failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    tagged_failed.completed_at = datetime(2026, 6, 28, 8, 0, tzinfo=UTC)
+    store.update(tagged_failed)
+
+    unrelated_tagged = store.add("Tagged pending task", task_type="implement", tags=(tag,))
+    assert unrelated_tagged.id is not None
+
+    unrelated_failed = store.add("Unrelated failed implementation", task_type="implement")
+    assert unrelated_failed.id is not None
+    unrelated_failed.status = "failed"
+    unrelated_failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    unrelated_failed.completed_at = datetime(2026, 6, 28, 9, 0, tzinfo=UTC)
+    store.update(unrelated_failed)
+
+    touched_failed_ids: list[str] = []
+    original = recovery_engine.is_chain_resolved_by_recovery
+
+    def _record_touched(store_arg, task, *args, **kwargs):
+        if task.id is not None:
+            touched_failed_ids.append(task.id)
+        return original(store_arg, task, *args, **kwargs)
+
+    monkeypatch.setattr(recovery_engine, "is_chain_resolved_by_recovery", _record_touched)
+
+    query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, tags=(tag,), include_skipped=True, max_recovery_attempts=1),
+        config=config,
+        git=MagicMock(),
+        target_branch="main",
+    )
+
+    assert tagged_failed.id in touched_failed_ids
+    assert unrelated_failed.id not in touched_failed_ids
 
 
 @pytest.mark.parametrize("sibling_has_commits", (False, None))

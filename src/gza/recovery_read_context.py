@@ -25,6 +25,7 @@ class RecoveryReadContext:
     lineage_tree_by_root_task_id: dict[str, object] = field(default_factory=dict)
     lineage_by_root_task_id: dict[str, tuple[DbTask, ...]] = field(default_factory=dict)
     dependency_completion_by_task_id: dict[str, DbTask | None] = field(default_factory=dict)
+    recovery_scope_task_ids: frozenset[str] | None = None
     pending_prerequisite_no_work_reconciliations: dict[
         str,
         tuple[DbTask, Literal["empty", "redundant"]],

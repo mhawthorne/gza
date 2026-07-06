@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -1146,6 +1146,64 @@ def _candidate_owner_rows(
     return tuple(candidates)
 
 
+def _build_tag_recovery_scope(
+    indexes: _LineageIndexes,
+    query: LineageOwnerQuery,
+    *,
+    tag_matcher,
+) -> frozenset[str] | None:
+    if query.tags is None and query.exclude_tags is None:
+        return None
+
+    def _matches_tag_scope(task: DbTask) -> bool:
+        if query.tags is not None and not tag_matcher(task_tags=task.tags, tag_filters=query.tags, any_tag=query.any_tag):
+            return False
+        if query.exclude_tags is not None and tag_matcher(
+            task_tags=task.tags,
+            tag_filters=query.exclude_tags,
+            any_tag=query.any_tag,
+        ):
+            return False
+        return True
+
+    scoped_task_ids: set[str] = set()
+    queue: deque[str] = deque()
+
+    def _add_task(task: DbTask | None) -> None:
+        if task is None or task.id is None or task.id in scoped_task_ids:
+            return
+        scoped_task_ids.add(task.id)
+        queue.append(task.id)
+
+    for task in indexes.tasks:
+        if _matches_tag_scope(task):
+            _add_task(task)
+
+    while queue:
+        task_id = queue.popleft()
+        current_task = indexes.task_by_id.get(task_id)
+        if current_task is None:
+            continue
+
+        owner = indexes.owner_by_task_id.get(task_id)
+        if owner is not None and owner.id is not None:
+            for member in indexes.members_by_owner_id.get(owner.id, ()):
+                _add_task(member)
+            for member in indexes.skipped_same_branch_members_by_root_id.get(owner.id, ()):
+                _add_task(member)
+
+        for parent_id in (current_task.based_on, current_task.depends_on):
+            if parent_id is not None:
+                _add_task(indexes.task_by_id.get(parent_id))
+
+        for child in indexes.based_on_children.get(task_id, ()):
+            _add_task(child)
+        for child in indexes.depends_on_children.get(task_id, ()):
+            _add_task(child)
+
+    return frozenset(scoped_task_ids)
+
+
 def query_lineage_owner_rows(
     store: SqliteTaskStore,
     query: LineageOwnerQuery,
@@ -1255,6 +1313,11 @@ def _query_lineage_owner_rows_with_context(
         merge_units_by_task_id=indexes.merge_units_by_task_id,
         historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
         allow_reconcile_mutation=store._read_session_depth == 0,
+        recovery_scope_task_ids=_build_tag_recovery_scope(
+            indexes,
+            query,
+            tag_matcher=task_matches_tag_filters,
+        ),
     )
     if isinstance(git, Git) and target_branch is not None:
         read_context.merge_context = build_merge_context_from_git(git, target_branch)
