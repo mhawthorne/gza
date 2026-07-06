@@ -302,6 +302,8 @@ def _watch_no_progress_park_is_stale(
         return True
     if merge_unit.state not in {"unmerged", "blocked", "stale"}:
         return True
+    if observation.subject_task_id is not None and merge_unit.owner_task_id != observation.subject_task_id:
+        return True
     return subject_task.status in {"failed", "dropped"}
 
 

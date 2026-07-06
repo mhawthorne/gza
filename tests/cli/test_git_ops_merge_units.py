@@ -542,7 +542,7 @@ def test_merge_explicit_retry_task_id_uses_actionable_member_when_owner_failed(t
     assert fake_git.merged == [("feature/explicit-retry", False)]
     unit = store.resolve_merge_unit_for_task(retry.id)
     assert unit is not None
-    assert unit.merged_by_task_id == failed.id
+    assert unit.merged_by_task_id == retry.id
 
 
 def test_merge_explicit_improve_task_uses_owner_for_provenance_and_squash_subject(tmp_path: Path) -> None:

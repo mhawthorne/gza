@@ -3380,7 +3380,7 @@ class TestMergeStatus:
         assert {member.id for member in store.list_tasks_for_merge_unit(unit.id)} == {task.id}
 
     def test_get_unmerged_prefers_actionable_merge_unit_member_over_failed_owner(self, tmp_path: Path) -> None:
-        """Unit-backed reads should surface the mergeable member, not a failed historical owner."""
+        """Unit-backed reads should surface the mergeable member and keep ownership on the live tip."""
         store = SqliteTaskStore(tmp_path / "test.db")
 
         failed = store.add(prompt="Failed implementation", task_type="implement")
@@ -3398,8 +3398,8 @@ class TestMergeStatus:
 
         unit = store.resolve_merge_unit_for_task(recovery.id)
         assert unit is not None
-        assert unit.owner_task_id == failed.id
-        assert store._legacy_merge_status_owner_for_unit(unit).id == failed.id
+        assert unit.owner_task_id == recovery.id
+        assert store._legacy_merge_status_owner_for_unit(unit).id == recovery.id
 
         assert [task.id for task in store.get_unmerged()] == [recovery.id]
         representative = store.resolve_merge_unit_representative_task(unit, require_actionable=True)
@@ -3502,7 +3502,7 @@ class TestMergeStatus:
         assert {member.id for member in store.list_tasks_for_merge_unit(unit.id)} == {task.id}
 
     def test_get_unmerged_prefers_actionable_merge_unit_member_over_failed_owner(self, tmp_path: Path) -> None:
-        """Unit-backed reads should surface the mergeable member, not a failed historical owner."""
+        """Unit-backed reads should surface the mergeable member and keep ownership on the live tip."""
         store = SqliteTaskStore(tmp_path / "test.db")
 
         failed = store.add(prompt="Failed implementation", task_type="implement")
@@ -3520,13 +3520,356 @@ class TestMergeStatus:
 
         unit = store.resolve_merge_unit_for_task(recovery.id)
         assert unit is not None
-        assert unit.owner_task_id == failed.id
-        assert store._legacy_merge_status_owner_for_unit(unit).id == failed.id
+        assert unit.owner_task_id == recovery.id
+        assert store._legacy_merge_status_owner_for_unit(unit).id == recovery.id
 
         assert [task.id for task in store.get_unmerged()] == [recovery.id]
         representative = store.resolve_merge_unit_representative_task(unit, require_actionable=True)
         assert representative is not None
         assert representative.id == recovery.id
+
+    def test_chained_successful_implements_advance_merge_unit_owner_to_branch_tip(self, tmp_path: Path) -> None:
+        """Attaching later successful implement slices should advance the persisted owner to the newest tip."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        first = store.add(prompt="First slice", task_type="implement")
+        store.mark_completed(first, has_commits=True, branch="feature/shared-tip")
+        assert first.id is not None
+        first_unit = store.resolve_merge_unit_for_task(first.id)
+        assert first_unit is not None
+        assert first_unit.owner_task_id == first.id
+
+        second = store.add(prompt="Second slice", task_type="implement", based_on=first.id)
+        store.mark_completed(second, has_commits=True, branch="feature/shared-tip")
+        assert second.id is not None
+        second_unit = store.resolve_merge_unit_for_task(second.id)
+        assert second_unit is not None
+        assert second_unit.id == first_unit.id
+        assert second_unit.owner_task_id == second.id
+
+        third = store.add(prompt="Third slice", task_type="implement", based_on=second.id)
+        store.mark_completed(third, has_commits=True, branch="feature/shared-tip")
+        assert third.id is not None
+        third_unit = store.resolve_merge_unit_for_task(third.id)
+        assert third_unit is not None
+        assert third_unit.id == first_unit.id
+        assert third_unit.owner_task_id == third.id
+
+        conn = sqlite3.connect(tmp_path / "test.db")
+        roles = {
+            row[0]: row[1]
+            for row in conn.execute(
+                """
+                SELECT task_id, role
+                FROM merge_unit_tasks
+                WHERE project_id = ? AND merge_unit_id = ?
+                """,
+                ("default", third_unit.id),
+            ).fetchall()
+        }
+        conn.close()
+        assert roles == {
+            first.id: "contributor",
+            second.id: "contributor",
+            third.id: "owner",
+        }
+
+    @pytest.mark.parametrize("lineage_link_field", ["based_on", "depends_on"])
+    def test_merge_unit_owner_advances_to_dependency_linked_successful_implement_on_attach(
+        self,
+        tmp_path: Path,
+        lineage_link_field: str,
+    ) -> None:
+        """Attaching a later successful same-branch implement should advance ownership to the branch tip."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        first = store.add(prompt="First slice", task_type="implement")
+        store.mark_completed(first, has_commits=True, branch="feature/owner-attach")
+        assert first.id is not None
+
+        second_kwargs = {lineage_link_field: first.id}
+        if lineage_link_field == "depends_on":
+            second_kwargs["same_branch"] = True
+        second = store.add(prompt="Second slice", task_type="implement", **second_kwargs)
+        store.mark_completed(second, has_commits=True, branch="feature/owner-attach")
+        assert second.id is not None
+
+        unit = store.resolve_merge_unit_for_task(second.id)
+        assert unit is not None
+        assert unit.owner_task_id == second.id
+
+        roles = {
+            member.id: member
+            for member in store.list_tasks_for_merge_unit(unit.id)
+            if member.id in {first.id, second.id}
+        }
+        assert set(roles) == {first.id, second.id}
+
+        conn = sqlite3.connect(tmp_path / "test.db")
+        attached_roles = {
+            row[0]: row[1]
+            for row in conn.execute(
+                """
+                SELECT task_id, role
+                FROM merge_unit_tasks
+                WHERE project_id = ? AND merge_unit_id = ?
+                """,
+                ("default", unit.id),
+            ).fetchall()
+        }
+        conn.close()
+        assert attached_roles[first.id] == "contributor"
+        assert attached_roles[second.id] == "owner"
+
+    def test_depends_on_without_same_branch_does_not_attach_merge_unit_lineage(self, tmp_path: Path) -> None:
+        """A same-branch implement needs same_branch=True before depends_on can share ownership."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        first = store.add(prompt="First slice", task_type="implement")
+        store.mark_completed(first, has_commits=True, branch="feature/no-same-branch")
+        assert first.id is not None
+        first_unit = store.resolve_merge_unit_for_task(first.id)
+        assert first_unit is not None
+        assert first_unit.owner_task_id == first.id
+
+        second = store.add(prompt="Second slice", task_type="implement", depends_on=first.id)
+        store.mark_completed(second, has_commits=True, branch="feature/no-same-branch")
+        assert second.id is not None
+
+        second_unit = store.resolve_merge_unit_for_task(second.id)
+        assert second_unit is not None
+        assert second_unit.id != first_unit.id
+        assert second_unit.owner_task_id == second.id
+
+        refreshed_first_unit = store.get_merge_unit(first_unit.id)
+        assert refreshed_first_unit is not None
+        assert refreshed_first_unit.owner_task_id == first.id
+        assert {task.id for task in store.list_tasks_for_merge_unit(first_unit.id)} == {first.id}
+        assert {task.id for task in store.list_tasks_for_merge_unit(second_unit.id)} == {second.id}
+
+    def test_non_implement_depends_on_same_branch_task_does_not_attach_as_lineage(self, tmp_path: Path) -> None:
+        """Non-implement same-branch dependents stay separate work units unless based_on proves lineage."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        first = store.add(prompt="First slice", task_type="implement")
+        store.mark_completed(first, has_commits=True, branch="feature/non-implement-dependent")
+        assert first.id is not None
+        first_unit = store.resolve_merge_unit_for_task(first.id)
+        assert first_unit is not None
+        assert first_unit.owner_task_id == first.id
+
+        second = store.add(prompt="Dependent task", task_type="task", depends_on=first.id, same_branch=True)
+        store.mark_completed(second, has_commits=True, branch="feature/non-implement-dependent")
+        assert second.id is not None
+
+        second_unit = store.resolve_merge_unit_for_task(second.id)
+        assert second_unit is not None
+        assert second_unit.id != first_unit.id
+        assert second_unit.owner_task_id == second.id
+
+        refreshed_first_unit = store.get_merge_unit(first_unit.id)
+        assert refreshed_first_unit is not None
+        assert refreshed_first_unit.owner_task_id == first.id
+        assert {task.id for task in store.list_tasks_for_merge_unit(first_unit.id)} == {first.id}
+        assert {task.id for task in store.list_tasks_for_merge_unit(second_unit.id)} == {second.id}
+
+    @pytest.mark.parametrize("lineage_link_field", ["based_on", "depends_on"])
+    def test_pre_attached_successful_implement_completion_advances_merge_unit_owner(
+        self,
+        tmp_path: Path,
+        lineage_link_field: str,
+    ) -> None:
+        """Completing an already-attached same-branch implement must still advance merge-unit ownership."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        first = store.add(prompt="First slice", task_type="implement")
+        store.mark_completed(first, has_commits=True, branch="feature/pre-attached-owner")
+        assert first.id is not None
+        first_unit = store.resolve_merge_unit_for_task(first.id)
+        assert first_unit is not None
+        assert first_unit.owner_task_id == first.id
+
+        second_kwargs = {
+            lineage_link_field: first.id,
+            "depends_on" if lineage_link_field == "based_on" else "based_on": first.id,
+        }
+        if lineage_link_field == "depends_on":
+            second_kwargs["same_branch"] = True
+        second = store.add(prompt="Second slice", task_type="implement", **second_kwargs)
+        assert second.id is not None
+        second.branch = "feature/pre-attached-owner"
+        store.update(second)
+
+        preattached_unit = store.get_or_create_merge_unit_for_task(second)
+        assert preattached_unit is not None
+        assert preattached_unit.id == first_unit.id
+        assert preattached_unit.owner_task_id == first.id
+
+        store.mark_completed(second, has_commits=True, branch="feature/pre-attached-owner")
+
+        completed_unit = store.resolve_merge_unit_for_task(second.id)
+        assert completed_unit is not None
+        assert completed_unit.id == first_unit.id
+        assert completed_unit.owner_task_id == second.id
+
+        conn = sqlite3.connect(tmp_path / "test.db")
+        attached_roles = {
+            row[0]: row[1]
+            for row in conn.execute(
+                """
+                SELECT task_id, role
+                FROM merge_unit_tasks
+                WHERE project_id = ? AND merge_unit_id = ?
+                """,
+                ("default", completed_unit.id),
+            ).fetchall()
+        }
+        conn.close()
+        assert attached_roles[first.id] == "contributor"
+        assert attached_roles[second.id] == "owner"
+
+    @pytest.mark.parametrize("lineage_link_field", ["based_on", "depends_on"])
+    def test_store_open_repairs_stale_unmerged_multi_implement_owner_only_once(
+        self,
+        tmp_path: Path,
+        lineage_link_field: str,
+    ) -> None:
+        """Startup repair should repoint stale live multi-implement owners, skip other units, and be idempotent."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        first = store.add(prompt="First slice", task_type="implement")
+        store.mark_completed(first, has_commits=True, branch="feature/stale-live-owner")
+        assert first.id is not None
+        second_kwargs = {lineage_link_field: first.id}
+        if lineage_link_field == "depends_on":
+            second_kwargs["same_branch"] = True
+        second = store.add(prompt="Second slice", task_type="implement", **second_kwargs)
+        store.mark_completed(second, has_commits=True, branch="feature/stale-live-owner")
+        assert second.id is not None
+        live_unit = store.resolve_merge_unit_for_task(second.id)
+        assert live_unit is not None
+
+        single = store.add(prompt="Single slice", task_type="implement")
+        store.mark_completed(single, has_commits=True, branch="feature/single-owner")
+        assert single.id is not None
+        single_unit = store.resolve_merge_unit_for_task(single.id)
+        assert single_unit is not None
+
+        merged_first = store.add(prompt="Merged first slice", task_type="implement")
+        store.mark_completed(merged_first, has_commits=True, branch="feature/merged-owner")
+        assert merged_first.id is not None
+        merged_second_kwargs = {lineage_link_field: merged_first.id}
+        if lineage_link_field == "depends_on":
+            merged_second_kwargs["same_branch"] = True
+        merged_second = store.add(prompt="Merged second slice", task_type="implement", **merged_second_kwargs)
+        store.mark_completed(merged_second, has_commits=True, branch="feature/merged-owner")
+        assert merged_second.id is not None
+        merged_unit = store.resolve_merge_unit_for_task(merged_second.id)
+        assert merged_unit is not None
+        store.set_merge_unit_state(merged_unit.id, "merged")
+
+        stale_now = datetime.now(UTC).isoformat()
+        with store._connect() as conn:
+            conn.execute(
+                """
+                UPDATE merge_units
+                SET owner_task_id = ?, updated_at = ?
+                WHERE project_id = ? AND id = ?
+                """,
+                (first.id, stale_now, store._project_id, live_unit.id),
+            )
+            conn.execute(
+                """
+                UPDATE merge_unit_tasks
+                SET role = CASE task_id
+                    WHEN ? THEN 'owner'
+                    WHEN ? THEN 'contributor'
+                    ELSE role
+                END
+                WHERE project_id = ? AND merge_unit_id = ? AND task_id IN (?, ?)
+                """,
+                (first.id, second.id, store._project_id, live_unit.id, first.id, second.id),
+            )
+            conn.execute(
+                """
+                UPDATE merge_units
+                SET owner_task_id = ?, updated_at = ?
+                WHERE project_id = ? AND id = ?
+                """,
+                (merged_first.id, stale_now, store._project_id, merged_unit.id),
+            )
+            conn.execute(
+                """
+                UPDATE merge_unit_tasks
+                SET role = CASE task_id
+                    WHEN ? THEN 'owner'
+                    WHEN ? THEN 'contributor'
+                    ELSE role
+                END
+                WHERE project_id = ? AND merge_unit_id = ? AND task_id IN (?, ?)
+                """,
+                (merged_first.id, merged_second.id, store._project_id, merged_unit.id, merged_first.id, merged_second.id),
+            )
+
+        reopened = SqliteTaskStore(db_path)
+        repaired_live = reopened.get_merge_unit(live_unit.id)
+        repaired_single = reopened.get_merge_unit(single_unit.id)
+        repaired_merged = reopened.get_merge_unit(merged_unit.id)
+        assert repaired_live is not None
+        assert repaired_single is not None
+        assert repaired_merged is not None
+        assert repaired_live.owner_task_id == second.id
+        assert repaired_single.owner_task_id == single.id
+        assert repaired_merged.owner_task_id == merged_first.id
+        assert reopened.repair_stale_unmerged_merge_unit_owners() == 0
+
+        conn = sqlite3.connect(db_path)
+        live_roles = {
+            row[0]: row[1]
+            for row in conn.execute(
+                """
+                SELECT task_id, role
+                FROM merge_unit_tasks
+                WHERE project_id = ? AND merge_unit_id = ?
+                """,
+                ("default", live_unit.id),
+            ).fetchall()
+        }
+        conn.close()
+        assert live_roles[first.id] == "contributor"
+        assert live_roles[second.id] == "owner"
+
+    @pytest.mark.parametrize("lineage_link_field", ["based_on", "depends_on"])
+    def test_store_open_skips_all_failed_multi_implement_unmerged_units(
+        self,
+        tmp_path: Path,
+        lineage_link_field: str,
+    ) -> None:
+        """Startup owner repair must not fail on same-branch units with only failed implement attempts."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        first = store.add(prompt="First failed slice", task_type="implement")
+        store.mark_failed(first, has_commits=True, branch="feature/all-failed-owner")
+        assert first.id is not None
+
+        second_kwargs = {lineage_link_field: first.id}
+        if lineage_link_field == "depends_on":
+            second_kwargs["same_branch"] = True
+        second = store.add(prompt="Second failed slice", task_type="implement", **second_kwargs)
+        store.mark_failed(second, has_commits=True, branch="feature/all-failed-owner")
+        assert second.id is not None
+
+        unit = store.resolve_merge_unit_for_task(second.id)
+        assert unit is not None
+        assert unit.owner_task_id == first.id
+
+        reopened = SqliteTaskStore(db_path)
+        repaired_unit = reopened.get_merge_unit(unit.id)
+        assert repaired_unit is not None
+        assert repaired_unit.owner_task_id == first.id
+        assert reopened.repair_stale_unmerged_merge_unit_owners() == 0
 
     def test_merge_unit_backfill_attaches_existing_branchless_reviews_with_review_role(self, tmp_path: Path) -> None:
         """Backfilling an implementation unit should attach existing branchless reviews."""

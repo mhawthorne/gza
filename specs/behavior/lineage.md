@@ -37,13 +37,15 @@ records provenance on recovery edges.
 | Edge / field | Meaning | Walked for |
 |--------------|---------|-----------|
 | `based_on` | **Context & provenance.** The new task derives from an existing one: branch/context inheritance (improve, rebase, fix derived from an implement) *and* recovery chains (a retry/resume derived from the attempt it replaces). | Owner resolution, recovery-chain walks, latest-node resolution. |
-| `depends_on` | **Execution ordering only.** This task MUST NOT start until its dependency is satisfied (L1). | Scheduling/gating only. |
+| `depends_on` | **Execution ordering, plus same-branch implement-slice attachment.** This task MUST NOT start until its dependency is satisfied (L1). For `implement` tasks that explicitly continue the same branch (`same_branch = true` and matching `branch`), `depends_on` MAY also prove that the new slice belongs to the same merge unit as the linked implement lineage (L2 / merge-unit ownership). | Scheduling/gating always; same-branch implement merge-unit attachment only. |
 | `recovery_origin` | Provenance tag on a `based_on` edge: `retry`, `resume`, `manual`, or none. Distinguishes a recovery attempt from an ordinary derived task. | Classifying whether a `based_on` child continues a lineage vs. starts new work. |
 
 - **E1 — Two edges, two purposes.** `based_on` and `depends_on` are distinct and MUST NOT
-  be conflated. Recovery and ownership questions MUST be answered by walking `based_on`;
-  `depends_on` MUST NOT be walked to decide that a dependency was satisfied by a retry
-  (L1), nor to decide ownership (L2).
+  be conflated. Recovery-chain questions MUST be answered by walking `based_on`, and
+  dependency satisfaction (L1) MUST NOT walk `depends_on` descendants looking for a retry.
+  Ownership / merge-unit attachment (L2) MAY additionally use a `depends_on` edge only for
+  a same-branch `implement` slice that explicitly continues the linked branch; outside that
+  narrow case, ownership still follows `based_on`.
 - **E2 — Recovery provenance is explicit.** A retry or resume task MUST record
   `based_on = <the attempt it replaces>` and a `recovery_origin` naming its role. The
   graph MUST be walkable to find a recovery chain from provenance alone, without
@@ -68,9 +70,11 @@ records provenance on recovery edges.
   membership cannot be established safely, the operation MUST report *unsatisfied /
   unresolved* and let the caller stop for a human, never guess in a direction that could
   run or merge work on a false premise. (Mirrors lifecycle P3/P4.)
-- **P5 — Based-on, not depends-on, defines a lineage.** Membership in a lineage (and thus
-  ownership and recovery-chain walks) follows `based_on`. `depends_on` connects *separate*
-  lineages in execution order; it does not make two tasks the same unit.
+- **P5 — Based-on defines lineage; depends-on can attach same-branch implement slices to the
+  active merge unit.** Recovery-chain walks and ordinary lineage membership follow
+  `based_on`. `depends_on` still connects separate units in execution order by default, but
+  a same-branch `implement` slice that explicitly continues the dependency's branch MAY
+  attach to that merge unit and share its canonical owner-tip progression.
 - **P6 — Terminal landed/no-work units are not actionable.** An active merge unit in a
   terminal landed/no-work state (`merged`, `empty`, or `redundant`) is not an actionable
   owner row on operator or recovery-selection surfaces. `gza incomplete`, watch
@@ -138,7 +142,9 @@ The intended resolution order, first match wins:
 1. **Canonical merge-unit owner.** If the task is attached to a merge unit, the unit's
    recorded owner is the owner.
 2. **Shared-branch root.** Else, if the task is a descendant sharing the work unit's
-   branch (an improve/rebase that did not fork a new branch), the branch root is the owner.
+   branch (an improve/rebase that did not fork a new branch, or a same-branch implement
+   slice attached through the narrow `depends_on` rule above), the branch root / shared
+   merge unit is the owner.
 3. **Recovery-chain root.** Else, if the task is `failed`, the root of its recovery chain
    is the owner — so a string of failed attempts presents as one unit, not many.
 4. **Same-type branch owner.** Else, walk `based_on` ancestors of the same task type until
@@ -267,6 +273,11 @@ It is the object L1/L2 ultimately resolve against.
   `state` not in `{dropped, superseded}` are active.
 - Tasks attach many-to-one to a merge unit. The unit, not any single task, is the "needs
   attention" row operators act on (P1).
+- Same-branch `implement` slices are allowed to keep that one-unit model even when the
+  linking edge is `depends_on` rather than `based_on`, as long as the task explicitly
+  continues the same branch. In that case the later successful implement slice becomes the
+  canonical `owner_task_id` for the shared unit just as a `based_on` same-branch slice
+  would.
 - Proven-merged truth for any member of a merge unit, including a non-owner same-branch
   follow-up (`improve`/`fix`/`rebase`), MUST resolve the active unit to its terminal
   state. When that proof lands the unit as `merged`, merge provenance MUST stay
@@ -295,10 +306,10 @@ with that work as it lands.*
   old or externally damaged databases. Intended behavior is that every unit has a canonical
   owner and every recovery edge carries `recovery_origin`. These fallbacks should be named
   as debt with a removal condition, not specified as desired behavior.
-- **OQ3 — Does `depends_on` ever participate in resolution?** This draft asserts strictly
-  no (P5/E1): lineage membership, ownership, and recovery satisfaction follow `based_on`
-  only, and `depends_on` is purely scheduling. Confirm no resolution path legitimately
-  needs to walk `depends_on`.
+- **OQ3 — Boundary of `depends_on` participation.** This draft now ratifies one narrow
+  ownership use: a same-branch `implement` slice may attach to the linked merge unit via
+  `depends_on`. Recovery satisfaction and recovery-chain walks still follow `based_on`
+  only. Revisit only if another resolution path needs broader `depends_on` semantics.
 - **OQ4 — Legacy compatibility boundary for no-work states.** The merge-unit
   `empty`/`redundant` dependency contract is explicit in L1; remaining open work is only
   about how long task-row-only compatibility fallbacks remain supported before all

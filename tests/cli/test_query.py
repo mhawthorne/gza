@@ -11739,7 +11739,7 @@ class TestUnmergedReviewStatus:
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
-        assert f"⚡ {root_impl.id}" in normalized
+        assert f"⚡ {impl_retry.id}" in normalized
         assert "review: review stale" in normalized
         assert f"latest implement {impl_retry.id}" in normalized
         assert "review: reviewed [✓ approved]" not in normalized
@@ -11823,7 +11823,7 @@ class TestUnmergedReviewStatus:
         assert result.returncode == 0
 
         normalized = " ".join(result.stdout.split())
-        assert f"⚡ {root_impl.id}" in normalized
+        assert f"⚡ {resumed_impl.id}" in normalized
         assert "review: review stale" in normalized
         assert f"review state cleared after last review {retry_review.id}" in normalized
         assert "review: no review" not in normalized
@@ -14167,7 +14167,7 @@ class TestUnmergedUnifiedQueryOutput:
         assert re.search(r"Progress: running unmerged query over \d+ task rows for \d+ selected branches", captured.err)
         assert re.search(r"Progress: rendering \d+ row\(s\) from \d+ filtered result\(s\) as rich", captured.err)
 
-    def test_unmerged_descendants_only_lineage_excludes_depends_on_only_child(
+    def test_unmerged_descendants_only_lineage_promotes_depends_on_only_child_to_owner_tip(
         self,
         tmp_path: Path,
         capsys: pytest.CaptureFixture[str],
@@ -14215,11 +14215,11 @@ class TestUnmergedUnifiedQueryOutput:
         captured = capsys.readouterr()
         assert result == 0
         normalized = " ".join(captured.out.split())
-        assert impl.id in normalized
+        assert impl.id not in normalized
         assert review.id in normalized
-        assert improve.id in normalized
-        assert "Depends-only implement noise" not in normalized
-        assert depends_only_impl.id not in normalized
+        assert improve.id not in normalized
+        assert "Depends-only implement noise" in normalized
+        assert depends_only_impl.id in normalized
 
     def test_descendants_only_unmerged_lineage_tree_dedupes_direct_review_children(self) -> None:
         store = MagicMock()

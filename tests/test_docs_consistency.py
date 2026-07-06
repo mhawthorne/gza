@@ -1809,6 +1809,18 @@ def test_lineage_spec_and_operator_docs_define_stale_unmerged_sweep_contract() -
     assert "proof error aborts the command before mutation" in config_docs
 
 
+def test_lineage_spec_ratifies_same_branch_depends_on_implement_owner_attachment() -> None:
+    """The behavior spec should explicitly allow the same-branch depends_on owner-tip rule."""
+    repo_root = Path(__file__).resolve().parents[1]
+    lineage_spec = (repo_root / "specs" / "behavior" / "lineage.md").read_text()
+    lineage_flat = " ".join(lineage_spec.split())
+
+    assert "Execution ordering, plus same-branch implement-slice attachment." in lineage_spec
+    assert "Ownership / merge-unit attachment (L2) MAY additionally use a `depends_on` edge only for" in lineage_spec
+    assert "a same-branch `implement` slice that explicitly continues the dependency's branch MAY" in lineage_spec
+    assert "the later successful implement slice becomes the canonical `owner_task_id` for the shared unit" in lineage_flat
+
+
 def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:
     """CLI help and bundled skills should avoid legacy base36 task-ID examples."""
     repo_root = Path(__file__).resolve().parents[1]

@@ -459,6 +459,16 @@ def merge_unit_membership_role(task: "Task") -> str:
     return "context"
 
 
+def merge_unit_attached_task_role(task: "Task", owner_task_id: str | None) -> str:
+    """Return the persisted membership role for an attached task."""
+    if task.id is not None and task.id == owner_task_id:
+        return "owner"
+    role = merge_unit_membership_role(task)
+    if role == "owner":
+        return "contributor"
+    return role
+
+
 def merge_unit_supersede_completion_reason(
     unit_id: str,
     *,
@@ -768,6 +778,15 @@ def _task_is_actionable_merge_unit_member(task: "Task", unit: MergeUnit) -> bool
     if task.status not in {"completed", "unmerged"}:
         return False
     return task.branch == unit.source_branch
+
+
+def _task_is_successful_merge_unit_implement(task: "Task", unit: MergeUnit) -> bool:
+    """Return whether ``task`` is a successful implementation tip candidate for ``unit``."""
+    if task.task_type != "implement":
+        return False
+    if task.branch != unit.source_branch:
+        return False
+    return task.status in {"completed", "merged"} or task.merge_status == "merged"
 
 
 @dataclass
@@ -4172,6 +4191,7 @@ class SqliteTaskStore:
         else:
             self._ensure_db()
             self.repair_inconsistent_unmerged_merge_units()
+            self.repair_stale_unmerged_merge_unit_owners()
             self._ensure_project_row()
 
     @classmethod
@@ -8466,6 +8486,92 @@ class SqliteTaskStore:
             return next((task for task in tasks if task.id == preferred_task_id), None)
         return tasks[0] if tasks else None
 
+    def resolve_merge_unit_owner_tip_task(self, unit: MergeUnit) -> Task | None:
+        """Return the latest successful implementation tip for ``unit``."""
+        tip_candidates = [
+            task
+            for task in self.list_tasks_for_merge_unit(unit.id)
+            if _task_is_successful_merge_unit_implement(task, unit)
+        ]
+        if not tip_candidates:
+            return None
+        return max(
+            tip_candidates,
+            key=lambda task: (
+                task.completed_at or task.created_at or datetime.min.replace(tzinfo=UTC),
+                task_id_numeric_key(task.id),
+            ),
+        )
+
+    def set_merge_unit_owner_task_id(self, unit_id: str, owner_task_id: str) -> None:
+        """Persist a merge-unit owner change and keep membership roles in sync."""
+        if not self.supports_merge_units():
+            return
+        unit = self.get_merge_unit(unit_id)
+        if unit is None:
+            raise ValueError(f"Merge unit {unit_id} not found")
+        if unit.owner_task_id == owner_task_id:
+            return
+        owner_task = self.get(owner_task_id)
+        if owner_task is None:
+            raise ValueError(f"Owner task {owner_task_id} not found for merge unit {unit_id}")
+        if owner_task.branch != unit.source_branch:
+            raise ValueError(
+                f"Owner task {owner_task_id} is on branch {owner_task.branch!r}; expected {unit.source_branch!r}"
+            )
+
+        previous_owner_task = self.get(unit.owner_task_id) if unit.owner_task_id is not None else None
+        now = _format_db_timestamp(datetime.now(UTC))
+        assert now is not None
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE merge_units
+                SET owner_task_id = ?, updated_at = ?
+                WHERE project_id = ? AND id = ?
+                """,
+                (owner_task_id, now, self._project_id, unit_id),
+            )
+            conn.execute(
+                """
+                UPDATE merge_unit_tasks
+                SET role = 'owner'
+                WHERE project_id = ? AND merge_unit_id = ? AND task_id = ?
+                """,
+                (self._project_id, unit_id, owner_task_id),
+            )
+            if previous_owner_task is not None and previous_owner_task.id is not None:
+                conn.execute(
+                    """
+                    UPDATE merge_unit_tasks
+                    SET role = 'contributor'
+                    WHERE project_id = ? AND merge_unit_id = ? AND task_id = ?
+                    """,
+                    (
+                        self._project_id,
+                        unit_id,
+                        previous_owner_task.id,
+                    ),
+                )
+        self.dual_write_legacy_merge_status(unit_id)
+
+    def sync_merge_unit_owner_to_tip(self, unit_id: str, *, require_tip: bool = False) -> bool:
+        """Advance ``owner_task_id`` to the latest successful implementation tip."""
+        if not self.supports_merge_units():
+            return False
+        unit = self.get_merge_unit(unit_id)
+        if unit is None:
+            raise ValueError(f"Merge unit {unit_id} not found")
+        tip = self.resolve_merge_unit_owner_tip_task(unit)
+        if tip is None or tip.id is None:
+            if require_tip:
+                raise ValueError(f"Could not resolve successful implementation tip for merge unit {unit_id}")
+            return False
+        if unit.owner_task_id == tip.id:
+            return False
+        self.set_merge_unit_owner_task_id(unit_id, tip.id)
+        return True
+
     def attach_task_to_merge_unit(self, task_id: str, merge_unit_id: str, role: str) -> None:
         """Attach a task row to a merge unit."""
         if not self.supports_merge_units():
@@ -8547,6 +8653,16 @@ class SqliteTaskStore:
             ).fetchone()
         return row is not None
 
+    def _depends_on_attaches_merge_unit_lineage(self, dependent: Task, dependency: Task) -> bool:
+        """Return whether ``dependent.depends_on`` proves same-lineage merge-unit membership."""
+        if dependent.depends_on is None or dependent.depends_on != dependency.id:
+            return False
+        if dependent.task_type != "implement" or not dependent.same_branch:
+            return False
+        if dependent.branch is None or dependency.branch is None:
+            return False
+        return dependent.branch == dependency.branch
+
     def _related_branch_tasks_for_merge_unit(self, task: Task, branch_tasks: list[Task]) -> list[Task]:
         """Return same-branch tasks that are provably part of the same work line."""
         if task.id is None:
@@ -8567,14 +8683,26 @@ class SqliteTaskStore:
             if current is None:
                 continue
 
-            for linked_id in (current.based_on, current.depends_on):
-                if linked_id is not None and linked_id in tasks_by_id and linked_id not in related_ids:
-                    stack.append(linked_id)
+            if current.based_on is not None and current.based_on in tasks_by_id and current.based_on not in related_ids:
+                stack.append(current.based_on)
+            if current.depends_on is not None and current.depends_on in tasks_by_id:
+                dependency = tasks_by_id[current.depends_on]
+                if (
+                    self._depends_on_attaches_merge_unit_lineage(current, dependency)
+                    and current.depends_on not in related_ids
+                ):
+                    stack.append(current.depends_on)
 
             for branch_task in branch_tasks:
                 if branch_task.id is None or branch_task.id in related_ids:
                     continue
-                if branch_task.based_on == current_id or branch_task.depends_on == current_id:
+                if branch_task.based_on == current_id:
+                    stack.append(branch_task.id)
+                    continue
+                if branch_task.depends_on == current_id and self._depends_on_attaches_merge_unit_lineage(
+                    branch_task,
+                    current,
+                ):
                     stack.append(branch_task.id)
 
         related_tasks = [branch_task for branch_task in branch_tasks if branch_task.id in related_ids]
@@ -8619,7 +8747,7 @@ class SqliteTaskStore:
             self.attach_task_to_merge_unit(
                 branch_task.id,
                 unit.id,
-                "owner" if branch_task.id == unit.owner_task_id else merge_unit_membership_role(branch_task),
+                merge_unit_attached_task_role(branch_task, unit.owner_task_id),
             )
         for review_task in self._related_review_tasks_for_merge_unit(related_branch_tasks):
             if review_task.id is None:
@@ -8656,6 +8784,12 @@ class SqliteTaskStore:
             return None
         existing = self.resolve_merge_unit_for_task(task.id)
         if existing is not None:
+            if _task_is_successful_merge_unit_implement(task, existing):
+                self.sync_merge_unit_owner_to_tip(existing.id, require_tip=True)
+                refreshed_unit = self.get_merge_unit(existing.id)
+                if refreshed_unit is None:
+                    raise ValueError(f"Merge unit {existing.id} disappeared after owner sync")
+                existing = refreshed_unit
             return existing
         if not task.branch:
             return self._attach_branchless_review_to_merge_unit(task)
@@ -8682,6 +8816,12 @@ class SqliteTaskStore:
             )
 
         self._attach_merge_unit_members(active_unit, related_branch_tasks)
+        if _task_is_successful_merge_unit_implement(task, active_unit):
+            self.sync_merge_unit_owner_to_tip(active_unit.id, require_tip=True)
+            refreshed_unit = self.get_merge_unit(active_unit.id)
+            if refreshed_unit is None:
+                raise ValueError(f"Merge unit {active_unit.id} disappeared after owner sync")
+            active_unit = refreshed_unit
         self.dual_write_legacy_merge_status(active_unit.id)
         return active_unit
 
@@ -8928,6 +9068,21 @@ class SqliteTaskStore:
         for unit_id in affected_unit_ids:
             self.dual_write_legacy_merge_status(unit_id)
         return len(affected_unit_ids)
+
+    def repair_stale_unmerged_merge_unit_owners(self) -> int:
+        """Advance stale owner rows on legacy multi-implement unmerged merge units."""
+        if not self.supports_merge_units():
+            return 0
+        repaired = 0
+        for unit in self.list_active_merge_units(states=("unmerged",)):
+            implement_members = [task for task in self.list_tasks_for_merge_unit(unit.id) if task.task_type == "implement"]
+            if len(implement_members) < 2:
+                continue
+            if not any(_task_is_successful_merge_unit_implement(task, unit) for task in implement_members):
+                continue
+            if self.sync_merge_unit_owner_to_tip(unit.id, require_tip=True):
+                repaired += 1
+        return repaired
 
     def refresh_merge_unit_head(
         self,
@@ -10316,7 +10471,7 @@ class SqliteTaskStore:
                 self.attach_task_to_merge_unit(
                     task.id,
                     unit.id,
-                    "owner" if task.id == unit.owner_task_id else merge_unit_membership_role(task),
+                    merge_unit_attached_task_role(task, unit.owner_task_id),
                 )
                 self.refresh_merge_unit_head(unit.id, head_sha, base_sha)
                 self.set_merge_unit_state(
@@ -10386,7 +10541,7 @@ class SqliteTaskStore:
                 self.attach_task_to_merge_unit(
                     task.id,
                     unit.id,
-                    "owner" if task.id == unit.owner_task_id else merge_unit_membership_role(task),
+                    merge_unit_attached_task_role(task, unit.owner_task_id),
                 )
                 self.refresh_merge_unit_head(unit.id, head_sha, base_sha)
                 self.set_merge_unit_state(unit.id, "unmerged")

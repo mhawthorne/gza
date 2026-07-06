@@ -18758,6 +18758,7 @@ def test_watch_cycle_logs_one_merge_line_for_merge_unit_owner_and_keeps_member_c
     store.attach_task_to_merge_unit(rebase.id, unit.id, "same_branch")
     store.attach_task_to_merge_unit(failed_impl.id, unit.id, "same_branch")
     store.attach_task_to_merge_unit(recovery.id, unit.id, "same_branch")
+    store.sync_merge_unit_owner_to_tip(unit.id, require_tip=True)
     store.dual_write_legacy_merge_status(unit.id)
 
     config = Config.load(tmp_path)
@@ -18766,7 +18767,7 @@ def test_watch_cycle_logs_one_merge_line_for_merge_unit_owner_and_keeps_member_c
     git = _make_watch_git()
 
     def choose_action(_cfg, _store, _git, task, _target, *, impl_based_on_ids, **_kwargs):  # noqa: ARG001
-        if task.id == owner.id:
+        if task.id == recovery.id:
             return {"type": "merge"}
         return {"type": "skip"}
 
@@ -18778,7 +18779,8 @@ def test_watch_cycle_logs_one_merge_line_for_merge_unit_owner_and_keeps_member_c
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", side_effect=choose_action),
+        patch("gza.cli.watch.determine_next_action", side_effect=choose_action),
+        patch("gza.cli.advance_engine.determine_next_action", side_effect=choose_action),
         patch(
             "gza.cli.watch._execute_merge_action",
             side_effect=merge_unit_side_effect,
@@ -18795,11 +18797,11 @@ def test_watch_cycle_logs_one_merge_line_for_merge_unit_owner_and_keeps_member_c
 
     assert result.work_done is True
     log_text = log_path.read_text()
-    assert log_text.count(f"MERGE     {owner.id} -> main") == 1
+    assert log_text.count(f"MERGE     {recovery.id} -> main") == 1
     assert f"MERGE     {review.id} -> main" not in log_text
     assert f"MERGE     {rebase.id} -> main" not in log_text
     assert f"MERGE     {failed_impl.id} -> main" not in log_text
-    assert f"MERGE     {recovery.id} -> main" not in log_text
+    assert f"MERGE     {owner.id} -> main" not in log_text
     for task_id in (owner.id, review.id, rebase.id, failed_impl.id, recovery.id):
         member_unit = store.resolve_merge_unit_for_task(task_id)
         assert member_unit is not None
@@ -18814,11 +18816,11 @@ def test_watch_cycle_logs_one_merge_line_for_merge_unit_owner_and_keeps_member_c
     assert rebase_task is not None
     assert failed_impl_task is not None
     assert recovery_task is not None
-    assert owner_task.merge_status == "merged"
+    assert owner_task.merge_status is None
     assert review_task.merge_status is None
     assert rebase_task.merge_status is None
     assert failed_impl_task.merge_status is None
-    assert recovery_task.merge_status is None
+    assert recovery_task.merge_status == "merged"
 
 
 def test_cmd_watch_logs_completed_review_before_same_cycle_merge(tmp_path: Path) -> None:
@@ -22940,7 +22942,7 @@ def test_watch_cycle_completed_rebase_without_owner_review_routes_to_iterate_bef
         max_recovery_attempts=config.max_resume_attempts,
         include_skipped=True,
     )
-    assert any(row.owner_task.id == failed_owner.id for row in rows)
+    assert any(row.owner_task.id == resumed.id for row in rows)
 
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
@@ -26896,6 +26898,166 @@ def test_reconcile_stale_watch_no_progress_parks_clears_residue_rows(tmp_path: P
         )
         == []
     )
+
+
+@pytest.mark.parametrize("lineage_link_field", ["based_on", "depends_on"])
+def test_reconcile_stale_watch_no_progress_parks_clears_rows_parked_on_old_merge_unit_owner(
+    tmp_path: Path,
+    lineage_link_field: str,
+) -> None:
+    setup_config(tmp_path)
+    db_path = tmp_path / ".gza" / "tasks.db"
+    store = make_store(tmp_path)
+
+    first = store.add("First slice", task_type="implement")
+    assert first.id is not None
+    store.mark_completed(first, has_commits=True, branch="feature/stale-park-owner")
+    second_kwargs = {lineage_link_field: first.id}
+    if lineage_link_field == "depends_on":
+        second_kwargs["same_branch"] = True
+    second = store.add("Second slice", task_type="implement", **second_kwargs)
+    assert second.id is not None
+    store.mark_completed(second, has_commits=True, branch="feature/stale-park-owner")
+    unit = store.resolve_merge_unit_for_task(second.id)
+    assert unit is not None
+
+    stale_now = datetime.now(UTC).isoformat()
+    with store._connect() as conn:
+        conn.execute(
+            """
+            UPDATE merge_units
+            SET owner_task_id = ?, updated_at = ?
+            WHERE project_id = ? AND id = ?
+            """,
+            (first.id, stale_now, store._project_id, unit.id),
+        )
+        conn.execute(
+            """
+            UPDATE merge_unit_tasks
+            SET role = CASE task_id
+                WHEN ? THEN 'owner'
+                WHEN ? THEN 'contributor'
+                ELSE role
+            END
+            WHERE project_id = ? AND merge_unit_id = ? AND task_id IN (?, ?)
+            """,
+            (first.id, second.id, store._project_id, unit.id, first.id, second.id),
+        )
+
+    first = store.get(first.id)
+    assert first is not None
+    stale_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=first,
+        action={"type": "create_review", "description": "Create review (required before merge)"},
+        action_task=first,
+        failed_task=None,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=stale_candidate.subject_kind,
+            subject_id=stale_candidate.subject_id,
+            action_type=stale_candidate.action_type,
+            action_reason=stale_candidate.action_reason,
+            subject_task_id=stale_candidate.subject_task_id,
+            action_task_id=stale_candidate.action_task_id,
+            action_task_status=stale_candidate.action_task_status,
+            action_task_started_at=stale_candidate.action_task_started_at,
+            action_task_running_pid=stale_candidate.action_task_running_pid,
+            failed_task_id=stale_candidate.failed_task_id,
+            recovery_task_id=stale_candidate.recovery_task_id,
+            merge_unit_id=stale_candidate.merge_unit_id,
+            merge_unit_state=stale_candidate.merge_unit_state,
+            merge_unit_head_sha=stale_candidate.merge_unit_head_sha,
+            evidence_fingerprint=stale_candidate.evidence_fingerprint,
+            streak=2,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    reopened = make_store(tmp_path)
+    repaired_unit = reopened.get_merge_unit(unit.id)
+    assert repaired_unit is not None
+    assert repaired_unit.owner_task_id == second.id
+
+    cleared = reconcile_stale_watch_no_progress_parks(reopened)
+
+    assert cleared == 1
+    assert (
+        reopened.list_watch_progress_observations(
+            subject_kind=stale_candidate.subject_kind,
+            subject_id=stale_candidate.subject_id,
+        )
+        == []
+    )
+    assert reconcile_stale_watch_no_progress_parks(reopened) == 0
+
+
+@pytest.mark.parametrize("lineage_link_field", ["based_on", "depends_on"])
+def test_query_owner_rows_repairs_stale_merge_unit_owner_before_create_review_routing(
+    tmp_path: Path,
+    lineage_link_field: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    first = store.add("First slice", task_type="implement")
+    assert first.id is not None
+    store.mark_completed(first, has_commits=True, branch="feature/stale-owner-routing")
+    second_kwargs = {lineage_link_field: first.id}
+    if lineage_link_field == "depends_on":
+        second_kwargs["same_branch"] = True
+    second = store.add("Second slice", task_type="implement", **second_kwargs)
+    assert second.id is not None
+    store.mark_completed(second, has_commits=True, branch="feature/stale-owner-routing")
+    unit = store.resolve_merge_unit_for_task(second.id)
+    assert unit is not None
+
+    stale_now = datetime.now(UTC).isoformat()
+    with store._connect() as conn:
+        conn.execute(
+            """
+            UPDATE merge_units
+            SET owner_task_id = ?, updated_at = ?
+            WHERE project_id = ? AND id = ?
+            """,
+            (first.id, stale_now, store._project_id, unit.id),
+        )
+        conn.execute(
+            """
+            UPDATE merge_unit_tasks
+            SET role = CASE task_id
+                WHEN ? THEN 'owner'
+                WHEN ? THEN 'contributor'
+                ELSE role
+            END
+            WHERE project_id = ? AND merge_unit_id = ? AND task_id IN (?, ?)
+            """,
+            (first.id, second.id, store._project_id, unit.id, first.id, second.id),
+        )
+
+    reopened = make_store(tmp_path)
+    repaired_unit = reopened.get_merge_unit(unit.id)
+    assert repaired_unit is not None
+    assert repaired_unit.owner_task_id == second.id
+
+    with patch("gza.cli.advance_engine.determine_next_action", return_value={"type": "create_review"}):
+        rows, _ = _query_owner_rows_with_context(
+            store=reopened,
+            config=Config.load(tmp_path),
+            git=_make_watch_git(),
+            target_branch="main",
+            max_recovery_attempts=1,
+            include_skipped=True,
+        )
+
+    row = next(row for row in rows if row.owner_task.id == second.id)
+    iterate_target = _resolve_watch_iterate_impl_for_task(reopened, row.owner_task)
+    assert row.owner_task.id == second.id
+    assert iterate_target is not None
+    assert iterate_target.id == second.id
+    assert all(owner_row.owner_task.id != first.id for owner_row in rows)
 
 
 def test_query_owner_rows_surfaces_persisted_watch_no_progress_backstop(tmp_path: Path) -> None:
