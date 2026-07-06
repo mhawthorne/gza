@@ -5812,6 +5812,83 @@ def test_settle_watch_dispatch_starts_returns_no_live_proof_without_real_sleep(t
     assert sleep_calls == [1.0, 1.0]
 
 
+def test_watch_cycle_pending_wave_settles_two_unproven_starts_in_single_window(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  slot_settle_seconds: 2\n")
+    store = make_store(tmp_path)
+
+    first_pending = store.add("Pending first", task_type="plan")
+    assert first_pending.id is not None
+    second_pending = store.add("Pending second", task_type="plan")
+    assert second_pending.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    def build_preview(*_args: object, **kwargs: object) -> DispatchPreview:
+        include_recovery = bool(kwargs.get("include_recovery", False))
+        assert include_recovery is False
+        return DispatchPreview(
+            entries=(
+                DispatchPreviewEntry(
+                    lane="pending",
+                    task=first_pending,
+                    runnable=True,
+                    worker_consuming=True,
+                ),
+                DispatchPreviewEntry(
+                    lane="pending",
+                    task=second_pending,
+                    runnable=True,
+                    worker_consuming=True,
+                ),
+            )
+        )
+
+    monotonic_values = iter([100.0, 100.0, 101.0, 102.0])
+    sleep_calls: list[float] = []
+
+    def probe_start_state(*, task_id: str, **_kwargs: object) -> object:
+        return watch_module._WatchDispatchSettleProbe(
+            status=watch_module._DispatchSettleProbeStatus.WAITING,
+            reason=f"task {task_id} remains pending with no live worker",
+            task=store.get(task_id),
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("plan pickup should use plain worker")),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch("gza.cli.watch._watch_dispatch_start_state", side_effect=probe_start_state),
+        patch("gza.cli.watch.time.monotonic", side_effect=lambda: next(monotonic_values)),
+        patch("gza.cli.watch.time.sleep", side_effect=lambda seconds: sleep_calls.append(seconds)),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", wraps=_REAL_SETTLE_WATCH_DISPATCH_STARTS) as settle_spy,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    assert result.work_done is False
+    assert result.confirmed_start_count == 0
+    assert spawn_worker.call_count == 2
+    assert settle_spy.call_count == 1
+    pending_starts = settle_spy.call_args.kwargs["pending_starts"]
+    assert [entry.task_id for entry in pending_starts] == [first_pending.id, second_pending.id]
+    assert sleep_calls == [1.0, 1.0]
+    text = log_path.read_text()
+    assert f"START_UNDISPATCHED {first_pending.id} plan: dispatch did not reach live slot occupancy" in text
+    assert f"START_UNDISPATCHED {second_pending.id} plan: dispatch did not reach live slot occupancy" in text
+
+
 def test_confirm_watch_dispatch_start_preserves_terminal_before_running_compatibility_bool(
     tmp_path: Path,
 ) -> None:
