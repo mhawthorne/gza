@@ -1269,6 +1269,181 @@ def test_collect_lifecycle_action_entries_reuses_primed_git_facts_with_active_ca
     }
 
 
+def test_collect_lifecycle_action_entries_skips_priming_without_active_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Lifecycle owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/no-cache-prime"
+    owner.has_commits = True
+    owner.completed_at = datetime.now(UTC)
+    store.update(owner)
+
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="",
+        unresolved_tasks=(owner,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=owner,
+    )
+
+    class _CacheAwareLifecycleGit(Git):
+        def __init__(self) -> None:
+            super().__init__(Path("."))
+            self.actual_probe_counts = {
+                "resolve_merge_source": 0,
+                "rev_parse": 0,
+                "is_ancestor": 0,
+                "can_merge": 0,
+                "name_status": 0,
+            }
+
+        def default_branch(self) -> str:
+            return "main"
+
+        def branch_exists(self, branch: str) -> bool:
+            key = ("branch-exists", branch)
+            hit, cached = self._lookup_cached_value(key)
+            if hit:
+                return bool(cached)
+            return bool(self._store_cached_value(key, branch == "feature/no-cache-prime"))
+
+        def ref_exists(self, ref: str) -> bool:
+            key = ("ref-exists", ref)
+            hit, cached = self._lookup_cached_value(key)
+            if hit:
+                return bool(cached)
+            return bool(self._store_cached_value(key, ref in {"feature/no-cache-prime", "main"}))
+
+        def resolve_fresh_merge_source(self, branch: str):
+            from gza.git import ResolvedMergeSourceRef
+
+            key = ("resolve-fresh-merge-source", branch)
+            hit, cached = self._lookup_cached_value(key)
+            if hit:
+                return cached
+            self.actual_probe_counts["resolve_merge_source"] += 1
+            return self._store_cached_value(key, ResolvedMergeSourceRef(branch, None))
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            key = ("rev-parse-if-exists", ref)
+            hit, cached = self._lookup_cached_value(key)
+            if hit:
+                return cached
+            self.actual_probe_counts["rev_parse"] += 1
+            value = "b" * 40 if ref == "main" else "a" * 40
+            return self._store_cached_value(key, value)
+
+        def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+            key = ("is-ancestor", ancestor, descendant)
+            hit, cached = self._lookup_cached_value(key)
+            if hit:
+                return bool(cached)
+            self.actual_probe_counts["is_ancestor"] += 1
+            return self._store_cached_value(key, False)
+
+        def can_merge(self, source_branch: str, target_branch: str) -> bool:
+            key = ("can-merge", source_branch, target_branch)
+            hit, cached = self._lookup_cached_value(key)
+            if hit:
+                return bool(cached)
+            self.actual_probe_counts["can_merge"] += 1
+            return self._store_cached_value(key, True)
+
+        def is_merged(self, source_branch: str, target_branch: str) -> bool:
+            key = ("is-merged", source_branch, target_branch)
+            hit, cached = self._lookup_cached_value(key)
+            if hit:
+                return bool(cached)
+            return bool(self._store_cached_value(key, False))
+
+        def resolve_refs(self, refs: tuple[str, ...], peel: str = "commit") -> dict[str, str | None]:
+            del peel
+            return {ref: ("b" * 40 if ref == "main" else "a" * 40) for ref in refs}
+
+        def merge_base(self, ref1: str, ref2: str) -> str:
+            del ref1, ref2
+            return "b" * 40
+
+        def count_commits_ahead_checked(self, branch: str, base: str) -> int | None:
+            del branch, base
+            return 1
+
+        def count_commits_behind(self, source_ref: str, target_ref: str) -> int | None:
+            del source_ref, target_ref
+            return 0
+
+        def get_diff_stat_parsed(self, revision_range: str) -> tuple[int, int, int]:
+            del revision_range
+            return (1, 1, 0)
+
+        def get_diff_name_status(
+            self,
+            revision_range: str,
+            paths: tuple[str, ...] | list[str] = (),
+            *,
+            check: bool = False,
+        ) -> str:
+            key = ("name-status", revision_range, tuple(paths), check)
+            hit, cached = self._lookup_cached_value(key)
+            if hit:
+                return str(cached)
+            self.actual_probe_counts["name_status"] += 1
+            return self._store_cached_value(key, "M\tfeature.txt\n")
+
+    def _fake_determine_next_action(
+        _config: Config,
+        _store: object,
+        git: _CacheAwareLifecycleGit,
+        task: Task,
+        target_branch: str,
+        **kwargs,
+    ) -> dict[str, str]:
+        del _config, _store, kwargs
+        assert task.branch is not None
+        git.resolve_fresh_merge_source(task.branch)
+        git.rev_parse_if_exists(task.branch)
+        git.rev_parse_if_exists(target_branch)
+        git.is_ancestor(target_branch, task.branch)
+        git.get_diff_name_status(f"{target_branch}...{task.branch}", check=True)
+        git.can_merge(task.branch, target_branch)
+        return {"type": "create_review", "description": "Create closing review"}
+
+    monkeypatch.setattr(lifecycle_actions_cli, "determine_next_action", _fake_determine_next_action)
+
+    git = _CacheAwareLifecycleGit()
+    entries = lifecycle_actions_cli.collect_lifecycle_action_entries(
+        store,
+        config=config,
+        git=git,
+        target_branch="main",
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=1,
+        owner_rows=(row,),
+        read_context=RecoveryReadContext(),
+    )
+
+    assert [entry.owner_task.id for entry in entries] == [owner.id]
+    assert git.actual_probe_counts == {
+        "resolve_merge_source": 1,
+        "rev_parse": 2,
+        "is_ancestor": 1,
+        "can_merge": 1,
+        "name_status": 1,
+    }
+
+
 def _seed_same_branch_merge_owner_and_improve(tmp_path: Path) -> tuple[Task, Task]:
     setup_config(tmp_path)
     store = make_store(tmp_path)

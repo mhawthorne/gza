@@ -86,17 +86,18 @@ def collect_lifecycle_action_entries(
     else:
         owner_rows = tuple(owner_rows)
 
-    prime_lifecycle_git_facts(
-        config=config,
-        store=store,
-        git=git,
-        tasks=tuple(
-            action_task
-            for row in owner_rows
-            if (action_task := row.lifecycle_action_task) is not None
-        ),
-        target_branch=target_branch,
-    )
+    if bool(getattr(git, "cache_active", False)):
+        prime_lifecycle_git_facts(
+            config=config,
+            store=store,
+            git=git,
+            tasks=tuple(
+                action_task
+                for row in owner_rows
+                if (action_task := row.lifecycle_action_task) is not None
+            ),
+            target_branch=target_branch,
+        )
 
     entries: list[LifecycleActionEntry] = []
     for row in owner_rows:

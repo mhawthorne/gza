@@ -331,6 +331,12 @@ class Git:
             if self._cache is not None:
                 self._cache.clear()
 
+    @property
+    def cache_active(self) -> bool:
+        """Return whether a shared read-cache scope is currently active."""
+        with self._get_cache_lock():
+            return self._cache is not None
+
     @staticmethod
     def _git_executable() -> str:
         """Resolve the real git binary instead of a provider shell shim.
