@@ -140,18 +140,32 @@ def build_merge_unit_group_tree(
         child_keys[key].sort(key=_hkey)
     roots.sort(key=_hkey)
 
+    built: set[str] = set()
+
     def _build(key: str) -> MergeUnitGroup:
+        built.add(key)
         header, unit = headers[key]
         group_members = [m for m in members[key] if m.id != header.id]
+        # Skip any child already built: guards against a parent-key cycle sending
+        # _build into infinite recursion (and double-rendering a group).
+        children = [_build(child) for child in child_keys[key] if child not in built]
         return MergeUnitGroup(
             key=key,
             header=header,
             unit=unit,
             members=group_members,
-            children=[_build(child) for child in child_keys[key]],
+            children=children,
         )
 
-    return [_build(root) for root in roots]
+    forest = [_build(root) for root in roots]
+    # A parent-key cycle (e.g. a unit whose resolved header is based_on a solo
+    # task that is itself based_on one of the unit's own members) leaves some
+    # groups neither a root nor reachable from one. Surface each remaining group
+    # as its own root so its tasks still render instead of silently vanishing.
+    for key in sorted(members, key=_hkey):
+        if key not in built:
+            forest.append(_build(key))
+    return forest
 
 
 def group_subtree_counts(group: MergeUnitGroup) -> tuple[int, int]:

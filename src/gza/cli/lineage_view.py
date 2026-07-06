@@ -28,7 +28,6 @@ from gza.lineage_grouping import (
 from gza.query import TaskLineageNode
 
 from ._common import (
-    _lineage_tree_prefix,
     format_task_merge_label,
     format_task_status_text,
     get_review_verdict,
@@ -126,13 +125,13 @@ def render_merge_grouped(
     header_rows: list[dict] = []
     member_rows: list[dict] = []
 
-    def _collect(group: MergeUnitGroup, ancestors_last: tuple[bool, ...]) -> None:
+    def _collect(group: MergeUnitGroup, depth: int) -> None:
         t = group.header
         when = t.completed_at or t.started_at or t.created_at
         state_text, state_color = group_state(group, status_color)
         header_rows.append(
             {
-                "prefix": _lineage_tree_prefix(ancestors_last),
+                "indent": "  " * depth,
                 "is_target": t.id == task_id,
                 "id": t.id or "-",
                 "when": format_utc(when) if when else "-",
@@ -143,14 +142,14 @@ def render_merge_grouped(
                 "row": len(header_rows) + len(member_rows),
             }
         )
-        guide = "".join("    " if flag else "│   " for flag in ancestors_last)
-        member_guide = guide + ("│   " if group.children else "    ")
         for member in group.members:
             annotation, annotation_color = member_annotation(config, store, member, status_color)
+            member_when = member.completed_at or member.started_at or member.created_at
             member_rows.append(
                 {
-                    "guide": member_guide,
+                    "indent": "  " * (depth + 1),
                     "is_target": member.id == task_id,
+                    "when": format_utc(member_when) if member_when else "-",
                     "type": member.task_type or "task",
                     "id": member.id or "-",
                     "annotation": annotation,
@@ -158,30 +157,31 @@ def render_merge_grouped(
                     "row": len(header_rows) + len(member_rows),
                 }
             )
-        for index, child in enumerate(group.children):
-            _collect(child, (*ancestors_last, index == len(group.children) - 1))
+        for child in group.children:
+            _collect(child, depth + 1)
 
     for group in groups:
-        _collect(group, ())
+        _collect(group, 0)
 
     if not header_rows:
         return
 
-    prefix_width = max(len(r["prefix"]) for r in header_rows)
+    # Hierarchy is shown by indentation (deeper = further right); the head row of
+    # each merge unit carries no ·, its members do (→ marks the looked-up task).
+    indent_width = max(len(r["indent"]) for r in header_rows)
     id_width = max([len(r["id"]) for r in header_rows] + [len(r["id"]) for r in member_rows] + [1])
-    when_width = max(len(r["when"]) for r in header_rows)
-    type_width = max(len(r["type"]) for r in header_rows)
+    when_width = max([len(r["when"]) for r in header_rows] + [len(r["when"]) for r in member_rows])
+    type_width = max([len(r["type"]) for r in header_rows] + [len(r["type"]) for r in member_rows] + [1])
     state_width = max(len(r["state"]) for r in header_rows)
-    member_type_width = max([len(r["type"]) for r in member_rows] + [1])
-    # Header columns left of the prompt are fixed-width; budget the prompt to the
+    # Columns left of the prompt are fixed-width; budget the prompt to the
     # remaining terminal width so long branch slugs don't wrap.
     try:
         term_width = console.size.width
     except Exception:
         term_width = 120
-    # prefix + arrow + id + when + type + state, each followed by one space.
+    # when + indent + marker + id + type + state, each followed by one space.
     header_used = (
-        prefix_width + 1 + 1 + 1 + id_width + 1 + when_width + 1 + type_width + 1 + state_width + 1
+        when_width + 1 + indent_width + 1 + 1 + id_width + 1 + type_width + 1 + state_width + 1
     )
     prompt_budget = max(20, term_width - header_used - 1)
 
@@ -193,15 +193,14 @@ def render_merge_grouped(
         by_row[r["row"]] = ("member", r)
 
     for _, (kind, r) in sorted(by_row.items()):
+        when_part = f"[{lc.stats}]{rich_escape(r['when'].ljust(when_width))}[/{lc.stats}]"
+        id_part = f"[{lc.task_id}]{rich_escape(r['id'].ljust(id_width))}[/{lc.task_id}]"
+        type_part = f"[{lc.type_label}]{rich_escape(r['type'].ljust(type_width))}[/{lc.type_label}]"
         if kind == "header":
-            prefix_part = f"[{lc.connector}]{rich_escape(r['prefix'].ljust(prefix_width))}[/{lc.connector}]"
             arrow_char = "→" if r["is_target"] else " "
-            arrow_part = f"[{lc.target_highlight}]{arrow_char}[/{lc.target_highlight}]"
-            id_part = f"[{lc.task_id}]{rich_escape(r['id'].ljust(id_width))}[/{lc.task_id}]"
-            when_part = f"[{lc.stats}]{rich_escape(r['when'].ljust(when_width))}[/{lc.stats}]"
-            type_part = f"[{lc.type_label}]{rich_escape(r['type'].ljust(type_width))}[/{lc.type_label}]"
+            marker_part = f"{r['indent']}[{lc.target_highlight}]{arrow_char}[/{lc.target_highlight}]"
             state_part = f"[{r['state_color']}]{rich_escape(r['state'].ljust(state_width))}[/{r['state_color']}]"
-            pieces = [prefix_part, arrow_part, id_part, when_part, type_part, state_part]
+            pieces = [when_part, marker_part, id_part, type_part, state_part]
             prompt = r["prompt"]
             if prompt:
                 if len(prompt) > prompt_budget:
@@ -209,19 +208,16 @@ def render_merge_grouped(
                 pieces.append(f"[{lc.prompt}]{rich_escape(prompt)}[/{lc.prompt}]")
             console.print(" ".join(pieces).rstrip())
         else:
-            guide_part = f"[{lc.connector}]{rich_escape(r['guide'])}[/{lc.connector}]"
             if r["is_target"]:
-                marker = f"[{lc.target_highlight}]→[/{lc.target_highlight}]"
+                marker_part = f"{r['indent']}[{lc.target_highlight}]→[/{lc.target_highlight}]"
             else:
-                marker = f"[{lc.annotation}]·[/{lc.annotation}]"
-            type_part = f"[{lc.type_label}]{rich_escape(r['type'].ljust(member_type_width))}[/{lc.type_label}]"
-            id_part = f"[{lc.task_id}]{rich_escape(r['id'].ljust(id_width))}[/{lc.task_id}]"
+                marker_part = f"{r['indent']}[{lc.annotation}]·[/{lc.annotation}]"
             annotation_part = (
                 f"[{r['annotation_color']}]{rich_escape(r['annotation'])}[/{r['annotation_color']}]"
                 if r["annotation"]
                 else ""
             )
-            pieces = [f"{guide_part}{marker}", type_part, id_part]
+            pieces = [when_part, marker_part, id_part, type_part]
             if annotation_part:
                 pieces.append(annotation_part)
             console.print(" ".join(pieces).rstrip())
@@ -256,11 +252,34 @@ def render_local(
     total_tasks = sum(group_subtree_counts(r)[0] for r in groups)
     total_units = sum(group_subtree_counts(r)[1] for r in groups)
 
-    # Column widths over every group header we will print.
+    def _when_text(t: DbTask) -> str:
+        when = t.completed_at or t.started_at or t.created_at
+        return format_utc(when) if when else "-"
+
+    # Column widths over every row we will print — headers *and* the target's
+    # members — so the id and type columns line up across the whole block.
     printable = [*ancestors, target, *peers, *target.children]
-    id_width = max((len(g.header.id or "-") for g in printable), default=1)
-    type_width = max((len(g.header.task_type or "implement") for g in printable), default=1)
+    id_width = max(
+        [len(g.header.id or "-") for g in printable]
+        + [len(m.id or "-") for m in target.members]
+        + [1]
+    )
+    # Pad the type column to the widest type across headers *and* members (+1 gap)
+    # so ids line up regardless of which row shows "implement" vs "review".
+    type_width = (
+        max(
+            [len(g.header.task_type or "implement") for g in printable]
+            + [len(m.task_type or "task") for m in target.members]
+            + [1]
+        )
+        + 1
+    )
     state_width = max((len(group_state(g, status_color)[0]) for g in printable), default=1)
+    when_width = max(
+        [len(_when_text(g.header)) for g in printable]
+        + [len(_when_text(m)) for m in target.members]
+        + [1]
+    )
 
     def _emit(group: MergeUnitGroup, *, counts: tuple[int, int] | None, note: str) -> None:
         t = group.header
@@ -268,6 +287,7 @@ def render_local(
         state_text, state_color = group_state(group, status_color)
         marker = "→" if is_target else " "
         pieces = [
+            f"[{lc.stats}]{rich_escape(_when_text(t).ljust(when_width))}[/{lc.stats}]",
             f"  [{lc.target_highlight}]{marker}[/{lc.target_highlight}]",
             f"[{lc.task_id}]{rich_escape((t.id or '-').ljust(id_width))}[/{lc.task_id}]",
             f"[{lc.type_label}]{rich_escape((t.task_type or 'implement').ljust(type_width))}[/{lc.type_label}]",
@@ -297,14 +317,10 @@ def render_local(
             note = "(root)" if index == 0 else "(parent)" if index == len(ancestors) - 1 else ""
             _emit(group, counts=None, note=note)
 
-    console.print(f"\n[{lc.type_label}]This task[/{lc.type_label}]:")
-    if target.header.id != task_id:
-        target_member = next((m for m in target.members if m.id == task_id), None)
-        member_type = (target_member.task_type if target_member else None) or "task"
-        console.print(
-            f"  [{lc.annotation}]{rich_escape(task_id)} is a {member_type} within "
-            f"merge unit {target.header.id}[/{lc.annotation}]"
-        )
+    # The focal merge-unit block: head row (no ·) is the owning implement, · are
+    # its supporting tasks, and → marks the looked-up task. No label — the → and
+    # the blank line above delimit it.
+    console.print()
     _emit(target, counts=None, note="")
     for member in target.members:
         annotation, annotation_color = member_annotation(config, store, member, status_color)
@@ -313,12 +329,15 @@ def render_local(
             if member.id == task_id
             else f"[{lc.annotation}]·[/{lc.annotation}]"
         )
-        type_part = f"[{lc.type_label}]{rich_escape((member.task_type or 'task').ljust(8))}[/{lc.type_label}]"
+        when_part = f"[{lc.stats}]{rich_escape(_when_text(member).ljust(when_width))}[/{lc.stats}]"
         id_part = f"[{lc.task_id}]{rich_escape((member.id or '-').ljust(id_width))}[/{lc.task_id}]"
+        type_part = f"[{lc.type_label}]{rich_escape((member.task_type or 'task').ljust(type_width))}[/{lc.type_label}]"
         annotation_part = (
             f"[{annotation_color}]{rich_escape(annotation)}[/{annotation_color}]" if annotation else ""
         )
-        console.print(" ".join(p for p in [f"      {mk}", type_part, id_part, annotation_part] if p).rstrip())
+        console.print(
+            " ".join(p for p in [when_part, f"  {mk}", id_part, type_part, annotation_part] if p).rstrip()
+        )
 
     if peers:
         anchor = parent.header.id if parent is not None else "?"
@@ -327,8 +346,6 @@ def render_local(
             _emit(group, counts=group_subtree_counts(group), note="")
 
     console.print(f"\n[{lc.type_label}]Children[/{lc.type_label}]: {len(target.children)}")
-    if not target.children:
-        console.print(f"  [{lc.annotation}](none)[/{lc.annotation}]")
     for group in target.children:
         _emit(group, counts=group_subtree_counts(group), note="")
     return True

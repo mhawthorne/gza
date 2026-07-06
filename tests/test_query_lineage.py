@@ -837,3 +837,62 @@ class TestBuildMergeUnitGroupTree:
         # Review and the retry sibling both collapse into B's unit as members.
         assert sorted(m.id for m in group_b.members) == ["gza-5", "gza-6"]
         assert group_b.children == []
+
+    def _cyclic_tree(self):
+        """A lineage where the parent-key graph has a cycle.
+
+        The merge unit ``mu-A``'s owner is ``gza-5``, which is ``based_on`` the
+        solo implement ``gza-4``, which is in turn ``based_on`` ``gza-3`` — a
+        member of ``mu-A``. So mu-A → solo:gza-4 → mu-A. A supporting rebase
+        ``gza-6`` sits inside mu-A (the gza-8274-in-production analog).
+        """
+        from gza.query import TaskLineageNode
+
+        n1 = TaskLineageNode(task=_make_task(id="gza-1", task_type="plan"))
+        n2 = TaskLineageNode(task=_make_task(id="gza-2", task_type="implement", based_on="gza-1"))
+        n3 = TaskLineageNode(task=_make_task(id="gza-3", task_type="implement", based_on="gza-2"))
+        n4 = TaskLineageNode(task=_make_task(id="gza-4", task_type="implement", based_on="gza-3"))
+        n5 = TaskLineageNode(task=_make_task(id="gza-5", task_type="implement", based_on="gza-4"))
+        n6 = TaskLineageNode(task=_make_task(id="gza-6", task_type="rebase", based_on="gza-5"))
+        n5.children = [n6]
+        n4.children = [n5]
+        n3.children = [n4]
+        n2.children = [n3]
+        n1.children = [n2]
+        return n1
+
+    def test_parent_key_cycle_still_renders_every_task(self):
+        """A cyclic parent-key graph must not silently drop groups (gza-8274)."""
+        from gza.lineage_grouping import (
+            build_merge_unit_group_tree as _build_merge_unit_group_tree,
+            find_group_path,
+        )
+
+        units = {
+            "gza-1": None,  # plan: no merge unit
+            "gza-2": "mu-A",
+            "gza-3": "mu-A",
+            "gza-4": None,  # solo implement between the unit and its owner
+            "gza-5": "mu-A",
+            "gza-6": "mu-A",  # supporting rebase inside the unit
+        }
+        owners = {"mu-A": "gza-5"}  # owner is based_on the solo gza-4 -> cycle
+        store = self._store(units, owners)
+
+        roots = _build_merge_unit_group_tree(store, self._cyclic_tree())
+
+        # Every task must appear somewhere despite the cycle.
+        seen: set[str] = set()
+
+        def _collect(group) -> None:
+            seen.add(group.header.id)
+            seen.update(m.id for m in group.members)
+            for child in group.children:
+                _collect(child)
+
+        for root in roots:
+            _collect(root)
+        assert seen == {"gza-1", "gza-2", "gza-3", "gza-4", "gza-5", "gza-6"}
+        # The supporting rebase in the cyclic unit is locatable (drives the
+        # local lineage view instead of falling back to the full dump).
+        assert find_group_path(roots, "gza-6") is not None
