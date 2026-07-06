@@ -1770,6 +1770,92 @@ def test_execute_merge_action_isolated_candidate_verify_pass_promotes_and_persis
     assert main_state.environment_identity is None
 
 
+def test_execute_merge_action_isolated_candidate_verify_red_defers_followup_creation_until_promotion(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    store = make_store(tmp_path)
+
+    task = store.add("Completed implementation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/candidate-followup-blocked"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: APPROVED**"
+    store.update(review)
+
+    followup = ReviewFinding(
+        id="F1",
+        severity="FOLLOWUP",
+        title="Tighten coverage",
+        body="Body",
+        evidence=None,
+        impact=None,
+        fix_or_followup="add coverage",
+        tests=None,
+        open_state_citation="citation",
+    )
+
+    repo_git = MagicMock()
+    repo_git.repo_dir = tmp_path
+
+    merge_git = MagicMock()
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "isolated-merge-oid"
+
+    red_check = SimpleNamespace(
+        classification="deterministic_red",
+        evidence=SimpleNamespace(
+            verify_status="failed",
+            head_sha="isolated-merge-oid",
+            tree_fingerprint="fp-candidate",
+            failure="verify_command failed",
+            failing_phase="unit",
+        ),
+    )
+
+    before_ids = {candidate.id for candidate in store.get_all() if candidate.id is not None}
+    with (
+        patch("gza.cli.git_ops._merge_single_task", return_value=0),
+        patch("gza.cli.git_ops.check_candidate_integration_verify", return_value=red_check),
+        patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch") as promote,
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            repo_git,
+            task,
+            {
+                "type": "merge_with_followups",
+                "description": "Merge",
+                "review_task": review,
+                "followup_findings": (followup,),
+            },
+            target_branch="main",
+            current_branch="main",
+            merge_git=merge_git,
+            merge_current_branch="main",
+        )
+
+    assert result.rc == 1
+    assert result.status == "blocked_candidate_verify"
+    promote.assert_not_called()
+    after_ids = {candidate.id for candidate in store.get_all() if candidate.id is not None}
+    assert after_ids == before_ids
+
+
 def test_execute_merge_action_isolated_whitespace_only_verify_command_keeps_no_gate_path(
     tmp_path: Path,
 ) -> None:

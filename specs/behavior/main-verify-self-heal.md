@@ -221,6 +221,26 @@ for the gate, ignoring a cached checkpoint.
 - If the forced rerun stays red, it MAY leave the freeze in place, but it MUST still
   leave behind fresh evidence rather than the stale cached checkpoint.
 
+### MV7 — Candidate verify MUST prevent isolated red-main promotion without poisoning canonical state
+
+When watch stages default-branch merges in an isolated detached checkout, that staged
+tree is only a candidate. A red or freshness-unproven candidate verify verdict MUST keep
+the canonical default branch unchanged and MUST NOT be persisted as proof that canonical
+main itself is red.
+
+- Watch MAY batch multiple isolated merge candidates into one staged detached tree, but
+  it MUST verify that exact staged tree before promotion.
+- A passing candidate verify verdict MAY become the canonical checkpoint only after
+  promotion proves the canonical target now matches the exact verified candidate tree.
+  If exact identity cannot be proven cheaply, automation MUST rerun canonical post-merge
+  verify instead of trusting the candidate evidence.
+- If a batched staged tree verifies red, watch MUST isolate the first red-producing
+  merge unit with bounded replay, route that unit to visible rework, and leave unrelated
+  canonical-main freeze state unchanged.
+- Candidate-red routing MUST create or reuse exactly one queued rework task for the
+  failure identity and emit distinct operator-visible blocked-candidate attention.
+- A blocked candidate MUST NOT create a global red-main merge freeze for unrelated work.
+
 ## Cross-document requirements
 
 - [lifecycle-engine.md](lifecycle-engine.md) MUST own the action semantics for the

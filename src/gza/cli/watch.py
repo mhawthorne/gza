@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import hashlib
 import io
+import json
 import os
 import platform
 import re
@@ -15,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal, TypeVar, cast
 
 from rich.text import Text
@@ -76,13 +78,17 @@ from ..main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_REASON,
     MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
     MAIN_INTEGRATION_VERIFY_TAG,
+    CandidateIntegrationVerifyCheck,
     MainIntegrationVerifyCheck,
     MainIntegrationVerifyEnvironmentIdentity,
     MainIntegrationVerifyRemediation,
     MainIntegrationVerifyState,
+    check_candidate_integration_verify,
     check_main_integration_verify,
     persist_main_integration_verify_alert_message,
     persist_main_integration_verify_pending_retire_signatures,
+    promote_candidate_integration_verify_evidence,
+    verify_gate_enabled,
 )
 from ..merge_state import (
     effective_no_work_merge_state,
@@ -208,12 +214,18 @@ from .advance_executor import (
 from .execution import _spawn_background_iterate
 from .git_ops import (
     _blocked_candidate_verify_attention_key,
+    _candidate_verify_promotion_proof,
     _collect_advance_completed_tasks as _git_ops_collect_advance_completed_tasks,
     _execute_merge_action,
+    _finalize_staged_isolated_merge_action,
     _merge_single_task as _git_ops_merge_single_task,
+    _MergeActionResult,
     _prepare_create_review_action,
+    _promote_isolated_merge_to_target_branch,
     _reconcile_diverged_branch_with_origin,
     _require_default_branch,
+    _stage_isolated_merge_action,
+    _StagedIsolatedMergeAction,
     _unimplemented_implement_prompt,
     cleanup_failed_merge_checkout,
     ensure_watch_main_checkout,
@@ -231,6 +243,8 @@ _WATCH_TASK_ID_TOKEN_RE = re.compile(
     rf"(?<![a-z0-9]){_TASK_ID_RE.pattern.removeprefix('^').removesuffix('$')}(?![a-z0-9])"
 )
 T = TypeVar("T")
+PRE_MERGE_INTEGRATION_VERIFY_REASON = "pre-merge-integration-verify-red"
+PRE_MERGE_INTEGRATION_VERIFY_TRIGGER_SOURCE = "watch-pre-merge-integration-verify-rework"
 
 
 def _render_watch_stdout(line: str) -> Text:
@@ -2633,6 +2647,16 @@ class _InstalledPackageDriftState:
     pending_restart_fingerprint: str | None = None
 
 
+@dataclass(frozen=True)
+class _InstalledPackageFileDigest:
+    size: int
+    mtime_ns: int
+    digest: bytes
+
+
+_INSTALLED_PACKAGE_FINGERPRINT_CACHE: dict[str, dict[str, _InstalledPackageFileDigest]] = {}
+
+
 def _assess_isolated_merge_failure(
     merge_git: Git,
     branch: str,
@@ -2663,15 +2687,47 @@ def _installed_gza_package_root() -> Path:
 
 def _installed_gza_package_fingerprint(package_root: Path | None = None) -> str:
     root = package_root or _installed_gza_package_root()
+    cache_key = str(root.resolve())
+    cached_digests = _INSTALLED_PACKAGE_FINGERPRINT_CACHE.get(cache_key, {})
+    next_cached_digests: dict[str, _InstalledPackageFileDigest] = {}
     hasher = hashlib.sha256()
-    for path in sorted(root.rglob("*.py")):
-        if not path.is_file():
+    for current_root, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name != "__pycache__")
+        python_filenames = sorted(name for name in filenames if name.endswith(".py"))
+        if not python_filenames:
             continue
-        relative_path = path.relative_to(root).as_posix()
-        hasher.update(relative_path.encode("utf-8"))
-        hasher.update(b"\0")
-        hasher.update(path.read_bytes())
-        hasher.update(b"\0")
+        current_root_path = Path(current_root)
+        for filename in python_filenames:
+            path = current_root_path / filename
+            relative_path = path.relative_to(root).as_posix()
+            stat_result = path.stat()
+            cached_digest = cached_digests.get(relative_path)
+            if (
+                cached_digest is not None
+                and cached_digest.size == stat_result.st_size
+                and cached_digest.mtime_ns == stat_result.st_mtime_ns
+            ):
+                file_digest = cached_digest.digest
+            else:
+                file_bytes = path.read_bytes()
+                file_digest = hashlib.sha256(file_bytes).digest()
+                if (
+                    cached_digest is not None
+                    and cached_digest.size == stat_result.st_size
+                    and cached_digest.digest == file_digest
+                ):
+                    file_digest = cached_digest.digest
+                cached_digest = _InstalledPackageFileDigest(
+                    size=stat_result.st_size,
+                    mtime_ns=stat_result.st_mtime_ns,
+                    digest=file_digest,
+                )
+            next_cached_digests[relative_path] = cached_digest
+            hasher.update(relative_path.encode("utf-8"))
+            hasher.update(b"\0")
+            hasher.update(file_digest)
+            hasher.update(b"\0")
+    _INSTALLED_PACKAGE_FINGERPRINT_CACHE[cache_key] = next_cached_digests
     return hasher.hexdigest()
 
 
@@ -2892,6 +2948,372 @@ def _emit_blocked_candidate_verify_attention(
             merge_result,
         ),
     )
+
+
+@dataclass(frozen=True)
+class _WatchBatchStagedMerge:
+    row: Any
+    task: DbTask
+    action: dict[str, Any]
+    display_task: DbTask
+    merge_event: Any
+    merge_status_before: str | None
+    staged: _StagedIsolatedMergeAction
+
+
+def _candidate_rework_identity(display_task: DbTask, check: CandidateIntegrationVerifyCheck) -> str:
+    evidence = check.evidence
+    gate_identity = (
+        evidence.verify_command or "(verify unavailable)",
+        evidence.verify_timeout_seconds,
+        evidence.verify_timeout_grace_seconds,
+        getattr(evidence.environment_identity, "runner_class", None),
+        getattr(evidence.environment_identity, "platform_system", None),
+        getattr(evidence.environment_identity, "platform_machine", None),
+        getattr(evidence.environment_identity, "python_version", None),
+    )
+    signature = (
+        getattr(check.remediation, "signature", None)
+        or evidence.failing_phase
+        or evidence.verify_exit_status
+        or evidence.verify_status
+        or "unknown"
+    )
+    payload = json.dumps(
+        {
+            "owner_id": display_task.id,
+            "tree_fingerprint": evidence.tree_fingerprint,
+            "gate_identity": gate_identity,
+            "signature": signature,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _candidate_rework_prompt(
+    display_task: DbTask,
+    check: CandidateIntegrationVerifyCheck,
+    *,
+    identity: str,
+) -> str:
+    evidence = check.evidence
+    verify_command = evidence.verify_command or "(verify_command unavailable)"
+    failing_phase = evidence.failing_phase or "unknown"
+    failure = evidence.failure or "verify gate failed without a structured failure message"
+    fingerprint = evidence.tree_fingerprint or "unavailable"
+    return (
+        f"Pre-merge integration verify rework for {display_task.id}.\n\n"
+        f"Identity: {identity}\n"
+        f"The staged isolated merge result for branch `{display_task.branch or 'unknown'}` was not landed because "
+        f"the local-target verify gate failed before promotion.\n"
+        f"Tree fingerprint: {fingerprint}\n"
+        f"Verify command: {verify_command}\n"
+        f"Failing phase: {failing_phase}\n"
+        f"Failure: {failure}\n\n"
+        "Fix the branch so it passes the project verify command, then rerun that verify command before completion."
+    )
+
+
+def _queue_candidate_rework_task(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    owner_task: DbTask,
+    check: CandidateIntegrationVerifyCheck,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+) -> DbTask:
+    identity = _candidate_rework_identity(owner_task, check)
+    desired_tags = tuple(dict.fromkeys(("system", MAIN_INTEGRATION_VERIFY_TAG, *(tags or ()))))
+    desired_prompt = _candidate_rework_prompt(owner_task, check, identity=identity)
+    existing_match: DbTask | None = None
+    for candidate in store.get_all():
+        if candidate.id is None:
+            continue
+        if candidate.trigger_source != PRE_MERGE_INTEGRATION_VERIFY_TRIGGER_SOURCE:
+            continue
+        if candidate.based_on != owner_task.id:
+            continue
+        if candidate.status in {"completed", "dropped"}:
+            continue
+        if f"Identity: {identity}" not in candidate.prompt:
+            continue
+        existing_match = candidate
+        break
+    task = existing_match
+    if task is None:
+        task = store.add(
+            desired_prompt,
+            task_type="fix",
+            based_on=owner_task.id,
+            same_branch=True,
+            tags=desired_tags,
+            trigger_source=PRE_MERGE_INTEGRATION_VERIFY_TRIGGER_SOURCE,
+            urgent=True,
+        )
+    else:
+        task.prompt = desired_prompt
+        task.tags = desired_tags
+        if task.status != "in_progress":
+            task.status = "pending"
+            task.started_at = None
+            task.running_pid = None
+            task.completed_at = None
+            task.failure_reason = None
+            task.completion_reason = None
+            task.drop_reason = None
+            task.execution_mode = None
+        store.update(task)
+    assert task.id is not None
+    set_task_urgency(store, task.id, urgent=True)
+    set_task_queue_position_scoped(store, task.id, position=1, tags=tags, any_tag=any_tag)
+    return store.get(task.id) or task
+
+
+def _should_queue_candidate_rework(check: CandidateIntegrationVerifyCheck | None) -> bool:
+    return isinstance(check, CandidateIntegrationVerifyCheck) and check.classification in {
+        "red",
+        "deterministic_red",
+    }
+
+
+def _run_isolated_merge_batch(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    merge_git: Git,
+    current_branch: str,
+    target_branch: str,
+    decisions: Sequence[Any],
+    quiet: bool,
+    dry_run: bool,
+    log: "_WatchLog",
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+) -> tuple[bool, bool, MainIntegrationVerifyRemediation | None]:
+    del dry_run
+    staged_batch: list[_WatchBatchStagedMerge] = []
+    for execution_decision in decisions:
+        row, task, action = execution_decision.item
+        action = dict(execution_decision.action)
+        display_task = row.owner_task
+        merge_event = None
+        merge_status_before: str | None = None
+        if display_task.id is not None:
+            merge_event = _resolve_watch_merge_log_event(
+                store,
+                task_id=display_task.id,
+                target_branch=target_branch,
+            )
+            if merge_event is not None:
+                merge_status_before = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
+                    "merge_status"
+                )
+        def _stage_current_merge() -> _StagedIsolatedMergeAction | _MergeActionResult:
+            return _stage_isolated_merge_action(
+                config,
+                store,
+                git,
+                task,
+                action,
+                target_branch=target_branch,
+                current_branch=current_branch,
+                merge_git=merge_git,
+                merge_current_branch=target_branch,
+                already_merged_behavior="mark_merged",
+                merge_source=MERGE_SOURCE_WATCH,
+                quiet_mechanics=True,
+            )
+
+        staged_result = _run_with_optional_stdout_suppressed(quiet, _stage_current_merge)
+        if not isinstance(staged_result, _StagedIsolatedMergeAction):
+            if getattr(staged_result, "status", None) in {
+                "blocked_candidate_verify",
+                "blocked_candidate_verify_unavailable",
+            }:
+                _emit_blocked_candidate_verify_attention(
+                    log=log,
+                    display_task=display_task,
+                    merge_result=staged_result,
+                )
+                blocked_check = getattr(staged_result, "candidate_verify", None)
+                rework_task = (
+                    _queue_candidate_rework_task(
+                        config=config,
+                        store=store,
+                        owner_task=display_task,
+                        check=blocked_check,
+                        tags=tags,
+                        any_tag=any_tag,
+                    )
+                    if isinstance(blocked_check, CandidateIntegrationVerifyCheck)
+                    else None
+                )
+                if rework_task is not None:
+                    log.emit("FOLLOW", _format_follow_line(str(rework_task.id), str(display_task.id), reused=False))
+                return False, False, None
+            log.emit(
+                "SKIP",
+                f"{display_task.id}: merge failed",
+                dedupe_key=f"merge-failed:{display_task.id}",
+            )
+            return False, False, None
+        staged_batch.append(
+            _WatchBatchStagedMerge(
+                row=row,
+                task=task,
+                action=action,
+                display_task=display_task,
+                merge_event=merge_event,
+                merge_status_before=merge_status_before,
+                staged=staged_result,
+            )
+        )
+
+    combined_candidate = _run_with_optional_stdout_suppressed(
+        quiet,
+        lambda: check_candidate_integration_verify(
+            config,
+            merge_git,
+            reason="watch-pre-merge-batch",
+            red_reruns=2,
+        ),
+    )
+    if combined_candidate.evidence.verify_status == "passed":
+        proof = _candidate_verify_promotion_proof(merge_git, combined_candidate)
+        if not proof.exact_match:
+            synthetic_result = SimpleNamespace(
+                rc=1,
+                status=proof.blocked_status,
+                block_reason=proof.block_reason,
+                candidate_verify=combined_candidate,
+            )
+            _emit_blocked_candidate_verify_attention(
+                log=log,
+                display_task=staged_batch[0].display_task,
+                merge_result=synthetic_result,
+            )
+            return False, False, None
+        warnings = _run_with_optional_stdout_suppressed(
+            quiet,
+            lambda: _promote_isolated_merge_to_target_branch(git, merge_git, target_branch),
+        )
+        assert proof.verified_head_sha is not None
+        assert proof.verified_tree_fingerprint is not None
+        persisted = promote_candidate_integration_verify_evidence(
+            store,
+            evidence=combined_candidate.evidence,
+            promoted_head_sha=proof.verified_head_sha,
+            promoted_tree_fingerprint=proof.verified_tree_fingerprint,
+        )
+        if persisted is None:
+            raise GitError("promoted target did not exactly match the verified candidate tree")
+        for warning in warnings:
+            log.emit("WARN", warning)
+        for staged_entry in staged_batch:
+            finalized = _finalize_staged_isolated_merge_action(
+                config,
+                store,
+                git,
+                staged=staged_entry.staged,
+                merge_source=MERGE_SOURCE_WATCH,
+                quiet_mechanics=True,
+            )
+            for followup_task in finalized.created_followups:
+                log.emit("FOLLOW", _format_follow_line(str(followup_task.id), str(staged_entry.display_task.id), reused=False))
+            for followup_task in finalized.reused_followups:
+                log.emit("FOLLOW", _format_follow_line(str(followup_task.id), str(staged_entry.display_task.id), reused=True))
+            for investigation_task_id in finalized.created_investigation_task_ids:
+                log.emit("FOLLOW", _format_follow_line(str(investigation_task_id), str(staged_entry.display_task.id), reused=False, investigation=True))
+            for investigation_task_id in finalized.reused_investigation_task_ids:
+                log.emit("FOLLOW", _format_follow_line(str(investigation_task_id), str(staged_entry.display_task.id), reused=True, investigation=True))
+            if staged_entry.merge_event is not None:
+                merge_status_after = (_task_snapshot(store).get(staged_entry.merge_event.display_task_id) or {}).get(
+                    "merge_status"
+                )
+                if (
+                    staged_entry.merge_status_before != "merged"
+                    and merge_status_after == "merged"
+                    and not log.was_merge_logged(staged_entry.merge_event.merge_key)
+                ):
+                    log.emit("MERGE", f"{staged_entry.merge_event.display_task_id} -> {staged_entry.merge_event.target_branch}")
+                    log.note_merge_logged(staged_entry.merge_event.merge_key)
+        return True, False, None
+
+    merge_git = _run_with_optional_stdout_suppressed(
+        quiet,
+        lambda: ensure_watch_main_checkout(config, git, target_branch),
+    )
+    first_red_entry: _WatchBatchStagedMerge | None = None
+    first_red_check: CandidateIntegrationVerifyCheck | None = None
+    for staged_entry in staged_batch:
+        def _replay_staged_merge() -> _StagedIsolatedMergeAction | _MergeActionResult:
+            return _stage_isolated_merge_action(
+                config,
+                store,
+                git,
+                staged_entry.task,
+                staged_entry.action,
+                target_branch=target_branch,
+                current_branch=current_branch,
+                merge_git=merge_git,
+                merge_current_branch=target_branch,
+                already_merged_behavior="mark_merged",
+                merge_source=MERGE_SOURCE_WATCH,
+                quiet_mechanics=True,
+            )
+
+        replay = _run_with_optional_stdout_suppressed(quiet, _replay_staged_merge)
+        if not isinstance(replay, _StagedIsolatedMergeAction):
+            first_red_entry = staged_entry
+            first_red_check = getattr(replay, "candidate_verify", None)
+            break
+        prefix_check = _run_with_optional_stdout_suppressed(
+            quiet,
+            lambda: check_candidate_integration_verify(
+                config,
+                merge_git,
+                reason=f"watch-pre-merge-prefix-{staged_entry.display_task.id}",
+                red_reruns=2,
+            ),
+        )
+        if prefix_check.evidence.verify_status != "passed":
+            first_red_entry = staged_entry
+            first_red_check = prefix_check
+            break
+    merge_git = _run_with_optional_stdout_suppressed(
+        quiet,
+        lambda: ensure_watch_main_checkout(config, git, target_branch),
+    )
+    if first_red_entry is None:
+        first_red_entry = staged_batch[0]
+        first_red_check = combined_candidate
+    synthetic_result = SimpleNamespace(
+        rc=1,
+        status="blocked_candidate_verify_unavailable"
+        if first_red_check is None or first_red_check.classification == "unavailable"
+        else "blocked_candidate_verify",
+        block_reason="candidate verify blocked isolated promotion",
+        candidate_verify=first_red_check or combined_candidate,
+    )
+    _emit_blocked_candidate_verify_attention(
+        log=log,
+        display_task=first_red_entry.display_task,
+        merge_result=synthetic_result,
+    )
+    if _should_queue_candidate_rework(synthetic_result.candidate_verify):
+        rework_task = _queue_candidate_rework_task(
+            config=config,
+            store=store,
+            owner_task=first_red_entry.display_task,
+            check=synthetic_result.candidate_verify,
+            tags=tags,
+            any_tag=any_tag,
+        )
+        log.emit("FOLLOW", _format_follow_line(str(rework_task.id), str(first_red_entry.display_task.id), reused=False))
+    return False, False, None
 
 
 def _sleep_interruptibly(seconds: int, stop_requested: Callable[[], bool], *, quantum: float = 1.0) -> None:
@@ -3780,6 +4202,7 @@ class _CycleResult:
     starting_worker_count: int = 0
     expected_starts: dict[str, "_ExpectedStart"] = field(default_factory=dict)
     confirmed_start_count: int = 0
+    active_recovery_subject_ids: frozenset[str] = frozenset()
 
 
 _DispatchObserver = Callable[[str, Literal["started", "direct", "capacity_blocked"], str], None]
@@ -5089,6 +5512,7 @@ def _dispatch_scoped_watch_once(
     dispatch_observer: _DispatchObserver | None = None,
     new_worker_start_cap: int | None = None,
     excluded_owner_ids: frozenset[str] = frozenset(),
+    seen_active_recovery_subject_ids: frozenset[str] = frozenset(),
 ) -> _CycleResult:
     """Run one scoped watch dispatch pass through the shared watch execution path."""
     return _run_cycle(
@@ -5116,6 +5540,7 @@ def _dispatch_scoped_watch_once(
         dispatch_observer=dispatch_observer,
         new_worker_start_cap=new_worker_start_cap,
         excluded_owner_ids=excluded_owner_ids,
+        seen_active_recovery_subject_ids=seen_active_recovery_subject_ids,
     )
 
 
@@ -5147,6 +5572,7 @@ def _run_cycle(
     dispatch_observer: _DispatchObserver | None = None,
     new_worker_start_cap: int | None = None,
     excluded_owner_ids: frozenset[str] = frozenset(),
+    seen_active_recovery_subject_ids: frozenset[str] = frozenset(),
 ) -> _CycleResult:
     from ._common import (
         prune_terminal_dead_workers,
@@ -5693,6 +6119,7 @@ def _run_cycle(
 
     if lifecycle_rows:
         action_plan = list(analysis.action_plan)
+        impl_based_on_ids = collect_non_dropped_implement_source_ids(store.get_all())
         has_merge_action = any(action.get("type") in {"merge", "merge_with_followups"} for _, _, action in action_plan)
         can_merge = merge_actions_available
         if has_merge_action:
@@ -5720,7 +6147,7 @@ def _run_cycle(
                     git,
                     item[1],
                     target_branch,
-                    impl_based_on_ids=collect_non_dropped_implement_source_ids(store.get_all()),
+                    impl_based_on_ids=impl_based_on_ids,
                     selected_for_merge=True,
                 ),
             )
@@ -5730,12 +6157,54 @@ def _run_cycle(
         if emit_lifecycle_summary and lifecycle_summary is not None:
             log.emit("INFO", lifecycle_summary)
 
-        for execution_decision in execution_decisions:
-            row, task, action = execution_decision.item
-            action = dict(execution_decision.action)
+        batch_processed = 0
+        if (
+            isolation_enabled
+            and not dry_run
+            and can_merge
+            and not merge_halted_for_cycle
+            and verify_gate_enabled(config)
+        ):
+            leading_merge_decisions: list[Any] = []
+            for merge_batch_decision in execution_decisions:
+                action_type = dict(merge_batch_decision.action).get("type")
+                if action_type not in {"merge", "merge_with_followups"}:
+                    break
+                leading_merge_decisions.append(merge_batch_decision)
+            if leading_merge_decisions:
+                try:
+                    merge_git = _run_with_optional_stdout_suppressed(
+                        quiet,
+                        lambda: ensure_watch_main_checkout(config, git, target_branch),
+                    )
+                    batch_work_done, merge_halted_for_cycle, active_main_verify_remediation = _run_isolated_merge_batch(
+                        config=config,
+                        store=store,
+                        git=git,
+                        merge_git=merge_git,
+                        current_branch=current_branch,
+                        target_branch=target_branch,
+                        decisions=leading_merge_decisions,
+                        quiet=quiet,
+                        dry_run=dry_run,
+                        log=log,
+                        tags=tags,
+                        any_tag=any_tag,
+                    )
+                    if batch_work_done:
+                        work_done = True
+                    batch_processed = len(leading_merge_decisions)
+                except GitError as exc:
+                    log.emit("ERROR", f"isolated merge batch failed: {exc}")
+                    batch_processed = len(leading_merge_decisions)
+
+        for lifecycle_execution_decision in execution_decisions[batch_processed:]:
+            row, task, action = lifecycle_execution_decision.item
+            action = dict(lifecycle_execution_decision.action)
             display_task = row.owner_task
             action_type = action.get("type")
             if classify_advance_action(action) == "needs_attention":
+                original_attention_reason = get_needs_attention_reason(action)
                 attention_key: str
                 recovery_entry = (
                     recovery_lane_entry_by_failed_id.get(get_action_subject_task_id(action) or "")
@@ -5758,6 +6227,17 @@ def _run_cycle(
                     attention_key=attention_key,
                     message=_watch_needs_attention_message(display_task, action),
                 )
+                if original_attention_reason == "rebase-failed-needs-manual-resolution":
+                    owner_action = determine_next_action(
+                        config,
+                        store,
+                        git,
+                        task,
+                        target_branch,
+                        impl_based_on_ids=impl_based_on_ids,
+                    )
+                    if not show_skipped and classify_advance_action(owner_action) != "needs_attention":
+                        work_done = True
                 continue
 
             if classify_advance_action(action) == "skip":
@@ -6464,13 +6944,31 @@ def _run_cycle(
     pending_recovery_task_ids = set(analysis.pending_recovery_task_ids)
     actionable_failed = list(analysis.actionable_failed)
     parked_recovery_subject_ids: set[str] = set()
+    lifecycle_attention_owner_ids = {
+        row.owner_task.id
+        for row, _task, action in analysis.action_plan
+        if row.owner_task.id is not None and classify_advance_action(action) == "needs_attention"
+    }
     for owner_task, decision, attention_action in analysis.recovery_attention_rows:
         owner_id = owner_task.id or "unknown"
         log.emit_attention(
             attention_key=f"failed-recovery-attention:{owner_id}:{decision.reason_code}",
             message=_watch_needs_attention_message(owner_task, attention_action),
         )
+        if (
+            not show_skipped
+            and owner_task.id not in lifecycle_attention_owner_ids
+            and decision.reason_code == "rebase-failed-needs-manual-resolution"
+        ):
+            work_done = True
     for owner_task, failed, decision, recovery_action in analysis.recovery_visible_skips:
+        if (
+            not restart_failed
+            and not show_skipped
+            and decision.reason_code in {"recovery_already_running", "recovery_already_pending"}
+        ):
+            if failed.id is not None and str(failed.id) not in seen_active_recovery_subject_ids:
+                work_done = True
         if recovery_slots > 0 and show_skipped:
             description = str(recovery_action.get("description", "")).strip()
             log.emit(
@@ -7303,6 +7801,7 @@ def _run_cycle(
                             f"{task.id} {task_type}: iterate startup preparation failed",
                             dedupe_key=f"prepare-iterate-failed:{task.id}",
                         )
+                        work_done = True
                         continue
                     pending_task_before = _snapshot_watch_dispatch_task(prepared_pending_task)
                     rc = _spawn_worker_with_failure_log(
@@ -7467,6 +7966,7 @@ def _run_cycle(
         starting_worker_count=end_starting_worker_count,
         expected_starts=expected_starts,
         confirmed_start_count=confirmed_start_count,
+        active_recovery_subject_ids=analysis.active_recovery_subject_ids,
     )
 
 
@@ -7721,6 +8221,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         failure_backoffs: dict[str, _OwnerFailureBackoffState] = {}
         previous_snapshot = _task_snapshot(store)
         expected_starts: dict[str, _ExpectedStart] = {}
+        seen_active_recovery_subject_ids: frozenset[str] = frozenset()
         system_hold_active = False
         git_health_hold_active = False
 
@@ -7988,6 +8489,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     emit_lifecycle_summary=not preview_cycle_open,
                     scoped_owner_ids=scoped_owner_ids,
                     excluded_owner_ids=excluded_owner_ids,
+                    seen_active_recovery_subject_ids=seen_active_recovery_subject_ids,
                 )
             else:
                 cycle_result = _run_cycle(
@@ -8013,12 +8515,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     emit_lifecycle_summary=not preview_cycle_open,
                     scoped_owner_ids=scoped_owner_ids,
                     excluded_owner_ids=excluded_owner_ids,
+                    seen_active_recovery_subject_ids=seen_active_recovery_subject_ids,
                 )
             pending_first_cycle_plan = None
             preview_cycle_open = False
             cycle_result.confirmed_start_count += cycle_confirmed_start_count
             if cycle_result.expected_starts:
                 expected_starts.update(cycle_result.expected_starts)
+            seen_active_recovery_subject_ids = cycle_result.active_recovery_subject_ids | frozenset(
+                str(task.based_on)
+                for task in store.get_all()
+                if task.status in {"pending", "in_progress"} and task.based_on is not None
+            )
 
             current_snapshot = _task_snapshot(store)
             post_cycle_confirmed_start_ids = _emit_transition_events(

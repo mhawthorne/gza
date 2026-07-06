@@ -25,8 +25,9 @@ When `main_checkout_isolate` is enabled:
 1. Automated default-branch merge flows that enable `main_checkout_isolate` MUST stage
    each merge attempt in a dedicated detached integration checkout that is separate from
    any operator-attached default-branch checkout.
-2. A staged merge MUST count as landed only after the real default-branch ref is advanced
-   to the detached merge result.
+2. When a configured local-target verify gate exists, the exact staged candidate tree
+   MUST verify green before promotion. A staged merge MUST count as landed only after the
+   real default-branch ref is advanced to that verified detached merge result.
 3. If some attached checkout currently has the default branch checked out, watch MUST
    reset that checkout to the newly advanced default-branch tip after promotion so the
    checkout does not drift behind the moved ref.
