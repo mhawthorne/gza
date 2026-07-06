@@ -37,6 +37,7 @@ Log line shapes it understands::
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 import time
@@ -219,17 +220,44 @@ def make_figure():
     return plt.subplots(figsize=(14, 7))
 
 
-def _draw_merges(ax, merges):
-    """Mark merges: exact-time dots on the baseline + quadrant boxes of task ids.
+def _spread(centers, halves, lo, hi, gap):
+    """Nudge box centers (px) apart so none overlap, staying within ``[lo, hi]``.
 
-    Merges are bucketed by the hour (one box per hour listing that hour's task
-    ids), and the boxes are stacked in a reserved band of "fake negative" space
-    **below** the baseline. Because every data series is non-negative, hanging the
-    boxes below zero keeps them clear of the lines and makes the leaders short.
-    Boxes are lane-packed (each takes the lowest lane whose previous box has ended)
-    to avoid horizontal overlap, then the lanes are distributed evenly inside a band
-    whose depth is **hard-capped** at roughly twice the data height. Busy windows
-    pack the lanes tighter rather than letting the band balloon downward.
+    A forward pass pushes each box right until it clears its left neighbour; if the
+    row then overruns ``hi`` a backward pass compresses it leftward, and a final
+    forward pass re-clamps the left edge. Boxes end up as close to their desired x
+    as the no-overlap constraint allows.
+    """
+    pos = list(centers)
+    n = len(pos)
+    for i in range(1, n):
+        pos[i] = max(pos[i], pos[i - 1] + halves[i - 1] + gap + halves[i])
+    if pos and pos[-1] + halves[-1] > hi:
+        pos[-1] = hi - halves[-1]
+        for i in range(n - 2, -1, -1):
+            pos[i] = min(pos[i], pos[i + 1] - halves[i + 1] - gap - halves[i])
+    if pos and pos[0] - halves[0] < lo:
+        pos[0] = lo + halves[0]
+        for i in range(1, n):
+            pos[i] = max(pos[i], pos[i - 1] + halves[i - 1] + gap + halves[i])
+    return pos
+
+
+def _draw_merges(ax, merges):
+    """Mark merges: exact-time dots on the baseline + hourly task-id boxes below it.
+
+    Merges are bucketed by the hour (one box per hour listing that hour's task ids)
+    and drawn in a reserved band of "fake negative" space **below** the baseline.
+    Because every data series is non-negative, hanging the boxes below zero keeps
+    them clear of the lines.
+
+    Crucially, a box's horizontal position is **decoupled from its timestamp**: the
+    boxes are spread evenly along the axis (in time order) and a thin leader connects
+    each to its real merge time on the baseline. This is what keeps them legible when
+    merges cluster in a short real-time span (e.g. active periods squeezed between
+    laptop-sleep gaps) — the boxes fan out horizontally instead of stacking into an
+    unreadable diagonal cascade. Only when a single row can't hold them all do we add
+    more rows.
     """
     if not merges:
         return
@@ -249,50 +277,70 @@ def _draw_merges(ax, merges):
     # Pixel geometry for width/height estimates (approximate; conservative is fine).
     fig = ax.figure
     fontsize = 9
-    x0, x1 = ax.get_xlim()
-    dmin, dmax = ax.get_ylim()
+    xlo, xhi = ax.get_xlim()             # matplotlib date numbers
+    dmax = ax.get_ylim()[1]
     pos = ax.get_position()
-    px_per_datex = (pos.width * fig.get_figwidth() * fig.dpi) / (x1 - x0)
+    usable_px = pos.width * fig.get_figwidth() * fig.dpi
     axheight_px = pos.height * fig.get_figheight() * fig.dpi
+    px_per_dx = usable_px / (xhi - xlo)
     char_px = fontsize * 0.62 * fig.dpi / 72.0
     line_px = fontsize * 1.5 * fig.dpi / 72.0
+    gap_px = 8.0
 
-    # Lane-pack in display-x: first lane whose last box ends before this one starts.
-    lane_right = []          # last right-edge (px) per lane, index == lane
-    placed = []              # (center_dt, ids, lane)
+    # Each box: true dot time, desired x (px from left), half-width, id list.
+    boxes = []               # (true_center_dt, desired_px, half_px, ids)
     for start, ids in ordered:
         center = start + timedelta(minutes=30)
-        cx = (mdates.date2num(center) - x0) * px_per_datex
-        half = (max(len(t) for t in ids) * char_px + 12) / 2
-        left, right = cx - half, cx + half
-        lane = next((i for i, r in enumerate(lane_right) if left >= r + 6), None)
-        if lane is None:
-            lane = len(lane_right)
-            lane_right.append(right)
-        else:
-            lane_right[lane] = right
-        placed.append((center, ids, lane))
+        desired = (mdates.date2num(center) - xlo) * px_per_dx
+        half = (max(len(t) for t in ids) * char_px + 14) / 2
+        boxes.append((center, desired, half, ids))
 
-    # Fit the lanes into a "fake negative" band whose depth is hard-capped at ~2x
-    # the data height. Lanes are spread evenly across the band, so more lanes pack
-    # tighter instead of extending the band downward without bound.
-    n = len(lane_right)
+    # How many rows are needed for the boxes to fit horizontally without overlap.
+    total_px = sum(2 * b[2] for b in boxes) + gap_px * (len(boxes) - 1)
+    rows = max(1, math.ceil(total_px / usable_px)) if usable_px else 1
+
+    # Assign boxes to rows round-robin (in time order) so each row stays sparse,
+    # then spread each row so its boxes don't overlap.
+    row_boxes = [[] for _ in range(rows)]
+    for i, b in enumerate(boxes):
+        row_boxes[i % rows].append(b)
+    row_x = {}               # id(box) -> adjusted center px
+    for rb in row_boxes:
+        adj = _spread([b[1] for b in rb], [b[2] for b in rb], 0.0, usable_px, gap_px)
+        for b, x in zip(rb, adj):
+            row_x[id(b)] = x
+
+    # Vertical: stack the rows below zero, each tall enough for its tallest box.
+    # Solve the new axis bottom so the whole band fits the pixels we need (the axis
+    # grows to make room, so lane spacing must track the final data range).
+    row_h_px = [max((len(b[3]) for b in rb), default=1) * line_px + 12 for rb in row_boxes]
+    band_px = sum(row_h_px) + gap_px * rows
     span = max(dmax, 1.0)
-    gap = span * 0.05                    # small gap below the baseline dots
-    cap = max(2.0 * span, 12.0)          # hard floor on how deep the band may go
-    band_top = -gap
-    band_bottom = -cap
-    step_y = (band_top - band_bottom) / n
-    ax.set_ylim(band_bottom - gap, dmax)
+    g = span * 0.05
+    k = min(band_px / axheight_px, 0.85) if axheight_px else 0.5
+    newmin = -(g + k * dmax) / (1 - k)
+    ax.set_ylim(newmin, dmax)
+    dy_per_px = (dmax - newmin) / axheight_px if axheight_px else 1.0
 
-    for center, ids, lane in placed:
-        y = band_top - (lane + 0.5) * step_y
-        ax.plot([center, center], [0, y], color="0.8", linewidth=0.6, alpha=0.5, zorder=0)
-        ax.annotate(
-            "\n".join(ids), (center, y), ha="center", va="center",
-            fontsize=fontsize, color="tab:purple", zorder=7,
-            bbox=dict(boxstyle="round", fc="white", ec="tab:purple", alpha=0.9),
-        )
+    # Row center y (data units), walking down from just below the baseline.
+    cursor = gap_px
+    row_center_y = []
+    for h in row_h_px:
+        row_center_y.append(-(g + (cursor + h / 2) * dy_per_px))
+        cursor += h + gap_px
+
+    for r, rb in enumerate(row_boxes):
+        y = row_center_y[r]
+        for b in rb:
+            center, _, _, ids = b
+            bx_num = xlo + row_x[id(b)] / px_per_dx
+            bx = mdates.num2date(bx_num)
+            ax.plot([center, bx], [0, y], color="0.8", linewidth=0.6, alpha=0.5, zorder=0)
+            ax.annotate(
+                "\n".join(ids), (bx, y), ha="center", va="center",
+                fontsize=fontsize, color="tab:purple", zorder=7,
+                bbox=dict(boxstyle="round", fc="white", ec="tab:purple", alpha=0.9),
+            )
 
 
 def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_label="",
