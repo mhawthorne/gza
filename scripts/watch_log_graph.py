@@ -225,10 +225,11 @@ def _draw_merges(ax, merges):
     Merges are bucketed into 15-minute quadrants (so at most four boxes per hour),
     and the boxes are stacked in a reserved band of "fake negative" space **below**
     the baseline. Because every data series is non-negative, hanging the boxes below
-    zero keeps them clear of the lines and makes the leaders short. Within the band,
-    boxes are lane-packed: any two that would overlap horizontally are pushed onto
-    separate stacked lanes, so no two boxes ever collide. The y-axis is extended
-    downward to make room for the band.
+    zero keeps them clear of the lines and makes the leaders short. Boxes are
+    lane-packed (each takes the lowest lane whose previous box has ended) to avoid
+    horizontal overlap, then the lanes are distributed evenly inside a band whose
+    depth is **hard-capped** at roughly twice the data height. Busy windows pack the
+    lanes tighter rather than letting the band balloon downward.
     """
     if not merges:
         return
@@ -257,7 +258,7 @@ def _draw_merges(ax, merges):
     line_px = fontsize * 1.5 * fig.dpi / 72.0
 
     # Lane-pack in display-x: first lane whose last box ends before this one starts.
-    lane_right = []          # last right-edge (px) per lane
+    lane_right = []          # last right-edge (px) per lane, index == lane
     placed = []              # (center_dt, ids, lane)
     for start, ids in ordered:
         center = start + timedelta(minutes=7, seconds=30)
@@ -272,21 +273,20 @@ def _draw_merges(ax, merges):
             lane_right[lane] = right
         placed.append((center, ids, lane))
 
-    # Reserve a "fake negative" band below zero and extend the y-axis downward to
-    # fit it. Solve for the new bottom so each lane gets ``lane_px`` pixels *after*
-    # the rescale (the axis grows, so lane spacing must track the final data range).
+    # Fit the lanes into a "fake negative" band whose depth is hard-capped at ~2x
+    # the data height. Lanes are spread evenly across the band, so more lanes pack
+    # tighter instead of extending the band downward without bound.
     n = len(lane_right)
-    max_lines = max(len(ids) for _, ids in ordered)
-    lane_px = max_lines * line_px + 10
-    gap = max(dmax, 1.0) * 0.05          # small gap below the baseline dots
-    c = min((n + 0.5) * lane_px / axheight_px, 0.7) if axheight_px else 0.5
-    rng = 1.05 * max(dmax, 1.0) / (1 - c)   # dmax - newmin, after the rescale
-    newmin = dmax - rng
-    ax.set_ylim(newmin, dmax)
-    step_y = lane_px * rng / axheight_px if axheight_px else lane_px
+    span = max(dmax, 1.0)
+    gap = span * 0.05                    # small gap below the baseline dots
+    cap = max(2.0 * span, 12.0)          # hard floor on how deep the band may go
+    band_top = -gap
+    band_bottom = -cap
+    step_y = (band_top - band_bottom) / n
+    ax.set_ylim(band_bottom - gap, dmax)
 
     for center, ids, lane in placed:
-        y = -(gap + (lane + 0.5) * step_y)
+        y = band_top - (lane + 0.5) * step_y
         ax.plot([center, center], [0, y], color="0.8", linewidth=0.6, alpha=0.5, zorder=0)
         ax.annotate(
             "\n".join(ids), (center, y), ha="center", va="center",
