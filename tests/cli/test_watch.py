@@ -11278,14 +11278,16 @@ def test_watch_cycle_green_post_merge_verify_clears_freeze_for_later_merge(tmp_p
     ]
 
 
-def test_watch_cycle_post_merge_verify_reuses_fresh_promoted_checkpoint(tmp_path: Path) -> None:
+def test_watch_cycle_isolated_candidate_verify_promotion_reuses_checkpoint(tmp_path: Path) -> None:
     setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
     store = make_store(tmp_path)
 
     task = _make_completed_watch_merge_task(
         store,
         "Completed task",
-        branch="feature/watch-post-merge-checkpoint",
+        branch="feature/watch-isolated-post-merge-checkpoint",
     )
 
     config = Config.load(tmp_path)
@@ -11293,31 +11295,62 @@ def test_watch_cycle_post_merge_verify_reuses_fresh_promoted_checkpoint(tmp_path
     log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
     git = _make_watch_git()
     git.repo_dir = tmp_path
-    git.rev_parse_if_exists = MagicMock(return_value="promoted-head")  # type: ignore[method-assign]
+    merge_git = MagicMock(name="isolated_watch_merge_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "promoted-head"
+    merge_git.rev_parse_if_exists.return_value = "promoted-head"
+    merge_git.current_branch.return_value = "main"
 
-    def persist_fresh_checkpoint(*_args, **_kwargs):
-        main_verify_task = _make_main_verify_internal_task(store, head_sha="promoted-head")
-        main_verify_task.review_verify_command = "./bin/tests"
-        main_verify_task.review_verify_status = "passed"
-        main_verify_task.review_verify_exit_status = "0"
-        main_verify_task.review_verify_failure = None
-        main_verify_task.review_verify_head_sha = "promoted-head"
-        main_verify_task.output_content = json.dumps(
-            {
-                "captured_at": "2026-06-30T00:00:00+00:00",
-                "environment_identity": _main_verify_environment_identity_payload(),
-                "gate_enabled": True,
-                "head_sha": "promoted-head",
-                "tree_fingerprint": "fp-promoted",
-                "verify_command": "./bin/tests",
-                "verify_timeout_grace_seconds": 5.0,
-                "verify_timeout_seconds": 120,
-            },
-            sort_keys=True,
+    candidate_check = CandidateIntegrationVerifyCheck(
+        evidence=CandidateIntegrationVerifyEvidence(
+            gate_enabled=True,
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            environment_identity=MainIntegrationVerifyEnvironmentIdentity(
+                runner_class="host",
+                platform_system=platform.system(),
+                platform_machine=platform.machine(),
+                python_implementation=platform.python_implementation(),
+                python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+                python_executable_family="python3",
+            ),
+            tree_fingerprint="fp-promoted",
+            head_sha="promoted-head",
+            verify_status="passed",
+            verify_exit_status="0",
+            failure=None,
+            failing_phase=None,
+            reviewed_branch="main",
+            working_directory=str(config.main_checkout_integration_path),
+            captured_at=datetime(2026, 6, 30, 0, 0, tzinfo=UTC),
+        ),
+        classification="pass",
+        merges_halted=False,
+        remediation=None,
+        verify_runs=1,
+    )
+
+    staged_merge = _StagedIsolatedMergeAction(
+        merge_subject=task,
+        merge_unit_id=None,
+        merge_branch=task.branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+    )
+
+    def finalize_staged_merge(_config, _store, _git, *, staged, **_kwargs):
+        assert staged.merge_subject.id == task.id
+        _store.set_merge_status(task.id, "merged")
+        return SimpleNamespace(
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
         )
-        store.update(main_verify_task)
-        store.set_merge_status(task.id, "merged")
-        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
 
     def watch_check_main_verify(*args, **kwargs):
         if kwargs["reason"] == "watch-main-verify":
@@ -11333,7 +11366,14 @@ def test_watch_cycle_post_merge_verify_reuses_fresh_promoted_checkpoint(tmp_path
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
-        patch("gza.cli.watch._execute_merge_action", side_effect=persist_fresh_checkpoint),
+        patch("gza.cli.watch.verify_gate_enabled", return_value=False),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.git_ops._resolve_merge_subject", return_value=None),
+        patch("gza.cli.git_ops._stage_isolated_merge_action", return_value=staged_merge),
+        patch("gza.cli.git_ops.check_candidate_integration_verify", return_value=candidate_check),
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-promoted"),
+        patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch", return_value=()),
+        patch("gza.cli.git_ops._finalize_staged_isolated_merge_action", side_effect=finalize_staged_merge),
         patch("gza.cli.watch.check_main_integration_verify", side_effect=watch_check_main_verify),
         patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-promoted"),
         patch("gza.main_integration_verify._run_review_verify_command") as run_verify,
@@ -11351,6 +11391,11 @@ def test_watch_cycle_post_merge_verify_reuses_fresh_promoted_checkpoint(tmp_path
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.merge_status == "merged"
+    main_state = load_main_integration_verify_state(store)
+    assert main_state is not None
+    assert main_state.head_sha == "promoted-head"
+    assert main_state.tree_fingerprint == "fp-promoted"
+    assert main_state.environment_identity == candidate_check.evidence.environment_identity
     run_verify.assert_not_called()
 
 
