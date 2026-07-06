@@ -1,6 +1,4 @@
 """Tests for gza.lineage helpers."""
-
-import logging
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -163,10 +161,7 @@ def test_lineage_view_owner_prefers_completed_reattempt_over_failed_original(tmp
     assert owner.id == reattempt.id
 
 
-def test_lineage_view_owner_warns_when_multiple_successful_implements_exist(
-    tmp_path: Path,
-    caplog,
-) -> None:
+def test_lineage_view_owner_returns_latest_successful_implement_when_multiple_exist(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
 
     first = store.add("First implementation", task_type="implement")
@@ -183,12 +178,10 @@ def test_lineage_view_owner_warns_when_multiple_successful_implements_exist(
     second.completed_at = datetime(2026, 7, 5, 11, 0, tzinfo=UTC)
     store.update(second)
 
-    with caplog.at_level(logging.WARNING):
-        owner = LineageView(store, first).owner()
+    owner = LineageView(store, first).owner()
 
     assert owner is not None
     assert owner.id == second.id
-    assert "multiple successful implement tasks" in caplog.text
 
 
 def test_lineage_view_original_latest_and_all_sort_by_event_time(tmp_path: Path) -> None:

@@ -8,13 +8,10 @@ resolvers is deferred to v0.6.0/v0.7.0.
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from .db import MergeUnit, SqliteTaskStore, Task as DbTask, task_id_numeric_key
-
-_LOG = logging.getLogger(__name__)
 
 
 def _normalize_event_time(value: datetime | None) -> datetime:
@@ -40,12 +37,6 @@ class LineageView:
     def owner(self) -> DbTask | None:
         """Return the latest successful implementation attempt for this lineage."""
         successful = [task for task in self.all("implement") if self._is_successful_implement(task)]
-        if len(successful) > 1:
-            _LOG.warning(
-                "LineageView.owner found multiple successful implement tasks for merge unit %s: %s",
-                self._merge_unit_id(),
-                ", ".join(task.id or "<unknown>" for task in successful),
-            )
         if successful:
             return successful[-1]
         representative = self._representative_implement()
@@ -110,13 +101,6 @@ class LineageView:
         if representative is not None and representative.task_type == "implement":
             return representative
         return None
-
-    def _merge_unit_id(self) -> str:
-        if self._merge_unit is not None:
-            return self._merge_unit.id
-        if self._task is not None:
-            return self._task.id or "<unattached>"
-        return "<unknown>"
 
     @staticmethod
     def _sorted_tasks(tasks: Iterable[DbTask]) -> list[DbTask]:
