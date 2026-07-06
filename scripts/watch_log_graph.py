@@ -222,14 +222,14 @@ def make_figure():
 def _draw_merges(ax, merges):
     """Mark merges: exact-time dots on the baseline + quadrant boxes of task ids.
 
-    Merges are bucketed into 15-minute quadrants (so at most four boxes per hour),
-    and the boxes are stacked in a reserved band of "fake negative" space **below**
-    the baseline. Because every data series is non-negative, hanging the boxes below
-    zero keeps them clear of the lines and makes the leaders short. Boxes are
-    lane-packed (each takes the lowest lane whose previous box has ended) to avoid
-    horizontal overlap, then the lanes are distributed evenly inside a band whose
-    depth is **hard-capped** at roughly twice the data height. Busy windows pack the
-    lanes tighter rather than letting the band balloon downward.
+    Merges are bucketed by the hour (one box per hour listing that hour's task
+    ids), and the boxes are stacked in a reserved band of "fake negative" space
+    **below** the baseline. Because every data series is non-negative, hanging the
+    boxes below zero keeps them clear of the lines and makes the leaders short.
+    Boxes are lane-packed (each takes the lowest lane whose previous box has ended)
+    to avoid horizontal overlap, then the lanes are distributed evenly inside a band
+    whose depth is **hard-capped** at roughly twice the data height. Busy windows
+    pack the lanes tighter rather than letting the band balloon downward.
     """
     if not merges:
         return
@@ -239,10 +239,10 @@ def _draw_merges(ax, merges):
     ax.scatter(xs, [0] * len(xs), marker="o", s=16, color="tab:purple",
                zorder=6, label=f"merge ({len(merges)})")
 
-    # Bucket into 15-minute quadrants: at most four boxes per hour.
-    groups = {}  # quadrant-start -> [task_id, ...] in time order
+    # Bucket by the hour: one box per hour listing that hour's merges.
+    groups = {}  # hour-start -> [task_id, ...] in time order
     for when, tid in merges:
-        start = when.replace(minute=(when.minute // 15) * 15, second=0, microsecond=0)
+        start = when.replace(minute=0, second=0, microsecond=0)
         groups.setdefault(start, []).append(tid)
     ordered = sorted(groups.items())
 
@@ -261,7 +261,7 @@ def _draw_merges(ax, merges):
     lane_right = []          # last right-edge (px) per lane, index == lane
     placed = []              # (center_dt, ids, lane)
     for start, ids in ordered:
-        center = start + timedelta(minutes=7, seconds=30)
+        center = start + timedelta(minutes=30)
         cx = (mdates.date2num(center) - x0) * px_per_datex
         half = (max(len(t) for t in ids) * char_px + 12) / 2
         left, right = cx - half, cx + half
