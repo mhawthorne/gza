@@ -2114,7 +2114,7 @@ def test_watch_cycle_owner_plan_attention_emits_once_even_with_skipped_failed_de
             max_recovery_attempts=config.max_resume_attempts,
         )
 
-    assert result.work_done is False
+    assert result.work_done is True
     attention_lines = [line for line in log_path.read_text().splitlines() if "ATTENTION" in line]
     assert len(attention_lines) == 2
     assert any("reason=rebase-failed-needs-manual-resolution" in line and impl.id in line for line in attention_lines)
@@ -2242,7 +2242,7 @@ def test_watch_cycle_show_skipped_keeps_manual_failed_recovery_on_attention_chan
             show_skipped=True,
         )
 
-    assert result.work_done is False
+    assert result.work_done is True
     text = log_path.read_text()
     assert "ATTENTION" in text
     assert any("ATTENTION" in line and impl.id in line for line in text.splitlines())
@@ -3844,6 +3844,161 @@ def test_watch_cycle_dry_run_matches_shared_preview_dispatch_plan_order(tmp_path
     assert dispatched_ids == [entry.task.id for entry in plan.entries]
 
 
+def test_watch_cycle_executes_only_planned_recovery_entries_and_preserves_pending_slot(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    store._default_merge_target_cache = "main"  # noqa: SLF001 - avoid real git in unit test
+    store._project_root = None  # noqa: SLF001 - avoid real git fallback in unit test
+
+    recovery_one = store.add("Failed implement one", task_type="implement")
+    assert recovery_one.id is not None
+    recovery_one.status = "failed"
+    recovery_one.failure_reason = "MAX_TURNS"
+    recovery_one.session_id = "sess-first-recovery"
+    recovery_one.completed_at = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+    store.update(recovery_one)
+
+    recovery_two = store.add("Failed implement two", task_type="implement")
+    assert recovery_two.id is not None
+    recovery_two.status = "failed"
+    recovery_two.failure_reason = "MAX_TURNS"
+    recovery_two.session_id = "sess-second-recovery"
+    recovery_two.completed_at = datetime(2026, 7, 1, 12, 5, 0, tzinfo=UTC)
+    store.update(recovery_two)
+
+    pending_plan = store.add("Pending plan", task_type="plan")
+    assert pending_plan.id is not None
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    real_plan_watch_dispatch_entries = plan_watch_dispatch_entries
+
+    def fake_plan_watch_dispatch_entries(
+        entries: tuple[DispatchPreviewEntry, ...],
+        *,
+        slots: int,
+        recovery_slot_cap: int,
+        selection_mode: str,
+        include_pending: bool = True,
+    ) -> WatchDispatchPlan:
+        if selection_mode == "default":
+            recovery_entries = [entry for entry in entries if entry.lane == "recovery"]
+            pending_entries = [entry for entry in entries if entry.lane == "pending"]
+            assert [entry.task.id for entry in recovery_entries] == [recovery_one.id, recovery_two.id]
+            assert [entry.task.id for entry in pending_entries] == [pending_plan.id]
+            return WatchDispatchPlan(
+                entries=(recovery_entries[1], pending_entries[0]),
+                recovery_worker_slots=1,
+                pending_slots=1,
+            )
+        return real_plan_watch_dispatch_entries(
+            entries,
+            slots=slots,
+            recovery_slot_cap=recovery_slot_cap,
+            selection_mode=selection_mode,
+            include_pending=include_pending,
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.plan_watch_dispatch_entries", side_effect=fake_plan_watch_dispatch_entries),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("dry-run should not spawn")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("dry-run should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    log_lines = log_path.read_text().splitlines()
+    recovery_lines = [line for line in log_lines if "RECOVR" in line]
+    assert any(recovery_two.id in line for line in recovery_lines)
+    assert all(recovery_one.id not in line for line in recovery_lines)
+    assert any("START" in line and str(pending_plan.id) in line and "[dry-run]" in line for line in log_lines)
+
+
+def test_watch_cycle_executes_only_planned_recovery_entries_when_no_pending_slots_remain(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    store._default_merge_target_cache = "main"  # noqa: SLF001 - avoid real git in unit test
+    store._project_root = None  # noqa: SLF001 - avoid real git fallback in unit test
+
+    recovery_one = store.add("Failed implement one", task_type="implement")
+    assert recovery_one.id is not None
+    recovery_one.status = "failed"
+    recovery_one.failure_reason = "MAX_TURNS"
+    recovery_one.session_id = "sess-first-recovery-no-pending"
+    recovery_one.completed_at = datetime(2026, 7, 1, 12, 0, 0, tzinfo=UTC)
+    store.update(recovery_one)
+
+    recovery_two = store.add("Failed implement two", task_type="implement")
+    assert recovery_two.id is not None
+    recovery_two.status = "failed"
+    recovery_two.failure_reason = "MAX_TURNS"
+    recovery_two.session_id = "sess-second-recovery-no-pending"
+    recovery_two.completed_at = datetime(2026, 7, 1, 12, 5, 0, tzinfo=UTC)
+    store.update(recovery_two)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    real_plan_watch_dispatch_entries = plan_watch_dispatch_entries
+
+    def fake_plan_watch_dispatch_entries(
+        entries: tuple[DispatchPreviewEntry, ...],
+        *,
+        slots: int,
+        recovery_slot_cap: int,
+        selection_mode: str,
+        include_pending: bool = True,
+    ) -> WatchDispatchPlan:
+        if selection_mode == "default":
+            recovery_entries = [entry for entry in entries if entry.lane == "recovery"]
+            assert [entry.task.id for entry in recovery_entries] == [recovery_one.id, recovery_two.id]
+            return WatchDispatchPlan(
+                entries=(recovery_entries[1],),
+                recovery_worker_slots=1,
+                pending_slots=0,
+            )
+        return real_plan_watch_dispatch_entries(
+            entries,
+            slots=slots,
+            recovery_slot_cap=recovery_slot_cap,
+            selection_mode=selection_mode,
+            include_pending=include_pending,
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.plan_watch_dispatch_entries", side_effect=fake_plan_watch_dispatch_entries),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("dry-run should not spawn")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("dry-run should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.work_done is True
+    log_lines = log_path.read_text().splitlines()
+    recovery_lines = [line for line in log_lines if "RECOVR" in line]
+    assert any(recovery_two.id in line for line in recovery_lines)
+    assert all(recovery_one.id not in line for line in recovery_lines)
+    assert not any("START" in line and "[dry-run]" in line for line in log_lines)
+
+
 def test_watch_cycle_dry_run_caps_pending_implement_preview_to_allocated_slots(tmp_path: Path) -> None:
     """Dry-run should preview only the pending implement starts allowed after recovery reservation."""
     setup_config(tmp_path)
@@ -4961,6 +5116,7 @@ def test_watch_cycle_needs_rebase_followup_does_not_start_unplanned_retry(
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.launch_permit"),
         patch(
             "gza.cli.watch.check_main_integration_verify",
             return_value=SimpleNamespace(
@@ -5018,6 +5174,902 @@ def test_watch_cycle_needs_rebase_followup_does_not_start_unplanned_retry(
     assert refreshed_retry_child is not None
     assert refreshed_rebase_child.status == "in_progress"
     assert refreshed_retry_child.status == "pending"
+
+
+def test_watch_cycle_replan_settles_only_new_recovery_starts(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    failed_retry_first = store.add("Failed retry first", task_type="implement")
+    assert failed_retry_first.id is not None
+    failed_retry_first.status = "failed"
+    failed_retry_first.failure_reason = "PROVIDER_ERROR"
+    failed_retry_first.completed_at = datetime.now(UTC)
+    failed_retry_first.branch = "feature/replan-first-retry"
+    store.update(failed_retry_first)
+
+    failed_reconcile = store.add("Failed reconcile", task_type="implement")
+    assert failed_reconcile.id is not None
+    failed_reconcile.status = "failed"
+    failed_reconcile.failure_reason = "BRANCH_UNPUSHABLE"
+    failed_reconcile.completed_at = datetime.now(UTC)
+    failed_reconcile.branch = "feature/replan-reconcile"
+    store.update(failed_reconcile)
+
+    failed_retry_replanned = store.add("Failed retry replanned", task_type="implement")
+    assert failed_retry_replanned.id is not None
+    failed_retry_replanned.status = "failed"
+    failed_retry_replanned.failure_reason = "PROVIDER_ERROR"
+    failed_retry_replanned.completed_at = datetime.now(UTC)
+    failed_retry_replanned.branch = "feature/replan-second-retry"
+    store.update(failed_retry_replanned)
+
+    retry_child_first = store.add(
+        failed_retry_first.prompt,
+        task_type="implement",
+        based_on=failed_retry_first.id,
+        recovery_origin="retry",
+    )
+    assert retry_child_first.id is not None
+
+    retry_child_replanned = store.add(
+        failed_retry_replanned.prompt,
+        task_type="implement",
+        based_on=failed_retry_replanned.id,
+        recovery_origin="retry",
+    )
+    assert retry_child_replanned.id is not None
+
+    def _recovery_row(task: Task) -> LineageOwnerRow:
+        return LineageOwnerRow(
+            owner_task=task,
+            members=(task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action=None,
+            next_action_reason="recovery",
+            unresolved_tasks=(task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=None,
+            recovery_action_task=task,
+            recovery_leaf_task=task,
+        )
+
+    retry_first_row = _recovery_row(failed_retry_first)
+    reconcile_row = _recovery_row(failed_reconcile)
+    retry_replanned_row = _recovery_row(failed_retry_replanned)
+
+    retry_first_decision = FailedRecoveryDecision(
+        task_id=failed_retry_first.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry failed implementation",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=retry_child_first.id,
+        reuse_existing=True,
+    )
+    reconcile_decision = FailedRecoveryDecision(
+        task_id=failed_reconcile.id,
+        action="reconcile",
+        reason_code="retry_branch_unpushable",
+        reason_text="Reconcile branch publication",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+    )
+    retry_replanned_decision = FailedRecoveryDecision(
+        task_id=failed_retry_replanned.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry failed implementation",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=retry_child_replanned.id,
+        reuse_existing=True,
+    )
+
+    precomputed_plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=2,
+        slots=2,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(retry_first_row, reconcile_row, retry_replanned_row),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(),
+            recovery_rows=(retry_first_row, reconcile_row, retry_replanned_row),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=(),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            actionable_failed=(
+                (
+                    retry_first_row,
+                    failed_retry_first,
+                    retry_first_decision,
+                    {"type": "retry", "description": "Retry failed task"},
+                    True,
+                    failed_retry_first,
+                ),
+                (
+                    reconcile_row,
+                    failed_reconcile,
+                    reconcile_decision,
+                    {
+                        "type": "reconcile_branch_divergence",
+                        "description": "Reconcile branch publication before queue pickup",
+                    },
+                    False,
+                    failed_reconcile,
+                ),
+                (
+                    retry_replanned_row,
+                    failed_retry_replanned,
+                    retry_replanned_decision,
+                    {"type": "retry", "description": "Retry failed task"},
+                    True,
+                    failed_retry_replanned,
+                ),
+            ),
+        ),
+    )
+
+    started_task_ids: list[str] = []
+    settled_start_batches: list[list[str]] = []
+    recovery_preview_entries = (
+        DispatchPreviewEntry(
+            lane="recovery",
+            task=failed_retry_first,
+            owner_task=failed_retry_first,
+            runnable=True,
+            worker_consuming=True,
+            decision=retry_first_decision,
+            advance_action={"type": "retry"},
+            lineage_row=retry_first_row,
+        ),
+        DispatchPreviewEntry(
+            lane="recovery",
+            task=failed_reconcile,
+            owner_task=failed_reconcile,
+            runnable=True,
+            worker_consuming=False,
+            decision=reconcile_decision,
+            advance_action={"type": "reconcile_branch_divergence"},
+            lineage_row=reconcile_row,
+        ),
+        DispatchPreviewEntry(
+            lane="recovery",
+            task=failed_retry_replanned,
+            owner_task=failed_retry_replanned,
+            runnable=True,
+            worker_consuming=True,
+            decision=retry_replanned_decision,
+            advance_action={"type": "retry"},
+            lineage_row=retry_replanned_row,
+        ),
+    )
+
+    def build_preview(*_args: object, **kwargs: object) -> DispatchPreview:
+        selection_mode = str(kwargs.get("selection_mode", ""))
+        include_recovery = bool(kwargs.get("include_recovery", True))
+        if include_recovery:
+            return DispatchPreview(entries=recovery_preview_entries)
+        assert selection_mode == "pending_only"
+        return DispatchPreview(entries=())
+
+    dispatch_plan_calls = {"count": 0}
+
+    def plan_dispatch_entries(
+        entries: tuple[DispatchPreviewEntry, ...],
+        *,
+        slots: int,
+        recovery_slot_cap: int | None,
+        selection_mode: str,
+        include_pending: bool,
+    ) -> WatchDispatchPlan:
+        del entries, slots, recovery_slot_cap, selection_mode, include_pending
+        dispatch_plan_calls["count"] += 1
+        if dispatch_plan_calls["count"] == 1:
+            return WatchDispatchPlan(
+                entries=(recovery_preview_entries[0], recovery_preview_entries[1]),
+                recovery_worker_slots=1,
+                pending_slots=0,
+            )
+        if dispatch_plan_calls["count"] == 2:
+            return WatchDispatchPlan(
+                entries=(recovery_preview_entries[2],),
+                recovery_worker_slots=1,
+                pending_slots=0,
+            )
+        return WatchDispatchPlan(entries=(), recovery_worker_slots=0, pending_slots=0)
+
+    def _fake_execute_advance_action(*, task, action, context):
+        del context
+        assert task.id == failed_reconcile.id
+        assert action["type"] == "reconcile_branch_divergence"
+        return AdvanceActionExecutionResult(
+            action_type="reconcile",
+            status="success",
+            message="Branch publication reconciled",
+            success_message="Branch publication reconciled",
+            worker_label="reconcile",
+            worker_consuming=False,
+            work_done=True,
+        )
+
+    def spawn_worker(
+        _args: argparse.Namespace,
+        _config: Config,
+        *,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        started_task_ids.append(task_id)
+        return 0
+
+    def settle_dispatches(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
+        settled_start_batches.append([getattr(entry, "task_id") for entry in pending_starts])
+        return _live_settle_results(pending_starts, store=store)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.launch_permit"),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(
+                merges_halted=False,
+                state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
+            ),
+        ),
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
+        patch("gza.cli.watch.plan_watch_dispatch_entries", side_effect=plan_dispatch_entries),
+        patch("gza.cli.watch.execute_advance_action", side_effect=_fake_execute_advance_action),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _config, task, **_kwargs: task),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=spawn_worker),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_dispatches),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            recovery_slots=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            max_recovery_attempts=config.max_resume_attempts,
+            precomputed_plan=precomputed_plan,
+        )
+
+    assert result.work_done is True
+    assert result.confirmed_start_count == 2
+    assert started_task_ids == [retry_child_first.id, retry_child_replanned.id]
+    assert settled_start_batches == [[retry_child_first.id], [retry_child_replanned.id]]
+
+    log_lines = log_path.read_text().splitlines()
+    assert sum("START" in line and retry_child_first.id in line for line in log_lines) == 1
+    assert sum("START" in line and retry_child_replanned.id in line for line in log_lines) == 1
+    assert sum("RECOVR" in line and "reconcile branch publication" in line for line in log_lines) == 1
+
+
+def test_watch_cycle_planned_recovery_mapping_drift_fails_closed_without_pending_fallback(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    actionable_failed = store.add("Actual actionable failed", task_type="implement")
+    assert actionable_failed.id is not None
+    actionable_failed.status = "failed"
+    actionable_failed.failure_reason = "PROVIDER_ERROR"
+    actionable_failed.completed_at = datetime.now(UTC)
+    actionable_failed.branch = "feature/actual-actionable-failed"
+    store.update(actionable_failed)
+
+    planned_only_failed = store.add("Planned-only failed", task_type="implement")
+    assert planned_only_failed.id is not None
+    planned_only_failed.status = "failed"
+    planned_only_failed.failure_reason = "PROVIDER_ERROR"
+    planned_only_failed.completed_at = datetime.now(UTC)
+    planned_only_failed.branch = "feature/planned-only-failed"
+    store.update(planned_only_failed)
+
+    pending_plan = store.add("Pending fallback work", task_type="plan")
+    assert pending_plan.id is not None
+
+    actionable_row = LineageOwnerRow(
+        owner_task=actionable_failed,
+        members=(actionable_failed,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(actionable_failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=actionable_failed,
+        recovery_leaf_task=actionable_failed,
+    )
+    planned_only_row = LineageOwnerRow(
+        owner_task=planned_only_failed,
+        members=(planned_only_failed,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(planned_only_failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=planned_only_failed,
+        recovery_leaf_task=planned_only_failed,
+    )
+    actionable_decision = FailedRecoveryDecision(
+        task_id=actionable_failed.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry failed implementation",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+    )
+    planned_only_decision = FailedRecoveryDecision(
+        task_id=planned_only_failed.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry failed implementation",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+    )
+    precomputed_plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=1,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(actionable_row, planned_only_row),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(),
+            recovery_rows=(actionable_row, planned_only_row),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=(),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            actionable_failed=(
+                (
+                    actionable_row,
+                    actionable_failed,
+                    actionable_decision,
+                    {"type": "retry", "description": "Retry failed task"},
+                    True,
+                    actionable_failed,
+                ),
+            ),
+        ),
+    )
+
+    def build_preview(*_args: object, **kwargs: object) -> DispatchPreview:
+        selection_mode = str(kwargs.get("selection_mode", ""))
+        include_recovery = bool(kwargs.get("include_recovery", True))
+        if include_recovery:
+            return DispatchPreview(
+                entries=(
+                    DispatchPreviewEntry(
+                        lane="recovery",
+                        task=planned_only_failed,
+                        owner_task=planned_only_failed,
+                        runnable=True,
+                        worker_consuming=True,
+                        decision=planned_only_decision,
+                        advance_action={"type": "retry"},
+                        lineage_row=planned_only_row,
+                    ),
+                    DispatchPreviewEntry(
+                        lane="pending",
+                        task=pending_plan,
+                        runnable=True,
+                        worker_consuming=True,
+                    ),
+                )
+            )
+        assert selection_mode == "pending_only"
+        return DispatchPreview(
+            entries=(
+                DispatchPreviewEntry(
+                    lane="pending",
+                    task=pending_plan,
+                    runnable=True,
+                    worker_consuming=True,
+                ),
+            )
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("drifted recovery plan should fail closed before pending starts")),
+        patch("gza.cli.watch.execute_advance_action", side_effect=AssertionError("drifted recovery plan should not execute unrelated recovery rows")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            recovery_slots=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+            max_recovery_attempts=config.max_resume_attempts,
+            precomputed_plan=precomputed_plan,
+        )
+
+    assert result.work_done is False
+    log_text = log_path.read_text()
+    assert "planned recovery entry from initial-plan could not be dispatched" in log_text
+    assert "watch stopped further dispatch for this pass" in log_text
+    assert str(planned_only_failed.id) in log_text
+    assert str(pending_plan.id) not in log_text
+    assert "START" not in log_text
+
+
+def test_watch_cycle_replan_executes_resume_recovery_entries(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    failed_reconcile = store.add("Failed reconcile", task_type="implement")
+    assert failed_reconcile.id is not None
+    failed_reconcile.status = "failed"
+    failed_reconcile.failure_reason = "BRANCH_UNPUSHABLE"
+    failed_reconcile.completed_at = datetime.now(UTC)
+    failed_reconcile.branch = "feature/replan-reconcile-resume"
+    store.update(failed_reconcile)
+
+    failed_resume = store.add("Failed resume replanned", task_type="implement")
+    assert failed_resume.id is not None
+    failed_resume.status = "failed"
+    failed_resume.failure_reason = "TIMEOUT"
+    failed_resume.completed_at = datetime.now(UTC)
+    failed_resume.branch = "feature/replan-resume"
+    failed_resume.session_id = "sess-replan-resume"
+    store.update(failed_resume)
+
+    resume_child = store.add(
+        failed_resume.prompt,
+        task_type="implement",
+        based_on=failed_resume.id,
+        recovery_origin="resume",
+    )
+    assert resume_child.id is not None
+
+    def _recovery_row(task: Task) -> LineageOwnerRow:
+        return LineageOwnerRow(
+            owner_task=task,
+            members=(task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action=None,
+            next_action_reason="recovery",
+            unresolved_tasks=(task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=None,
+            recovery_action_task=task,
+            recovery_leaf_task=task,
+        )
+
+    reconcile_row = _recovery_row(failed_reconcile)
+    resume_row = _recovery_row(failed_resume)
+    reconcile_decision = FailedRecoveryDecision(
+        task_id=failed_reconcile.id,
+        action="reconcile",
+        reason_code="retry_branch_unpushable",
+        reason_text="Reconcile branch publication",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+    )
+    resume_decision = FailedRecoveryDecision(
+        task_id=failed_resume.id,
+        action="resume",
+        reason_code="retry_timeout",
+        reason_text="Resume failed implementation",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=resume_child.id,
+        reuse_existing=True,
+    )
+    precomputed_plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(reconcile_row, resume_row),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(),
+            recovery_rows=(reconcile_row, resume_row),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=(),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            actionable_failed=(
+                (
+                    reconcile_row,
+                    failed_reconcile,
+                    reconcile_decision,
+                    {"type": "reconcile_branch_divergence", "description": "Reconcile branch publication before queue pickup"},
+                    False,
+                    failed_reconcile,
+                ),
+                (
+                    resume_row,
+                    failed_resume,
+                    resume_decision,
+                    {"type": "resume", "description": "Resume failed task"},
+                    True,
+                    failed_resume,
+                ),
+            ),
+        ),
+    )
+
+    recovery_preview_entries = (
+        DispatchPreviewEntry(
+            lane="recovery",
+            task=failed_reconcile,
+            owner_task=failed_reconcile,
+            runnable=True,
+            worker_consuming=False,
+            decision=reconcile_decision,
+            advance_action={"type": "reconcile_branch_divergence"},
+            lineage_row=reconcile_row,
+        ),
+        DispatchPreviewEntry(
+            lane="recovery",
+            task=failed_resume,
+            owner_task=failed_resume,
+            runnable=True,
+            worker_consuming=True,
+            decision=resume_decision,
+            advance_action={"type": "resume"},
+            lineage_row=resume_row,
+        ),
+    )
+
+    dispatch_plan_calls = {"count": 0}
+    started_task_ids: list[str] = []
+
+    def build_preview(*_args: object, **kwargs: object) -> DispatchPreview:
+        if bool(kwargs.get("include_recovery", True)):
+            return DispatchPreview(entries=recovery_preview_entries)
+        return DispatchPreview(entries=())
+
+    def plan_dispatch_entries(
+        entries: tuple[DispatchPreviewEntry, ...],
+        *,
+        slots: int,
+        recovery_slot_cap: int | None,
+        selection_mode: str,
+        include_pending: bool,
+    ) -> WatchDispatchPlan:
+        del entries, slots, recovery_slot_cap, selection_mode, include_pending
+        dispatch_plan_calls["count"] += 1
+        if dispatch_plan_calls["count"] == 1:
+            return WatchDispatchPlan(
+                entries=(recovery_preview_entries[0],),
+                recovery_worker_slots=0,
+                pending_slots=0,
+            )
+        if dispatch_plan_calls["count"] == 2:
+            return WatchDispatchPlan(
+                entries=(recovery_preview_entries[1],),
+                recovery_worker_slots=1,
+                pending_slots=0,
+            )
+        return WatchDispatchPlan(entries=(), recovery_worker_slots=0, pending_slots=0)
+
+    def spawn_resume_worker(
+        _args: argparse.Namespace,
+        _config: Config,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        started_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
+        patch("gza.cli.watch.plan_watch_dispatch_entries", side_effect=plan_dispatch_entries),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            return_value=AdvanceActionExecutionResult(
+                action_type="reconcile",
+                status="success",
+                message="Branch publication reconciled",
+                success_message="Branch publication reconciled",
+                worker_label="reconcile",
+                worker_consuming=False,
+                work_done=True,
+            ),
+        ),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _config, task, **_kwargs: task),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=spawn_resume_worker),
+        patch(
+            "gza.cli.watch._settle_watch_dispatch_starts",
+            side_effect=lambda *, pending_starts, **_kwargs: _live_settle_results(pending_starts, store=store),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            recovery_slots=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            max_recovery_attempts=config.max_resume_attempts,
+            precomputed_plan=precomputed_plan,
+        )
+
+    assert result.work_done is True
+    assert started_task_ids == [resume_child.id]
+    assert dispatch_plan_calls["count"] >= 2
+    log_text = log_path.read_text()
+    assert "reconcile branch publication" in log_text
+    assert any("START" in line and resume_child.id in line for line in log_text.splitlines())
+
+
+def test_watch_cycle_replan_executes_fresh_retry_recovery_entries(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    failed_reconcile = store.add("Failed reconcile", task_type="implement")
+    assert failed_reconcile.id is not None
+    failed_reconcile.status = "failed"
+    failed_reconcile.failure_reason = "BRANCH_UNPUSHABLE"
+    failed_reconcile.completed_at = datetime.now(UTC)
+    failed_reconcile.branch = "feature/replan-reconcile-fresh-retry"
+    store.update(failed_reconcile)
+
+    failed_retry = store.add("Failed retry replanned fresh", task_type="implement")
+    assert failed_retry.id is not None
+    failed_retry.status = "failed"
+    failed_retry.failure_reason = "PROVIDER_ERROR"
+    failed_retry.completed_at = datetime.now(UTC)
+    failed_retry.branch = "feature/replan-fresh-retry"
+    store.update(failed_retry)
+
+    def _recovery_row(task: Task) -> LineageOwnerRow:
+        return LineageOwnerRow(
+            owner_task=task,
+            members=(task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action=None,
+            next_action_reason="recovery",
+            unresolved_tasks=(task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=None,
+            recovery_action_task=task,
+            recovery_leaf_task=task,
+        )
+
+    reconcile_row = _recovery_row(failed_reconcile)
+    retry_row = _recovery_row(failed_retry)
+    reconcile_decision = FailedRecoveryDecision(
+        task_id=failed_reconcile.id,
+        action="reconcile",
+        reason_code="retry_branch_unpushable",
+        reason_text="Reconcile branch publication",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+    )
+    retry_decision = FailedRecoveryDecision(
+        task_id=failed_retry.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry failed implementation",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        reuse_existing=False,
+    )
+    precomputed_plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(reconcile_row, retry_row),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(),
+            recovery_rows=(reconcile_row, retry_row),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=(),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            actionable_failed=(
+                (
+                    reconcile_row,
+                    failed_reconcile,
+                    reconcile_decision,
+                    {"type": "reconcile_branch_divergence", "description": "Reconcile branch publication before queue pickup"},
+                    False,
+                    failed_reconcile,
+                ),
+                (
+                    retry_row,
+                    failed_retry,
+                    retry_decision,
+                    {"type": "retry", "description": "Retry failed task"},
+                    True,
+                    failed_retry,
+                ),
+            ),
+        ),
+    )
+
+    recovery_preview_entries = (
+        DispatchPreviewEntry(
+            lane="recovery",
+            task=failed_reconcile,
+            owner_task=failed_reconcile,
+            runnable=True,
+            worker_consuming=False,
+            decision=reconcile_decision,
+            advance_action={"type": "reconcile_branch_divergence"},
+            lineage_row=reconcile_row,
+        ),
+        DispatchPreviewEntry(
+            lane="recovery",
+            task=failed_retry,
+            owner_task=failed_retry,
+            runnable=True,
+            worker_consuming=True,
+            decision=retry_decision,
+            advance_action={"type": "retry"},
+            lineage_row=retry_row,
+        ),
+    )
+
+    dispatch_plan_calls = {"count": 0}
+    started_task_ids: list[str] = []
+
+    def build_preview(*_args: object, **kwargs: object) -> DispatchPreview:
+        if bool(kwargs.get("include_recovery", True)):
+            return DispatchPreview(entries=recovery_preview_entries)
+        return DispatchPreview(entries=())
+
+    def plan_dispatch_entries(
+        entries: tuple[DispatchPreviewEntry, ...],
+        *,
+        slots: int,
+        recovery_slot_cap: int | None,
+        selection_mode: str,
+        include_pending: bool,
+    ) -> WatchDispatchPlan:
+        del entries, slots, recovery_slot_cap, selection_mode, include_pending
+        dispatch_plan_calls["count"] += 1
+        if dispatch_plan_calls["count"] == 1:
+            return WatchDispatchPlan(
+                entries=(recovery_preview_entries[0],),
+                recovery_worker_slots=0,
+                pending_slots=0,
+            )
+        if dispatch_plan_calls["count"] == 2:
+            return WatchDispatchPlan(
+                entries=(recovery_preview_entries[1],),
+                recovery_worker_slots=1,
+                pending_slots=0,
+            )
+        return WatchDispatchPlan(entries=(), recovery_worker_slots=0, pending_slots=0)
+
+    def spawn_worker(
+        _args: argparse.Namespace,
+        _config: Config,
+        *,
+        task_id: str,
+        **_kwargs: object,
+    ) -> int:
+        started_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
+        patch("gza.cli.watch.plan_watch_dispatch_entries", side_effect=plan_dispatch_entries),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            return_value=AdvanceActionExecutionResult(
+                action_type="reconcile",
+                status="success",
+                message="Branch publication reconciled",
+                success_message="Branch publication reconciled",
+                worker_label="reconcile",
+                worker_consuming=False,
+                work_done=True,
+            ),
+        ),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _config, task, **_kwargs: task),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=spawn_worker),
+        patch(
+            "gza.cli.watch._settle_watch_dispatch_starts",
+            side_effect=lambda *, pending_starts, **_kwargs: _live_settle_results(pending_starts, store=store),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            recovery_slots=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            max_recovery_attempts=config.max_resume_attempts,
+            precomputed_plan=precomputed_plan,
+        )
+
+    assert result.work_done is True
+    assert dispatch_plan_calls["count"] >= 2
+    assert len(started_task_ids) == 1
+    started_retry = store.get(started_task_ids[0])
+    assert started_retry is not None
+    assert started_retry.based_on == failed_retry.id
+    assert started_retry.recovery_origin == "retry"
+    assert any("START" in line and started_task_ids[0] in line for line in log_path.read_text().splitlines())
 
 
 def test_watch_cycle_terminal_recovery_start_releases_reserved_slot_for_same_cycle_pending(

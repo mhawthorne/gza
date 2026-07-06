@@ -4739,43 +4739,31 @@ def _map_planned_recovery_entries_to_actionable_failed(
         tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]
     ],
     known_non_actionable_failed_ids: frozenset[str] = frozenset(),
-) -> tuple[tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask], ...]:
-    """Preserve preview-plan order when watch launches recovery work."""
-    actionable_by_failed_id: dict[
-        str, tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]
-    ] = {}
-    for actionable_entry in actionable_failed:
-        _row, failed, _decision, _action, _worker_consuming, _action_task = actionable_entry
-        if failed.id is None:
+) -> tuple[
+    tuple[tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask], ...],
+    tuple[DispatchPreviewEntry, ...],
+]:
+    actionable_by_failed_id = {
+        str(failed.id): (row, failed, decision, recovery_action, worker_consuming_recovery, action_task)
+        for row, failed, decision, recovery_action, worker_consuming_recovery, action_task in actionable_failed
+        if failed.id is not None
+    }
+    planned_actionable_failed: list[
+        tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]
+    ] = []
+    unmapped_entries: list[DispatchPreviewEntry] = []
+    for entry in planned_entries:
+        if entry.lane != "recovery" or entry.task.id is None:
             continue
-        actionable_by_failed_id[str(failed.id)] = actionable_entry
-
-    mapped_entries: list[tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]] = []
-    missing_failed_ids: list[str] = []
-    seen_failed_ids: set[str] = set()
-    for planned_entry in planned_entries:
-        if planned_entry.lane != "recovery" or planned_entry.task.id is None:
-            continue
-        failed_id = str(planned_entry.task.id)
-        if failed_id in seen_failed_ids:
-            continue
-        seen_failed_ids.add(failed_id)
-        resolved_actionable_entry = actionable_by_failed_id.get(failed_id)
-        if resolved_actionable_entry is None:
+        failed_id = str(entry.task.id)
+        planned_failed = actionable_by_failed_id.get(failed_id)
+        if planned_failed is None:
             if failed_id in known_non_actionable_failed_ids:
                 continue
-            missing_failed_ids.append(failed_id)
+            unmapped_entries.append(entry)
             continue
-        mapped_entries.append(resolved_actionable_entry)
-
-    if missing_failed_ids:
-        missing_list = ", ".join(missing_failed_ids)
-        raise RuntimeError(
-            "watch dispatch preview drift: planned recovery tasks missing actionable rows: "
-            f"{missing_list}"
-        )
-
-    return tuple(mapped_entries)
+        planned_actionable_failed.append(planned_failed)
+    return tuple(planned_actionable_failed), tuple(unmapped_entries)
 
 
 def allocate_watch_slots(
@@ -7405,21 +7393,16 @@ def _run_cycle(
     pending_recovery_task_ids = set(analysis.pending_recovery_task_ids)
     actionable_failed = list(analysis.actionable_failed)
     parked_recovery_subject_ids: set[str] = set()
-    lifecycle_attention_owner_ids = {
-        row.owner_task.id
-        for row, _task, action in analysis.action_plan
-        if row.owner_task.id is not None and classify_advance_action(action) == "needs_attention"
-    }
     for owner_task, decision, attention_action in analysis.recovery_attention_rows:
         owner_id = owner_task.id or "unknown"
         log.emit_attention(
             attention_key=f"failed-recovery-attention:{owner_id}:{decision.reason_code}",
             message=_watch_needs_attention_message(owner_task, attention_action),
         )
-        if (
-            not show_skipped
-            and owner_task.id not in lifecycle_attention_owner_ids
-            and decision.reason_code == "rebase-failed-needs-manual-resolution"
+        if decision.reason_code == "rebase-failed-needs-manual-resolution" or (
+            decision.reason_code == "manual_failure_reason"
+            and owner_task.id is not None
+            and owner_task.id != decision.task_id
         ):
             work_done = True
     for owner_task, failed, decision, recovery_action in getattr(analysis, "recovery_undispatched_rows", ()):
@@ -7434,6 +7417,11 @@ def _run_cycle(
             ),
             dedupe_key=f"recovery-undispatched:{failed.id}:{decision.action}:{reason}",
         )
+    explicitly_undispatched_recovery_subject_ids = {
+        str(failed.id)
+        for _owner_task, failed, _decision, _recovery_action in getattr(analysis, "recovery_undispatched_rows", ())
+        if failed.id is not None
+    }
     for owner_task, failed, decision, recovery_action in analysis.recovery_visible_skips:
         if (
             not restart_failed
@@ -7549,15 +7537,14 @@ def _run_cycle(
         )
         if failed.id is not None
     )
-    planned_recovery_actionable_failed = _map_planned_recovery_entries_to_actionable_failed(
+    planned_recovery_actionable_failed, unmapped_planned_recovery_entries = _map_planned_recovery_entries_to_actionable_failed(
         planned_dispatch_entries,
         actionable_failed=actionable_failed,
         known_non_actionable_failed_ids=known_non_actionable_recovery_subject_ids,
     )
-    recovery_dispatch_actionable_failed = list(planned_recovery_actionable_failed)
     launchable_recovery_subject_ids = {
         str(failed.id)
-        for _row, failed, _decision, _action, _worker_consuming, _action_task in recovery_dispatch_actionable_failed
+        for _row, failed, _decision, _action, _worker_consuming, _action_task in planned_recovery_actionable_failed
         if failed.id is not None
         and str(failed.id) not in parked_recovery_subject_ids
         and str(failed.id) not in active_backoff_recovery_subject_ids
@@ -7577,7 +7564,564 @@ def _run_cycle(
                 subject_task=failed,
                 action=recovery_action,
             )
-    for row, failed, decision, recovery_action, worker_consuming_recovery, action_task in recovery_dispatch_actionable_failed:
+    def _fail_closed_for_planned_recovery_entry(
+        entry: DispatchPreviewEntry,
+        *,
+        stage: str,
+        reason: str,
+    ) -> None:
+        task_id = str(entry.task.id) if entry.task.id is not None else "unknown"
+        owner_id = entry.owner_task.id if entry.owner_task is not None and entry.owner_task.id is not None else "unknown"
+        log.emit_attention(
+            attention_key=f"planned-recovery-dispatch-invariant:{stage}:{task_id}:{reason}",
+            message=(
+                f"{task_id}: planned recovery entry from {stage} could not be dispatched "
+                f"(owner={owner_id}, reason={reason}); watch stopped further dispatch for this pass"
+            ),
+        )
+
+    def _dispatch_planned_recovery_entries(
+        planned_rows: Sequence[
+            tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]
+        ],
+        *,
+        pending_slots_for_replan: int,
+        allow_replan: bool,
+        processed_task_ids: set[str] | None = None,
+    ) -> tuple[bool, bool]:
+        nonlocal recovery_started_this_cycle, work_done
+        local_replan_requested = False
+        local_fail_closed = False
+        deferred_recovery_starts: list[_DeferredWatchDispatchStart] = []
+
+        for row, failed, decision, recovery_action, worker_consuming_recovery, action_task in planned_rows:
+            if failed.id is None:
+                continue
+            if processed_task_ids is not None:
+                processed_task_ids.add(str(failed.id))
+            recovery_action_type = str(recovery_action.get("type", ""))
+            if worker_consuming_recovery and (_free_worker_start_slots() <= 0 or _free_reserved_recovery_slots() <= 0):
+                _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
+                no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
+                    store=store,
+                    subject_task=failed,
+                    action=recovery_action,
+                    action_task=action_task,
+                    failed_task=failed,
+                    no_progress_cycles=config.watch.no_progress_cycles,
+                    persist=not dry_run,
+                )
+                if no_progress_attention is not None:
+                    parked_recovery_subject_ids.add(str(failed.id))
+                    nonparked_recovery_subject_ids.discard(str(failed.id))
+                    log.emit_attention(
+                        attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                        message=_watch_needs_attention_message(failed, no_progress_attention),
+                    )
+                continue
+            if not dry_run:
+                no_progress_attention = _maybe_park_watch_no_progress(
+                    config=config,
+                    store=store,
+                    subject_task=failed,
+                    action=recovery_action,
+                    action_task=action_task,
+                    failed_task=failed,
+                    no_progress_cycles=config.watch.no_progress_cycles,
+                )
+                if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
+                    _maybe_emit_active_watch_recovery_backoff(
+                        store=store,
+                        log=log,
+                        subject_task=failed,
+                        action=recovery_action,
+                    )
+                    continue
+                if no_progress_attention is not None:
+                    parked_recovery_subject_ids.add(str(failed.id))
+                    nonparked_recovery_subject_ids.discard(str(failed.id))
+                    if decision.recovery_task_id is not None:
+                        pending_recovery_task_ids.add(decision.recovery_task_id)
+                    log.emit_attention(
+                        attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                        message=_watch_needs_attention_message(failed, no_progress_attention),
+                    )
+                    continue
+            if recovery_action_type == "reconcile_branch_divergence":
+                if dry_run:
+                    log.emit(
+                        "RECOVR",
+                        (
+                            f"{failed.id} reconcile branch publication "
+                            f"[owner={row.owner_task.id}] "
+                            f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) [dry-run]"
+                        ),
+                    )
+                    work_done = True
+                    continue
+                exec_result = execute_advance_action(task=failed, action=recovery_action, context=executor_context)
+                if exec_result.status == "skip":
+                    if exec_result.message.startswith("SKIP: no watch worker slots available for "):
+                        _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
+                    attention = resolve_execution_needs_attention(failed, exec_result)
+                    if attention is not None:
+                        log.emit_attention(
+                            attention_key=f"recovery-attention:{failed.id}:reconcile",
+                            message=_watch_needs_attention_message(attention.task, attention.action),
+                        )
+                    else:
+                        no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
+                            store=store,
+                            subject_task=failed,
+                            action=recovery_action,
+                            action_task=action_task,
+                            failed_task=failed,
+                            no_progress_cycles=config.watch.no_progress_cycles,
+                        )
+                        if no_progress_attention is not None:
+                            log.emit_attention(
+                                attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                                message=_watch_needs_attention_message(failed, no_progress_attention),
+                            )
+                            continue
+                        log.emit(
+                            "SKIP",
+                            f"{failed.id}: {exec_result.message}",
+                            dedupe_key=f"recovery-reconcile-skip:{failed.id}:{exec_result.message}",
+                        )
+                    continue
+                if exec_result.status == "error":
+                    log.emit(
+                        "REPAIR",
+                        f"{failed.id}: {exec_result.message}",
+                        dedupe_key=f"recovery-reconcile-error:{failed.id}:{exec_result.message}",
+                    )
+                    continue
+                if exec_result.status == "success":
+                    _observe_dispatch(row.owner_task.id, "direct", recovery_action_type)
+                    refreshed_failed = store.get(failed.id) if failed.id is not None else None
+                    no_progress_attention = _finalize_watch_no_progress_after_execution(
+                        config=config,
+                        store=store,
+                        subject_task=failed,
+                        action=recovery_action,
+                        action_task_before=action_task,
+                        action_task_after=refreshed_failed or action_task,
+                        failed_task=failed,
+                        no_progress_cycles=config.watch.no_progress_cycles,
+                    )
+                    recovery_started_this_cycle = True
+                    log.emit(
+                        "RECOVR",
+                        (
+                            f"{failed.id} reconcile branch publication "
+                            f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit})"
+                        ),
+                    )
+                    log.emit(
+                        "REPAIR",
+                        f"{failed.id}: {exec_result.success_message or exec_result.message}",
+                        dedupe_key=f"recovery-reconcile-success:{failed.id}",
+                    )
+                    if no_progress_attention is not None:
+                        log.emit_attention(
+                            attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                            message=_watch_needs_attention_message(failed, no_progress_attention),
+                        )
+                    work_done = True
+                    _consume_worker_slot_if_needed(exec_result, reserve_recovery_slot=True)
+                    if allow_replan and pending_slots_for_replan <= 0 and not exec_result.worker_consuming:
+                        local_replan_requested = True
+                    continue
+                continue
+            if recovery_action_type == "needs_rebase":
+                if dry_run:
+                    deferred_action_type = recovery_action.get("deferred_action_type")
+                    deferred_text = (
+                        f" deferred={deferred_action_type}"
+                        if isinstance(deferred_action_type, str) and deferred_action_type
+                        else ""
+                    )
+                    log.emit(
+                        "RECOVR",
+                        (
+                            f"{failed.id} needs_rebase [owner={row.owner_task.id}] "
+                            f"({recovery_action.get('reason', 'recovery-preflight-rebase')}{deferred_text}) [dry-run]"
+                        ),
+                    )
+                    _consume_worker_slot_if_needed(
+                        AdvanceActionExecutionResult(
+                            action_type="needs_rebase",
+                            status="dry_run",
+                            message="Would create rebase task",
+                            worker_consuming=True,
+                        ),
+                        reserve_recovery_slot=True,
+                    )
+                    work_done = True
+                    continue
+                exec_result = execute_advance_action(task=failed, action=recovery_action, context=executor_context)
+                if exec_result.status == "skip":
+                    if exec_result.message.startswith("SKIP: no watch worker slots available for "):
+                        _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
+                    attention = resolve_execution_needs_attention(failed, exec_result)
+                    if attention is not None:
+                        log.emit_attention(
+                            attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}",
+                            message=_watch_needs_attention_message(attention.task, attention.action),
+                        )
+                    else:
+                        no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
+                            store=store,
+                            subject_task=failed,
+                            action=recovery_action,
+                            action_task=action_task,
+                            failed_task=failed,
+                            no_progress_cycles=config.watch.no_progress_cycles,
+                        )
+                        if no_progress_attention is not None:
+                            log.emit_attention(
+                                attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                                message=_watch_needs_attention_message(failed, no_progress_attention),
+                            )
+                            continue
+                        log.emit(
+                            "SKIP",
+                            f"{failed.id}: {exec_result.message}",
+                            dedupe_key=f"recovery-needs-rebase-skip:{failed.id}:{exec_result.message}",
+                        )
+                    continue
+                if exec_result.status == "error":
+                    log.emit(
+                        "REPAIR",
+                        f"{failed.id}: {exec_result.message}",
+                        dedupe_key=f"recovery-needs-rebase-error:{failed.id}:{exec_result.message}",
+                    )
+                    continue
+                if exec_result.status != "success" or exec_result.created_task is None or exec_result.created_task.id is None:
+                    if allow_replan and exec_result.status == "success" and pending_slots_for_replan <= 0 and not exec_result.worker_consuming:
+                        local_replan_requested = True
+                    continue
+                recovered_task_id = str(exec_result.created_task.id)
+                recovered_start_task = exec_result.created_task
+                recovery_annotation = _format_expected_start_annotation(
+                    _ExpectedStart(
+                        recovery_action="needs_rebase",
+                        parent_failed_id=str(failed.id),
+                        launch_mode="worker",
+                    )
+                )
+                deferred_recovery_starts.append(
+                    _DeferredWatchDispatchStart(
+                        settle=_PendingWatchDispatchSettle(
+                            task_id=recovered_task_id,
+                            task_before=_snapshot_watch_dispatch_task(exec_result.created_task),
+                            start_label=f"{failed.id} -> {recovered_task_id}",
+                            dedupe_key=f"recovery-undispatched:needs_rebase:{failed.id}:{recovered_task_id}",
+                        ),
+                        subject_task=failed,
+                        action=recovery_action,
+                        action_task_before=action_task,
+                        failed_task=failed,
+                        owner_task_id=row.owner_task.id,
+                        action_type=recovery_action_type,
+                        start_message=_format_start_line(
+                            recovered_start_task,
+                            recovery_annotation=recovery_annotation,
+                        ),
+                        worker_consuming=exec_result.worker_consuming,
+                        reserve_recovery_slot=True,
+                    )
+                )
+                continue
+            if recovery_action_type == "resume":
+                if dry_run:
+                    destination = decision.recovery_task_id or "(new task)"
+                    log.emit(
+                        "RECOVR",
+                        (
+                            f"{failed.id} resume via {decision.launch_mode} -> {destination} "
+                            f"[owner={row.owner_task.id}] "
+                            f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) [dry-run]"
+                        ),
+                    )
+                    _consume_new_worker_start(reserve_recovery_slot=True)
+                    work_done = True
+                    continue
+                if decision.launch_mode == "worker":
+                    reserved_launch = _reserve_watch_launch("resume", str(failed.id))
+                    if reserved_launch is None:
+                        _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
+                        continue
+                    if decision.reuse_existing:
+                        assert decision.recovery_task_id is not None
+                        recovered_task_id = decision.recovery_task_id
+                        recovered_task = store.get(recovered_task_id)
+                        assert recovered_task is not None
+                    else:
+                        try:
+                            recovered_task = _create_resume_task(store, failed, trigger_source="watch")
+                        except DuplicateActiveChildError as exc:
+                            reserved_launch.release()
+                            log.emit(
+                                "SKIP",
+                                (
+                                    f"{failed.id}: "
+                                    f"{format_duplicate_active_child_message(exc, parent_task_id=str(failed.id), task=failed)}"
+                                ),
+                                dedupe_key=f"recovery-resume-duplicate:{failed.id}:{exc.active_child.id}",
+                            )
+                            continue
+                        except Exception:
+                            reserved_launch.release()
+                            raise
+                        assert recovered_task.id is not None
+                        recovered_task_id = str(recovered_task.id)
+                    prepared_recovered_task = _prepare_watch_reserved_task(
+                        recovered_task,
+                        permit=reserved_launch,
+                        rollback_on_failure=not decision.reuse_existing,
+                    )
+                    if prepared_recovered_task is None:
+                        continue
+                    recovered_start_task = prepared_recovered_task
+                    recovered_task_before = _snapshot_watch_dispatch_task(prepared_recovered_task)
+                    pending_recovery_task_ids.add(recovered_task_id)
+                    rc = _spawn_worker_with_failure_log(
+                        quiet=quiet,
+                        log=log,
+                        failure_message=f"{failed.id} -> {recovered_task_id}: resume worker spawn failed",
+                        dedupe_key=f"spawn-resume-failed:{failed.id}:{recovered_task_id}",
+                        spawn_fn=lambda: _spawn_background_resume_worker(
+                            argparse.Namespace(no_docker=False, max_turns=None),
+                            config,
+                            recovered_task_id,
+                            quiet=quiet,
+                            prepared_task=prepared_recovered_task,
+                            startup_quiet=True,
+                        ),
+                    )
+                    _release_watch_reserved_task(recovered_task_id)
+                else:
+                    reserved_launch = _reserve_watch_launch("iterate", str(failed.id))
+                    if reserved_launch is None:
+                        _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
+                        continue
+                    if decision.reuse_existing:
+                        assert decision.recovery_task_id is not None
+                        recovered_task = store.get(decision.recovery_task_id)
+                        assert recovered_task is not None
+                    else:
+                        try:
+                            recovered_task = _create_resume_task(store, failed, trigger_source="watch")
+                        except DuplicateActiveChildError as exc:
+                            reserved_launch.release()
+                            log.emit(
+                                "SKIP",
+                                (
+                                    f"{failed.id}: "
+                                    f"{format_duplicate_active_child_message(exc, parent_task_id=str(failed.id), task=failed)}"
+                                ),
+                                dedupe_key=f"recovery-resume-duplicate:{failed.id}:{exc.active_child.id}:iterate",
+                            )
+                            continue
+                        except Exception:
+                            reserved_launch.release()
+                            raise
+                    prepared_recovered_task = _prepare_watch_reserved_task(
+                        recovered_task,
+                        permit=reserved_launch,
+                        rollback_on_failure=not decision.reuse_existing,
+                    )
+                    if prepared_recovered_task is None:
+                        continue
+                    resume_recovered_task = prepared_recovered_task
+                    recovered_start_task = resume_recovered_task
+                    recovered_task_before = _snapshot_watch_dispatch_task(resume_recovered_task)
+                    recovered_task_id = str(prepared_recovered_task.id)
+                    pending_recovery_task_ids.add(recovered_task_id)
+                    rc = _spawn_worker_with_failure_log(
+                        quiet=quiet,
+                        log=log,
+                        failure_message=f"{failed.id} -> {recovered_task_id}: iterate worker spawn failed",
+                        dedupe_key=f"spawn-iterate-failed:{failed.id}:{recovered_task_id}",
+                        spawn_fn=lambda: _spawn_background_iterate(
+                            argparse.Namespace(
+                                max_iterations=max_iterations,
+                                no_docker=False,
+                                resume=False,
+                                retry=False,
+                                auto_iterate=True,
+                            ),
+                            config,
+                            resume_recovered_task,
+                            prepared_task_id=recovered_task_id,
+                            prepared_resume=True,
+                            prepared_phase="preloop",
+                            startup_quiet=True,
+                        ),
+                    )
+                    _release_watch_reserved_task(recovered_task_id)
+            elif recovery_action_type == "retry":
+                if dry_run:
+                    destination = decision.recovery_task_id or "(new task)"
+                    log.emit(
+                        "RECOVR",
+                        (
+                            f"{failed.id} retry via {decision.launch_mode} -> {destination} "
+                            f"[owner={row.owner_task.id}] "
+                            f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) [dry-run]"
+                        ),
+                    )
+                    _consume_new_worker_start(reserve_recovery_slot=True)
+                    work_done = True
+                    continue
+                reserved_launch = _reserve_watch_launch(
+                    "iterate" if decision.launch_mode != "worker" else "retry",
+                    str(failed.id),
+                )
+                if reserved_launch is None:
+                    _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
+                    continue
+                if decision.reuse_existing:
+                    assert decision.recovery_task_id is not None
+                    recovered_task_id = decision.recovery_task_id
+                    existing_recovered_task = store.get(recovered_task_id)
+                    assert existing_recovered_task is not None
+                    recovered_task = existing_recovered_task
+                else:
+                    try:
+                        recovered_task = _create_retry_task(
+                            store,
+                            failed,
+                            trigger_source="watch",
+                            automatic_recovery=True,
+                        )
+                    except DuplicateActiveChildError as exc:
+                        reserved_launch.release()
+                        log.emit(
+                            "SKIP",
+                            (
+                                f"{failed.id}: "
+                                f"{format_duplicate_active_child_message(exc, parent_task_id=str(failed.id), task=failed)}"
+                            ),
+                            dedupe_key=f"recovery-retry-duplicate:{failed.id}:{exc.active_child.id}",
+                        )
+                        continue
+                    except Exception:
+                        reserved_launch.release()
+                        raise
+                    assert recovered_task.id is not None
+                    recovered_task_id = str(recovered_task.id)
+                prepared_recovered_task = _prepare_watch_reserved_task(
+                    recovered_task,
+                    permit=reserved_launch,
+                    rollback_on_failure=not decision.reuse_existing,
+                )
+                if prepared_recovered_task is None:
+                    continue
+                retry_recovered_task = prepared_recovered_task
+                recovered_start_task = retry_recovered_task
+                recovered_task_before = _snapshot_watch_dispatch_task(retry_recovered_task)
+                recovered_task_id = str(prepared_recovered_task.id)
+                pending_recovery_task_ids.add(recovered_task_id)
+                rc = (
+                    _spawn_worker_with_failure_log(
+                        quiet=quiet,
+                        log=log,
+                        failure_message=f"{failed.id} -> {recovered_task_id}: worker spawn failed",
+                        dedupe_key=f"spawn-worker-failed:{failed.id}:{recovered_task_id}",
+                        spawn_fn=lambda: _spawn_background_worker(
+                            argparse.Namespace(no_docker=False, max_turns=None, resume=False),
+                            config,
+                            task_id=recovered_task_id,
+                            quiet=quiet,
+                            prepared_task=prepared_recovered_task,
+                            startup_quiet=True,
+                        ),
+                    )
+                    if decision.launch_mode == "worker"
+                    else _spawn_worker_with_failure_log(
+                        quiet=quiet,
+                        log=log,
+                        failure_message=f"{failed.id} -> {recovered_task_id}: iterate worker spawn failed",
+                        dedupe_key=f"spawn-iterate-failed:{failed.id}:{recovered_task_id}",
+                        spawn_fn=lambda: _spawn_background_iterate(
+                            argparse.Namespace(
+                                max_iterations=max_iterations,
+                                no_docker=False,
+                                resume=False,
+                                retry=False,
+                                auto_iterate=True,
+                            ),
+                            config,
+                            retry_recovered_task,
+                            prepared_task_id=recovered_task_id,
+                            prepared_resume=False,
+                            prepared_phase="preloop",
+                            startup_quiet=True,
+                        ),
+                    )
+                )
+                _release_watch_reserved_task(recovered_task_id)
+            else:
+                local_fail_closed = True
+                _fail_closed_for_planned_recovery_entry(
+                    DispatchPreviewEntry(
+                        lane="recovery",
+                        task=failed,
+                        owner_task=row.owner_task,
+                        runnable=True,
+                        worker_consuming=worker_consuming_recovery,
+                        decision=decision,
+                        advance_action=recovery_action,
+                        lineage_row=row,
+                    ),
+                    stage="replan" if not allow_replan else "initial-plan",
+                    reason=f"unsupported-action:{recovery_action_type or 'unknown'}",
+                )
+                break
+
+            if local_fail_closed:
+                break
+            if rc != 0:
+                continue
+            recovery_annotation = _format_expected_start_annotation(
+                _ExpectedStart(
+                    recovery_action=recovery_action_type,
+                    parent_failed_id=str(failed.id),
+                    launch_mode=decision.launch_mode,
+                )
+            )
+            deferred_recovery_starts.append(
+                _DeferredWatchDispatchStart(
+                    settle=_PendingWatchDispatchSettle(
+                        task_id=recovered_task_id,
+                        task_before=recovered_task_before,
+                        start_label=f"{failed.id} -> {recovered_task_id}",
+                        dedupe_key=f"recovery-undispatched:{recovery_action_type}:{failed.id}:{recovered_task_id}",
+                    ),
+                    subject_task=failed,
+                    action=recovery_action,
+                    action_task_before=action_task,
+                    failed_task=failed,
+                    owner_task_id=row.owner_task.id,
+                    action_type=recovery_action_type,
+                    start_message=_format_start_line(
+                        recovered_start_task,
+                        recovery_annotation=recovery_annotation,
+                    ),
+                    reserve_recovery_slot=True,
+                )
+            )
+
+        _settle_deferred_dispatch_starts(
+            deferred_recovery_starts,
+            count_confirmed_start=True,
+            count_recovery_start=True,
+        )
+        return local_fail_closed, local_replan_requested
+    for row, failed, decision, recovery_action, _worker_consuming_recovery, action_task in actionable_failed:
         if failed.id is None:
             continue
         recovery_action_type = str(recovery_action.get("type", ""))
@@ -7599,513 +8143,86 @@ def _run_cycle(
                         message=_watch_needs_attention_message(failed, active_attention),
                     )
             continue
-        if not dry_run:
-            if _maybe_emit_active_watch_recovery_backoff(
+        if not dry_run and str(failed.id) in active_backoff_recovery_subject_ids:
+            _maybe_emit_active_watch_recovery_backoff(
                 store=store,
                 log=log,
                 subject_task=failed,
                 action=recovery_action,
-            ):
-                continue
-        if worker_consuming_recovery and (_free_worker_start_slots() <= 0 or _free_reserved_recovery_slots() <= 0):
-            _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
-            no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
-                store=store,
-                subject_task=failed,
-                action=recovery_action,
-                action_task=action_task,
-                failed_task=failed,
-                no_progress_cycles=config.watch.no_progress_cycles,
-                persist=not dry_run,
             )
-            if no_progress_attention is not None:
-                parked_recovery_subject_ids.add(str(failed.id))
-                nonparked_recovery_subject_ids.discard(str(failed.id))
-                log.emit_attention(
-                    attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
-                    message=_watch_needs_attention_message(failed, no_progress_attention),
-                )
-            continue
-        if not dry_run:
-            no_progress_attention = _maybe_park_watch_no_progress(
-                config=config,
-                store=store,
-                subject_task=failed,
-                action=recovery_action,
-                action_task=action_task,
-                failed_task=failed,
-                no_progress_cycles=config.watch.no_progress_cycles,
-            )
-            if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
-                _maybe_emit_active_watch_recovery_backoff(
-                    store=store,
-                    log=log,
-                    subject_task=failed,
-                    action=recovery_action,
-                )
-                continue
-            if no_progress_attention is not None:
-                parked_recovery_subject_ids.add(str(failed.id))
-                nonparked_recovery_subject_ids.discard(str(failed.id))
-                if decision.recovery_task_id is not None:
-                    pending_recovery_task_ids.add(decision.recovery_task_id)
-                log.emit_attention(
-                    attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
-                    message=_watch_needs_attention_message(failed, no_progress_attention),
-                )
-                continue
-        if recovery_action_type == "reconcile_branch_divergence":
-            if dry_run:
-                log.emit(
-                    "RECOVR",
-                    (
-                        f"{failed.id} reconcile branch publication "
-                        f"[owner={row.owner_task.id}] "
-                        f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) [dry-run]"
-                    ),
-                )
-                work_done = True
-                continue
-            exec_result = execute_advance_action(task=failed, action=recovery_action, context=executor_context)
-            if exec_result.status == "skip":
-                if exec_result.message.startswith("SKIP: no watch worker slots available for "):
-                    _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
-                attention = resolve_execution_needs_attention(failed, exec_result)
-                if attention is not None:
-                    log.emit_attention(
-                        attention_key=f"recovery-attention:{failed.id}:reconcile",
-                        message=_watch_needs_attention_message(attention.task, attention.action),
-                    )
-                else:
-                    no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
-                        store=store,
-                        subject_task=failed,
-                        action=recovery_action,
-                        action_task=action_task,
-                        failed_task=failed,
-                        no_progress_cycles=config.watch.no_progress_cycles,
-                    )
-                    if no_progress_attention is not None:
-                        log.emit_attention(
-                            attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
-                            message=_watch_needs_attention_message(failed, no_progress_attention),
-                        )
-                        continue
-                    log.emit(
-                        "SKIP",
-                        f"{failed.id}: {exec_result.message}",
-                        dedupe_key=f"recovery-reconcile-skip:{failed.id}:{exec_result.message}",
-                    )
-                continue
-            if exec_result.status == "error":
-                log.emit(
-                    "REPAIR",
-                    f"{failed.id}: {exec_result.message}",
-                    dedupe_key=f"recovery-reconcile-error:{failed.id}:{exec_result.message}",
-                )
-                continue
-            if exec_result.status == "success":
-                _observe_dispatch(row.owner_task.id, "direct", recovery_action_type)
-                refreshed_failed = store.get(failed.id) if failed.id is not None else None
-                no_progress_attention = _finalize_watch_no_progress_after_execution(
-                    config=config,
-                    store=store,
-                    subject_task=failed,
-                    action=recovery_action,
-                    action_task_before=action_task,
-                    action_task_after=refreshed_failed or action_task,
-                    failed_task=failed,
-                    no_progress_cycles=config.watch.no_progress_cycles,
-                )
-                recovery_started_this_cycle = True
-                log.emit(
-                    "RECOVR",
-                    (
-                        f"{failed.id} reconcile branch publication "
-                        f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit})"
-                    ),
-                )
-                log.emit(
-                    "REPAIR",
-                    f"{failed.id}: {exec_result.success_message or exec_result.message}",
-                    dedupe_key=f"recovery-reconcile-success:{failed.id}",
-                )
-                if no_progress_attention is not None:
-                    log.emit_attention(
-                        attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
-                        message=_watch_needs_attention_message(failed, no_progress_attention),
-                    )
-                work_done = True
-                _consume_worker_slot_if_needed(exec_result, reserve_recovery_slot=True)
-                continue
-            continue
-        if recovery_action_type == "needs_rebase":
-            if dry_run:
-                deferred_action_type = recovery_action.get("deferred_action_type")
-                deferred_text = (
-                    f" deferred={deferred_action_type}"
-                    if isinstance(deferred_action_type, str) and deferred_action_type
-                    else ""
-                )
-                log.emit(
-                    "RECOVR",
-                    (
-                        f"{failed.id} needs_rebase [owner={row.owner_task.id}] "
-                        f"({recovery_action.get('reason', 'recovery-preflight-rebase')}{deferred_text}) [dry-run]"
-                    ),
-                )
-                _consume_worker_slot_if_needed(
-                    AdvanceActionExecutionResult(
-                        action_type="needs_rebase",
-                        status="dry_run",
-                        message="Would create rebase task",
-                        worker_consuming=True,
-                    ),
-                    reserve_recovery_slot=True,
-                )
-                work_done = True
-                continue
-            exec_result = execute_advance_action(task=failed, action=recovery_action, context=executor_context)
-            if exec_result.status == "skip":
-                if exec_result.message.startswith("SKIP: no watch worker slots available for "):
-                    _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
-                attention = resolve_execution_needs_attention(failed, exec_result)
-                if attention is not None:
-                    log.emit_attention(
-                        attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}",
-                        message=_watch_needs_attention_message(attention.task, attention.action),
-                    )
-                else:
-                    no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
-                        store=store,
-                        subject_task=failed,
-                        action=recovery_action,
-                        action_task=action_task,
-                        failed_task=failed,
-                        no_progress_cycles=config.watch.no_progress_cycles,
-                    )
-                    if no_progress_attention is not None:
-                        log.emit_attention(
-                            attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
-                            message=_watch_needs_attention_message(failed, no_progress_attention),
-                        )
-                        continue
-                    log.emit(
-                        "SKIP",
-                        f"{failed.id}: {exec_result.message}",
-                        dedupe_key=f"recovery-needs-rebase-skip:{failed.id}:{exec_result.message}",
-                    )
-                continue
-            if exec_result.status == "error":
-                log.emit(
-                    "REPAIR",
-                    f"{failed.id}: {exec_result.message}",
-                    dedupe_key=f"recovery-needs-rebase-error:{failed.id}:{exec_result.message}",
-                )
-                continue
-            if exec_result.status != "success" or exec_result.created_task is None or exec_result.created_task.id is None:
-                continue
-            recovered_task_id = str(exec_result.created_task.id)
-            recovered_start_task = exec_result.created_task
-            recovery_annotation = _format_expected_start_annotation(
-                _ExpectedStart(
-                    recovery_action="needs_rebase",
-                    parent_failed_id=str(failed.id),
-                    launch_mode="worker",
-                )
-            )
-            deferred_recovery_starts.append(
-                _DeferredWatchDispatchStart(
-                    settle=_PendingWatchDispatchSettle(
-                        task_id=recovered_task_id,
-                        task_before=_snapshot_watch_dispatch_task(exec_result.created_task),
-                        start_label=f"{failed.id} -> {recovered_task_id}",
-                        dedupe_key=f"recovery-undispatched:needs_rebase:{failed.id}:{recovered_task_id}",
-                    ),
-                    subject_task=failed,
-                    action=recovery_action,
-                    action_task_before=action_task,
-                    failed_task=failed,
-                    owner_task_id=row.owner_task.id,
-                    action_type=recovery_action_type,
-                    start_message=_format_start_line(
-                        recovered_start_task,
-                        recovery_annotation=recovery_annotation,
-                    ),
-                    worker_consuming=exec_result.worker_consuming,
-                    reserve_recovery_slot=True,
-                )
-            )
-            continue
-        if recovery_action_type == "resume":
-            if dry_run:
-                destination = decision.recovery_task_id or "(new task)"
-                log.emit(
-                    "RECOVR",
-                    (
-                        f"{failed.id} resume via {decision.launch_mode} -> {destination} "
-                        f"[owner={row.owner_task.id}] "
-                        f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) [dry-run]"
-                    ),
-                )
-                _consume_new_worker_start(reserve_recovery_slot=True)
-                work_done = True
-                continue
-            if decision.launch_mode == "worker":
-                reserved_launch = _reserve_watch_launch("resume", str(failed.id))
-                if reserved_launch is None:
-                    _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
-                    continue
-                if decision.reuse_existing:
-                    assert decision.recovery_task_id is not None
-                    recovered_task_id = decision.recovery_task_id
-                    recovered_task = store.get(recovered_task_id)
-                    assert recovered_task is not None
-                else:
-                    try:
-                        recovered_task = _create_resume_task(store, failed, trigger_source="watch")
-                    except DuplicateActiveChildError as exc:
-                        reserved_launch.release()
-                        log.emit(
-                            "SKIP",
-                            (
-                                f"{failed.id}: "
-                                f"{format_duplicate_active_child_message(exc, parent_task_id=str(failed.id), task=failed)}"
-                            ),
-                            dedupe_key=f"recovery-resume-duplicate:{failed.id}:{exc.active_child.id}",
-                        )
-                        continue
-                    except Exception:
-                        reserved_launch.release()
-                        raise
-                    assert recovered_task.id is not None
-                    recovered_task_id = str(recovered_task.id)
-                prepared_recovered_task = _prepare_watch_reserved_task(
-                    recovered_task,
-                    permit=reserved_launch,
-                    rollback_on_failure=not decision.reuse_existing,
-                )
-                if prepared_recovered_task is None:
-                    continue
-                recovered_start_task = prepared_recovered_task
-                recovered_task_before = _snapshot_watch_dispatch_task(prepared_recovered_task)
-                pending_recovery_task_ids.add(recovered_task_id)
-                rc = _spawn_worker_with_failure_log(
-                    quiet=quiet,
-                    log=log,
-                    failure_message=f"{failed.id} -> {recovered_task_id}: resume worker spawn failed",
-                    dedupe_key=f"spawn-resume-failed:{failed.id}:{recovered_task_id}",
-                    spawn_fn=lambda: _spawn_background_resume_worker(
-                        argparse.Namespace(no_docker=False, max_turns=None),
-                        config,
-                        recovered_task_id,
-                        quiet=quiet,
-                        prepared_task=prepared_recovered_task,
-                        startup_quiet=True,
-                    ),
-                )
-                _release_watch_reserved_task(recovered_task_id)
-            else:
-                reserved_launch = _reserve_watch_launch("iterate", str(failed.id))
-                if reserved_launch is None:
-                    _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
-                    continue
-                if decision.reuse_existing:
-                    assert decision.recovery_task_id is not None
-                    recovered_task = store.get(decision.recovery_task_id)
-                    assert recovered_task is not None
-                else:
-                    try:
-                        recovered_task = _create_resume_task(store, failed, trigger_source="watch")
-                    except DuplicateActiveChildError as exc:
-                        reserved_launch.release()
-                        log.emit(
-                            "SKIP",
-                            (
-                                f"{failed.id}: "
-                                f"{format_duplicate_active_child_message(exc, parent_task_id=str(failed.id), task=failed)}"
-                            ),
-                            dedupe_key=f"recovery-resume-duplicate:{failed.id}:{exc.active_child.id}:iterate",
-                        )
-                        continue
-                    except Exception:
-                        reserved_launch.release()
-                        raise
-                prepared_recovered_task = _prepare_watch_reserved_task(
-                    recovered_task,
-                    permit=reserved_launch,
-                    rollback_on_failure=not decision.reuse_existing,
-                )
-                if prepared_recovered_task is None:
-                    continue
-                resume_recovered_task = prepared_recovered_task
-                recovered_start_task = resume_recovered_task
-                recovered_task_before = _snapshot_watch_dispatch_task(resume_recovered_task)
-                recovered_task_id = str(prepared_recovered_task.id)
-                pending_recovery_task_ids.add(recovered_task_id)
-                rc = _spawn_worker_with_failure_log(
-                    quiet=quiet,
-                    log=log,
-                    failure_message=f"{failed.id} -> {recovered_task_id}: iterate worker spawn failed",
-                    dedupe_key=f"spawn-iterate-failed:{failed.id}:{recovered_task_id}",
-                    spawn_fn=lambda: _spawn_background_iterate(
-                        argparse.Namespace(
-                            max_iterations=max_iterations,
-                            no_docker=False,
-                            resume=False,
-                            retry=False,
-                            auto_iterate=True,
-                        ),
-                        config,
-                        resume_recovered_task,
-                        prepared_task_id=recovered_task_id,
-                        prepared_resume=True,
-                        prepared_phase="preloop",
-                        startup_quiet=True,
-                    ),
-                )
-                _release_watch_reserved_task(recovered_task_id)
-        elif recovery_action_type == "retry":
-            if dry_run:
-                destination = decision.recovery_task_id or "(new task)"
-                log.emit(
-                    "RECOVR",
-                    (
-                        f"{failed.id} retry via {decision.launch_mode} -> {destination} "
-                        f"[owner={row.owner_task.id}] "
-                        f"(reason={decision.reason_code}, attempt {decision.attempt_index}/{decision.attempt_limit}) [dry-run]"
-                    ),
-                )
-                _consume_new_worker_start(reserve_recovery_slot=True)
-                work_done = True
-                continue
-            reserved_launch = _reserve_watch_launch(
-                "iterate" if decision.launch_mode != "worker" else "retry",
-                str(failed.id),
-            )
-            if reserved_launch is None:
-                _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
-                continue
-            if decision.reuse_existing:
-                assert decision.recovery_task_id is not None
-                recovered_task_id = decision.recovery_task_id
-                existing_recovered_task = store.get(recovered_task_id)
-                assert existing_recovered_task is not None
-                recovered_task = existing_recovered_task
-            else:
-                try:
-                    recovered_task = _create_retry_task(
-                        store,
-                        failed,
-                        trigger_source="watch",
-                        automatic_recovery=True,
-                    )
-                except DuplicateActiveChildError as exc:
-                    reserved_launch.release()
-                    log.emit(
-                        "SKIP",
-                        (
-                            f"{failed.id}: "
-                            f"{format_duplicate_active_child_message(exc, parent_task_id=str(failed.id), task=failed)}"
-                        ),
-                        dedupe_key=f"recovery-retry-duplicate:{failed.id}:{exc.active_child.id}",
-                    )
-                    continue
-                except Exception:
-                    reserved_launch.release()
-                    raise
-                assert recovered_task.id is not None
-                recovered_task_id = str(recovered_task.id)
-            prepared_recovered_task = _prepare_watch_reserved_task(
-                recovered_task,
-                permit=reserved_launch,
-                rollback_on_failure=not decision.reuse_existing,
-            )
-            if prepared_recovered_task is None:
-                continue
-            retry_recovered_task = prepared_recovered_task
-            recovered_start_task = retry_recovered_task
-            recovered_task_before = _snapshot_watch_dispatch_task(retry_recovered_task)
-            recovered_task_id = str(prepared_recovered_task.id)
-            pending_recovery_task_ids.add(recovered_task_id)
-            rc = (
-                _spawn_worker_with_failure_log(
-                    quiet=quiet,
-                    log=log,
-                    failure_message=f"{failed.id} -> {recovered_task_id}: worker spawn failed",
-                    dedupe_key=f"spawn-worker-failed:{failed.id}:{recovered_task_id}",
-                    spawn_fn=lambda: _spawn_background_worker(
-                        argparse.Namespace(no_docker=False, max_turns=None, resume=False),
-                        config,
-                        task_id=recovered_task_id,
-                        quiet=quiet,
-                        prepared_task=prepared_recovered_task,
-                        startup_quiet=True,
-                    ),
-                )
-                if decision.launch_mode == "worker"
-                else _spawn_worker_with_failure_log(
-                    quiet=quiet,
-                    log=log,
-                    failure_message=f"{failed.id} -> {recovered_task_id}: iterate worker spawn failed",
-                    dedupe_key=f"spawn-iterate-failed:{failed.id}:{recovered_task_id}",
-                    spawn_fn=lambda: _spawn_background_iterate(
-                        argparse.Namespace(
-                            max_iterations=max_iterations,
-                            no_docker=False,
-                            resume=False,
-                            retry=False,
-                            auto_iterate=True,
-                        ),
-                        config,
-                        retry_recovered_task,
-                        prepared_task_id=recovered_task_id,
-                        prepared_resume=False,
-                        prepared_phase="preloop",
-                        startup_quiet=True,
-                    ),
-                )
-            )
-            _release_watch_reserved_task(recovered_task_id)
-        else:
-            continue
-
-        if rc != 0:
-            continue
-        recovery_annotation = _format_expected_start_annotation(
-            _ExpectedStart(
-                recovery_action=recovery_action_type,
-                parent_failed_id=str(failed.id),
-                launch_mode=decision.launch_mode,
-            )
+    processed_planned_recovery_task_ids: set[str] = set()
+    planned_recovery_dispatch_failed_closed = False
+    if unmapped_planned_recovery_entries:
+        invariant_violating_entries = tuple(
+            entry
+            for entry in unmapped_planned_recovery_entries
+            if entry.task.id is None or str(entry.task.id) not in explicitly_undispatched_recovery_subject_ids
         )
-        deferred_recovery_starts.append(
-            _DeferredWatchDispatchStart(
-                settle=_PendingWatchDispatchSettle(
-                    task_id=recovered_task_id,
-                    task_before=recovered_task_before,
-                    start_label=f"{failed.id} -> {recovered_task_id}",
-                    dedupe_key=f"recovery-undispatched:{recovery_action_type}:{failed.id}:{recovered_task_id}",
-                ),
-                subject_task=failed,
-                action=recovery_action,
-                action_task_before=action_task,
-                failed_task=failed,
-                owner_task_id=row.owner_task.id,
-                action_type=recovery_action_type,
-                start_message=_format_start_line(
-                    recovered_start_task,
-                    recovery_annotation=recovery_annotation,
-                ),
-                reserve_recovery_slot=True,
+        if invariant_violating_entries:
+            planned_recovery_dispatch_failed_closed = True
+        for entry in invariant_violating_entries:
+            _fail_closed_for_planned_recovery_entry(
+                entry,
+                stage="initial-plan",
+                reason="missing-actionable-failed",
             )
+    replan_recovery_dispatch = False
+    if not planned_recovery_dispatch_failed_closed:
+        planned_recovery_dispatch_failed_closed, replan_recovery_dispatch = _dispatch_planned_recovery_entries(
+            planned_recovery_actionable_failed,
+            pending_slots_for_replan=pending_slots,
+            allow_replan=True,
+            processed_task_ids=processed_planned_recovery_task_ids,
         )
 
-    _settle_deferred_dispatch_starts(
-        deferred_recovery_starts,
-        count_confirmed_start=True,
-        count_recovery_start=True,
-    )
+    if replan_recovery_dispatch and slots > 0 and not planned_recovery_dispatch_failed_closed:
+        remaining_dispatch_entries = tuple(
+            entry
+            for entry in dispatch_launchable_entries
+            if entry.lane != "recovery"
+            or entry.task.id is None
+            or str(entry.task.id) not in processed_planned_recovery_task_ids
+        )
+        replanned_dispatch_plan = plan_watch_dispatch_entries(
+            remaining_dispatch_entries,
+            slots=slots,
+            recovery_slot_cap=recovery_slots,
+            selection_mode=dispatch_selection_mode,
+            include_pending=scoped_owner_ids is None,
+        )
+        replanned_dispatch_entries = tuple(getattr(replanned_dispatch_plan, "entries", remaining_dispatch_entries))
+        replanned_actionable_failed, unmapped_replanned_recovery_entries = _map_planned_recovery_entries_to_actionable_failed(
+            replanned_dispatch_entries,
+            actionable_failed=actionable_failed,
+            known_non_actionable_failed_ids=known_non_actionable_recovery_subject_ids,
+        )
+        if unmapped_replanned_recovery_entries:
+            invariant_violating_entries = tuple(
+                entry
+                for entry in unmapped_replanned_recovery_entries
+                if entry.task.id is None or str(entry.task.id) not in explicitly_undispatched_recovery_subject_ids
+            )
+            if invariant_violating_entries:
+                planned_recovery_dispatch_failed_closed = True
+            for entry in invariant_violating_entries:
+                _fail_closed_for_planned_recovery_entry(
+                    entry,
+                    stage="replan",
+                    reason="missing-actionable-failed",
+                )
+        elif replanned_actionable_failed:
+            replanned_reserved_recovery_slots = replanned_dispatch_plan.recovery_worker_slots
+            if remaining_new_worker_starts is not None:
+                replanned_reserved_recovery_slots = min(
+                    replanned_reserved_recovery_slots,
+                    remaining_new_worker_starts,
+                )
+            reserved_recovery_slots = replanned_reserved_recovery_slots
+            planned_recovery_dispatch_failed_closed, _ = _dispatch_planned_recovery_entries(
+                replanned_actionable_failed,
+                pending_slots_for_replan=0,
+                allow_replan=False,
+            )
 
     def _recompute_pending_dispatch() -> tuple[list[DbTask], int]:
         if scoped_owner_ids is not None:
@@ -8144,7 +8261,10 @@ def _run_cycle(
             pending_plan.pending_slots,
         )
 
-    if scoped_owner_ids is None and recovery_mode != "recovery_only":
+    if planned_recovery_dispatch_failed_closed:
+        pending_slots = 0
+        pending_tasks = []
+    elif scoped_owner_ids is None and recovery_mode != "recovery_only":
         pending_tasks, pending_slots = _recompute_pending_dispatch()
 
     if (
