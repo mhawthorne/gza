@@ -866,7 +866,7 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
             # Persisted unmerged state on the failed leaf's own merge unit is enough to keep
             # the work visible unless live merge truth later disproves it.
             return True
-        if merge_state_is_terminal_for_lifecycle(leaf_merge_unit.state) and git is None:
+        if merge_state_is_terminal_for_lifecycle(leaf_merge_unit.state):
             return False
 
     source_branch = failed_task.branch

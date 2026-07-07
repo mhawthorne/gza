@@ -20,6 +20,7 @@ from gza.git import Git, GitError, ResolvedMergeSourceRef
 from gza.lineage_query import (
     LineageOwnerQuery,
     LineageOwnerRow,
+    _failed_leaf_has_unique_unmerged_work_under_terminal_owner,
     _load_indexes,
     _query_lineage_owner_rows_with_context,
     collect_stale_unmerged_sweep_candidates,
@@ -3964,7 +3965,79 @@ def test_query_lineage_owner_rows_hides_empty_failed_owner_resolved_by_landed_si
         if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
     }
     assert failed.id not in failed_leaf_ids
-    assert ("count_commits_ahead_checked", f"{failed.branch}->main") in git.probes
+
+
+def test_failed_leaf_unique_unmerged_work_short_circuits_terminal_leaf_even_with_live_git(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Merged owner", task_type="implement")
+    assert owner.id is not None
+    _set_completed(
+        owner,
+        when=datetime(2026, 5, 19, 8, 0, tzinfo=UTC),
+        branch="feature/terminal-owner-short-circuit",
+        has_commits=True,
+    )
+    owner.merge_status = "merged"
+    store.update(owner)
+
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed_leaf = store.add(
+        "Failed implement leaf with merged own unit",
+        task_type="implement",
+        based_on=owner.id,
+        recovery_origin="manual",
+    )
+    assert failed_leaf.id is not None
+    failed_leaf.status = "failed"
+    failed_leaf.failure_reason = "WORKER_DIED"
+    failed_leaf.branch = "feature/terminal-owner-short-circuit-followup"
+    failed_leaf.has_commits = True
+    failed_leaf.completed_at = datetime(2026, 5, 19, 9, 0, tzinfo=UTC)
+    store.update(failed_leaf)
+
+    failed_leaf_unit = store.create_merge_unit(
+        source_branch=failed_leaf.branch,
+        target_branch="main",
+        owner_task_id=failed_leaf.id,
+        state="merged",
+        head_sha="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    )
+    store.attach_task_to_merge_unit(failed_leaf.id, failed_leaf_unit.id, "owner")
+
+    git = MagicMock(spec=Git)
+    git.is_ancestor.side_effect = AssertionError("terminal leaf should short-circuit before git proof")
+
+    caplog.clear()
+    with (
+        caplog.at_level("WARNING", logger="gza.lineage_query"),
+        patch(
+            "gza.lineage_query.classify_branch_merge_state_for_target",
+            side_effect=AssertionError("terminal leaf should short-circuit before classify"),
+        ) as classify,
+    ):
+        result = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+            failed_task=failed_leaf,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=failed_leaf_unit,
+            git=git,
+        )
+
+    assert result is False
+    classify.assert_not_called()
+    git.is_ancestor.assert_not_called()
+    assert caplog.records == []
 
     entries = collect_recovery_lane_entries(
         store,
