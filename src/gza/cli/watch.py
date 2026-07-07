@@ -6,7 +6,6 @@ import hashlib
 import io
 import json
 import os
-import platform
 import re
 import signal
 import sys
@@ -101,7 +100,7 @@ from ..pickup import (
     is_in_quiet_period,
     is_worker_consuming_advance_action,
 )
-from ..providers.base import resolve_docker_worker_environment_identity, wait_for_docker_ready
+from ..providers.base import resolve_docker_worker_environment_identity, wait_for_docker_ready  # noqa: F401
 from ..query import resolve_lineage_owner_task
 from ..recovery_engine import (
     FailedRecoveryDecision,
@@ -350,13 +349,11 @@ MAIN_VERIFY_REMEDIATION_EXHAUSTED_FAILURE_REASON = "MAIN_VERIFY_REMEDIATION_LIMI
 MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT = DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS
 MAIN_VERIFY_REMEDIATION_EXHAUSTED_REASON = MAIN_VERIFY_REMEDIATION_EXHAUSTED_FAILURE_REASON
 MAIN_VERIFY_REMEDIATION_MOOT_GREEN_REASON = "main verify turned green for cleared signature"
-MAIN_VERIFY_REMEDIATION_ENVIRONMENT_MISMATCH_DROP_REASON = "main_verify_remediation_environment_mismatch"
 _MAIN_VERIFY_REMEDIATION_ATTEMPTS_PREFIX = "Remediation attempts spent: "
 _MAIN_VERIFY_REMEDIATION_EXHAUSTED_ATTENTION_RE = re.compile(
     r"automatic remediation exhausted after (?P<attempts>\d+/\d+) attempts"
     r"(?: for (?P<signature>.+?) on (?P<fingerprint>.+?))?(?:;|$)",
 )
-_MAIN_VERIFY_REMEDIATION_ENVIRONMENT_MISMATCH_MARKER = "automatic remediation parked for environment mismatch"
 
 
 def _main_verify_remediation_prompt(
@@ -394,8 +391,10 @@ def _main_verify_remediation_prompt(
     observed_environment = _describe_main_verify_environment_identity(
         getattr(remediation, "observed_environment_identity", None)
     )
-    if observed_environment is not None:
-        body.append(f"Observed verify environment: {observed_environment}")
+    body.append(
+        "Observed verify environment: "
+        f"{observed_environment or 'unknown/unavailable'}"
+    )
     failure = getattr(remediation, "failure", None)
     artifact_path = getattr(remediation, "artifact_path", None)
     failing_test_ids = tuple(getattr(remediation, "failing_test_ids", ()))
@@ -445,47 +444,6 @@ def _describe_main_verify_environment_identity(
     if python_bits:
         description = f"{description} ({' '.join(python_bits)})"
     return description
-
-
-def _main_verify_remediation_worker_environment_identity(
-    config: Config,
-) -> MainIntegrationVerifyEnvironmentIdentity | None:
-    if config.use_docker:
-        resolved = resolve_docker_worker_environment_identity(config, task_type="implement")
-        if isinstance(resolved, MainIntegrationVerifyEnvironmentIdentity):
-            return resolved
-        return None
-    return MainIntegrationVerifyEnvironmentIdentity(
-        runner_class="host",
-        platform_system=platform.system(),
-        platform_machine=platform.machine(),
-        python_implementation=platform.python_implementation(),
-        python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
-    )
-
-
-def _main_verify_remediation_environment_is_representative(
-    *,
-    observed: MainIntegrationVerifyEnvironmentIdentity | None,
-    available: MainIntegrationVerifyEnvironmentIdentity | None,
-) -> bool:
-    if available is None:
-        return False
-    if observed is None:
-        return True
-    # Fail closed on Python runtime identity: remediation must only launch when
-    # the worker can represent the observed verify runtime, not just the OS/CPU.
-    return (
-        observed.runner_class == available.runner_class
-        and observed.platform_system == available.platform_system
-        and observed.platform_machine == available.platform_machine
-        and bool(observed.python_implementation)
-        and bool(available.python_implementation)
-        and observed.python_implementation == available.python_implementation
-        and bool(observed.python_version)
-        and bool(available.python_version)
-        and observed.python_version == available.python_version
-    )
 
 
 def _parse_main_verify_remediation_attempts_line(prompt: str) -> tuple[int, int] | None:
@@ -1338,19 +1296,6 @@ def _retire_moot_main_verify_remediations(
     )
 
 
-def _park_main_verify_remediations_for_environment_mismatch(
-    *,
-    store: SqliteTaskStore,
-    signature: str,
-    reason: str,
-) -> _MainVerifyMootRetireResult:
-    return _transition_non_live_main_verify_remediations(
-        store=store,
-        signature=signature,
-        reason=reason,
-    )
-
-
 def _collect_main_verify_pending_retirement_signatures(state: Any) -> tuple[str, ...]:
     raw = getattr(state, "pending_retirement_signatures", ())
     if not isinstance(raw, tuple):
@@ -1424,51 +1369,6 @@ def _apply_main_verify_green_cleanup(
         )
 
 
-def _persist_main_verify_remediation_environment_mismatch(
-    *,
-    store: SqliteTaskStore,
-    state: MainIntegrationVerifyState,
-    remediation: MainIntegrationVerifyRemediation,
-    available_environment: MainIntegrationVerifyEnvironmentIdentity | None,
-) -> tuple[MainIntegrationVerifyState, _MainVerifyMootRetireResult]:
-    observed = getattr(remediation, "observed_environment_identity", None)
-    signature_label = remediation.signature
-    fingerprint_label = remediation.tree_fingerprint or "unavailable"
-    observed_label = _describe_main_verify_environment_identity(observed) or "unknown"
-    available_label = (
-        _describe_main_verify_environment_identity(available_environment)
-        or "unknown/unavailable"
-    )
-    base_message = state.alert_message or "main verify is red; merges halted"
-    message = (
-        f"{base_message}; {_MAIN_VERIFY_REMEDIATION_ENVIRONMENT_MISMATCH_MARKER} for "
-        f"{signature_label} on {fingerprint_label}; observed {observed_label}, "
-        f"available worker environment {available_label}; human intervention required"
-    )
-    drop_reason_suffix = available_label if available_environment is not None else "unknown-unavailable"
-    park_reason = (
-        f"{MAIN_VERIFY_REMEDIATION_ENVIRONMENT_MISMATCH_DROP_REASON}:"
-        f"{signature_label}:{fingerprint_label}:{drop_reason_suffix}"
-    )
-    parking = _park_main_verify_remediations_for_environment_mismatch(
-        store=store,
-        signature=signature_label,
-        reason=park_reason,
-    )
-    store.clear_main_verify_remediation_active_task(
-        signature=signature_label,
-        tree_fingerprint=None,
-        last_observed_head_sha=state.head_sha,
-        last_observed_failure=remediation.failure,
-    )
-    persisted_state = persist_main_integration_verify_alert_message(
-        store,
-        state=state,
-        alert_message=message,
-    )
-    return persisted_state, parking
-
-
 def _maybe_file_main_verify_remediation(
     *,
     dry_run: bool,
@@ -1493,42 +1393,6 @@ def _maybe_file_main_verify_remediation(
         )
     if remediation is None or dry_run:
         return None
-    available_environment = _main_verify_remediation_worker_environment_identity(config)
-    observed_environment = getattr(remediation, "observed_environment_identity", None)
-    if not _main_verify_remediation_environment_is_representative(
-        observed=observed_environment,
-        available=available_environment,
-    ):
-        persisted_state, parking = _persist_main_verify_remediation_environment_mismatch(
-            store=store,
-            state=check.state,
-            remediation=remediation,
-            available_environment=available_environment,
-        )
-        phase = remediation.failing_phase or remediation.signature
-        observed_label = _describe_main_verify_environment_identity(observed_environment) or "unknown"
-        available_label = (
-            _describe_main_verify_environment_identity(available_environment)
-            or "unknown/unavailable worker environment"
-        )
-        log.emit(
-            "REMEDY",
-            f"parked {remediation.kind} remediation for {phase}; observed {observed_label} "
-            f"cannot be represented by configured worker environment {available_label}",
-        )
-        if parking.retired_ids:
-            log.emit(
-                "REMEDY",
-                f"parked existing non-live remediation rows for {remediation.signature}: "
-                f"{', '.join(parking.retired_ids)}",
-            )
-        if parking.deferred_live_ids:
-            log.emit(
-                "REMEDY",
-                f"environment mismatch for {remediation.signature}; leaving live remediation rows untouched: "
-                f"{', '.join(parking.deferred_live_ids)}",
-            )
-        return persisted_state
     result = _ensure_main_verify_remediation_task(
         config=config,
         store=store,
@@ -3253,10 +3117,6 @@ def _main_verify_attention_key(state: Any) -> str | None:
         signature = _main_verify_state_failure_signature(state)
         if signature:
             return f"main-verify-remediation-exhausted:{signature}"
-    if _MAIN_VERIFY_REMEDIATION_ENVIRONMENT_MISMATCH_MARKER in message:
-        signature = _main_verify_state_failure_signature(state) or "unknown"
-        fingerprint = getattr(state, "tree_fingerprint", None) or "unavailable"
-        return f"main-verify-remediation-environment-mismatch:{signature}:{fingerprint}"
     return f"main-integration-verify:{task_id}:{MAIN_INTEGRATION_VERIFY_REASON}"
 
 

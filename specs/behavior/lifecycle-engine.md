@@ -585,10 +585,9 @@ failure *and* actionable merge/review work remains eligible for the latter.
   `verify_command` are an explicit no-gate exception: they MAY persist an `unavailable`
   checkpoint with `exit_status="not configured"` for visibility, but that checkpoint MUST
   NOT halt merges or emit the red-main attention signal.
-- When that red-main path would hand off to automatic remediation, lifecycle MUST keep the
-  shared representativeness gate intact: remediation metadata includes the observed verify
-  environment identity, and watch MUST park with durable attention instead of queueing a
-  non-representative or unknown/unavailable worker environment for ordinary remediation.
+- When that red-main path hands off to automatic remediation, remediation metadata MUST
+  include the observed verify environment identity as prompt context, but that metadata
+  MUST NOT block watch from creating or requeueing the bounded remediation task.
 - When automation uses an isolated host merge checkout to stage a merge before updating
   the canonical local target, that isolated checkout becomes the authoritative
   pre-promotion verify subject. With a configured verify gate, the shared merge executor

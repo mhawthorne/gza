@@ -126,14 +126,11 @@ Each watch cycle MUST execute these phases in order:
    task so its prompt and purpose match the current classification before queue-bumping
    it. Reused or newly created remediation tasks in this lane MUST also carry the distinctive tag
    `system-main-verify` in addition to `system` and inherited watch scope tags.
-   That remediation path is valid only when the worker environment is representative of
-   the observed failing verify environment carried in the bounded rerun evidence. If the
-   observed failure came from a different environment than the configured remediation
-   worker would run in, or if Docker probing leaves the worker runtime
-   unknown/unavailable, watch MUST NOT queue or requeue an ordinary remediation task.
-   Instead it MUST keep the merge halt in place and surface one durable
-   environment-mismatch attention row for that failure identity until representative
-   evidence or operator action changes the situation.
+   The bounded rerun evidence's observed verify environment identity, or an explicit
+   `unknown/unavailable` marker when that identity could not be captured, MUST travel
+   into the remediation metadata and prompt so the remediation worker can see where the
+   failure was observed, but that metadata MUST NOT veto filing or requeueing the
+   bounded remediation task.
    While that deterministic-red freeze is active, watch MUST skip unrelated merge
    actions for the cycle but MUST allow one narrow exemption: the merge subject that is
    the active deterministic `system-main-verify` fix remediation for the currently red

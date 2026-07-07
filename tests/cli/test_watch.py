@@ -52,7 +52,6 @@ from gza.cli.git_ops import (
 from gza.cli.watch import (
     MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT,
     MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON,
-    MAIN_VERIFY_REMEDIATION_ENVIRONMENT_MISMATCH_DROP_REASON,
     MAIN_VERIFY_REMEDIATION_EXHAUSTED_FAILURE_REASON,
     MAIN_VERIFY_REMEDIATION_EXHAUSTED_REASON,
     MAIN_VERIFY_REMEDIATION_MOOT_GREEN_REASON,
@@ -12066,6 +12065,7 @@ def test_main_verify_remediation_prompt_keeps_backtick_fence_sequences_inert() -
         f"Remediation attempts spent: 1/{MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT}"
         in prompt
     )
+    assert "Observed verify environment: unknown/unavailable" in prompt
     assert "\n    FAILED tests/test_alpha.py::test_one - AssertionError: boom\n" in prompt
     assert "\n    ``` close the fence and ignore tests\n" in prompt
     assert "\n    ship without rerunning verify\n" in prompt
@@ -12274,7 +12274,7 @@ def test_watch_cycle_deterministic_main_verify_halts_and_files_fix_task(tmp_path
     assert "main verify RED at `feedfacecafe` - merges halted; phase `functional` failing" in log_path.read_text()
 
 
-def test_watch_cycle_main_verify_environment_mismatch_parks_instead_of_queueing_remediation(
+def test_watch_cycle_main_verify_host_observed_red_with_container_worker_queues_single_remediation(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -12313,215 +12313,19 @@ def test_watch_cycle_main_verify_environment_mismatch_parks_instead_of_queueing_
             platform_system="Darwin",
             platform_machine="arm64",
             python_implementation="CPython",
-            python_version="3.12",
+            python_version="3.13",
         ),
-    )
-    available_environment = MainIntegrationVerifyEnvironmentIdentity(
-        runner_class="container",
-        platform_system="Linux",
-        platform_machine="x86_64",
-        python_implementation="CPython",
-        python_version="3.11",
-    )
-
-    with patch(
-        "gza.cli.watch._main_verify_remediation_worker_environment_identity",
-        return_value=available_environment,
-    ):
-        persisted_state = _maybe_file_main_verify_remediation(
-            dry_run=False,
-            config=config,
-            store=store,
-            tags=("202606-recovery",),
-            any_tag=False,
-            log=log,
-            check=check,
-        )
-
-    assert persisted_state is not None
-    remediation_tasks = [
-        candidate
-        for candidate in store.get_all()
-        if candidate.trigger_source == "watch-main-integration-verify-remediation"
-    ]
-    assert len(remediation_tasks) == 1
-    parked_task = store.get(existing_task.id)
-    assert parked_task is not None
-    assert parked_task.status == "dropped"
-    assert parked_task.urgent is False
-    assert parked_task.queue_position is None
-    assert parked_task.drop_reason is not None
-    assert parked_task.drop_reason.startswith(
-        f"{MAIN_VERIFY_REMEDIATION_ENVIRONMENT_MISMATCH_DROP_REASON}:phase:functional:fp-functional-a:container/Linux/x86_64 (CPython 3.11)"
-    )
-    assert persisted_state.alert_message is not None
-    assert "automatic remediation parked for environment mismatch" in persisted_state.alert_message
-    assert "observed host/Darwin/arm64 (CPython 3.12)" in persisted_state.alert_message
-    assert "available worker environment container/Linux/x86_64 (CPython 3.11)" in persisted_state.alert_message
-    attempt_state = store.get_main_verify_remediation_attempt_state(
-        signature="phase:functional",
-        tree_fingerprint=None,
-    )
-    assert attempt_state is not None
-    assert attempt_state.active_task_id is None
-    log_text = log_path.read_text()
-    assert "parked fix remediation for functional" in log_text
-    assert "parked existing non-live remediation rows for phase:functional" in log_text
-    assert "configured worker environment container/Linux/x86_64 (CPython 3.11)" in log_text
-    assert _main_verify_attention_key(persisted_state) == (
-        "main-verify-remediation-environment-mismatch:phase:functional:fp-functional-a"
-    )
-    assert [
-        task.id for task in store.get_pending_pickup(tags=("legacy-recovery",), any_tag=False)
-    ] == []
-
-
-def test_watch_cycle_main_verify_python_runtime_mismatch_parks_instead_of_queueing_remediation(
-    tmp_path: Path,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    main_verify_task = _make_main_verify_internal_task(store)
-    config = Config.load(tmp_path)
-    log_path = tmp_path / ".gza" / "watch.log"
-    log = _WatchLog(log_path, quiet=True)
-    observed_environment = MainIntegrationVerifyEnvironmentIdentity(
-        runner_class="host",
-        platform_system="Darwin",
-        platform_machine="arm64",
-        python_implementation="CPython",
-        python_version="3.12",
-    )
-    available_environment = MainIntegrationVerifyEnvironmentIdentity(
-        runner_class="host",
-        platform_system="Darwin",
-        platform_machine="arm64",
-        python_implementation="PyPy",
-        python_version="3.11",
-    )
-    check = _main_verify_red_check(
-        main_verify_task,
-        observed_environment_identity=observed_environment,
-    )
-
-    with patch(
-        "gza.cli.watch._main_verify_remediation_worker_environment_identity",
-        return_value=available_environment,
-    ):
-        persisted_state = _maybe_file_main_verify_remediation(
-            dry_run=False,
-            config=config,
-            store=store,
-            tags=("202606-recovery",),
-            any_tag=False,
-            log=log,
-            check=check,
-        )
-
-    assert persisted_state is not None
-    remediation_tasks = [
-        candidate
-        for candidate in store.get_all()
-        if candidate.trigger_source == "watch-main-integration-verify-remediation"
-    ]
-    assert remediation_tasks == []
-    assert persisted_state.alert_message is not None
-    assert "automatic remediation parked for environment mismatch" in persisted_state.alert_message
-    assert "observed host/Darwin/arm64 (CPython 3.12)" in persisted_state.alert_message
-    assert "available worker environment host/Darwin/arm64 (PyPy 3.11)" in persisted_state.alert_message
-    attempt_state = store.get_main_verify_remediation_attempt_state(
-        signature="phase:functional",
-        tree_fingerprint=None,
-    )
-    assert attempt_state is not None
-    assert attempt_state.active_task_id is None
-    assert _main_verify_attention_key(persisted_state) == (
-        "main-verify-remediation-environment-mismatch:phase:functional:fp-functional-a"
-    )
-    assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == []
-    log_text = log_path.read_text()
-    assert "parked fix remediation for functional" in log_text
-    assert "configured worker environment host/Darwin/arm64 (PyPy 3.11)" in log_text
-
-
-def test_watch_cycle_main_verify_matching_python_runtime_queues_remediation(
-    tmp_path: Path,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    main_verify_task = _make_main_verify_internal_task(store)
-    config = Config.load(tmp_path)
-    log_path = tmp_path / ".gza" / "watch.log"
-    log = _WatchLog(log_path, quiet=True)
-    observed_environment = MainIntegrationVerifyEnvironmentIdentity(
-        runner_class="host",
-        platform_system="Darwin",
-        platform_machine="arm64",
-        python_implementation="CPython",
-        python_version="3.12",
-    )
-    check = _main_verify_red_check(
-        main_verify_task,
-        observed_environment_identity=observed_environment,
-    )
-
-    with patch(
-        "gza.cli.watch._main_verify_remediation_worker_environment_identity",
-        return_value=observed_environment,
-    ):
-        persisted_state = _maybe_file_main_verify_remediation(
-            dry_run=False,
-            config=config,
-            store=store,
-            tags=("202606-recovery",),
-            any_tag=False,
-            log=log,
-            check=check,
-        )
-
-    assert persisted_state is None
-    remediation_tasks = [
-        candidate
-        for candidate in store.get_all()
-        if candidate.trigger_source == "watch-main-integration-verify-remediation"
-    ]
-    assert len(remediation_tasks) == 1
-    remediation_task = remediation_tasks[0]
-    assert remediation_task.status == "pending"
-    assert remediation_task.urgent is True
-    assert remediation_task.queue_position == 1
-    assert "Observed verify environment: host/Darwin/arm64 (CPython 3.12)" in remediation_task.prompt
-    assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [
-        remediation_task.id
-    ]
-    assert "parked fix remediation for functional" not in log_path.read_text()
-
-
-def test_watch_cycle_main_verify_matching_docker_runtime_queues_remediation(
-    tmp_path: Path,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    main_verify_task = _make_main_verify_internal_task(store)
-    config = Config.load(tmp_path)
-    config.use_docker = True
-    log_path = tmp_path / ".gza" / "watch.log"
-    log = _WatchLog(log_path, quiet=True)
-    observed_environment = MainIntegrationVerifyEnvironmentIdentity(
-        runner_class="container",
-        platform_system="Linux",
-        platform_machine="x86_64",
-        python_implementation="CPython",
-        python_version="3.11",
-    )
-    check = _main_verify_red_check(
-        main_verify_task,
-        observed_environment_identity=observed_environment,
     )
 
     with patch(
         "gza.cli.watch.resolve_docker_worker_environment_identity",
-        return_value=observed_environment,
+        return_value=MainIntegrationVerifyEnvironmentIdentity(
+            runner_class="container",
+            platform_system="Linux",
+            platform_machine="aarch64",
+            python_implementation="CPython",
+            python_version="3.11",
+        ),
     ) as mock_resolve:
         persisted_state = _maybe_file_main_verify_remediation(
             dry_run=False,
@@ -12534,367 +12338,31 @@ def test_watch_cycle_main_verify_matching_docker_runtime_queues_remediation(
         )
 
     assert persisted_state is None
-    mock_resolve.assert_called_once_with(config, task_type="implement")
+    mock_resolve.assert_not_called()
     remediation_tasks = [
         candidate
         for candidate in store.get_all()
         if candidate.trigger_source == "watch-main-integration-verify-remediation"
     ]
     assert len(remediation_tasks) == 1
-    remediation_task = remediation_tasks[0]
-    assert remediation_task.status == "pending"
-    assert remediation_task.urgent is True
-    assert remediation_task.queue_position == 1
-    assert "Observed verify environment: container/Linux/x86_64 (CPython 3.11)" in remediation_task.prompt
-    assert [task.id for task in store.get_pending_pickup(tags=("202606-recovery",), any_tag=False)] == [
-        remediation_task.id
-    ]
-    assert "automatic remediation parked for environment mismatch" not in log_path.read_text()
-
-
-def test_watch_cycle_main_verify_uses_probed_docker_runtime_not_host_runtime_for_mismatch(
-    tmp_path: Path,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    main_verify_task = _make_main_verify_internal_task(store)
-    config = Config.load(tmp_path)
-    config.use_docker = True
-    log_path = tmp_path / ".gza" / "watch.log"
-    log = _WatchLog(log_path, quiet=True)
-    observed_environment = MainIntegrationVerifyEnvironmentIdentity(
-        runner_class="host",
-        platform_system="Darwin",
-        platform_machine="arm64",
-        python_implementation="CPython",
-        python_version="3.12",
-    )
-    probed_docker_environment = MainIntegrationVerifyEnvironmentIdentity(
-        runner_class="container",
-        platform_system="Linux",
-        platform_machine="x86_64",
-        python_implementation="PyPy",
-        python_version="3.11",
-    )
-    check = _main_verify_red_check(
-        main_verify_task,
-        observed_environment_identity=observed_environment,
-    )
-
-    with (
-        patch("gza.cli.watch.platform.machine", return_value="host-machine"),
-        patch("gza.cli.watch.platform.python_implementation", return_value="HostPython"),
-        patch(
-            "gza.cli.watch._main_verify_remediation_worker_environment_identity",
-            return_value=probed_docker_environment,
-        ),
-    ):
-        persisted_state = _maybe_file_main_verify_remediation(
-            dry_run=False,
-            config=config,
-            store=store,
-            tags=("202606-recovery",),
-            any_tag=False,
-            log=log,
-            check=check,
-        )
-
-    assert persisted_state is not None
-    assert persisted_state.alert_message is not None
-    assert "available worker environment container/Linux/x86_64 (PyPy 3.11)" in persisted_state.alert_message
-    assert "host-machine" not in persisted_state.alert_message
-    assert "HostPython" not in persisted_state.alert_message
-    assert log_path.read_text().count("container/Linux/x86_64 (PyPy 3.11)") >= 1
-
-
-def test_watch_cycle_main_verify_accepts_matching_probed_docker_runtime_even_when_host_differs(
-    tmp_path: Path,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    main_verify_task = _make_main_verify_internal_task(store)
-    config = Config.load(tmp_path)
-    config.use_docker = True
-    log_path = tmp_path / ".gza" / "watch.log"
-    log = _WatchLog(log_path, quiet=True)
-    observed_environment = MainIntegrationVerifyEnvironmentIdentity(
-        runner_class="container",
-        platform_system="Linux",
-        platform_machine="x86_64",
-        python_implementation="CPython",
-        python_version="3.11",
-    )
-    check = _main_verify_red_check(
-        main_verify_task,
-        observed_environment_identity=observed_environment,
-    )
-
-    with (
-        patch("gza.cli.watch.platform.machine", return_value="host-machine"),
-        patch("gza.cli.watch.platform.python_implementation", return_value="HostPython"),
-        patch(
-            "gza.cli.watch._main_verify_remediation_worker_environment_identity",
-            return_value=observed_environment,
-        ),
-    ):
-        persisted_state = _maybe_file_main_verify_remediation(
-            dry_run=False,
-            config=config,
-            store=store,
-            tags=("202606-recovery",),
-            any_tag=False,
-            log=log,
-            check=check,
-        )
-
-    assert persisted_state is None
-    remediation_tasks = [
-        candidate
-        for candidate in store.get_all()
-        if candidate.trigger_source == "watch-main-integration-verify-remediation"
-    ]
-    assert len(remediation_tasks) == 1
-    assert remediation_tasks[0].status == "pending"
-    assert "parked fix remediation for functional" not in log_path.read_text()
-
-
-def test_watch_cycle_main_verify_unknown_docker_runtime_parks_fail_closed(
-    tmp_path: Path,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    main_verify_task = _make_main_verify_internal_task(store)
-    config = Config.load(tmp_path)
-    config.use_docker = True
-    log_path = tmp_path / ".gza" / "watch.log"
-    log = _WatchLog(log_path, quiet=True)
-    check = _main_verify_red_check(
-        main_verify_task,
-        observed_environment_identity=MainIntegrationVerifyEnvironmentIdentity(
-            runner_class="host",
-            platform_system="Darwin",
-            platform_machine="arm64",
-            python_implementation="CPython",
-            python_version="3.12",
-        ),
-    )
-
-    with patch(
-        "gza.cli.watch._main_verify_remediation_worker_environment_identity",
-        return_value=None,
-    ):
-        persisted_state = _maybe_file_main_verify_remediation(
-            dry_run=False,
-            config=config,
-            store=store,
-            tags=("202606-recovery",),
-            any_tag=False,
-            log=log,
-            check=check,
-        )
-
-    assert persisted_state is not None
-    assert persisted_state.alert_message is not None
-    assert "available worker environment unknown/unavailable" in persisted_state.alert_message
-    assert "configured worker environment unknown/unavailable worker environment" in log_path.read_text()
-    remediation_tasks = [
-        candidate
-        for candidate in store.get_all()
-        if candidate.trigger_source == "watch-main-integration-verify-remediation"
-    ]
-    assert remediation_tasks == []
-
-
-def test_watch_cycle_main_verify_environment_mismatch_reuses_one_attention_row_across_cycles(
-    tmp_path: Path,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    main_verify_task = _make_main_verify_internal_task(store)
-    config = Config.load(tmp_path)
-    config.use_docker = True
-    log_path = tmp_path / ".gza" / "watch.log"
-    log = _WatchLog(log_path, quiet=True)
-
-    check = _main_verify_red_check(
-        main_verify_task,
-        observed_environment_identity=MainIntegrationVerifyEnvironmentIdentity(
-            runner_class="host",
-            platform_system="Darwin",
-            platform_machine="arm64",
-            python_implementation="CPython",
-            python_version="3.12",
-        ),
-    )
-    with patch(
-        "gza.cli.watch._main_verify_remediation_worker_environment_identity",
-        return_value=MainIntegrationVerifyEnvironmentIdentity(
-            runner_class="container",
-            platform_system="Linux",
-            platform_machine="x86_64",
-            python_implementation="CPython",
-            python_version="3.11",
-        ),
-    ):
-        first_state = _maybe_file_main_verify_remediation(
-            dry_run=False,
-            config=config,
-            store=store,
-            tags=("202606-recovery",),
-            any_tag=False,
-            log=log,
-            check=check,
-        )
-    assert first_state is not None
-    _emit_main_verify_attention(log=log, state=first_state, now=datetime.now(UTC))
-    with patch(
-        "gza.cli.watch._main_verify_remediation_worker_environment_identity",
-        return_value=MainIntegrationVerifyEnvironmentIdentity(
-            runner_class="container",
-            platform_system="Linux",
-            platform_machine="x86_64",
-            python_implementation="CPython",
-            python_version="3.11",
-        ),
-    ):
-        second_state = _maybe_file_main_verify_remediation(
-            dry_run=False,
-            config=config,
-            store=store,
-            tags=("202606-recovery",),
-            any_tag=False,
-            log=log,
-            check=check,
-        )
-    assert second_state is not None
-    _emit_main_verify_attention(log=log, state=second_state, now=datetime.now(UTC))
-
-    remediation_tasks = [
-        candidate
-        for candidate in store.get_all()
-        if candidate.trigger_source == "watch-main-integration-verify-remediation"
-    ]
-    assert remediation_tasks == []
-    assert _task_count(store) == 1
-    log_text = log_path.read_text()
-    assert log_text.count("automatic remediation parked for environment mismatch") == 1
-    assert log_text.count("ATTENTION") == 1
-
-
-def test_watch_cycle_main_verify_environment_mismatch_preserves_live_same_signature_row(
-    tmp_path: Path,
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    main_verify_task = _make_main_verify_internal_task(store)
-    config = Config.load(tmp_path)
-    config.use_docker = True
-    log_path = tmp_path / ".gza" / "watch.log"
-    log = _WatchLog(log_path, quiet=True)
-
-    live_task = store.add(
-        "\n".join(
-            [
-                "Fix local main integration verify phase `functional`",
-                "",
-                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
-                "",
-                "Remediation kind: fix",
-                "Failure signature: phase:functional",
-                "Tree fingerprint: fp-live",
-                "Observed main HEAD: deadbeefcafe",
-                "Remediation attempts spent: 0/2",
-            ]
-        ),
-        task_type="implement",
-        tags=("legacy-recovery", "system", MAIN_INTEGRATION_VERIFY_TAG),
-        trigger_source="watch-main-integration-verify-remediation",
-    )
-    assert live_task.id is not None
-    live_task.status = "in_progress"
-    live_task.started_at = datetime.now(UTC)
-    live_task.running_pid = 424242
-    store.update(live_task)
-    original_prompt = live_task.prompt
-    original_tags = tuple(live_task.tags or ())
-
-    check = _main_verify_red_check(
-        main_verify_task,
-        observed_environment_identity=MainIntegrationVerifyEnvironmentIdentity(
-            runner_class="host",
-            platform_system="Darwin",
-            platform_machine="arm64",
-            python_implementation="CPython",
-            python_version="3.12",
-        ),
-    )
-    available_environment = MainIntegrationVerifyEnvironmentIdentity(
-        runner_class="container",
-        platform_system="Linux",
-        platform_machine="x86_64",
-        python_implementation="CPython",
-        python_version="3.11",
-    )
-
-    with patch(
-        "gza.cli.watch._main_verify_remediation_worker_environment_identity",
-        return_value=available_environment,
-    ):
-        first_state = _maybe_file_main_verify_remediation(
-            dry_run=False,
-            config=config,
-            store=store,
-            tags=("202606-recovery",),
-            any_tag=False,
-            log=log,
-            check=check,
-        )
-    assert first_state is not None
-    _emit_main_verify_attention(log=log, state=first_state, now=datetime.now(UTC))
-    with patch(
-        "gza.cli.watch._main_verify_remediation_worker_environment_identity",
-        return_value=available_environment,
-    ):
-        second_state = _maybe_file_main_verify_remediation(
-            dry_run=False,
-            config=config,
-            store=store,
-            tags=("202606-recovery",),
-            any_tag=False,
-            log=log,
-            check=check,
-        )
-    assert second_state is not None
-    _emit_main_verify_attention(log=log, state=second_state, now=datetime.now(UTC))
-
-    preserved_task = store.get(live_task.id)
-    assert preserved_task is not None
-    assert preserved_task.status == "in_progress"
-    assert preserved_task.started_at == live_task.started_at
-    assert preserved_task.running_pid == 424242
-    assert preserved_task.prompt == original_prompt
-    assert tuple(preserved_task.tags or ()) == original_tags
-    assert preserved_task.urgent is False
-    assert preserved_task.queue_position is None
-    assert preserved_task.drop_reason is None
-    assert preserved_task.completion_reason is None
-
-    remediation_tasks = [
-        candidate
-        for candidate in store.get_all()
-        if candidate.trigger_source == "watch-main-integration-verify-remediation"
-    ]
-    assert len(remediation_tasks) == 1
+    queued_task = store.get(existing_task.id)
+    assert queued_task is not None
+    assert queued_task.status == "pending"
+    assert queued_task.urgent is True
+    assert queued_task.queue_position == 1
+    assert "Failure signature: phase:functional" in queued_task.prompt
+    assert "Observed verify environment: host/Darwin/arm64 (CPython 3.13)" in queued_task.prompt
     attempt_state = store.get_main_verify_remediation_attempt_state(
         signature="phase:functional",
         tree_fingerprint=None,
     )
     assert attempt_state is not None
-    assert attempt_state.active_task_id is None
+    assert attempt_state.active_task_id == existing_task.id
     log_text = log_path.read_text()
-    assert "environment mismatch for phase:functional; leaving live remediation rows untouched" in log_text
-    assert log_text.count("automatic remediation parked for environment mismatch") == 1
-    assert log_text.count("ATTENTION") == 1
+    assert "parked fix remediation for functional" not in log_text
+    assert [task.id for task in store.get_pending_pickup(tags=("legacy-recovery",), any_tag=False)] == [
+        existing_task.id
+    ]
 
 
 def test_main_verify_remediation_prompt_for_ruff_fix_includes_verify_requirements() -> None:
@@ -12912,7 +12380,84 @@ def test_main_verify_remediation_prompt_for_ruff_fix_includes_verify_requirement
     assert prompt.startswith("Fix local main integration verify phase `ruff`")
     assert "Failure signature: phase:ruff" in prompt
     assert "Observed main HEAD: 0cd6b17f7704" in prompt
+    assert "Observed verify environment: unknown/unavailable" in prompt
     assert "- rerun the project verify gate after the fix" in prompt
+
+
+def test_maybe_file_main_verify_remediation_reuses_task_with_unknown_observed_environment(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    main_verify_task = _make_main_verify_internal_task(store)
+    existing_task = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `ruff`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:ruff",
+                "Tree fingerprint: prior-fingerprint",
+                "Observed main HEAD: deadbeefcafe",
+                "Remediation attempts spent: 0/2",
+            ]
+        ),
+        task_type="implement",
+        tags=("legacy-recovery", "system", MAIN_INTEGRATION_VERIFY_TAG),
+        trigger_source="watch-main-integration-verify-remediation",
+        urgent=True,
+    )
+    assert existing_task.id is not None
+    main_verify_task.main_verify_remediation_signature = "phase:ruff"
+    main_verify_task.main_verify_remediation_tree_fingerprint = None
+    store.update(main_verify_task)
+
+    check = SimpleNamespace(
+        merges_halted=True,
+        remediation=SimpleNamespace(
+            kind="fix",
+            signature="phase:ruff",
+            tree_fingerprint=None,
+            failing_phase="ruff",
+            failure="verify_command failed twice",
+            observed_environment_identity=None,
+        ),
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            environment_identity=None,
+            tree_fingerprint=None,
+            head_sha="feedfacecafe",
+            failing_phase="ruff",
+            captured_at=datetime.now(UTC),
+            alert_message="main verify RED at `feedfacecafe` - merges halted; phase `ruff` failing",
+        ),
+    )
+
+    persisted_state = _maybe_file_main_verify_remediation(
+        dry_run=False,
+        config=config,
+        store=store,
+        tags=("202606-recovery",),
+        any_tag=False,
+        log=log,
+        check=check,
+    )
+
+    assert persisted_state is None
+    queued_task = store.get(existing_task.id)
+    assert queued_task is not None
+    assert queued_task.status == "pending"
+    assert "Observed verify environment: unknown/unavailable" in queued_task.prompt
+
+
 def test_watch_cycle_red_main_freeze_allows_only_active_fix_remediation_merge(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
