@@ -1946,6 +1946,30 @@ def test_verify_surface_docs_describe_neutral_owner_and_projection_fields() -> N
     assert "Review-verify audit fields" not in config_docs
 
 
+def test_show_provenance_repair_warning_docs_cover_read_only_and_generic_failures() -> None:
+    """Show docs should keep both operator-facing provenance-repair warning branches discoverable."""
+    repo_root = Path(__file__).resolve().parents[1]
+    config_docs = (repo_root / "docs" / "configuration.md").read_text()
+    query_source = (repo_root / "src" / "gza" / "cli" / "query.py").read_text()
+
+    read_only_warning_head = "Could not repair changed-diff rebase provenance before lifecycle rendering"
+    read_only_warning_tail = (
+        "because the task database is read-only; lifecycle may reflect stale resolution metadata."
+    )
+    generic_warning_prefix = "Could not complete changed-diff rebase provenance repair before lifecycle rendering:"
+    generic_warning_tail = "Lifecycle may reflect stale or partially repaired resolution metadata."
+    generic_docs_tail = "stale or partially repaired resolution metadata."
+
+    assert read_only_warning_head in query_source
+    assert read_only_warning_tail in query_source
+    assert read_only_warning_head in config_docs
+    assert read_only_warning_tail in config_docs
+    assert generic_warning_prefix in query_source
+    assert generic_warning_prefix in config_docs
+    assert generic_warning_tail in query_source
+    assert generic_docs_tail in config_docs
+
+
 def test_cli_help_and_skill_docs_use_decimal_task_id_examples() -> None:
     """CLI help and bundled skills should avoid legacy base36 task-ID examples."""
     repo_root = Path(__file__).resolve().parents[1]
