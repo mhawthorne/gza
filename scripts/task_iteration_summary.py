@@ -46,6 +46,7 @@ SIMILARITY_STOPWORDS = frozenset({
     "under", "when", "whether", "which", "while", "whose", "will", "with",
     "would", "what",
 })
+RECOVERY_ORIGINS = frozenset({"manual", "resume", "retry"})
 
 
 @dataclass
@@ -96,7 +97,7 @@ def _resolve_effective_impl(store: SqliteTaskStore, task_id: str) -> Task:
     while True:
         children = [
             t for t in store.get_based_on_children(task.id)
-            if t.task_type == "implement"
+            if t.task_type == "implement" and t.recovery_origin in RECOVERY_ORIGINS
         ]
         if not children:
             return task
