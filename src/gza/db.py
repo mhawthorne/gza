@@ -1562,6 +1562,34 @@ def _is_readonly_snapshot_operational_error(exc: sqlite3.OperationalError) -> bo
     return _is_readonly_operational_error(exc)
 
 
+def _preserve_completed_rebase_provenance_scope(
+    conn: sqlite3.Connection,
+    *,
+    project_id: str,
+    task_id: str,
+    candidate_scope: str | None,
+) -> str | None:
+    """Keep persisted rebase provenance authoritative across stale whole-row updates."""
+    from .rebase_diff import parse_rebase_diff_provenance, rebase_diff_provenance_quality
+
+    candidate_provenance = parse_rebase_diff_provenance(candidate_scope)
+    row = conn.execute(
+        "SELECT status, changed_diff, review_scope FROM tasks WHERE project_id = ? AND id = ?",
+        (project_id, task_id),
+    ).fetchone()
+    if row is None:
+        return candidate_scope
+    if row["status"] != "completed" or row["changed_diff"] != 1:
+        return candidate_scope
+    persisted_scope = row["review_scope"]
+    persisted_provenance = parse_rebase_diff_provenance(persisted_scope)
+    if rebase_diff_provenance_quality(candidate_provenance) < rebase_diff_provenance_quality(
+        persisted_provenance
+    ):
+        return persisted_scope
+    return candidate_scope
+
+
 def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
     """Check whether a table contains a specific column."""
     try:
@@ -5453,6 +5481,15 @@ class SqliteTaskStore:
         task.tags = normalized_tags
         task.group = persisted_group
         with self._connect() as conn:
+            review_scope_to_persist = task.review_scope
+            if task.id is not None and task.task_type == "rebase":
+                review_scope_to_persist = _preserve_completed_rebase_provenance_scope(
+                    conn,
+                    project_id=self._project_id,
+                    task_id=task.id,
+                    candidate_scope=task.review_scope,
+                )
+                task.review_scope = review_scope_to_persist
             conn.execute(
                 """
                 UPDATE tasks SET
@@ -5557,7 +5594,7 @@ class SqliteTaskStore:
                     persisted_group,
                     task.depends_on,
                     task.spec,
-                    task.review_scope,
+                    review_scope_to_persist,
                     1 if task.create_review else 0,
                     None if task.auto_implement is None else (1 if task.auto_implement else 0),
                     1 if task.create_pr else 0,
@@ -9399,6 +9436,22 @@ class SqliteTaskStore:
     def get_merge_status_backfill_candidates(self) -> list[Task]:
         """Return merge-owning legacy rows that still need merge_status backfill."""
         return [task for task in self.get_canonical_unmerged_candidates() if task.merge_status is None]
+
+    def get_changed_diff_rebase_review_scope_repair_candidates(self) -> list[Task]:
+        """Return completed changed-diff rebases whose persisted provenance may need repair."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE project_id = ?
+                  AND task_type = 'rebase'
+                  AND status = 'completed'
+                  AND changed_diff = 1
+                ORDER BY completed_at DESC, id DESC
+                """,
+                (self._project_id,),
+            )
+            return self._rows_to_tasks(conn, cur.fetchall())
 
     def get_tasks_for_branch(self, branch: str) -> list[Task]:
         """Return all task rows attached to a branch, oldest first."""

@@ -44,7 +44,7 @@ from gza.main_integration_verify import (
     MainIntegrationVerifyEnvironmentIdentity,
     load_main_integration_verify_state,
 )
-from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult
+from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult, parse_rebase_diff_provenance
 from gza.review_verify_state import persist_verify_gate_artifact
 from gza.review_verdict import ReviewFinding
 from gza.worktree_roots import managed_worktree_root_paths
@@ -2249,6 +2249,78 @@ def test_run_task_backed_rebase_invalidates_review_state_when_diff_changes(tmp_p
     refreshed_rebase = store.get(rebase_task.id)
     assert refreshed_rebase is not None
     assert refreshed_rebase.changed_diff is True
+
+
+def test_run_task_backed_rebase_persists_provenance_over_inherited_custom_review_scope(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    parent.review_scope = "Review only the custom lifecycle slice."
+    parent.status = "completed"
+    parent.branch = "feature/rebased"
+    store.update(parent)
+    assert parent.id is not None
+
+    rebase_task = store.add(
+        "Rebase feature",
+        task_type="rebase",
+        based_on=parent.id,
+        same_branch=True,
+        review_scope=parent.review_scope,
+    )
+    rebase_task.branch = parent.branch
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.worktree_remove.return_value = None
+    repo_git._run.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.return_value = None
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/rebased": "head-new",
+        "main": "base-new",
+    }.get(ref)
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline(
+                old_tip="head-old",
+                target_at_start="base-old",
+                merge_base_at_start="merge-base",
+            ),
+        ),
+        patch(
+            "gza.cli.git_ops.compute_rebase_changed_diff",
+            return_value=RebaseDiffResult(changed_diff=True, detail="yes (review must be refreshed)"),
+        ),
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+        )
+
+    assert rc == 0
+    refreshed_rebase = store.get(rebase_task.id)
+    assert refreshed_rebase is not None
+    provenance = parse_rebase_diff_provenance(refreshed_rebase.review_scope)
+    assert provenance is not None
+    assert provenance.old_tip == "head-old"
+    assert provenance.target_at_start == "base-old"
+    assert provenance.merge_base_at_start == "merge-base"
+    assert provenance.resolved_head_sha == "head-new"
+    assert provenance.resolved_target_sha == "base-new"
 
 def test_run_task_backed_rebase_passes_managed_roots_to_cleanup(tmp_path: Path) -> None:
     """Foreground rebase setup should constrain branch cleanup to managed roots."""

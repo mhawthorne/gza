@@ -1,5 +1,6 @@
 """Tests for aggregate rebase diff comparison."""
 
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -10,6 +11,7 @@ from gza.rebase_diff import (
     RebaseDiffProvenance,
     compute_rebase_changed_diff,
     compute_resolution_delta_context,
+    recover_rebase_diff_provenance,
 )
 
 
@@ -145,3 +147,84 @@ def test_compute_resolution_delta_context_fails_closed_when_provenance_missing()
     assert context.available is False
     assert "resolution delta unavailable" in context.summary
     git._run.assert_not_called()
+
+
+def test_recover_rebase_diff_provenance_from_reflogs(tmp_path: Path) -> None:
+    git_dir = tmp_path / ".git" / "logs" / "refs" / "heads"
+    git_dir.mkdir(parents=True)
+    branch = "feature/rebase-backfill"
+    target = "main"
+    (git_dir / "feature").mkdir(parents=True, exist_ok=True)
+    (git_dir / branch).write_text(
+        "\n".join(
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb user <u@example.com> 1000 +0000\tcommit: prior",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "
+                "cccccccccccccccccccccccccccccccccccccccc user <u@example.com> 2000 +0000\t"
+                "rebase (finish): refs/heads/feature/rebase-backfill onto "
+                "dddddddddddddddddddddddddddddddddddddddd",
+            )
+        )
+        + "\n"
+    )
+    (git_dir / target).write_text(
+        "dddddddddddddddddddddddddddddddddddddddd "
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee user <u@example.com> 1999 +0000\tcommit: target moved\n"
+    )
+
+    git = MagicMock(spec=Git)
+    git.repo_dir = tmp_path
+    git.merge_base.return_value = "ffffffffffffffffffffffffffffffffffffffff"
+
+    recovered = recover_rebase_diff_provenance(
+        git,
+        branch=branch,
+        target_branch=target,
+        completed_at=datetime.fromtimestamp(2001, UTC),
+        review_scope="Review only the custom lifecycle slice.",
+    )
+
+    assert recovered is not None
+    assert recovered.old_tip == "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    assert recovered.target_at_start == "dddddddddddddddddddddddddddddddddddddddd"
+    assert recovered.merge_base_at_start == "ffffffffffffffffffffffffffffffffffffffff"
+    assert recovered.resolved_head_sha == "cccccccccccccccccccccccccccccccccccccccc"
+    assert recovered.resolved_target_sha == "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+
+def test_recover_rebase_diff_provenance_fails_closed_without_rebase_reflog_proof(tmp_path: Path) -> None:
+    git_dir = tmp_path / ".git" / "logs" / "refs" / "heads"
+    git_dir.mkdir(parents=True)
+    branch = "feature/rebase-backfill"
+    target = "main"
+    (git_dir / "feature").mkdir(parents=True, exist_ok=True)
+    (git_dir / branch).write_text(
+        "\n".join(
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb user <u@example.com> 1000 +0000\tcommit: prior",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "
+                "cccccccccccccccccccccccccccccccccccccccc user <u@example.com> 2000 +0000\tcommit: ordinary branch move",
+            )
+        )
+        + "\n"
+    )
+    (git_dir / target).write_text(
+        "dddddddddddddddddddddddddddddddddddddddd "
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee user <u@example.com> 1999 +0000\tcommit: target moved\n"
+    )
+
+    git = MagicMock(spec=Git)
+    git.repo_dir = tmp_path
+
+    recovered = recover_rebase_diff_provenance(
+        git,
+        branch=branch,
+        target_branch=target,
+        completed_at=datetime.fromtimestamp(2001, UTC),
+        review_scope="Review only the custom lifecycle slice.",
+    )
+
+    assert recovered is None
+    git.merge_base.assert_not_called()

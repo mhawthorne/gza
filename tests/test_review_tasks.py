@@ -10,19 +10,22 @@ import pytest
 from gza.artifacts import store_command_output_artifact
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task
+from gza.git import Git
+from gza.rebase_diff import parse_rebase_diff_provenance
 from gza.review_scope import parse_spec_coherence_review_scope
 from gza.review_tasks import (
     OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
     DuplicateReviewError,
     VerifyFixContextError,
+    backfill_changed_diff_rebase_review_scope_provenance,
     build_auto_review_prompt,
-    build_verify_fix_prompt,
     build_deferred_blocker_prompt_prefix,
     build_followup_prompt,
     build_followup_prompt_prefix,
     build_review_blocker_adjudication_prompt,
     build_review_blocker_adjudication_prompt_prefix,
     build_spec_coherence_review_prompt,
+    build_verify_fix_prompt,
     create_or_reuse_deferred_blocker_task,
     create_or_reuse_followup_task,
     create_or_reuse_review_blocker_adjudication_task,
@@ -44,6 +47,7 @@ from gza.review_tasks import (
     parse_verify_fix_epoch_artifact_metadata,
     parse_verify_fix_prompt,
     persist_off_topic_verify_clearance,
+    rebase_review_scope_provenance_is_complete,
     resolve_latest_failed_verify_epoch,
     resolve_verify_fix_context,
     resolve_verify_fix_representative_task,
@@ -125,6 +129,12 @@ def _seed_failed_verify_evidence(
         producer="test",
     )
     return stored_output.path
+
+
+def _write_reflog(tmp_path: Path, ref: str, lines: tuple[str, ...]) -> None:
+    path = tmp_path / ".git" / "logs" / "refs" / "heads" / ref
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -1239,6 +1249,110 @@ class TestCreateReviewTask:
         assert persisted_rebase.review_scope is not None
         assert "Resolved head SHA: \n" in persisted_rebase.review_scope
         assert "Resolved target SHA: target-at-rebase" in persisted_rebase.review_scope
+
+    def test_backfill_changed_diff_rebase_review_scope_provenance_repairs_all_candidates(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        impl_one = store.add("Implement one", task_type="implement")
+        impl_one.status = "completed"
+        impl_one.branch = "feature/rebase-backfill-one"
+        store.update(impl_one)
+        rebase_one = store.add("Rebase one", task_type="rebase", based_on=impl_one.id, same_branch=True)
+        rebase_one.status = "completed"
+        rebase_one.completed_at = datetime.fromtimestamp(2001, UTC)
+        rebase_one.branch = impl_one.branch
+        rebase_one.changed_diff = True
+        rebase_one.review_scope = "clobbered"
+        store.update(rebase_one)
+
+        impl_two = store.add("Implement two", task_type="implement")
+        impl_two.status = "completed"
+        impl_two.branch = "feature/rebase-backfill-two"
+        store.update(impl_two)
+        rebase_two = store.add("Rebase two", task_type="rebase", based_on=impl_two.id, same_branch=True)
+        rebase_two.status = "completed"
+        rebase_two.completed_at = datetime.fromtimestamp(4001, UTC)
+        rebase_two.branch = impl_two.branch
+        rebase_two.changed_diff = True
+        rebase_two.review_scope = "still clobbered"
+        store.update(rebase_two)
+
+        _write_reflog(
+            tmp_path,
+            "feature/rebase-backfill-one",
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb user <u@example.com> 1000 +0000\tcommit: prior",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "
+                "cccccccccccccccccccccccccccccccccccccccc user <u@example.com> 2000 +0000\t"
+                "rebase (finish): refs/heads/feature/rebase-backfill-one onto "
+                "dddddddddddddddddddddddddddddddddddddddd",
+            ),
+        )
+        _write_reflog(
+            tmp_path,
+            "feature/rebase-backfill-two",
+            (
+                "1111111111111111111111111111111111111111 "
+                "2222222222222222222222222222222222222222 user <u@example.com> 3000 +0000\tcommit: prior",
+                "2222222222222222222222222222222222222222 "
+                "3333333333333333333333333333333333333333 user <u@example.com> 4000 +0000\t"
+                "rebase (finish): refs/heads/feature/rebase-backfill-two onto "
+                "4444444444444444444444444444444444444444",
+            ),
+        )
+        _write_reflog(
+            tmp_path,
+            "main",
+            (
+                "dddddddddddddddddddddddddddddddddddddddd "
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee user <u@example.com> 1999 +0000\tcommit: target moved",
+                "4444444444444444444444444444444444444444 "
+                "5555555555555555555555555555555555555555 user <u@example.com> 3999 +0000\tcommit: target moved",
+            ),
+        )
+
+        git = MagicMock(spec=Git)
+        git.repo_dir = tmp_path
+        merge_bases = {
+            (
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "dddddddddddddddddddddddddddddddddddddddd",
+            ): "f" * 40,
+            (
+                "2222222222222222222222222222222222222222",
+                "4444444444444444444444444444444444444444",
+            ): "6" * 40,
+        }
+        git.merge_base.side_effect = lambda old_tip, target: merge_bases[(old_tip, target)]
+
+        results = backfill_changed_diff_rebase_review_scope_provenance(
+            store,
+            git=git,
+            target_branch="main",
+        )
+
+        assert len(results) == 2
+        assert all(result.persisted for result in results)
+
+        persisted_one = store.get(rebase_one.id)
+        persisted_two = store.get(rebase_two.id)
+        assert persisted_one is not None
+        assert persisted_two is not None
+        assert rebase_review_scope_provenance_is_complete(persisted_one.review_scope)
+        assert rebase_review_scope_provenance_is_complete(persisted_two.review_scope)
+
+        provenance_one = parse_rebase_diff_provenance(persisted_one.review_scope)
+        provenance_two = parse_rebase_diff_provenance(persisted_two.review_scope)
+        assert provenance_one is not None
+        assert provenance_two is not None
+        assert provenance_one.resolved_head_sha == "cccccccccccccccccccccccccccccccccccccccc"
+        assert provenance_one.resolved_target_sha == "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        assert provenance_two.resolved_head_sha == "3333333333333333333333333333333333333333"
+        assert provenance_two.resolved_target_sha == "5555555555555555555555555555555555555555"
 
 
 @pytest.mark.parametrize("terminal_status", ["completed", "failed", "dropped"])

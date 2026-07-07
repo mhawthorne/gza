@@ -27,7 +27,7 @@ from gza.log_paths import ops_log_path_for
 from gza.providers import ClaudeProvider, RunResult
 from gza.providers.base import PreflightCheckResult
 from gza.rebase_checkout import IsolatedRebaseCheckout
-from gza.rebase_diff import RebaseDiffBaseline
+from gza.rebase_diff import RebaseDiffBaseline, parse_rebase_diff_provenance
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.recovery_transients import classify_transient_recovery_terminal
 from gza.review_clearance import VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS
@@ -17774,6 +17774,72 @@ class TestExtractedRunInnerHelpers:
         assert "Warning: rebase diff comparison unavailable for recovered/resumed rebase; treating as changed" in surfaced
         assert "Changed Diff: yes (review must be refreshed)" in surfaced
         assert "rebase diff comparison unavailable for recovered/resumed rebase; treating as changed" in caplog.text
+
+    def test_post_complete_rebase_provenance_survives_stale_resave_for_custom_review_scope(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        assert parent.id is not None
+        parent.branch = "feature/rebase-parent"
+        parent.status = "completed"
+        parent.review_scope = "Review only the custom lifecycle slice."
+        store.update(parent)
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            base_branch="main",
+            review_scope=parent.review_scope,
+        )
+        assert task.id is not None
+        task.status = "completed"
+        task.branch = parent.branch
+        store.update(task)
+
+        stale_task = store.get(task.id)
+        assert stale_task is not None
+        stale_task.review_scope = parent.review_scope
+
+        mock_worktree_git = Mock(spec=Git)
+        mock_worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            parent.branch: "rebased-head",
+            "main": "target-head",
+        }.get(ref)
+        config = self._make_config(tmp_path)
+
+        with (
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = _post_complete_code_task(
+                task,
+                config,
+                store,
+                mock_worktree_git,
+                parent.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=1, cost_usd=0.01),
+                target_branch="main",
+                rebase_diff_baseline=RebaseDiffBaseline(
+                    old_tip="old-tip",
+                    target_at_start="target-before",
+                    merge_base_at_start="merge-base",
+                ),
+            )
+
+        assert rc == 0
+        stale_task.output_content = "late stale rewrite"
+        store.update(stale_task)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert parse_rebase_diff_provenance(refreshed.review_scope) is not None
+        assert "Resolved head SHA: rebased-head" in (refreshed.review_scope or "")
 
     def test_post_complete_retry_recovery_rebase_invalidates_impl_review_state(
         self,

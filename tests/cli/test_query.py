@@ -37,9 +37,10 @@ from gza.dispatch_preview import DispatchPreview, build_dispatch_preview
 from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerRow
 from gza.pr_ops import LookupTaskPrResult
+from gza.rebase_diff import parse_rebase_diff_provenance
 from gza.recovery_read_context import RecoveryReadContext
-from gza.review_verify_state import persist_verify_gate_artifact
 from gza.review_verdict import ParsedReviewReport
+from gza.review_verify_state import persist_verify_gate_artifact
 from gza.sync_ops import BranchSyncResult
 
 from .conftest import (
@@ -177,6 +178,12 @@ def _mock_unmerged_git() -> Git:
             return {str(ref): False for ref in refs}
 
     return _MockUnmergedGit()
+
+
+def _write_reflog(tmp_path: Path, ref: str, lines: tuple[str, ...]) -> None:
+    path = tmp_path / ".git" / "logs" / "refs" / "heads" / ref
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
 
 
 def _seed_owner_verify_evidence(
@@ -3840,7 +3847,7 @@ class TestNextCommand:
         setup_config(tmp_path)
         store = make_store(tmp_path)
         failed = _create_failed_recovery_candidate(store, prompt="Resume me")
-        pending = store.add("Pending work")
+        store.add("Pending work")
 
         result = invoke_gza("next", "--project", str(tmp_path))
 
@@ -6959,7 +6966,7 @@ class TestShowCommand:
         task = store.add("Task with artifacts", task_type="review")
         store.update(task)
         config = Config.load(tmp_path)
-        older = store_command_output_artifact(
+        store_command_output_artifact(
             store,
             task,
             config,
@@ -9195,6 +9202,196 @@ class TestShowCommand:
         assert "Lineage:" in output
         assert f"{failed_root.id} implement failed (TIMEOUT)" in " ".join(output.split())
         assert resumed.id in output
+
+    def test_show_backfills_changed_rebase_provenance_before_query_only_lifecycle_render(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implementation needing rebase provenance repair", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/show-rebase-provenance-repair"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+        store.update(impl)
+
+        review = store.add("Approved review before rebase", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        rebase = store.add("Changed-diff rebase with clobbered scope", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.branch = impl.branch
+        rebase.has_commits = True
+        rebase.changed_diff = True
+        rebase.review_scope = "clobbered by stale row update"
+        rebase.completed_at = datetime.fromtimestamp(2001, UTC)
+        store.update(rebase)
+
+        _write_reflog(
+            tmp_path,
+            impl.branch,
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb user <u@example.com> 1000 +0000\tcommit: prior",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "
+                "cccccccccccccccccccccccccccccccccccccccc user <u@example.com> 2000 +0000\t"
+                "rebase (finish): refs/heads/feature/show-rebase-provenance-repair onto "
+                "dddddddddddddddddddddddddddddddddddddddd",
+            ),
+        )
+        _write_reflog(
+            tmp_path,
+            "main",
+            (
+                "dddddddddddddddddddddddddddddddddddddddd "
+                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee user <u@example.com> 1999 +0000\tcommit: target moved",
+            ),
+        )
+
+        git = MagicMock(spec=Git)
+        git.repo_dir = tmp_path
+        git.default_branch.return_value = "main"
+        git.merge_base.return_value = "f" * 40
+        git.worktree_list.return_value = []
+
+        def _determine_action(_config, action_store, _git, task, _target_branch, **_kwargs):
+            del task
+            refreshed_rebase = action_store.get(rebase.id)
+            assert refreshed_rebase is not None
+            provenance = parse_rebase_diff_provenance(refreshed_rebase.review_scope)
+            if provenance is None or not provenance.resolved_head_sha or not provenance.resolved_target_sha:
+                return {
+                    "type": "needs_discussion",
+                    "description": "SKIP: required resolution-review metadata is missing or malformed",
+                    "needs_attention_reason": "resolution-review-metadata-invalid",
+                    "subject_task_id": impl.id,
+                }
+            return {"type": "create_review", "description": "Create review task"}
+
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch("gza.cli.query.determine_next_action", side_effect=_determine_action),
+            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+        ):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(impl.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        persisted_rebase = store.get(rebase.id)
+        assert exit_code == 0
+        assert persisted_rebase is not None
+        assert parse_rebase_diff_provenance(persisted_rebase.review_scope) is not None
+        assert "Lifecycle: ready for review" in output
+        assert "resolution-review-metadata-invalid" not in output
+
+    def test_show_warns_when_changed_rebase_provenance_repair_partially_persists_then_fails(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implementation with failing show-time provenance repair", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/show-rebase-provenance-warning"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        store.update(impl)
+
+        review = store.add("Approved review before rebase", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        rebase = store.add(
+            "Changed-diff rebase with failing backfill",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.branch = impl.branch
+        rebase.has_commits = True
+        rebase.changed_diff = True
+        rebase.review_scope = "clobbered by stale row update"
+        rebase.completed_at = datetime.fromtimestamp(2001, UTC)
+        store.update(rebase)
+
+        repaired_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: target-before\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: resolved-head\n"
+            "Resolved target SHA: resolved-target\n"
+            "Recovered baseline: no"
+        )
+
+        def _partial_backfill(action_store, *, git, target_branch):
+            del git, target_branch
+            refreshed = action_store.get(rebase.id)
+            assert refreshed is not None
+            refreshed.review_scope = repaired_scope
+            action_store.update(refreshed)
+            raise OSError("simulated mid-repair failure")
+
+        with (
+            patch("gza.cli.query.Git"),
+            patch(
+                "gza.cli.query.backfill_changed_diff_rebase_review_scope_provenance",
+                side_effect=_partial_backfill,
+            ),
+        ):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(impl.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        persisted_rebase = store.get(rebase.id)
+        assert exit_code == 0
+        assert persisted_rebase is not None
+        assert persisted_rebase.review_scope == repaired_scope
+        assert "Warning: Could not complete changed-diff rebase provenance repair before lifecycle rendering:" in output
+        assert "simulated mid-repair failure" in output
+        assert "Lifecycle:" in output
 
     def test_show_omits_prunable_worktree_path_for_task_branch(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

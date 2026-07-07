@@ -4,7 +4,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -15,12 +15,14 @@ from .artifacts import prepare_command_output_artifact, store_command_output_art
 from .config import Config
 from .db import NewTaskParams, SqliteTaskStore, Task, TaskArtifact
 from .derived_tags import resolve_derived_task_tags
+from .git import Git
 from .lineage import resolve_impl_task, walk_based_on_descendants
 from .prompts import PromptBuilder
 from .rebase_diff import (
     RebaseDiffBaseline,
     build_rebase_diff_provenance,
     parse_rebase_diff_provenance,
+    recover_rebase_diff_provenance,
     resolution_delta_provenance_is_complete,
 )
 from .review_scope import (
@@ -118,6 +120,15 @@ class ReviewClearancePersistenceResult:
     """Persisted structured review-clearance details."""
 
     review_cleared_at: datetime
+
+
+@dataclass(frozen=True)
+class ReviewScopeRepairResult:
+    """Outcome of trying to persist repaired review-scope metadata."""
+
+    task: Task
+    persisted: bool
+    blocked_by_readonly: bool = False
 
 
 @dataclass(frozen=True)
@@ -1010,6 +1021,104 @@ def create_resolution_review_task(
     )
     store.update(review_task)
     return review_task
+
+
+def repair_rebase_review_scope_provenance(
+    store: SqliteTaskStore,
+    *,
+    rebase_task: Task,
+    git: Git,
+    target_branch: str | None = None,
+) -> ReviewScopeRepairResult:
+    """Recover and persist a clobbered rebase provenance block when local refs still prove it."""
+    if rebase_task.id is None or rebase_task.task_type != "rebase" or not rebase_task.branch:
+        return ReviewScopeRepairResult(task=rebase_task, persisted=True)
+    target_ref = (
+        rebase_task.base_branch
+        or target_branch
+        or git.default_branch()
+    )
+    recovered = recover_rebase_diff_provenance(
+        git,
+        branch=rebase_task.branch,
+        target_branch=target_ref,
+        completed_at=rebase_task.completed_at,
+        review_scope=rebase_task.review_scope,
+    )
+    if recovered is None:
+        return ReviewScopeRepairResult(task=rebase_task, persisted=True)
+    existing = parse_rebase_diff_provenance(rebase_task.review_scope)
+    if existing == recovered:
+        return ReviewScopeRepairResult(task=rebase_task, persisted=True)
+    rebuilt_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip=recovered.old_tip,
+            target_at_start=recovered.target_at_start,
+            merge_base_at_start=recovered.merge_base_at_start,
+            recovered=recovered.recovered,
+        ),
+        resolved_head_sha=recovered.resolved_head_sha,
+        resolved_target_sha=recovered.resolved_target_sha,
+    )
+    return persist_repaired_review_scope(store, task=rebase_task, repaired_scope=rebuilt_scope)
+
+
+def rebase_review_scope_provenance_is_complete(review_scope: str | None) -> bool:
+    """Return whether review_scope carries the full persisted changed-rebase provenance block."""
+    provenance = parse_rebase_diff_provenance(review_scope)
+    return bool(
+        provenance is not None
+        and resolution_delta_provenance_is_complete(provenance)
+        and provenance.resolved_head_sha
+        and provenance.resolved_target_sha
+    )
+
+
+def backfill_changed_diff_rebase_review_scope_provenance(
+    store: SqliteTaskStore,
+    *,
+    git: Git,
+    target_branch: str | None = None,
+) -> tuple[ReviewScopeRepairResult, ...]:
+    """Repair every changed-diff rebase row surfaced by the shared backfill selector."""
+    repaired: list[ReviewScopeRepairResult] = []
+    for rebase_task in store.get_changed_diff_rebase_review_scope_repair_candidates():
+        if rebase_review_scope_provenance_is_complete(rebase_task.review_scope):
+            continue
+        repaired.append(
+            repair_rebase_review_scope_provenance(
+                store,
+                rebase_task=rebase_task,
+                git=git,
+                target_branch=target_branch,
+            )
+        )
+    return tuple(repaired)
+
+
+def persist_repaired_review_scope(
+    store: SqliteTaskStore,
+    *,
+    task: Task,
+    repaired_scope: str,
+) -> ReviewScopeRepairResult:
+    """Persist repaired review-scope metadata without mutating the live task on failure."""
+    if task.review_scope == repaired_scope:
+        return ReviewScopeRepairResult(task=task, persisted=True)
+    repaired_task = replace(task, review_scope=repaired_scope)
+    try:
+        store.update(repaired_task)
+    except sqlite3.OperationalError as exc:
+        if not _is_readonly_sqlite_error(exc):
+            raise
+        return ReviewScopeRepairResult(task=task, persisted=False, blocked_by_readonly=True)
+    task.review_scope = repaired_scope
+    return ReviewScopeRepairResult(task=task, persisted=True)
+
+
+def _is_readonly_sqlite_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "readonly" in message or "read-only" in message
 
 
 def build_followup_prompt_prefix(review_task_id: str, impl_task_id: str, finding_id: str) -> str:

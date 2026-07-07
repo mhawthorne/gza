@@ -40,7 +40,9 @@ from ..console import (
     truncate,
 )
 from ..db import (
+    ManualMigrationRequired,
     MergeUnit,
+    SchemaIntegrityError,
     SqliteTaskStore,
     Task as DbTask,
     TaskArtifact,
@@ -83,6 +85,7 @@ from ..query import (
     get_code_changing_descendants_for_root as _get_code_changing_descendants_for_root_task,
     get_reviews_for_root as _get_reviews_for_root_task,
 )
+from ..review_tasks import backfill_changed_diff_rebase_review_scope_provenance
 from ..review_verify_state import (
     VerifyReadModel,
     owner_task_verify_epoch,
@@ -360,6 +363,11 @@ class _LifecycleSummary:
     severity: _LifecycleSeverity
 
 
+@dataclass(frozen=True)
+class _ShowRebaseProvenanceBackfillOutcome:
+    warning: str | None = None
+
+
 def _with_recovered_lifecycle_prefix(detail: str, *, recovered: bool, severity: _LifecycleSeverity) -> _LifecycleSummary:
     return _LifecycleSummary(f"recovered, {detail}" if recovered else detail, severity)
 
@@ -454,6 +462,37 @@ def _query_git_cache_scope(git: Git | None) -> contextlib.AbstractContextManager
     if git is not None and hasattr(git, "cached"):
         return git.cached()
     return contextlib.nullcontext(git)
+
+
+def _best_effort_backfill_show_rebase_provenance(config: Config) -> _ShowRebaseProvenanceBackfillOutcome:
+    """Repair changed-diff rebase provenance before query-only show lifecycle rendering."""
+    try:
+        store = get_store(config)
+        candidates = store.get_changed_diff_rebase_review_scope_repair_candidates()
+        if not candidates:
+            return _ShowRebaseProvenanceBackfillOutcome()
+        if config.db_path.exists() and (config.db_path.stat().st_mode & 0o222) == 0:
+            return _ShowRebaseProvenanceBackfillOutcome(
+                warning=(
+                    "Warning: Could not repair changed-diff rebase provenance before lifecycle rendering "
+                    "because the task database is read-only; lifecycle may reflect stale resolution metadata."
+                )
+            )
+        git = Git(config.project_dir)
+        target_branch = git.default_branch()
+        backfill_changed_diff_rebase_review_scope_provenance(
+            store,
+            git=git,
+            target_branch=target_branch,
+        )
+        return _ShowRebaseProvenanceBackfillOutcome()
+    except (GitError, ManualMigrationRequired, OSError, SchemaIntegrityError, ValueError, sqlite3.Error) as exc:
+        return _ShowRebaseProvenanceBackfillOutcome(
+            warning=(
+                "Warning: Could not complete changed-diff rebase provenance repair before lifecycle rendering: "
+                f"{exc}. Lifecycle may reflect stale or partially repaired resolution metadata."
+            )
+        )
 
 
 def _resolve_show_lifecycle_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
@@ -4479,7 +4518,11 @@ def cmd_show(args: argparse.Namespace) -> int:
         return 1
 
     config = Config.load(args.project_dir)
+    backfill_outcome = _best_effort_backfill_show_rebase_provenance(config)
     store = get_store(config, open_mode="query_only")
+
+    if backfill_outcome.warning is not None:
+        console.print(f"[yellow]{rich_escape(backfill_outcome.warning)}[/yellow]")
 
     task_id = resolve_id(config, args.task_id)
     task = store.get(task_id)

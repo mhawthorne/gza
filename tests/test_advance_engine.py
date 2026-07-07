@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import py_compile
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -89,6 +90,7 @@ class _FakeGit:
         rev_parse_errors: dict[str, Exception] | None = None,
         default_branch_name: str = "main",
         resolved_tree_shas: dict[str, str | None] | None = None,
+        merge_base_by_ref: dict[tuple[str, str], str | None] | None = None,
     ):
         self._can_merge = can_merge
         self._can_merge_by_ref = can_merge_by_ref or {}
@@ -108,6 +110,7 @@ class _FakeGit:
         self._rev_parse_errors = rev_parse_errors or {}
         self._default_branch_name = default_branch_name
         self._resolved_tree_shas = resolved_tree_shas or {}
+        self._merge_base_by_ref = merge_base_by_ref or {}
         self.can_merge_calls: list[tuple[str, str]] = []
         self.rev_parse_calls: list[str] = []
         self.is_ancestor_calls: list[tuple[str, str]] = []
@@ -180,6 +183,12 @@ class _FakeGit:
     def default_branch(self) -> str:
         return self._default_branch_name
 
+    def merge_base(self, ref1: str, ref2: str) -> str:
+        value = self._merge_base_by_ref.get((ref1, ref2))
+        if value is None:
+            raise GitError(f"missing merge-base fixture for {ref1} {ref2}")
+        return value
+
     def resolve_refs(self, refs: tuple[str, ...], peel: str = "commit") -> dict[str, str | None]:
         if peel != "tree":
             raise AssertionError(f"unexpected peel: {peel}")
@@ -205,6 +214,12 @@ def _make_store(tmp_path: Path) -> SqliteTaskStore:
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return SqliteTaskStore(db_path, prefix=config.project_prefix)
+
+
+def _write_reflog(tmp_path: Path, ref: str, lines: tuple[str, ...]) -> None:
+    path = tmp_path / ".git" / "logs" / "refs" / "heads" / ref
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
 
 
 def _set_subdir_project_boundary(config: Config, tmp_path: Path) -> None:
@@ -5200,6 +5215,25 @@ def test_changed_rebase_with_missing_persisted_provenance_rederives_resolution_r
     )
     rebase.review_scope = "Rebase diff provenance: yes\nResolved head SHA: rebased-head\nRecovered baseline: no"
     store.update(rebase)
+    assert rebase.completed_at is not None
+    rebase_ts = int(rebase.completed_at.timestamp())
+    pre_head = "b" * 40
+    rebased_head = "c" * 40
+    target_now = "e" * 40
+    _write_reflog(
+        tmp_path,
+        impl.branch,
+        (
+            f"{'a'*40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
+            f"{pre_head} {rebased_head} user <u@example.com> {rebase_ts - 1} +0000\t"
+            f"rebase (finish): refs/heads/{impl.branch} onto {'d'*40}",
+        ),
+    )
+    _write_reflog(
+        tmp_path,
+        "main",
+        (f"{'d'*40} {target_now} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
+    )
 
     monkeypatch.setattr(
         advance_engine_module,
@@ -5211,24 +5245,181 @@ def test_changed_rebase_with_missing_persisted_provenance_rederives_resolution_r
         ),
     )
 
-    action = evaluate_advance_rules(
-        config,
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: rebased_head, "main": target_now},
+        merge_base_by_ref={(pre_head, "d" * 40): "merge-base"},
+    )
+    git.repo_dir = tmp_path
+
+    action = evaluate_advance_rules(config, store, git, rebase, "main")
+
+    repaired_rebase = store.get(rebase.id)
+    assert repaired_rebase is not None
+    assert repaired_rebase.review_scope is not None
+    assert f"Pre-rebase head SHA: {pre_head}" in repaired_rebase.review_scope
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+
+
+def test_changed_rebase_with_missing_persisted_provenance_stays_parked_without_rebase_reflog_proof(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
         store,
-        _FakeGit(
-            can_merge=True,
-            existing_branches={impl.branch},
-            ref_shas={impl.branch: "rebased-head", "main": "target-now"},
+        branch="feature/rebase-provenance-ambiguous",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    original_scope = "Rebase diff provenance: yes\nResolved head SHA: rebased-head\nRecovered baseline: no"
+    rebase.review_scope = original_scope
+    store.update(rebase)
+    assert rebase.completed_at is not None
+    rebase_ts = int(rebase.completed_at.timestamp())
+    pre_head = "b" * 40
+    rebased_head = "c" * 40
+    target_now = "e" * 40
+    _write_reflog(
+        tmp_path,
+        impl.branch,
+        (
+            f"{'a'*40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
+            f"{pre_head} {rebased_head} user <u@example.com> {rebase_ts - 1} +0000\treset: moving to HEAD",
         ),
-        rebase,
+    )
+    _write_reflog(
+        tmp_path,
         "main",
+        (f"{'d'*40} {target_now} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
     )
 
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: rebased_head, "main": target_now},
+        merge_base_by_ref={(pre_head, target_now): "merge-base"},
+    )
+    git.repo_dir = tmp_path
+
+    action = evaluate_advance_rules(config, store, git, rebase, "main")
+
+    persisted_rebase = store.get(rebase.id)
+    assert persisted_rebase is not None
+    assert persisted_rebase.review_scope == original_scope
     assert action["type"] == "needs_discussion"
-    assert action["description"] == "SKIP: required resolution-review metadata is missing or malformed"
     assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
 
 
-def test_changed_rebase_completed_approved_review_with_missing_persisted_provenance_still_parks(
+def test_changed_rebase_with_missing_persisted_provenance_readonly_repair_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-provenance-readonly",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "reviewed-head"
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    original_scope = "Rebase diff provenance: yes\nResolved head SHA: rebased-head\nRecovered baseline: no"
+    rebase.review_scope = original_scope
+    store.update(rebase)
+    assert rebase.completed_at is not None
+    rebase_ts = int(rebase.completed_at.timestamp())
+    pre_head = "b" * 40
+    rebased_head = "c" * 40
+    target_now = "e" * 40
+    _write_reflog(
+        tmp_path,
+        impl.branch,
+        (
+            f"{'a'*40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
+            f"{pre_head} {rebased_head} user <u@example.com> {rebase_ts - 1} +0000\t",
+        ),
+    )
+    _write_reflog(
+        tmp_path,
+        "main",
+        (f"{'d'*40} {target_now} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
+    )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    original_update = store.update
+
+    def readonly_update(task: DbTask) -> None:
+        if task.id == rebase.id and task.review_scope != original_scope:
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+        original_update(task)
+
+    monkeypatch.setattr(store, "update", readonly_update)
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: rebased_head, "main": target_now},
+        merge_base_by_ref={(pre_head, target_now): "merge-base"},
+    )
+    git.repo_dir = tmp_path
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    persisted_rebase = store.get(rebase.id)
+    assert persisted_rebase is not None
+    assert persisted_rebase.review_scope == original_scope
+    assert rebase.review_scope == original_scope
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+
+
+def test_changed_rebase_completed_approved_review_with_missing_persisted_provenance_repairs_and_unparks(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -5255,6 +5446,25 @@ def test_changed_rebase_completed_approved_review_with_missing_persisted_provena
 
     rebase.review_scope = "Rebase diff provenance: yes\nResolved head SHA: rebased-sha\nRecovered baseline: no"
     store.update(rebase)
+    assert rebase.completed_at is not None
+    rebase_ts = int(rebase.completed_at.timestamp())
+    pre_head = "1" * 40
+    rebased_head = "3" * 40
+    target_sha = "4" * 40
+    _write_reflog(
+        tmp_path,
+        impl.branch,
+        (
+            f"{'0'*40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
+            f"{pre_head} {rebased_head} user <u@example.com> {rebase_ts - 1} +0000\t"
+            f"rebase (finish): refs/heads/{impl.branch} onto {target_sha}",
+        ),
+    )
+    _write_reflog(
+        tmp_path,
+        "main",
+        (f"{'2'*40} {target_sha} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
+    )
 
     monkeypatch.setattr(
         advance_engine_module,
@@ -5265,6 +5475,77 @@ def test_changed_rebase_completed_approved_review_with_missing_persisted_provena
             format_version="legacy",
         ),
     )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: rebased_head, "main": target_sha},
+        merge_base_by_ref={(pre_head, target_sha): "pre-rebase-merge-base"},
+    )
+    git.repo_dir = tmp_path
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    repaired_rebase = store.get(rebase.id)
+    repaired_review = store.get(review.id)
+    assert repaired_rebase is not None
+    assert repaired_review is not None
+    _assert_resolution_review_scope_matches_context(
+        repaired_review.review_scope,
+        impl=impl,
+        rebase=repaired_rebase,
+        resolved_head_sha="rebased-sha",
+        resolved_target_sha=target_sha,
+    )
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+
+
+def test_changed_rebase_completed_review_missing_resolution_metadata_readonly_repair_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-resolution-review-readonly",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_scope = None
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    original_update = store.update
+
+    def readonly_update(task: DbTask) -> None:
+        if task.id == review.id and task.review_scope is not None:
+            raise sqlite3.OperationalError("attempt to write a readonly database")
+        original_update(task)
+
+    monkeypatch.setattr(store, "update", readonly_update)
 
     action = evaluate_advance_rules(
         config,
@@ -5278,8 +5559,11 @@ def test_changed_rebase_completed_approved_review_with_missing_persisted_provena
         "main",
     )
 
+    persisted_review = store.get(review.id)
+    assert persisted_review is not None
+    assert persisted_review.review_scope is None
+    assert review.review_scope is None
     assert action["type"] == "needs_discussion"
-    assert action["description"] == "SKIP: required resolution-review metadata is missing or malformed"
     assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
 
 

@@ -45,6 +45,7 @@ from gza.db import (
     run_v27_migration,
     task_owns_merge_status,
 )
+from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
 from gza.review_tasks import build_auto_review_prompt
 from gza.runner import _compute_slug_override
 from gza.sync_ops import BranchCohort, sync_branch_cohorts
@@ -90,6 +91,47 @@ def test_is_readonly_snapshot_operational_error_accepts_snapshot_variants() -> N
     )
     assert not _is_readonly_snapshot_operational_error(sqlite3.OperationalError("disk I/O error"))
     assert not _is_readonly_snapshot_operational_error(sqlite3.OperationalError("database is locked"))
+
+
+def test_update_preserves_complete_changed_rebase_provenance_against_stale_partial_scope(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    rebase = store.add(
+        "Rebase feature",
+        task_type="rebase",
+        review_scope="custom review scope from stale object",
+    )
+    complete_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip="a" * 40,
+            target_at_start="b" * 40,
+            merge_base_at_start="c" * 40,
+            recovered=False,
+        ),
+        resolved_head_sha="d" * 40,
+        resolved_target_sha="e" * 40,
+    )
+    rebase.review_scope = complete_scope
+    store.mark_completed(
+        rebase,
+        has_commits=False,
+        changed_diff=True,
+    )
+
+    stale_rebase = Task(**rebase.__dict__)
+    stale_rebase.review_scope = "\n".join(
+        (
+            "Rebase diff provenance: yes",
+            f"Resolved head SHA: {'d' * 40}",
+            "Recovered baseline: no",
+        )
+    )
+    store.update(stale_rebase)
+
+    persisted = store.get(rebase.id)
+    assert persisted is not None
+    assert persisted.review_scope == complete_scope
 
 
 def test_behavior_check_fingerprint_ignores_line_number_churn() -> None:

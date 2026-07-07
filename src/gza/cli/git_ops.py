@@ -86,7 +86,11 @@ from ..pickup import (
 )
 from ..pr_ops import build_task_pr_content, ensure_task_pr
 from ..rebase_checkout import import_isolated_rebase_tip, isolated_rebase_checkout
-from ..rebase_diff import capture_rebase_diff_baseline, compute_rebase_changed_diff
+from ..rebase_diff import (
+    build_rebase_diff_provenance,
+    capture_rebase_diff_baseline,
+    compute_rebase_changed_diff,
+)
 from ..rebase_publish import publish_rebased_branch
 from ..recovery_engine import (
     _MergeContext,
@@ -2326,6 +2330,11 @@ def _run_task_backed_rebase(
         )
         if comparison.warning:
             logger.warning(comparison.warning)
+        rebase_task.review_scope = build_rebase_diff_provenance(
+            baseline=rebase_diff_baseline,
+            resolved_head_sha=head_ref.sha,
+            resolved_target_sha=base_ref.sha,
+        )
         store.mark_completed(
             rebase_task,
             branch=branch,

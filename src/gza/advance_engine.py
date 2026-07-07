@@ -81,6 +81,8 @@ from gza.review_tasks import (
     find_existing_review_blocker_adjudication_task,
     find_existing_verify_fix_task,
     persist_off_topic_verify_clearance,
+    persist_repaired_review_scope,
+    repair_rebase_review_scope_provenance,
     resolve_verify_fix_representative_task,
     review_blocker_dispute_matches_current,
 )
@@ -2132,6 +2134,14 @@ def _resolve_resolution_review_metadata_shas(
     """Resolve resolution-review head/target SHAs from provenance or live refs."""
     if rebase_task is None or rebase_task.id is None:
         return None, None, None
+    repair_result = repair_rebase_review_scope_provenance(
+        ctx.store,
+        rebase_task=rebase_task,
+        git=ctx.git,
+        target_branch=ctx.target_branch,
+    )
+    if not repair_result.persisted:
+        return rebase_task.id, None, None
     provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
     resolved_head_sha = provenance.resolved_head_sha if provenance is not None else None
     if not resolved_head_sha:
@@ -2196,6 +2206,14 @@ def _resolution_review_metadata_matches_context(
 ) -> bool:
     if metadata is None or impl_task.id is None or rebase_task is None or rebase_task.id is None:
         return False
+    repair_result = repair_rebase_review_scope_provenance(
+        ctx.store,
+        rebase_task=rebase_task,
+        git=ctx.git,
+        target_branch=ctx.target_branch,
+    )
+    if not repair_result.persisted:
+        return False
     provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
     if provenance is None or not resolution_delta_provenance_is_complete(provenance):
         return False
@@ -2236,6 +2254,14 @@ def _repair_resolution_review_scope_from_context(
 ) -> ResolutionReviewScope | None:
     if impl_task.id is None or rebase_task is None or rebase_task.id is None:
         return None
+    repair_result = repair_rebase_review_scope_provenance(
+        store,
+        rebase_task=rebase_task,
+        git=ctx.git,
+        target_branch=ctx.target_branch,
+    )
+    if not repair_result.persisted:
+        return None
     provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
     if provenance is None or not resolution_delta_provenance_is_complete(provenance):
         return None
@@ -2254,9 +2280,13 @@ def _repair_resolution_review_scope_from_context(
         pre_rebase_target_sha=provenance.target_at_start,
         pre_rebase_merge_base_sha=provenance.merge_base_at_start,
     )
-    if review_task.review_scope != rebuilt_scope:
-        review_task.review_scope = rebuilt_scope
-        store.update(review_task)
+    repair_result = persist_repaired_review_scope(
+        store,
+        task=review_task,
+        repaired_scope=rebuilt_scope,
+    )
+    if not repair_result.persisted:
+        return None
     return parse_resolution_review_scope(review_task.review_scope)
 
 
