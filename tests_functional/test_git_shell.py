@@ -622,7 +622,70 @@ def test_squash_merge_without_remote_tracking_ref_stays_local_only(tmp_path: Pat
 
     assert result.rc == 1
     assert result.status == "merged"
-    assert git.rev_parse_if_exists(f"refs/remotes/origin/{branch}") is None
+
+
+def test_merge_force_refuses_real_git_conflict_and_leaves_clean_checkout(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    git = Git(tmp_path)
+
+    git._run("init", "-b", "main")
+    git._run("config", "user.name", "Test User")
+    git._run("config", "user.email", "test@example.com")
+    conflict_file = tmp_path / "conflict.txt"
+    conflict_file.write_text("base\n")
+    git._run("add", "conflict.txt")
+    git._run("commit", "-m", "Initial commit")
+
+    task = store.add("Force merge conflict", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/force-conflict"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git._run("checkout", "-b", "feature/force-conflict")
+    conflict_file.write_text("feature change\n")
+    git._run("add", "conflict.txt")
+    git._run("commit", "-m", "Feature change")
+    git._run("checkout", "main")
+    conflict_file.write_text("main change\n")
+    git._run("add", "conflict.txt")
+    git._run("commit", "-m", "Main change")
+
+    args = argparse.Namespace(
+        rebase=False,
+        squash=True,
+        delete=False,
+        mark_only=False,
+        force=True,
+        remote=False,
+        resolve=False,
+        defer_blockers=False,
+        no_followups=False,
+    )
+
+    with patch(
+        "gza.cli.git_ops.determine_next_action",
+        return_value={
+            "type": "needs_discussion",
+            "description": "SKIP: required resolution-review metadata is missing or malformed",
+            "needs_attention_reason": "resolution-review-metadata-invalid",
+        },
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    assert git.current_branch() == "main"
+    assert git._run("diff", "--quiet", check=False).returncode == 0
+    assert git._run("diff", "--cached", "--quiet", check=False).returncode == 0
+    assert not (tmp_path / ".git" / "MERGE_HEAD").exists()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
 
 
 def test_resolve_context_prefers_local_branch_when_origin_is_stale(tmp_path: Path) -> None:

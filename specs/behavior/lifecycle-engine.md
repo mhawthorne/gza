@@ -547,9 +547,13 @@ failure *and* actionable merge/review work remains eligible for the latter.
 - Manual `gza merge` retains a narrower human-override path than automation. Automated
   lifecycle actions (`advance`/`watch`) MUST still merge only review-cleared work under
   the rules above; they MUST NOT auto-merge `CHANGES_REQUESTED` reviews by deferring
-  blockers. Manual `gza merge` MUST refuse a latest completed `CHANGES_REQUESTED` review
-  that still has any open non-verify `BLOCKER` finding unless the operator passes
-  `--defer-blockers`.
+  blockers, and they MUST NOT bypass parked lifecycle `needs_attention` /
+  `needs_discussion` merge gates. Manual `gza merge --force` MAY override those parked
+  lifecycle gates for the local merge path only, but it MUST still refuse any real git
+  conflict and MUST leave the unit's persisted provenance distinguishable from an
+  ordinary manual merge. Manual `gza merge` MUST refuse a latest completed
+  `CHANGES_REQUESTED` review that still has any open non-verify `BLOCKER` finding unless
+  the operator passes `--defer-blockers`.
 - For manual `gza merge`, when the latest completed `CHANGES_REQUESTED` review is a
   verify-only compatibility case blocked only by verify failures/timeouts, the
   command MAY auto-defer those blockers without a flag. Every blocker bypassed by either

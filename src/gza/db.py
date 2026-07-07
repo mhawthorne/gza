@@ -4078,6 +4078,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
 
 MERGE_SOURCE_MANUAL = "manual"
+MERGE_SOURCE_MANUAL_FORCE = "manual_force"
 MERGE_SOURCE_ADVANCE = "advance"
 MERGE_SOURCE_WATCH = "watch"
 MERGE_SOURCE_GITHUB_PR = "github_pr"
@@ -4085,6 +4086,7 @@ MERGE_SOURCE_EXTERNAL = "external"
 MERGE_SOURCE_VALUES: frozenset[str] = frozenset(
     {
         MERGE_SOURCE_MANUAL,
+        MERGE_SOURCE_MANUAL_FORCE,
         MERGE_SOURCE_ADVANCE,
         MERGE_SOURCE_WATCH,
         MERGE_SOURCE_GITHUB_PR,

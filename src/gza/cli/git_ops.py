@@ -40,6 +40,7 @@ from ..db import (
     DB_UNSET,
     MERGE_SOURCE_ADVANCE,
     MERGE_SOURCE_MANUAL,
+    MERGE_SOURCE_MANUAL_FORCE,
     DuplicateActiveChildError,
     MergeTargetResolutionError,
     SqliteTaskStore,
@@ -1557,8 +1558,8 @@ def _merge_single_task(
     # Handle --mark-only flag
     if args.mark_only:
         # Check for conflicting flags
-        if args.rebase or args.squash or args.delete:
-            print("Error: --mark-only cannot be used with --rebase, --squash, or --delete")
+        if args.rebase or args.squash or args.delete or getattr(args, "force", False):
+            print("Error: --mark-only cannot be used with --rebase, --squash, --delete, or --force")
             return _MergeSingleTaskResult(rc=1)
 
         if materialize_side_effects:
@@ -1639,10 +1640,20 @@ def _merge_single_task(
             target_branch,
             selected_for_merge=True,
         )
+    effective_merge_source = merge_source
     if planned_action.get("type") not in {"merge", "merge_with_followups"}:
-        description = str(planned_action.get("description") or "merge is blocked")
-        print(f"Error: {description}")
-        return _MergeSingleTaskResult(rc=1)
+        if getattr(args, "force", False) and classify_advance_action(planned_action) == "needs_attention":
+            effective_merge_source = (
+                MERGE_SOURCE_MANUAL_FORCE
+                if merge_source == MERGE_SOURCE_MANUAL
+                else merge_source
+            )
+            description = str(planned_action.get("description") or "merge is blocked")
+            print(f"Warning: Forcing merge despite lifecycle gate: {description}")
+        else:
+            description = str(planned_action.get("description") or "merge is blocked")
+            print(f"Error: {description}")
+            return _MergeSingleTaskResult(rc=1)
 
     # Check if branch already merged
     if git.is_merged(merge_source_ref, current_branch):
@@ -1790,7 +1801,7 @@ def _merge_single_task(
                     merge_unit_id,
                     "merged",
                     merged_by_task_id=merge_subject.id,
-                    merge_source=merge_source,
+                    merge_source=effective_merge_source,
                 )
             else:
                 store.set_merge_status(merge_subject.id, "merged")
@@ -1849,7 +1860,7 @@ def _merge_single_task(
                         merge_unit_id,
                         "merged",
                         merged_by_task_id=merge_subject.id,
-                        merge_source=merge_source,
+                        merge_source=effective_merge_source,
                     )
                 else:
                     store.set_merge_status(merge_subject.id, "merged")
@@ -1873,8 +1884,13 @@ def _merge_single_task(
                     pass  # Best effort to return to original branch
                 print("✓ Rebase aborted, working directory restored")
             else:
-                git.merge_abort()
-                print("✓ Merge aborted, working directory restored")
+                try:
+                    git.merge_abort()
+                    print("✓ Merge aborted, working directory restored")
+                except GitError:
+                    # Failed squash merges can leave tracked files dirty without MERGE_HEAD.
+                    git.reset_hard_head()
+                    print("✓ Merge cleanup reset tracked files to HEAD")
         except GitError as abort_error:
             print(f"Warning: Could not abort {operation}: {abort_error}")
         return _MergeSingleTaskResult(rc=1)

@@ -18,10 +18,11 @@ for only the selected owners, so slot ceilings, launch permits, recovery routing
 worker-consuming-vs-direct action accounting stay identical across `watch` and
 `unstick --run`.
 
-Manual `gza merge` has one deliberate operator-only escape hatch that `advance`/`watch`
-do not share: a human can defer review blockers into urgent PR-required follow-up tasks.
-The automated lifecycle remains stricter and does not merge `CHANGES_REQUESTED` reviews
-by deferring blockers.
+Manual `gza merge` has two deliberate operator-only escape hatches that `advance`/`watch`
+do not share: a human can defer review blockers into urgent PR-required follow-up tasks,
+and can pass `--force` to override lifecycle parked merge gates such as malformed
+resolution-review metadata. The automated lifecycle remains stricter and does not merge
+`CHANGES_REQUESTED` reviews by deferring blockers or bypass lifecycle parked states.
 
 ## Usage
 

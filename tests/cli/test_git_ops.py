@@ -1389,11 +1389,96 @@ def test_merge_single_task_same_merge_unit_review_on_representative_defer_flag_m
 
     assert result.rc == 0
     assert merge_order == ["merge"]
-    blockers = [
-        child for child in store.get_based_on_children(review.id)
-        if child.prompt.startswith(f"Deferred blocker B1 from review {review.id} for task {owner.id}:")
-    ]
-    assert len(blockers) == 1
+
+
+def test_merge_single_task_force_still_refuses_open_review_blockers_without_defer_flag(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement forced blocked merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/force-blocker"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    blocker = ReviewFinding(
+        id="B-force",
+        severity="BLOCKER",
+        title="Missing data migration",
+        body="Body",
+        evidence=None,
+        impact=None,
+        fix_or_followup="add migration",
+        tests=None,
+        open_state_citation="citation",
+    )
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        branch_exists=MagicMock(return_value=True),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        force=True,
+        remote=False,
+        resolve=False,
+        defer_blockers=False,
+        no_followups=False,
+    )
+    config = Config.load(tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={
+                "type": "needs_discussion",
+                "description": "SKIP: required resolution-review metadata is missing or malformed",
+                "needs_attention_reason": "resolution-review-metadata-invalid",
+            },
+        ),
+        patch(
+            "gza.cli.git_ops.get_review_report",
+            return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
+        ),
+        patch("gza.cli.git_ops.get_review_content", return_value="review content"),
+        patch(
+            "gza.cli.git_ops.summarize_review_blockers",
+            return_value=SimpleNamespace(
+                blocker_count=1,
+                verify_timeout_count=0,
+                verify_failure_count=0,
+                unknown_or_code_count=1,
+            ),
+        ),
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    output = capsys.readouterr().out
+    assert "Warning: Forcing merge despite lifecycle gate" in output
+    assert f"Error: Task {task.id} has open BLOCKER findings in review {review.id}." in output
+    assert "Use --defer-blockers to merge anyway and create urgent PR-required follow-up tasks." in output
 
 
 def test_merge_single_task_same_merge_unit_verify_only_review_on_representative_mark_only_refuses(

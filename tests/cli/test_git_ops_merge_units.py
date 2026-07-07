@@ -660,6 +660,56 @@ def test_merge_explicit_improve_task_uses_owner_for_provenance_and_squash_subjec
     assert unit.merged_by_task_id == impl.id
 
 
+def test_merge_force_bypasses_lifecycle_gate_and_records_manual_force_provenance(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement forced merge path", task_type="implement")
+    store.mark_completed(impl, has_commits=True, branch="feature/force-lifecycle-gate")
+    assert impl.id is not None
+
+    review = _add_completed_approved_review(store, based_on_task=impl, depends_on_task=impl)
+    _persist_current_green_verify(tmp_path, store, owner_task=impl, source_task=review)
+
+    fake_git = _MergeGit(tmp_path)
+    blocked_action = {
+        "type": "needs_discussion",
+        "description": "SKIP: required resolution-review metadata is missing or malformed",
+        "needs_attention_reason": "resolution-review-metadata-invalid",
+    }
+
+    with (
+        patch("gza.cli.git_ops.Git", lambda project_dir: fake_git),
+        patch("gza.cli.git_ops.determine_next_action", return_value=blocked_action),
+    ):
+        blocked = invoke_gza("merge", str(impl.id), "--squash", "--project", str(tmp_path), cwd=tmp_path)
+
+    assert blocked.returncode == 1
+    assert "required resolution-review metadata is missing or malformed" in blocked.stdout
+    assert fake_git.merged == []
+
+    with (
+        patch("gza.cli.git_ops.Git", lambda project_dir: fake_git),
+        patch("gza.cli.git_ops.determine_next_action", return_value=blocked_action),
+    ):
+        forced = invoke_gza(
+            "merge",
+            str(impl.id),
+            "--squash",
+            "--force",
+            "--project",
+            str(tmp_path),
+            cwd=tmp_path,
+        )
+
+    assert forced.returncode == 0
+    assert "Warning: Forcing merge despite lifecycle gate" in forced.stdout
+    assert fake_git.merged == [("feature/force-lifecycle-gate", True)]
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    assert unit is not None
+    assert unit.merge_source == "manual_force"
+
+
 def test_merge_valid_and_missing_explicit_task_ids_report_missing_without_partial_merge(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

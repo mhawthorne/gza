@@ -1469,6 +1469,14 @@ def main() -> int:
         help="Mark the task as merged in the database without performing an actual git merge (branch is preserved)",
     )
     merge_parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Override lifecycle parked merge gates for manual merge execution, but still refuse git conflicts "
+            "and open review BLOCKER findings unless --defer-blockers is also passed"
+        ),
+    )
+    merge_parser.add_argument(
         "--no-followups",
         action="store_true",
         help=(

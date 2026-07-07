@@ -416,8 +416,6 @@ class TestMergeCommand:
 
     def test_mark_only_requires_completed_task(self, tmp_path: Path):
         """--mark-only flag requires task to be completed."""
-        from gza.git import Git
-
         setup_config(tmp_path)
         store = make_store(tmp_path)
 

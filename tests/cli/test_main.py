@@ -1033,6 +1033,24 @@ class TestHelpOutput:
         assert "Pass `--all` to see full history" in docs_text
         assert "use explicit `--last-days` / `--since` filters to request a different window" in docs_text
 
+    def test_merge_help_and_docs_describe_force_as_lifecycle_only_override(self, tmp_path):
+        """`merge --help` and docs should describe `--force` as a lifecycle override, not a git-conflict override."""
+        setup_config(tmp_path)
+
+        merge_help = invoke_gza("merge", "--help", "--project", str(tmp_path))
+        assert merge_help.returncode == 0
+
+        help_text = " ".join(merge_help.stdout.split())
+        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
+
+        assert "--force" in merge_help.stdout
+        assert "Override lifecycle parked merge gates for manual merge execution" in help_text
+        assert "still refuse git conflicts and open review BLOCKER findings unless --defer-blockers is also passed" in help_text
+
+        assert "| `--force` | Override lifecycle parked merge gates for the local merge path; does not bypass git conflicts or open review `BLOCKER`s without `--defer-blockers` |" in docs_text
+        assert "`--force` is the manual break-glass path for lifecycle parked merge gates" in docs_text
+        assert "`manual_force` when `--force` actually overrides a parked lifecycle gate" in docs_text
+
     def test_show_help_and_docs_describe_prompt_as_plain_text(self, tmp_path):
         """`show --prompt` should be documented as plain prompt-text output, not JSON."""
         setup_config(tmp_path)
