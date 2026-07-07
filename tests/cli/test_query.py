@@ -15984,6 +15984,73 @@ class TestLineageCommand:
         assert "\x1b[33mfailed \x1b[0m" in rendered
         assert "\x1b[31mfailed \x1b[0m" not in rendered
 
+    @pytest.mark.parametrize("extra_args", [(), ("--json",)])
+    def test_lineage_uses_one_read_session_connection_for_successful_render(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+        extra_args: tuple[str, ...],
+    ) -> None:
+        """`gza lineage` should keep tree construction and rendering in one read session."""
+        from gza.cli.query import cmd_lineage
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("Plan lineage session", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime(2026, 5, 4, 10, 0, 0, tzinfo=UTC)
+        store.update(plan)
+
+        impl = store.add("Implement lineage session", task_type="implement", based_on=plan.id)
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.completed_at = datetime(2026, 5, 4, 10, 10, 0, tzinfo=UTC)
+        impl.branch = "feature/lineage-session"
+        impl.has_commits = True
+        store.update(impl)
+
+        review = store.add("Review lineage session", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 4, 10, 20, 0, tzinfo=UTC)
+        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        original_open_connection = store._open_connection
+        opened_read_session_connections: list[sqlite3.Connection] = []
+
+        def _tracking_open_connection(*, close_on_exit: bool):
+            conn = original_open_connection(close_on_exit=close_on_exit)
+            if not close_on_exit:
+                opened_read_session_connections.append(conn)
+            return conn
+
+        monkeypatch.setattr(store, "_open_connection", _tracking_open_connection)
+        monkeypatch.setattr(query_cli, "get_store", lambda config, open_mode="query_only": store)
+
+        args = argparse.Namespace(
+            project_dir=tmp_path,
+            task_id=str(plan.id),
+            full=False,
+            parents_only=False,
+            children_only=False,
+            flat=False,
+            json="--json" in extra_args,
+        )
+
+        exit_code = cmd_lineage(args)
+        output = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert output
+        assert len(opened_read_session_connections) == 1
+
+        with pytest.raises(sqlite3.ProgrammingError):
+            opened_read_session_connections[0].execute("SELECT 1")
+
     def test_lineage_full_tree(self, tmp_path: Path):
         """Lineage command renders a multi-level tree with parent and children."""
         from datetime import datetime

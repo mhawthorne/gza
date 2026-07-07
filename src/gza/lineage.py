@@ -76,12 +76,24 @@ def walk_ancestors(
         stack.append(task.depends_on)
 
     visited: set[str] = {task.id}
+    cached_ancestors: dict[str, Task] = {}
     while stack:
+        missing_ids = tuple(
+            dict.fromkeys(
+                task_id
+                for task_id in reversed(stack)
+                if task_id not in visited and task_id not in cached_ancestors
+            )
+        )
+        if missing_ids:
+            cached_ancestors.update(_get_tasks_by_id(store, list(missing_ids)))
+
         task_id = stack.pop()
         if task_id in visited:
             continue
         visited.add(task_id)
-        ancestor = store.get(task_id)
+
+        ancestor = cached_ancestors.get(task_id)
         if ancestor is None or ancestor.id is None:
             continue
         yield ancestor
@@ -137,6 +149,53 @@ def _parent_ids(task: Task) -> list[str]:
     if task.depends_on is not None:
         parent_ids.append(task.depends_on)
     return parent_ids
+
+
+def _get_tasks_by_id(store: SqliteTaskStore, task_ids: list[str]) -> dict[str, Task]:
+    if isinstance(store, SqliteTaskStore):
+        return {
+            task.id: task
+            for task in store.get_many(task_ids)
+            if task.id is not None
+        }
+    return {
+        task_id: task
+        for task_id in task_ids
+        if (task := store.get(task_id)) is not None
+    }
+
+
+def load_lineage_subtree_indexes(
+    store: SqliteTaskStore,
+    root_task: Task,
+) -> tuple[dict[str, list[Task]], dict[str, list[Task]]]:
+    """Load based_on/depends_on child indexes for the subtree rooted at ``root_task``."""
+    if root_task.id is None:
+        return {}, {}
+
+    based_on_children: dict[str, list[Task]] = {}
+    depends_on_children: dict[str, list[Task]] = {}
+    visited: set[str] = {root_task.id}
+    frontier: list[str] = [root_task.id]
+
+    while frontier:
+        frontier_ids = tuple(dict.fromkeys(task_id for task_id in frontier if task_id))
+        frontier = []
+        if not frontier_ids:
+            continue
+
+        for child in store.get_lineage_children_for_parents(frontier_ids):
+            child_id = child.id
+            if child.based_on in frontier_ids and child.based_on is not None:
+                based_on_children.setdefault(child.based_on, []).append(child)
+            if child.depends_on in frontier_ids and child.depends_on is not None:
+                depends_on_children.setdefault(child.depends_on, []).append(child)
+            if child_id is None or child_id in visited:
+                continue
+            visited.add(child_id)
+            frontier.append(child_id)
+
+    return based_on_children, depends_on_children
 
 
 def resolve_lineage_root(store: SqliteTaskStore, task: Task) -> Task:

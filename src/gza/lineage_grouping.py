@@ -146,7 +146,7 @@ def build_merge_unit_group_tree(
         built.add(key)
         header, unit = headers[key]
         group_members = [m for m in members[key] if m.id != header.id]
-        # Skip any child already built: guards against a parent-key cycle sending
+        # Skip any child already built: guards against a parent-key loop sending
         # _build into infinite recursion (and double-rendering a group).
         children = [_build(child) for child in child_keys[key] if child not in built]
         return MergeUnitGroup(
@@ -158,7 +158,7 @@ def build_merge_unit_group_tree(
         )
 
     forest = [_build(root) for root in roots]
-    # A parent-key cycle (e.g. a unit whose resolved header is based_on a solo
+    # A parent-key loop (e.g. a unit whose resolved header is based_on a solo
     # task that is itself based_on one of the unit's own members) leaves some
     # groups neither a root nor reachable from one. Surface each remaining group
     # as its own root so its tasks still render instead of silently vanishing.

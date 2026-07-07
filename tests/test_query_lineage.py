@@ -576,6 +576,32 @@ class TestResolveLineageRoot:
         result = resolve_lineage_root(store, child)
         assert result == grandparent
 
+    def test_batches_ancestor_fetches_with_get_many_when_available(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        grandparent = store.add("grandparent", task_type="implement")
+        assert grandparent.id is not None
+        parent = store.add("parent", task_type="implement", based_on=grandparent.id)
+        assert parent.id is not None
+        child = store.add("child", task_type="implement", based_on=parent.id)
+        assert child.id is not None
+
+        get_many_calls: list[tuple[str, ...]] = []
+
+        original_get_many = store.get_many
+
+        def _counting_get_many(task_ids):
+            ordered_ids = tuple(task_ids)
+            get_many_calls.append(ordered_ids)
+            return original_get_many(ordered_ids)
+
+        store.get_many = _counting_get_many  # type: ignore[method-assign]
+        store.get = MagicMock(side_effect=AssertionError("batched root resolution should not call store.get"))
+
+        result = resolve_lineage_root(store, child)
+
+        assert result.id == grandparent.id
+        assert get_many_calls == [(parent.id,), (grandparent.id,)]
+
     def test_handles_cycle_in_based_on_chain(self):
         store = MagicMock()
         task_a = _make_task(id="gza-1", task_type="implement", based_on="gza-2")
@@ -839,7 +865,7 @@ class TestBuildMergeUnitGroupTree:
         assert group_b.children == []
 
     def _cyclic_tree(self):
-        """A lineage where the parent-key graph has a cycle.
+        """A lineage where the parent-key graph loops back on itself.
 
         The merge unit ``mu-A``'s owner is ``gza-5``, which is ``based_on`` the
         solo implement ``gza-4``, which is in turn ``based_on`` ``gza-3`` — a
@@ -876,12 +902,12 @@ class TestBuildMergeUnitGroupTree:
             "gza-5": "mu-A",
             "gza-6": "mu-A",  # supporting rebase inside the unit
         }
-        owners = {"mu-A": "gza-5"}  # owner is based_on the solo gza-4 -> cycle
+        owners = {"mu-A": "gza-5"}  # owner is based_on the solo gza-4 -> loop
         store = self._store(units, owners)
 
         roots = _build_merge_unit_group_tree(store, self._cyclic_tree())
 
-        # Every task must appear somewhere despite the cycle.
+        # Every task must appear somewhere despite the loop.
         seen: set[str] = set()
 
         def _collect(group) -> None:

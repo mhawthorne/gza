@@ -38,6 +38,24 @@ def test_get_plan_for_task_finds_direct_based_on_plan_for_transition(tmp_path: P
     assert found.id == plan.id
 
 
+def test_get_plan_for_task_prefers_nested_depends_on_plan_before_direct_based_on_plan(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    nested_plan = store.add("Nested plan", task_type="plan")
+    upstream_impl = store.add("Upstream implementation", task_type="implement", depends_on=nested_plan.id)
+    direct_plan = store.add("Direct transition plan", task_type="plan")
+    impl = store.add(
+        "Implementation with competing plan ancestors",
+        task_type="implement",
+        based_on=direct_plan.id,
+        depends_on=upstream_impl.id,
+    )
+
+    found = get_plan_for_task(store, impl)
+
+    assert found is not None
+    assert found.id == nested_plan.id
+
+
 def test_get_plan_for_task_cycle_guard(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
     first = store.add("First implementation", task_type="implement")

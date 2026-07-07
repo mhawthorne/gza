@@ -533,6 +533,15 @@ class TaskQueryService:
         git: Any | None = None,
         target_branch: str | None = None,
     ) -> list[LineageRow]:
+        if self._is_single_lineage_window_query(query):
+            row = self._collect_single_lineage_window(
+                query,
+                config=config,
+                git=git,
+                target_branch=target_branch,
+            )
+            return [] if row is None else [row]
+
         use_incomplete_rollup = bool(
             query.lifecycle_state and "incomplete" in query.lifecycle_state
         )
@@ -650,6 +659,70 @@ class TaskQueryService:
             reverse=query.sort.descending,
         )
         return rows
+
+    def _is_single_lineage_window_query(self, query: TaskQuery) -> bool:
+        return (
+            query.scope == "lineages"
+            and query.lineage_of is not None
+            and query.limit == 1
+            and query.text is None
+            and query.statuses is None
+            and query.exclude_statuses is None
+            and query.task_types is None
+            and query.exclude_task_types is None
+            and query.lifecycle_state is None
+            and query.merge_chain_state is None
+            and query.exclude_merge_chain_state is None
+            and query.dependency_state is None
+            and query.exclude_lineage_of is None
+            and query.root_ids is None
+            and query.exclude_root_ids is None
+            and query.task_ids is None
+            and query.branch_owner_ids is None
+            and query.merge_unit_ids is None
+            and query.tag_filters is None
+            and query.exclude_tag_filters is None
+            and not query.pickup_only
+            and query.max_recovery_attempts is None
+            and query.date_filter is None
+            and query.projection.preset == TaskProjectionPreset.LINEAGE_FULL
+            and query.presentation.mode == "tree"
+        )
+
+    def _collect_single_lineage_window(
+        self,
+        query: TaskQuery,
+        *,
+        config: Any | None = None,
+        git: Any | None = None,
+        target_branch: str | None = None,
+    ) -> LineageRow | None:
+        del config, git, target_branch
+
+        assert query.lineage_of is not None
+        with self._store.read_session():
+            target_task = self._store.get(query.lineage_of)
+            if target_task is None:
+                return None
+
+            root_task = _resolve_lineage_root(self._store, target_task)
+            based_on_children, depends_on_children = lineage.load_lineage_subtree_indexes(
+                self._store,
+                root_task,
+            )
+            full_tree = _build_lineage_tree_from_index(
+                root_task,
+                based_on_children=based_on_children,
+                depends_on_children=depends_on_children,
+                max_depth=None,
+            )
+            owner_task = self._resolve_branch_owner(target_task, query=query)
+            members = tuple(_flatten_lineage_tree(full_tree))
+            return LineageRow(
+                owner_task=owner_task,
+                members=members,
+                tree=full_tree,
+            )
 
     def _apply_limit(self, rows: list[_T], limit: int | None) -> list[_T]:
         if limit is None:
@@ -1560,10 +1633,29 @@ def _build_lineage_tree(store: SqliteTaskStore, root_task: DbTask, *, max_depth:
     return build_lineage_tree(store, root_task, max_depth=max_depth)
 
 
+def _build_lineage_tree_from_index(
+    root_task: DbTask,
+    *,
+    based_on_children: Mapping[str, list[DbTask]],
+    depends_on_children: Mapping[str, list[DbTask]],
+    max_depth: int | None,
+) -> Any:
+    from gza.query import build_lineage_tree_from_index
+
+    return build_lineage_tree_from_index(
+        root_task,
+        based_on_children=based_on_children,
+        depends_on_children=depends_on_children,
+        max_depth=max_depth,
+    )
+
+
 def _flatten_lineage_tree(tree: Any) -> list[DbTask]:
     from gza.query import flatten_lineage_tree
 
     return flatten_lineage_tree(tree)
+
+
 
 
 def _query_incomplete(store: SqliteTaskStore, history_filter: Any, *, target_branch: str | None = None) -> list[Any]:

@@ -5374,6 +5374,23 @@ class SqliteTaskStore:
                 return None
             return self._rows_to_tasks(conn, [row])[0]
 
+    def get_many(self, task_ids: Iterable[str]) -> list[Task]:
+        """Get tasks by ID in a single query, preserving input order when possible."""
+        ordered_ids = tuple(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        if not ordered_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in ordered_ids)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"SELECT * FROM tasks WHERE project_id = ? AND id IN ({placeholders})",
+                (self._project_id, *ordered_ids),
+            )
+            tasks = self._rows_to_tasks(conn, cur.fetchall())
+
+        task_by_id = {task.id: task for task in tasks if task.id is not None}
+        return [task_by_id[task_id] for task_id in ordered_ids if task_id in task_by_id]
+
     def get_by_seq(self, seq_number: int, prefix: str | None = None) -> Task | None:
         """Get task by ordinal sequence number within a project prefix.
 
@@ -6169,6 +6186,28 @@ class SqliteTaskStore:
                 ORDER BY created_at ASC
                 """,
                 (self._project_id, task_id, task_id),
+            )
+            return self._rows_to_tasks(conn, cur.fetchall())
+
+    def get_lineage_children_for_parents(self, task_ids: Iterable[str]) -> list[Task]:
+        """Return lineage children for multiple parents in a single query."""
+        ordered_ids = tuple(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        if not ordered_ids:
+            return []
+
+        placeholders = ",".join("?" for _ in ordered_ids)
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"""
+                SELECT * FROM tasks
+                WHERE project_id = ?
+                  AND (
+                    based_on IN ({placeholders})
+                    OR depends_on IN ({placeholders})
+                  )
+                ORDER BY created_at ASC
+                """,
+                (self._project_id, *ordered_ids, *ordered_ids),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 

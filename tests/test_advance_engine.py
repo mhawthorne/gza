@@ -24,6 +24,7 @@ from gza.advance_engine import (
     WORKER_CONSUMING_ACTIONS,
     _count_consecutive_plan_review_cycles,
     _empty_merge_state_description,
+    _resolve_owning_implementation_task,
     _resolve_and_persist_post_merge_rebase_state,
     classify_advance_action,
     evaluate_advance_rules,
@@ -8195,6 +8196,28 @@ def test_verify_blocked_subject_is_implement_when_evaluated_from_improve_leaf(tm
     # resolve_subject_task must resolve to the implement task.
     resolved = resolve_subject_task(store, action)
     assert resolved.id == impl.id
+
+
+def test_resolve_owning_implementation_task_prefers_depth_first_nested_implementation_ancestor(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    nested_owner = store.add("Nested owner implementation", task_type="implement")
+    assert nested_owner.id is not None
+    review = store.add("Review pointing at nested owner", task_type="review", depends_on=nested_owner.id)
+    assert review.id is not None
+    direct_owner = store.add("Direct sibling implementation", task_type="implement")
+    assert direct_owner.id is not None
+    leaf = store.add(
+        "Leaf with competing implementation ancestors",
+        task_type="fix",
+        based_on=direct_owner.id,
+        depends_on=review.id,
+    )
+
+    owner = _resolve_owning_implementation_task(store, leaf)
+
+    assert owner is not None
+    assert owner.id == nested_owner.id
 
 
 def test_verify_only_noop_improve_timestamp_only_clearance_does_not_merge(tmp_path: Path) -> None:

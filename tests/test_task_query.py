@@ -191,6 +191,60 @@ def test_incomplete_preset_projects_real_next_action_when_context_available(tmp_
     assert row.values["next_action_reason"] == "Create and start plan review task"
 
 
+def test_lineage_preset_does_not_fall_back_to_get_all(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store(tmp_path)
+    root = store.add("Root plan", task_type="plan")
+    assert root.id is not None
+    child = store.add("Implement root", task_type="implement", based_on=root.id)
+    assert child.id is not None
+    review = store.add("Review root", task_type="review", depends_on=child.id)
+    assert review.id is not None
+
+    unrelated = store.add("Unrelated root", task_type="implement")
+    assert unrelated.id is not None
+    store.add("Unrelated child", task_type="review", depends_on=unrelated.id)
+
+    def _must_not_get_all():
+        raise AssertionError("lineage preset should not scan the whole task table")
+
+    monkeypatch.setattr(store, "get_all", _must_not_get_all)
+
+    service = TaskQueryService(store)
+    result = service.run(TaskQueryPresets.lineage(review.id))
+
+    assert len(result.rows) == 1
+    row = result.rows[0]
+    assert isinstance(row, task_query.LineageRow)
+    assert row.tree is not None
+    assert [task.id for task in row.members] == [root.id, child.id, review.id]
+
+
+def test_lineage_preset_uses_one_read_session_connection(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store(tmp_path)
+    root = store.add("Root plan", task_type="plan")
+    assert root.id is not None
+    child = store.add("Implement root", task_type="implement", based_on=root.id)
+    assert child.id is not None
+    review = store.add("Review root", task_type="review", depends_on=child.id)
+    assert review.id is not None
+
+    opened_connections: list[tuple[bool, object]] = []
+    original_open_connection = store._open_connection
+
+    def _tracking_open_connection(*, close_on_exit: bool):
+        conn = original_open_connection(close_on_exit=close_on_exit)
+        opened_connections.append((close_on_exit, conn))
+        return conn
+
+    monkeypatch.setattr(store, "_open_connection", _tracking_open_connection)
+
+    service = TaskQueryService(store)
+    result = service.run(TaskQueryPresets.lineage(review.id))
+
+    assert len(result.rows) == 1
+    assert len([conn for close_on_exit, conn in opened_connections if close_on_exit is False]) == 1
+
+
 def test_incomplete_preset_projects_revised_plan_followup_when_context_available(tmp_path: Path) -> None:
     from tests.cli.conftest import setup_config
 
