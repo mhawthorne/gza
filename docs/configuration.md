@@ -146,7 +146,7 @@ Example:
 use_docker: false
 docker_startup_timeout: 90
 timeout_minutes: 30
-unit_verify_command: ./bin/tests --unit
+unit_verify_command: ./bin/test-unit --summary -- tests/ -n 2 --dist loadscope
 inner_verify_command: ./bin/tests --quick
 docker_volumes:
   - ~/datasets:/datasets:ro
@@ -497,7 +497,7 @@ Code tasks support a final verify gate plus optional fast-path tiers:
 
 ```yaml
 verify_command: ./bin/tests
-unit_verify_command: ./bin/tests --unit
+unit_verify_command: ./bin/test-unit --summary -- tests/ -n 2 --dist loadscope
 inner_verify_command: ./bin/tests --quick
 ```
 
@@ -2329,7 +2329,7 @@ max_turns: 80
 autonomous_verify_timeout_seconds: 180
 review_verify_timeout_grace_seconds: 5
 verify_command: ./bin/tests
-unit_verify_command: ./bin/tests --unit
+unit_verify_command: ./bin/test-unit --summary -- tests/ -n 2 --dist loadscope
 inner_verify_command: ./bin/tests --quick
 code_task_diff_timeout_medium_threshold: 500
 code_task_diff_timeout_large_threshold: 1500

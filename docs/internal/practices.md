@@ -112,7 +112,7 @@ Code-task verification has two distinct jobs:
 
 In practice:
 
-- Use `inner_verify_command` or targeted tests while editing.
+- Use `unit_verify_command`, then `inner_verify_command`, or targeted tests while editing.
 - Run the full `verify_command` once after the last planned edit.
 - If the full gate fails, fix the failures and rerun it. Do not keep
   relaunching the full suite after every intermediate edit.

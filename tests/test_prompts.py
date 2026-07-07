@@ -1635,11 +1635,11 @@ class TestVerifyCommandConfig:
         config_file = tmp_path / "gza.yaml"
         config_file.write_text(
             "project_name: testproject\n"
-            "unit_verify_command: './bin/tests --unit'\n"
+            "unit_verify_command: './bin/test-unit --summary -- tests/ -n 2 --dist loadscope'\n"
         )
 
         config = Config.load(tmp_path)
-        assert config.unit_verify_command == "./bin/tests --unit"
+        assert config.unit_verify_command == "./bin/test-unit --summary -- tests/ -n 2 --dist loadscope"
 
     def test_unit_verify_command_load_rejects_non_string(self, tmp_path: Path):
         """Config.load should reject malformed unit verify commands at runtime."""
@@ -1938,6 +1938,30 @@ class TestVerifyCommandInjection:
         assert "Preferred unit verify command: `./bin/tests --unit`" in result
         assert "Preferred inner-loop verify command" not in result
         assert "./bin/tests --quick" not in result
+
+    def test_project_config_unit_verify_command_renders_in_code_task_prompt(self, tmp_path: Path):
+        """Project config should render the unit-test inner-loop hint while keeping the full final gate."""
+        from gza.config import Config
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement feature", task_type="implement")
+
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "verify_command: './bin/tests'\n"
+            "unit_verify_command: './bin/test-unit --summary -- tests/ -n 2 --dist loadscope'\n"
+        )
+
+        config = Config.load(tmp_path)
+        result = PromptBuilder().build(task, config, store)
+
+        assert (
+            "Preferred unit verify command: "
+            "`./bin/test-unit --summary -- tests/ -n 2 --dist loadscope`"
+        ) in result
+        assert "Required final verify command: `./bin/tests`" in result
+        assert "Preferred inner-loop verify command" not in result
 
     def test_prompt_falls_back_to_targeted_checks_when_no_unit_or_inner_verify_is_configured(self, tmp_path: Path):
         """Code-task prompts should fall back to AGENTS/project guidance when no fast verify command is configured."""
