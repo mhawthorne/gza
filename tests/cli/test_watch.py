@@ -18733,6 +18733,112 @@ def test_watch_cycle_creates_exactly_one_closing_review_after_completed_improve_
     assert spawn_iterate.call_count == 0
 
 
+def test_watch_cycle_recovered_completed_closing_review_on_stable_head_does_not_reroute_to_iterate_create_review(
+    tmp_path: Path,
+) -> None:
+    """A recovered completed closing review should keep stable-head watch cycles off create_review."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime(2026, 1, 1, tzinfo=UTC)
+    impl.branch = "feature/watch-recovered-closing-review"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    stale_review = store.add("Old review", task_type="review", depends_on=impl.id)
+    assert stale_review.id is not None
+    stale_review.status = "completed"
+    stale_review.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    stale_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(stale_review)
+
+    improve = store.add(
+        "Improve feature",
+        task_type="improve",
+        based_on=impl.id,
+        depends_on=stale_review.id,
+        same_branch=True,
+    )
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime(2026, 1, 3, tzinfo=UTC)
+    store.update(improve)
+
+    failed_closing = store.add("Closing review attempt 1", task_type="review", depends_on=impl.id)
+    assert failed_closing.id is not None
+    failed_closing.status = "failed"
+    failed_closing.failure_reason = "NO_ACTIVITY"
+    failed_closing.completed_at = datetime(2026, 1, 4, tzinfo=UTC)
+    store.update(failed_closing)
+
+    recovered_closing = store.add(
+        "Closing review attempt 2",
+        task_type="review",
+        based_on=failed_closing.id,
+        depends_on=impl.id,
+        recovery_origin="retry",
+    )
+    assert recovered_closing.id is not None
+    recovered_closing.status = "completed"
+    recovered_closing.completed_at = datetime(2026, 1, 5, tzinfo=UTC)
+    recovered_closing.report_file = f"reviews/{recovered_closing.id}.md"
+    store.update(recovered_closing)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.can_merge.return_value = True
+
+    with (
+        patch("gza.advance_engine.get_review_report") as get_review_report,
+        patch(
+            "gza.advance_engine.resolve_verify_gate_decision",
+            return_value=SimpleNamespace(state="passed"),
+        ),
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate should not run")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker should not run")),
+    ):
+        get_review_report.side_effect = lambda _project_dir, review: ParsedReviewReport(
+            verdict="APPROVED" if review.id == recovered_closing.id else "CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        )
+
+        first = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+        second = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+
+    assert first.work_done is True
+    assert second.work_done is True
+    log_text = log_path.read_text()
+    assert log_text.count(f"MERGE     {impl.id} -> main [dry-run]") == 2
+    assert f"START     {impl.id} iterate [dry-run]" not in log_text
+
+
 def test_watch_cycle_creates_implement_from_completed_plan_with_iterate_mode(tmp_path: Path) -> None:
     """Completed plan without implement child should create implement and start iterate."""
     setup_config(tmp_path)

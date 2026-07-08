@@ -51,6 +51,7 @@ from gza.plan_review_materialization import (
     plan_review_manifest_digest,
 )
 from gza.query import get_reviews_for_root
+from gza.query import get_implementation_review_evidence
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.review_scope import (
@@ -3375,10 +3376,13 @@ def test_stale_review_with_review_requirement_disabled_merges(
         lambda project_dir, r: ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
     )
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_merge"
+    assert action["type"] == "merge"
 
 
 def test_head_advanced_stale_review_refresh_preempts_max_cycles(tmp_path: Path, monkeypatch) -> None:
@@ -16575,6 +16579,7 @@ def test_completed_recovered_closing_review_counts_as_review_evidence(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
+    """Automatic review recovery descendants count; manual merge-unit follow-ups do not."""
     from gza import advance_engine as advance_engine_module
 
     store = _make_store(tmp_path)
@@ -16585,6 +16590,7 @@ def test_completed_recovered_closing_review_counts_as_review_evidence(
         branch="feat/recovered-closing-review",
         when=datetime(2026, 5, 2, 9, 0, tzinfo=UTC),
     )
+    assert store.get_or_create_merge_unit_for_task(impl) is not None
     stale_review = _add_completed_review(store, impl, when=datetime(2026, 5, 2, 10, 0, tzinfo=UTC))
     improve = _add_completed_improve_for_review(
         store,
@@ -16616,6 +16622,7 @@ def test_completed_recovered_closing_review_counts_as_review_evidence(
     recovered_completed_review.completed_at = datetime(2026, 5, 2, 13, 0, tzinfo=UTC)
     recovered_completed_review.report_file = f"reviews/{recovered_completed_review.id}.md"
     store.update(recovered_completed_review)
+    assert store.get_or_create_merge_unit_for_task(recovered_completed_review) is not None
 
     manual_followup = store.add(
         "Manual review follow-up",
@@ -16629,6 +16636,21 @@ def test_completed_recovered_closing_review_counts_as_review_evidence(
     manual_followup.completed_at = datetime(2026, 5, 2, 14, 0, tzinfo=UTC)
     manual_followup.report_file = f"reviews/{manual_followup.id}.md"
     store.update(manual_followup)
+    assert store.get_or_create_merge_unit_for_task(manual_followup) is not None
+
+    impl_merge_unit = store.resolve_merge_unit_for_task(impl.id)
+    recovered_merge_unit = store.resolve_merge_unit_for_task(recovered_completed_review.id)
+    manual_merge_unit = store.resolve_merge_unit_for_task(manual_followup.id)
+    assert impl_merge_unit is not None
+    assert recovered_merge_unit is not None
+    assert manual_merge_unit is not None
+    assert recovered_merge_unit.id == impl_merge_unit.id
+    assert manual_merge_unit.id == impl_merge_unit.id
+
+    review_evidence = get_implementation_review_evidence(store, impl)
+    evidence_ids = [review.id for review in review_evidence]
+    assert recovered_completed_review.id in evidence_ids
+    assert manual_followup.id not in evidence_ids
 
     monkeypatch.setattr(
         advance_engine_module,
@@ -16649,10 +16671,111 @@ def test_completed_recovered_closing_review_counts_as_review_evidence(
     assert action.get("closing_review_action") is None
 
 
+def test_get_implementation_review_evidence_excludes_review_with_missing_review_parent(
+    tmp_path: Path,
+) -> None:
+    """Malformed review-to-review ancestry must fail closed instead of becoming latest evidence."""
+    store = _make_store(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/malformed-review-parent",
+        when=datetime(2026, 5, 3, 9, 0, tzinfo=UTC),
+    )
+    direct_review = _add_completed_review(store, impl, when=datetime(2026, 5, 3, 10, 0, tzinfo=UTC))
+
+    malformed_recovered_review = store.add(
+        "Malformed recovered review",
+        task_type="review",
+        based_on="gza-999999",
+        depends_on=impl.id,
+    )
+    assert malformed_recovered_review.id is not None
+    malformed_recovered_review.status = "completed"
+    malformed_recovered_review.completed_at = datetime(2026, 5, 3, 11, 0, tzinfo=UTC)
+    store.update(malformed_recovered_review)
+    assert store.get_or_create_merge_unit_for_task(malformed_recovered_review) is not None
+
+    review_evidence = get_implementation_review_evidence(store, impl)
+    evidence_ids = [review.id for review in review_evidence]
+
+    assert direct_review.id in evidence_ids
+    assert malformed_recovered_review.id not in evidence_ids
+    assert review_evidence[0].id == direct_review.id
+
+
+def test_malformed_review_parent_does_not_satisfy_closing_review_invariant_or_route_to_merge(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/malformed-closing-review-parent",
+        when=datetime(2026, 5, 4, 9, 0, tzinfo=UTC),
+    )
+    stale_review = _add_completed_review(store, impl, when=datetime(2026, 5, 4, 10, 0, tzinfo=UTC))
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        stale_review,
+        when=datetime(2026, 5, 4, 11, 0, tzinfo=UTC),
+    )
+
+    malformed_recovered_review = store.add(
+        "Malformed recovered review",
+        task_type="review",
+        based_on="gza-999999",
+        depends_on=impl.id,
+    )
+    assert malformed_recovered_review.id is not None
+    malformed_recovered_review.status = "completed"
+    malformed_recovered_review.completed_at = datetime(2026, 5, 4, 12, 0, tzinfo=UTC)
+    malformed_recovered_review.report_file = f"reviews/{malformed_recovered_review.id}.md"
+    store.update(malformed_recovered_review)
+    assert store.get_or_create_merge_unit_for_task(malformed_recovered_review) is not None
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda project_dir, review: ParsedReviewReport(
+            verdict="APPROVED" if review.id == malformed_recovered_review.id else "CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    review_evidence = get_implementation_review_evidence(store, impl)
+    assert malformed_recovered_review.id not in {review.id for review in review_evidence}
+
+    closing_review_action = resolve_closing_review_action(
+        task=impl,
+        reviews=review_evidence,
+        latest_completed_review=stale_review,
+        latest_completed_code_change=improve,
+    )
+    assert closing_review_action is not None
+    assert closing_review_action["type"] == "create_review"
+    assert "code changed since the last review" in closing_review_action["description"]
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    assert action["type"] == "create_review"
+    assert action["description"] == "Create closing review (code changed since the last review)"
+    assert action.get("review_task") is None
+
+
 def test_repeated_failed_closing_reviews_escalate_to_needs_attention(
     tmp_path: Path,
 ) -> None:
-    """After max_failed_closing_review_retries consecutive failures, escalate to needs_attention."""
+    """Failed closing-review recovery descendants count toward the bounded retry chain."""
     store = _make_store(tmp_path)
 
     impl = store.add("Implement feature", task_type="implement")
@@ -16686,18 +16809,31 @@ def test_repeated_failed_closing_reviews_escalate_to_needs_attention(
     store.update(impl)
 
     max_retries = 2
-    for i in range(max_retries):
-        failed = store.add(f"Closing review attempt {i + 1}", task_type="review", depends_on=impl.id)
-        assert failed.id is not None
-        failed.status = "failed"
-        failed.failure_reason = "UNKNOWN"
-        failed.created_at = datetime(2026, 1, 4 + i, tzinfo=UTC)
-        failed.completed_at = datetime(2026, 1, 4 + i, 1, tzinfo=UTC)
-        store.update(failed)
+    failed_root = store.add("Closing review attempt 1", task_type="review", depends_on=impl.id)
+    assert failed_root.id is not None
+    failed_root.status = "failed"
+    failed_root.failure_reason = "UNKNOWN"
+    failed_root.created_at = datetime(2026, 1, 4, tzinfo=UTC)
+    failed_root.completed_at = datetime(2026, 1, 4, 1, tzinfo=UTC)
+    store.update(failed_root)
+
+    failed_retry = store.add(
+        "Closing review attempt 2",
+        task_type="review",
+        based_on=failed_root.id,
+        depends_on=impl.id,
+        recovery_origin="retry",
+    )
+    assert failed_retry.id is not None
+    failed_retry.status = "failed"
+    failed_retry.failure_reason = "WORKER_DIED"
+    failed_retry.created_at = datetime(2026, 1, 5, tzinfo=UTC)
+    failed_retry.completed_at = datetime(2026, 1, 5, 1, tzinfo=UTC)
+    store.update(failed_retry)
 
     action = resolve_closing_review_action(
         task=impl,
-        reviews=store.get_reviews_for_task(impl.id),
+        reviews=get_implementation_review_evidence(store, impl),
         latest_completed_review=stale_review,
         latest_completed_code_change=improve,
         max_failed_closing_review_retries=max_retries,

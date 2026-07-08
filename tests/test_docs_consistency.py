@@ -364,6 +364,33 @@ def test_failed_rebase_docs_distinguish_manual_parking_from_transient_recovery()
     ) in workflow
 
 
+def test_closing_review_recovery_contract_stays_aligned_across_spec_and_internal_docs() -> None:
+    """Lifecycle spec and internal workflow docs should describe recovered review evidence consistently."""
+    repo_root = Path(__file__).resolve().parents[1]
+    lifecycle = (repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text()
+    workflow = (repo_root / "docs" / "internal" / "advance-workflow.md").read_text()
+    lifecycle_flat = " ".join(lifecycle.split())
+    workflow_flat = " ".join(workflow.split())
+
+    shared_evidence_snippet = (
+        "direct implementation-linked reviews, merge-unit-attached reviews, and review "
+        "recovery descendants"
+    )
+    shared_retry_snippet = "bounded retry accounting"
+    shared_chain_snippet = "rather than restarting from zero on each retry/resume descendant"
+
+    assert shared_evidence_snippet in lifecycle_flat
+    assert shared_evidence_snippet in workflow_flat
+    assert "manual same-type follow-up" in lifecycle_flat
+    assert "manual same-type review follow-ups do not count" in workflow_flat
+    assert "satisfied by any follow-on review evidence for that implementation" in lifecycle_flat
+    assert "counts as the required review evidence" in workflow_flat
+    assert shared_retry_snippet in lifecycle_flat
+    assert shared_retry_snippet in workflow_flat
+    assert shared_chain_snippet in lifecycle_flat
+    assert "follows that same recovery chain" in workflow_flat
+
+
 def test_plan_review_schema_version_contract_stays_aligned_across_spec_and_workflow_docs() -> None:
     """Spec and internal workflow docs should preserve integer-like schema-version normalization."""
     repo_root = Path(__file__).resolve().parents[1]

@@ -512,6 +512,32 @@ def get_reviews_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:
     return get_implementation_review_evidence(store, root_task)
 
 
+def _is_automatic_review_recovery_chain(store: SqliteTaskStore, review: Task) -> bool:
+    """Return True when every review-to-review based_on edge is automatic recovery."""
+    from gza.recovery_engine import classify_recovery_row
+
+    current = review
+    seen_ids: set[str] = set()
+    while current.based_on is not None:
+        if current.id is None or current.id in seen_ids:
+            return False
+        seen_ids.add(current.id)
+        parent = store.get(current.based_on)
+        if parent is None or parent.id is None:
+            return False
+        if parent.task_type != "review":
+            return True
+        if classify_recovery_row(store, current) not in {"resume", "retry"}:
+            return False
+        current = parent
+    return True
+
+
+def _review_counts_as_implementation_evidence(store: SqliteTaskStore, review: Task) -> bool:
+    """Exclude manual same-type follow-ups even when attached to a merge unit."""
+    return review.task_type == "review" and _is_automatic_review_recovery_chain(store, review)
+
+
 def get_implementation_review_evidence(store: SqliteTaskStore, root_task: Task) -> list[Task]:
     """Return implementation review evidence, including recovered review descendants."""
     if root_task.id is None:
@@ -519,13 +545,13 @@ def get_implementation_review_evidence(store: SqliteTaskStore, root_task: Task) 
 
     reviews_by_id: dict[str, Task] = {}
     for review in store.get_reviews_for_task(root_task.id):
-        if review.id is not None:
+        if review.id is not None and _review_counts_as_implementation_evidence(store, review):
             reviews_by_id.setdefault(review.id, review)
 
     merge_unit = store.resolve_merge_unit_for_task(root_task.id)
     if merge_unit is not None:
         for task in store.list_tasks_for_merge_unit(merge_unit.id):
-            if task.task_type == "review" and task.id is not None:
+            if task.id is not None and _review_counts_as_implementation_evidence(store, task):
                 reviews_by_id.setdefault(task.id, task)
 
     if reviews_by_id:

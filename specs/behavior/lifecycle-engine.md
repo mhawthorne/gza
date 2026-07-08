@@ -319,6 +319,11 @@ closed and be treated as changed.
   durable-progress epoch. The epoch resets only when persisted evidence shows a new
   reviewed head or other durable branch progress boundary; historical pre-boundary churn
   MUST NOT keep poisoning the lineage after that progress.
+- Review evidence for an implementation lineage MUST include direct implementation-linked
+  reviews, merge-unit-attached reviews, and review recovery descendants whose `based_on`
+  chain stays on the automatic review recovery path. A manual same-type follow-up on a
+  review MUST NOT silently count as review evidence for merge or closing-review
+  invariants.
 
 ### §5a — Pre-review verify gate
 
@@ -355,6 +360,12 @@ When a current review exists for the implementation lineage:
 - Verdict `APPROVED` and still valid for the current mergeable diff → if the current
   pre-merge verify gate is green, `merge`; otherwise lifecycle MUST route through the
   shared `verify_gate` / same-epoch `verify_fix` handling before merge.
+- A completed recovered review descendant that resolves to the current implementation
+  lineage counts as review evidence for this section and for the closing-review invariant
+  in §8. Once such a recovered review exists, lifecycle MUST route on its verdict or park
+  fail-closed; it MUST NOT keep selecting a fresh same-head `create_review` only because
+  the recovered row is linked through a failed review ancestor instead of directly to the
+  implementation root.
 - Verdict `APPROVED_WITH_FOLLOWUPS` with ≥1 parsed follow-up, review still valid →
   if the current pre-merge verify gate is green, `merge_with_followups` (create/reuse
   follow-up implement tasks, then merge); otherwise lifecycle MUST route through the
@@ -533,7 +544,12 @@ failure *and* actionable merge/review work remains eligible for the latter.
   invalidating that state → if the current pre-merge verify gate is green, `merge`;
   otherwise lifecycle MUST route through the shared `verify_gate` / same-epoch
   `verify_fix` handling before merge.
-- A non-implementation unit → `merge`.
+- The closing-review requirement after a newer completed code change is satisfied by any
+  follow-on review evidence for that implementation, including an eligible completed
+  review recovery descendant. Failed closing-review attempts do not satisfy the invariant,
+  and their bounded retry accounting MUST follow the same logical review recovery chain
+  rather than restarting from zero on each retry/resume descendant.
+- A non-implementation unit, or a unit that does not require review → `merge`.
 - For implementation-owned units whose review gate is enabled, merge eligibility remains
   the ordinary two-gate rule even after an approved review: automation MUST have both a
   merge-permitting current review verdict and current passing lifecycle-owned verify
