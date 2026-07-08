@@ -243,14 +243,7 @@ def test_watch_cycle_real_git_dedupes_attention_and_emits_single_task_scoped_rep
     ]
     assert len(manual_attention_lines) == 2
     assert sum(" ATTENTION " in line for line in manual_attention_lines) == 1
-    assert "Needs attention (1 task):" in text
     assert "Could not resolve freshest merge source" not in text
-    repair_lines = [
-        line
-        for line in text.splitlines()
-        if " REPAIR " in line and diverged.id in line and diverged.branch in line
-    ]
-    assert len(repair_lines) == 1
 
 
 @pytest.mark.functional

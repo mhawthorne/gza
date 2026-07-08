@@ -179,6 +179,58 @@ def test_format_iterate_terminal_merge_state_message_hides_pending_redundant_res
     )
 
 
+def test_format_iterate_terminal_merge_state_message_relabels_legacy_empty_with_commits_as_redundant(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Legacy empty implementation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.has_commits = True
+    store.update(task)
+
+    assert _format_iterate_terminal_merge_state_message(
+        store=store,
+        requested_impl_task=task,
+        iterate_task=task,
+        resolved_from_failed_ancestor=False,
+        merge_state="empty",
+    ) == (
+        "No remaining iterate action: "
+        f"implementation {task.id}'s commits are already present on target."
+    )
+
+
+def test_format_iterate_terminal_merge_state_message_keeps_empty_wording_for_failed_ancestor_descendant(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    requested = store.add("Failed implementation", task_type="implement")
+    assert requested.id is not None
+    requested.status = "failed"
+    store.update(requested)
+
+    descendant = store.add("Recovered implementation", task_type="implement", based_on=requested.id)
+    assert descendant.id is not None
+    descendant.status = "completed"
+    descendant.has_commits = True
+    store.update(descendant)
+
+    assert _format_iterate_terminal_merge_state_message(
+        store=store,
+        requested_impl_task=requested,
+        iterate_task=descendant,
+        resolved_from_failed_ancestor=True,
+        merge_state="empty",
+    ) == (
+        "No remaining iterate action: "
+        f"failed implementation {requested.id} was fully recovered by descendant "
+        f"{descendant.id} with no remaining commits to land."
+    )
+
+
 class TestDerivedTaskTagSelection:
     def test_selected_tag_override_for_derived_task_preserves_omission(self) -> None:
         args = argparse.Namespace(tags=None, all_tags=False)
@@ -10132,6 +10184,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
 
         with (
@@ -10195,6 +10248,7 @@ class TestIterateCommand:
         )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
 
         with (
@@ -10272,6 +10326,7 @@ class TestIterateCommand:
         mock_config = self._make_iterate_mock_config(tmp_path)
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else None
 
@@ -10351,6 +10406,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject", verify_command="uv run pytest tests/unit -q")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref in {impl.branch, "HEAD"} else None
         mock_git.worktree_add_existing.side_effect = lambda path, ref, detach=False: Path(path).mkdir(parents=True, exist_ok=True) or Path(path)
@@ -10460,6 +10516,7 @@ class TestIterateCommand:
         )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref in {impl.branch, "HEAD"} else None
         mock_git.worktree_add_existing.side_effect = (
@@ -11162,6 +11219,7 @@ class TestIterateCommand:
         config.review_verify_timeout_grace_seconds = 5.0
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = (
             lambda ref: "same-head" if isinstance(ref, str) and ref.startswith("task-") else "base-head" if ref == "main" else None
@@ -12179,6 +12237,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
@@ -12238,6 +12297,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -12329,6 +12389,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -12402,6 +12463,7 @@ class TestIterateCommand:
         mock_config = self._make_iterate_mock_config(tmp_path)
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
 
@@ -12491,6 +12553,7 @@ class TestIterateCommand:
         mock_config = self._make_iterate_mock_config(tmp_path)
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
 
@@ -12576,6 +12639,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -12633,6 +12697,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -12680,6 +12745,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -12734,6 +12800,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -12778,6 +12845,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
@@ -12840,6 +12908,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
 
         with (
@@ -12903,10 +12972,16 @@ class TestIterateCommand:
             background=False,
         )
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
         ):
             result = cmd_iterate(args)
         output = capsys.readouterr().out
@@ -12966,6 +13041,7 @@ class TestIterateCommand:
         )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "head-1" if ref == impl.branch else None
 
@@ -13067,6 +13143,7 @@ class TestIterateCommand:
         )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "improved-head" if ref == impl.branch else None
 
@@ -13141,10 +13218,16 @@ class TestIterateCommand:
             background=False,
         )
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
 
         with (
             patch("gza.cli.Config.load", return_value=mock_config),
             patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.db.Git", return_value=mock_git, create=True),
         ):
             result = cmd_iterate(args)
         output = capsys.readouterr().out
@@ -13263,6 +13346,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
 
         with (
@@ -13336,6 +13420,7 @@ class TestIterateCommand:
         )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
 
         with (
@@ -13985,6 +14070,7 @@ class TestIterateCommand:
         )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
 
         def fake_run_foreground(_config, task_id, resume=False, **kwargs):
@@ -14277,6 +14363,7 @@ class TestIterateCommand:
         )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
 
         with (
@@ -14625,6 +14712,7 @@ class TestIterateCommand:
         )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = (
             lambda ref: "same-head" if ref == "test-project/20260101-resume-mismatch" else "base-head" if ref == "main" else None
@@ -14730,6 +14818,7 @@ class TestIterateCommand:
         mock_config = self._make_iterate_mock_config(tmp_path)
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with (
@@ -14789,7 +14878,7 @@ class TestIterateCommand:
         assert f"No remaining iterate action: implementation {impl.id} is already merged." not in output
         assert f"[dry-run] Would iterate implementation {impl.id}" in output
 
-    def test_iterate_suppresses_when_off_target_remote_source_ref_is_merged(
+    def test_iterate_uses_persisted_merged_unit_without_remote_merge_probe(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         import argparse
@@ -14820,6 +14909,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "release"
+        mock_git.branch_exists.return_value = False
         mock_git.resolve_merge_source_ref.return_value = f"origin/{impl.branch}"
         mock_git.is_merged.return_value = True
         mock_git.can_merge.return_value = True
@@ -14833,11 +14923,11 @@ class TestIterateCommand:
 
         output = capsys.readouterr().out
         assert result == 0
-        mock_git.is_merged.assert_called_once_with(f"origin/{impl.branch}", "release")
-        assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
-        assert f"[dry-run] Would iterate implementation {impl.id}" not in output
+        mock_git.is_merged.assert_not_called()
+        assert f"[dry-run] Would iterate implementation {impl.id}" in output
+        assert "[dry-run] First next action: skip - SKIP: target implementation already merged (merge-unit-merged)" in output
 
-    def test_iterate_suppresses_legacy_impl_without_merge_unit_when_remote_source_ref_is_merged(
+    def test_iterate_remote_only_merge_probe_does_not_suppress_legacy_impl_without_merge_unit(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         import argparse
@@ -14868,6 +14958,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "release"
+        mock_git.branch_exists.return_value = False
         mock_git.resolve_merge_source_ref.return_value = f"origin/{impl.branch}"
         mock_git.is_merged.return_value = True
         mock_git.can_merge.return_value = True
@@ -14881,11 +14972,15 @@ class TestIterateCommand:
 
         output = capsys.readouterr().out
         assert result == 0
-        mock_git.is_merged.assert_called_once_with(f"origin/{impl.branch}", "release")
-        assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
-        assert f"[dry-run] Would iterate implementation {impl.id}" not in output
+        mock_git.is_merged.assert_not_called()
+        assert f"[dry-run] Would iterate implementation {impl.id}" in output
+        assert (
+            "[dry-run] First next action: needs_discussion - "
+            f"SKIP: fresh merge source for branch '{impl.branch}' is unavailable; "
+            "cannot auto-merge without a resolvable local source"
+        ) in output
 
-    def test_iterate_reconciles_stale_legacy_impl_when_current_target_git_proves_merged(
+    def test_iterate_remote_only_current_target_proof_keeps_legacy_impl_actionable(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         import argparse
@@ -14906,7 +15001,7 @@ class TestIterateCommand:
         args = argparse.Namespace(
             impl_task_id=impl.id,
             max_iterations=1,
-            dry_run=False,
+            dry_run=True,
             project_dir=tmp_path,
             no_docker=True,
             resume=False,
@@ -14936,13 +15031,16 @@ class TestIterateCommand:
 
         assert result == 0
         assert refreshed is not None
-        assert refreshed.merge_status == "merged"
-        assert unit is not None
-        assert unit.target_branch == "main"
-        assert unit.state == "merged"
-        assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
+        assert refreshed.merge_status == "unmerged"
+        assert unit is None
+        assert f"[dry-run] Would iterate implementation {impl.id}" in output
+        assert (
+            "[dry-run] First next action: needs_discussion - "
+            f"SKIP: fresh merge source for branch '{impl.branch}' is unavailable; "
+            "cannot auto-merge without a resolvable local source"
+        ) in output
 
-    def test_iterate_reconciles_resolved_completed_descendant_before_failed_ancestor_noop(
+    def test_iterate_remote_only_current_target_proof_does_not_hide_recovered_descendant(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         import argparse
@@ -14981,7 +15079,7 @@ class TestIterateCommand:
         args = argparse.Namespace(
             impl_task_id=failed_impl.id,
             max_iterations=1,
-            dry_run=False,
+            dry_run=True,
             project_dir=tmp_path,
             no_docker=True,
             resume=False,
@@ -15011,14 +15109,16 @@ class TestIterateCommand:
 
         assert result == 0
         assert refreshed is not None
-        assert unit is not None
-        assert unit.state == "merged"
+        assert refreshed.merge_status == "unmerged"
+        assert unit is None
+        assert f"[dry-run] Would iterate implementation {recovered_impl.id}" in output
         assert (
-            "No remaining iterate action: "
-            f"failed implementation {failed_impl.id} was fully recovered by merged descendant {recovered_impl.id}."
+            "[dry-run] First next action: needs_discussion - "
+            f"SKIP: fresh merge source for branch '{recovered_impl.branch}' is unavailable; "
+            "cannot auto-merge without a resolvable local source"
         ) in output
 
-    def test_iterate_suppresses_when_off_target_unmerged_merge_unit_is_merged(
+    def test_iterate_remote_only_merge_probe_does_not_suppress_off_target_unmerged_unit(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         import argparse
@@ -15049,6 +15149,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "release"
+        mock_git.branch_exists.return_value = False
         mock_git.resolve_merge_source_ref.return_value = f"origin/{impl.branch}"
         mock_git.is_merged.return_value = True
         mock_git.can_merge.return_value = True
@@ -15061,9 +15162,13 @@ class TestIterateCommand:
 
         output = capsys.readouterr().out
         assert result == 0
-        mock_git.is_merged.assert_called_once_with(f"origin/{impl.branch}", "release")
-        assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
-        assert f"[dry-run] Would iterate implementation {impl.id}" not in output
+        mock_git.is_merged.assert_not_called()
+        assert f"[dry-run] Would iterate implementation {impl.id}" in output
+        assert (
+            "[dry-run] First next action: needs_discussion - "
+            f"SKIP: fresh merge source for branch '{impl.branch}' is unavailable; "
+            "cannot auto-merge without a resolvable local source"
+        ) in output
 
     def test_iterate_suppresses_when_merge_unit_is_merged_for_current_target(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -15109,7 +15214,7 @@ class TestIterateCommand:
         assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
         assert f"[dry-run] Would iterate implementation {impl.id}" not in output
 
-    def test_iterate_suppresses_pending_impl_when_legacy_empty_merge_unit_stays_empty_for_current_target(
+    def test_iterate_suppresses_pending_impl_when_legacy_empty_merge_unit_is_redundant_for_current_target(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         import argparse
@@ -15144,6 +15249,7 @@ class TestIterateCommand:
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.resolve_fresh_merge_source.return_value = impl.branch
         mock_git.rev_parse_if_exists.side_effect = lambda ref: {
@@ -15169,8 +15275,7 @@ class TestIterateCommand:
         output = capsys.readouterr().out
         assert result == 0
         run_foreground.assert_not_called()
-        assert f"implementation {impl.id} has no remaining commits to land." in output
-        assert "commits are already present on target" not in output
+        assert f"implementation {impl.id}'s commits are already present on target." in output
 
     def test_iterate_suppresses_historical_prerequisite_unmerged_failure_once_reconciled_empty(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -15801,8 +15906,14 @@ class TestIterateCommand:
 
         args = argparse.Namespace(impl_task_id=impl.id, max_iterations=1, dry_run=False, project_dir=tmp_path, no_docker=True)
         mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.can_merge.return_value = True
         with patch("gza.cli.Config.load", return_value=mock_config), \
              patch("gza.cli.get_store", return_value=store), \
+             patch("gza.cli.Git", return_value=mock_git), \
+             patch("gza.db.Git", return_value=mock_git, create=True), \
              patch("gza.cli._create_review_task") as create_review, \
              patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground, \
              patch("gza.cli._create_improve_task") as create_improve:
@@ -15845,6 +15956,7 @@ class TestIterateCommand:
         mock_config = self._make_iterate_mock_config(tmp_path)
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with patch("gza.cli.Config.load", return_value=mock_config), \
@@ -15888,6 +16000,7 @@ class TestIterateCommand:
         mock_config = self._make_iterate_mock_config(tmp_path)
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with patch("gza.cli.Config.load", return_value=mock_config), \
@@ -15936,6 +16049,7 @@ class TestIterateCommand:
         mock_config = self._make_iterate_mock_config(tmp_path)
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with (
@@ -16451,7 +16565,7 @@ class TestIterateCommand:
         assert "Iterate blocked: task has no branch (no commits)" in output
         assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
 
-    def test_background_iterate_reconciles_already_merged_noop_before_spawn(
+    def test_background_iterate_remote_only_merge_probe_keeps_merge_ready_state_without_reconcile(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         import argparse
@@ -16513,13 +16627,12 @@ class TestIterateCommand:
         assert result == 0
         spawn_background.assert_not_called()
         assert refreshed is not None
-        assert refreshed.merge_status == "merged"
-        assert unit is not None
-        assert unit.state == "merged"
-        assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
+        assert refreshed.merge_status == "unmerged"
+        assert unit is None
+        assert f"No remaining iterate action: implementation {impl.id} is ready to merge." in output
         assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
 
-    def test_background_iterate_failed_retry_reconciles_already_merged_noop_before_spawn(
+    def test_background_iterate_failed_retry_remote_only_merge_probe_still_spawns_work(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         import argparse
@@ -16577,15 +16690,16 @@ class TestIterateCommand:
         output = capsys.readouterr().out
         refreshed = store.get(impl.id)
         unit = store.resolve_merge_unit_for_task(impl.id)
+        children = store.get_based_on_children(impl.id)
 
         assert result == 0
-        spawn_background.assert_not_called()
-        assert store.get_based_on_children(impl.id) == []
+        spawn_background.assert_called_once()
+        assert len(children) == 1
+        assert children[0].status == "pending"
         assert refreshed is not None
-        assert refreshed.merge_status == "merged"
-        assert unit is not None
-        assert unit.state == "merged"
-        assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
+        assert refreshed.merge_status == "unmerged"
+        assert unit is None
+        assert output == ""
         assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
 
     def test_background_iterate_failed_retry_git_preflight_failure_surfaces_before_spawn(
@@ -16701,6 +16815,7 @@ class TestIterateCommand:
         config.advance_create_reviews = True
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.resolve_fresh_merge_source.return_value = recovered_impl.branch
         mock_git.rev_parse_if_exists.side_effect = lambda ref: {
             recovered_impl.branch: "branch-tip-sha",
@@ -18630,6 +18745,7 @@ class TestIterateCommand:
         store.update(improve)
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         self._persist_current_green_verify(store, tmp_path, impl)
@@ -18719,6 +18835,7 @@ class TestIterateCommand:
         mock_config = self._make_iterate_mock_config(tmp_path)
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with (
@@ -18797,6 +18914,7 @@ class TestIterateCommand:
         mock_config = self._make_iterate_mock_config(tmp_path)
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with (
@@ -18899,6 +19017,7 @@ class TestIterateCommand:
         mock_config = self._make_iterate_mock_config(tmp_path)
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with (
@@ -19112,6 +19231,7 @@ class TestIterateCommand:
         )
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
 
         def fake_run_foreground(config, task_id, **kwargs):
             del config, kwargs
@@ -19213,6 +19333,7 @@ class TestIterateCommand:
         mock_config = self._make_iterate_mock_config(tmp_path)
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
         with patch("gza.cli.Config.load", return_value=mock_config), \
@@ -20823,6 +20944,9 @@ class TestIterateCommand:
         impl = self._make_completed_impl(store)
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.ref_exists.return_value = False
+        mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
         mock_git.can_merge.return_value = False
         engine_config = _AdvanceEngineConfigAdapter(
             project_dir=tmp_path,

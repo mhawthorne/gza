@@ -395,14 +395,11 @@ def skip_reason_for_landed_or_moot(
     local_branch_exists = git.branch_exists(task.branch)
     remote_branch_ref = f"origin/{task.branch}"
     remote_branch_exists = git.ref_exists(remote_branch_ref)
-    remote_target_ref: str | None = None
     if not local_branch_exists and not remote_branch_exists:
         return "missing branch cannot prove unresolved"
     if not local_branch_exists:
-        remote_target_candidate = f"origin/{target_branch}"
-        if not git.ref_exists(remote_target_candidate):
+        if not git.ref_exists(f"origin/{target_branch}"):
             return "missing branch cannot prove unresolved"
-        remote_target_ref = remote_target_candidate
     cohorts = build_branch_cohorts_for_tasks(store, [task])
     if not cohorts:
         return None
@@ -411,7 +408,6 @@ def skip_reason_for_landed_or_moot(
         cohorts,
         target_branch=target_branch,
         include_diff_stats=False,
-        remote_target_ref=remote_target_ref,
     )[0]
     if result.merge_status == "merged":
         return "already merged"

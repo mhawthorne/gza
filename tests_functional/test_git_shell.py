@@ -776,9 +776,14 @@ def test_real_git_remote_tracking_ref_unblocks_failed_rebase_after_later_approve
     ctx = resolve_advance_context(config, store, git, impl, "main")
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert ctx.can_merge is True
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_merge"
+    assert ctx.can_merge is False
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
+    assert action["description"] == (
+        f"SKIP: fresh merge source for branch '{branch}' is unavailable; "
+        "cannot auto-merge without a resolvable local source"
+    )
 
 
 def test_cleanup_worktree_for_branch_refuses_foreign_live_worktree_in_real_repo(tmp_path: Path) -> None:

@@ -161,98 +161,42 @@ def test_reconcile_branch_merge_truth_marks_proven_merged_zero_ahead_task_branch
     assert "marked merged" not in results[0].actions
 
 
-def test_reconcile_branch_merge_truth_stale_source_missing_multicommit_recorded_head_stays_unmerged(
+def test_reconcile_task_branch_merge_truth_missing_local_branch_ignores_remote_only_merge_proof(
     tmp_path,
 ):
     store = SqliteTaskStore(tmp_path / "test.db")
-    task = _completed_branch_task(store, "Task", "feature/false-redundant")
-    cohort = BranchCohort(
-        branch=task.branch,
-        tasks=(task,),
-        merge_unit_id="gza-mu-563",
-        merge_unit_state="redundant",
-        merge_unit_head_sha="recorded-head-tip-sha",
-    )
+    task = _completed_branch_task(store, "Task", "feature/remote-only-proof")
+    assert task.id is not None
 
     git = Mock()
     git.branch_exists.return_value = False
-    git.ref_exists.return_value = True
-    git.is_merged.return_value = True
-    git.count_commits_ahead_checked.return_value = 0
-    git.is_on_first_parent_history.return_value = True
-    git.is_ancestor.return_value = False
-    git.has_non_empty_source_diff_against_target.return_value = False
-    # The recorded head covers multiple commits; target only has the tip patch,
-    # so the shared helper reports the range as not fully represented.
-    git.is_patch_equivalent_commit_present_on_target.return_value = False
-    git.resolve_refs.side_effect = lambda refs, peel="commit": {
-        "origin/feature/false-redundant": "shared-tree-sha" if peel == "tree" else "base-sha",
-        "main": "shared-tree-sha" if peel == "tree" else "target-sha",
-        "origin/main": "shared-tree-sha" if peel == "tree" else "target-sha",
-    }
+    git.ref_exists.side_effect = lambda ref: ref in {"origin/main", "origin/feature/remote-only-proof"}
+    git.is_merged.side_effect = lambda branch, into: True
     git.rev_parse_if_exists.side_effect = lambda ref: {
-        "origin/feature/false-redundant": "base-sha",
-        "main": "target-sha",
-        "origin/main": "target-sha",
+        "main": "local-target-sha",
     }.get(ref)
 
-    results = reconcile_branch_merge_truth(
+    result = reconcile_task_branch_merge_truth(
+        store,
         git,
-        [cohort],
+        task.id,
         target_branch="main",
         include_diff_stats=True,
         remote_target_ref="origin/main",
+        persist=True,
     )
 
-    assert results[0].merge_status == "unmerged"
-    assert "marked merged" not in results[0].actions
-
-
-def test_reconcile_branch_merge_truth_stale_source_missing_multicommit_recorded_head_stays_redundant_when_all_patches_are_already_on_target(
-    tmp_path,
-):
-    store = SqliteTaskStore(tmp_path / "test.db")
-    task = _completed_branch_task(store, "Task", "feature/redundant")
-    cohort = BranchCohort(
-        branch=task.branch,
-        tasks=(task,),
-        merge_unit_id="gza-mu-564",
-        merge_unit_state="redundant",
-        merge_unit_head_sha="recorded-head-tip-sha",
-    )
-
-    git = Mock()
-    git.branch_exists.return_value = False
-    git.ref_exists.return_value = True
-    git.is_merged.return_value = True
-    git.count_commits_ahead_checked.return_value = 0
-    git.is_on_first_parent_history.return_value = True
-    git.is_ancestor.return_value = False
-    git.has_non_empty_source_diff_against_target.return_value = False
-    # The stale source ref points at an ancestor, but every recorded-head patch
-    # is already present on target via patch equivalence.
-    git.is_patch_equivalent_commit_present_on_target.return_value = True
-    git.resolve_refs.side_effect = lambda refs, peel="commit": {
-        "origin/feature/redundant": "shared-tree-sha" if peel == "tree" else "base-sha",
-        "main": "shared-tree-sha" if peel == "tree" else "target-sha",
-        "origin/main": "shared-tree-sha" if peel == "tree" else "target-sha",
-    }
-    git.rev_parse_if_exists.side_effect = lambda ref: {
-        "origin/feature/redundant": "base-sha",
-        "main": "target-sha",
-        "origin/main": "target-sha",
-    }.get(ref)
-
-    results = reconcile_branch_merge_truth(
-        git,
-        [cohort],
-        target_branch="main",
-        include_diff_stats=True,
-        remote_target_ref="origin/main",
-    )
-
-    assert results[0].merge_status == "redundant"
-    assert "marked merged" not in results[0].actions
+    assert result.merge_status == "unmerged"
+    assert any("ignoring remote-only merge proof" in warning for warning in result.warnings)
+    git.is_merged.assert_not_called()
+    git.count_commits_ahead_checked.assert_not_called()
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    assert unit.state == "unmerged"
+    assert unit.base_sha == "local-target-sha"
 
 
 def test_reconcile_branch_merge_truth_marks_redundant_when_side_branch_probe_fails(tmp_path):
@@ -355,6 +299,40 @@ def test_reconcile_branch_merge_truth_keeps_zero_ahead_branch_with_live_net_diff
 
     assert results[0].merge_status == "unmerged"
     assert "marked merged" not in results[0].actions
+
+
+def test_reconcile_branch_merge_truth_missing_local_branch_preserves_no_work_state_without_remote_proof(
+    tmp_path,
+):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/remote-only-no-work")
+    cohort = BranchCohort(
+        branch=task.branch,
+        tasks=(task,),
+        merge_unit_id="gza-mu-remote-only-no-work",
+        merge_unit_state="redundant",
+    )
+
+    git = Mock()
+    git.branch_exists.return_value = False
+    git.ref_exists.side_effect = lambda ref: ref == "origin/feature/remote-only-no-work"
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "main": "local-target-tip-sha",
+    }.get(ref)
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=False,
+        remote_target_ref="origin/main",
+    )
+
+    assert results[0].merge_status == "redundant"
+    assert any("ignoring remote-only merge proof" in warning for warning in results[0].warnings)
+    git.is_merged.assert_not_called()
+    git.count_commits_ahead_checked.assert_not_called()
+    assert "origin/main" not in {call.args[0] for call in git.rev_parse_if_exists.call_args_list}
 
 
 def test_reconcile_task_branch_merge_truth_skips_no_commit_task_before_merged_persistence(
@@ -467,7 +445,8 @@ def test_reconcile_branch_merge_truth_preserves_recorded_merge_when_remote_targe
     assert results[0].merge_status == "merged"
     assert "marked merged" not in results[0].actions
     assert results[0].diff_files_changed == 1
-    git.is_merged.assert_called_once_with("feature/local-merged-remote-lag", into="origin/main")
+    assert any("ignoring remote merge-proof target" in warning for warning in results[0].warnings)
+    git.is_merged.assert_called_once_with("feature/local-merged-remote-lag", into="main")
 
 
 def test_reconcile_task_branch_merge_truth_persists_branch_state(tmp_path):
@@ -664,7 +643,7 @@ def test_reconcile_task_branch_merge_truth_persists_redundant_for_zero_commit_ta
     assert unit.base_sha == "base-sync-empty"
 
 
-def test_reconcile_task_branch_merge_truth_uses_remote_target_ref_for_merge_proof_but_persists_canonical_target(
+def test_reconcile_task_branch_merge_truth_ignores_remote_target_ref_for_local_merge_proof(
     tmp_path,
 ):
     store = SqliteTaskStore(tmp_path / "test.db")
@@ -681,52 +660,6 @@ def test_reconcile_task_branch_merge_truth_uses_remote_target_ref_for_merge_proo
     git.is_merged.side_effect = _is_merged
     git.rev_parse_if_exists.side_effect = lambda ref: {
         "feature/scoped-remote-proof": "head-remote-proof",
-        "origin/main": "base-origin-proof",
-        "main": "base-local-stale",
-    }.get(ref)
-
-    result = reconcile_task_branch_merge_truth(
-        store,
-        git,
-        task.id,
-        target_branch="main",
-        remote_target_ref="origin/main",
-        include_diff_stats=True,
-        persist=True,
-    )
-
-    assert result.merge_status == "merged"
-    git.is_merged.assert_called_once_with("feature/scoped-remote-proof", into="origin/main")
-
-    refreshed = store.get(task.id)
-    assert refreshed is not None
-    assert refreshed.merge_status == "merged"
-
-    unit = store.resolve_merge_unit_for_task(task.id)
-    assert unit is not None
-    assert unit.state == "merged"
-    assert unit.target_branch == "main"
-    assert unit.base_sha == "base-origin-proof"
-
-
-def test_reconcile_task_branch_merge_truth_remote_proof_does_not_accept_stale_local_target(
-    tmp_path,
-):
-    store = SqliteTaskStore(tmp_path / "test.db")
-    task = _completed_branch_task(store, "Task", "feature/scoped-remote-false-positive")
-    assert task.id is not None
-
-    git = Mock()
-    git.branch_exists.return_value = True
-    git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
-
-    def _is_merged(branch, into):
-        return into == "main"
-
-    git.is_merged.side_effect = _is_merged
-    git.rev_parse_if_exists.side_effect = lambda ref: {
-        "feature/scoped-remote-false-positive": "head-remote-false-positive",
-        "origin/main": "base-origin-proof",
         "main": "base-local-stale",
     }.get(ref)
 
@@ -741,7 +674,9 @@ def test_reconcile_task_branch_merge_truth_remote_proof_does_not_accept_stale_lo
     )
 
     assert result.merge_status == "unmerged"
-    git.is_merged.assert_called_once_with("feature/scoped-remote-false-positive", into="origin/main")
+    assert any("ignoring remote merge-proof target" in warning for warning in result.warnings)
+    git.is_merged.assert_called_once_with("feature/scoped-remote-proof", into="main")
+    assert "origin/main" not in {call.args[0] for call in git.rev_parse_if_exists.call_args_list}
 
     refreshed = store.get(task.id)
     assert refreshed is not None
@@ -751,7 +686,7 @@ def test_reconcile_task_branch_merge_truth_remote_proof_does_not_accept_stale_lo
     assert unit is not None
     assert unit.state == "unmerged"
     assert unit.target_branch == "main"
-    assert unit.base_sha == "base-origin-proof"
+    assert unit.base_sha == "base-local-stale"
 
 
 def test_reconcile_task_branch_merge_truth_persisted_local_proof_does_not_downgrade_merged(
@@ -861,7 +796,7 @@ def test_sync_branch_cohorts_marks_only_owner_row_merged_for_same_branch_improve
     git.ref_exists.return_value = True
     git.branch_exists.return_value = True
     git.get_diff_numstat.return_value = ""
-    git.is_merged.side_effect = lambda branch, into: into == "origin/main"
+    git.is_merged.side_effect = lambda branch, into: into == "main"
 
     results, partial = sync_branch_cohorts(
         store,
@@ -885,7 +820,7 @@ def test_sync_branch_cohorts_marks_only_owner_row_merged_for_same_branch_improve
     assert refreshed_child.merged_at is None
 
 
-def test_sync_branch_cohorts_marks_merged_when_origin_default_ref_proves_remote_merge(tmp_path):
+def test_sync_branch_cohorts_does_not_mark_merged_when_only_origin_default_ref_would_prove_merge(tmp_path):
     store = SqliteTaskStore(tmp_path / "test.db")
     task = _completed_branch_task(store, "Task with remote-only merge", "feature/remote-only-merge")
 
@@ -911,11 +846,11 @@ def test_sync_branch_cohorts_marks_merged_when_origin_default_ref_proves_remote_
     )
 
     assert partial is False
-    assert results[0].merge_status == "merged"
-    assert "marked merged" in results[0].actions
+    assert results[0].merge_status == "unmerged"
+    assert "marked merged" not in results[0].actions
     refreshed = store.get(task.id)
     assert refreshed is not None
-    assert refreshed.merge_status == "merged"
+    assert refreshed.merge_status == "unmerged"
 
 
 def test_sync_branch_cohorts_does_not_downgrade_merged_when_origin_default_ref_lags(tmp_path):
@@ -1017,7 +952,8 @@ def test_reconcile_task_branch_merge_truth_preserves_existing_base_sha_on_partia
     assert refreshed_unit.head_sha == "head-new-789"
     assert refreshed_unit.base_sha == "base-old-456"
     assert result.warnings == [
-        "degraded merge-unit provenance: could not resolve base SHA for 'main'; preserving any stored base_sha"
+        "degraded merge-unit provenance: could not resolve base SHA for 'main'; preserving any stored base_sha",
+        "branch 'feature/partial-provenance': could not determine unique commit count against 'main'; preserving existing merge state",
     ]
 
 
@@ -1293,7 +1229,7 @@ def test_sync_branch_cohorts_no_fetch_ignores_cached_origin_default_ref_by_defau
     assert refreshed.merge_status == "unmerged"
 
 
-def test_sync_branch_cohorts_missing_local_branch_uses_remote_feature_ref_before_marking_merged(tmp_path):
+def test_sync_branch_cohorts_missing_local_branch_does_not_use_remote_feature_ref_for_merge_proof(tmp_path):
     store = SqliteTaskStore(tmp_path / "test.db")
     task = _completed_branch_task(store, "Task with deleted local branch", "feature/remote-survivor")
 
@@ -1321,7 +1257,7 @@ def test_sync_branch_cohorts_missing_local_branch_uses_remote_feature_ref_before
     assert partial is False
     assert results[0].merge_status == "unmerged"
     assert "marked merged" not in results[0].actions
-    git.is_merged.assert_called_once_with("origin/feature/remote-survivor", into="origin/main")
+    git.is_merged.assert_not_called()
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.merge_status == "unmerged"

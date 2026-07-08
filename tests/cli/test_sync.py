@@ -105,7 +105,7 @@ def test_sync_without_task_ids_uses_default_branch_cohort_builder(tmp_path, caps
     assert "feature/default-sync" in output
 
 
-def test_sync_git_only_reports_merged_when_origin_default_ref_proves_remote_merge(tmp_path, capsys):
+def test_sync_git_only_does_not_report_merged_when_only_origin_default_ref_would_prove_merge(tmp_path, capsys):
     setup_config(tmp_path)
     store = make_store(tmp_path)
     task = _completed_branch_task(store, "Remote-only merge", "feature/remote-only-merge")
@@ -140,10 +140,10 @@ def test_sync_git_only_reports_merged_when_origin_default_ref_proves_remote_merg
     assert rc == 0
     refreshed = store.get(task.id)
     assert refreshed is not None
-    assert refreshed.merge_status == "merged"
+    assert refreshed.merge_status == "unmerged"
     output = capsys.readouterr().out
-    assert "feature/remote-only-merge | merge=merged" in output
-    assert "marked merged" in output
+    assert "feature/remote-only-merge | merge=unmerged" in output
+    assert "marked merged" not in output
 
 
 def test_sync_no_fetch_does_not_use_cached_origin_default_ref_as_merge_proof(tmp_path, capsys):

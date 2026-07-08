@@ -46,6 +46,9 @@ def _advance_args(tmp_path: Path, **overrides) -> argparse.Namespace:
 def _mock_git(*, current_branch: str = "main", can_merge: bool = True) -> Mock:
     git = Mock()
     git.current_branch.return_value = current_branch
+    git.local_branch_names.return_value = ()
+    git.branch_exists.return_value = True
+    git.ref_exists.return_value = False
     git.can_merge.return_value = can_merge
     return git
 
@@ -875,7 +878,7 @@ def test_advance_explicit_impl_reports_already_merged_when_branch_is_reachable_b
     assert "Would advance" not in captured.out
 
 
-def test_advance_explicit_impl_prefers_fresh_remote_over_stale_legacy_local_ref(
+def test_advance_explicit_impl_remote_only_fresh_ref_no_longer_proves_merged(
     tmp_path: Path,
     capsys,
 ) -> None:
@@ -912,7 +915,7 @@ def test_advance_explicit_impl_prefers_fresh_remote_over_stale_legacy_local_ref(
 
     captured = capsys.readouterr()
     assert rc == 0
-    assert f"Task {impl.id} is already merged" in captured.out
+    assert f'{impl.id} implement "Implement feature" reason=resolution-review-metadata-invalid required resolution-review metadata is missing or malformed' in captured.out
     assert "Would advance" not in captured.out
 
 

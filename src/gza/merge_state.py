@@ -30,6 +30,13 @@ class BranchMergeClassification:
 logger = logging.getLogger(__name__)
 
 
+def is_local_merge_proof_ref(ref: str | None, branch: str) -> bool:
+    """Return whether ``ref`` is an admissible local lifecycle proof ref for ``branch``."""
+    if not ref:
+        return False
+    return ref == branch or ref == f"refs/heads/{branch}"
+
+
 def effective_no_work_merge_state(task: DbTask, raw_state: str | None) -> str | None:
     """Return the operator-effective no-work state for legacy empty rows."""
     if raw_state == "empty" and task.has_commits is True:
@@ -336,16 +343,71 @@ def _terminal_source_ref_head_guard(
 
 
 def resolve_task_merge_source(git: Any, branch: str) -> ResolvedMergeSourceRef:
-    """Return the freshest merge source ref available for a branch."""
+    """Return a local merge source ref available for a branch."""
+    branch_exists = getattr(git, "branch_exists", None)
+
+    def _local_branch_ref() -> ResolvedMergeSourceRef | None:
+        if callable(branch_exists) and branch_exists(branch) is True:
+            return ResolvedMergeSourceRef(branch)
+        return None
+
+    def _is_remote_tracking_warning(warning: str | None) -> bool:
+        if warning is None:
+            return False
+        return "remote-tracking ref" in warning or "refs/remotes/" in warning or "remotes/" in warning
+
+    def _normalize_local_ref(resolved_ref: str | None) -> ResolvedMergeSourceRef | None:
+        if resolved_ref is None:
+            return ResolvedMergeSourceRef(None)
+        if resolved_ref == branch:
+            local_branch_ref = _local_branch_ref()
+            if local_branch_ref is not None:
+                return local_branch_ref
+            if callable(branch_exists):
+                return ResolvedMergeSourceRef(None)
+            return ResolvedMergeSourceRef(branch)
+        if resolved_ref.startswith(("refs/remotes/", "remotes/")):
+            return ResolvedMergeSourceRef(None)
+        if resolved_ref == f"refs/heads/{branch}":
+            ref_exists = getattr(git, "ref_exists", None)
+            if callable(ref_exists) and ref_exists(resolved_ref) is True:
+                return ResolvedMergeSourceRef(resolved_ref)
+            if callable(ref_exists):
+                return ResolvedMergeSourceRef(None)
+            return ResolvedMergeSourceRef(resolved_ref)
+        if callable(branch_exists):
+            return ResolvedMergeSourceRef(None)
+        ref_exists = getattr(git, "ref_exists", None)
+        if callable(ref_exists):
+            return ResolvedMergeSourceRef(None)
+        return ResolvedMergeSourceRef(None)
+
+    local_branch_ref = _local_branch_ref()
+    if local_branch_ref is not None:
+        return local_branch_ref
+
     resolve_fresh = getattr(git, "resolve_fresh_merge_source", None)
     if callable(resolve_fresh):
         resolved = resolve_fresh(branch)
         if isinstance(resolved, ResolvedMergeSourceRef):
-            return resolved
+            normalized = _normalize_local_ref(resolved.ref)
+            if normalized is not None:
+                warning = None if _is_remote_tracking_warning(resolved.warning) else resolved.warning
+                return ResolvedMergeSourceRef(normalized.ref, warning)
+            warning = None if _is_remote_tracking_warning(resolved.warning) else resolved.warning
+            return ResolvedMergeSourceRef(None, warning)
         if isinstance(resolved, tuple) and len(resolved) == 2:
-            return ResolvedMergeSourceRef(resolved[0], resolved[1])
+            normalized = _normalize_local_ref(resolved[0])
+            if normalized is not None:
+                warning = None if _is_remote_tracking_warning(resolved[1]) else resolved[1]
+                return ResolvedMergeSourceRef(normalized.ref, warning)
+            warning = None if _is_remote_tracking_warning(resolved[1]) else resolved[1]
+            return ResolvedMergeSourceRef(None, warning)
         if isinstance(resolved, str):
-            return ResolvedMergeSourceRef(resolved)
+            normalized = _normalize_local_ref(resolved)
+            if normalized is not None:
+                return normalized
+            return ResolvedMergeSourceRef(None)
         if resolved is None:
             return ResolvedMergeSourceRef(None)
 
@@ -353,30 +415,28 @@ def resolve_task_merge_source(git: Any, branch: str) -> ResolvedMergeSourceRef:
     if callable(resolve_fresh_ref):
         resolved_ref = resolve_fresh_ref(branch)
         if isinstance(resolved_ref, str) or resolved_ref is None:
-            return ResolvedMergeSourceRef(resolved_ref)
+            normalized = _normalize_local_ref(resolved_ref)
+            if normalized is not None:
+                return normalized
+            return ResolvedMergeSourceRef(None)
 
     resolve_merge_source_ref = getattr(git, "resolve_merge_source_ref", None)
     if callable(resolve_merge_source_ref):
         resolved_ref = resolve_merge_source_ref(branch)
         if isinstance(resolved_ref, str) or resolved_ref is None:
-            return ResolvedMergeSourceRef(resolved_ref)
+            normalized = _normalize_local_ref(resolved_ref)
+            if normalized is not None:
+                return normalized
+            return ResolvedMergeSourceRef(None)
 
-    remote_ref = f"origin/{branch}"
-    ref_exists = getattr(git, "ref_exists", None)
-    if callable(ref_exists) and ref_exists(remote_ref):
-        return ResolvedMergeSourceRef(remote_ref)
-
-    branch_exists = getattr(git, "branch_exists", None)
-    if callable(branch_exists) and branch_exists(branch):
-        return ResolvedMergeSourceRef(branch)
-
-    return ResolvedMergeSourceRef(branch)
+    return ResolvedMergeSourceRef(None)
 
 
 def classify_branch_merge_state_for_target(
     *,
     git: Any,
     source_branch: str | None,
+    source_ref: str | None = None,
     target_branch: str,
     persisted_state: str | None = None,
     merged_proof: bool | None = None,
@@ -386,7 +446,8 @@ def classify_branch_merge_state_for_target(
 ) -> BranchMergeClassification:
     """Classify branch merge truth relative to ``target_branch``."""
 
-    source_ref = resolve_task_merge_source(git, source_branch).ref if source_branch else None
+    if source_ref is None and source_branch:
+        source_ref = resolve_task_merge_source(git, source_branch).ref
     source_resolution = resolve_ref_if_possible(git, source_ref)
     target_resolution = resolve_ref_if_possible(git, target_branch)
     source_sha = source_resolution.sha

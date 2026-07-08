@@ -14,7 +14,7 @@ import gza.recovery_engine as recovery_engine
 from gza import dependency_preconditions as dependency_preconditions_module
 from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.config import Config
-from gza.db import SqliteTaskStore
+from gza.db import MergeUnit, SqliteTaskStore
 from gza.dispatch_preview import DispatchPreview
 from gza.git import Git, GitError, ResolvedMergeSourceRef
 from gza.lineage_query import (
@@ -119,6 +119,65 @@ def _persist_current_green_verify(
         verify_timeout_grace_seconds=5.0,
         producer="test",
     )
+
+
+class _ExplodingLineageGit:
+    def __init__(self) -> None:
+        self.is_ancestor_calls = 0
+
+    def is_ancestor(self, _ancestor: str, _descendant: str) -> bool:
+        self.is_ancestor_calls += 1
+        raise AssertionError("terminal merged failed leaf should not hit git ancestry probes")
+
+
+def test_failed_leaf_with_terminal_merged_unit_skips_live_git_proof(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    owner = store.add("Merged owner", task_type="implement")
+    owner.status = "completed"
+    owner.completed_at = datetime(2026, 5, 20, 9, 0, tzinfo=UTC)
+    owner.branch = "feature/owner"
+    owner.has_commits = True
+    store.update(owner)
+    assert owner.id is not None
+
+    failed = store.add("Failed leaf", task_type="implement", based_on=owner.id, recovery_origin="manual")
+    failed.status = "failed"
+    failed.completed_at = datetime(2026, 5, 21, 9, 0, tzinfo=UTC)
+    failed.branch = "feature/failed-leaf"
+    failed.has_commits = True
+    store.update(failed)
+    assert failed.id is not None
+
+    owner_merge_unit: MergeUnit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    leaf_merge_unit: MergeUnit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="merged",
+    )
+    store.refresh_merge_unit_head(leaf_merge_unit.id, head_sha="missing-recorded-head")
+
+    git = _ExplodingLineageGit()
+    with caplog.at_level("WARNING"):
+        visible = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+            failed_task=failed,
+            owner_merge_unit=owner_merge_unit,
+            leaf_merge_unit=store.get_merge_unit(leaf_merge_unit.id),
+            git=git,  # type: ignore[arg-type]
+        )
+
+    assert visible is False
+    assert git.is_ancestor_calls == 0
+    assert caplog.text == ""
 
 
 class _LineageMergeStateGit:
@@ -297,6 +356,7 @@ def test_query_lineage_owner_rows_tag_filter_keeps_merge_unit_representative(tmp
     config.autonomous_verify_timeout_seconds = 120
     config.review_verify_timeout_grace_seconds = 5.0
     git = MagicMock()
+    git.branch_exists.return_value = True
     git.can_merge.return_value = True
     git.rev_parse_if_exists.side_effect = (
         lambda ref: "same-head" if ref == "feature/tag-filtered-merge-unit" else "target-sha" if ref == "main" else None
@@ -588,6 +648,7 @@ def test_query_lineage_owner_rows_without_tag_filter_keeps_merge_unit_representa
     config.autonomous_verify_timeout_seconds = 120
     config.review_verify_timeout_grace_seconds = 5.0
     git = MagicMock()
+    git.branch_exists.return_value = True
     git.can_merge.return_value = True
     git.rev_parse_if_exists.side_effect = (
         lambda ref: "same-head" if ref == "feature/tag-filtered-merge-unit" else "target-sha" if ref == "main" else None
@@ -789,6 +850,7 @@ def test_query_lineage_owner_rows_task_id_filter_keeps_skipped_same_branch_manua
     store.update(unrelated_owner)
 
     git = MagicMock()
+    git.branch_exists.return_value = True
     git.can_merge.return_value = True
 
     unfiltered_rows = query_lineage_owner_rows(
@@ -1068,6 +1130,7 @@ def test_query_lineage_owner_rows_completed_explore_without_followup_needs_atten
     store.update(explore)
 
     git = MagicMock()
+    git.branch_exists.return_value = True
     git.can_merge.return_value = True
 
     rows = query_lineage_owner_rows(
@@ -1117,6 +1180,7 @@ def test_query_lineage_owner_rows_surfaces_strict_scope_violation_paths(tmp_path
     store.update(impl)
 
     git = MagicMock()
+    git.branch_exists.return_value = True
     git.can_merge.return_value = True
     git.get_diff_name_status.return_value = "M\tservices/foo/app.py\nM\tdre/web/src/app.tsx\n"
 
@@ -1692,6 +1756,7 @@ def test_query_lineage_owner_rows_prefers_impl_branch_over_orphan_rebase_owner(t
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = (
         lambda ref: "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
     )
@@ -1807,6 +1872,7 @@ def test_query_lineage_owner_rows_excludes_orphan_rebase_descendant_from_actiona
 
     git = MagicMock()
     git.can_merge.return_value = False
+    git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = (
         lambda ref: "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
     )
@@ -1870,6 +1936,7 @@ def test_query_lineage_owner_rows_planning_excludes_dropped_descendant_rebase(tm
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = (
         lambda ref: "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
     )
@@ -2334,6 +2401,7 @@ def test_query_lineage_owner_rows_keeps_legitimate_impl_branch_rebase_descendant
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = (
         lambda ref: "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
     )
@@ -2387,6 +2455,7 @@ def test_query_lineage_owner_rows_planning_keeps_completed_and_failed_live_tasks
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = (
         lambda ref: "same-head" if ref == "feature/completed-live" else "base-head" if ref == "main" else None
     )
@@ -2515,6 +2584,7 @@ def test_query_lineage_owner_rows_mergeable_behind_branch_projects_normal_action
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = (
         lambda ref: "same-head" if ref == "feature/stale-lineage" else "base-head" if ref == "main" else None
     )
@@ -2572,6 +2642,7 @@ def test_query_lineage_owner_rows_projects_merge_for_approved_behind_branch(tmp_
 
     git = MagicMock()
     git.can_merge.return_value = True
+    git.branch_exists.return_value = True
     git.rev_parse_if_exists.side_effect = (
         lambda ref: "same-head" if ref == "feature/approved-stale-lineage" else "base-head" if ref == "main" else None
     )
@@ -3964,6 +4035,7 @@ def test_query_lineage_owner_rows_hides_empty_failed_owner_resolved_by_landed_si
         if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
     }
     assert failed.id not in failed_leaf_ids
+    assert not any(f"{failed.branch}->main" in probe for _kind, probe in git.probes)
 
 
 @pytest.mark.parametrize(
@@ -4810,6 +4882,7 @@ def test_query_lineage_owner_rows_keeps_auto_refreshable_stale_review_out_of_att
     git.default_branch.return_value = "main"
     git.current_branch.return_value = "topic"
     git.can_merge.return_value = True
+    git.branch_exists.return_value = True
     git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(impl.branch)
     git.rev_parse_if_exists.side_effect = lambda ref: "current-sha" if ref == impl.branch else None
     _persist_current_green_verify(store, config, owner_task=impl, source_task=improve, head_sha="current-sha")

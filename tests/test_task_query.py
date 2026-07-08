@@ -1883,6 +1883,7 @@ def test_incomplete_projection_uses_review_flow_for_mergeable_behind_branch(tmp_
         TaskQueryPresets.incomplete(limit=None),
         config=config,
         git=SimpleNamespace(
+            branch_exists=lambda branch: branch == impl.branch,
             can_merge=lambda source, target: True,
             is_merged=lambda source, target: False,
             resolve_fresh_merge_source=lambda branch: ("origin/feature/stale-projection", None),
@@ -1941,6 +1942,7 @@ def test_incomplete_projection_uses_merge_flow_for_approved_behind_branch(tmp_pa
         TaskQueryPresets.incomplete(limit=None),
         config=config,
         git=SimpleNamespace(
+            branch_exists=lambda branch: branch == impl.branch,
             can_merge=lambda source, target: True,
             is_merged=lambda source, target: False,
             resolve_fresh_merge_source=lambda branch: (

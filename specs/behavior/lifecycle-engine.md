@@ -197,10 +197,15 @@ Conflict is decided against the canonical local target (see
   `needs_rebase` when an active rebase child already exists, while non-singleton fan-out
   such as follow-up `implement` children and comments-only `improve` refreshes remains
   allowed.
-- A selected-for-merge branch that cannot merge, has no rebase child, and does not
-  already contain the local target tip → create a `rebase` task (`needs_rebase`). The
-  action's machine-readable reason slug MUST distinguish this merge-lane path from the
-  recovery-preflight path; `merge-selection-conflict-rebase` is the canonical slug.
+- A selected-for-merge branch that cannot merge, has no rebase child, does not already
+  contain the local target tip, and still has a resolvable local merge source →
+  create a `rebase` task (`needs_rebase`). The action's machine-readable reason slug
+  MUST distinguish this merge-lane path from the recovery-preflight path;
+  `merge-selection-conflict-rebase` is the canonical slug.
+- If a selected-for-merge branch lacks any resolvable local merge source while persisted
+  merge state is still non-terminal, lifecycle MUST fail closed with `needs_discussion`
+  (`merge-source-needs-manual-resolution`) instead of planning or continuing rebase
+  automation from a remote-only/deleted source ref.
 - A recovery-preflight rebase MUST remain lifecycle-owned around recovery policy. When
   recovery would otherwise choose `resume` or `retry`, but the branch does not contain the
   local target tip, lifecycle MUST emit `needs_rebase` first instead of spawning the
@@ -209,15 +214,20 @@ Conflict is decided against the canonical local target (see
   action to resume on the next pass. Recovery policy owns deciding **whether** the failed
   task is recoverable; lifecycle owns this local-target rebase preflight around that
   policy decision.
-- Local branch and `origin/<branch>` have diverged → reconcile publication host-side.
-  The engine MAY inspect, fetch, and publish the unit's own `origin/<branch>` ref to
-  decide whether the local side is strictly ahead, patch-equivalent, or otherwise safe to
-  republish. But merge/rebase correctness MUST still be proven against the canonical
-  local target branch, never any `origin/*` ref: if direct publication is not enough, the
-  mechanical fallback MUST rebase onto that local target branch and then publish. A
-  genuine host-side conflict in that local-target rebase MUST be parked as
-  `needs_discussion`, **not** delegated to a sandboxed rebase task — task sandboxes
-  cannot reach remote-tracking refs, and worker rebase targets MUST stay local.
+- Lifecycle merge-source proof MUST use confirmed local refs only. If the implementation
+  branch exists locally, that branch is the merge source for advance/watch mergeability,
+  diff/spec gates, already-merged checks, and merge execution. Remote-only or divergent
+  `origin/<branch>` state MUST NOT count as merge-source proof.
+- Local branch and `origin/<branch>` have diverged during explicit host-side publication
+  reconcile → reconcile publication host-side. The engine MAY inspect, fetch, and publish
+  the unit's own `origin/<branch>` ref to decide whether the local side is strictly
+  ahead, patch-equivalent, or otherwise safe to republish. But merge/rebase correctness
+  MUST still be proven against the canonical local target branch, never any `origin/*`
+  ref: if direct publication is not enough, the mechanical fallback MUST rebase onto that
+  local target branch and then publish. A genuine host-side conflict in that local-target
+  rebase MUST be parked as `needs_discussion`, **not** delegated to a sandboxed rebase
+  task — task sandboxes cannot reach remote-tracking refs, and worker rebase targets MUST
+  stay local.
 - Branch cannot merge AND the latest rebase child `failed`, with no later proof the work
   landed, AND shared recovery classification says the failure is manual (for example a
   real `REBASE_CONFLICT`) → `needs_discussion` (rebase-failed). The proof set is
@@ -316,6 +326,11 @@ Before lifecycle creates a first review or refreshes a stale review for an imple
 owner, it MUST evaluate the runner-owned verify gate for that owner's current verify
 epoch.
 
+- If the current implementation lineage has no resolvable local merge source (`merge_source_ref`
+  is absent, there is no explicit merge-source warning, and persisted merge state is not
+  terminal), lifecycle MUST fail closed with `needs_discussion`
+  (`merge-source-needs-manual-resolution`) before any pre-review `verify_gate`,
+  `create_review`, or `run_review` automation.
 - Missing or stale verify evidence for the current owner epoch MUST select `verify_gate`
   first. Lifecycle MUST rerun verify before it creates a review for that head.
 - Current red verify evidence before review MUST route into the `verify_fix` lane, not the

@@ -660,7 +660,7 @@ def test_select_and_clear_parked_tasks_skips_remote_only_branch_without_remote_t
     git.is_merged.assert_not_called()
 
 
-def test_select_and_clear_parked_tasks_uses_remote_proof_path_for_remote_only_unresolved_branch(tmp_path: Path) -> None:
+def test_select_and_clear_parked_tasks_rearms_remote_only_unresolved_branch_without_remote_merge_proof(tmp_path: Path) -> None:
     config, store = _config_and_store(tmp_path)
     impl, owner_row = _make_backstop_owner(
         store,
@@ -690,10 +690,9 @@ def test_select_and_clear_parked_tasks_uses_remote_proof_path_for_remote_only_un
         ("rearmed", f"cleared {WATCH_NO_PROGRESS_BACKSTOP_REASON}"),
     ]
     assert store.list_watch_progress_observations(subject_kind="merge_unit", subject_id=str(merge_unit.id)) == []
-    git.is_merged.assert_called_once_with(f"origin/{impl.branch}", into="origin/main")
+    git.is_merged.assert_not_called()
 
-
-def test_select_and_clear_parked_tasks_skips_remote_only_branch_when_remote_proves_merged(tmp_path: Path) -> None:
+def test_select_and_clear_parked_tasks_rearms_remote_only_branch_when_remote_would_claim_merged(tmp_path: Path) -> None:
     config, store = _config_and_store(tmp_path)
     impl, owner_row = _make_backstop_owner(
         store,
@@ -722,8 +721,8 @@ def test_select_and_clear_parked_tasks_skips_remote_only_branch_when_remote_prov
         )
 
     assert [(outcome.status, outcome.detail) for outcome in result.outcomes] == [
-        ("skipped", "already merged"),
+        ("rearmed", f"cleared {WATCH_NO_PROGRESS_BACKSTOP_REASON}"),
     ]
     observations = store.list_watch_progress_observations(subject_kind="merge_unit", subject_id=str(merge_unit.id))
-    assert len(observations) == 1
-    git.is_merged.assert_called_once_with(f"origin/{impl.branch}", into="origin/main")
+    assert observations == []
+    git.is_merged.assert_not_called()

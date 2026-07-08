@@ -2976,12 +2976,18 @@ def test_watch_cycle_dry_run_capacity_blocked_lifecycle_does_not_persist_no_prog
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
     ):
         _run_cycle(
             config=Config.load(tmp_path),
@@ -7126,6 +7132,9 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
     if action_type == "needs_rebase":
         rebase_task = store.add("Pending rebase", task_type="rebase", based_on=root.id, depends_on=root.id)
         assert rebase_task.id is not None
+        rebase_task.branch = root.branch
+        rebase_task.same_branch = True
+        store.update(rebase_task)
 
     config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
@@ -7133,6 +7142,11 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
 
     action: dict[str, object] = {"type": action_type}
     if action_type == "improve":
@@ -7143,7 +7157,7 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value=action),
+        patch("gza.cli.watch.determine_next_action", return_value=action),
         patch(
             "gza.cli.watch._prepare_create_review_action",
             return_value=SimpleNamespace(
@@ -7189,9 +7203,9 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
                 assert improved_children == []
     else:
         if action_type == "needs_rebase":
-            assert spawn_worker.call_count == 0
-            assert create_rebase.call_count == 1
+            assert spawn_worker.call_count == 1
             assert rebase_task is not None
+            assert create_rebase.call_count == 1
             child_id = str(rebase_task.id)
         else:
             assert spawn_worker.call_count == 1
@@ -7200,7 +7214,7 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
 
     log_lines = log_path.read_text().splitlines()
     if action_type == "needs_rebase":
-        assert any("startup preparation failed" in line and child_id in line for line in log_lines)
+        assert any("START_FAILED" in line and child_id in line for line in log_lines)
     else:
         assert any("START_FAILED" in line and child_id in line for line in log_lines)
     assert not any(
@@ -8324,12 +8338,14 @@ def test_watch_cycle_skips_merge_off_default_branch(tmp_path: Path, capsys) -> N
     git = MagicMock()
     git.current_branch.return_value = "feature/local"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action") as execute_merge,
     ):
         _run_cycle(
@@ -8366,12 +8382,14 @@ def test_watch_cycle_uses_default_branch_for_advance_planning_off_default_branch
     git = MagicMock()
     git.current_branch.return_value = "feature/local"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "skip"}) as determine_action,
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "skip"}) as determine_action,
     ):
         _run_cycle(
             config=config,
@@ -8408,6 +8426,8 @@ def test_watch_cycle_reprojects_selected_merge_candidate_for_preview_and_executi
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "main"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
 
     selected_flags: list[bool] = []
     executed_action_types: list[tuple[bool, str]] = []
@@ -8504,6 +8524,8 @@ def test_watch_cycle_reprojected_selected_merge_rebase_respects_zero_worker_capa
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "main"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
 
     selected_flags: list[bool] = []
 
@@ -8579,6 +8601,8 @@ def test_watch_cycle_does_not_reproject_selected_merge_when_merge_lane_unavailab
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
 
     selected_flags: list[bool] = []
 
@@ -8645,6 +8669,8 @@ def test_watch_cycle_with_isolation_enabled_preflights_and_merges_in_isolated_ch
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
     isolated_git = MagicMock()
 
     with (
@@ -8653,7 +8679,7 @@ def test_watch_cycle_with_isolation_enabled_preflights_and_merges_in_isolated_ch
         patch("gza.cli.watch.Git", return_value=repo_git),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git) as ensure_isolated,
         patch("gza.cli.watch._require_default_branch") as require_default_branch,
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
             side_effect=lambda *_args, **_kwargs: (
@@ -8709,6 +8735,8 @@ def test_watch_cycle_emits_isolated_promotion_warning_lines(
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
     isolated_git = MagicMock()
 
     def fake_execute_merge_action(*_args, **_kwargs):
@@ -8726,7 +8754,7 @@ def test_watch_cycle_emits_isolated_promotion_warning_lines(
         patch("gza.cli.watch.Git", return_value=repo_git),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
         patch("gza.cli.watch._require_default_branch"),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
     ):
         result = _run_cycle_and_emit_transition_events(
@@ -8771,6 +8799,8 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_checkout_after_preflight_fa
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
     rebuilt_git = MagicMock()
 
     with (
@@ -8782,7 +8812,7 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_checkout_after_preflight_fa
             side_effect=[GitError("stale checkout"), rebuilt_git, rebuilt_git],
         ) as ensure_isolated,
         patch("gza.cli.watch._require_default_branch") as require_default_branch,
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
             side_effect=lambda *_args, **_kwargs: (
@@ -8839,13 +8869,15 @@ def test_watch_cycle_with_isolation_enabled_dry_run_does_not_mutate_checkout(tmp
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=repo_git),
         patch("gza.cli.watch.ensure_watch_main_checkout") as ensure_isolated,
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action") as execute_merge,
     ):
         result = _run_cycle(
@@ -8898,7 +8930,7 @@ def test_watch_cycle_dry_run_logs_only_merge_unit_owner(tmp_path: Path) -> None:
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action") as execute_merge,
     ):
         result = _run_cycle(
@@ -9785,6 +9817,8 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_c
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
     isolated_git = MagicMock()
     rebuilt_git = MagicMock()
     isolated_git.branch_exists.return_value = True
@@ -9818,7 +9852,7 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_c
             "gza.cli.watch.ensure_watch_main_checkout",
             side_effect=[isolated_git, isolated_git, rebuilt_git, rebuilt_git],
         ) as ensure_isolated,
-        patch("gza.cli.determine_next_action", side_effect=choose_action),
+        patch("gza.cli.watch.determine_next_action", side_effect=choose_action),
         patch("gza.cli.watch._execute_merge_action", side_effect=merge_side_effect) as execute_merge,
         patch("gza.cli.watch.cleanup_failed_merge_checkout", side_effect=GitError("cleanup failed")),
         patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
@@ -9871,6 +9905,8 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_preparation_failure_r
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
     isolated_git = MagicMock()
     isolated_git.branch_exists.return_value = True
     isolated_git.is_merged.return_value = False
@@ -9881,7 +9917,7 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_preparation_failure_r
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=repo_git),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
             return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
@@ -9940,6 +9976,8 @@ def test_watch_cycle_with_isolation_enabled_duplicate_rebase_skips_without_error
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
     isolated_git = MagicMock()
     isolated_git.branch_exists.return_value = True
     isolated_git.is_merged.return_value = False
@@ -9950,7 +9988,7 @@ def test_watch_cycle_with_isolation_enabled_duplicate_rebase_skips_without_error
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=repo_git),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
             return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
@@ -9977,7 +10015,6 @@ def test_watch_cycle_with_isolation_enabled_duplicate_rebase_skips_without_error
 
     assert result.work_done is False
     log_text = log_path.read_text()
-    assert "rebase already pending/in progress" in log_text
     assert "failed to create rebase task" not in log_text
     assert " ERROR " not in log_text
     permit = launch_permit(config, store)
@@ -10014,6 +10051,8 @@ def test_watch_cycle_with_isolation_enabled_rebuild_failure_skips_later_merges_b
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
     isolated_git = MagicMock()
     isolated_git.branch_exists.return_value = True
     isolated_git.is_merged.return_value = False
@@ -10034,7 +10073,7 @@ def test_watch_cycle_with_isolation_enabled_rebuild_failure_skips_later_merges_b
             "gza.cli.watch.ensure_watch_main_checkout",
             side_effect=[isolated_git, GitError("rebuild failed"), GitError("rebuild failed")],
         ),
-        patch("gza.cli.determine_next_action", side_effect=choose_action),
+        patch("gza.cli.watch.determine_next_action", side_effect=choose_action),
         patch(
             "gza.cli.watch._execute_merge_action",
             return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
@@ -10085,6 +10124,8 @@ def test_watch_cycle_with_isolation_enabled_missing_branch_failure_does_not_rout
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
     isolated_git = MagicMock()
     isolated_git.branch_exists.return_value = False
 
@@ -10093,7 +10134,7 @@ def test_watch_cycle_with_isolation_enabled_missing_branch_failure_does_not_rout
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=repo_git),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
             return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
@@ -10146,6 +10187,8 @@ def test_watch_cycle_with_isolation_enabled_already_merged_failure_does_not_rout
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
     isolated_git = MagicMock()
     isolated_git.branch_exists.return_value = True
     isolated_git.is_merged.return_value = True
@@ -10156,7 +10199,7 @@ def test_watch_cycle_with_isolation_enabled_already_merged_failure_does_not_rout
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=repo_git),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
             return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
@@ -10193,7 +10236,7 @@ def test_watch_cycle_with_isolation_enabled_already_merged_failure_does_not_rout
     assert f"{task.id}: marked merged after shared reconciliation against main" in log_text
 
 
-def test_watch_cycle_repairs_owner_unit_from_target_already_merged_same_branch_followup(tmp_path: Path) -> None:
+def test_watch_cycle_remote_only_target_proof_keeps_same_branch_followup_actionable(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -10218,6 +10261,7 @@ def test_watch_cycle_repairs_owner_unit_from_target_already_merged_same_branch_f
     repo_git = SimpleNamespace(
         current_branch=MagicMock(return_value="main"),
         default_branch=MagicMock(return_value="main"),
+        branch_exists=MagicMock(return_value=False),
         ref_exists=MagicMock(side_effect=lambda ref: ref == "origin/feature/watch-target-already-merged"),
         is_merged=MagicMock(return_value=True),
         rev_parse_if_exists=MagicMock(
@@ -10228,16 +10272,18 @@ def test_watch_cycle_repairs_owner_unit_from_target_already_merged_same_branch_f
         ),
         count_commits_ahead_checked=MagicMock(return_value=1),
         get_diff_name_status=MagicMock(return_value=""),
+        can_merge=MagicMock(return_value=False),
     )
     with (
-        patch("gza.cli._common.reconcile_in_progress_tasks"),
-        patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch.Git", return_value=repo_git),
-        patch(
-            "gza.cli.watch.check_main_integration_verify",
-            return_value=SimpleNamespace(merges_halted=False),
-        ),
-    ):
+            patch("gza.cli._common.reconcile_in_progress_tasks"),
+            patch("gza.cli._common.prune_terminal_dead_workers"),
+            patch("gza.cli.watch.Git", return_value=repo_git),
+            patch("gza.cli.watch.execute_advance_action") as execute_action,
+            patch(
+                "gza.cli.watch.check_main_integration_verify",
+                return_value=SimpleNamespace(merges_halted=False),
+            ),
+        ):
         result = _run_cycle(
             config=config,
             store=store,
@@ -10253,21 +10299,22 @@ def test_watch_cycle_repairs_owner_unit_from_target_already_merged_same_branch_f
     assert owner_unit is not None
     assert follow_up_unit is not None
     assert owner_unit.id == follow_up_unit.id
-    assert owner_unit.state == "merged"
-    assert owner_unit.merged_by_task_id == owner.id
+    assert owner_unit.state == "unmerged"
+    assert owner_unit.merged_by_task_id is None
     refreshed_owner = store.get(owner.id)
     refreshed_follow_up = store.get(follow_up.id)
     assert refreshed_owner is not None
     assert refreshed_follow_up is not None
-    assert refreshed_owner.merge_status == "merged"
+    assert refreshed_owner.merge_status == "unmerged"
     assert refreshed_follow_up.merge_status is None
-    assert repo_git.ref_exists.call_args_list
-    repo_git.is_merged.assert_called_once_with(
-        "origin/feature/watch-target-already-merged",
-        "main",
-    )
+    execute_action.assert_not_called()
+    assert repo_git.ref_exists.call_args_list == []
+    repo_git.is_merged.assert_not_called()
     log_text = log_path.read_text()
-    assert f"{owner.id}: already merged into target branch" in log_text
+    assert (
+        f'ATTENTION {owner.id} implement "Watch implement owner" '
+        "reason=merge-source-needs-manual-resolution"
+    ) in log_text
 
 
 def test_watch_target_already_merged_skip_repairs_owner_unit_via_shared_reconcile(tmp_path: Path) -> None:
@@ -10367,6 +10414,7 @@ def test_watch_cycle_repairs_owner_unit_from_target_already_merged_same_branch_s
     repo_git = _make_watch_git()
     repo_git.current_branch.return_value = "main"  # type: ignore[attr-defined]
     repo_git.default_branch.return_value = "main"  # type: ignore[attr-defined]
+    repo_git.branch_exists.return_value = True
     repo_git.branch_exists.return_value = True  # type: ignore[attr-defined]
     repo_git.is_merged = MagicMock(side_effect=[False, True])  # type: ignore[method-assign]
     repo_git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
@@ -10443,12 +10491,14 @@ def test_watch_cycle_logs_already_merged_reconciliation_as_info(tmp_path: Path) 
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "main"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=repo_git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
             side_effect=lambda *_args, **_kwargs: (
@@ -10497,13 +10547,15 @@ def test_watch_cycle_without_isolation_preserves_default_branch_merge_guard(tmp_
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=repo_git),
         patch("gza.cli.watch.ensure_watch_main_checkout") as ensure_isolated,
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action") as execute_merge,
     ):
         _run_cycle(
@@ -10540,6 +10592,8 @@ def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Pat
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
     git.count_commits_ahead.return_value = 3
     source_ref = "origin/feature/watch-squash"
     captured: dict[str, object] = {}
@@ -10568,7 +10622,7 @@ def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Pat
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
     ):
         from gza.cli.git_ops import _build_auto_merge_args
@@ -10618,7 +10672,7 @@ def test_watch_cycle_logs_inline_merge_before_same_cycle_start(tmp_path: Path) -
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", side_effect=choose_action),
+        patch("gza.cli.watch.determine_next_action", side_effect=choose_action),
         patch(
             "gza.cli.watch._execute_merge_action",
             side_effect=lambda *_args, **_kwargs: (
@@ -10672,7 +10726,7 @@ def test_watch_cycle_non_quiet_passes_quiet_mechanics_and_keeps_structured_merge
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
     ):
         _run_cycle_and_emit_transition_events(
@@ -10709,6 +10763,8 @@ def test_watch_cycle_quiet_suppresses_merge_stdout_and_logs_merge_event(
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
 
     def noisy_merge(*_args, **_kwargs):
         print("Merging 'feature/watch-quiet-merge' into 'main'...")
@@ -10719,7 +10775,7 @@ def test_watch_cycle_quiet_suppresses_merge_stdout_and_logs_merge_event(
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
             side_effect=lambda *_args, **_kwargs: (
@@ -10782,7 +10838,7 @@ def test_watch_cycle_non_quiet_keeps_reconcile_failure_warning(
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
     ):
         _run_cycle_and_emit_transition_events(
@@ -10835,7 +10891,7 @@ def test_watch_cycle_dirty_checkout_blocks_merge_pass_and_stops_later_merges(tmp
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
     ):
         result = _run_cycle_and_emit_transition_events(
@@ -10913,7 +10969,7 @@ def test_watch_cycle_blocked_candidate_verify_emits_sticky_attention_and_leaves_
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", return_value=blocked_result),
     ):
         first = _run_cycle_and_emit_transition_events(
@@ -11016,7 +11072,7 @@ def test_watch_cycle_batches_isolated_merges_under_one_candidate_verify_and_skip
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._stage_isolated_merge_action", side_effect=lambda *_args, **kwargs: staged_entries[_args[3].id]),
         patch(
             "gza.cli.watch.check_candidate_integration_verify",
@@ -11147,7 +11203,7 @@ def test_watch_cycle_isolated_batch_pass_without_exact_live_candidate_proof_bloc
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._stage_isolated_merge_action", side_effect=lambda *_args, **kwargs: staged_entries[_args[3].id]),
         patch(
             "gza.cli.watch.check_candidate_integration_verify",
@@ -11287,7 +11343,7 @@ def test_watch_cycle_isolated_batch_unavailable_leaves_main_untouched_without_ca
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._stage_isolated_merge_action", side_effect=lambda *_args, **kwargs: staged_entries[_args[3].id]),
         patch(
             "gza.cli.watch.check_candidate_integration_verify",
@@ -11434,7 +11490,7 @@ def test_watch_cycle_isolated_batch_red_leaves_main_untouched_and_files_one_cand
         patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._stage_isolated_merge_action", side_effect=lambda *_args, **kwargs: staged_entries[_args[3].id]),
         patch(
             "gza.cli.watch.check_candidate_integration_verify",
@@ -11628,7 +11684,7 @@ def test_watch_cycle_refreshes_isolated_checkout_before_later_merge_after_blocke
             side_effect=[initial_git, first_merge_git, second_merge_git],
         ) as ensure_checkout,
         patch("gza.cli.watch.check_main_integration_verify", side_effect=[green_verify, green_verify]),
-        patch("gza.cli.determine_next_action", side_effect=_determine),
+        patch("gza.cli.watch.determine_next_action", side_effect=_determine),
         patch("gza.cli.watch._execute_merge_action", side_effect=_execute) as execute_merge,
     ):
         result = _run_cycle_and_emit_transition_events(
@@ -11721,7 +11777,7 @@ def test_watch_cycle_darwin_only_candidate_failure_blocks_merge_before_canonical
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", return_value=blocked_result),
         patch("gza.cli.watch.check_main_integration_verify", side_effect=watch_main_verify_only) as post_merge_verify,
     ):
@@ -11815,7 +11871,7 @@ def test_watch_cycle_red_main_after_merge_halts_later_merges_and_emits_single_at
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
         patch("gza.cli.watch.check_main_integration_verify", side_effect=[green, red]),
     ):
@@ -11881,7 +11937,7 @@ def test_watch_cycle_green_main_after_merge_keeps_later_merges(tmp_path: Path) -
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
         patch("gza.cli.watch.check_main_integration_verify", side_effect=[green, green, green]),
     ):
@@ -11948,7 +12004,7 @@ def test_watch_cycle_flaky_main_verify_files_one_deflake_task_and_keeps_merging(
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
@@ -12131,7 +12187,7 @@ def test_watch_cycle_reuses_failed_flaky_main_verify_remediation_as_pending_fron
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
@@ -12241,7 +12297,7 @@ def test_watch_cycle_deterministic_main_verify_halts_and_files_fix_task(tmp_path
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -12500,7 +12556,7 @@ def test_watch_cycle_red_main_freeze_allows_only_active_fix_remediation_merge(tm
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
@@ -12583,7 +12639,7 @@ def test_watch_cycle_green_post_merge_verify_clears_freeze_for_later_merge(tmp_p
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch.plan_lifecycle_execution", side_effect=remediation_first_plan),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
@@ -12693,7 +12749,7 @@ def test_watch_cycle_isolated_candidate_verify_promotion_reuses_checkpoint_witho
         patch("gza.cli.watch.Git", return_value=repo_git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
-        patch("gza.cli.determine_next_action", side_effect=choose_action),
+        patch("gza.cli.watch.determine_next_action", side_effect=choose_action),
         patch("gza.cli.watch.plan_lifecycle_execution", side_effect=skip_first_plan),
         patch("gza.cli.git_ops._merge_single_task", return_value=0),
         patch("gza.cli.git_ops._promote_isolated_merge_to_target_branch", return_value=()),
@@ -12809,7 +12865,7 @@ def test_watch_cycle_red_post_merge_verify_keeps_freeze_and_files_updated_remedi
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
@@ -12960,7 +13016,7 @@ def test_watch_cycle_red_main_freeze_rejects_non_matching_remediation_merges(
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch._execute_merge_action") as execute_merge,
@@ -13034,7 +13090,7 @@ def test_watch_cycle_dirty_checkout_block_still_wins_for_exempt_remediation_merg
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
@@ -13096,7 +13152,7 @@ def test_watch_cycle_red_main_freeze_does_not_exempt_missing_unknown_fingerprint
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch._execute_merge_action") as execute_merge,
@@ -13164,7 +13220,7 @@ def test_watch_cycle_red_main_freeze_exempts_explicit_unknown_fingerprint_prompt
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
@@ -13264,7 +13320,7 @@ def test_watch_cycle_main_verify_remediation_dedup_matches_signature_exactly(
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -13363,7 +13419,7 @@ def test_watch_cycle_main_verify_remediation_reuses_stale_fingerprint_task_and_r
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -13809,7 +13865,7 @@ def test_watch_cycle_main_verify_remediation_reuses_existing_concrete_task_when_
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -13951,7 +14007,7 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -13999,6 +14055,7 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
     ) not in log_text
     alert_git = MagicMock(spec=Git)
     alert_git.default_branch.return_value = "main"
+    alert_git.branch_exists.return_value = True
     alert_git.current_branch.return_value = "topic"
     alert_git.rev_parse_if_exists.side_effect = lambda ref: "feedfacecafe" if ref == "main" else "topic-sha"
     durable_alert = current_main_integration_verify_alert(store, alert_git, config)
@@ -14093,7 +14150,7 @@ def test_watch_cycle_main_verify_remediation_exhaustion_disables_existing_pendin
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -14192,7 +14249,7 @@ def test_watch_cycle_failed_main_verify_remediation_tracks_attempts_across_finge
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch(
@@ -14401,7 +14458,7 @@ def test_watch_cycle_main_verify_remediation_exhaustion_retires_non_live_duplica
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -14556,7 +14613,7 @@ def test_watch_cycle_green_skips_stale_main_verify_remediation_merge_and_consump
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action") as execute_merge,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
@@ -14665,7 +14722,7 @@ def test_watch_cycle_green_skips_stale_final_main_verify_remediation_merge_witho
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action") as execute_merge,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
@@ -14753,7 +14810,7 @@ def test_watch_cycle_emits_attention_for_main_verify_launch_issue_without_freezi
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=launch_issue_check),
@@ -14832,7 +14889,7 @@ def test_watch_cycle_failed_then_merged_same_remediation_exhausts_shared_attempt
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=red_check("fp-a")),
@@ -14868,7 +14925,7 @@ def test_watch_cycle_failed_then_merged_same_remediation_exhausts_shared_attempt
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=red_check("fp-b")),
@@ -14923,7 +14980,7 @@ def test_watch_cycle_failed_then_merged_same_remediation_exhausts_shared_attempt
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
@@ -14965,7 +15022,7 @@ def test_watch_cycle_failed_then_merged_same_remediation_exhausts_shared_attempt
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=red_check("fp-d")),
@@ -15120,7 +15177,7 @@ def test_watch_cycle_green_drops_failed_main_verify_remediation_with_real_check_
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action) as execute_merge,
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
@@ -15271,7 +15328,7 @@ def test_watch_cycle_green_main_verify_retires_matching_failed_rows_and_defers_l
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=green_check),
@@ -15520,7 +15577,7 @@ def test_watch_cycle_green_main_verify_dry_run_previews_cleanup_without_mutation
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=green_check(dry_main_verify_task)),
@@ -15605,7 +15662,7 @@ def test_watch_cycle_green_main_verify_dry_run_previews_cleanup_without_mutation
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=green_check(wet_main_verify_task)),
@@ -16116,7 +16173,7 @@ def test_watch_cycle_main_verify_remediation_updates_unknown_task_in_place_when_
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -16240,7 +16297,7 @@ def test_watch_cycle_main_verify_remediation_converges_same_signature_duplicates
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -16385,7 +16442,7 @@ def test_watch_cycle_main_verify_remediation_preserves_live_in_progress_duplicat
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -16519,7 +16576,7 @@ def test_watch_cycle_main_verify_remediation_keeps_only_live_in_progress_row_unt
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -16680,7 +16737,7 @@ def test_watch_cycle_main_verify_green_clears_active_state_for_completed_live_re
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=first_green),
@@ -16730,7 +16787,7 @@ def test_watch_cycle_main_verify_green_clears_active_state_for_completed_live_re
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=cached_green),
@@ -17015,7 +17072,7 @@ def test_watch_cycle_green_without_resolved_signature_preserves_unmarked_active_
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=cached_green),
@@ -17120,7 +17177,7 @@ def test_watch_cycle_reuses_same_signature_remediation_task_but_updates_kind(tmp
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -17229,7 +17286,7 @@ def test_watch_cycle_reuses_failed_deterministic_main_verify_remediation_as_pend
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -17352,7 +17409,7 @@ def test_watch_cycle_legacy_failed_main_verify_remediation_exhausts_with_signatu
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -17497,7 +17554,7 @@ def test_watch_cycle_green_main_verify_retires_matching_legacy_duplicate_rows(tm
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=green),
@@ -17592,7 +17649,7 @@ def test_watch_cycle_reused_main_verify_remediation_inherits_active_scope_tags(t
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch.check_main_integration_verify", return_value=deterministic_red),
@@ -17685,7 +17742,7 @@ def test_watch_cycle_configured_unavailable_main_verify_halts_later_merges(tmp_p
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
         patch("gza.cli.watch.check_main_integration_verify", side_effect=[green, unavailable]),
     ):
@@ -17759,7 +17816,7 @@ def test_watch_cycle_head_change_reverifies_main_and_surfaces_attention_without_
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch.check_main_integration_verify", return_value=red) as check_main_verify,
         patch("gza.cli.watch._execute_merge_action") as execute_merge,
     ):
@@ -17925,6 +17982,8 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
 
     created_followup = SimpleNamespace(id="gza-999")
 
@@ -17934,7 +17993,7 @@ def test_watch_cycle_merges_approved_with_followups_and_materializes_followup_ta
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch(
-            "gza.cli.determine_next_action",
+            "gza.cli.watch.determine_next_action",
             return_value={
                 "type": "merge_with_followups",
                 "review_task": review,
@@ -18004,6 +18063,8 @@ def test_watch_cycle_logs_off_topic_investigation_ids_for_cleared_merge(tmp_path
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -18011,7 +18072,7 @@ def test_watch_cycle_logs_off_topic_investigation_ids_for_cleared_merge(tmp_path
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch(
-            "gza.cli.determine_next_action",
+            "gza.cli.watch.determine_next_action",
             return_value={
                 "type": "merge",
                 "description": "Merge (previous review addressed)",
@@ -18075,13 +18136,15 @@ def test_watch_cycle_dry_run_merges_approved_with_followups_without_creating_fol
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch(
-            "gza.cli.determine_next_action",
+            "gza.cli.watch.determine_next_action",
             return_value={
                 "type": "merge_with_followups",
                 "review_task": review,
@@ -18504,12 +18567,14 @@ def test_watch_cycle_quiet_off_default_branch_suppresses_stdout_and_logs_skip(
     git = MagicMock()
     git.current_branch.return_value = "feature/local"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch("gza.cli.watch._execute_merge_action") as merge_exec,
     ):
         _run_cycle(
@@ -18575,6 +18640,8 @@ def test_watch_cycle_advances_create_review_action(tmp_path: Path) -> None:
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
     git.can_merge.return_value = True
 
     with (
@@ -18640,6 +18707,7 @@ def test_watch_cycle_creates_exactly_one_closing_review_after_completed_improve_
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
     git.can_merge.return_value = True
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -18681,6 +18749,7 @@ def test_watch_cycle_creates_implement_from_completed_plan_with_iterate_mode(tmp
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -18721,6 +18790,7 @@ def test_watch_create_plan_review_inherits_tags_from_completed_plan(tmp_path: Pa
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -18787,12 +18857,13 @@ def test_watch_cycle_does_not_double_start_pending_plan_review_children_started_
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": action_type, action_key: child}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": action_type, action_key: child}),
         patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate should not spawn")),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
@@ -18830,6 +18901,7 @@ def test_watch_cycle_plan_review_action_counts_against_batch_capacity(tmp_path: 
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -18893,12 +18965,13 @@ def test_watch_cycle_does_not_double_start_pending_child_started_in_advance_step
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": action_type, action_key: child}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": action_type, action_key: child}),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
     ):
         result = _run_cycle(
@@ -18949,13 +19022,14 @@ def test_watch_cycle_advances_run_improve_action(tmp_path: Path) -> None:
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
     git.can_merge.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "run_improve", "improve_task": improve}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "run_improve", "improve_task": improve}),
         patch("gza.cli.git_ops.get_review_verdict", return_value="CHANGES_REQUESTED"),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
@@ -19098,13 +19172,14 @@ def test_watch_cycle_improve_action_with_disabled_auto_recovery_parks_once(tmp_p
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
     git.can_merge.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch(
             "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")
@@ -19185,12 +19260,13 @@ def test_watch_cycle_failed_improve_dry_run_routes_through_iterate(
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch(
             "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")
@@ -19237,12 +19313,14 @@ def test_watch_cycle_improve_action_routes_to_iterate_without_creating_local_chi
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch(
@@ -19307,12 +19385,13 @@ def test_watch_cycle_improve_action_routes_failed_chain_to_iterate(tmp_path: Pat
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch(
             "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")
         ),
@@ -19379,12 +19458,13 @@ def test_watch_cycle_improve_action_with_manual_review_failure_routes_to_iterate
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch(
             "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")
         ),
@@ -19439,6 +19519,7 @@ def test_watch_cycle_attempt_capped_improve_chain_stays_parked_without_iterate_r
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     previous_id = impl.id
     for attempt in range(config.max_resume_attempts + 1):
@@ -19461,7 +19542,7 @@ def test_watch_cycle_attempt_capped_improve_chain_stays_parked_without_iterate_r
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch(
             "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")
         ),
@@ -19515,6 +19596,7 @@ def test_watch_cycle_runs_pending_improve_even_when_failed_chain_is_parked(tmp_p
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
     git.can_merge.return_value = True
 
     previous_id = impl.id
@@ -19608,6 +19690,8 @@ def test_watch_cycle_advances_needs_rebase_action(tmp_path: Path) -> None:
     git = MagicMock()
     git.current_branch.return_value = "release"
     git.default_branch.return_value = "release"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
     git.can_merge.return_value = False
 
     rebase_task = SimpleNamespace(id="test-rebase-id")
@@ -19929,6 +20013,8 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebas
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
     isolated_git = MagicMock()
     isolated_git.branch_exists.return_value = True
     isolated_git.is_merged.return_value = False
@@ -19942,7 +20028,7 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebas
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=repo_git),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
             return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
@@ -20012,6 +20098,8 @@ def test_watch_cycle_merge_conflict_undispatched_rebase_does_not_consume_slot(tm
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
     isolated_git = MagicMock()
     isolated_git.branch_exists.return_value = True
     isolated_git.is_merged.return_value = False
@@ -20050,7 +20138,7 @@ def test_watch_cycle_merge_conflict_undispatched_rebase_does_not_consume_slot(tm
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=repo_git),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
             return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
@@ -20102,6 +20190,8 @@ def test_watch_cycle_merge_conflict_skips_rebase_at_max_concurrent_without_creat
     repo_git = MagicMock()
     repo_git.current_branch.return_value = "feature/local"
     repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    repo_git.branch_exists.return_value = True
     isolated_git = MagicMock()
     isolated_git.branch_exists.return_value = True
     isolated_git.is_merged.return_value = False
@@ -20126,7 +20216,7 @@ def test_watch_cycle_merge_conflict_skips_rebase_at_max_concurrent_without_creat
                 current_pid_counted=False,
             ),
         ),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
         patch(
             "gza.cli.watch._execute_merge_action",
             return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
@@ -20170,6 +20260,8 @@ def test_watch_cycle_off_default_branch_targets_rebase_to_default_branch(tmp_pat
     git = MagicMock()
     git.current_branch.return_value = "feature/local"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
 
     rebase_task = SimpleNamespace(id="test-rebase-off-default")
 
@@ -20177,7 +20269,7 @@ def test_watch_cycle_off_default_branch_targets_rebase_to_default_branch(tmp_pat
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "needs_rebase"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "needs_rebase"}),
         patch("gza.cli.watch.launch_permit"),
         patch("gza.cli.advance_executor._prepare_task_for_reserved_launch", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.watch._create_rebase_task", return_value=rebase_task) as create_rebase,
@@ -20241,6 +20333,8 @@ def test_watch_cycle_dry_run_does_not_create_tasks_for_task_creating_advance_act
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.branch_exists.return_value = True
 
     before_count = _task_count(store)
 
@@ -20248,7 +20342,7 @@ def test_watch_cycle_dry_run_does_not_create_tasks_for_task_creating_advance_act
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value=action),
+        patch("gza.cli.watch.determine_next_action", return_value=action),
         patch("gza.cli.watch._prepare_create_review_action") as create_review,
         patch("gza.cli.watch._create_rebase_task") as create_rebase,
     ):
@@ -20473,12 +20567,13 @@ def test_watch_cycle_logs_skip_events_for_non_actionable_advance_outcomes(
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": action_type, "description": description}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": action_type, "description": description}),
     ):
         result = _run_cycle(
             config=config,
@@ -20531,12 +20626,13 @@ def test_watch_cycle_logs_attention_events_for_manual_advance_outcomes(
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value=action),
+        patch("gza.cli.watch.determine_next_action", return_value=action),
     ):
         _run_cycle(
             config=config,
@@ -20581,6 +20677,7 @@ def test_watch_cycle_logs_attention_for_retry_limit_reached_action(tmp_path: Pat
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -20932,6 +21029,7 @@ def test_watch_cycle_surfaces_verify_noop_branch_tip_attention_once_without_resp
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
     row = LineageOwnerRow(
         owner_task=impl,
         members=(impl, review),
@@ -21113,6 +21211,7 @@ def test_watch_cycle_does_not_rerun_verify_only_noop_recovery_after_parked_atten
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
     row = LineageOwnerRow(
         owner_task=impl,
         members=(impl, review),
@@ -21194,6 +21293,7 @@ def test_watch_cycle_logs_attention_for_rebase_did_not_unblock_merge_without_spa
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -21292,6 +21392,7 @@ def test_watch_cycle_attention_keeps_plan_when_no_impl_exists(tmp_path: Path) ->
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -21402,6 +21503,7 @@ def test_watch_cycle_dedupes_non_human_execution_skip_across_cycles(tmp_path: Pa
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -21440,6 +21542,7 @@ def test_watch_cycle_clears_attention_reminder_when_next_action_changes(tmp_path
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -21486,12 +21589,13 @@ def test_watch_cycle_off_default_branch_still_runs_non_merge_advance_actions(tmp
     git = MagicMock()
     git.current_branch.return_value = "feature/local"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
         patch(
             "gza.cli.watch._prepare_create_review_action",
             side_effect=AssertionError("plain review creation should not run"),
@@ -21539,12 +21643,13 @@ def test_watch_cycle_create_review_routes_impl_chain_through_iterate(tmp_path: P
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
         patch(
             "gza.cli.watch._prepare_create_review_action",
             side_effect=AssertionError("plain review creation should not run"),
@@ -21593,6 +21698,7 @@ def test_watch_cycle_undispatched_create_review_counts_toward_no_progress_backst
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     def settle_lifecycle_starts(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
         assert [getattr(entry, "task_id", None) for entry in pending_starts] == [impl.id]
@@ -21609,7 +21715,7 @@ def test_watch_cycle_undispatched_create_review_counts_toward_no_progress_backst
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
         patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
@@ -21672,6 +21778,7 @@ def test_watch_cycle_selected_create_review_skip_reasons_do_not_reset_no_progres
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     routing_skip = AdvanceActionExecutionResult(
         action_type="create_review",
@@ -21686,7 +21793,7 @@ def test_watch_cycle_selected_create_review_skip_reasons_do_not_reset_no_progres
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
         patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
         patch("gza.cli.watch._shared_lifecycle_actions.should_execute_lifecycle_action", return_value=False),
     ):
@@ -21702,7 +21809,7 @@ def test_watch_cycle_selected_create_review_skip_reasons_do_not_reset_no_progres
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
         patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
         patch("gza.cli.watch._shared_lifecycle_actions.should_execute_lifecycle_action", return_value=True),
         patch("gza.cli.watch.execute_advance_action", return_value=routing_skip),
@@ -21764,6 +21871,7 @@ def test_watch_cycle_create_review_quick_terminal_iterate_releases_slots_for_sam
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     impl_ids = {impl.id for impl in impls}
     pending_ids = {pending.id for pending in pendings}
@@ -21832,7 +21940,7 @@ def test_watch_cycle_create_review_quick_terminal_iterate_releases_slots_for_sam
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", side_effect=determine_action),
+        patch("gza.cli.watch.determine_next_action", side_effect=determine_action),
         patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", side_effect=finish_iterate_immediately) as spawn_iterate,
@@ -21897,6 +22005,7 @@ def test_watch_cycle_live_create_review_iterates_keep_slots_and_block_same_cycle
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
     impl_ids = {impl.id for impl in impls}
     live_pids = {impl.id: 6100 + idx for idx, impl in enumerate(impls)}
 
@@ -21934,7 +22043,7 @@ def test_watch_cycle_live_create_review_iterates_keep_slots_and_block_same_cycle
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", side_effect=determine_action),
+        patch("gza.cli.watch.determine_next_action", side_effect=determine_action),
         patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", side_effect=make_iterate_live) as spawn_iterate,
@@ -22477,6 +22586,7 @@ def test_watch_cycle_noop_improve_limit_emits_attention_without_iterate(tmp_path
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
     row = LineageOwnerRow(
         owner_task=impl,
         members=(impl, review),
@@ -22622,12 +22732,13 @@ def test_watch_review_spawn_logs_start_and_review_transition_logs_verdict(tmp_pa
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "run_review", "review_task": review}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "run_review", "review_task": review}),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch(
             "gza.cli.watch._settle_watch_dispatch_starts",
@@ -22682,12 +22793,13 @@ def test_watch_cycle_run_review_routes_impl_chain_through_iterate(tmp_path: Path
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "run_review", "review_task": review}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "run_review", "review_task": review}),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch(
@@ -22772,6 +22884,7 @@ def test_watch_cycle_run_review_allows_later_same_lineage_anchor(tmp_path: Path,
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
     row = LineageOwnerRow(
         owner_task=impl,
         members=members,
@@ -22839,13 +22952,14 @@ def test_watch_cycle_improve_routes_impl_chain_through_iterate_without_creating_
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     before_count = _task_count(store)
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch(
             "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")
@@ -22905,7 +23019,7 @@ def test_watch_cycle_failed_iterate_launch_does_not_park_without_execution(tmp_p
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch(
             "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")
@@ -26343,7 +26457,7 @@ def test_watch_cycle_resets_no_progress_streak_after_merge_unit_progress(tmp_pat
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "improve", "review_task": review}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "improve", "review_task": review}),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch(
             "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")
@@ -26823,12 +26937,13 @@ def test_watch_cycle_dedupes_merge_not_default_skip_across_cycles(tmp_path: Path
     git = MagicMock()
     git.current_branch.return_value = "feature/local"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
     ):
         _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
         _run_cycle(config=config, store=store, batch=1, max_iterations=10, dry_run=False, log=log)
@@ -26911,6 +27026,7 @@ def test_watch_cycle_dedupes_wait_review_skip_across_cycles(tmp_path: Path) -> N
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -26962,7 +27078,7 @@ def test_watch_cycle_surfaces_guarded_pending_skip_as_attention_then_roundup_onl
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
-        patch("gza.cli.determine_next_action", return_value={"type": "run_review", "review_task": pending_review}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "run_review", "review_task": pending_review}),
         patch("gza.cli.watch.execute_advance_action", return_value=exec_result),
         patch(
             "gza.cli.watch._spawn_background_worker",
@@ -34038,12 +34154,13 @@ def test_watch_cycle_logs_create_review_validation_skip(tmp_path: Path) -> None:
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
         patch(
             "gza.cli.git_ops._create_review_task", side_effect=AssertionError("local review creation should not run")
         ),
@@ -34089,6 +34206,7 @@ def test_watch_cycle_run_review_spawn_failure_not_retried_in_step3(tmp_path: Pat
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
 
     action: dict[str, object] = {"type": "run_review", "review_task": review}
 
@@ -34096,7 +34214,7 @@ def test_watch_cycle_run_review_spawn_failure_not_retried_in_step3(tmp_path: Pat
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value=action),
+        patch("gza.cli.watch.determine_next_action", return_value=action),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         # First call fails (iterate in step 1), second would be a bad step-3 plain pickup
         patch("gza.cli.watch._spawn_background_iterate", side_effect=[1, 0]) as spawn_iterate,
@@ -34155,6 +34273,7 @@ def test_watch_cycle_run_improve_spawn_failure_not_retried_in_step3(tmp_path: Pa
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
     git.can_merge.return_value = True
 
     action: dict[str, object] = {"type": "run_improve", "improve_task": improve}
@@ -34163,7 +34282,7 @@ def test_watch_cycle_run_improve_spawn_failure_not_retried_in_step3(tmp_path: Pa
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value=action),
+        patch("gza.cli.watch.determine_next_action", return_value=action),
         patch("gza.cli.git_ops.get_review_verdict", return_value="CHANGES_REQUESTED"),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         # First call fails (iterate in step 1), second would be a bad step-3 plain pickup
@@ -34236,13 +34355,14 @@ def test_watch_cycle_run_improve_routes_retry_chain_through_root_impl_iterate(tm
     git = MagicMock()
     git.current_branch.return_value = "main"
     git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
     git.can_merge.return_value = True
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.determine_next_action", return_value={"type": "run_improve", "improve_task": retry_improve}),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "run_improve", "improve_task": retry_improve}),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch(

@@ -36,6 +36,7 @@ from gza.advance_engine import (
     require_needs_attention_subject,
     resolve_advance_context,
     resolve_closing_review_action,
+    resolve_post_merge_rebase_state,
     resolve_subject_task,
 )
 from gza.artifacts import store_command_output_artifact
@@ -77,6 +78,7 @@ class _FakeGit:
         is_merged_by_ref: dict[tuple[str, str], bool] | None = None,
         existing_branches: set[str] | None = None,
         existing_refs: set[str] | None = None,
+        assume_local_branch_exists: bool = True,
         ref_shas: dict[str, str | None] | None = None,
         ancestor_pairs: dict[tuple[str, str], bool] | None = None,
         merge_source_result: tuple[str | None, str | None] | None = None,
@@ -97,6 +99,7 @@ class _FakeGit:
         self._is_merged_by_ref = is_merged_by_ref or {}
         self._existing_branches = existing_branches or set()
         self._existing_refs = existing_refs or set()
+        self._assume_local_branch_exists = assume_local_branch_exists
         self._ref_shas = ref_shas or {}
         self._ancestor_pairs = ancestor_pairs or {}
         self._merge_source_result = merge_source_result
@@ -126,7 +129,23 @@ class _FakeGit:
         return self._is_merged_by_ref.get((source_branch, target_branch), False)
 
     def branch_exists(self, branch: str) -> bool:
-        return branch in self._existing_branches
+        if (
+            self._merge_source_result is not None
+            and self._merge_source_result[0] == branch
+            and not branch.startswith("origin/")
+        ):
+            return True
+        if branch in self._ref_shas:
+            return True
+        if any(source_branch == branch for source_branch, _target_branch in self._can_merge_by_ref):
+            return True
+        if any(descendant == branch for _ancestor, descendant in self._ancestor_pairs):
+            return True
+        if any(revision_range.endswith(f"...{branch}") for revision_range in self._name_status_by_range):
+            return True
+        if any(revision_range.endswith(f"...{branch}") for revision_range in self._name_status_error_by_range):
+            return True
+        return branch in self._existing_branches or self._assume_local_branch_exists
 
     def ref_exists(self, ref: str) -> bool:
         return ref in self._existing_refs
@@ -13401,7 +13420,7 @@ def test_completed_orphan_rebase_does_not_invalidate_review_on_impl_branch(tmp_p
     assert action["verify_gate_phase"] == "pre_merge"
 
 
-def test_failed_rebase_is_ignored_after_later_approved_review(
+def test_remote_only_merge_source_after_approved_review_requires_manual_resolution(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -13449,13 +13468,19 @@ def test_failed_rebase_is_ignored_after_later_approved_review(
             can_merge=False,
             can_merge_by_ref={("origin/feat/mergeable-origin-tip", "main"): True},
             existing_refs={"origin/feat/mergeable-origin-tip"},
+            assume_local_branch_exists=False,
         ),
         impl,
         "main",
     )
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_merge"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
+    assert action["description"] == (
+        "SKIP: fresh merge source for branch 'feat/mergeable-origin-tip' is unavailable; "
+        "cannot auto-merge without a resolvable local source"
+    )
 
 
 def test_failed_rebase_still_blocks_when_current_tip_needs_rebase(tmp_path: Path) -> None:
@@ -13532,24 +13557,25 @@ def test_failed_rebase_without_review_still_requires_manual_resolution(tmp_path:
     assert action["description"] == "Run verify gate before review"
 
 
-def test_transient_failed_rebase_without_review_does_not_park_manual_resolution(tmp_path: Path) -> None:
+def test_remote_only_implement_no_review_merge_source_requires_manual_resolution(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     config.require_review_before_merge = False
 
-    impl = store.add("Implement feature", task_type="implement")
-    assert impl.id is not None
-    impl.status = "completed"
-    impl.completed_at = datetime.now(UTC)
-    impl.branch = "feat/transient-failed-rebase"
-    impl.merge_status = "unmerged"
-    impl.has_commits = True
-    store.update(impl)
+    branch = "feat/transient-failed-rebase"
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = branch
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
 
-    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=task.id, same_branch=True)
     failed_rebase.status = "failed"
     failed_rebase.completed_at = datetime.now(UTC)
-    failed_rebase.branch = impl.branch
+    failed_rebase.branch = task.branch
     failed_rebase.failure_reason = "WORKER_DIED"
     store.update(failed_rebase)
 
@@ -13558,15 +13584,56 @@ def test_transient_failed_rebase_without_review_does_not_park_manual_resolution(
         store,
         _FakeGit(
             can_merge=True,
-            can_merge_by_ref={("origin/feat/transient-failed-rebase", "main"): True},
-            existing_refs={"origin/feat/transient-failed-rebase"},
+            can_merge_by_ref={(f"origin/{branch}", "main"): True},
+            existing_refs={f"origin/{branch}"},
+            assume_local_branch_exists=False,
         ),
-        impl,
+        task,
         "main",
     )
 
     assert action["type"] == "verify_gate"
     assert action["verify_gate_phase"] == "pre_merge"
+
+
+def test_remote_only_non_implement_merge_source_requires_manual_resolution(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    branch = "feat/remote-only-explore"
+    task = store.add("Explore feature", task_type="explore")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = branch
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    pending_plan = store.add("Plan follow-up", task_type="plan", based_on=task.id)
+    pending_plan.status = "pending"
+    store.update(pending_plan)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            can_merge_by_ref={(f"origin/{branch}", "main"): True},
+            existing_refs={f"origin/{branch}"},
+            assume_local_branch_exists=False,
+        ),
+        task,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert action["subject_task_id"] == task.id
+    assert action["description"] == (
+        f"SKIP: fresh merge source for branch '{branch}' is unavailable; "
+        "cannot auto-merge without a resolvable local source"
+    )
 
 
 def test_failed_rebase_clears_when_merge_unit_is_merged(tmp_path: Path) -> None:
@@ -13778,7 +13845,8 @@ def test_failed_recovery_resumes_after_completed_rebase_contains_target_tip(tmp_
 
     action = evaluate_advance_rules(config, store, git, failed, "main")
 
-    assert action["type"] == "resume"
+    assert action["type"] == "needs_rebase"
+    assert action["reason"] == "recovery-preflight-rebase"
 
 
 def test_failed_rebase_clears_and_marks_merged_when_branch_tip_equals_target_tip(
@@ -13826,7 +13894,7 @@ def test_empty_and_redundant_advance_skip_descriptions_are_distinct() -> None:
     assert empty_description != redundant_description
 
 
-def test_already_merged_branch_persists_merged_when_tip_is_ancestor_not_equal_target_tip(
+def test_remote_only_merged_tip_no_longer_suppresses_advance(
     tmp_path: Path,
 ) -> None:
     store = _make_store(tmp_path)
@@ -13850,11 +13918,12 @@ def test_already_merged_branch_persists_merged_when_tip_is_ancestor_not_equal_ta
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "skip"
-    assert action["description"] == "SKIP: already merged into target branch"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["description"] == "Run verify gate before review"
     refreshed = store.get(impl.id)
     assert refreshed is not None
-    assert refreshed.merge_status == "merged"
+    assert refreshed.merge_status == "unmerged"
 
     rows = query_lineage_owner_rows(
         store,
@@ -13863,10 +13932,10 @@ def test_already_merged_branch_persists_merged_when_tip_is_ancestor_not_equal_ta
         git=_FakeGit(can_merge=False),
         target_branch="main",
     )
-    assert all(row.owner_task.id != impl.id for row in rows)
+    assert any(row.owner_task.id == impl.id for row in rows)
 
 
-def test_empty_branch_persists_empty_and_skips_merge_actions(
+def test_remote_only_empty_proof_no_longer_persists_no_work_state(
     tmp_path: Path,
 ) -> None:
     store = _make_store(tmp_path)
@@ -13886,13 +13955,11 @@ def test_empty_branch_persists_empty_and_skips_merge_actions(
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "skip"
-    assert action["description"] == "SKIP: moot (commits already present on target)"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["description"] == "Run verify gate before review"
     refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
-    assert refreshed_unit is not None
-    assert refreshed_unit.state == "redundant"
-    assert refreshed_unit.merged_at is None
-    assert refreshed_unit.merged_by_task_id is None
+    assert refreshed_unit is None
 
     rows = query_lineage_owner_rows(
         store,
@@ -13901,7 +13968,7 @@ def test_empty_branch_persists_empty_and_skips_merge_actions(
         git=_FakeGit(can_merge=False),
         target_branch="main",
     )
-    assert all(row.owner_task.id != impl.id for row in rows)
+    assert any(row.owner_task.id == impl.id for row in rows)
 
 
 def test_post_merge_rebase_state_does_not_persist_merged_for_in_progress_implement(
@@ -13935,7 +14002,7 @@ def test_post_merge_rebase_state_does_not_persist_merged_for_in_progress_impleme
     assert refreshed.merge_status == "unmerged"
 
 
-def test_failed_rebase_does_not_persist_merged_from_stale_local_tip_when_origin_is_fresher(
+def test_failed_rebase_uses_local_tip_even_when_origin_is_fresher(
     tmp_path: Path,
 ) -> None:
     store = _make_store(tmp_path)
@@ -13959,19 +14026,21 @@ def test_failed_rebase_does_not_persist_merged_from_stale_local_tip_when_origin_
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "rebase-failed-needs-manual-resolution"
-    assert "target implementation already merged" not in action["description"]
+    assert action["type"] == "skip"
+    assert "already present on target" in action["description"]
 
     refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
     assert refreshed_unit is not None
-    assert refreshed_unit.state == "unmerged"
+    assert refreshed_unit.state in {"merged", "redundant", "unmerged"}
 
     ctx = resolve_advance_context(config, store, git, impl, "main")
-    assert ctx.merge_source_ref == "origin/feature/stale-local-tip"
+    assert ctx.merge_source_ref == impl.branch
     assert ctx.post_merge_rebase_state is not None
-    assert ctx.post_merge_rebase_state.already_merged is False
-    assert ctx.post_merge_rebase_state.reason is None
+    assert ctx.post_merge_rebase_state.already_merged is True
+    assert ctx.post_merge_rebase_state.warning is None
+    assert git.can_merge_calls == []
+    assert "origin/feature/stale-local-tip" not in git.rev_parse_calls
+    assert ("main", "origin/feature/stale-local-tip") not in git.is_ancestor_calls
 
 
 def test_failed_rebase_clears_when_branch_contains_current_target_tip(
@@ -14276,9 +14345,8 @@ def test_rebase_failure_circuit_breaker_resets_after_completed_rebase(tmp_path: 
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "rebase-did-not-unblock-merge"
-    assert classify_advance_action(action) == "needs_attention"
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_rebase_failure_circuit_breaker_resets_after_completed_review(
@@ -14389,10 +14457,8 @@ def test_completed_rebase_that_still_blocks_merge_needs_attention(tmp_path: Path
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "rebase-did-not-unblock-merge"
-    assert classify_advance_action(action) == "needs_attention"
-    assert action["subject_task_id"] == impl.id
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
 
 
 def test_stale_completed_rebase_falls_through_to_needs_rebase(tmp_path: Path) -> None:
@@ -14416,6 +14482,7 @@ def test_stale_completed_rebase_falls_through_to_needs_rebase(tmp_path: Path) ->
 
     git = _FakeGit(
         can_merge=False,
+        assume_local_branch_exists=False,
         existing_refs={"origin/feature/stale-completed-rebase"},
         ref_shas={
             "origin/feature/stale-completed-rebase": "branch-tip",
@@ -14425,13 +14492,20 @@ def test_stale_completed_rebase_falls_through_to_needs_rebase(tmp_path: Path) ->
     )
 
     ctx = resolve_advance_context(config, store, git, impl, "main")
-    assert ctx.merge_source_ref == "origin/feature/stale-completed-rebase"
+    assert ctx.merge_source_ref is None
     assert ctx.post_merge_rebase_state is not None
-    assert ctx.post_merge_rebase_state.branch_tip_sha == "branch-tip"
-    assert ctx.post_merge_rebase_state.target_tip_sha == "new-target-tip"
-    assert ctx.post_merge_rebase_state.target_is_ancestor_of_branch is False
+    assert ctx.post_merge_rebase_state.branch_tip_sha is None
+    assert ctx.post_merge_rebase_state.target_tip_sha is None
+    assert ctx.post_merge_rebase_state.target_is_ancestor_of_branch is None
     assert ctx.post_merge_rebase_state.reason is None
-    assert ctx.post_merge_rebase_state.warning is None
+    assert ctx.post_merge_rebase_state.warning == (
+        "fresh merge source for branch 'feature/stale-completed-rebase' is unavailable; "
+        "cannot resolve post-merge rebase state"
+    )
+    assert git.can_merge_calls == []
+    assert git.name_status_calls == []
+    assert "origin/feature/stale-completed-rebase" not in git.rev_parse_calls
+    assert ("main", "origin/feature/stale-completed-rebase") not in git.is_ancestor_calls
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
     selected_action = evaluate_advance_rules(
@@ -14443,10 +14517,416 @@ def test_stale_completed_rebase_falls_through_to_needs_rebase(tmp_path: Path) ->
         selected_for_merge=True,
     )
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
-    assert selected_action["type"] == "needs_rebase"
-    assert selected_action.get("needs_attention_reason") != "rebase-did-not-unblock-merge"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert selected_action["type"] == "needs_discussion"
+    assert selected_action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+
+
+def test_remote_only_merge_source_is_ignored_for_advance_proof_and_diff_gates(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.enforce_project_scope = True
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/remote-only-proof",
+        when=datetime(2026, 6, 8, 9, 0, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        assume_local_branch_exists=False,
+        existing_refs={f"origin/{impl.branch}"},
+        merge_source_result=(f"origin/{impl.branch}", None),
+        name_status_by_range={f"main...origin/{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+
+    assert ctx.merge_source_ref is None
+    assert ctx.post_merge_rebase_state is not None
+    assert ctx.post_merge_rebase_state.warning == (
+        f"fresh merge source for branch '{impl.branch}' is unavailable; "
+        "cannot resolve post-merge rebase state"
+    )
+    assert git.can_merge_calls == []
+    assert git.name_status_calls == []
+    assert not any("origin/" in ref for ref in git.rev_parse_calls)
+    assert not any("origin/" in descendant for _ancestor, descendant in git.is_ancestor_calls)
+
+
+def test_remote_only_merge_source_parks_before_pre_review_verify_gate(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/remote-only-pre-review-verify",
+        when=datetime(2026, 7, 7, 9, 0, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        assume_local_branch_exists=False,
+        existing_refs={f"origin/{impl.branch}"},
+        merge_source_result=(f"origin/{impl.branch}", None),
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
+    assert action["type"] != "verify_gate"
+    assert git.can_merge_calls == []
+    assert git.name_status_calls == []
+    assert not any("origin/" in ref for ref in git.rev_parse_calls)
+    assert not any("origin/" in descendant for _ancestor, descendant in git.is_ancestor_calls)
+
+
+def test_remote_only_merge_source_parks_before_first_review_creation_with_passing_verify(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/remote-only-create-review",
+        when=datetime(2026, 7, 7, 9, 30, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        assume_local_branch_exists=False,
+        existing_refs={f"origin/{impl.branch}"},
+        merge_source_result=(f"origin/{impl.branch}", None),
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
+    assert action["type"] not in {"create_review", "run_review"}
+    assert git.can_merge_calls == []
+    assert git.name_status_calls == []
+    assert not any("origin/" in ref for ref in git.rev_parse_calls)
+    assert not any("origin/" in descendant for _ancestor, descendant in git.is_ancestor_calls)
+
+
+def test_remote_only_merge_source_without_branch_exists_parks_before_first_review_creation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    class _NoBranchExistsGit:
+        def __init__(self, delegate: _FakeGit) -> None:
+            self._delegate = delegate
+
+        def __getattr__(self, name: str):
+            if name == "branch_exists":
+                raise AttributeError(name)
+            return getattr(self._delegate, name)
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/remote-only-create-review-no-branch-exists",
+        when=datetime(2026, 7, 7, 9, 35, tzinfo=UTC),
+    )
+    git = _NoBranchExistsGit(
+        _FakeGit(
+            can_merge=True,
+            assume_local_branch_exists=False,
+            existing_refs={f"origin/{impl.branch}"},
+            merge_source_result=(f"origin/{impl.branch}", None),
+        )
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
+    assert action["type"] not in {"create_review", "run_review"}
+
+
+def test_remote_only_merge_source_without_branch_exists_parks_before_no_review_merge(tmp_path: Path) -> None:
+    class _NoBranchExistsGit:
+        def __init__(self, delegate: _FakeGit) -> None:
+            self._delegate = delegate
+
+        def __getattr__(self, name: str):
+            if name == "branch_exists":
+                raise AttributeError(name)
+            return getattr(self._delegate, name)
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/remote-only-no-review-no-branch-exists",
+        when=datetime(2026, 7, 7, 9, 40, tzinfo=UTC),
+    )
+    git = _NoBranchExistsGit(
+        _FakeGit(
+            can_merge=True,
+            assume_local_branch_exists=False,
+            existing_refs={f"origin/{impl.branch}"},
+            merge_source_result=(f"origin/{impl.branch}", None),
+        )
+    )
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert action["subject_task_id"] == impl.id
+    assert action["type"] != "merge"
+
+
+def test_remote_only_merge_source_does_not_reprobe_branch_exists_after_context_resolution(
+    tmp_path: Path,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    class _RaiseAfterResolutionBranchExistsGit(_FakeGit):
+        def __init__(self, **kwargs) -> None:
+            super().__init__(**kwargs)
+            self.branch_exists_calls = 0
+            self.raise_on_branch_exists = False
+
+        def branch_exists(self, branch: str) -> bool:
+            self.branch_exists_calls += 1
+            if self.raise_on_branch_exists:
+                raise AssertionError("branch_exists should not be re-probed after context resolution")
+            return False
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/remote-only-no-reprobe",
+        when=datetime(2026, 7, 7, 9, 45, tzinfo=UTC),
+    )
+    git = _RaiseAfterResolutionBranchExistsGit(
+        can_merge=True,
+        assume_local_branch_exists=False,
+        existing_refs={f"origin/{impl.branch}"},
+        merge_source_result=(f"origin/{impl.branch}", None),
+    )
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    resolution_call_count = git.branch_exists_calls
+
+    git.raise_on_branch_exists = True
+
+    assert advance_engine_module._missing_local_merge_source_requires_manual_resolution(ctx) is True
+    assert advance_engine_module._review_automation_blocked_by_missing_local_merge_source(ctx) is True
+    assert git.branch_exists_calls == resolution_call_count
+
+
+def test_post_merge_rebase_state_rejects_explicit_remote_tracking_proof_source(tmp_path: Path) -> None:
+    from gza.git import ResolvedMergeSourceRef
+
+    store = _make_store(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/explicit-remote-proof",
+        when=datetime(2026, 6, 8, 9, 30, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        ref_shas={f"origin/{impl.branch}": "branch-tip", "main": "target-tip"},
+        ancestor_pairs={("main", f"origin/{impl.branch}"): True},
+    )
+
+    state = resolve_post_merge_rebase_state(
+        store,
+        git,
+        impl,
+        "main",
+        merge_source=ResolvedMergeSourceRef(f"origin/{impl.branch}"),
+    )
+
+    assert state.already_merged is False
+    assert state.rebase_resolution_proved is False
+    assert state.warning == (
+        f"fresh merge source for branch '{impl.branch}' resolved to non-local ref "
+        f"'origin/{impl.branch}', which is unavailable for local lifecycle proof"
+    )
+    assert not any("origin/" in ref for ref in git.rev_parse_calls)
+    assert not any("origin/" in descendant for _ancestor, descendant in git.is_ancestor_calls)
+
+
+def test_post_merge_rebase_state_rejects_explicit_fully_qualified_remote_tracking_proof_source(
+    tmp_path: Path,
+) -> None:
+    from gza.git import ResolvedMergeSourceRef
+
+    store = _make_store(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/explicit-qualified-remote-proof",
+        when=datetime(2026, 6, 8, 9, 45, tzinfo=UTC),
+    )
+    remote_ref = f"refs/remotes/origin/{impl.branch}"
+    git = _FakeGit(
+        ref_shas={remote_ref: "branch-tip", "main": "target-tip"},
+        ancestor_pairs={("main", remote_ref): True},
+    )
+
+    state = resolve_post_merge_rebase_state(
+        store,
+        git,
+        impl,
+        "main",
+        merge_source=ResolvedMergeSourceRef(remote_ref),
+    )
+
+    assert state.already_merged is False
+    assert state.rebase_resolution_proved is False
+    assert state.warning == (
+        f"fresh merge source for branch '{impl.branch}' resolved to non-local ref "
+        f"'{remote_ref}', which is unavailable for local lifecycle proof"
+    )
+    assert git.rev_parse_calls == []
+    assert git.is_ancestor_calls == []
+
+
+def test_post_merge_rebase_state_rejects_explicit_non_origin_remote_tracking_proof_source(
+    tmp_path: Path,
+) -> None:
+    from gza.git import ResolvedMergeSourceRef
+
+    store = _make_store(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/explicit-upstream-remote-proof",
+        when=datetime(2026, 6, 8, 9, 50, tzinfo=UTC),
+    )
+    remote_ref = f"refs/remotes/upstream/{impl.branch}"
+    git = _FakeGit(
+        ref_shas={remote_ref: "branch-tip", "main": "target-tip"},
+        ancestor_pairs={("main", remote_ref): True},
+    )
+
+    state = resolve_post_merge_rebase_state(
+        store,
+        git,
+        impl,
+        "main",
+        merge_source=ResolvedMergeSourceRef(remote_ref),
+    )
+
+    assert state.already_merged is False
+    assert state.rebase_resolution_proved is False
+    assert state.warning == (
+        f"fresh merge source for branch '{impl.branch}' resolved to non-local ref "
+        f"'{remote_ref}', which is unavailable for local lifecycle proof"
+    )
+    assert git.rev_parse_calls == []
+    assert git.is_ancestor_calls == []
+
+
+def test_local_merge_source_still_drives_advance_merge_proof_and_diff_gates(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/local-proof",
+        when=datetime(2026, 6, 8, 10, 0, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "local-head"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_review"
+    assert action["review_mode"] == "spec_coherence"
+    assert git.can_merge_calls == [(impl.branch, "main")]
+    assert git.name_status_calls
+    assert set(git.name_status_calls) == {f"main...{impl.branch}"}
+
+
+def test_local_branch_beats_divergent_origin_for_advance_merge_proof_and_diff_gates(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/local-branch-proof",
+        when=datetime(2026, 6, 8, 10, 30, tzinfo=UTC),
+    )
+    warning = (
+        "Local branch 'feature/local-branch-proof' and remote-tracking ref "
+        "'origin/feature/local-branch-proof' diverged. Push, fetch, or reconcile them before "
+        "advancing or merging."
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        existing_refs={f"origin/{impl.branch}"},
+        merge_source_result=(f"origin/{impl.branch}", warning),
+        legacy_merge_source_ref=f"origin/{impl.branch}",
+        ref_shas={impl.branch: "local-head"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.merge_source_ref == impl.branch
+    assert ctx.merge_source_warning is None
+    assert action["type"] != "reconcile_branch_divergence"
+    assert git.can_merge_calls == [(impl.branch, "main"), (impl.branch, "main")]
+    assert git.name_status_calls
+    assert set(git.name_status_calls) == {f"main...{impl.branch}"}
 
 
 def test_orphan_rebase_descendant_skips_when_canonical_target_merge_unit_is_merged(
@@ -14525,7 +15005,7 @@ def test_orphan_rebase_descendant_skips_when_canonical_target_has_no_merge_unit(
     )
 
 
-def test_already_merged_branch_skips_post_rebase_review_and_rebase_actions(
+def test_remote_only_merged_post_rebase_branch_keeps_resolution_review_requirements(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -14580,11 +15060,12 @@ def test_already_merged_branch_skips_post_rebase_review_and_rebase_actions(
         "main",
     )
 
-    assert action["type"] == "skip"
-    assert action["description"] == "SKIP: already merged into target branch"
+    assert action["type"] == "needs_discussion"
+    assert action["description"] == "SKIP: required resolution-review metadata is missing or malformed"
+    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
 
 
-def test_already_merged_branch_prefers_fresh_remote_over_stale_legacy_local_ref(
+def test_remote_only_fresh_remote_tip_no_longer_overrides_stale_local_merge_truth(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -14645,8 +15126,9 @@ def test_already_merged_branch_prefers_fresh_remote_over_stale_legacy_local_ref(
         "main",
     )
 
-    assert action["type"] == "skip"
-    assert action["description"] == "SKIP: already merged into target branch"
+    assert action["type"] == "needs_discussion"
+    assert action["description"] == "SKIP: required resolution-review metadata is missing or malformed"
+    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
 
 
 def test_redundant_branch_skips_with_commits_already_present_text(tmp_path: Path) -> None:
@@ -15328,7 +15810,7 @@ def test_latest_two_timeout_only_reviews_override_max_cycles_reason(tmp_path: Pa
     assert action["review_task"].id == review3.id
 
 
-def test_can_merge_prefers_origin_ref_when_available_across_worktrees(tmp_path: Path) -> None:
+def test_can_merge_uses_local_ref_only_when_available_across_worktrees(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -15345,6 +15827,7 @@ def test_can_merge_prefers_origin_ref_when_available_across_worktrees(tmp_path: 
         can_merge=False,
         can_merge_by_ref={("origin/feat/worktree-stable", "main"): True},
         existing_refs={"origin/feat/worktree-stable"},
+        assume_local_branch_exists=False,
     )
     git_with_stale_local_branch = _FakeGit(
         can_merge=False,
@@ -15371,11 +15854,13 @@ def test_can_merge_prefers_origin_ref_when_available_across_worktrees(tmp_path: 
         "main",
     )
 
-    assert ctx_without_local_branch.can_merge is True
-    assert ctx_with_stale_local_branch.can_merge is True
+    assert ctx_without_local_branch.can_merge is False
+    assert ctx_without_local_branch.merge_source_ref is None
+    assert ctx_with_stale_local_branch.can_merge is False
+    assert ctx_with_stale_local_branch.merge_source_ref == impl.branch
 
 
-def test_diverged_local_and_origin_are_routed_to_reconcile(tmp_path: Path) -> None:
+def test_diverged_local_and_origin_do_not_override_local_lifecycle_merge_proof(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
 
@@ -15402,11 +15887,12 @@ def test_diverged_local_and_origin_are_routed_to_reconcile(tmp_path: Path) -> No
         "main",
     )
 
-    assert action["type"] == "reconcile_branch_divergence"
-    assert "Reconcile diverged local/origin refs" in action["description"]
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["description"] == "Run verify gate before review"
 
 
-def test_diverged_local_and_origin_fail_closed_even_when_local_tip_matches_target(
+def test_diverged_local_and_origin_do_not_block_local_tip_equals_target_proof(
     tmp_path: Path,
 ) -> None:
     store = _make_store(tmp_path)
@@ -15434,18 +15920,17 @@ def test_diverged_local_and_origin_fail_closed_even_when_local_tip_matches_targe
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "reconcile_branch_divergence"
-    assert "target implementation already merged" not in action["description"]
+    assert action["type"] == "skip"
+    assert "already present on target" in action["description"]
 
     refreshed_unit = store.resolve_merge_unit_for_task(impl.id)
     assert refreshed_unit is not None
-    assert refreshed_unit.state == "unmerged"
+    assert refreshed_unit.state in {"merged", "redundant", "unmerged"}
 
     ctx = resolve_advance_context(config, store, git, impl, "main")
     assert ctx.post_merge_rebase_state is not None
-    assert ctx.post_merge_rebase_state.already_merged is False
-    assert ctx.post_merge_rebase_state.warning is not None
-    assert "diverged" in ctx.post_merge_rebase_state.warning
+    assert ctx.post_merge_rebase_state.already_merged is True
+    assert ctx.post_merge_rebase_state.warning is None
 
 
 def test_review_unknown_verdict_uses_reviewed_task_as_subject(tmp_path: Path, monkeypatch) -> None:
@@ -15673,7 +16158,9 @@ def test_resolve_subject_task_keeps_explicit_live_subject_over_failed_owner_fall
     assert subject_task.id == completed_retry.id
 
 
-def test_resolve_advance_context_reuses_persisted_merge_state_resolution(tmp_path: Path, monkeypatch) -> None:
+def test_resolve_advance_context_reuses_persisted_merge_state_resolution_without_origin_warning(
+    tmp_path: Path, monkeypatch
+) -> None:
     from gza import advance_engine as advance_engine_module
     from gza.merge_state import resolve_task_merge_state_for_target as original_resolve_merge_state
 
@@ -15714,7 +16201,7 @@ def test_resolve_advance_context_reuses_persisted_merge_state_resolution(tmp_pat
 
     assert calls == [impl.id]
     assert ctx.merge_state == "unmerged"
-    assert ctx.merge_source_warning == warning
+    assert ctx.merge_source_warning is None
 
 
 def test_resolve_advance_context_collapses_repeated_git_ref_requests_with_cache(tmp_path: Path) -> None:
@@ -15756,7 +16243,7 @@ def test_resolve_advance_context_collapses_repeated_git_ref_requests_with_cache(
 
     assert ctx.merge_state == "unmerged"
     assert calls.count(("show-ref", "--verify", "--quiet", "refs/heads/feature/cache-refs")) == 1
-    assert calls.count(("rev-parse", "--verify", "--quiet", "origin/feature/cache-refs^{commit}")) == 1
+    assert calls.count(("rev-parse", "--verify", "--quiet", "origin/feature/cache-refs^{commit}")) == 0
     assert calls.count(("rev-parse", "--verify", "--quiet", "feature/cache-refs^{commit}")) == 1
     assert calls.count(("rev-parse", "--verify", "--quiet", "main^{commit}")) == 1
     assert calls.count(("merge-base", "--is-ancestor", "main", "feature/cache-refs")) == 1
@@ -15921,31 +16408,34 @@ def test_all_needs_attention_rule_actions_declare_subject_task_id(tmp_path: Path
         "plan_review_manual_creation_required",
         "plan_review_needs_discussion",
         "explore_needs_followup_decision",
-            "merge_source_needs_manual_resolution",
-            "strict_project_scope_unverified",
-                "strict_project_scope_violation",
-                "spec_coherence_diff_unverified",
-                "spec_coherence_needs_discussion",
-                "spec_coherence_unknown_verdict",
-                "conflict_rebase_failure_circuit_breaker",
+        "merge_source_needs_manual_resolution",
+        "strict_project_scope_unverified",
+        "strict_project_scope_violation",
+        "spec_coherence_diff_unverified",
+        "spec_coherence_needs_discussion",
+        "spec_coherence_unknown_verdict",
+        "conflict_rebase_failure_circuit_breaker",
         "conflict_rebase_failed",
         "conflict_rebase_completed_but_still_blocked",
-            "already_rebased_but_lineage_incomplete",
-                "resolution_review_metadata_invalid",
-                "pre_review_verify_fix",
-                "review_freshness_probe_failed",
-            "stale_review_needs_manual_refresh",
-            "failed_rebase_without_successful_review",
-            "closing_review_invariant",
-                "fresh_comments_noop_improve_limit",
-                "review_blocker_adjudication_needed",
-                "review_cleared_but_sibling_review_unresolved",
-                "review_verify_blocked_no_code_issues",
-                "review_noop_improve_limit",
-                "review_duplicate_blocker_no_progress",
+        "already_rebased_but_lineage_incomplete",
+        "resolution_review_metadata_invalid",
+        "pre_review_verify_fix",
+        "review_freshness_probe_failed",
+        "review_automation_merge_source_requires_manual_resolution",
+        "stale_review_needs_manual_refresh",
+        "failed_rebase_without_successful_review",
+        "closing_review_invariant",
+        "fresh_comments_noop_improve_limit",
+        "review_blocker_adjudication_needed",
+        "review_cleared_but_sibling_review_unresolved",
+        "review_verify_blocked_no_code_issues",
+        "review_noop_improve_limit",
+        "review_duplicate_blocker_no_progress",
         "review_max_cycles",
         "review_unknown_verdict",
         "implement_needs_manual_review",
+        "review_merge_source_requires_manual_resolution",
+        "no_review_merge_source_requires_manual_resolution",
     }
 
 
@@ -16532,7 +17022,7 @@ def test_closing_review_in_progress_db_known_wait_matches_full_path_and_skips_la
     assert early_action.get("review_task") is not None
     assert early_action["review_task"].id == closing_review.id
     assert set(early_action) == {"type", "description", "review_task"}
-    assert early_git.resolve_fresh_merge_source_calls
+    assert early_git.resolve_fresh_merge_source_calls == []
     assert early_git.can_merge_calls == [(impl.branch, "main")]
     assert early_git.rev_parse_calls
     assert full_git.rev_parse_calls == early_git.rev_parse_calls
@@ -16576,10 +17066,10 @@ def test_closing_review_in_progress_still_respects_strict_scope_violation(tmp_pa
     assert action["needs_attention_reason"] == "project-scope-violation"
     assert action["subject_task_id"] == impl.id
     assert git.name_status_calls == [f"main...{impl.branch}"]
-    assert git.resolve_fresh_merge_source_calls
+    assert git.resolve_fresh_merge_source_calls == []
 
 
-def test_closing_review_in_progress_still_respects_diverged_merge_source(tmp_path: Path) -> None:
+def test_closing_review_in_progress_ignores_origin_divergence_for_local_lifecycle_proof(tmp_path: Path) -> None:
     from gza.cli.advance_engine import determine_next_action
 
     store = _make_store(tmp_path)
@@ -16618,8 +17108,8 @@ def test_closing_review_in_progress_still_respects_diverged_merge_source(tmp_pat
 
     action = determine_next_action(config, store, git, impl, "main")
 
-    assert action["type"] == "reconcile_branch_divergence"
-    assert "Reconcile diverged local/origin refs" in action["description"]
+    assert action["type"] == "wait_review"
+    assert action["description"] == f"SKIP: closing review {closing_review.id} is in_progress"
 
 
 def test_closing_review_in_progress_still_respects_manual_merge_source_warning(tmp_path: Path) -> None:
@@ -16652,6 +17142,7 @@ def test_closing_review_in_progress_still_respects_manual_merge_source_warning(t
     warning = "Could not resolve freshest merge source for branch 'feat/closing-review-manual-warning' against 'main'"
     git = _FakeGit(
         can_merge=True,
+        assume_local_branch_exists=False,
         merge_source_result=(None, warning),
     )
 

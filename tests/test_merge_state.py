@@ -12,10 +12,59 @@ from gza.db import SqliteTaskStore
 from gza.merge_state import (
     classify_branch_merge_state_for_target,
     classify_proven_merged_state,
+    resolve_task_merge_source,
     resolve_task_merge_state_for_target,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _MergeSourceResolverGit:
+    def __init__(
+        self,
+        *,
+        local_branches: set[str] | None = None,
+        existing_refs: set[str] | None = None,
+        fresh_source_ref: str | None = None,
+        fresh_source_warning: str | None = None,
+        merge_source_ref: str | None = None,
+    ) -> None:
+        self._local_branches = local_branches or set()
+        self._existing_refs = existing_refs or set()
+        self._fresh_source_ref = fresh_source_ref
+        self._fresh_source_warning = fresh_source_warning
+        self._merge_source_ref = merge_source_ref
+        self.resolve_fresh_merge_source_calls: list[str] = []
+        self.rev_parse_calls: list[str] = []
+        self.is_ancestor_calls: list[tuple[str, str]] = []
+        self.is_merged_calls: list[tuple[str, str]] = []
+
+    def resolve_fresh_merge_source(self, _branch: str):
+        from gza.git import ResolvedMergeSourceRef
+
+        self.resolve_fresh_merge_source_calls.append(_branch)
+        return ResolvedMergeSourceRef(self._fresh_source_ref, self._fresh_source_warning)
+
+    def resolve_merge_source_ref(self, _branch: str) -> str | None:
+        return self._merge_source_ref
+
+    def branch_exists(self, branch: str) -> bool:
+        return branch in self._local_branches
+
+    def ref_exists(self, ref: str) -> bool:
+        return ref in self._existing_refs
+
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        self.rev_parse_calls.append(ref)
+        return None
+
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        self.is_ancestor_calls.append((ancestor, descendant))
+        return False
+
+    def is_merged(self, branch: str, target: str) -> bool:
+        self.is_merged_calls.append((branch, target))
+        return False
 
 
 class _FakeGit:
@@ -367,16 +416,16 @@ def test_classify_zero_unique_commits_with_live_net_diff_stays_unmerged() -> Non
 def test_classify_stale_source_missing_recorded_head_stays_unmerged() -> None:
     result = classify_branch_merge_state_for_target(
         git=_FakeGit(
-            source_ref="origin/feature/false-redundant",
-            ref_shas={"origin/feature/false-redundant": "base-sha", "main": "target-sha"},
-            tree_shas={"origin/feature/false-redundant": "shared-tree-sha", "main": "shared-tree-sha"},
+            source_ref="feature/false-redundant",
+            ref_shas={"feature/false-redundant": "base-sha", "main": "target-sha"},
+            tree_shas={"feature/false-redundant": "shared-tree-sha", "main": "shared-tree-sha"},
             ahead_count=0,
             merged=True,
             net_diff_by_ref={
-                "origin/feature/false-redundant": False,
+                "feature/false-redundant": False,
             },
             patch_present_by_commit={("recorded-head-sha", "main"): False},
-            ancestors={("recorded-head-sha", "origin/feature/false-redundant"): False},
+            ancestors={("recorded-head-sha", "feature/false-redundant"): False},
             on_first_parent=True,
         ),
         source_branch="feature/false-redundant",
@@ -392,16 +441,16 @@ def test_classify_stale_source_missing_recorded_head_stays_unmerged() -> None:
 def test_classify_stale_source_missing_recorded_head_can_still_be_redundant_when_head_has_no_diff() -> None:
     result = classify_branch_merge_state_for_target(
         git=_FakeGit(
-            source_ref="origin/feature/redundant",
-            ref_shas={"origin/feature/redundant": "base-sha", "main": "target-sha"},
-            tree_shas={"origin/feature/redundant": "shared-tree-sha", "main": "shared-tree-sha"},
+            source_ref="feature/redundant",
+            ref_shas={"feature/redundant": "base-sha", "main": "target-sha"},
+            tree_shas={"feature/redundant": "shared-tree-sha", "main": "shared-tree-sha"},
             ahead_count=0,
             merged=True,
             net_diff_by_ref={
-                "origin/feature/redundant": False,
+                "feature/redundant": False,
             },
             patch_present_by_commit={("recorded-head-sha", "main"): True},
-            ancestors={("recorded-head-sha", "origin/feature/redundant"): False},
+            ancestors={("recorded-head-sha", "feature/redundant"): False},
             on_first_parent=True,
         ),
         source_branch="feature/redundant",
@@ -417,14 +466,14 @@ def test_classify_stale_source_missing_recorded_head_can_still_be_redundant_when
 def test_classify_proved_merged_unresolved_source_sha_missing_recorded_head_stays_unmerged() -> None:
     result = classify_branch_merge_state_for_target(
         git=_FakeGit(
-            source_ref="origin/feature/false-redundant",
-            ref_shas={"origin/feature/false-redundant": None, "main": "target-sha"},
-            tree_shas={"origin/feature/false-redundant": "shared-tree-sha", "main": "shared-tree-sha"},
+            source_ref="feature/false-redundant",
+            ref_shas={"feature/false-redundant": None, "main": "target-sha"},
+            tree_shas={"feature/false-redundant": "shared-tree-sha", "main": "shared-tree-sha"},
             ahead_count=0,
             merged=True,
-            net_diff_by_ref={"origin/feature/false-redundant": False},
+            net_diff_by_ref={"feature/false-redundant": False},
             patch_present_by_commit={("recorded-head-sha", "main"): False},
-            ancestors={("recorded-head-sha", "origin/feature/false-redundant"): False},
+            ancestors={("recorded-head-sha", "feature/false-redundant"): False},
             on_first_parent=True,
         ),
         source_branch="feature/false-redundant",
@@ -440,14 +489,14 @@ def test_classify_proved_merged_unresolved_source_sha_missing_recorded_head_stay
 def test_classify_proved_merged_unresolved_target_sha_missing_recorded_head_stays_unmerged() -> None:
     result = classify_branch_merge_state_for_target(
         git=_FakeGit(
-            source_ref="origin/feature/false-redundant",
-            ref_shas={"origin/feature/false-redundant": "base-sha", "main": None},
-            tree_shas={"origin/feature/false-redundant": "shared-tree-sha", "main": "shared-tree-sha"},
+            source_ref="feature/false-redundant",
+            ref_shas={"feature/false-redundant": "base-sha", "main": None},
+            tree_shas={"feature/false-redundant": "shared-tree-sha", "main": "shared-tree-sha"},
             ahead_count=0,
             merged=True,
-            net_diff_by_ref={"origin/feature/false-redundant": False},
+            net_diff_by_ref={"feature/false-redundant": False},
             patch_present_by_commit={("recorded-head-sha", "main"): False},
-            ancestors={("recorded-head-sha", "origin/feature/false-redundant"): False},
+            ancestors={("recorded-head-sha", "feature/false-redundant"): False},
             on_first_parent=True,
         ),
         source_branch="feature/false-redundant",
@@ -1183,16 +1232,16 @@ def test_resolve_task_merge_state_uses_recorded_head_when_source_ref_is_stale_an
         store=store,
         task=refreshed,
         git=_FakeGit(
-            source_ref="origin/feature/false-redundant",
-            ref_shas={"origin/feature/false-redundant": "base-sha", "main": "target-sha"},
-            tree_shas={"origin/feature/false-redundant": "shared-tree-sha", "main": "shared-tree-sha"},
+            source_ref="feature/false-redundant",
+            ref_shas={"feature/false-redundant": "base-sha", "main": "target-sha"},
+            tree_shas={"feature/false-redundant": "shared-tree-sha", "main": "shared-tree-sha"},
             ahead_count=0,
             merged=True,
             net_diff_by_ref={
-                "origin/feature/false-redundant": False,
+                "feature/false-redundant": False,
             },
             patch_present_by_commit={("recorded-head-sha", "main"): False},
-            ancestors={("recorded-head-sha", "origin/feature/false-redundant"): False},
+            ancestors={("recorded-head-sha", "feature/false-redundant"): False},
             on_first_parent=True,
         ),
         target_branch="main",
@@ -1274,6 +1323,83 @@ def test_resolve_task_merge_state_does_not_log_merge_source_warning_side_effect(
     assert warning not in caplog.text
 
 
+def test_resolve_task_merge_source_ignores_origin_only_fallback() -> None:
+    result = resolve_task_merge_source(
+        _MergeSourceResolverGit(
+            local_branches=set(),
+            existing_refs={"origin/feature/missing-local"},
+            fresh_source_ref="origin/feature/missing-local",
+            merge_source_ref="origin/feature/missing-local",
+        ),
+        "feature/missing-local",
+    )
+
+    assert result.ref is None
+
+
+def test_resolve_task_merge_source_ignores_fully_qualified_origin_fallback_without_proof_calls() -> None:
+    git = _MergeSourceResolverGit(
+        local_branches=set(),
+        existing_refs={"refs/remotes/origin/feature/missing-local"},
+        fresh_source_ref="refs/remotes/origin/feature/missing-local",
+        merge_source_ref="refs/remotes/origin/feature/missing-local",
+    )
+
+    result = resolve_task_merge_source(git, "feature/missing-local")
+
+    assert result.ref is None
+    assert result.warning is None
+    assert git.rev_parse_calls == []
+    assert git.is_ancestor_calls == []
+    assert git.is_merged_calls == []
+
+
+@pytest.mark.parametrize(
+    "remote_ref",
+    [
+        "refs/remotes/upstream/feature/missing-local",
+        "remotes/upstream/feature/missing-local",
+    ],
+)
+def test_resolve_task_merge_source_rejects_non_origin_remote_tracking_fallback_without_proof_calls(
+    remote_ref: str,
+) -> None:
+    git = _MergeSourceResolverGit(
+        local_branches=set(),
+        existing_refs={remote_ref},
+        fresh_source_ref=remote_ref,
+        merge_source_ref=remote_ref,
+    )
+
+    result = resolve_task_merge_source(git, "feature/missing-local")
+
+    assert result.ref is None
+    assert result.warning is None
+    assert git.rev_parse_calls == []
+    assert git.is_ancestor_calls == []
+    assert git.is_merged_calls == []
+
+
+def test_resolve_task_merge_source_prefers_local_branch_without_origin_warning() -> None:
+    git = _MergeSourceResolverGit(
+        local_branches={"feature/local-wins"},
+        existing_refs={"origin/feature/local-wins"},
+        fresh_source_ref="origin/feature/local-wins",
+        fresh_source_warning=(
+            "Local branch 'feature/local-wins' and remote-tracking ref "
+            "'origin/feature/local-wins' diverged. Push, fetch, or reconcile them before "
+            "advancing or merging."
+        ),
+        merge_source_ref="origin/feature/local-wins",
+    )
+
+    result = resolve_task_merge_source(git, "feature/local-wins")
+
+    assert result.ref == "feature/local-wins"
+    assert result.warning is None
+    assert git.resolve_fresh_merge_source_calls == []
+
+
 def test_classify_branch_merge_state_returns_unknown_without_persisted_state_for_missing_ref() -> None:
     result = classify_branch_merge_state_for_target(
         git=_FakeGit(source_ref=None, ref_shas={"main": "target-sha"}),
@@ -1284,3 +1410,24 @@ def test_classify_branch_merge_state_returns_unknown_without_persisted_state_for
 
     assert result.state == "unknown"
     assert result.reason == "missing-ref"
+
+
+def test_classify_branch_merge_state_uses_persisted_merged_when_source_is_unresolvable_locally(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING"):
+        result = classify_branch_merge_state_for_target(
+            git=_MergeSourceResolverGit(
+                local_branches=set(),
+                existing_refs={"origin/feature/already-merged"},
+                fresh_source_ref="origin/feature/already-merged",
+                merge_source_ref="origin/feature/already-merged",
+            ),
+            source_branch="feature/already-merged",
+            target_branch="main",
+            persisted_state="merged",
+        )
+
+    assert result.state == "merged"
+    assert result.reason == "missing-ref-persisted-state"
+    assert caplog.text == ""

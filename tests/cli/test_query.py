@@ -7991,6 +7991,7 @@ class TestShowCommand:
 
         git = MagicMock()
         git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
         git.can_merge.return_value = True
         git.worktree_list.return_value = []
 
@@ -8074,6 +8075,7 @@ class TestShowCommand:
 
         git = MagicMock()
         git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
         git.can_merge.return_value = True
         git.worktree_list.return_value = []
 
@@ -8143,6 +8145,7 @@ class TestShowCommand:
 
         git = MagicMock()
         git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
         git.can_merge.return_value = True
         git.worktree_list.return_value = []
 
@@ -8175,6 +8178,7 @@ class TestShowCommand:
 
         git = MagicMock()
         git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
         git.can_merge.return_value = True
         git.worktree_list.return_value = []
 
@@ -8655,6 +8659,7 @@ class TestShowCommand:
 
         git = MagicMock()
         git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
         git.can_merge.return_value = True
         git.worktree_list.return_value = []
 
@@ -9067,6 +9072,7 @@ class TestShowCommand:
 
         git = MagicMock()
         git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
         git.can_merge.return_value = True
         git.resolve_fresh_merge_source.return_value = ("origin/feature/stale-show", None)
         git.count_commits_behind.return_value = 1
@@ -14244,7 +14250,7 @@ class TestUnmergedSelectionBehavior:
         self,
         tmp_path: Path,
     ):
-        """Plain canonical unmerged should reuse an existing origin/default ref without fetching."""
+        """Plain canonical unmerged should ignore cached origin/default refs as merge proof."""
         store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Remote-only merged task",
@@ -14259,14 +14265,13 @@ class TestUnmergedSelectionBehavior:
 
         assert git.fetch_calls == []
         assert result.returncode == 0
-        assert "Remote-only merged task" not in result.stdout
-        assert "No unmerged tasks" in result.stdout
+        assert "Remote-only merged task" in result.stdout
         refreshed = store.get(task.id)
         assert refreshed is not None
-        assert refreshed.merge_status == "merged"
+        assert refreshed.merge_status == "unmerged"
 
     def test_unmerged_fetch_flag_fetches_origin_default_branch_before_canonical_reconcile(self, tmp_path: Path):
-        """`--fetch` should refresh origin/default merge evidence before canonical reconcile."""
+        """`--fetch` may refresh origin, but canonical reconcile still uses local merge proof."""
         store, task, git = setup_unmerged_env(
             tmp_path,
             task_prompt="Remote-only merged task",
@@ -14280,11 +14285,11 @@ class TestUnmergedSelectionBehavior:
         result = invoke_gza("unmerged", "--fetch", "--project", str(tmp_path))
 
         assert result.returncode == 0
-        assert "Remote-only merged task" not in result.stdout
-        assert "No unmerged tasks" in result.stdout
+        assert git.fetch_calls == ["origin"]
+        assert "Remote-only merged task" in result.stdout
         refreshed = store.get(task.id)
         assert refreshed is not None
-        assert refreshed.merge_status == "merged"
+        assert refreshed.merge_status == "unmerged"
 
     def test_unmerged_fetch_failure_fails_closed_without_rendering_stale_rows(self, tmp_path: Path):
         """`--fetch` should stop instead of showing stale rows after fetch failures."""
@@ -18640,7 +18645,7 @@ class TestIncompleteCommand:
         assert result == 0
         assert json.loads(captured.out) == [
             {
-                "id": impl.id,
+                "id": followup.id,
                 "unresolved_ids": [followup.id],
             }
         ]

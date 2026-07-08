@@ -325,23 +325,6 @@ def build_unmerged_branch_cohorts(store: SqliteTaskStore) -> list[BranchCohort]:
         store,
         store.get_canonical_unmerged_candidates(),
     )
-
-
-def _remote_branch_ref_for_reconcile(
-    git: Git,
-    branch: str,
-    *,
-    remote_target_ref: str | None,
-) -> str | None:
-    """Return a surviving remote feature ref that can prove merge truth."""
-    if remote_target_ref is None or not remote_target_ref.startswith("origin/"):
-        return None
-    remote_branch_ref = f"origin/{branch}"
-    if git.ref_exists(remote_branch_ref):
-        return remote_branch_ref
-    return None
-
-
 def reconcile_branch_merge_truth(
     git: Git,
     cohorts: list[BranchCohort],
@@ -354,11 +337,9 @@ def reconcile_branch_merge_truth(
     """Compute branch-scoped merge truth and optional diff stats without persistence.
 
     Missing local branches do not imply merged. Reconciliation requires explicit
-    target-branch proof from a surviving branch ref, typically the local feature
-    branch or a fetched ``origin/<feature>`` ref for canonical default-branch syncs.
-    A lagging remote proof target must not revoke an already-recorded merged state
-    unless the source branch itself has disappeared and no surviving ref can prove
-    merge truth.
+    target-branch proof from a surviving local branch ref. Remote-tracking refs may
+    still matter to host-side publication reconcile or PR metadata, but persisted
+    merge truth must be proven against the canonical local target branch only.
     """
     results: list[BranchSyncResult] = []
 
@@ -378,7 +359,7 @@ def reconcile_branch_merge_truth(
         source_owner_task = owner_tasks[0] if owner_tasks else code_tasks[0]
         source_has_commits = source_owner_task.has_commits
         desired_merge_status = owner_tasks[0].merge_status if owner_tasks else code_tasks[0].merge_status
-        proof_target_ref = remote_target_ref or target_branch
+        proof_target_ref = target_branch
         if (
             merge_state_is_terminal_for_lifecycle(cohort.merge_unit_state)
             and cohort.merge_unit_target_branch == target_branch
@@ -387,11 +368,7 @@ def reconcile_branch_merge_truth(
             continue
         try:
             local_branch_exists = git.branch_exists(cohort.branch)
-            reconcile_ref = cohort.branch if local_branch_exists else _remote_branch_ref_for_reconcile(
-                git,
-                cohort.branch,
-                remote_target_ref=remote_target_ref,
-            )
+            reconcile_ref = cohort.branch if local_branch_exists else None
             if reconcile_ref is None:
                 target_merged = None
             else:
@@ -402,7 +379,7 @@ def reconcile_branch_merge_truth(
             continue
 
         head_resolution = resolve_ref_if_possible(git, reconcile_ref)
-        base_resolution = resolve_ref_if_possible(git, remote_target_ref or target_branch)
+        base_resolution = resolve_ref_if_possible(git, target_branch)
         result.head_sha = head_resolution.sha
         result.base_sha = base_resolution.sha
         if head_resolution.warning is not None:
@@ -416,9 +393,8 @@ def reconcile_branch_merge_truth(
                     "preserving any stored head_sha"
                 )
             else:
-                target_ref = remote_target_ref or target_branch
                 result.warnings.append(
-                    f"degraded merge-unit provenance: could not resolve base SHA for '{target_ref}'; "
+                    f"degraded merge-unit provenance: could not resolve base SHA for '{target_branch}'; "
                     "preserving any stored base_sha"
                 )
 
@@ -439,6 +415,14 @@ def reconcile_branch_merge_truth(
             # Fail-closed: preserve a previously-proven "empty" state rather than
             # overwriting it with "unmerged". Emit a warning so operators know
             # reconciliation was incomplete.
+            if remote_target_ref is not None:
+                remote_branch_ref = f"origin/{cohort.branch}"
+                if git.ref_exists(remote_branch_ref):
+                    result.warnings.append(
+                        f"branch '{cohort.branch}': ignoring remote-only merge proof from "
+                        f"'{remote_branch_ref}' into '{remote_target_ref}'; canonical reconcile "
+                        f"requires a local branch against '{target_branch}'"
+                    )
             if cohort.merge_unit_state in {"empty", "redundant"}:
                 desired_merge_status = cohort.merge_unit_state
                 result.warnings.append(
@@ -452,10 +436,17 @@ def reconcile_branch_merge_truth(
             # Branch is inspectable but not proven merged against the target.
             # Use the F-A1 classifier to detect zero-commit empty branches.
             # Fail-closed to the existing state when commit count is unavailable.
+            if remote_target_ref is not None:
+                result.warnings.append(
+                    f"branch '{cohort.branch}': ignoring remote merge-proof target "
+                    f"'{remote_target_ref}'; canonical reconcile uses local target "
+                    f"'{target_branch}'"
+                )
             try:
                 classification = classify_branch_merge_state_for_target(
                     git=git,
-                    source_branch=reconcile_ref,
+                    source_branch=cohort.branch,
+                    source_ref=reconcile_ref,
                     target_branch=proof_target_ref,
                     persisted_state=cohort.merge_unit_state,
                     merged_proof=False,
@@ -1013,7 +1004,6 @@ def sync_branch_cohorts(
             eligible_cohorts,
             target_branch=default_branch,
             include_diff_stats=include_diff_stats,
-            remote_target_ref=remote_default_ref,
         )
     else:
         results = [

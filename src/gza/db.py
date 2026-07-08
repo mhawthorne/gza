@@ -10852,7 +10852,6 @@ def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
     if store.supports_merge_units():
         candidate_tasks = store.get_canonical_unmerged_candidates()
 
-    remote_default_ref: str | None = None
     remote_exists = getattr(git, "remote_exists", None)
     has_origin_remote = True
     if callable(remote_exists):
@@ -10878,7 +10877,11 @@ def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
         else:
             remote_default_candidate = f"origin/{default_branch}"
             if git.ref_exists(remote_default_candidate):
-                remote_default_ref = remote_default_candidate
+                logger.info(
+                    "Ignoring %s for merge-status backfill; canonical merge proof uses local target %s",
+                    remote_default_candidate,
+                    default_branch,
+                )
 
     cohorts = build_branch_cohorts_for_tasks(store, candidate_tasks)
     results = reconcile_branch_merge_truth(
@@ -10886,7 +10889,6 @@ def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
         cohorts,
         target_branch=default_branch,
         include_diff_stats=False,
-        remote_target_ref=remote_default_ref,
     )
     status_by_branch = {
         result.branch: result.merge_status

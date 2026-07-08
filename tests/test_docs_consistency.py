@@ -303,10 +303,21 @@ def test_stale_completed_rebase_spec_only_parks_when_current_target_tip_is_alrea
         "`merge-selection-conflict-rebase` above."
     ) in lifecycle_flat
     assert (
+        "If a selected-for-merge branch lacks any resolvable local merge source while persisted "
+        "merge state is still non-terminal, lifecycle MUST fail closed with `needs_discussion` "
+        "(`merge-source-needs-manual-resolution`) instead of planning or continuing rebase "
+        "automation from a remote-only/deleted source ref."
+    ) in lifecycle_flat
+    assert (
         "completed`, conflicts still remain, and the branch already contains the current target tip"
     ) in internal
     assert (
-        "only a stale completed rebase) and the branch does not already contain the target tip"
+        "if the selected merge candidate no longer has any resolvable local merge source, park it "
+        "with `needs_discussion` / `merge-source-needs-manual-resolution` instead of creating or "
+        "continuing rebase automation from a remote-only/deleted source ref"
+    ) in internal
+    assert (
+        "only a stale completed rebase), the branch does not already contain the target tip, and a local merge source is still resolvable"
     ) in internal
     assert (
         "a same-branch rebase child already completed AND the branch already contains the current target tip"
@@ -1779,6 +1790,34 @@ def test_plan_materialization_repair_docs_distinguish_repairable_from_ambiguous_
         "already complete while stale extra pending duplicate slice descendants remain outside the recorded "
         "set"
     ) in _normalize_whitespace(configuration)
+
+
+def test_lifecycle_merge_source_docs_keep_origin_out_of_local_merge_proof() -> None:
+    """Lifecycle docs/spec must keep origin inspection scoped to explicit host-side publication reconcile."""
+    repo_root = Path(__file__).resolve().parents[1]
+    rebase_flow = _normalize_whitespace((repo_root / "docs" / "internal" / "advance-rebase-flow.md").read_text())
+    workflow = _normalize_whitespace((repo_root / "docs" / "internal" / "advance-workflow.md").read_text())
+    lifecycle = _normalize_whitespace((repo_root / "specs" / "behavior" / "lifecycle-engine.md").read_text())
+
+    stale_phrases = (
+        "resolves the freshest available source ref for the implementation branch by comparing the local branch and "
+        "`origin/<branch>` when both exist",
+        "prefers `origin/<branch>` when the refs are equal or the remote-tracking ref is ahead",
+        "Local branch and `origin/<branch>` diverged | `reconcile_branch_divergence`",
+    )
+
+    for text in (rebase_flow, workflow, lifecycle):
+        for phrase in stale_phrases:
+            assert phrase not in text
+
+    assert "resolves lifecycle merge proof from local refs only" in rebase_flow
+    assert "Remote-only or divergent `origin/<branch>` state is therefore not merge-source proof for advance/watch" in rebase_flow
+    assert "advance/watch merge proof still uses confirmed local refs only" in workflow
+    assert "remote-only or divergent `origin/<branch>` is not merge-source proof" in workflow
+    assert "Lifecycle merge-source proof MUST use confirmed local refs only" in lifecycle
+    assert "Remote-only or divergent `origin/<branch>` state MUST NOT count as merge-source proof" in lifecycle
+    assert "explicit host-side publication reconcile" in workflow
+    assert "explicit host-side publication reconcile" in lifecycle
 
 
 def test_docker_setup_command_docs_describe_prewarm_hook_and_race_avoidance() -> None:

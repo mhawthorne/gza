@@ -64,8 +64,12 @@ def _advance_args(tmp_path: Path, **overrides) -> argparse.Namespace:
 def _mock_git(*, current_branch: str = "main", can_merge: bool = True, commit_count: int = 0) -> Mock:
     git = Mock()
     git.current_branch.return_value = current_branch
+    git.local_branch_names.return_value = ()
+    git.branch_exists.return_value = True
+    git.ref_exists.return_value = False
     git.can_merge.return_value = can_merge
     git.count_commits_ahead.return_value = commit_count
+    git.count_commits_ahead_checked.return_value = commit_count
     return git
 
 

@@ -175,6 +175,8 @@ def _make_preload_recording_git(tmp_path: Path) -> tuple[MagicMock, list[tuple[t
     fake_git.default_branch.return_value = "main"
     fake_git.current_branch.return_value = "main"
     fake_git.branch_exists.return_value = True
+    fake_git.branch_exists.return_value = True
+    fake_git.branch_exists.return_value = True
     fake_git.ref_exists.return_value = True
     fake_git.is_merged.return_value = False
     fake_git.has_changes.return_value = False
@@ -433,6 +435,7 @@ def test_merge_single_task_preflights_conflicts_before_merge(tmp_path, capsys) -
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -498,6 +501,7 @@ def test_merge_single_task_returns_blocked_dirty_checkout_status(tmp_path: Path,
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=True),
@@ -543,6 +547,7 @@ def test_merge_single_task_runs_shared_verify_gate_before_merge(tmp_path: Path) 
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -606,6 +611,7 @@ def test_merge_single_task_default_keeps_merge_mechanics_output(tmp_path: Path, 
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -648,6 +654,7 @@ def test_merge_single_task_quiet_mechanics_suppresses_default_success_output(
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -698,6 +705,7 @@ def test_merge_single_task_quiet_mechanics_keeps_squash_reconcile_warning_output
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -781,6 +789,7 @@ def test_merge_single_task_refuses_verify_only_blockers_without_flag(
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -852,6 +861,7 @@ def test_merge_single_task_refuses_verify_only_report_file_blockers_without_flag
     deferred_task = store.add("Deferred blocker B1", task_type="implement", based_on=review.id, depends_on=task.id)
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -921,6 +931,7 @@ def test_merge_single_task_refuses_non_verify_blockers_without_flag(
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -1000,6 +1011,7 @@ def test_merge_single_task_refuses_non_verify_report_file_blockers_with_normal_h
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -1079,6 +1091,7 @@ def test_merge_single_task_defer_blockers_flag_materializes_and_proceeds(
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -1149,6 +1162,7 @@ def test_merge_single_task_mark_only_materializes_blockers_before_marking_merged
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -1235,6 +1249,7 @@ def test_merge_single_task_no_followups_does_not_suppress_deferred_blockers(
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -1303,6 +1318,7 @@ def test_merge_single_task_mark_only_verify_only_blocker_without_flag_refuses(tm
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -1358,6 +1374,7 @@ def test_merge_single_task_same_merge_unit_review_on_representative_refuses_with
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -1416,6 +1433,7 @@ def test_merge_single_task_same_merge_unit_review_on_representative_defer_flag_m
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -1570,6 +1588,7 @@ def test_merge_single_task_same_merge_unit_verify_only_review_on_representative_
 
     git = SimpleNamespace(
         repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
@@ -2816,7 +2835,7 @@ def test_run_task_backed_rebase_reconciles_parent_merge_status_when_rebased_bran
     assert "needs_rebase" not in output
 
 
-def test_run_task_backed_rebase_remote_uses_fetched_target_ref_for_merge_proof(tmp_path) -> None:
+def test_run_task_backed_rebase_remote_uses_local_target_ref_for_merge_proof(tmp_path) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
     store = make_store(tmp_path)
@@ -2841,77 +2860,6 @@ def test_run_task_backed_rebase_remote_uses_fetched_target_ref_for_merge_proof(t
     worktree_git.current_branch.return_value = "feature/rebased"
     worktree_git.rebase.return_value = None
     worktree_git.branch_exists.return_value = True
-
-    def _is_merged(branch, into):
-        return into == "origin/main"
-
-    worktree_git.is_merged.side_effect = _is_merged
-    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
-        "feature/rebased": "head-remote",
-        "origin/main": "base-origin",
-        "main": "base-local-stale",
-    }.get(ref)
-
-    with (
-        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
-        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
-        patch("gza.cli.git_ops._branch_has_commits", return_value=True),
-        patch(
-            "gza.cli.git_ops.compute_rebase_changed_diff",
-            return_value=RebaseDiffResult(changed_diff=True, detail="yes (review must be refreshed)"),
-        ),
-    ):
-        rc = _run_task_backed_rebase(
-            config=config,
-            store=store,
-            rebase_task=rebase_task,
-            branch="feature/rebased",
-            target_branch="main",
-            remote=True,
-        )
-
-    assert rc == 0
-    worktree_git.rebase.assert_called_once_with("origin/main")
-    worktree_git.is_merged.assert_called_once_with("feature/rebased", into="origin/main")
-
-    refreshed_parent = store.get(parent.id)
-    assert refreshed_parent is not None
-    assert refreshed_parent.merge_status == "merged"
-    assert refreshed_parent.merged_at is not None
-
-    refreshed_unit = store.get_merge_unit(unit.id)
-    assert refreshed_unit is not None
-    assert refreshed_unit.state == "merged"
-    assert refreshed_unit.target_branch == "main"
-    assert refreshed_unit.base_sha == "base-origin"
-
-
-def test_run_task_backed_rebase_remote_does_not_mark_merged_from_stale_local_target(tmp_path) -> None:
-    setup_config(tmp_path)
-    config = Config.load(tmp_path)
-    store = make_store(tmp_path)
-
-    parent = store.add("Implement feature", task_type="implement")
-    store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
-    assert parent.id is not None
-    unit = store.resolve_merge_unit_for_task(parent.id)
-    assert unit is not None
-
-    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
-    rebase_task.branch = "feature/rebased"
-    store.update(rebase_task)
-
-    repo_git = MagicMock()
-    repo_git.current_branch.return_value = "main"
-    repo_git.fetch.return_value = None
-    repo_git.worktree_remove.return_value = None
-    repo_git._run.return_value = None
-
-    worktree_git = MagicMock()
-    worktree_git.current_branch.return_value = "feature/rebased"
-    worktree_git.rebase.return_value = None
-    worktree_git.branch_exists.return_value = True
-    worktree_git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
 
     def _is_merged(branch, into):
         return into == "main"
@@ -2943,7 +2891,78 @@ def test_run_task_backed_rebase_remote_does_not_mark_merged_from_stale_local_tar
 
     assert rc == 0
     worktree_git.rebase.assert_called_once_with("origin/main")
-    worktree_git.is_merged.assert_called_once_with("feature/rebased", into="origin/main")
+    worktree_git.is_merged.assert_called_once_with("feature/rebased", into="main")
+
+    refreshed_parent = store.get(parent.id)
+    assert refreshed_parent is not None
+    assert refreshed_parent.merge_status == "merged"
+    assert refreshed_parent.merged_at is not None
+
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "merged"
+    assert refreshed_unit.target_branch == "main"
+    assert refreshed_unit.base_sha == "base-local-stale"
+
+
+def test_run_task_backed_rebase_remote_does_not_mark_merged_from_stale_local_target(tmp_path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    parent = store.add("Implement feature", task_type="implement")
+    store.mark_completed(parent, has_commits=True, branch="feature/rebased", head_sha="head-old", base_sha="base-old")
+    assert parent.id is not None
+    unit = store.resolve_merge_unit_for_task(parent.id)
+    assert unit is not None
+
+    rebase_task = store.add("Rebase feature", task_type="rebase", based_on=parent.id, same_branch=True)
+    rebase_task.branch = "feature/rebased"
+    store.update(rebase_task)
+
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "main"
+    repo_git.fetch.return_value = None
+    repo_git.worktree_remove.return_value = None
+    repo_git._run.return_value = None
+
+    worktree_git = MagicMock()
+    worktree_git.current_branch.return_value = "feature/rebased"
+    worktree_git.rebase.return_value = None
+    worktree_git.branch_exists.return_value = True
+    worktree_git.get_diff_numstat.return_value = "2\t1\tfeature.txt\n"
+
+    def _is_merged(branch, into):
+        return into == "origin/main"
+
+    worktree_git.is_merged.side_effect = _is_merged
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "feature/rebased": "head-remote",
+        "origin/main": "base-origin",
+        "main": "base-local-stale",
+    }.get(ref)
+
+    with (
+        patch("gza.cli.git_ops.Git", side_effect=[repo_git, worktree_git]),
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch("gza.cli.git_ops._branch_has_commits", return_value=True),
+        patch(
+            "gza.cli.git_ops.compute_rebase_changed_diff",
+            return_value=RebaseDiffResult(changed_diff=True, detail="yes (review must be refreshed)"),
+        ),
+    ):
+        rc = _run_task_backed_rebase(
+            config=config,
+            store=store,
+            rebase_task=rebase_task,
+            branch="feature/rebased",
+            target_branch="main",
+            remote=True,
+        )
+
+    assert rc == 0
+    worktree_git.rebase.assert_called_once_with("origin/main")
+    worktree_git.is_merged.assert_called_once_with("feature/rebased", into="main")
 
     refreshed_parent = store.get(parent.id)
     assert refreshed_parent is not None
@@ -2954,7 +2973,7 @@ def test_run_task_backed_rebase_remote_does_not_mark_merged_from_stale_local_tar
     assert refreshed_unit is not None
     assert refreshed_unit.state == "unmerged"
     assert refreshed_unit.target_branch == "main"
-    assert refreshed_unit.base_sha == "base-origin"
+    assert refreshed_unit.base_sha == "base-local-stale"
 
 
 def test_run_task_backed_rebase_failure_does_not_reconcile_parent_merge_status(tmp_path) -> None:
@@ -3587,7 +3606,7 @@ def test_advance_explicit_merge_refuses_when_checkout_does_not_match_canonical_t
     fake_git.is_merged.assert_called()
 
 
-def test_advance_execution_merges_remote_tracking_ref_when_local_branch_is_missing(
+def test_advance_execution_remote_only_ref_now_requires_manual_resolution_when_local_branch_is_missing(
     tmp_path: Path,
     monkeypatch,
     capsys,
@@ -3627,7 +3646,7 @@ def test_advance_execution_merges_remote_tracking_ref_when_local_branch_is_missi
         patch("gza.cli.git_ops.Git", return_value=fake_git),
         patch("gza.git.Git", return_value=fake_git),
     ):
-        rc = cmd_advance(_advance_args(tmp_path, task.id))
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, task.id)), "dry_run": True}))
 
     assert rc == 0
     refreshed = store.get(task.id)
@@ -3637,8 +3656,11 @@ def test_advance_execution_merges_remote_tracking_ref_when_local_branch_is_missi
     fake_git.merge.assert_not_called()
 
     output = capsys.readouterr().out
-    assert "Run verify gate before merge" in output
-    assert "verify epoch is unavailable; merge is blocked" in output
+    assert f"fresh merge source for branch '{branch}' is unavailable" in output
+    assert "cannot auto-merge without a" in output
+    assert "resolvable local source" in output
+    assert "rebase --resolve (conflicts detected)" not in output
+    assert f"Merging 'origin/{branch}' into 'main'" not in output
 
 
 def test_cmd_advance_wraps_planning_in_git_cache(tmp_path: Path) -> None:
@@ -4493,9 +4515,9 @@ def test_cmd_advance_explicit_task_plans_only_requested_lineage_refs(
         rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, requested.id)), "dry_run": True}))
 
     assert rc == 0
-    assert merge_sources
-    assert set(merge_sources) == {requested.branch}
-    assert set(merge_checks) == {f"origin/{requested.branch}"}
+    assert merge_sources == []
+    assert merge_checks
+    assert set(merge_checks) == {requested.branch}
     _assert_scoped_preload_refs(
         ref_calls,
         branch_calls,
@@ -4785,7 +4807,7 @@ def test_cmd_advance_explicit_dropped_owner_fallback_preloads_only_requested_lin
     )
 
 
-def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(
+def test_advance_execution_remote_only_fresh_ref_no_longer_overrides_stale_local_branch(
     tmp_path: Path,
     monkeypatch,
     capsys,
@@ -4825,7 +4847,7 @@ def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(
         patch("gza.cli.git_ops.Git", return_value=fake_git),
         patch("gza.git.Git", return_value=fake_git),
     ):
-        rc = cmd_advance(_advance_args(tmp_path, task.id))
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, task.id)), "dry_run": True}))
 
     assert rc == 0
     refreshed = store.get(task.id)
@@ -4835,8 +4857,10 @@ def test_advance_execution_prefers_remote_tracking_ref_over_stale_local_branch(
     fake_git.merge.assert_not_called()
 
     output = capsys.readouterr().out
+    assert "Would advance 1 task(s):" in output
     assert "Run verify gate before merge" in output
-    assert "verify epoch is unavailable; merge is blocked" in output
+    assert f"Merging 'origin/{branch}' into 'main'" not in output
+    assert f"Merging '{branch}' into 'main'" not in output
 
 
 def test_advance_execution_prefers_local_branch_when_origin_is_stale(
@@ -4899,6 +4923,135 @@ def test_advance_execution_prefers_local_branch_when_origin_is_stale(
     output = capsys.readouterr().out
     assert "Run verify gate before merge" in output
     assert "verify epoch is unavailable; merge is blocked" in output
+
+
+def test_cmd_advance_execution_fails_closed_when_only_origin_branch_exists(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    task.branch = "feature/advance-origin-only"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="merge",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = False
+    fake_git.ref_exists.return_value = True
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(f"origin/{task.branch}")
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.merge.return_value = None
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={"type": "merge", "description": "Merge"},
+        ),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    assert rc == 1
+    assert all(call_args.args[0] != f"origin/{task.branch}" for call_args in fake_git.is_merged.call_args_list)
+    assert all(call_args.args[0] != f"origin/{task.branch}" for call_args in fake_git.can_merge.call_args_list)
+    assert all(call_args.args[0] != f"origin/{task.branch}" for call_args in fake_git.merge.call_args_list)
+    output = capsys.readouterr().out
+    assert f"Error: Task {task.id} has no resolvable merge source" in output
+    assert f"Merging 'origin/{task.branch}' into 'main'" not in output
+
+
+def test_cmd_advance_execution_uses_local_branch_when_origin_ref_is_reported(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Implement feature", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime(2026, 5, 10, 9, 0, tzinfo=UTC)
+    task.branch = "feature/advance-local-only-proof"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="merge",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
+    fake_git.ref_exists.return_value = True
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(f"origin/{task.branch}")
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+    fake_git.merge.return_value = None
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={"type": "merge", "description": "Merge"},
+        ),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    assert rc == 0
+    fake_git.merge.assert_called_once()
+    assert fake_git.merge.call_args.args[0] == task.branch
+    assert all(call_args.args[0] != f"origin/{task.branch}" for call_args in fake_git.is_merged.call_args_list)
+    assert all(call_args.args[0] != f"origin/{task.branch}" for call_args in fake_git.can_merge.call_args_list)
+    output = capsys.readouterr().out
+    assert f"Merging '{task.branch}' into 'main'" in output
+    assert f"Merging 'origin/{task.branch}' into 'main'" not in output
 
 
 def test_reconcile_diverged_branch_with_origin_force_pushes_gza_rewrite(tmp_path: Path) -> None:
@@ -5388,7 +5541,7 @@ def test_advance_dry_run_surfaces_diverged_merge_source_for_reconcile(
     output = capsys.readouterr().out
     assert rc == 0
     assert "Would advance 1 task(s):" in output
-    assert "Reconcile diverged local/origin refs" in output
+    assert "Run verify gate before review" in output
     assert "Needs attention" not in output
 
 
@@ -5426,6 +5579,7 @@ def test_cmd_advance_uses_shared_lifecycle_execution_gate(
     fake_git.repo_dir = tmp_path
     fake_git.default_branch.return_value = "main"
     fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.return_value = True
 
     gate_calls: list[tuple[str, int]] = []
 
@@ -5750,6 +5904,78 @@ def test_cmd_advance_reprojected_selected_merge_rebase_respects_zero_worker_capa
     assert "already at max concurrent tasks: 1 running, limit is 1, skipping" in output
     execute_action.assert_not_called()
     execute_merge.assert_not_called()
+
+
+def test_cmd_advance_reprojected_selected_merge_candidate_with_only_origin_branch_parks_for_manual_resolution(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Advance remote-only selected merge candidate", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
+    task.branch = "feature/advance-selected-origin-only"
+    task.merge_status = "unmerged"
+    task.has_commits = True
+    store.update(task)
+
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "merge", "description": "Merge"},
+        next_action_reason="merge",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    fake_git = MagicMock(spec=Git)
+    fake_git.repo_dir = tmp_path
+    fake_git.default_branch.return_value = "main"
+    fake_git.current_branch.return_value = "main"
+    fake_git.branch_exists.side_effect = lambda branch_name: branch_name != task.branch
+    fake_git.ref_exists.side_effect = lambda ref: ref == f"origin/{task.branch}"
+    fake_git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef(f"origin/{task.branch}")
+    fake_git.is_merged.return_value = False
+    fake_git.has_changes.return_value = False
+    fake_git.can_merge.return_value = True
+    fake_git.count_commits_ahead.return_value = 1
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch(
+            "gza.cli.git_ops.get_concurrency_snapshot",
+            return_value=SimpleNamespace(available=1, running=0, limit=1),
+        ),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.cli.git_ops.execute_advance_action") as execute_action,
+        patch("gza.cli.git_ops._execute_merge_action") as execute_merge,
+    ):
+        dry_run_rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, task.id)), "dry_run": True}))
+        execute_rc = cmd_advance(_advance_args(tmp_path, task.id))
+
+    output = capsys.readouterr().out
+    assert dry_run_rc == 0
+    assert execute_rc == 0
+    assert "Would create rebase task" not in output
+    assert "Started rebase" not in output
+    assert "rebase --resolve (conflicts detected)" not in output
+    assert "No eligible tasks to advance" in output
+    execute_action.assert_not_called()
+    execute_merge.assert_not_called()
+    assert all(call.args[0] != f"origin/{task.branch}" for call in fake_git.is_merged.call_args_list)
+    assert all(call.args[0] != f"origin/{task.branch}" for call in fake_git.can_merge.call_args_list)
+    assert all(call.args[0] != f"origin/{task.branch}" for call in fake_git.is_ancestor.call_args_list)
 
 
 def test_cmd_advance_all_tasks_query_uses_one_read_session_connection(

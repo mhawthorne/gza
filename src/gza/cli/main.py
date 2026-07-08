@@ -752,8 +752,9 @@ def main() -> int:
         "--fetch",
         action="store_true",
         help=(
-            "Fetch `origin` before the canonical default-branch refresh so `origin/<default>` "
-            "merge evidence is current. Has no effect with `--into-current` or `--target`."
+            "Fetch `origin` before the canonical default-branch refresh so host-side publication "
+            "or PR metadata can use fresh remote-tracking refs. Canonical merge proof still uses "
+            "local branch state only. Has no effect with `--into-current` or `--target`."
         ),
     )
     target_group = unmerged_parser.add_mutually_exclusive_group()

@@ -23,11 +23,21 @@ from gza.db import (
     task_id_numeric_key,
     task_owns_merge_status,
 )
-from gza.flaky_investigations import FlakyInvestigationEvidence
+from gza.flaky_investigations import (
+    FlakyInvestigationEvidence,
+)
 from gza.git import ResolvedMergeSourceRef
 from gza.lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from gza.lineage import resolve_impl_task, walk_ancestors, walk_based_on_descendants
-from gza.merge_state import resolve_task_merge_state_for_target
+from gza.merge_state import (
+    is_local_merge_proof_ref,
+    resolve_task_merge_source,
+    resolve_task_merge_state_for_target,
+)
+from gza.off_topic_verify import (
+    classify_failure_diff_scope,
+    parse_review_verify_failure_set,
+)
 from gza.operator_state import terminal_no_work_lifecycle_detail
 from gza.plan_review_materialization import (
     build_plan_review_slice_task_specs,
@@ -507,28 +517,7 @@ class SpecCoherenceInspection:
 
 def _resolve_current_merge_source(git: Any, branch: str) -> ResolvedMergeSourceRef:
     """Return the merge source chosen for advance planning and any warning."""
-    resolve_fresh = getattr(git, "resolve_fresh_merge_source", None)
-    if callable(resolve_fresh):
-        resolved = resolve_fresh(branch)
-        if isinstance(resolved, ResolvedMergeSourceRef):
-            return resolved
-        if isinstance(resolved, tuple) and len(resolved) == 2:
-            return ResolvedMergeSourceRef(resolved[0], resolved[1])
-        if isinstance(resolved, str):
-            return ResolvedMergeSourceRef(resolved)
-        if resolved is None:
-            return ResolvedMergeSourceRef(None)
-
-    resolve_fresh_ref = getattr(git, "resolve_fresh_merge_source_ref", None)
-    if callable(resolve_fresh_ref):
-        return ResolvedMergeSourceRef(resolve_fresh_ref(branch))
-
-    ref_exists = getattr(git, "ref_exists", None)
-    if callable(ref_exists):
-        remote_ref = f"origin/{branch}"
-        if ref_exists(remote_ref):
-            return ResolvedMergeSourceRef(remote_ref)
-    return ResolvedMergeSourceRef(branch)
+    return resolve_task_merge_source(git, branch)
 
 
 def resolve_post_merge_rebase_state(
@@ -628,6 +617,21 @@ def resolve_post_merge_rebase_state(
             warning=(
                 f"fresh merge source for branch '{branch_name}' is unavailable; "
                 "cannot resolve post-merge rebase state"
+            ),
+        )
+    if not is_local_merge_proof_ref(proof_ref, branch_name):
+        return PostMergeRebaseState(
+            merge_unit_state=merge_unit_state,
+            branch_tip_sha=None,
+            target_tip_sha=None,
+            target_is_ancestor_of_branch=None,
+            branch_equals_target=False,
+            already_merged=False,
+            rebase_resolution_proved=False,
+            reason=None,
+            warning=(
+                f"fresh merge source for branch '{branch_name}' resolved to non-local ref "
+                f"'{proof_ref}', which is unavailable for local lifecycle proof"
             ),
         )
 
@@ -1213,8 +1217,6 @@ def _classify_off_topic_noop_improve_verify_clearance(
     persist: bool,
 ) -> tuple[bool, datetime | None, str | None, tuple[str, ...], tuple[str, ...]]:
     from gza.off_topic_verify import (
-        classify_failure_diff_scope,
-        parse_review_verify_failure_set,
         run_local_target_baseline_plan,
         select_local_target_baseline_plan,
     )
@@ -3297,6 +3299,66 @@ def needs_attention_recommended_next_step(
 def is_diverged_merge_source_warning(warning: str | None) -> bool:
     """Return True when the merge-source warning indicates local/remote divergence."""
     return isinstance(warning, str) and "diverged" in warning.lower()
+
+
+def _missing_local_merge_source_requires_manual_resolution(ctx: AdvanceContext) -> bool:
+    """Return whether lifecycle lacks any resolvable local merge source."""
+    if ctx.merge_source_warning is not None:
+        return False
+    if ctx.merge_source_ref is not None:
+        return False
+    branch_name = ctx.task.branch
+    if not branch_name:
+        return False
+    if ctx.post_merge_rebase_state is not None and ctx.post_merge_rebase_state.already_merged:
+        return False
+    return not merge_state_is_terminal_for_lifecycle(ctx.merge_state)
+
+
+def _merge_source_unavailable_requires_manual_resolution(ctx: AdvanceContext) -> bool:
+    """Return whether auto-merge must fail closed for a missing local merge source."""
+    return execution_status_allows_merge(ctx) and _missing_local_merge_source_requires_manual_resolution(ctx)
+
+
+def _review_automation_blocked_by_missing_local_merge_source(ctx: AdvanceContext) -> bool:
+    """Return whether pre-review verify/review automation must park for local source repair."""
+    if not _is_implementation_owned_lineage(ctx):
+        return False
+    if not ctx.requires_review:
+        return False
+    if not _missing_local_merge_source_requires_manual_resolution(ctx):
+        return False
+    action = ctx.closing_review_action
+    if action is not None:
+        action_type = action.get("type")
+        if action_type not in {"create_review", "run_review"}:
+            return False
+        if action_type == "create_review" and not ctx.create_reviews:
+            return False
+        return True
+    return ctx.create_reviews and ctx.active_review is None and ctx.latest_completed_review is None
+
+
+def _merge_source_unavailable_manual_resolution_action(ctx: AdvanceContext) -> dict[str, Any]:
+    """Park lifecycle when a live auto-merge path lacks a resolvable local source."""
+    branch_name = ctx.task.branch or "<unknown>"
+    description = (
+        f"SKIP: fresh merge source for branch '{branch_name}' is unavailable; "
+        "cannot auto-merge without a resolvable local source"
+    )
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": description,
+        },
+        reason="merge-source-needs-manual-resolution",
+        subject_task_id=ctx.task.id,
+    )
+
+
+def _can_emit_live_merge_action(ctx: AdvanceContext) -> bool:
+    """Return whether planner merge actions have sufficient local merge proof."""
+    return execution_status_allows_merge(ctx) and not _merge_source_unavailable_requires_manual_resolution(ctx)
 
 
 def classify_advance_action(action: Mapping[str, Any]) -> str:
@@ -6544,6 +6606,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
         matches=lambda ctx: (
             ctx.selected_for_merge
             and not ctx.can_merge
+            and not _merge_source_unavailable_requires_manual_resolution(ctx)
             and ctx.rebase_pending_or_running is None
             and not _branch_contains_target_tip(ctx)
         ),
@@ -6603,9 +6666,28 @@ ADVANCE_RULES: list[AdvanceRule] = [
         ),
     ),
     AdvanceRule(
+        name="review_automation_merge_source_requires_manual_resolution",
+        matches=_review_automation_blocked_by_missing_local_merge_source,
+        action=_merge_source_unavailable_manual_resolution_action,
+    ),
+    AdvanceRule(
         name="pre_review_verify_fix",
         matches=_pre_review_verify_fix_required,
         action=_pre_review_verify_fix_action,
+    ),
+    AdvanceRule(
+        name="review_merge_source_requires_manual_resolution",
+        matches=lambda ctx: _merge_source_unavailable_requires_manual_resolution(ctx)
+        and has_valid_review_for_merge(ctx)
+        and (
+            (ctx.review_cleared and ctx.latest_completed_review is not None)
+            or (
+                (not ctx.review_cleared)
+                and ctx.latest_completed_review is not None
+                and ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
+            )
+        ),
+        action=_merge_source_unavailable_manual_resolution_action,
     ),
     AdvanceRule(
         name="pre_review_verify_gate",
@@ -6759,7 +6841,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_approved_with_followups",
-        matches=lambda ctx: execution_status_allows_merge(ctx)
+        matches=lambda ctx: _can_emit_live_merge_action(ctx)
         and has_valid_review_for_merge(ctx)
         and (not ctx.review_cleared)
         and ctx.latest_completed_review is not None
@@ -6774,7 +6856,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_approved",
-        matches=lambda ctx: execution_status_allows_merge(ctx)
+        matches=lambda ctx: _can_emit_live_merge_action(ctx)
         and has_valid_review_for_merge(ctx)
         and (not ctx.review_cleared)
         and ctx.latest_completed_review is not None
@@ -6962,7 +7044,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_cleared_but_sibling_review_unresolved",
-        matches=lambda ctx: execution_status_allows_merge(ctx)
+        matches=lambda ctx: _can_emit_live_merge_action(ctx)
         and has_valid_review_for_merge(ctx)
         and ctx.review_cleared
         and ctx.latest_completed_review is not None
@@ -6971,15 +7053,21 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="reviews_all_cleared",
-        matches=lambda ctx: execution_status_allows_merge(ctx)
+        matches=lambda ctx: _can_emit_live_merge_action(ctx)
         and has_valid_review_for_merge(ctx)
         and ctx.review_cleared
         and ctx.latest_completed_review is not None,
         action=_merge_review_cleared_action,
     ),
     AdvanceRule(
+        name="no_review_merge_source_requires_manual_resolution",
+        matches=lambda ctx: _merge_source_unavailable_requires_manual_resolution(ctx)
+        and (not _is_implementation_owned_lineage(ctx) or not ctx.requires_review),
+        action=_merge_source_unavailable_manual_resolution_action,
+    ),
+    AdvanceRule(
         name="non_implement_no_review",
-        matches=lambda ctx: execution_status_allows_merge(ctx) and not _is_implementation_owned_lineage(ctx),
+        matches=lambda ctx: _can_emit_live_merge_action(ctx) and not _is_implementation_owned_lineage(ctx),
         action=lambda ctx: {"type": "merge", "description": "Merge task (no review yet)"},
     ),
     AdvanceRule(
@@ -7012,7 +7100,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="implement_no_review_required",
-        matches=lambda ctx: execution_status_allows_merge(ctx) and not ctx.requires_review,
+        matches=lambda ctx: _can_emit_live_merge_action(ctx) and not ctx.requires_review,
         action=lambda ctx: {"type": "merge", "description": "Merge task (no review yet)"},
     ),
 ]

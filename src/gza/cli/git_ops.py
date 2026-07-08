@@ -79,7 +79,7 @@ from ..main_integration_verify import (
     promote_candidate_integration_verify_evidence,
     verify_gate_enabled,
 )
-from ..merge_state import resolve_task_merge_state_for_target
+from ..merge_state import resolve_task_merge_source, resolve_task_merge_state_for_target
 from ..pickup import (
     count_worker_consuming_actions,
     get_runnable_pending_tasks,
@@ -797,39 +797,10 @@ def _coerce_merge_single_task_result(result: int | _MergeSingleTaskResult) -> _M
 
 
 def _resolve_fresh_merge_source(git: Git, branch: str | None) -> ResolvedMergeSourceRef:
-    """Return the freshest merge source ref supported by this git runtime."""
+    """Return the local-only merge source ref used by lifecycle merge execution."""
     if not branch:
         return ResolvedMergeSourceRef(None)
-
-    resolve_fresh = getattr(git, "resolve_fresh_merge_source", None)
-    if callable(resolve_fresh):
-        resolved = resolve_fresh(branch)
-        if isinstance(resolved, ResolvedMergeSourceRef):
-            return resolved
-        if isinstance(resolved, tuple) and len(resolved) == 2:
-            return ResolvedMergeSourceRef(resolved[0], resolved[1])
-        if isinstance(resolved, str):
-            return ResolvedMergeSourceRef(resolved)
-        if resolved is None:
-            return ResolvedMergeSourceRef(None)
-
-    resolve_fresh_ref = getattr(git, "resolve_fresh_merge_source_ref", None)
-    if callable(resolve_fresh_ref):
-        return ResolvedMergeSourceRef(resolve_fresh_ref(branch))
-
-    ref_exists = getattr(git, "ref_exists", None)
-    if callable(ref_exists):
-        remote_ref = f"origin/{branch}"
-        if ref_exists(remote_ref):
-            return ResolvedMergeSourceRef(remote_ref)
-
-    branch_exists = getattr(git, "branch_exists", None)
-    if callable(branch_exists):
-        if branch_exists(branch):
-            return ResolvedMergeSourceRef(branch)
-        return ResolvedMergeSourceRef(None)
-
-    return ResolvedMergeSourceRef(branch)
+    return resolve_task_merge_source(git, branch)
 
 
 def _task_is_already_merged(store: SqliteTaskStore, task: DbTask) -> bool:
@@ -2391,7 +2362,6 @@ def _run_task_backed_rebase(
                 target_parent_id,
                 target_branch=target_branch,
                 include_diff_stats=True,
-                remote_target_ref=rebase_target if remote else None,
             )
             for warning in reconciliation.warnings:
                 logger.warning(warning)

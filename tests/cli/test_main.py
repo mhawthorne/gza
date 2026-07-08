@@ -962,15 +962,20 @@ class TestHelpOutput:
         assert "--list-fields" in unmerged_help.stdout
         assert "Show last N unmerged tasks (default: 5, 0 for all)" in help_text
         assert "Fetch `origin` before the canonical default-branch refresh" in help_text
+        assert "host-side publication or PR metadata can use fresh remote-tracking refs" in help_text
+        assert "Canonical merge proof still uses local branch state only" in help_text
         assert "Has no effect with `--into-current` or `--target`" in help_text
         assert "Projection fields override" in help_text
         assert "works in text or JSON mode" in help_text
         assert "Output JSON rows from the unified query API" in help_text
+        assert "origin/<default>` merge evidence is current" not in help_text
 
         assert "uv run gza unmerged [options]" in docs_text
         assert "\ngza unmerged [options]\n" not in docs_raw
         assert "`uv run gza unmerged` is the daily merge-truth command" in docs_text
         assert "`--fetch` | Fetch `origin` before the canonical default-branch refresh" in docs_text
+        assert "host-side publication or PR metadata can use fresh remote-tracking refs" in docs_text
+        assert "Canonical merge proof still uses local branch state only" in docs_text
         assert "| `--json` | Output JSON rows from the unified query API |" in docs_text
         assert "| `--fields CSV` | Projection field override" in docs_text
         assert "| `--list-fields` | List valid `--fields` values for this command and exit |" in docs_text
@@ -982,6 +987,7 @@ class TestHelpOutput:
         assert "builds an unmerged-specific query preset and then renders that result through the shared query projection/presentation path" in docs_text
         assert "logs concise progress for the refresh, query, and render phases" in docs_text
         assert "showing only the selected branch-owner task and its descendants" in docs_text
+        assert "origin/<default>` merge evidence is current" not in docs_text
 
     def test_stale_unmerged_help_and_docs_describe_json_execute_contract(self, tmp_path):
         """stale-unmerged help/docs should state that JSON mode still honors execution."""

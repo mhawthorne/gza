@@ -1342,7 +1342,7 @@ def test_is_resolved_by_landed_lineage_uses_existing_branch_set_and_branch_resol
 
     assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
     assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
-    assert git.branch_exists_calls == 0
+    assert git.branch_exists_calls == 1
     assert git.is_merged_calls == 1
     assert git.count_commits_ahead_checked_calls == 1
 

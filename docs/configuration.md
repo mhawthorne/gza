@@ -1261,20 +1261,20 @@ uv run gza unmerged [options]
 | Option | Description |
 |--------|-------------|
 | `-n N` | Show last N unmerged tasks (default: 5, `0` for all) |
-| `--fetch` | Fetch `origin` before the canonical default-branch refresh so `origin/<default>` merge evidence is current. Has no effect with `--into-current` or `--target` |
+| `--fetch` | Fetch `origin` before the canonical default-branch refresh so host-side publication or PR metadata can use fresh remote-tracking refs. Canonical merge proof still uses local branch state only. Has no effect with `--into-current` or `--target` |
 | `--into-current` | Compare against the current branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
 | `--target BRANCH` | Compare against the specified branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
 | `--json` | Output JSON rows from the unified query API |
 | `--fields CSV` | Projection field override (for example `id,prompt`). In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
 | `--list-fields` | List valid `--fields` values for this command and exit |
 
-`uv run gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills merge units when needed, refreshes canonical branch-cohort merge truth from local git plus any already-present `origin/<default-branch>` remote-tracking ref, persists merge-unit state and diff stats for the real default target branch, dual-writes compatibility task merge fields, and then prints the reconciled default-branch unmerged list. Same-branch improve/fix/rebase/review follow-ups may validly keep `merge_status = NULL` because the owning implementation row carries the shared branch merge truth while all related rows remain attached to the same merge unit.
+`uv run gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills merge units when needed, refreshes canonical branch-cohort merge truth from local git, persists merge-unit state and diff stats for the real default target branch, dual-writes compatibility task merge fields, and then prints the reconciled default-branch unmerged list. Same-branch improve/fix/rebase/review follow-ups may validly keep `merge_status = NULL` because the owning implementation row carries the shared branch merge truth while all related rows remain attached to the same merge unit.
 
 This is the deliberate narrow exception to the usual read-only query convention: only plain default-branch `uv run gza unmerged` mutates, because its entire purpose is to answer the canonical question "what still needs to be merged?" without leaving stale cached rows behind.
 
-By default, plain `uv run gza unmerged` does not initiate network I/O. It reuses any already-present `origin/<default-branch>` remote-tracking ref if one exists locally, but otherwise relies on local branch state. Pass `--fetch` to opt into the older fetch-then-reconcile behavior and refresh `origin/*` first.
+By default, plain `uv run gza unmerged` does not initiate network I/O and relies on local branch state for merge proof. Pass `--fetch` when a host-side sync flow also needs refreshed remote-tracking refs for publication or PR metadata work.
 
-Deleted local feature branches are not treated as merge proof by themselves. Canonical reconciliation keeps them unmerged and visible until the target branch is explicitly proven to contain the changes, for example via a surviving `origin/<feature>` ref or merged PR metadata from `gza sync`.
+Deleted local feature branches are not treated as merge proof by themselves. Canonical reconciliation keeps them unmerged and visible until a local proof path or separate publication/PR evidence confirms the work landed; remote-tracking refs are not persisted as merge proof.
 
 If the canonical default-branch refresh cannot persist because the database is read-only, `uv run gza unmerged` fails with a targeted error instead of silently falling back to stale split-brain behavior.
 

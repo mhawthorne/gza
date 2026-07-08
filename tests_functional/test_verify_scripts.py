@@ -523,7 +523,10 @@ def test_quick_verify_runs_ruff_phase_against_src_gza_with_project_venv(tmp_path
     assert "gza-verify phase=start name=ruff" in result.stdout
     assert "gza-verify phase=passed name=ruff duration_seconds=" in result.stdout
     tool_invocations = tool_log.read_text(encoding="utf-8")
-    assert f"python -m gza.tools.verify_phase ruff -- {venv_bin / 'ruff'} check src/gza/" in tool_invocations
+    assert (
+        f"python -m gza.tools.verify_phase ruff -- {venv_bin / 'ruff'} check "
+        "src/gza/"
+    ) in tool_invocations
     assert "uv run ruff check src/gza/" not in tool_invocations
 
 
@@ -625,6 +628,11 @@ def test_full_verify_ruff_command_matches_bin_tests_modes(tmp_path: Path) -> Non
 @pytest.mark.timeout(30, method="signal")
 def test_verify_phase_ruff_passes_for_full_src_tree_on_real_repo() -> None:
     repo_root = Path(__file__).resolve().parents[1]
+    git_metadata = repo_root / ".git"
+    try:
+        git_metadata.read_bytes()
+    except OSError as exc:
+        pytest.skip(f"real-repo git metadata is unavailable in this environment: {exc}")
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{repo_root / 'src'}:{repo_root}:{env.get('PYTHONPATH', '')}".rstrip(":")
 

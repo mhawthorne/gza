@@ -68,7 +68,7 @@ from ..git import Git
 from ..lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from ..lineage import resolve_impl_task
 from ..log_paths import ops_log_path_for
-from ..merge_state import resolve_task_merge_state_for_target
+from ..merge_state import effective_no_work_merge_state, resolve_task_merge_state_for_target
 from ..operator_state import blocked_dependency_error_message
 from ..plan_review_verdict import PlanReviewManifest, get_plan_review_outcome, validate_plan_review_manifest
 from ..prompts import PromptBuilder
@@ -597,13 +597,20 @@ def _format_iterate_terminal_merge_state_message(
     merge_state: str | None,
 ) -> str | None:
     """Return the operator-facing noop message for terminal iterate merge states."""
-    if not merge_state_is_terminal_for_lifecycle(merge_state):
+    effective_merge_state = (
+        merge_state
+        if resolved_from_failed_ancestor
+        else effective_no_work_merge_state(iterate_task, merge_state)
+    )
+    if not merge_state_is_terminal_for_lifecycle(effective_merge_state):
         return None
 
-    if merge_state in {"empty", "redundant"}:
+    if effective_merge_state in {"empty", "redundant"}:
         if resolve_pending_recovery_execution_mode(iterate_task) is not None:
             return None
-        empty_recovery_state = _classify_empty_task_recovery_state(store, iterate_task, merge_state=merge_state)
+        empty_recovery_state = _classify_empty_task_recovery_state(
+            store, iterate_task, merge_state=effective_merge_state
+        )
         if empty_recovery_state == "requires_recovery":
             return None
         if empty_recovery_state == "resolved" and iterate_task.status == "failed":
@@ -612,7 +619,7 @@ def _format_iterate_terminal_merge_state_message(
                 f"failed implementation {iterate_task.id} was already resolved by landed lineage or completed "
                 "recovery work."
             )
-        if merge_state == "redundant":
+        if effective_merge_state == "redundant":
             if resolved_from_failed_ancestor:
                 return (
                     "No remaining iterate action: "

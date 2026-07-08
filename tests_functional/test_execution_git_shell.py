@@ -25,6 +25,7 @@ from tests.cli.conftest import invoke_gza, make_store, setup_config
 def _iterate_git_runtime():
     mock_git = MagicMock()
     mock_git.current_branch.return_value = "main"
+    mock_git.branch_exists.return_value = True
     mock_git.resolve_merge_source_ref.return_value = None
     mock_git.is_merged.return_value = False
     mock_git.can_merge.return_value = True
@@ -247,6 +248,8 @@ def test_dry_run_changes_requested_completed_improve_without_review_clear_create
     )
     improve.status = "completed"
     improve.completed_at = datetime(2026, 1, 3, tzinfo=UTC)
+    improve.branch = impl.branch
+    improve.has_commits = True
     store.update(improve)
 
     with _iterate_git_runtime():
@@ -674,6 +677,7 @@ def test_failed_task_retry_runs_then_iterates(tmp_path, capsys: pytest.CaptureFi
     )
     mock_git = MagicMock()
     mock_git.current_branch.return_value = "main"
+    mock_git.branch_exists.return_value = True
     mock_git.can_merge.return_value = True
     with (
         patch("gza.cli.Config.load", return_value=mock_config),
@@ -741,6 +745,7 @@ def test_failed_task_resume_runs_then_iterates(tmp_path, capsys: pytest.CaptureF
     )
     mock_git = MagicMock()
     mock_git.current_branch.return_value = "main"
+    mock_git.branch_exists.return_value = True
     mock_git.can_merge.return_value = True
 
     with (
@@ -887,6 +892,8 @@ def test_dry_run_completed_improve_without_review_clear_starts_from_closing_revi
     )
     improve.status = "completed"
     improve.completed_at = datetime(2026, 1, 2, tzinfo=UTC)
+    improve.branch = impl.branch
+    improve.has_commits = True
     store.update(improve)
 
     with _iterate_git_runtime():
