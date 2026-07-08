@@ -78,6 +78,16 @@ class ResolutionReviewScope:
 
 
 @dataclass(frozen=True)
+class ResolutionReviewScopeRebuildFields:
+    """Best-effort required fields for rebuilding malformed resolution metadata."""
+
+    implementation_task_id: str | None = None
+    rebase_task_id: str | None = None
+    resolved_head_sha: str | None = None
+    resolved_target_sha: str | None = None
+
+
+@dataclass(frozen=True)
 class SpecCoherenceReviewScope:
     """Parsed structured metadata for a spec-coherence review."""
 
@@ -215,6 +225,60 @@ def parse_resolution_review_scope(scope: str | None) -> ResolutionReviewScope | 
         pre_rebase_head_sha=fields.get("pre_rebase_head_sha") or None,
         pre_rebase_target_sha=fields.get("pre_rebase_target_sha") or None,
         pre_rebase_merge_base_sha=fields.get("pre_rebase_merge_base_sha") or None,
+    )
+
+
+def extract_resolution_review_scope_identity(scope: str | None) -> tuple[str | None, str | None]:
+    """Best-effort identity extraction for malformed resolution-review metadata."""
+    fields = extract_resolution_review_scope_rebuild_fields(scope)
+    return fields.implementation_task_id, fields.rebase_task_id
+
+
+def extract_resolution_review_scope_rebuild_fields(
+    scope: str | None,
+) -> ResolutionReviewScopeRebuildFields:
+    """Best-effort extraction of rebuildable resolution-review fields from malformed scope."""
+    if not declares_resolution_review_mode(scope):
+        return ResolutionReviewScopeRebuildFields()
+    assert scope is not None
+    lines = scope.splitlines()
+    mode_index = next(
+        (
+            index
+            for index, raw_line in enumerate(lines)
+            if raw_line.strip() == "Review mode: resolution"
+        ),
+        None,
+    )
+    if mode_index is None:
+        return ResolutionReviewScopeRebuildFields()
+
+    implementation_task_id: str | None = None
+    rebase_task_id: str | None = None
+    resolved_head_sha: str | None = None
+    resolved_target_sha: str | None = None
+    for raw_line in lines[mode_index + 1 :]:
+        line = raw_line.strip()
+        if not line:
+            break
+        match = _RESOLUTION_REVIEW_FIELD_RE.match(line)
+        if match is None:
+            continue
+        field_name, field_value = match.groups()
+        value = field_value.strip()
+        if field_name == "Implementation task" and value and implementation_task_id is None:
+            implementation_task_id = value
+        elif field_name == "Rebase task" and value and rebase_task_id is None:
+            rebase_task_id = value
+        elif field_name == "Resolved head SHA" and value and resolved_head_sha is None:
+            resolved_head_sha = value
+        elif field_name == "Resolved target SHA" and value and resolved_target_sha is None:
+            resolved_target_sha = value
+    return ResolutionReviewScopeRebuildFields(
+        implementation_task_id=implementation_task_id,
+        rebase_task_id=rebase_task_id,
+        resolved_head_sha=resolved_head_sha,
+        resolved_target_sha=resolved_target_sha,
     )
 
 

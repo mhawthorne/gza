@@ -84,6 +84,7 @@ from gza.review_tasks import (
     persist_off_topic_verify_clearance,
     persist_repaired_review_scope,
     repair_rebase_review_scope_provenance,
+    repair_resolution_review_scope_provenance,
     resolve_verify_fix_representative_task,
     review_blocker_dispute_matches_current,
 )
@@ -2299,6 +2300,14 @@ def _resolve_valid_resolution_review_metadata(
     impl_task: DbTask,
     rebase_task: DbTask | None,
 ) -> ResolutionReviewScope | None:
+    repair_result = repair_resolution_review_scope_provenance(
+        store,
+        review_task=review_task,
+        git=ctx.git,
+        target_branch=ctx.target_branch,
+    )
+    if not repair_result.persisted:
+        return None
     scope_text = review_task.review_scope
     try:
         metadata = parse_resolution_review_scope(scope_text)

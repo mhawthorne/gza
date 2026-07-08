@@ -75,6 +75,7 @@ def resolution_delta_provenance_is_complete(provenance: RebaseDiffProvenance) ->
     return all(
         (
             provenance.old_tip,
+            provenance.target_at_start,
             provenance.merge_base_at_start,
         )
     )

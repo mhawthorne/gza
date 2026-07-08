@@ -9455,6 +9455,22 @@ class SqliteTaskStore:
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
+    def get_resolution_review_scope_repair_candidates(self) -> list[Task]:
+        """Return completed resolution reviews whose persisted provenance may need repair."""
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE project_id = ?
+                  AND task_type = 'review'
+                  AND status = 'completed'
+                  AND review_scope LIKE '%Review mode: resolution%'
+                ORDER BY completed_at DESC, id DESC
+                """,
+                (self._project_id,),
+            )
+            return self._rows_to_tasks(conn, cur.fetchall())
+
     def get_tasks_for_branch(self, branch: str) -> list[Task]:
         """Return all task rows attached to a branch, oldest first."""
         with self._connect() as conn:

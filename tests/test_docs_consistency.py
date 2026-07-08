@@ -1951,22 +1951,31 @@ def test_show_provenance_repair_warning_docs_cover_read_only_and_generic_failure
     repo_root = Path(__file__).resolve().parents[1]
     config_docs = (repo_root / "docs" / "configuration.md").read_text()
     query_source = (repo_root / "src" / "gza" / "cli" / "query.py").read_text()
+    normalized_query_source = " ".join(query_source.split())
 
-    read_only_warning_head = "Could not repair changed-diff rebase provenance before lifecycle rendering"
+    read_only_warning_head = (
+        "Could not repair changed-diff rebase provenance or dependent resolution-review metadata "
+        "before lifecycle rendering"
+    )
     read_only_warning_tail = (
         "because the task database is read-only; lifecycle may reflect stale resolution metadata."
     )
-    generic_warning_prefix = "Could not complete changed-diff rebase provenance repair before lifecycle rendering:"
+    generic_warning_prefix = (
+        "Could not complete changed-diff rebase provenance or dependent resolution-review metadata "
+        "repair before lifecycle rendering:"
+    )
     generic_warning_tail = "Lifecycle may reflect stale or partially repaired resolution metadata."
     generic_docs_tail = "stale or partially repaired resolution metadata."
 
-    assert read_only_warning_head in query_source
-    assert read_only_warning_tail in query_source
+    assert "Could not repair changed-diff rebase provenance or dependent resolution-review metadata" in normalized_query_source
+    assert "before lifecycle rendering" in normalized_query_source
+    assert read_only_warning_tail in normalized_query_source
     assert read_only_warning_head in config_docs
     assert read_only_warning_tail in config_docs
-    assert generic_warning_prefix in query_source
+    assert "Could not complete changed-diff rebase provenance or dependent resolution-review metadata" in normalized_query_source
+    assert "repair before lifecycle rendering:" in normalized_query_source
     assert generic_warning_prefix in config_docs
-    assert generic_warning_tail in query_source
+    assert generic_warning_tail in normalized_query_source
     assert generic_docs_tail in config_docs
 
 

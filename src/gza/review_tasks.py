@@ -28,6 +28,9 @@ from .rebase_diff import (
 from .review_scope import (
     build_resolution_review_scope,
     build_spec_coherence_review_scope,
+    declares_resolution_review_mode,
+    extract_resolution_review_scope_rebuild_fields,
+    parse_resolution_review_scope,
     resolve_review_scope_for_impl,
 )
 from .review_verdict import ReviewFinding
@@ -1074,6 +1077,152 @@ def rebase_review_scope_provenance_is_complete(review_scope: str | None) -> bool
     )
 
 
+def resolution_review_scope_provenance_is_complete(review_scope: str | None) -> bool:
+    """Return whether a resolution-review scope carries the full pre-rebase provenance block."""
+    try:
+        metadata = parse_resolution_review_scope(review_scope)
+    except ValueError:
+        return False
+    return bool(
+        metadata is not None
+        and metadata.pre_rebase_head_sha
+        and metadata.pre_rebase_target_sha
+        and metadata.pre_rebase_merge_base_sha
+    )
+
+
+def resolution_review_scope_needs_canonical_repair(
+    store: SqliteTaskStore,
+    *,
+    review_task: Task,
+) -> bool:
+    """Return whether writable repair would rewrite a resolution-review scope."""
+    if review_task.task_type != "review" or not declares_resolution_review_mode(review_task.review_scope):
+        return False
+    try:
+        metadata = parse_resolution_review_scope(review_task.review_scope)
+    except ValueError:
+        metadata = None
+
+    implementation_task_id: str | None
+    rebase_task_id: str | None
+    resolved_head_sha: str | None
+    resolved_target_sha: str | None
+    if metadata is not None:
+        implementation_task_id = metadata.implementation_task_id
+        rebase_task_id = metadata.rebase_task_id
+        resolved_head_sha = metadata.resolved_head_sha
+        resolved_target_sha = metadata.resolved_target_sha
+    else:
+        rebuild_fields = extract_resolution_review_scope_rebuild_fields(review_task.review_scope)
+        implementation_task_id = rebuild_fields.implementation_task_id
+        rebase_task_id = rebuild_fields.rebase_task_id
+        resolved_head_sha = rebuild_fields.resolved_head_sha
+        resolved_target_sha = rebuild_fields.resolved_target_sha
+
+    if (
+        not implementation_task_id
+        or not rebase_task_id
+        or not resolved_head_sha
+        or not resolved_target_sha
+    ):
+        return False
+
+    rebase_task = store.get(rebase_task_id)
+    if rebase_task is None or rebase_task.task_type != "rebase":
+        return False
+    if not rebase_review_scope_provenance_is_complete(rebase_task.review_scope):
+        return True
+
+    provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
+    if provenance is None or not resolution_delta_provenance_is_complete(provenance):
+        return False
+
+    canonical_scope = build_resolution_review_scope(
+        implementation_task_id=implementation_task_id,
+        rebase_task_id=rebase_task_id,
+        resolved_head_sha=resolved_head_sha,
+        resolved_target_sha=resolved_target_sha,
+        pre_rebase_head_sha=provenance.old_tip,
+        pre_rebase_target_sha=provenance.target_at_start,
+        pre_rebase_merge_base_sha=provenance.merge_base_at_start,
+    )
+    return review_task.review_scope != canonical_scope
+
+
+def repair_resolution_review_scope_provenance(
+    store: SqliteTaskStore,
+    *,
+    review_task: Task,
+    git: Git,
+    target_branch: str | None = None,
+) -> ReviewScopeRepairResult:
+    """Recover clobbered resolution-review provenance from the associated rebase row."""
+    if review_task.id is None or review_task.task_type != "review":
+        return ReviewScopeRepairResult(task=review_task, persisted=True)
+    scope_text = review_task.review_scope
+    if not declares_resolution_review_mode(scope_text):
+        return ReviewScopeRepairResult(task=review_task, persisted=True)
+
+    try:
+        metadata = parse_resolution_review_scope(scope_text)
+    except ValueError:
+        metadata = None
+
+    implementation_task_id: str | None
+    rebase_task_id: str | None
+    resolved_head_sha: str | None
+    resolved_target_sha: str | None
+    if metadata is not None:
+        implementation_task_id = metadata.implementation_task_id
+        rebase_task_id = metadata.rebase_task_id
+        resolved_head_sha = metadata.resolved_head_sha
+        resolved_target_sha = metadata.resolved_target_sha
+    else:
+        rebuild_fields = extract_resolution_review_scope_rebuild_fields(scope_text)
+        implementation_task_id = rebuild_fields.implementation_task_id
+        rebase_task_id = rebuild_fields.rebase_task_id
+        resolved_head_sha = rebuild_fields.resolved_head_sha
+        resolved_target_sha = rebuild_fields.resolved_target_sha
+
+    if (
+        not implementation_task_id
+        or not rebase_task_id
+        or not resolved_head_sha
+        or not resolved_target_sha
+    ):
+        return ReviewScopeRepairResult(task=review_task, persisted=True)
+
+    rebase_task = store.get(rebase_task_id)
+    if rebase_task is None or rebase_task.task_type != "rebase":
+        return ReviewScopeRepairResult(task=review_task, persisted=True)
+
+    if not rebase_review_scope_provenance_is_complete(rebase_task.review_scope):
+        rebase_repair = repair_rebase_review_scope_provenance(
+            store,
+            rebase_task=rebase_task,
+            git=git,
+            target_branch=target_branch,
+        )
+        if not rebase_repair.persisted:
+            return ReviewScopeRepairResult(task=review_task, persisted=False, blocked_by_readonly=True)
+
+    provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
+    if provenance is None or not resolution_delta_provenance_is_complete(provenance):
+        return ReviewScopeRepairResult(task=review_task, persisted=True)
+
+    rebuilt_scope = build_resolution_review_scope(
+        implementation_task_id=implementation_task_id,
+        rebase_task_id=rebase_task_id,
+        resolved_head_sha=resolved_head_sha,
+        resolved_target_sha=resolved_target_sha,
+        pre_rebase_head_sha=provenance.old_tip,
+        pre_rebase_target_sha=provenance.target_at_start,
+        pre_rebase_merge_base_sha=provenance.merge_base_at_start,
+    )
+    return persist_repaired_review_scope(store, task=review_task, repaired_scope=rebuilt_scope)
+
+
 def backfill_changed_diff_rebase_review_scope_provenance(
     store: SqliteTaskStore,
     *,
@@ -1089,6 +1238,28 @@ def backfill_changed_diff_rebase_review_scope_provenance(
             repair_rebase_review_scope_provenance(
                 store,
                 rebase_task=rebase_task,
+                git=git,
+                target_branch=target_branch,
+            )
+        )
+    return tuple(repaired)
+
+
+def backfill_resolution_review_scope_provenance(
+    store: SqliteTaskStore,
+    *,
+    git: Git,
+    target_branch: str | None = None,
+) -> tuple[ReviewScopeRepairResult, ...]:
+    """Repair completed resolution-review rows whose persisted metadata is not canonical."""
+    repaired: list[ReviewScopeRepairResult] = []
+    for review_task in store.get_resolution_review_scope_repair_candidates():
+        if not resolution_review_scope_needs_canonical_repair(store, review_task=review_task):
+            continue
+        repaired.append(
+            repair_resolution_review_scope_provenance(
+                store,
+                review_task=review_task,
                 git=git,
                 target_branch=target_branch,
             )

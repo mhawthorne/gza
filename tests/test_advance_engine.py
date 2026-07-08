@@ -4629,6 +4629,160 @@ def test_changed_rebase_completed_passing_review_after_rebase_repairs_missing_re
     assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
+def test_changed_rebase_completed_approved_resolution_review_with_blank_pre_rebase_shas_is_backfilled(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-resolution-completed-blank-pre-rebase",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    assert impl.id is not None
+    assert rebase.id is not None
+    review.review_scope = (
+        "Review mode: resolution\n"
+        f"Implementation task: {impl.id}\n"
+        f"Rebase task: {rebase.id}\n"
+        "Pre-rebase head SHA: \n"
+        "Pre-rebase target SHA: \n"
+        "Pre-rebase merge-base SHA: \n"
+        "Resolved head SHA: rebased-sha\n"
+        "Resolved target SHA: target-sha\n"
+        "\n"
+        "Review only the conflict-resolution delta introduced by this rebase.\n"
+        "Do not re-review the whole implementation except where context is required."
+    )
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    repaired_review = store.get(review.id)
+    assert repaired_review is not None
+    _assert_resolution_review_scope_matches_context(repaired_review.review_scope, impl=impl, rebase=rebase)
+    assert repaired_review.review_scope is not None
+    assert "Pre-rebase head SHA: pre-rebase-head" in repaired_review.review_scope
+    assert "Pre-rebase target SHA: pre-rebase-target" in repaired_review.review_scope
+    assert "Pre-rebase merge-base SHA: pre-rebase-merge-base" in repaired_review.review_scope
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_merge"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+
+
+def test_changed_rebase_completed_resolution_review_missing_pre_rebase_target_still_parks(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-resolution-completed-missing-target-proof",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    rebase.review_scope = (
+        "Rebase diff provenance: yes\n"
+        "Pre-rebase head SHA: pre-rebase-head\n"
+        "Pre-rebase target SHA: \n"
+        "Pre-rebase merge-base SHA: pre-rebase-merge-base\n"
+        "Resolved head SHA: rebased-sha\n"
+        "Resolved target SHA: target-sha\n"
+        "Recovered baseline: no"
+    )
+    store.update(rebase)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    assert impl.id is not None
+    assert rebase.id is not None
+    review.review_scope = (
+        "Review mode: resolution\n"
+        f"Implementation task: {impl.id}\n"
+        f"Rebase task: {rebase.id}\n"
+        "Pre-rebase head SHA: \n"
+        "Pre-rebase target SHA: \n"
+        "Pre-rebase merge-base SHA: \n"
+        "Resolved head SHA: rebased-sha\n"
+        "Resolved target SHA: target-sha\n"
+        "\n"
+        "Review only the conflict-resolution delta introduced by this rebase.\n"
+        "Do not re-review the whole implementation except where context is required."
+    )
+    store.update(review)
+    original_scope = review.review_scope
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    persisted_review = store.get(review.id)
+    assert persisted_review is not None
+    assert persisted_review.review_scope == original_scope
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["subject_task_id"] == impl.id
+
+
 @pytest.mark.parametrize(
     ("resolved_head_sha", "resolved_target_sha"),
     [
@@ -5415,6 +5569,74 @@ def test_changed_rebase_with_missing_persisted_provenance_readonly_repair_fails_
     assert persisted_rebase is not None
     assert persisted_rebase.review_scope == original_scope
     assert rebase.review_scope == original_scope
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+
+
+def test_changed_rebase_completed_resolution_review_with_missing_resolved_shas_stays_parked(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-review-missing-resolved-shas",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_scope = (
+        f"Review mode: resolution\n"
+        f"Implementation task: {impl.id}\n"
+        f"Rebase task: {rebase.id}\n"
+        "Pre-rebase head SHA: old-head\n"
+        "Pre-rebase target SHA old-target\n"
+        "Pre-rebase merge-base SHA: old-base\n"
+        "Resolved head SHA: \n"
+        "Resolved target SHA: \n"
+        "\n"
+        "Review only the conflict-resolution delta introduced by this rebase.\n"
+        "Do not re-review the whole implementation except where context is required."
+    )
+    store.update(review)
+    original_scope = review.review_scope
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-head", "main": "target-now"},
+        ),
+        impl,
+        "main",
+    )
+
+    persisted_review = store.get(review.id)
+    assert persisted_review is not None
+    assert persisted_review.review_scope == original_scope
     assert action["type"] == "needs_discussion"
     assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
 

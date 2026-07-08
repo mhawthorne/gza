@@ -85,7 +85,12 @@ from ..query import (
     get_code_changing_descendants_for_root as _get_code_changing_descendants_for_root_task,
     get_reviews_for_root as _get_reviews_for_root_task,
 )
-from ..review_tasks import backfill_changed_diff_rebase_review_scope_provenance
+from ..review_tasks import (
+    backfill_changed_diff_rebase_review_scope_provenance,
+    backfill_resolution_review_scope_provenance,
+    rebase_review_scope_provenance_is_complete,
+    resolution_review_scope_needs_canonical_repair,
+)
 from ..review_verify_state import (
     VerifyReadModel,
     owner_task_verify_epoch,
@@ -464,17 +469,35 @@ def _query_git_cache_scope(git: Git | None) -> contextlib.AbstractContextManager
     return contextlib.nullcontext(git)
 
 
+def _show_rebase_provenance_repair_candidates(
+    store: SqliteTaskStore,
+) -> tuple[list[DbTask], list[DbTask]]:
+    """Return only show-time changed-rebase and resolution-review rows that still need repair."""
+    rebase_candidates = [
+        task
+        for task in store.get_changed_diff_rebase_review_scope_repair_candidates()
+        if not rebase_review_scope_provenance_is_complete(task.review_scope)
+    ]
+    review_candidates = [
+        task
+        for task in store.get_resolution_review_scope_repair_candidates()
+        if resolution_review_scope_needs_canonical_repair(store, review_task=task)
+    ]
+    return rebase_candidates, review_candidates
+
+
 def _best_effort_backfill_show_rebase_provenance(config: Config) -> _ShowRebaseProvenanceBackfillOutcome:
-    """Repair changed-diff rebase provenance before query-only show lifecycle rendering."""
+    """Repair changed-diff rebase provenance and dependent resolution reviews before show."""
     try:
         store = get_store(config)
-        candidates = store.get_changed_diff_rebase_review_scope_repair_candidates()
-        if not candidates:
+        rebase_candidates, review_candidates = _show_rebase_provenance_repair_candidates(store)
+        if not rebase_candidates and not review_candidates:
             return _ShowRebaseProvenanceBackfillOutcome()
         if config.db_path.exists() and (config.db_path.stat().st_mode & 0o222) == 0:
             return _ShowRebaseProvenanceBackfillOutcome(
                 warning=(
-                    "Warning: Could not repair changed-diff rebase provenance before lifecycle rendering "
+                    "Warning: Could not repair changed-diff rebase provenance or dependent resolution-review metadata "
+                    "before lifecycle rendering "
                     "because the task database is read-only; lifecycle may reflect stale resolution metadata."
                 )
             )
@@ -485,11 +508,17 @@ def _best_effort_backfill_show_rebase_provenance(config: Config) -> _ShowRebaseP
             git=git,
             target_branch=target_branch,
         )
+        backfill_resolution_review_scope_provenance(
+            store,
+            git=git,
+            target_branch=target_branch,
+        )
         return _ShowRebaseProvenanceBackfillOutcome()
     except (GitError, ManualMigrationRequired, OSError, SchemaIntegrityError, ValueError, sqlite3.Error) as exc:
         return _ShowRebaseProvenanceBackfillOutcome(
             warning=(
-                "Warning: Could not complete changed-diff rebase provenance repair before lifecycle rendering: "
+                "Warning: Could not complete changed-diff rebase provenance or dependent resolution-review metadata "
+                f"repair before lifecycle rendering: "
                 f"{exc}. Lifecycle may reflect stale or partially repaired resolution metadata."
             )
         )

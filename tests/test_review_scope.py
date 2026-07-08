@@ -8,6 +8,8 @@ from gza.review_scope import (
     build_resolution_review_scope,
     declares_spec_coherence_review_mode,
     declares_resolution_review_mode,
+    extract_resolution_review_scope_identity,
+    extract_resolution_review_scope_rebuild_fields,
     extract_review_scope_from_prompt,
     get_latest_review_scope_comment_for_impl,
     normalize_review_scope_identity_text,
@@ -143,6 +145,44 @@ def test_declares_resolution_review_mode_detects_header_without_parsing() -> Non
         "Review mode: resolution\nImplementation task: gza-10\n"
     )
     assert not declares_resolution_review_mode("Review only the parser slice.")
+
+
+def test_extract_resolution_review_scope_identity_from_malformed_scope() -> None:
+    implementation_task_id, rebase_task_id = extract_resolution_review_scope_identity(
+        "\n".join(
+            (
+                "Review mode: resolution",
+                "Implementation task: gza-10",
+                "Rebase task: gza-11",
+                "Pre-rebase head SHA old123",
+                "Resolved head SHA: head123",
+                "Resolved target SHA: target456",
+            )
+        )
+    )
+
+    assert implementation_task_id == "gza-10"
+    assert rebase_task_id == "gza-11"
+
+
+def test_extract_resolution_review_scope_rebuild_fields_from_malformed_scope() -> None:
+    fields = extract_resolution_review_scope_rebuild_fields(
+        "\n".join(
+            (
+                "Review mode: resolution",
+                "Implementation task: gza-10",
+                "Rebase task: gza-11",
+                "Pre-rebase head SHA old123",
+                "Resolved head SHA: head123",
+                "Resolved target SHA: target456",
+            )
+        )
+    )
+
+    assert fields.implementation_task_id == "gza-10"
+    assert fields.rebase_task_id == "gza-11"
+    assert fields.resolved_head_sha == "head123"
+    assert fields.resolved_target_sha == "target456"
 
 
 def test_spec_coherence_review_scope_round_trips() -> None:

@@ -12,12 +12,13 @@ from gza.config import Config
 from gza.db import SqliteTaskStore, Task
 from gza.git import Git
 from gza.rebase_diff import parse_rebase_diff_provenance
-from gza.review_scope import parse_spec_coherence_review_scope
+from gza.review_scope import parse_resolution_review_scope, parse_spec_coherence_review_scope
 from gza.review_tasks import (
     OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
     DuplicateReviewError,
     VerifyFixContextError,
     backfill_changed_diff_rebase_review_scope_provenance,
+    backfill_resolution_review_scope_provenance,
     build_auto_review_prompt,
     build_deferred_blocker_prompt_prefix,
     build_followup_prompt,
@@ -47,6 +48,7 @@ from gza.review_tasks import (
     parse_verify_fix_epoch_artifact_metadata,
     parse_verify_fix_prompt,
     persist_off_topic_verify_clearance,
+    resolution_review_scope_provenance_is_complete,
     rebase_review_scope_provenance_is_complete,
     resolve_latest_failed_verify_epoch,
     resolve_verify_fix_context,
@@ -1353,6 +1355,422 @@ class TestCreateReviewTask:
         assert provenance_one.resolved_target_sha == "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
         assert provenance_two.resolved_head_sha == "3333333333333333333333333333333333333333"
         assert provenance_two.resolved_target_sha == "5555555555555555555555555555555555555555"
+
+    def test_backfill_resolution_review_scope_provenance_repairs_blank_pre_rebase_fields(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/resolution-review-backfill"
+        store.update(impl)
+
+        rebase = store.add("Rebase feature", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.branch = impl.branch
+        rebase.changed_diff = True
+        rebase.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "Recovered baseline: no"
+        )
+        store.update(rebase)
+
+        review = store.add("Resolution review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.review_scope = (
+            f"Review mode: resolution\n"
+            f"Implementation task: {impl.id}\n"
+            f"Rebase task: {rebase.id}\n"
+            "Pre-rebase head SHA: \n"
+            "Pre-rebase target SHA: \n"
+            "Pre-rebase merge-base SHA: \n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "\n"
+            "Review only the conflict-resolution delta introduced by this rebase.\n"
+            "Do not re-review the whole implementation except where context is required."
+        )
+        store.update(review)
+
+        results = backfill_resolution_review_scope_provenance(
+            store,
+            git=MagicMock(spec=Git),
+            target_branch="main",
+        )
+
+        assert len(results) == 1
+        assert results[0].persisted
+        persisted_review = store.get(review.id)
+        assert persisted_review is not None
+        assert resolution_review_scope_provenance_is_complete(persisted_review.review_scope)
+        metadata = parse_resolution_review_scope(persisted_review.review_scope)
+        assert metadata is not None
+        assert metadata.pre_rebase_head_sha == "old-head"
+        assert metadata.pre_rebase_target_sha == "old-target"
+        assert metadata.pre_rebase_merge_base_sha == "old-base"
+
+    def test_backfill_resolution_review_scope_provenance_repairs_stale_complete_pre_rebase_fields(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        store.update(impl)
+
+        rebase = store.add("Rebase feature", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "Recovered baseline: no"
+        )
+        store.update(rebase)
+
+        review = store.add("Resolution review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.review_scope = (
+            f"Review mode: resolution\n"
+            f"Implementation task: {impl.id}\n"
+            f"Rebase task: {rebase.id}\n"
+            "Pre-rebase head SHA: stale-head\n"
+            "Pre-rebase target SHA: stale-target\n"
+            "Pre-rebase merge-base SHA: stale-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "\n"
+            "Review only the conflict-resolution delta introduced by this rebase.\n"
+            "Do not re-review the whole implementation except where context is required."
+        )
+        store.update(review)
+
+        results = backfill_resolution_review_scope_provenance(
+            store,
+            git=MagicMock(spec=Git),
+            target_branch="main",
+        )
+
+        assert len(results) == 1
+        assert results[0].persisted
+        persisted_review = store.get(review.id)
+        assert persisted_review is not None
+        metadata = parse_resolution_review_scope(persisted_review.review_scope)
+        assert metadata is not None
+        assert metadata.pre_rebase_head_sha == "old-head"
+        assert metadata.pre_rebase_target_sha == "old-target"
+        assert metadata.pre_rebase_merge_base_sha == "old-base"
+
+    def test_backfill_resolution_review_scope_provenance_is_noop_for_valid_rows(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        store.update(impl)
+
+        rebase = store.add("Rebase feature", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "Recovered baseline: no"
+        )
+        store.update(rebase)
+
+        review = store.add("Resolution review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.review_scope = (
+            f"Review mode: resolution\n"
+            f"Implementation task: {impl.id}\n"
+            f"Rebase task: {rebase.id}\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "\n"
+            "Review only the conflict-resolution delta introduced by this rebase.\n"
+            "Do not re-review the whole implementation except where context is required."
+        )
+        store.update(review)
+        original_scope = review.review_scope
+
+        results = backfill_resolution_review_scope_provenance(
+            store,
+            git=MagicMock(spec=Git),
+            target_branch="main",
+        )
+
+        assert results == ()
+        persisted_review = store.get(review.id)
+        assert persisted_review is not None
+        assert persisted_review.review_scope == original_scope
+
+    def test_backfill_resolution_review_scope_provenance_leaves_unrecoverable_rows_untouched(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/resolution-review-unrecoverable"
+        store.update(impl)
+
+        rebase = store.add("Rebase feature", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.branch = impl.branch
+        rebase.changed_diff = True
+        rebase.review_scope = "Rebase diff provenance: yes\nResolved head SHA: rebased-head\nRecovered baseline: no"
+        store.update(rebase)
+
+        review = store.add("Resolution review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.review_scope = (
+            f"Review mode: resolution\n"
+            f"Implementation task: {impl.id}\n"
+            f"Rebase task: {rebase.id}\n"
+            "Pre-rebase head SHA: \n"
+            "Pre-rebase target SHA: \n"
+            "Pre-rebase merge-base SHA: \n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "\n"
+            "Review only the conflict-resolution delta introduced by this rebase.\n"
+            "Do not re-review the whole implementation except where context is required."
+        )
+        store.update(review)
+        original_scope = review.review_scope
+
+        git = MagicMock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.repo_dir = tmp_path
+
+        results = backfill_resolution_review_scope_provenance(
+            store,
+            git=git,
+            target_branch="main",
+        )
+
+        assert len(results) == 1
+        assert results[0].persisted
+        persisted_review = store.get(review.id)
+        assert persisted_review is not None
+        assert persisted_review.review_scope == original_scope
+        assert not resolution_review_scope_provenance_is_complete(persisted_review.review_scope)
+
+    def test_backfill_resolution_review_scope_provenance_leaves_missing_target_proof_untouched(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/resolution-review-missing-target-proof"
+        store.update(impl)
+
+        rebase = store.add("Rebase feature", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.branch = impl.branch
+        rebase.changed_diff = True
+        rebase.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: \n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "Recovered baseline: no"
+        )
+        store.update(rebase)
+
+        review = store.add("Resolution review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.review_scope = (
+            f"Review mode: resolution\n"
+            f"Implementation task: {impl.id}\n"
+            f"Rebase task: {rebase.id}\n"
+            "Pre-rebase head SHA: \n"
+            "Pre-rebase target SHA: \n"
+            "Pre-rebase merge-base SHA: \n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "\n"
+            "Review only the conflict-resolution delta introduced by this rebase.\n"
+            "Do not re-review the whole implementation except where context is required."
+        )
+        store.update(review)
+        original_scope = review.review_scope
+
+        results = backfill_resolution_review_scope_provenance(
+            store,
+            git=MagicMock(spec=Git),
+            target_branch="main",
+        )
+
+        assert len(results) == 1
+        assert results[0].persisted
+        persisted_review = store.get(review.id)
+        assert persisted_review is not None
+        assert persisted_review.review_scope == original_scope
+        assert not resolution_review_scope_provenance_is_complete(persisted_review.review_scope)
+
+    def test_backfill_resolution_review_scope_provenance_leaves_rows_without_resolved_shas_untouched(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/resolution-review-missing-resolved-shas"
+        store.update(impl)
+
+        rebase = store.add("Rebase feature", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.branch = impl.branch
+        rebase.changed_diff = True
+        rebase.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "Recovered baseline: no"
+        )
+        store.update(rebase)
+
+        review = store.add("Resolution review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.review_scope = (
+            f"Review mode: resolution\n"
+            f"Implementation task: {impl.id}\n"
+            f"Rebase task: {rebase.id}\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: \n"
+            "Resolved target SHA: \n"
+            "\n"
+            "Review only the conflict-resolution delta introduced by this rebase.\n"
+            "Do not re-review the whole implementation except where context is required."
+        )
+        store.update(review)
+        original_scope = review.review_scope
+
+        results = backfill_resolution_review_scope_provenance(
+            store,
+            git=MagicMock(spec=Git),
+            target_branch="main",
+        )
+
+        assert results == ()
+        persisted_review = store.get(review.id)
+        assert persisted_review is not None
+        assert persisted_review.review_scope == original_scope
+        assert not resolution_review_scope_provenance_is_complete(persisted_review.review_scope)
+
+    def test_backfill_resolution_review_scope_provenance_repairs_malformed_scope_when_resolved_shas_survive(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/resolution-review-malformed-pre-rebase"
+        store.update(impl)
+
+        rebase = store.add("Rebase feature", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.branch = impl.branch
+        rebase.changed_diff = True
+        rebase.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "Recovered baseline: no"
+        )
+        store.update(rebase)
+
+        review = store.add("Resolution review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.review_scope = (
+            f"Review mode: resolution\n"
+            f"Implementation task: {impl.id}\n"
+            f"Rebase task: {rebase.id}\n"
+            "Pre-rebase head SHA old-head\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "\n"
+            "Review only the conflict-resolution delta introduced by this rebase.\n"
+            "Do not re-review the whole implementation except where context is required."
+        )
+        store.update(review)
+
+        results = backfill_resolution_review_scope_provenance(
+            store,
+            git=MagicMock(spec=Git),
+            target_branch="main",
+        )
+
+        assert len(results) == 1
+        assert results[0].persisted
+        persisted_review = store.get(review.id)
+        assert persisted_review is not None
+        metadata = parse_resolution_review_scope(persisted_review.review_scope)
+        assert metadata is not None
+        assert metadata.implementation_task_id == impl.id
+        assert metadata.rebase_task_id == rebase.id
+        assert metadata.resolved_head_sha == "rebased-head"
+        assert metadata.resolved_target_sha == "target-now"
+        assert metadata.pre_rebase_head_sha == "old-head"
+        assert metadata.pre_rebase_target_sha == "old-target"
+        assert metadata.pre_rebase_merge_base_sha == "old-base"
 
 
 @pytest.mark.parametrize("terminal_status", ["completed", "failed", "dropped"])

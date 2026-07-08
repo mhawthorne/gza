@@ -38,6 +38,7 @@ from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerRow
 from gza.pr_ops import LookupTaskPrResult
 from gza.rebase_diff import parse_rebase_diff_provenance
+from gza.review_scope import parse_resolution_review_scope
 from gza.recovery_read_context import RecoveryReadContext
 from gza.review_verdict import ParsedReviewReport
 from gza.review_verify_state import persist_verify_gate_artifact
@@ -9306,6 +9307,590 @@ class TestShowCommand:
         assert "Lifecycle: ready for review" in output
         assert "resolution-review-metadata-invalid" not in output
 
+    def test_show_backfills_resolution_review_provenance_before_query_only_lifecycle_render(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implementation needing resolution review repair", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/show-resolution-review-repair"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+        store.update(impl)
+
+        review = store.add("Approved review before rebase", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        rebase = store.add("Changed-diff rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.branch = impl.branch
+        rebase.has_commits = True
+        rebase.changed_diff = True
+        rebase.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "Recovered baseline: no"
+        )
+        rebase.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+        store.update(rebase)
+
+        resolution_review = store.add("Approved resolution review", task_type="review", depends_on=impl.id)
+        assert resolution_review.id is not None
+        resolution_review.status = "completed"
+        resolution_review.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
+        resolution_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        resolution_review.review_scope = (
+            "Review mode: resolution\n"
+            f"Implementation task: {impl.id}\n"
+            f"Rebase task: {rebase.id}\n"
+            "Pre-rebase head SHA: \n"
+            "Pre-rebase target SHA: \n"
+            "Pre-rebase merge-base SHA: \n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "\n"
+            "Review only the conflict-resolution delta introduced by this rebase.\n"
+            "Do not re-review the whole implementation except where context is required."
+        )
+        store.update(resolution_review)
+
+        git = MagicMock(spec=Git)
+        git.repo_dir = tmp_path
+        git.default_branch.return_value = "main"
+        git.worktree_list.return_value = []
+
+        def _determine_action(_config, action_store, _git, task, _target_branch, **_kwargs):
+            del task
+            refreshed_review = action_store.get(resolution_review.id)
+            assert refreshed_review is not None
+            metadata = parse_resolution_review_scope(refreshed_review.review_scope)
+            if (
+                metadata is None
+                or not metadata.pre_rebase_head_sha
+                or not metadata.pre_rebase_target_sha
+                or not metadata.pre_rebase_merge_base_sha
+            ):
+                return {
+                    "type": "needs_discussion",
+                    "description": "SKIP: required resolution-review metadata is missing or malformed",
+                    "needs_attention_reason": "resolution-review-metadata-invalid",
+                    "subject_task_id": impl.id,
+                }
+            return {"type": "verify_gate", "description": "Run verify gate before merge", "verify_gate_phase": "pre_merge"}
+
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch("gza.cli.query.determine_next_action", side_effect=_determine_action),
+            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+        ):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(impl.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        persisted_review = store.get(resolution_review.id)
+        assert exit_code == 0
+        assert persisted_review is not None
+        metadata = parse_resolution_review_scope(persisted_review.review_scope)
+        assert metadata is not None
+        assert metadata.pre_rebase_head_sha == "old-head"
+        assert metadata.pre_rebase_target_sha == "old-target"
+        assert metadata.pre_rebase_merge_base_sha == "old-base"
+        assert "resolution-review-metadata-invalid" not in output
+
+    def test_show_readonly_skips_provenance_warning_when_changed_rebase_and_resolution_review_are_complete(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implementation with complete read-only provenance", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/show-readonly-complete-provenance"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+        store.update(impl)
+
+        review = store.add("Approved review before rebase", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        rebase = store.add("Changed-diff rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.branch = impl.branch
+        rebase.has_commits = True
+        rebase.changed_diff = True
+        rebase.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "Recovered baseline: no"
+        )
+        rebase.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+        store.update(rebase)
+
+        resolution_review = store.add("Approved resolution review", task_type="review", depends_on=impl.id)
+        assert resolution_review.id is not None
+        resolution_review.status = "completed"
+        resolution_review.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
+        resolution_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        resolution_review.review_scope = (
+            "Review mode: resolution\n"
+            f"Implementation task: {impl.id}\n"
+            f"Rebase task: {rebase.id}\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "\n"
+            "Review only the conflict-resolution delta introduced by this rebase.\n"
+            "Do not re-review the whole implementation except where context is required."
+        )
+        store.update(resolution_review)
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+
+        git = MagicMock(spec=Git)
+        git.repo_dir = tmp_path
+        git.default_branch.return_value = "main"
+        git.worktree_list.return_value = []
+
+        try:
+            with (
+                patch("gza.cli.query.Git", return_value=git),
+                patch(
+                    "gza.cli.query.determine_next_action",
+                    return_value={
+                        "type": "verify_gate",
+                        "description": "Run verify gate before merge",
+                        "verify_gate_phase": "pre_merge",
+                    },
+                ),
+                patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+            ):
+                exit_code = cmd_show(
+                    argparse.Namespace(
+                        project_dir=tmp_path,
+                        task_id=str(impl.id),
+                        prompt=False,
+                        path=False,
+                        output=False,
+                        page=False,
+                        full=False,
+                        metadata_only=True,
+                    )
+                )
+        finally:
+            os.chmod(db_path, original_mode)
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Could not repair changed-diff rebase provenance" not in output
+        assert "Lifecycle:" in output
+
+    def test_show_readonly_warns_when_resolution_review_provenance_repair_is_still_needed(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implementation with incomplete read-only resolution metadata", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/show-readonly-incomplete-resolution-provenance"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+        store.update(impl)
+
+        review = store.add("Approved review before rebase", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        rebase = store.add("Changed-diff rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.branch = impl.branch
+        rebase.has_commits = True
+        rebase.changed_diff = True
+        rebase.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "Recovered baseline: no"
+        )
+        rebase.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+        store.update(rebase)
+
+        resolution_review = store.add("Approved resolution review", task_type="review", depends_on=impl.id)
+        assert resolution_review.id is not None
+        resolution_review.status = "completed"
+        resolution_review.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
+        resolution_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        resolution_review.review_scope = (
+            "Review mode: resolution\n"
+            f"Implementation task: {impl.id}\n"
+            f"Rebase task: {rebase.id}\n"
+            "Pre-rebase head SHA: \n"
+            "Pre-rebase target SHA: \n"
+            "Pre-rebase merge-base SHA: \n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "\n"
+            "Review only the conflict-resolution delta introduced by this rebase.\n"
+            "Do not re-review the whole implementation except where context is required."
+        )
+        store.update(resolution_review)
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+
+        git = MagicMock(spec=Git)
+        git.repo_dir = tmp_path
+        git.default_branch.return_value = "main"
+        git.worktree_list.return_value = []
+
+        def _determine_action(_config, action_store, _git, task, _target_branch, **_kwargs):
+            del task
+            refreshed_review = action_store.get(resolution_review.id)
+            assert refreshed_review is not None
+            metadata = parse_resolution_review_scope(refreshed_review.review_scope)
+            if metadata is None or metadata.pre_rebase_head_sha is not None:
+                return {
+                    "type": "verify_gate",
+                    "description": "Run verify gate before merge",
+                    "verify_gate_phase": "pre_merge",
+                }
+            return {
+                "type": "needs_discussion",
+                "description": "SKIP: required resolution-review metadata is missing or malformed",
+                "needs_attention_reason": "resolution-review-metadata-invalid",
+                "subject_task_id": impl.id,
+            }
+
+        try:
+            with (
+                patch("gza.cli.query.Git", return_value=git),
+                patch("gza.cli.query.determine_next_action", side_effect=_determine_action),
+                patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+            ):
+                exit_code = cmd_show(
+                    argparse.Namespace(
+                        project_dir=tmp_path,
+                        task_id=str(impl.id),
+                        prompt=False,
+                        path=False,
+                        output=False,
+                        page=False,
+                        full=False,
+                        metadata_only=True,
+                    )
+                )
+        finally:
+            os.chmod(db_path, original_mode)
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Could not repair changed-diff rebase provenance or dependent " in output
+        assert "resolution-review metadata before lifecycle rendering" in output
+        assert "because the task database is read-only" in output
+        assert "Lifecycle:" in output
+
+    def test_show_backfills_stale_complete_resolution_review_provenance_before_query_only_lifecycle_render(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implementation needing stale resolution review rewrite", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/show-stale-resolution-review-repair"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+        store.update(impl)
+
+        review = store.add("Approved review before rebase", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        rebase = store.add("Changed-diff rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.branch = impl.branch
+        rebase.has_commits = True
+        rebase.changed_diff = True
+        rebase.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "Recovered baseline: no"
+        )
+        rebase.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+        store.update(rebase)
+
+        resolution_review = store.add("Approved resolution review", task_type="review", depends_on=impl.id)
+        assert resolution_review.id is not None
+        resolution_review.status = "completed"
+        resolution_review.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
+        resolution_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        resolution_review.review_scope = (
+            "Review mode: resolution\n"
+            f"Implementation task: {impl.id}\n"
+            f"Rebase task: {rebase.id}\n"
+            "Pre-rebase head SHA: stale-head\n"
+            "Pre-rebase target SHA: stale-target\n"
+            "Pre-rebase merge-base SHA: stale-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "\n"
+            "Review only the conflict-resolution delta introduced by this rebase.\n"
+            "Do not re-review the whole implementation except where context is required."
+        )
+        store.update(resolution_review)
+
+        git = MagicMock(spec=Git)
+        git.repo_dir = tmp_path
+        git.default_branch.return_value = "main"
+        git.worktree_list.return_value = []
+
+        def _determine_action(_config, action_store, _git, task, _target_branch, **_kwargs):
+            del task
+            refreshed_review = action_store.get(resolution_review.id)
+            assert refreshed_review is not None
+            metadata = parse_resolution_review_scope(refreshed_review.review_scope)
+            if (
+                metadata is None
+                or metadata.pre_rebase_head_sha != "old-head"
+                or metadata.pre_rebase_target_sha != "old-target"
+                or metadata.pre_rebase_merge_base_sha != "old-base"
+            ):
+                return {
+                    "type": "needs_discussion",
+                    "description": "SKIP: required resolution-review metadata is missing or malformed",
+                    "needs_attention_reason": "resolution-review-metadata-invalid",
+                    "subject_task_id": impl.id,
+                }
+            return {"type": "verify_gate", "description": "Run verify gate before merge", "verify_gate_phase": "pre_merge"}
+
+        with (
+            patch("gza.cli.query.Git", return_value=git),
+            patch("gza.cli.query.determine_next_action", side_effect=_determine_action),
+            patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+        ):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(impl.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=True,
+                )
+            )
+
+        output = capsys.readouterr().out
+        persisted_review = store.get(resolution_review.id)
+        assert exit_code == 0
+        assert persisted_review is not None
+        metadata = parse_resolution_review_scope(persisted_review.review_scope)
+        assert metadata is not None
+        assert metadata.pre_rebase_head_sha == "old-head"
+        assert metadata.pre_rebase_target_sha == "old-target"
+        assert metadata.pre_rebase_merge_base_sha == "old-base"
+        assert "resolution-review-metadata-invalid" not in output
+
+    def test_show_readonly_warns_for_stale_complete_resolution_review_provenance_before_lifecycle_render(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl = store.add("Implementation with stale read-only resolution metadata", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/show-readonly-stale-resolution-provenance"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        impl.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+        store.update(impl)
+
+        review = store.add("Approved review before rebase", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        rebase = store.add("Changed-diff rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.branch = impl.branch
+        rebase.has_commits = True
+        rebase.changed_diff = True
+        rebase.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: old-target\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "Recovered baseline: no"
+        )
+        rebase.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+        store.update(rebase)
+
+        resolution_review = store.add("Approved resolution review", task_type="review", depends_on=impl.id)
+        assert resolution_review.id is not None
+        resolution_review.status = "completed"
+        resolution_review.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
+        resolution_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        resolution_review.review_scope = (
+            "Review mode: resolution\n"
+            f"Implementation task: {impl.id}\n"
+            f"Rebase task: {rebase.id}\n"
+            "Pre-rebase head SHA: stale-head\n"
+            "Pre-rebase target SHA: stale-target\n"
+            "Pre-rebase merge-base SHA: stale-base\n"
+            "Resolved head SHA: rebased-head\n"
+            "Resolved target SHA: target-now\n"
+            "\n"
+            "Review only the conflict-resolution delta introduced by this rebase.\n"
+            "Do not re-review the whole implementation except where context is required."
+        )
+        store.update(resolution_review)
+
+        db_path = tmp_path / ".gza" / "gza.db"
+        original_mode = db_path.stat().st_mode
+        os.chmod(db_path, 0o444)
+
+        git = MagicMock(spec=Git)
+        git.repo_dir = tmp_path
+        git.default_branch.return_value = "main"
+        git.worktree_list.return_value = []
+
+        def _determine_action(_config, action_store, _git, task, _target_branch, **_kwargs):
+            del task
+            refreshed_review = action_store.get(resolution_review.id)
+            assert refreshed_review is not None
+            metadata = parse_resolution_review_scope(refreshed_review.review_scope)
+            if (
+                metadata is not None
+                and metadata.pre_rebase_head_sha == "old-head"
+                and metadata.pre_rebase_target_sha == "old-target"
+                and metadata.pre_rebase_merge_base_sha == "old-base"
+            ):
+                return {
+                    "type": "verify_gate",
+                    "description": "Run verify gate before merge",
+                    "verify_gate_phase": "pre_merge",
+                }
+            return {
+                "type": "needs_discussion",
+                "description": "SKIP: required resolution-review metadata is missing or malformed",
+                "needs_attention_reason": "resolution-review-metadata-invalid",
+                "subject_task_id": impl.id,
+            }
+
+        try:
+            with (
+                patch("gza.cli.query.Git", return_value=git),
+                patch("gza.cli.query.determine_next_action", side_effect=_determine_action),
+                patch("gza.cli.query._implementation_review_rebase_detail", return_value=None),
+            ):
+                exit_code = cmd_show(
+                    argparse.Namespace(
+                        project_dir=tmp_path,
+                        task_id=str(impl.id),
+                        prompt=False,
+                        path=False,
+                        output=False,
+                        page=False,
+                        full=False,
+                        metadata_only=True,
+                    )
+                )
+        finally:
+            os.chmod(db_path, original_mode)
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Could not repair changed-diff rebase provenance or dependent " in output
+        assert "resolution-review metadata before lifecycle rendering" in output
+        assert "because the task database is read-only" in output
+        assert "resolution-review-metadata-invalid" in output
+        assert output.index("Could not repair changed-diff rebase provenance") < output.index("Lifecycle:")
+
     def test_show_warns_when_changed_rebase_provenance_repair_partially_persists_then_fails(
         self,
         tmp_path: Path,
@@ -9389,7 +9974,10 @@ class TestShowCommand:
         assert exit_code == 0
         assert persisted_rebase is not None
         assert persisted_rebase.review_scope == repaired_scope
-        assert "Warning: Could not complete changed-diff rebase provenance repair before lifecycle rendering:" in output
+        assert (
+            "Warning: Could not complete changed-diff rebase provenance or dependent "
+            "resolution-review metadata repair before lifecycle rendering:"
+        ) in output
         assert "simulated mid-repair failure" in output
         assert "Lifecycle:" in output
 
