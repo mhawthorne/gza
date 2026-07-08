@@ -1,0 +1,441 @@
+#!/usr/bin/env python3
+"""Show everything that changed in the codebase over a time window as a single
+hunk diff, annotated with the gza task behind each changed region.
+
+This is the window-scoped sibling of bin/gza-task-diff: instead of "show me task
+X's diff", it answers "show me the last week of changes, and tell me which task
+is behind each hunk".
+
+Attribution is git-based. Every squash-merge commit in main carries the task ID
+in its message ("Task gza-XXXX" trailer, "Squash merge: <prompt>" subject), so
+we blame the post-image of each changed file and map each line's commit back to
+its task. Lines from commits without a Task trailer (branch merges, hand
+commits) are left unannotated.
+
+Each note is then enriched from the gza DB: the note title comes from the task's
+full (un-truncated) prompt, and the note body (rationale) from the agent's own
+"what was accomplished" summary (output_content) — its first paragraph by
+default, or the entire summary with --full. When the DB is unavailable the note
+falls back to the commit subject line.
+
+Notes are emitted as a hunk --agent-context JSON sidecar (schema version 1).
+
+Usage:
+    bin/gza-changes [--since <when>] [--until <when>] [--full] [--watch]
+
+    --since   start of the window. Anything git approxidate understands
+              ('1 hour ago', '1 day ago', '1 week ago', '2026-06-25').
+              Default: '1 day ago'. A bare date acts as the start bound.
+    --until   end of the window (same forms). Default: now (main tip). Lets you
+              inspect a window that ended in the past, e.g.
+              --since '4 days ago' --until '2 days ago'.
+    --full        put each task's entire output_content summary in the note
+                  rationale. Default is the first paragraph only, to keep the
+                  per-hunk notes compact.
+    --watch       auto-reload while viewing. Off by default: the window is a
+                  fixed commit range, so hunk's 250ms poll never surfaces new
+                  work and can reset your scroll position on a busy repo.
+    --keep-notes  write the notes JSON to .gza/changes-notes.json (for
+                  inspection / reuse) instead of a throwaway temp file.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+# Canonical empty-tree object; used as the base when the window predates the
+# repo so the diff starts from the repo root.
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+# Matches the "Task gza-XXXX" trailer written by
+# src/gza/commit_messages.py:format_task_trailers.
+TASK_TRAILER_RE = re.compile(r"^Task (gza-\d+)\s*$", re.MULTILINE)
+
+# Noise prefixes stripped from the commit subject to form a short note label.
+SUBJECT_NOISE_RE = re.compile(r"^(Squash merge: |Implement )+", re.IGNORECASE)
+
+
+def run_git(args, check=True):
+    """Run a git command, returning stripped stdout. Exit on error when check."""
+    result = subprocess.run(["git"] + args, capture_output=True, text=True)
+    if check and result.returncode != 0:
+        print(f"ERROR - git {' '.join(args)}: {result.stderr.strip()}",
+              file=sys.stderr)
+        sys.exit(1)
+    return result.stdout
+
+
+def resolve_bound(rev_for: str, when: str | None):
+    """Resolve a window bound to a commit SHA on main.
+
+    rev_for is 'before' (start: last commit strictly before `when`) or 'until'
+    (end: newest commit at or before `when`). Returns the SHA, or "" if none.
+    """
+    flag = f"--{rev_for}={when}" if when else None
+    args = ["rev-list", "-1", "main"]
+    if flag:
+        args.append(flag)
+    return run_git(args).strip()
+
+
+def build_attribution_map(base: str, cap: str):
+    """Map commit SHA -> {task_id, subject, date} for in-window commits.
+
+    Commits without a Task trailer map to None (unattributed). Returns
+    (sha_map, unattributed_count).
+    """
+    sep = "\x1f"  # field separator
+    rec = "\x1e"  # record separator
+    out = run_git([
+        "log", f"{base}..{cap}", "--no-merges",
+        f"--format=%H{sep}%s{sep}%cI{sep}%b{rec}",
+    ])
+    sha_map = {}
+    unattributed = 0
+    for raw in out.split(rec):
+        raw = raw.strip("\n")
+        if not raw:
+            continue
+        parts = raw.split(sep)
+        if len(parts) < 4:
+            continue
+        sha, subject, date, body = parts[0], parts[1], parts[2], parts[3]
+        m = TASK_TRAILER_RE.search(body)
+        if not m:
+            sha_map[sha] = None
+            unattributed += 1
+            continue
+        task_id = m.group(1)
+        label = SUBJECT_NOISE_RE.sub("", subject).strip()
+        sha_map[sha] = {"task_id": task_id, "subject": label, "date": date}
+    return sha_map, unattributed
+
+
+def blame_line_shas(cap: str, path: str):
+    """Return a list of commit SHAs, one per line, blaming `path` at `cap`.
+
+    Returns None if the file can't be blamed (deleted/binary/absent at cap).
+    """
+    result = subprocess.run(
+        ["git", "blame", "--line-porcelain", cap, "--", path],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    shas = []
+    for line in result.stdout.splitlines():
+        # Porcelain header lines start with a 40-hex SHA followed by line nums.
+        if len(line) >= 40 and re.match(r"^[0-9a-f]{40} ", line):
+            shas.append(line[:40])
+    return shas
+
+
+def group_annotations(line_shas, sha_map, task_info):
+    """Group consecutive lines sharing the same attributed task into ranges.
+
+    Yields annotation dicts with 1-based inclusive newRange. Notes are enriched
+    from the gza DB (full task title + the agent's own summary) when available,
+    falling back to the truncated commit subject.
+    """
+    annotations = []
+    run_task = None
+    run_start = None
+
+    def flush(end_line):
+        if run_task is None:
+            return
+        info = sha_map[run_task_sha]
+        tid = info["task_id"]
+        enrich = task_info.get(tid)
+        title = (enrich["title"] if enrich and enrich.get("title")
+                 else info["subject"])
+        annotation = {
+            "summary": f"{tid} {title}".rstrip(),
+            "newRange": [run_start, end_line],
+            "tags": [tid],
+            "author": tid,
+            "createdAt": info["date"],
+        }
+        if enrich and enrich.get("rationale"):
+            annotation["rationale"] = enrich["rationale"]
+        annotations.append(annotation)
+
+    run_task_sha = None
+    for idx, sha in enumerate(line_shas, start=1):
+        info = sha_map.get(sha)
+        task = info["task_id"] if info else None
+        if task is not None and task == run_task:
+            continue
+        # Boundary: flush the previous run, start a new one (or a gap).
+        flush(idx - 1)
+        if task is not None:
+            run_task = task
+            run_task_sha = sha
+            run_start = idx
+        else:
+            run_task = None
+            run_task_sha = None
+            run_start = None
+    flush(len(line_shas))
+    return annotations
+
+
+def title_from_prompt(prompt):
+    """First non-empty line of a task prompt, stripped of a leading '#'."""
+    for line in prompt.splitlines():
+        line = line.strip().lstrip("#").strip()
+        if line:
+            return line[:200]
+    return ""
+
+
+def first_paragraph(text):
+    """First blank-line-delimited block (the one-line accomplishment)."""
+    block = []
+    for line in text.splitlines():
+        if not line.strip():
+            if block:
+                break
+            continue
+        block.append(line.strip())
+    return " ".join(block)
+
+
+def main_checkout_db():
+    """The main-checkout .gza/gza.db, derived from git's common dir.
+
+    A linked worktree carries its own (often empty stub) local DB, so when run
+    from one we fall back to the primary checkout's populated DB. Returns None
+    if it can't be determined.
+    """
+    result = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True, text=True)
+    common = result.stdout.strip()
+    if result.returncode != 0 or not common:
+        return None
+    return os.path.join(os.path.dirname(common), ".gza", "gza.db")
+
+
+def db_candidates(explicit):
+    """Ordered gza DB paths to try: --db / $GZA_DB_PATH, else local then main."""
+    if explicit:
+        return [os.path.expanduser(explicit)]
+    env = os.environ.get("GZA_DB_PATH")
+    if env:
+        return [os.path.expanduser(env)]
+    candidates = []
+    for path in (os.path.join(".gza", "gza.db"), main_checkout_db()):
+        if path and path not in candidates:
+            candidates.append(path)
+    return candidates
+
+
+def load_task_info(candidates, task_ids, brief):
+    """Map task_id -> {title, rationale} from the first usable gza DB.
+
+    Tries each candidate path in order (a linked worktree's local DB is an empty
+    stub, so we fall back to the main checkout's populated DB). Returns {} if no
+    candidate yields the tasks table, so notes fall back to commit subjects.
+    """
+    if not task_ids:
+        return {}
+    for db_path in candidates:
+        info = _read_task_info(db_path, task_ids, brief)
+        if info:
+            return info
+    return {}
+
+
+def _read_task_info(db_path, task_ids, brief):
+    """Read task_id -> {title, rationale} from one gza DB (best-effort).
+
+    title comes from the task prompt; rationale from the agent's own
+    output_content summary (its first paragraph when brief). Returns {} if the
+    DB is missing, empty, or unreadable.
+    """
+    if not os.path.exists(db_path):
+        return {}
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return {}
+    info = {}
+    try:
+        if not con.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='tasks'"
+        ).fetchone():
+            return {}
+        ids = list(task_ids)
+        for i in range(0, len(ids), 900):
+            chunk = ids[i:i + 900]
+            placeholders = ",".join("?" * len(chunk))
+            rows = con.execute(
+                f"SELECT id, prompt, output_content FROM tasks "
+                f"WHERE id IN ({placeholders})", chunk)
+            for tid, prompt, output in rows:
+                rationale = (output or "").strip()
+                if brief and rationale:
+                    rationale = first_paragraph(rationale)
+                info[tid] = {
+                    "title": title_from_prompt(prompt or ""),
+                    "rationale": rationale or None,
+                }
+    except sqlite3.Error:
+        pass
+    finally:
+        con.close()
+    return info
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Time-windowed, task-annotated diff via hunk.")
+    parser.add_argument("--since", default="1 day ago",
+                        help="window start (git approxidate or ISO date)")
+    parser.add_argument("--until", default=None,
+                        help="window end (default: main tip)")
+    parser.add_argument("--watch", action="store_true",
+                        help="auto-reload while viewing. The window is a fixed "
+                             "commit range so nothing new is ever picked up, and "
+                             "hunk's 250ms poll can reset your scroll on a busy "
+                             "repo; off by default.")
+    parser.add_argument("--keep-notes", action="store_true",
+                        help="write notes to .gza/changes-notes.json")
+    parser.add_argument("--notes-only", action="store_true",
+                        help="emit the notes JSON and skip launching hunk")
+    parser.add_argument("--db", default=None,
+                        help="gza DB for note enrichment (default: $GZA_DB_PATH, "
+                             "else local .gza/gza.db, else the main checkout's)")
+    parser.add_argument("--full", action="store_true",
+                        help="use each task's entire output_content summary as "
+                             "the note rationale (default: first paragraph only)")
+    args = parser.parse_args()
+
+    if not args.notes_only and not shutil.which("hunk"):
+        print("ERROR - hunk not installed", file=sys.stderr)
+        sys.exit(1)
+
+    base = resolve_bound("before", args.since)
+    if not base:
+        base = EMPTY_TREE
+    cap = resolve_bound("until", args.until)
+    if not cap:
+        print("ERROR - could not resolve window end on main", file=sys.stderr)
+        sys.exit(1)
+
+    if base == cap:
+        window = f"since '{args.since}'"
+        if args.until:
+            window += f" until '{args.until}'"
+        print(f"No changes on main in window {window}.")
+        sys.exit(0)
+
+    # Guard against an inverted window (start newer than end). If cap is an
+    # ancestor of base, the range is empty/backwards.
+    if base != EMPTY_TREE:
+        ancestor = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base, cap]
+        ).returncode
+        if ancestor != 0:
+            print("ERROR - --since must be older than --until "
+                  "(empty or inverted window)", file=sys.stderr)
+            sys.exit(2)
+
+    revspec = f"{base}..{cap}"
+    sha_map, unattributed = build_attribution_map(base, cap)
+
+    window_task_ids = {v["task_id"] for v in sha_map.values() if v}
+    task_info = load_task_info(
+        db_candidates(args.db), window_task_ids, brief=not args.full)
+
+    changed = [p for p in run_git(
+        ["diff", "--name-only", revspec]).splitlines() if p]
+
+    files_notes = []
+    skipped = []
+    task_ids = set()
+    for path in changed:
+        line_shas = blame_line_shas(cap, path)
+        if line_shas is None:
+            skipped.append(path)
+            continue
+        annotations = group_annotations(line_shas, sha_map, task_info)
+        if not annotations:
+            continue
+        for a in annotations:
+            task_ids.update(a["tags"])
+        files_notes.append({"path": path, "annotations": annotations})
+
+    summary_bits = [
+        f"{len(task_ids)} task(s) across {len(files_notes)} file(s)",
+        f"since '{args.since}'",
+    ]
+    if args.until:
+        summary_bits.append(f"until '{args.until}'")
+    if unattributed:
+        summary_bits.append(f"{unattributed} unattributed commit(s)")
+    if skipped:
+        summary_bits.append(f"{len(skipped)} unblameable file(s)")
+    if task_info:
+        summary_bits.append(f"{len(task_info)} task(s) enriched from db")
+    notes = {
+        "version": 1,
+        "summary": ", ".join(summary_bits),
+        "files": files_notes,
+    }
+
+    if args.notes_only and not args.keep_notes:
+        json.dump(notes, sys.stdout, indent=2)
+        print()
+        return 0
+
+    if args.keep_notes:
+        os.makedirs(".gza", exist_ok=True)
+        notes_path = os.path.join(".gza", "changes-notes.json")
+        with open(notes_path, "w") as f:
+            json.dump(notes, f, indent=2)
+        if args.notes_only:
+            print(notes_path)
+            return 0
+        cleanup = None
+    else:
+        fd, notes_path = tempfile.mkstemp(prefix="gza-changes-", suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump(notes, f, indent=2)
+        cleanup = notes_path
+
+    hunk_cmd = ["hunk", "diff"]
+    if args.watch:
+        hunk_cmd.append("--watch")
+    hunk_cmd += [
+        "--mode", "stack",    # unified layout: notes get full width (split docks
+                              # them into a cramped half-width side column)
+        "--line-numbers",     # show line numbers
+        "--wrap",             # wrap long lines instead of truncating
+        "--hunk-headers",     # show hunk metadata rows
+        "--agent-notes",      # show the task annotations inline by default
+        "--agent-context", notes_path,
+        revspec,
+    ]
+    # Note: the file-list sidebar has no CLI flag. hunk shows it only when the
+    # terminal is wide enough ("full" viewport); toggle it in-TUI with `s`.
+    try:
+        return subprocess.run(hunk_cmd).returncode
+    finally:
+        if cleanup:
+            try:
+                os.unlink(cleanup)
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
