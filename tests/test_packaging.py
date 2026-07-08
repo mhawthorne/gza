@@ -2,6 +2,7 @@
 
 import ast
 import importlib.util
+import re
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,30 @@ def _load_module(path: Path, module_name: str):
 
 def _format_unit_suite_boundary_violations(tests_root: Path) -> list[str]:
     return [violation.format() for violation in find_unit_suite_boundary_violations(tests_root)]
+
+
+def _functional_subprocess_run_timeouts(tests_root: Path) -> list[tuple[Path, int, int | float]]:
+    timeouts: list[tuple[Path, int, int | float]] = []
+    for test_file in tests_root.rglob("test_*.py"):
+        module = ast.parse(test_file.read_text(), filename=str(test_file))
+        for inner in ast.walk(module):
+            if not isinstance(inner, ast.Call):
+                continue
+            if not (
+                isinstance(inner.func, ast.Attribute)
+                and inner.func.attr == "run"
+                and isinstance(inner.func.value, ast.Name)
+                and inner.func.value.id == "subprocess"
+            ):
+                continue
+            for kw in inner.keywords:
+                if (
+                    kw.arg == "timeout"
+                    and isinstance(kw.value, ast.Constant)
+                    and isinstance(kw.value.value, (int, float))
+                ):
+                    timeouts.append((test_file, inner.lineno, kw.value.value))
+    return timeouts
 
 
 def test_hatch_vcs_does_not_write_source_version_file() -> None:
@@ -465,41 +490,43 @@ def test_pytest_suite_conftests_do_not_register_sigterm_faulthandler_inline() ->
 
 
 def test_functional_subprocess_timeouts_within_watchdog() -> None:
-    """tests_functional subprocess.run(timeout=N) calls must stay within the suite watchdog."""
+    """tests_functional subprocess.run(timeout=N) calls must stay within local and CI watchdogs."""
     repo_root = Path(__file__).resolve().parents[1]
     conftest_path = repo_root / "tests_functional" / "conftest.py"
     module = _load_module(conftest_path, "tests_functional_watchdog_budget_conftest")
     functional_budget = module.FUNCTIONAL_TEST_TIMEOUT_SECONDS
 
+    subprocess_timeouts = _functional_subprocess_run_timeouts(repo_root / "tests_functional")
     inversions: list[str] = []
-    tests_root = repo_root / "tests_functional"
-    for test_file in tests_root.rglob("test_*.py"):
-        module = ast.parse(test_file.read_text(), filename=str(test_file))
-        for inner in ast.walk(module):
-            if not isinstance(inner, ast.Call):
-                continue
-            if not (
-                isinstance(inner.func, ast.Attribute)
-                and inner.func.attr == "run"
-                and isinstance(inner.func.value, ast.Name)
-                and inner.func.value.id == "subprocess"
-            ):
-                continue
-            for kw in inner.keywords:
-                if (
-                    kw.arg == "timeout"
-                    and isinstance(kw.value, ast.Constant)
-                    and isinstance(kw.value.value, (int, float))
-                    and kw.value.value > functional_budget
-                ):
-                    inversions.append(
-                        f"{test_file}:{inner.lineno} subprocess.run(timeout={kw.value.value}) "
-                        f"> FUNCTIONAL_TEST_TIMEOUT_SECONDS={functional_budget}"
-                    )
+    for test_file, lineno, timeout in subprocess_timeouts:
+        if timeout > functional_budget:
+            inversions.append(
+                f"{test_file}:{lineno} subprocess.run(timeout={timeout}) "
+                f"> FUNCTIONAL_TEST_TIMEOUT_SECONDS={functional_budget}"
+            )
 
     assert not inversions, (
         "Inner subprocess.run timeouts exceed the functional watchdog; the watchdog will fire first "
         "and the inner timeout can never trip:\n  " + "\n  ".join(inversions)
+    )
+
+    workflow_path = repo_root / ".github" / "workflows" / "test.yml"
+    workflow_text = workflow_path.read_text()
+    match = re.search(
+        r'^\s*GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS:\s*"?(?P<timeout>\d+)"?\s*$',
+        workflow_text,
+        re.MULTILINE,
+    )
+    if match is None:
+        return
+
+    ci_budget = int(match.group("timeout"))
+    largest_inner_timeout = max(timeout for _test_file, _lineno, timeout in subprocess_timeouts)
+    assert ci_budget > largest_inner_timeout, (
+        "GitHub Actions functional watchdog must stay above the largest functional subprocess "
+        f"timeout so the inner timeout can fire first: "
+        f"GZA_FUNCTIONAL_TEST_TIMEOUT_SECONDS={ci_budget}, largest subprocess.run(timeout=...)="
+        f"{largest_inner_timeout}"
     )
 
 
