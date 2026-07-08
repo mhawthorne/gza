@@ -1042,18 +1042,16 @@ class Git:
         return {ref: resolved[ref] for ref in requested}
 
     def resolve_merge_source_ref(self, branch: str, *, remote: str = "origin") -> str | None:
-        """Return an existing ref that can prove merge truth for a branch.
+        """Return the legacy local merge-source ref for a branch, if any.
 
-        Prefer the local branch when it survives. Fall back to ``<remote>/<branch>``
-        when only the remote-tracking ref remains. If neither exists, return
-        ``None`` so callers do not treat a missing source ref as merge proof.
+        This helper is intentionally local-only even when a matching remote-tracking
+        ref still exists. Lifecycle merge proof must be derived from confirmed local
+        refs only; remote-aware callers must use ``resolve_fresh_merge_source()`` or
+        an explicit publication-reconcile path instead. The ``remote`` argument is
+        retained for compatibility with older callers but is not consulted here.
         """
         if self.branch_exists(branch):
             return branch
-
-        remote_ref = f"{remote}/{branch}"
-        if self.ref_exists(remote_ref):
-            return remote_ref
 
         return None
 
