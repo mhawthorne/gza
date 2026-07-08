@@ -4,6 +4,8 @@ from datetime import UTC, datetime, timedelta
 from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
+import pytest
+
 from gza.db import SqliteTaskStore
 from gza.git import GitError
 from gza.github import GitHub, GitHubError, PullRequestDetails
@@ -2101,6 +2103,95 @@ def test_reconcile_branch_merge_truth_preserves_redundant_state_when_ref_becomes
     assert results[0].warnings
     assert "redundant" in results[0].warnings[0]
     git.is_merged.assert_not_called()
+
+
+@pytest.mark.parametrize("persisted_state", ["merged", "empty", "redundant"])
+def test_reconcile_branch_merge_truth_short_circuits_terminal_state_before_classify(
+    tmp_path, persisted_state: str
+):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", f"feature/{persisted_state}-terminal")
+    task.merge_status = persisted_state
+    task.has_commits = True
+    store.update(task)
+
+    cohort = BranchCohort(
+        branch=task.branch,
+        tasks=(task,),
+        merge_unit_state=persisted_state,
+        merge_unit_target_branch="main",
+        merge_unit_head_sha="missing-recorded-head",
+    )
+
+    class _GuardGit:
+        def __init__(self) -> None:
+            self.is_ancestor = Mock(side_effect=AssertionError("terminal state should bypass ancestor proof"))
+            self.is_merged = Mock(side_effect=AssertionError("terminal state should bypass merged proof"))
+
+        def branch_exists(self, branch: str) -> bool:
+            return branch == task.branch
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            return {
+                task.branch: "branch-tip-sha",
+                "main": "target-tip-sha",
+            }.get(ref)
+
+    git = _GuardGit()
+
+    with patch(
+        "gza.sync_ops.classify_branch_merge_state_for_target",
+        side_effect=AssertionError("terminal state should bypass classify"),
+    ) as classify, patch(
+        "gza.sync_ops.classify_proven_merged_state",
+        side_effect=AssertionError("terminal state should bypass proven-merged classify"),
+    ) as classify_proven:
+        results = reconcile_branch_merge_truth(
+            git,
+            [cohort],
+            target_branch="main",
+            include_diff_stats=False,
+        )
+
+    assert results[0].merge_status == persisted_state
+    assert all("Could not verify whether" not in warning for warning in results[0].warnings)
+    classify.assert_not_called()
+    classify_proven.assert_not_called()
+    git.is_merged.assert_not_called()
+    git.is_ancestor.assert_not_called()
+
+
+def test_reconcile_branch_merge_truth_still_classifies_unmerged_state(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/still-unmerged")
+    cohort = BranchCohort(
+        branch=task.branch,
+        tasks=(task,),
+        merge_unit_state="unmerged",
+        merge_unit_head_sha="recorded-head",
+    )
+
+    git = Mock()
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = False
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        task.branch: "branch-tip-sha",
+        "main": "target-tip-sha",
+    }.get(ref)
+
+    with patch(
+        "gza.sync_ops.classify_branch_merge_state_for_target",
+        return_value=Mock(state="unmerged"),
+    ) as classify:
+        results = reconcile_branch_merge_truth(
+            git,
+            [cohort],
+            target_branch="main",
+            include_diff_stats=False,
+        )
+
+    assert results[0].merge_status == "unmerged"
+    classify.assert_called_once()
 
 
 def test_reconcile_task_branch_merge_truth_persists_preserved_empty_when_ref_unavailable(tmp_path):

@@ -2698,8 +2698,7 @@ def test_query_lineage_owner_rows_hides_empty_owner_with_failed_same_branch_desc
     )
 
     assert rows == ()
-    assert ("count_commits_ahead_checked", f"{impl.branch}->main") in git.probes
-    assert ("has_non_empty_source_diff_against_target", f"{impl.branch}->main") in git.probes
+    assert git.probes == []
 
 
 def test_query_lineage_owner_rows_hides_terminal_owner_with_moot_failed_implement_leaf(
@@ -3967,9 +3966,15 @@ def test_query_lineage_owner_rows_hides_empty_failed_owner_resolved_by_landed_si
     assert failed.id not in failed_leaf_ids
 
 
+@pytest.mark.parametrize(
+    ("leaf_state", "has_commits"),
+    [("merged", True), ("empty", False), ("redundant", True)],
+)
 def test_failed_leaf_unique_unmerged_work_short_circuits_terminal_leaf_even_with_live_git(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    leaf_state: str,
+    has_commits: bool,
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -4003,7 +4008,7 @@ def test_failed_leaf_unique_unmerged_work_short_circuits_terminal_leaf_even_with
     failed_leaf.status = "failed"
     failed_leaf.failure_reason = "WORKER_DIED"
     failed_leaf.branch = "feature/terminal-owner-short-circuit-followup"
-    failed_leaf.has_commits = True
+    failed_leaf.has_commits = has_commits
     failed_leaf.completed_at = datetime(2026, 5, 19, 9, 0, tzinfo=UTC)
     store.update(failed_leaf)
 
@@ -4011,7 +4016,7 @@ def test_failed_leaf_unique_unmerged_work_short_circuits_terminal_leaf_even_with
         source_branch=failed_leaf.branch,
         target_branch="main",
         owner_task_id=failed_leaf.id,
-        state="merged",
+        state=leaf_state,
         head_sha="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
     )
     store.attach_task_to_merge_unit(failed_leaf.id, failed_leaf_unit.id, "owner")
@@ -4046,6 +4051,72 @@ def test_failed_leaf_unique_unmerged_work_short_circuits_terminal_leaf_even_with
         max_recovery_attempts=1,
     )
     assert [entry.decision.task_id for entry in entries] == []
+
+
+def test_failed_rebase_contributor_under_terminal_owner_short_circuits_before_git_proof(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Merged owner", task_type="implement")
+    assert owner.id is not None
+    _set_completed(
+        owner,
+        when=datetime(2026, 7, 6, 8, 0, tzinfo=UTC),
+        branch="feature/terminal-owner-rebase-contributor",
+        has_commits=True,
+    )
+    owner.merge_status = "merged"
+    store.update(owner)
+
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed_rebase = store.add(
+        "Failed rebase contributor",
+        task_type="rebase",
+        based_on=owner.id,
+        recovery_origin="manual",
+    )
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.failure_reason = "GIT_ERROR"
+    failed_rebase.branch = owner.branch
+    failed_rebase.has_commits = True
+    failed_rebase.completed_at = datetime(2026, 7, 6, 9, 0, tzinfo=UTC)
+    store.update(failed_rebase)
+    store.attach_task_to_merge_unit(failed_rebase.id, owner_unit.id, "contributor")
+
+    git = MagicMock(spec=Git)
+    git.is_ancestor.side_effect = AssertionError("terminal contributor should short-circuit before git proof")
+
+    caplog.clear()
+    with (
+        caplog.at_level("WARNING", logger="gza.lineage_query"),
+        patch(
+            "gza.lineage_query.classify_branch_merge_state_for_target",
+            side_effect=AssertionError("terminal contributor should short-circuit before classify"),
+        ) as classify,
+    ):
+        result = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+            failed_task=failed_rebase,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=owner_unit,
+            git=git,
+        )
+
+    assert result is False
+    classify.assert_not_called()
+    git.is_ancestor.assert_not_called()
+    assert caplog.records == []
 
 
 class _MinimalGit(Git):

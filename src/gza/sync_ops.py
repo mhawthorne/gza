@@ -21,6 +21,7 @@ from .db import (
 )
 from .git import Git, GitError, parse_diff_numstat, resolve_ref_if_possible
 from .github import GitHub, GitHubError, PullRequestDetails, is_github_repo_unsupported_error
+from .lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from .merge_state import (
     classify_branch_merge_state_for_target,
     classify_proven_merged_state,
@@ -52,6 +53,7 @@ class BranchCohort:
     tasks: tuple[Task, ...]
     merge_unit_id: str | None = None
     merge_unit_state: str | None = None
+    merge_unit_target_branch: str | None = None
     merge_unit_head_sha: str | None = None
 
     @property
@@ -235,6 +237,7 @@ def build_branch_cohorts_for_task_ids(
                     tasks=tuple(store.list_tasks_for_merge_unit(unit.id)),
                     merge_unit_id=unit.id,
                     merge_unit_state=unit.state,
+                    merge_unit_target_branch=unit.target_branch,
                     merge_unit_head_sha=unit.head_sha,
                 )
             )
@@ -274,6 +277,7 @@ def build_branch_cohorts_for_tasks(
                     tasks=tuple(store.list_tasks_for_merge_unit(unit.id)),
                     merge_unit_id=unit.id,
                     merge_unit_state=unit.state,
+                    merge_unit_target_branch=unit.target_branch,
                     merge_unit_head_sha=unit.head_sha,
                 )
             )
@@ -375,6 +379,12 @@ def reconcile_branch_merge_truth(
         source_has_commits = source_owner_task.has_commits
         desired_merge_status = owner_tasks[0].merge_status if owner_tasks else code_tasks[0].merge_status
         proof_target_ref = remote_target_ref or target_branch
+        if (
+            merge_state_is_terminal_for_lifecycle(cohort.merge_unit_state)
+            and cohort.merge_unit_target_branch == target_branch
+        ):
+            result.merge_status = cohort.merge_unit_state
+            continue
         try:
             local_branch_exists = git.branch_exists(cohort.branch)
             reconcile_ref = cohort.branch if local_branch_exists else _remote_branch_ref_for_reconcile(

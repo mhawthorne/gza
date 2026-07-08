@@ -1254,15 +1254,25 @@ def _is_resolved_by_landed_lineage(
                     branch_exists = merge_context.git.branch_exists(task.branch)
                 branch_merge_state = "unmerged"
                 if branch_exists:
-                    merged_proof = merge_context.git.is_merged(task.branch, target_branch)
-                    if merged_proof:
-                        branch_merge_state = classify_branch_merge_state_for_target(
-                            git=merge_context.git,
-                            source_branch=task.branch,
-                            target_branch=target_branch,
-                            merged_proof=merged_proof,
-                            source_has_commits=task.has_commits,
-                        ).state
+                    persisted_state = None
+                    if task.id is not None:
+                        resolved_merge_unit = store.resolve_merge_unit_for_task(task.id)
+                        if resolved_merge_unit is not None and resolved_merge_unit.target_branch == target_branch:
+                            persisted_state = resolved_merge_unit.state
+                    if persisted_state is not None and merge_state_is_terminal_for_lifecycle(persisted_state):
+                        branch_merge_state = persisted_state
+                    else:
+                        merged_proof = merge_context.git.is_merged(task.branch, target_branch)
+                        if merged_proof:
+                            branch_merge_state = classify_branch_merge_state_for_target(
+                                git=merge_context.git,
+                                source_branch=task.branch,
+                                target_branch=target_branch,
+                                persisted_state=persisted_state,
+                                merged_proof=merged_proof,
+                                source_has_commits=task.has_commits,
+                                recorded_head_sha=resolved_merge_unit.head_sha if resolved_merge_unit is not None else None,
+                            ).state
                 merge_context.branch_resolution[branch_resolution_key] = branch_merge_state
             branch_merged = branch_merge_state == "merged"
             if branch_merged:

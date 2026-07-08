@@ -10,6 +10,7 @@ from typing import Any, Literal, cast
 
 from .db import SqliteTaskStore, Task as DbTask
 from .git import ResolvedMergeSourceRef, resolve_ref_if_possible
+from .lifecycle_completion import merge_state_is_terminal_for_lifecycle
 
 MergeBranchState = Literal["merged", "unmerged", "empty", "redundant", "unknown"]
 
@@ -663,6 +664,13 @@ def resolve_task_merge_state_for_target(
     """Resolve merge state for a specific target branch."""
 
     resolved_merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
+    if (
+        resolved_merge_unit is not None
+        and resolved_merge_unit.target_branch == target_branch
+        and merge_state_is_terminal_for_lifecycle(resolved_merge_unit.state)
+    ):
+        return resolved_merge_unit.state
+
     merge_source = resolve_task_merge_source(git, task.branch) if task.branch else ResolvedMergeSourceRef(None)
     source_merge_ref = merge_source.ref
 

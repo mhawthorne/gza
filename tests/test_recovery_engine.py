@@ -1394,6 +1394,102 @@ def test_is_resolved_by_landed_lineage_does_not_treat_reachable_empty_branch_as_
     assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is False
 
 
+@pytest.mark.parametrize(
+    ("persisted_state", "expected"),
+    [("merged", True), ("empty", False), ("redundant", False)],
+)
+def test_is_resolved_by_landed_lineage_short_circuits_terminal_persisted_merge_state(
+    tmp_path: Path,
+    persisted_state: str,
+    expected: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add(f"Failed {persisted_state} implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.branch = f"feature/{persisted_state}-terminal"
+    failed.has_commits = persisted_state != "empty"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state=persisted_state,
+        head_sha="missing-recorded-head",
+    )
+    store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+
+    class _GuardGit:
+        def __init__(self) -> None:
+            self.is_merged_calls = 0
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            self.is_merged_calls += 1
+            raise AssertionError("terminal state should bypass git merge proof")
+
+    git = _GuardGit()
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({failed.branch}),
+    )
+
+    assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is expected
+    assert git.is_merged_calls == 0
+
+
+def test_is_resolved_by_landed_lineage_still_classifies_unmerged_state(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed unmerged implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.branch = "feature/unmerged-live-proof"
+    failed.has_commits = True
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+
+    class _ProbeGit:
+        def __init__(self) -> None:
+            self.is_merged_calls = 0
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            self.is_merged_calls += 1
+            return True
+
+    git = _ProbeGit()
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({failed.branch}),
+    )
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setattr(
+            recovery_engine,
+            "classify_branch_merge_state_for_target",
+            lambda **kwargs: type("Classification", (), {"state": "merged"})(),
+        )
+        assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
+
+    assert git.is_merged_calls == 1
+
+
 def test_empty_task_with_provider_output_remains_visible_when_branch_has_no_unique_commits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

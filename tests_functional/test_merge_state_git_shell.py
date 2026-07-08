@@ -102,7 +102,7 @@ def test_resolve_task_merge_state_real_squash_equivalent_branch_with_commits(tmp
     ) == "merged"
 
 
-def test_resolve_task_merge_state_missing_ref_uses_persisted_empty_state(tmp_path: Path) -> None:
+def test_resolve_task_merge_state_missing_ref_preserves_persisted_empty_state(tmp_path: Path) -> None:
     git = init_basic_repo(tmp_path)
     store = SqliteTaskStore(tmp_path / "test.db")
 

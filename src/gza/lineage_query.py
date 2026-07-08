@@ -868,6 +868,8 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
             return True
         if merge_state_is_terminal_for_lifecycle(leaf_merge_unit.state):
             return False
+    if leaf_targets_owner and not leaf_has_own_merge_unit and failed_task.task_type in {"review", "improve", "rebase", "fix"}:
+        return False
 
     source_branch = failed_task.branch
     if source_branch is None and leaf_targets_owner and leaf_merge_unit is not None:
@@ -884,6 +886,11 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
 
     if git is None:
         return True
+
+    if leaf_has_own_merge_unit and leaf_merge_unit is not None and merge_state_is_terminal_for_lifecycle(
+        leaf_merge_unit.state
+    ):
+        return False
 
     try:
         classification = classify_branch_merge_state_for_target(

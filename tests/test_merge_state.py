@@ -142,7 +142,7 @@ def test_resolve_task_merge_state_classifies_zero_commit_branch_with_commits_as_
         target_branch="main",
     )
 
-    assert result == "redundant"
+    assert result == "merged"
 
 
 def test_resolve_task_merge_state_keeps_merged_when_empty_probe_is_indeterminate(
@@ -174,7 +174,7 @@ def test_resolve_task_merge_state_keeps_merged_when_empty_probe_is_indeterminate
         )
 
     assert result == "merged"
-    assert "keeping merge state at 'merged' instead of classifying 'empty'" in caplog.text
+    assert caplog.text == ""
 
 
 def test_resolve_task_merge_state_prefers_redundant_over_merged_when_task_commits_have_no_unique_commits(
@@ -927,6 +927,102 @@ def test_resolve_task_merge_state_stale_empty_branch_is_empty_not_merged(
     assert state == "empty"
 
 
+@pytest.mark.parametrize("persisted_state", ["merged", "empty", "redundant"])
+def test_resolve_task_merge_state_returns_terminal_persisted_state_without_source_probe(
+    tmp_path: Path,
+    persisted_state: str,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add(f"Terminal {persisted_state} branch", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.has_commits = persisted_state != "empty"
+    task.branch = f"feature/{persisted_state}-terminal"
+    store.update(task)
+    assert task.id is not None
+
+    unit = store.create_merge_unit(
+        source_branch=task.branch,
+        target_branch="main",
+        owner_task_id=task.id,
+        state=persisted_state,
+        head_sha="missing-recorded-head",
+    )
+    store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+
+    class _GuardGit:
+        def __init__(self) -> None:
+            self.resolve_calls = 0
+            self.is_merged_calls = 0
+
+        def resolve_fresh_merge_source(self, _branch: str):
+            self.resolve_calls += 1
+            raise AssertionError("terminal state should bypass source resolution")
+
+        def is_merged(self, _branch: str, _target: str) -> bool:
+            self.is_merged_calls += 1
+            raise AssertionError("terminal state should bypass merge proof")
+
+    git = _GuardGit()
+
+    state = resolve_task_merge_state_for_target(
+        store=store,
+        task=task,
+        git=git,
+        target_branch="main",
+    )
+
+    assert state == persisted_state
+    assert git.resolve_calls == 0
+    assert git.is_merged_calls == 0
+
+
+def test_resolve_task_merge_state_still_probes_unmerged_state(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = store.add("Unmerged branch", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.has_commits = True
+    task.branch = "feature/still-unmerged"
+    store.update(task)
+    assert task.id is not None
+
+    unit = store.create_merge_unit(
+        source_branch=task.branch,
+        target_branch="main",
+        owner_task_id=task.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(task.id, unit.id, "owner")
+
+    class _TrackingGit(_FakeGit):
+        def __init__(self) -> None:
+            super().__init__(
+                source_ref=task.branch,
+                ref_shas={task.branch: "branch-tip-sha", "main": "target-tip-sha"},
+                ahead_count=1,
+                merged=False,
+                net_diff=True,
+            )
+            self.resolve_calls = 0
+
+        def resolve_fresh_merge_source(self, branch: str):
+            self.resolve_calls += 1
+            return super().resolve_fresh_merge_source(branch)
+
+    git = _TrackingGit()
+
+    state = resolve_task_merge_state_for_target(
+        store=store,
+        task=task,
+        git=git,
+        target_branch="main",
+    )
+
+    assert state == "unmerged"
+    assert git.resolve_calls >= 1
+
+
 def test_resolve_task_merge_state_falls_back_to_persisted_empty_when_source_ref_missing(
     tmp_path: Path,
 ) -> None:
@@ -994,7 +1090,7 @@ def test_resolve_task_merge_state_falls_back_to_persisted_redundant_when_source_
 
 
 @pytest.mark.parametrize("persisted_state", ["empty", "redundant"])
-def test_resolve_task_merge_state_reclassifies_persisted_no_work_with_live_net_diff(
+def test_resolve_task_merge_state_preserves_terminal_no_work_state_without_live_net_diff_probe(
     tmp_path: Path,
     persisted_state: str,
 ) -> None:
@@ -1012,26 +1108,56 @@ def test_resolve_task_merge_state_reclassifies_persisted_no_work_with_live_net_d
         target_branch="main",
         owner_task_id=task.id,
         state=persisted_state,
+        head_sha="missing-recorded-head",
     )
     store.attach_task_to_merge_unit(task.id, unit.id, "owner")
     store.set_merge_unit_state(unit.id, persisted_state)
 
+    class _GuardGit(_FakeGit):
+        def __init__(self) -> None:
+            super().__init__(
+                source_ref=task.branch,
+                ref_shas={task.branch: "branch-tip-sha", "main": "target-tip-sha"},
+                ahead_count=1,
+                merged=False,
+                net_diff=True,
+            )
+            self.resolve_calls = 0
+            self.is_merged_calls = 0
+            self.net_diff_calls = 0
+
+        def resolve_fresh_merge_source(self, branch: str):
+            self.resolve_calls += 1
+            raise AssertionError(f"terminal persisted {persisted_state} should bypass source resolution")
+
+        def is_merged(self, _branch: str, _target: str) -> bool:
+            self.is_merged_calls += 1
+            raise AssertionError(f"terminal persisted {persisted_state} should bypass merge proof")
+
+        def has_non_empty_source_diff_against_target(self, _source_ref: str, _target: str) -> bool | None:
+            self.net_diff_calls += 1
+            raise AssertionError(f"terminal persisted {persisted_state} should bypass diff proof")
+
     refreshed = store.get(task.id)
     assert refreshed is not None
+    if persisted_state == "empty":
+        refreshed.has_commits = True
+        store.update(refreshed)
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+
+    git = _GuardGit()
     state = resolve_task_merge_state_for_target(
         store=store,
         task=refreshed,
-        git=_FakeGit(
-            source_ref=task.branch,
-            ref_shas={task.branch: "branch-tip-sha", "main": "target-tip-sha"},
-            ahead_count=1,
-            merged=False,
-            net_diff=True,
-        ),
+        git=git,
         target_branch="main",
     )
 
-    assert state == "unmerged"
+    assert state == persisted_state
+    assert git.resolve_calls == 0
+    assert git.is_merged_calls == 0
+    assert git.net_diff_calls == 0
 
 
 def test_resolve_task_merge_state_uses_recorded_head_when_source_ref_is_stale_ancestor(
@@ -1072,10 +1198,10 @@ def test_resolve_task_merge_state_uses_recorded_head_when_source_ref_is_stale_an
         target_branch="main",
     )
 
-    assert state == "unmerged"
+    assert state == "redundant"
 
 
-def test_resolve_task_merge_state_relabels_legacy_empty_with_task_commits_when_source_is_inspectable(
+def test_resolve_task_merge_state_preserves_terminal_empty_with_task_commits_when_source_is_inspectable(
     tmp_path: Path,
 ) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
@@ -1112,7 +1238,7 @@ def test_resolve_task_merge_state_relabels_legacy_empty_with_task_commits_when_s
         target_branch="main",
     )
 
-    assert state == "redundant"
+    assert state == "empty"
 
 
 def test_resolve_task_merge_state_does_not_log_merge_source_warning_side_effect(

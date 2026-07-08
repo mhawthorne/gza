@@ -15109,7 +15109,7 @@ class TestIterateCommand:
         assert f"No remaining iterate action: implementation {impl.id} is already merged." in output
         assert f"[dry-run] Would iterate implementation {impl.id}" not in output
 
-    def test_iterate_suppresses_pending_impl_when_legacy_empty_merge_unit_is_redundant_for_current_target(
+    def test_iterate_suppresses_pending_impl_when_legacy_empty_merge_unit_stays_empty_for_current_target(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ):
         import argparse
@@ -15161,7 +15161,7 @@ class TestIterateCommand:
             patch("gza.cli.Git", return_value=mock_git),
             patch(
                 "gza.cli.execution._run_foreground",
-                side_effect=AssertionError("iterate should not start foreground work for redundant merge state"),
+                side_effect=AssertionError("iterate should not start foreground work for terminal empty merge state"),
             ) as run_foreground,
         ):
             result = cmd_iterate(args)
@@ -15169,8 +15169,8 @@ class TestIterateCommand:
         output = capsys.readouterr().out
         assert result == 0
         run_foreground.assert_not_called()
-        assert f"implementation {impl.id}'s commits are already present on target." in output
-        assert "has no remaining commits to land" not in output
+        assert f"implementation {impl.id} has no remaining commits to land." in output
+        assert "commits are already present on target" not in output
 
     def test_iterate_suppresses_historical_prerequisite_unmerged_failure_once_reconciled_empty(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -16654,7 +16654,7 @@ class TestIterateCommand:
         if workers_dir.exists():
             assert list(workers_dir.iterdir()) == []
 
-    def test_background_iterate_completed_descendant_legacy_empty_noops_with_redundant_message_before_spawn(
+    def test_background_iterate_completed_descendant_legacy_empty_noops_with_empty_message_before_spawn(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         import argparse
@@ -16730,7 +16730,7 @@ class TestIterateCommand:
             patch("gza.cli.execution.Git", return_value=mock_git),
             patch(
                 "gza.cli.execution._spawn_background_iterate",
-                side_effect=AssertionError("background iterate should not spawn for redundant merge state"),
+                side_effect=AssertionError("background iterate should not spawn for terminal empty merge state"),
             ) as spawn_background,
         ):
             result = cmd_iterate(args)
@@ -16741,7 +16741,7 @@ class TestIterateCommand:
         assert (
             "No remaining iterate action: "
             f"failed implementation {failed_impl.id} was fully recovered by descendant "
-            f"{recovered_impl.id}; commits are already present on target."
+            f"{recovered_impl.id} with no remaining commits to land."
         ) in output
         assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
 
