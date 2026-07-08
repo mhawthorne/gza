@@ -17705,6 +17705,48 @@ def test_non_stale_branch_keeps_existing_review_action(tmp_path: Path) -> None:
     assert action["verify_gate_phase"] == "pre_review"
 
 
+@pytest.mark.parametrize("advance_create_reviews", [True, False])
+def test_completed_rebase_without_completed_impl_skips_plain_review_creation(
+    tmp_path: Path,
+    advance_create_reviews: bool,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.advance_create_reviews = advance_create_reviews
+
+    impl = store.add("Failed implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "failed"
+    impl.branch = "feature/review-target-missing"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    rebase = store.add("Completed rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert rebase.id is not None
+    rebase.status = "completed"
+    rebase.completed_at = datetime.now(UTC)
+    rebase.branch = impl.branch
+    rebase.merge_status = "unmerged"
+    rebase.has_commits = True
+    store.update(rebase)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            existing_refs={f"origin/{impl.branch}"},
+        ),
+        rebase,
+        "main",
+    )
+
+    assert action["type"] == "skip"
+    assert "does not resolve to a completed implementation review target" in action["description"]
+
+
 def test_approved_but_behind_branch_merges_when_clean(tmp_path: Path, monkeypatch) -> None:
     from gza import advance_engine as advance_engine_module
 

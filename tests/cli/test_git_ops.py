@@ -22,6 +22,7 @@ from gza.cli.git_ops import (
     _execute_merge_action,
     _merge_single_task,
     _MergeSingleTaskResult,
+    _prepare_create_review_action,
     _print_squash_reconcile_result,
     _reconcile_diverged_branch_with_origin,
     _reconcile_squash_merged_branch_with_origin,
@@ -250,6 +251,55 @@ def _add_prerequisite_unmerged_failed_child(
     failed.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
     store.update(failed)
     return dependency, owner, failed
+
+
+@pytest.mark.parametrize("subject_type", ["improve", "rebase", "fix"])
+def test_prepare_create_review_action_resolves_completed_impl_target(
+    tmp_path: Path,
+    subject_type: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Completed implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/review-target"
+    impl.merge_status = "unmerged"
+    impl.has_commits = True
+    store.update(impl)
+
+    subject = store.add(
+        f"Completed {subject_type}",
+        task_type=subject_type,
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert subject.id is not None
+    subject.status = "completed"
+    subject.completed_at = datetime.now(UTC)
+    subject.branch = impl.branch
+    subject.merge_status = "unmerged"
+    subject.has_commits = True
+    store.update(subject)
+
+    review = store.add("Prepared review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    called_impl_ids: list[str | None] = []
+
+    def _fake_create_review_task(_store, impl_task, *, trigger_source):
+        called_impl_ids.append(impl_task.id)
+        assert trigger_source == "watch"
+        return review
+
+    with patch("gza.cli.git_ops._create_review_task", side_effect=_fake_create_review_task):
+        result = _prepare_create_review_action(store, subject, trigger_source="watch")
+
+    assert called_impl_ids == [impl.id]
+    assert result.status == "created"
+    assert result.review_task is not None
+    assert result.review_task.id == review.id
+    assert result.message == f"Created review task {review.id}"
 
 
 def _assert_scoped_preload_refs(

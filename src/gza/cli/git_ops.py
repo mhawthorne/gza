@@ -95,6 +95,7 @@ from ..rebase_diff import (
 from ..rebase_publish import publish_rebased_branch
 from ..recovery_engine import (
     _MergeContext,
+    _resolve_merged_target_task,
     build_merge_context_from_git,
     list_failed_tasks_for_recovery,
     resolve_pending_recovery_execution_mode,
@@ -113,6 +114,8 @@ from ..runner import (
     TaskExecutionLogger,
     _complete_failed_code_task_after_pr_publication,
     _compute_tree_fingerprint,
+    _resolve_impl_ancestor,
+    _resolve_root_implementation_for_fix,
     ensure_task_log_path,
     get_effective_config_for_task,
     load_dotenv,
@@ -3127,8 +3130,22 @@ def _prepare_create_review_action(
     trigger_source: str,
 ) -> _CreateReviewActionResult:
     """Create or resolve the review task for an advance-style create_review action."""
+    review_target = task
+    if task.task_type in {"improve", "rebase"}:
+        resolved_impl = _resolve_merged_target_task(store, task)
+        if resolved_impl is not None:
+            review_target = resolved_impl
+    elif task.task_type == "fix":
+        resolved_impl = _resolve_root_implementation_for_fix(task, store)
+        if resolved_impl is not None:
+            review_target = resolved_impl
+    elif task.task_type != "implement":
+        resolved_impl = _resolve_impl_ancestor(store, task)
+        if resolved_impl is not None:
+            review_target = resolved_impl
+
     try:
-        review_task = _create_review_task(store, task, trigger_source=trigger_source)
+        review_task = _create_review_task(store, review_target, trigger_source=trigger_source)
     except DuplicateReviewError as exc:
         review_task = exc.active_review
         return _CreateReviewActionResult(

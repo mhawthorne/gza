@@ -54,6 +54,7 @@ from gza.rebase_diff import (
 )
 from gza.recovery_engine import (
     FailedRecoveryDecision,
+    _resolve_merged_target_task,
     classify_failure_reason,
     decide_failed_task_recovery,
     get_failed_recovery_needs_attention_reason,
@@ -4474,6 +4475,51 @@ def _resolve_impl_ancestor_by_based_on(store: SqliteTaskStore, task: DbTask) -> 
     return None
 
 
+def _resolve_fix_review_target(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
+    """Resolve the implementation ancestor for fix lineages using based_on only."""
+    visited: set[str] = set()
+    current: DbTask | None = task
+    while current is not None:
+        if current.id is not None:
+            if current.id in visited:
+                return None
+            visited.add(current.id)
+        if current.task_type == "implement":
+            return current
+        if current.based_on is None:
+            return None
+        current = store.get(current.based_on)
+    return None
+
+
+def _resolve_plain_review_target_task(ctx: AdvanceContext) -> DbTask | None:
+    """Resolve the completed implementation target for plain create_review actions."""
+    target: DbTask | None
+    if ctx.task.task_type == "implement":
+        target = ctx.task
+    elif ctx.task.task_type in {"improve", "rebase"}:
+        target = _resolve_merged_target_task(ctx.store, ctx.task)
+    elif ctx.task.task_type == "fix":
+        target = _resolve_fix_review_target(ctx.store, ctx.task)
+    else:
+        target = None
+
+    if target is None or target.task_type != "implement" or target.status != "completed":
+        return None
+    return target
+
+
+def _plain_review_target_missing_skip_action(ctx: AdvanceContext) -> dict[str, Any]:
+    task_id = _task_id(ctx.task)
+    return {
+        "type": "skip",
+        "description": (
+            f"SKIP: {ctx.task.task_type} task {task_id} does not resolve to a completed "
+            "implementation review target"
+        ),
+    }
+
+
 def _spec_coherence_reviews(reviews: list[DbTask] | None) -> list[DbTask]:
     return [
         review
@@ -6928,13 +6974,24 @@ ADVANCE_RULES: list[AdvanceRule] = [
         action=lambda ctx: {"type": "merge", "description": "Merge task (no review yet)"},
     ),
     AdvanceRule(
+        name="implement_plain_review_target_missing",
+        matches=lambda ctx: ctx.requires_review
+        and ctx.task.task_type in {"improve", "rebase", "fix"}
+        and _resolve_plain_review_target_task(ctx) is None,
+        action=_plain_review_target_missing_skip_action,
+    ),
+    AdvanceRule(
         name="implement_create_review",
-        matches=lambda ctx: ctx.requires_review and ctx.create_reviews,
+        matches=lambda ctx: ctx.requires_review
+        and ctx.create_reviews
+        and _resolve_plain_review_target_task(ctx) is not None,
         action=lambda ctx: {"type": "create_review", "description": "Create review (required before merge)"},
     ),
     AdvanceRule(
         name="implement_needs_manual_review",
-        matches=lambda ctx: ctx.requires_review and not ctx.create_reviews,
+        matches=lambda ctx: ctx.requires_review
+        and not ctx.create_reviews
+        and _resolve_plain_review_target_task(ctx) is not None,
         action=lambda ctx: with_needs_attention(
             {
                 "type": "needs_discussion",
