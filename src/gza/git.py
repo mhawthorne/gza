@@ -1409,27 +1409,32 @@ class Git:
             )
 
     def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
-        """Check if a branch has been merged into another branch.
+        """Check if one ref's content has already landed in another ref.
 
         By default, uses git merge-tree to simulate a merge and compare the
-        resulting tree with the target branch's tree. If they're identical,
-        merging the branch would be a no-op, meaning all changes are already
-        in the target. This correctly handles squash merges, rebases, and
-        branches that diverged but have equivalent content.
+        resulting tree with the target ref's tree. If they're identical,
+        merging the source ref would be a no-op, meaning all changes are
+        already in the target. This correctly handles squash merges, rebases,
+        and refs that diverged but have equivalent content.
+
+        This helper accepts any resolvable source ref, including remote-tracking
+        refs when a caller is explicitly reconciling publication state. gza's
+        lifecycle, ``advance``, and ``watch`` canonical landed-proof paths must
+        still resolve merge proof from local refs only before calling it.
 
         Args:
-            branch: The branch to check
-            into: The target branch (defaults to default branch)
+            branch: The source branch or other resolvable ref to check
+            into: The target branch or other resolvable ref (defaults to default branch)
             use_cherry: Use git cherry instead of merge-tree (legacy method)
 
         Returns:
-            True if the branch has been merged into the target
+            True if the source ref's content is already present in the target
         """
         if into is None:
             into = self.default_branch()
 
-        # Accept either a local branch name or any other resolvable ref
-        # (for example ``origin/feature`` during canonical sync reconciliation).
+        # Accept either a local branch name or any other resolvable ref. Callers
+        # that need canonical lifecycle proof must still pass only local refs.
         if not self.branch_exists(branch) and not self.ref_exists(branch):
             return True  # Ref deleted, assume merged
 
@@ -1460,19 +1465,20 @@ class Git:
             return merged_tree == target_tree
 
     def can_merge(self, branch: str, into: str | None = None) -> bool:
-        """Check if a branch can be merged cleanly (no conflicts).
+        """Check if one ref can be merged cleanly into another (no conflicts).
 
         Uses git merge-tree to simulate a merge without touching the worktree.
-        Accepts either a local branch name or any other resolvable commit ref,
-        such as ``origin/<branch>`` when advance planning is reconciling across
-        worktrees.
+        Accepts either a local branch name or any other resolvable commit ref.
+        That generic ref support is for callers doing explicit reconciliation;
+        gza's lifecycle, ``advance``, and ``watch`` canonical proof paths must
+        still resolve their merge inputs to local refs before calling this.
 
         Args:
-            branch: The branch to check
-            into: The target branch (defaults to default branch)
+            branch: The source branch or other resolvable ref to check
+            into: The target branch or other resolvable ref (defaults to default branch)
 
         Returns:
-            True if the branch can be merged without conflicts
+            True if the source ref can be merged without conflicts
         """
         if into is None:
             into = self.default_branch()
