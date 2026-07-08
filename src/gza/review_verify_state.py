@@ -344,18 +344,12 @@ def review_task_verify_epoch(task: Task, config: object | None) -> VerifyEpoch |
     command = normalized_verify_command(task.review_verify_command)
     if command is None:
         return None
-    timeout_seconds = getattr(config, "autonomous_verify_timeout_seconds", None)
-    timeout_grace_seconds = getattr(config, "review_verify_timeout_grace_seconds", None)
     return make_verify_epoch(
         reviewed_branch=task.review_verify_branch,
         reviewed_head_sha=task.review_verify_head_sha,
         verify_command=command,
-        verify_timeout_seconds=timeout_seconds if isinstance(timeout_seconds, int) else None,
-        verify_timeout_grace_seconds=(
-            float(timeout_grace_seconds)
-            if isinstance(timeout_grace_seconds, (int, float)) and not isinstance(timeout_grace_seconds, bool)
-            else None
-        ),
+        verify_timeout_seconds=None,
+        verify_timeout_grace_seconds=None,
     )
 
 
