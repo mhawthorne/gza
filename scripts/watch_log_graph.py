@@ -143,18 +143,41 @@ def parse_log(path, base_date):
     have_full = any(r[0] is not None for r in raw)
     times = _assign_datetimes(raw, base_date, have_full)
 
-    # Second pass: build Points from WAKE rows, carrying attention forward.
+    # Second pass: build Points from WAKE rows, resolving each cycle's attention.
+    #
+    # While the count is > 0 the watch emits exactly one attention line per cycle
+    # (a "Needs attention (N)" header or an "N still need attention (unchanged)"
+    # line); when the count is zero it emits nothing. So we can't just carry the
+    # last value forward — that would pin the curve at the last non-zero count
+    # forever. Instead, for each WAKE we look ahead within its own cycle (up to
+    # the next WAKE) for an attention line: found -> that count; absent -> zero.
+    # We only infer zero once the log has started reporting attention at all, so
+    # older logs that never emit attention lines keep attention=None as before.
+    first_attn_idx = next((i for i, r in enumerate(raw) if r[2] == "attn"), None)
     points = []
     merges = []  # (datetime, task_id)
     attention = None
-    for (row, when) in zip(raw, times):
+    for i, (row, when) in enumerate(zip(raw, times)):
         kind = row[2]
         if kind == "attn":
-            attention = row[3]
             continue
         if kind == "merge":
             merges.append((when, row[3]))
             continue
+        # WAKE: find this cycle's attention line, if any, before the next WAKE.
+        cycle_attn = None
+        for j in range(i + 1, len(raw)):
+            nxt = raw[j][2]
+            if nxt == "wake":
+                break
+            if nxt == "attn":
+                cycle_attn = raw[j][3]
+                break
+        if cycle_attn is not None:
+            attention = cycle_attn
+        elif first_attn_idx is not None and i > first_attn_idx:
+            attention = 0  # attention reporting is active but this cycle is silent
+        # else: before any attention reporting -> leave as None (unknown)
         _, _, _, running, pending, blocked = row
         points.append(Point(when, running, pending, blocked, attention))
     return points, merges
