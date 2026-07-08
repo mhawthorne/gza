@@ -6227,6 +6227,56 @@ class TestShowCommand:
         assert task.failure_reason in output
         assert "comment keeps [b]rackets visible" in output
 
+    def test_show_escapes_bracketed_task_text_in_ansi_output(self, tmp_path: Path) -> None:
+        """Show should not emit Rich dim/strikethrough ANSI when task text contains bracket tags."""
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        prompt = "keys: [l]ineage [d]ate [s]tatus [t]oggle [q]uit"
+        comment = "comment keeps [d]im and [s]trike text literal"
+        task = store.add(prompt, task_type="implement")
+        assert task.id is not None
+        store.add_comment(task.id, comment, source="direct")
+
+        console = Console(record=True, force_terminal=True, color_system="standard", width=300, highlight=False)
+
+        with (
+            patch("gza.cli.query.pager_context", return_value=contextlib.nullcontext()),
+            patch.object(query_cli, "console", console),
+            patch.object(query_cli._lv, "console", console),
+        ):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(task.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=False,
+                )
+            )
+
+        plain = console.export_text(clear=False)
+        ansi = console.export_text(styles=True, clear=False)
+
+        assert exit_code == 0
+        assert prompt in plain
+        assert comment in plain
+        assert "[d]ate" in plain
+        assert "[s]tatus" in plain
+        assert "[d]im" in plain
+        assert "[s]trike" in plain
+        assert "[d]ate" in ansi
+        assert "[s]tatus" in ansi
+        assert "[d]im" in ansi
+        assert "[s]trike" in ansi
+        assert "\x1b[2m" not in ansi
+        assert "\x1b[9m" not in ansi
+
     def test_show_output_reads_legacy_fix_summary_fallback(self, tmp_path: Path):
         """--output should surface legacy fix summaries stored only on disk."""
         setup_config(tmp_path)
