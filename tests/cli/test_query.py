@@ -6185,6 +6185,48 @@ class TestShowCommand:
         assert "A detailed task prompt" in result.stdout
         assert "Status: pending" in result.stdout
 
+    @pytest.mark.parametrize("page", [False, True])
+    def test_show_escapes_bracketed_task_text_in_prompt_and_comments(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        page: bool,
+    ) -> None:
+        """Show should render bracketed task text literally instead of interpreting Rich markup."""
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        prompt = "keys: [l]ineage [d]ate [s]tatus [t]oggle [q]uit"
+        task = store.add(prompt, task_type="implement")
+        assert task.id is not None
+        task.slug = "20260626-gza-[s]tatus"
+        task.failure_reason = "failed because [red] is literal"
+        store.update(task)
+        store.add_comment(task.id, "comment keeps [b]rackets visible", source="direct")
+
+        with patch("gza.cli.query.pager_context", return_value=contextlib.nullcontext()):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(task.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=page,
+                    full=False,
+                    metadata_only=False,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert prompt in output
+        assert task.slug in output
+        assert task.failure_reason in output
+        assert "comment keeps [b]rackets visible" in output
+
     def test_show_output_reads_legacy_fix_summary_fallback(self, tmp_path: Path):
         """--output should surface legacy fix summaries stored only on disk."""
         setup_config(tmp_path)
