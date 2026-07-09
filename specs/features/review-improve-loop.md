@@ -1,6 +1,8 @@
 # Review-Improve Loop
 
 > **Implementation note (updated 2026-04-11):** `gza iterate` now runs as a pure loop without `TaskCycle` / `TaskCycleIteration` DB bookkeeping. There are no `task_cycles` / `task_cycle_iterations` tables and no `cycle_*` task columns. Iteration state is derived from the task lineage (reviews/improves) and the per-invocation `--max-iterations` value.
+>
+> **The design below was not shipped as described.** The `gza add --auto-review` / `--max-cycles` flags and the `auto_review` / `review_cycle` / `final_verdict` task fields do not exist. The review-improve loop is driven by `gza iterate <task-id> --max-iterations N` (see the `iterate` command and `iterate_max_iterations` config). This spec is retained for design rationale only.
 
 ## Overview
 

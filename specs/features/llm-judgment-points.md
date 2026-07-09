@@ -11,7 +11,7 @@ output. These break on edge cases and require ongoing maintenance:
 
 - **Branch type inference** (`branch_naming.py:7-55`): keyword list can't classify
   "Optimize database query for 1M records" as `perf`
-- **Review verdict parsing** (`cli.py:608-615`): regex extracts `APPROVED` but
+- **Review verdict parsing** (`src/gza/review_verdict.py`): regex extracts `APPROVED` but
   discards the actual review feedback (specific issues, priorities)
 - **Task failure analysis** (`runner.py:881-931`): exit codes can't distinguish
   "got stuck in a loop" from "finished but task was already done"
@@ -99,7 +99,7 @@ def infer_type_from_prompt(prompt: str) -> str | None:
 
 ## 2. Review Verdict Parsing
 
-**File:** `cli.py`
+**File:** `src/gza/review_verdict.py`
 
 **Current:** Regex extracts one of three verdict strings. Discards everything else.
 

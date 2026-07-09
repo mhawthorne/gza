@@ -172,7 +172,7 @@ Safety rules:
 
 ## Implementation
 
-### 1. Changes to `_spawn_background_worker` (`cli.py`)
+### 1. Changes to `_spawn_background_worker` (`src/gza/cli/execution.py`)
 
 Replace the bare `subprocess.Popen` with a tmux session launch:
 

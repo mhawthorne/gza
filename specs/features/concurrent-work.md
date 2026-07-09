@@ -1,5 +1,11 @@
 # Concurrent Work Command Execution
 
+> **Status note:** Log viewing shipped as `gza log` (singular), not `gza logs`.
+> The `gza logs <worker_id>` invocations below map to `gza log <id>` with
+> `--worker`, `--follow`/`-f`, and `--tail N` (there is no `--no-follow`; not
+> following is the default). Background execution (`gza work -b`/`--background`),
+> `gza ps`, and `gza kill` are implemented as described.
+
 ## Overview
 
 This spec describes how to spawn `work` commands in the background, view running commands, and tail their logs—similar to `docker ps` and `docker logs`.
