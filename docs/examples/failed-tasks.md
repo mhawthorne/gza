@@ -165,7 +165,7 @@ failed    gza-3 (2026-01-07 09:44) refactor api
    # gza.yaml
    task_types:
      implement:
-       max_turns: 80
+       max_steps: 80
        timeout_minutes: 20
    ```
 

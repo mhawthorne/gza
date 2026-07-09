@@ -52,14 +52,16 @@ $ gza rebase gza-3 --run
 Rebasing feature/add-user-auth onto main...
 CONFLICT in src/auth/login.py
 
-Rebase paused. Resolve conflicts and run:
-  gza rebase gza-3 --continue
-
-Or abort with:
-  gza rebase gza-3 --abort
+Rebase paused. Resolve the conflict using the `/gza-rebase` skill,
+or run an AI-assisted resolution:
+  gza rebase gza-3 --run --resolve
 ```
 
-You can also use the `/gza-rebase` skill in your active runtime (Claude, Codex, or Gemini) for interactive conflict resolution.
+`gza rebase` has no `--continue`/`--abort` flags. Resolve conflicts one of two ways:
+
+- **Interactive:** use the `/gza-rebase` skill in your active runtime (Claude, Codex, or Gemini).
+- **Non-interactive:** pass `--resolve` to have the agent auto-resolve conflicts.
+
 If `gza rebase --resolve` reports the skill is missing, install it for the active runtime first, for example:
 
 ```bash

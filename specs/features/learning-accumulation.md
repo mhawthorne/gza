@@ -293,13 +293,11 @@ gza learnings show
 gza learnings show --pager
 ```
 
-### `gza learnings clear`
+### `gza learnings clear` (not implemented)
 
-Delete learnings file (fresh start):
-
-```bash
-gza learnings clear
-```
+> Only `gza learnings show` and `gza learnings update` exist today. A `clear`
+> subcommand to delete the learnings file for a fresh start is not implemented;
+> remove `.gza/learnings.md` manually if you need to reset.
 
 ---
 
@@ -342,7 +340,7 @@ The following infrastructure is in place but producing poor results:
 
 ### What's broken
 
-1. **Garbage output** — `_extract_learnings_from_output()` has a header extraction path (`_HEADER_RE`) that converts markdown headers into meaningless "Prefer following documented X conventions" strings. This fires on both LLM output and regex fallback output.
+1. **Garbage output** — *(RESOLVED)* `_extract_learnings_from_output()` used to have a header extraction path (`_HEADER_RE`) that converted markdown headers into meaningless "Prefer following documented X conventions" strings. That path has since been removed; only bullet extraction (`_BULLET_RE`) remains.
 2. **Full replacement, not incremental** — `regenerate_learnings()` overwrites learnings from scratch each time. Stable knowledge about untouched parts of the codebase is lost.
 3. **Blocking execution** — `maybe_auto_regenerate_learnings()` runs the LLM task synchronously inline after task completion, blocking the CLI for minutes every 5th task.
 4. **Weak prompt** — `_build_summarization_prompt()` lacks "Do NOT include" guidance, output format constraints, and doesn't pass existing learnings as context. The LLM returns unstructured markdown that gets mangled by the header regex.
@@ -353,7 +351,7 @@ The following infrastructure is in place but producing poor results:
 
 All items below address the broken state above. They should be implemented together — fixing the prompt without fixing the incremental approach (or vice versa) won't produce good results.
 
-1. **Delete header extraction** — remove the `_HEADER_RE` path from `_extract_learnings_from_output()`. Only keep bullet extraction (`_BULLET_RE`).
+1. **Delete header extraction** — *(DONE)* the `_HEADER_RE` path has been removed from `_extract_learnings_from_output()`; only bullet extraction (`_BULLET_RE`) remains.
 2. **Switch to incremental update** — rewrite `_build_summarization_prompt()` to include existing learnings alongside recent tasks, asking the LLM to ADD/REVISE/KEEP/REMOVE rather than regenerate from scratch. See prompt template in Generation Strategy section above.
 3. **Improve summarization prompt** — add "Do NOT include" guidance, specify flat bullet format (no headers, no numbering), max 25 words per learning, require concrete/actionable items.
 4. **Make learnings task non-blocking** — spawn as detached background subprocess instead of running synchronously inline. Use the same worker-mode entry point as `gza work`. CLI returns immediately after spawning. The background process writes `.gza/learnings.md` on completion.
@@ -606,7 +604,7 @@ gza learnings update --dry-run
 - [x] `regenerate_learnings()` tries LLM first, falls back to bullet extraction
 - [x] `skip_learnings=True` on internal tasks to avoid circular injection
 - [x] Internal tasks tracked in DB — visible via `gza history --type internal`
-- [ ] Delete header extraction (`_HEADER_RE` path) from `_extract_learnings_from_output()` — only keep bullet extraction
+- [x] Delete header extraction (`_HEADER_RE` path) from `_extract_learnings_from_output()` — only keep bullet extraction
 - [ ] Improve summarization prompt — flat bullets, no headers, max 25 words, concrete/actionable, "Do NOT include" guidance
 - [ ] Make learnings task non-blocking — spawn as detached background subprocess instead of synchronous inline execution
 - [ ] Add tests for non-blocking behavior + improved extraction (tests/test_learnings.py)

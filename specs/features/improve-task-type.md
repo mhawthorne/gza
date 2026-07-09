@@ -24,12 +24,13 @@ implement #29 → review #30 (CHANGES_REQUESTED) → improve #31 → review #32 
 ### Creating an improve task
 
 ```bash
-# Improve implementation task #29 based on its most recent review
-gza improve 29
-
-# Equivalent explicit form
-gza add --type improve --based-on 29
+# Improve implementation task gza-29 based on its most recent review
+gza improve gza-29
 ```
+
+> **Note:** `improve` tasks are created only via `gza improve <impl-id>` (or spawned
+> by the lifecycle). `gza add --type improve` is rejected — there is no equivalent
+> `gza add` form.
 
 The `gza improve <impl-id>` command:
 

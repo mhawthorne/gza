@@ -16,7 +16,8 @@ The project already has:
 - Modern `pyproject.toml` with hatchling build backend
 - Proper src-layout (`src/gza/`)
 - CLI entry point defined (`gza = gza.cli:main`)
-- Minimal runtime dependencies (only `pyyaml>=6.0`)
+- Runtime dependencies: `pyyaml>=6.0` and `rich>=13.0`
+- Package name is `gza-agent` (published name); `dynamic = ["version"]` + `hatch-vcs` are already configured (see Version Management below)
 
 ## Required Changes
 
@@ -26,8 +27,8 @@ Add required and recommended fields:
 
 ```toml
 [project]
-name = "gza"
-version = "0.1.0"
+name = "gza-agent"
+# version is derived from git tags via hatch-vcs (dynamic = ["version"]); see Version Management
 description = "A coding AI agent runner for Claude Code"
 readme = "README.md"
 license = "MIT"
@@ -190,6 +191,8 @@ pip install --index-url https://test.pypi.org/simple/ gza
 ## Version Management
 
 ### Automated Versioning with hatch-vcs
+
+> **Status: Implemented** — the configuration below is already present in `pyproject.toml`.
 
 Use `hatch-vcs` to derive versions automatically from git tags. This eliminates manual version management and enables snapshot releases.
 

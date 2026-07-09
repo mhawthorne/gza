@@ -67,9 +67,18 @@ Operators should periodically sample `APPROVED_WITH_FOLLOWUPS` reviews to catch 
 
 ## Calibration Examples
 
-TODO: backfill 3-5 real examples once the missing gza-2887 review artifacts are recovered.
+These illustrate how the severity taxonomy is meant to be applied at the margin:
 
-Planned examples:
-- Broad exception that masks visible state -> `BLOCKER`.
-- Adjacent-path coverage sweep -> `FOLLOWUP`.
-- Centralization/refactor debt -> `FOLLOWUP`.
+- **Broad exception that masks visible state -> `BLOCKER`.** A `try/except` that
+  swallows an error and returns a success-looking value hides a user- or
+  agent-visible fallback, so an operator can no longer tell the operation failed.
+  Correctness/observability defect, merge-blocking.
+- **Adjacent-path coverage sweep -> `FOLLOWUP`.** The slice is correct and safe to
+  ship, but a nearby code path lacks tests. Worth tracking and doing, but not
+  required to make the current change safe.
+- **Centralization/refactor debt -> `FOLLOWUP`.** Duplicated logic the change
+  could eventually consolidate. Real, task-worthy debt that should not disappear
+  into review prose, but does not gate this merge.
+- **Wording/formatting tweak with no behavioral effect -> `NIT`.** Rename a local
+  variable or reflow a comment. Cosmetic only; omitted from canonical review
+  output and never affects the verdict.

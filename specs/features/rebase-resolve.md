@@ -1,6 +1,6 @@
 # Rebase with Auto-Resolve
 
-> **Status: Aspirational** - This spec describes a planned feature. The `--resolve` flag for `gza rebase` has not been implemented yet.
+> **Status: Implemented** - `gza rebase --resolve` is available; see `gza rebase --help`. This spec is retained as design/rationale; some orchestration details below (e.g. force-push and test steps) may differ from the shipped flow.
 
 ## Overview
 
@@ -62,7 +62,7 @@ Modify the skill process:
 
 ### 2. Add --resolve flag to CLI
 
-In `src/gza/cli.py`, update `cmd_rebase`:
+In `src/gza/cli/git_ops.py`, `cmd_rebase` (the CLI is now the `src/gza/cli/` package, not a single `cli.py`):
 
 ```python
 def cmd_rebase(args: argparse.Namespace) -> int:

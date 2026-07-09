@@ -2,9 +2,9 @@
 
 ## Ensure latest GZA skills are installed for Claude and Codex in your env
 
-TODO: which commands is this required for?  review, rebase, ?
-
-This is only necessary if you want to use GZA stuff in interactive conversations.
+This is only necessary if you want to use the GZA skills (slash commands like
+`/gza-rebase`, `/gza-plan-review`, `/gza-task-fix`, and `/gza-code-review`) in
+interactive Claude/Codex conversations. The `gza` CLI itself does not require it.
 
 ```bash
 $ gza skills-install --update
@@ -69,7 +69,7 @@ gza history --status failed
 ```
 
 
-## Find plan or exploretasks that were never implemented
+## Find plan or explore tasks that were never implemented
 
 ```bash
 gza advance --unimplemented
@@ -85,8 +85,9 @@ You can manually review plans using the `gza-plan-review` skill to refine before
 
 ```bash
 gza implement <plan_task_id>
-(grab new pending implement task i)
+# grab the new pending implement task id from the command output
 gza iterate -i 5 -b <implement_task_id>
+```
 
 
 ## Drop tasks that are "incomplete" but don't need follow-up

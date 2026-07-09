@@ -106,10 +106,10 @@ Branch: feature/implement-the-jwt-authentication
 Create and run a review task:
 
 ```bash
-$ uv run gza review gza-2 --run
-✓ Created review task gza-3
+$ uv run gza review gza-3 --run
+✓ Created review task gza-4
 === Task: Review implementation... ===
-    ID: gza-3 20260108-review-implementation
+    ID: gza-4 20260108-review-implementation
     Type: review
 ...
 === Done ===
@@ -167,10 +167,10 @@ Verdict: CHANGES_REQUESTED
 If the review requests changes, create and run an improve task with `--run`:
 
 ```bash
-$ uv run gza improve gza-2 --run
-✓ Created improve task gza-4
+$ uv run gza improve gza-3 --run
+✓ Created improve task gza-5
 === Task: Improve implementation based on review... ===
-    ID: gza-4 20260108-improve-implementation
+    ID: gza-5 20260108-improve-implementation
     Type: improve
 ...
 === Done ===
@@ -183,10 +183,10 @@ Stats: Runtime: 5m 22s | Turns: 14 | Cost: $0.45
 Run a follow-up review to verify the changes:
 
 ```bash
-$ uv run gza review gza-2 --run
-✓ Created review task gza-5
+$ uv run gza review gza-3 --run
+✓ Created review task gza-6
 === Task: Review implementation... ===
-    ID: gza-5 20260108-review-implementation
+    ID: gza-6 20260108-review-implementation
     Type: review
 ...
 === Done ===
@@ -233,27 +233,30 @@ $ uv run gza search --tag auth-refactor
   ✓ gza-1 20260108-design-a-new-authentication (plan)
       completed - 8m 12s
 
-  ✓ gza-2 20260108-implement-the-jwt-authentication (implement)
+  ✓ gza-2 20260108-plan-review-authentication (plan_review)
+      completed - APPROVED
+
+  ✓ gza-3 20260108-implement-the-jwt-authentication (implement)
       completed - 12m 45s
 
-  ✓ gza-3 20260108-review-implementation (review)
+  ✓ gza-4 20260108-review-implementation (review)
       completed - CHANGES_REQUESTED
 
-  ✓ gza-4 20260108-improve-implementation (improve)
+  ✓ gza-5 20260108-improve-implementation (improve)
       completed - 5m 22s
 
-  ✓ gza-5 20260108-review-implementation (review)
+  ✓ gza-6 20260108-review-implementation (review)
       completed - APPROVED
 ```
 
-Create and merge the PR:
+Create and merge the PR (target the implementation task, `gza-3`):
 
 ```bash
-$ uv run gza pr gza-2
+$ uv run gza pr gza-3
 PR created: https://github.com/myorg/myapp/pull/143
 
 # After PR approval, merge locally
-$ uv run gza merge gza-2 --squash
+$ uv run gza merge gza-3 --squash
 Merged: feature/implement-the-jwt-authentication → main (squashed)
 
 # Daily merge-truth check: what still needs to be merged?
@@ -261,7 +264,7 @@ $ uv run gza unmerged
 No unmerged tasks
 
 # Explicit PR reconciliation: refresh cached PR state and close stale open PRs if origin proves the merge landed
-$ uv run gza sync gza-2
+$ uv run gza sync gza-3
 feature/implement-the-jwt-authentication | merge=merged | pr=#143:closed
 ```
 

@@ -664,7 +664,7 @@ gza add [prompt] [options]
 |--------|-------------|
 | `prompt` | Task prompt (opens $EDITOR if not provided) |
 | `--edit`, `-e` | Open $EDITOR to write the prompt |
-| `--type TYPE` | Set task type: `explore`\|`plan`\|`implement`\|`review`\|`improve` (default: `implement`) |
+| `--type TYPE` | Set task type: `explore`\|`plan`\|`plan_review`\|`plan_improve`\|`implement`\|`review`\|`verify_fix`\|`improve` (default: `implement`). `explore`, `plan`, `implement`, and `review` are the common manual choices; `plan_review`, `plan_improve`, `verify_fix`, and `improve` are usually created by the lifecycle (`gza plan-review`, `gza improve`, etc.) rather than by hand. |
 | `--branch-type TYPE` | Set branch type hint for naming |
 | `--explore` | Create explore task (shorthand) |
 | `--tag TAG` | Add task tag (repeatable) |
@@ -912,6 +912,27 @@ By default the execution path follows `use_docker` from config. Use `--docker`
 or `--no-docker` to override that for the check. Docker preflights require API
 keys in the container environment; OAuth or keychain-backed credentials do not
 propagate into containers.
+
+### flaky
+
+Investigate a flaky verify failure with a bounded stress harness. `gza flaky reproduce <task_id>`
+runs targeted reruns for one flaky-investigation task, persists per-attempt evidence, and records a
+structured inconclusive artifact when the same failing-node signature does not reproduce within budget.
+
+```bash
+gza flaky reproduce <task_id>
+gza flaky reproduce <task_id> --runs 50 --seed 1729
+gza flaky reproduce <task_id> --no-xdist --no-randomization
+```
+
+| Option | Description |
+|--------|-------------|
+| `task_id` | Flaky investigation task ID |
+| `--runs N` | Bounded number of targeted reruns (default: `20`) |
+| `--seed N` | Base seed for optional randomization plugins (default: `1729`) |
+| `--no-xdist` | Do not add xdist stress flags even if xdist was in the original verify evidence |
+| `--no-randomization` | Do not add pytest randomization flags even if a supported plugin is available |
+| `--hypothesis TEXT` | Optional hypothesis to persist on the inconclusive record (repeatable) |
 
 ### config
 
@@ -1208,6 +1229,7 @@ gza merge <task_id> [task_id...] [options]
 | `--remote` | Fetch from origin and rebase against remote (requires --rebase) |
 | `--mark-only` | Mark branch as merged without performing the git merge or deleting the branch |
 | `--force` | Override lifecycle parked merge gates for the local merge path; does not bypass git conflicts or open review `BLOCKER`s without `--defer-blockers` |
+| `--defer-blockers` | With `--force`, allow the merge to proceed despite open review `BLOCKER` findings (defers them rather than requiring resolution first); still requires a clean git merge |
 | `--no-followups` | Skip materializing review FOLLOWUP tasks after a successful merge or mark-only |
 | `--resolve` | Auto-resolve conflicts using AI when rebasing (requires --rebase) |
 
@@ -2204,14 +2226,16 @@ Gza supports several task types, each with distinct behavior:
 
 | Type | Purpose | Output Location |
 |------|---------|-----------------|
-| `explore` | Research and investigation | `.gza/explorations/{task_id}.md` |
-| `plan` | Design and architecture | `.gza/plans/{task_id}.md` |
+| `explore` | Research and investigation | `.gza/explorations/{slug}.md` |
+| `plan` | Design and architecture | `.gza/plans/{slug}.md` |
 | `implement` | Build per a plan (default) | Code changes on branch |
-| `review` | Evaluate implementation | `.gza/reviews/{task_id}.md` |
+| `review` | Evaluate implementation | `.gza/reviews/{slug}.md` |
 | `improve` | Address review feedback | Code changes on same branch |
 | `verify_fix` | Address a failing verify epoch on the implementation branch; manual creation requires `--based-on <implementation-lineage-task>` plus `--same-branch`, derives the prompt from the latest failed verify evidence, rejects custom prompt text / `--edit` / `--prompt-file`, and fails closed unless that failed evidence matches the current implementation branch/head/verify-command epoch | Code changes on same branch |
 | `fix` | Rescue stuck implementation lifecycle or repeated review regressions | Code changes on implementation branch |
-| `internal` | gza-owned provider workflows (for example learnings/PR drafting) | `.gza/internal/{task_id}.md` |
+| `internal` | gza-owned provider workflows (for example learnings/PR drafting) | `.gza/internal/{slug}.md` |
+
+Output files are named by the task slug (for example `.gza/plans/20260108-design-a-new-authentication.md`), not by the numeric task id.
 
 **Typical workflow:**
 
@@ -2228,12 +2252,12 @@ Override settings for specific task types in `gza.yaml`:
 task_types:
   explore:
     model: claude-sonnet-4-5
-    max_turns: 20
+    max_steps: 20
   plan:
     model: claude-opus-4
-    max_turns: 30
+    max_steps: 30
   review:
-    max_turns: 15
+    max_steps: 15
 ```
 
 ---
@@ -2327,7 +2351,7 @@ project_name: my-app
 use_docker: true
 docker_setup_command: "uv sync"
 timeout_minutes: 15
-max_turns: 80
+max_steps: 80
 autonomous_verify_timeout_seconds: 180
 review_verify_timeout_grace_seconds: 5
 verify_command: ./bin/tests
@@ -2354,9 +2378,9 @@ branch_strategy: conventional
 # Task type overrides
 task_types:
   explore:
-    max_turns: 20
+    max_steps: 20
   review:
-    max_turns: 15
+    max_steps: 15
   implement:
     timeout_minutes: 30
 providers:

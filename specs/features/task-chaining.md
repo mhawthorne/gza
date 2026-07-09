@@ -1,5 +1,12 @@
 # Task Chaining and Planning Workflow
 
+> **Status note:** Task grouping shipped as tags, not a first-class "group" object.
+> The `gza status <group>`, `gza groups`, and `gza group` commands shown below do
+> **not** exist. Use `--tag` on `gza add` and inspect grouped work with
+> `gza search --tag <tag>`, `gza queue --tag <tag>`, or `gza next`. The
+> `depends_on` / `based_on` chaining, `--same-branch`, and `--review` mechanisms
+> described here are implemented.
+
 ## Overview
 
 This spec describes extensions to gza for supporting multi-phase development workflows where tasks can depend on each other, be tagged, and automatically trigger follow-up tasks like reviews.

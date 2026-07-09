@@ -1,6 +1,6 @@
 # Task Workflow Orchestration
 
-> **Status: Aspirational** - This spec describes planned features. Commands like `gza dashboard`, `gza advance`, `gza summary`, and `gza changelog` have not been implemented yet.
+> **Status: Partially implemented** - `gza advance` is implemented (lifecycle progression, failed-task recovery, and merge). `gza dashboard`, `gza summary`, and `gza changelog` have not been implemented yet.
 
 ## Overview
 
