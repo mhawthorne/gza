@@ -21,6 +21,7 @@ Run it with uv (deps are declared inline above)::
     uv run scripts/watch_log_graph.py --hours 72           # last 3 days
     uv run scripts/watch_log_graph.py --all                # full log history
     uv run scripts/watch_log_graph.py --start 2026-06-28   # from an absolute date
+    uv run scripts/watch_log_graph.py --start "2026-07-01 09:00" --end "2026-07-01 17:00"  # hour range
     uv run scripts/watch_log_graph.py --all --resolution day --aggregate p90  # daily p90
     uv run scripts/watch_log_graph.py --resolution hour --agg max        # hourly peaks
     uv run scripts/watch_log_graph.py --no-merges          # hide merge dots (on by default)
@@ -46,6 +47,10 @@ import time
 from datetime import date as date_cls
 from datetime import datetime, timedelta
 from pathlib import Path
+
+# Make sibling scripts/ modules (e.g. palette) importable whether this file is run
+# directly or loaded by path (tests load it via importlib without scripts/ on sys.path).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # --- line patterns ---------------------------------------------------------
 
@@ -231,6 +236,14 @@ _SERIES = [
     ("attention", "need attention"),
 ]
 
+# Semantic line color per series (name of a color constant in scripts/palette.py).
+_SERIES_COLORS = {
+    "running": "GREEN",
+    "pending": "BLUE",
+    "blocked": "ORANGE",
+    "attention": "RED",
+}
+
 # Row-unit word per resolution, for table/plot/summary captions.
 _UNIT = {"raw": "cycles", "hour": "hours", "day": "days"}
 
@@ -241,13 +254,17 @@ MERGE_BAND_MAX = 0.5
 
 
 def make_figure():
-    """Create a reusable (fig, ax) with the Agg backend. Import matplotlib once."""
+    """Create a reusable (fig, ax) with the Agg backend, themed dark/neon."""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import palette
 
-    return plt.subplots(figsize=(14, 7))
+    palette.apply()  # dark background + neon color cycle, before the figure is created
+    fig, ax = plt.subplots(figsize=(14, 7))
+    palette.style(fig, ax)
+    return fig, ax
 
 
 def _spread(centers, halves, lo, hi, gap):
@@ -299,9 +316,10 @@ def _draw_merges(ax, merges, bucket="hour", labels="auto", band=MERGE_BAND_DEFAU
     if not merges:
         return
     import matplotlib.dates as mdates
+    import palette
 
     xs = [when for when, _ in merges]
-    ax.scatter(xs, [0] * len(xs), marker="o", s=16, color="tab:purple",
+    ax.scatter(xs, [0] * len(xs), marker="o", s=16, color=palette.PINK,
                zorder=6, label=f"merge ({len(merges)})")
 
     if bucket == "off" or labels == "off":
@@ -426,13 +444,17 @@ def _draw_merges(ax, merges, bucket="hour", labels="auto", band=MERGE_BAND_DEFAU
         y = row_center_y[r]
         for b in rb:
             center, _, _, text, _ = b
+            # Work in matplotlib date numbers, not datetimes: num2date returns a
+            # timezone-aware value, and feeding that back to plot/annotate makes matplotlib
+            # warn about "no timezone representation for np.datetime64". Numbers sidestep it.
+            center_num = mdates.date2num(center)
             bx_num = xlo + row_x[id(b)] / px_per_dx
-            bx = mdates.num2date(bx_num)
-            ax.plot([center, bx], [0, y], color="0.8", linewidth=0.6, alpha=0.5, zorder=0)
+            ax.plot([center_num, bx_num], [0, y], color=palette.MUTED, linewidth=0.6,
+                    alpha=0.4, zorder=0)
             ax.annotate(
-                text, (bx, y), ha="center", va="center",
-                fontsize=fontsize, color="tab:purple", zorder=7,
-                bbox=dict(boxstyle="round", fc="white", ec="tab:purple", alpha=0.9),
+                text, (bx_num, y), ha="center", va="center",
+                fontsize=fontsize, color=palette.PINK, zorder=7,
+                bbox=dict(boxstyle="round", fc=palette.PANEL, ec=palette.PINK, alpha=0.92),
             )
 
     # Pin x to the data range: the boxes are placed in axis pixels and their annotations
@@ -442,7 +464,7 @@ def _draw_merges(ax, merges, bucket="hour", labels="auto", band=MERGE_BAND_DEFAU
 
 def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_label="",
                merges=None, merge_bucket="auto", merge_labels="auto",
-               merge_band=MERGE_BAND_DEFAULT):
+               merge_band=MERGE_BAND_DEFAULT, xmin=None, xmax=None, markers=True):
     """Render the 4-series plot to ``out_path``.
 
     Pass ``fig_ax`` (from :func:`make_figure`) to reuse a single figure across
@@ -452,21 +474,44 @@ def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_la
     capped band of id/count boxes; ``merge_bucket``/``merge_labels``/``merge_band``
     control that band (see :func:`_draw_merges`). ``merge_bucket="auto"`` resolves to
     hourly boxes for short windows and daily boxes for windows spanning over ~2 days.
+    ``xmin``/``xmax`` (datetimes) pin the x-axis to an explicit window so the plot spans
+    exactly the requested range even when the data stops short of it (a gap in cycles
+    before ``--end`` would otherwise autoscale the axis in and look like it "ends early").
     """
     import matplotlib.dates as mdates
+    import palette
 
     if fig_ax is None:
         fig, ax = make_figure()
         own = True
     else:
         fig, ax = fig_ax
-        ax.clear()
+        ax.clear()  # resets the axes facecolor — repaint it dark
+        palette.style(fig, ax)
         own = False
+
+    # Dot each actual cycle so sparse stretches (e.g. an overnight gap with only a couple
+    # of cycles) read as discrete points instead of a line that looks like it "cuts off".
+    # Thin the markers on dense windows so they don't smear into the line, but show every
+    # point once a window is sparse — which is exactly when the markers matter most.
+    marker = "o" if markers else None
+    markevery = max(1, len(points) // 200) if markers else None
 
     xs = [p.when for p in points]
     for attr, label in _SERIES:
         ys = [float("nan") if getattr(p, attr) is None else getattr(p, attr) for p in points]
-        ax.plot(xs, ys, label=label, linewidth=1.2)
+        ax.plot(xs, ys, label=label, linewidth=1.2,
+                color=getattr(palette, _SERIES_COLORS[attr]),
+                marker=marker, markersize=3.0, markevery=markevery)
+
+    # Pin the x-axis to any explicitly requested bound before drawing merges (which read
+    # and re-pin the limits), so the plot honors --start/--end exactly. An unspecified
+    # side keeps its autoscaled edge (right edge tracks "latest" when there's no --end).
+    if xmin is not None or xmax is not None:
+        cur_lo, cur_hi = ax.get_xlim()
+        left = mdates.date2num(xmin) if xmin is not None else cur_lo
+        right = mdates.date2num(xmax) if xmax is not None else cur_hi
+        ax.set_xlim(left, right)
 
     # Resolve an "auto" merge bucket from the plotted span: daily boxes for windows
     # spanning more than ~2 days (keeps the box count small), hourly for short ones.
@@ -600,33 +645,64 @@ def parse_date(s):
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
-def compute_cutoff(points, args):
-    """Resolve the start-of-window datetime from args (precedence: all > start > hours).
+# Accepted --start/--end shapes, tried in order. A date with no time yields midnight.
+_DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_WHEN_FORMATS = (
+    "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d %H", "%Y-%m-%dT%H",
+    "%Y-%m-%d",
+)
 
-    Default is a rolling window of ``args.hours`` before the newest cycle, so the
-    graph shows recent activity rather than the whole log. Returns None for "no cut".
+
+def parse_when(s):
+    """Parse a date or date+time into a datetime (date-only -> 00:00:00)."""
+    s = s.strip()
+    for fmt in _WHEN_FORMATS:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    raise argparse.ArgumentTypeError(
+        f"bad date/time {s!r} (use YYYY-MM-DD or 'YYYY-MM-DD HH:MM')")
+
+
+def parse_end(s):
+    """Like :func:`parse_when`, but a date-only end covers that whole day (inclusive)."""
+    dt = parse_when(s)
+    if _DATE_ONLY_RE.match(s.strip()):
+        dt = dt.replace(hour=23, minute=59, second=59)
+    return dt
+
+
+def compute_window(points, args):
+    """Resolve the ``(lo, hi)`` datetime bounds of the plotted window (None = open).
+
+    ``lo`` precedence: ``--all`` (None) > ``--start`` > rolling ``--hours`` before the
+    anchor. ``hi`` is ``--end`` if given, else None. When the rolling ``--hours`` window
+    is used it is measured back from ``--end`` (if set) rather than the newest cycle.
     """
+    hi = getattr(args, "end", None)
     if getattr(args, "all", False):
-        return None
+        return None, hi
     if args.start is not None:
-        return datetime.combine(args.start, datetime.min.time())
+        return args.start, hi
     if points:
-        return points[-1].when - timedelta(hours=args.hours)
-    return None
+        anchor = hi if hi is not None else points[-1].when
+        return anchor - timedelta(hours=args.hours), hi
+    return None, hi
 
 
-def filter_since(points, cutoff):
-    """Keep only cycles at/after ``cutoff`` (a datetime), or all if ``cutoff`` is None."""
-    if cutoff is None:
-        return points
-    return [p for p in points if p.when >= cutoff]
+def filter_window(points, lo, hi):
+    """Keep cycles within ``[lo, hi]`` (either bound None = open on that side)."""
+    return [p for p in points
+            if (lo is None or p.when >= lo) and (hi is None or p.when <= hi)]
 
 
-def filter_since_events(events, cutoff):
-    """Keep only ``(datetime, id)`` events at/after ``cutoff``."""
-    if cutoff is None:
-        return events
-    return [(when, tid) for when, tid in events if when >= cutoff]
+def filter_window_events(events, lo, hi):
+    """Keep ``(datetime, id)`` events within ``[lo, hi]`` (None bound = open)."""
+    return [(when, tid) for when, tid in events
+            if (lo is None or when >= lo) and (hi is None or when <= hi)]
 
 
 # --- rollup / aggregation --------------------------------------------------
@@ -731,9 +807,13 @@ def main(argv=None):
                     help="base date to assume for the newest line (default: today)")
     ap.add_argument("--hours", type=float, default=24.0, metavar="H",
                     help="rolling window: show only the last H hours of activity "
-                         "before the newest cycle (default 24)")
-    ap.add_argument("--start", type=parse_date, default=None, metavar="YYYY-MM-DD",
-                    help="absolute start date (overrides --hours)")
+                         "before the newest cycle, or before --end if set (default 24)")
+    ap.add_argument("--start", type=parse_when, default=None, metavar="WHEN",
+                    help="absolute start, date or date+time e.g. 2026-07-01 or "
+                         "'2026-07-01 14:00' (overrides --hours)")
+    ap.add_argument("--end", type=parse_end, default=None, metavar="WHEN",
+                    help="absolute end, date or date+time e.g. '2026-07-05 18:00'; a "
+                         "date-only end covers that whole day")
     ap.add_argument("--all", action="store_true",
                     help="show the full log history (disable the default 24h window)")
     ap.add_argument("--resolution", "--rollup", choices=("raw", "hour", "day"), default="raw",
@@ -744,6 +824,10 @@ def main(argv=None):
     ap.add_argument("--table-rows", type=int, default=40,
                     help="max rows in the printed table, evenly sampled (0 = all)")
     ap.add_argument("--no-png", action="store_true", help="skip PNG, table only")
+    ap.add_argument("--markers", action=argparse.BooleanOptionalAction, default=True,
+                    help="dot each actual cycle on the series lines so sparse stretches "
+                         "(e.g. an overnight gap) read as discrete points, not a line that "
+                         "looks cut off (default: on; use --no-markers for clean lines)")
     ap.add_argument("--merges", action=argparse.BooleanOptionalAction, default=True,
                     help="mark each merge on the graph as a task-id-labeled dot "
                          "(default: on; use --no-merges to hide, --start to declutter)")
@@ -768,6 +852,8 @@ def main(argv=None):
         ap.error(f"watch.log not found (looked for {log_path or '.gza/watch.log'}); pass --log")
     if args.aggregate is not None and args.resolution == "raw":
         ap.error("--aggregate requires --resolution hour|day")
+    if args.start is not None and args.end is not None and args.start > args.end:
+        ap.error(f"--start ({args.start}) is after --end ({args.end})")
 
     if args.watch is not None:
         return _watch_loop(args, log_path)
@@ -778,13 +864,13 @@ def main(argv=None):
     if not points:
         print(f"no WAKE cycles parsed from {log_path}", file=sys.stderr)
         return 1
-    cutoff = compute_cutoff(points, args)
-    points = filter_since(points, cutoff)
+    lo, hi = compute_window(points, args)
+    points = filter_window(points, lo, hi)
     if not points:
         print("no cycles in the selected window", file=sys.stderr)
         return 1
     points = rollup(points, args.resolution, agg)
-    merges = filter_since_events(merges, cutoff) if args.merges else None
+    merges = filter_window_events(merges, lo, hi) if args.merges else None
 
     print_table(points, args.table_rows, unit=unit)
     if merges is not None:
@@ -792,7 +878,8 @@ def main(argv=None):
     if not args.no_png:
         render_png(points, args.out, log_path, resolution=args.resolution,
                    agg_label=agg_label, merges=merges, merge_bucket=args.merge_bucket,
-                   merge_labels=args.merge_labels, merge_band=args.merge_band)
+                   merge_labels=args.merge_labels, merge_band=args.merge_band,
+                   xmin=args.start, xmax=args.end, markers=args.markers)
     print_summary(points, "(skipped)" if args.no_png else args.out,
                   unit=unit, agg_label=agg_label)
     return 0
@@ -814,10 +901,11 @@ def _watch_loop(args, log_path):
                 print(f"read error: {exc}; retrying in {interval}s...", file=sys.stderr)
                 time.sleep(interval)
                 continue
-            cutoff = compute_cutoff(points, args)
-            points = filter_since(points, cutoff)
+            latest = points[-1].when if points else None
+            lo, hi = compute_window(points, args)
+            points = filter_window(points, lo, hi)
             points = rollup(points, args.resolution, agg)
-            merges = filter_since_events(merges, cutoff) if args.merges else None
+            merges = filter_window_events(merges, lo, hi) if args.merges else None
 
             print(_CLEAR, end="")
             if not points:
@@ -832,8 +920,16 @@ def _watch_loop(args, log_path):
                     render_png(points, args.out, log_path, fig_ax=fig_ax,
                                resolution=args.resolution, agg_label=agg_label,
                                merges=merges, merge_bucket=args.merge_bucket,
-                               merge_labels=args.merge_labels, merge_band=args.merge_band)
+                               merge_labels=args.merge_labels, merge_band=args.merge_band,
+                               xmin=args.start, xmax=args.end, markers=args.markers)
                     print(f"\npng refreshed: {args.out}")
+            # A bounded --end window is static once the log has advanced past it, so there
+            # is nothing new to show — render once and stop rather than re-drawing forever.
+            # An open-ended window (no --end) always tracks "latest" and keeps refreshing.
+            if hi is not None and latest is not None and latest >= hi:
+                print(f"\nwindow ends {hi:%Y-%m-%d %H:%M:%S} and the log has passed it — "
+                      f"view is complete, not refreshing.", flush=True)
+                break
             print(f"\nrefreshing every {interval}s — Ctrl-C to stop", flush=True)
             time.sleep(interval)
     except KeyboardInterrupt:
