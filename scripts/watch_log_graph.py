@@ -24,6 +24,8 @@ Run it with uv (deps are declared inline above)::
     uv run scripts/watch_log_graph.py --all --resolution day --aggregate p90  # daily p90
     uv run scripts/watch_log_graph.py --resolution hour --agg max        # hourly peaks
     uv run scripts/watch_log_graph.py --no-merges          # hide merge dots (on by default)
+    uv run scripts/watch_log_graph.py --start 2026-06-01 --merge-bucket day   # daily merge boxes
+    uv run scripts/watch_log_graph.py --merge-labels count --merge-band 0.2    # compact merge band
     uv run scripts/watch_log_graph.py --watch 60      # live: refresh table + PNG every 60s
 
 Log line shapes it understands::
@@ -232,6 +234,11 @@ _SERIES = [
 # Row-unit word per resolution, for table/plot/summary captions.
 _UNIT = {"raw": "cycles", "hour": "hours", "day": "days"}
 
+# The merge id boxes hang in negative space below the baseline. Cap how much of the
+# vertical axis that band may consume so the data lines always stay readable.
+MERGE_BAND_DEFAULT = 0.25
+MERGE_BAND_MAX = 0.5
+
 
 def make_figure():
     """Create a reusable (fig, ax) with the Agg backend. Import matplotlib once."""
@@ -266,21 +273,28 @@ def _spread(centers, halves, lo, hi, gap):
     return pos
 
 
-def _draw_merges(ax, merges):
-    """Mark merges: exact-time dots on the baseline + hourly task-id boxes below it.
+def _draw_merges(ax, merges, bucket="hour", labels="auto", band=MERGE_BAND_DEFAULT):
+    """Mark merges: exact-time dots on the baseline + task-id/count boxes below it.
 
-    Merges are bucketed by the hour (one box per hour listing that hour's task ids)
-    and drawn in a reserved band of "fake negative" space **below** the baseline.
-    Because every data series is non-negative, hanging the boxes below zero keeps
-    them clear of the lines.
+    Merges are bucketed by ``bucket`` (``"hour"`` or ``"day"``; ``"off"`` draws dots
+    only) — one box per bucket — and drawn in a reserved band of "fake negative" space
+    **below** the baseline. Because every data series is non-negative, hanging the
+    boxes below zero keeps them clear of the lines.
 
-    Crucially, a box's horizontal position is **decoupled from its timestamp**: the
-    boxes are spread evenly along the axis (in time order) and a thin leader connects
-    each to its real merge time on the baseline. This is what keeps them legible when
-    merges cluster in a short real-time span (e.g. active periods squeezed between
-    laptop-sleep gaps) — the boxes fan out horizontally instead of stacking into an
-    unreadable diagonal cascade. Only when a single row can't hold them all do we add
-    more rows.
+    The band is **hard-capped** at ``band`` (a fraction of the axis height, default
+    0.25) so the data lines always keep the rest of the vertical space — this is the
+    whole point: over long windows the boxes must never crush the lines into a sliver.
+
+    ``labels`` controls box content: ``"ids"`` lists the bucket's task ids (one per
+    line), ``"count"`` shows just how many merged, ``"off"`` draws no boxes, and
+    ``"auto"`` uses ids when they fit the capped band and falls back to counts when
+    they don't. If even the chosen labels can't fit the capped band we clamp to the
+    rows that fit and print a note rather than stealing space from the lines.
+
+    A box's horizontal position is **decoupled from its timestamp**: boxes are spread
+    evenly along the axis (in time order) and a thin leader connects each to its real
+    merge time on the baseline — keeping them legible when merges cluster in a short
+    real-time span instead of stacking into an unreadable diagonal cascade.
     """
     if not merges:
         return
@@ -290,10 +304,17 @@ def _draw_merges(ax, merges):
     ax.scatter(xs, [0] * len(xs), marker="o", s=16, color="tab:purple",
                zorder=6, label=f"merge ({len(merges)})")
 
-    # Bucket by the hour: one box per hour listing that hour's merges.
-    groups = {}  # hour-start -> [task_id, ...] in time order
+    if bucket == "off" or labels == "off":
+        return
+
+    # Bucket by the chosen window: one box per bucket listing its merges (time order).
+    day_bucket = bucket == "day"
+    groups = {}
     for when, tid in merges:
-        start = when.replace(minute=0, second=0, microsecond=0)
+        if day_bucket:
+            start = when.replace(hour=0, minute=0, second=0, microsecond=0)
+        else:
+            start = when.replace(minute=0, second=0, microsecond=0)
         groups.setdefault(start, []).append(tid)
     ordered = sorted(groups.items())
 
@@ -301,7 +322,7 @@ def _draw_merges(ax, merges):
     fig = ax.figure
     fontsize = 9
     xlo, xhi = ax.get_xlim()             # matplotlib date numbers
-    dmax = ax.get_ylim()[1]
+    top = max(ax.get_ylim()[1], 1.0)
     pos = ax.get_position()
     usable_px = pos.width * fig.get_figwidth() * fig.dpi
     axheight_px = pos.height * fig.get_figheight() * fig.dpi
@@ -309,18 +330,65 @@ def _draw_merges(ax, merges):
     char_px = fontsize * 0.62 * fig.dpi / 72.0
     line_px = fontsize * 1.5 * fig.dpi / 72.0
     gap_px = 8.0
+    band = min(max(band, 0.05), MERGE_BAND_MAX)
+    band_budget_px = band * axheight_px
+    box_offset = timedelta(hours=12) if day_bucket else timedelta(minutes=30)
 
-    # Each box: true dot time, desired x (px from left), half-width, id list.
-    boxes = []               # (true_center_dt, desired_px, half_px, ids)
-    for start, ids in ordered:
-        center = start + timedelta(minutes=30)
-        desired = (mdates.date2num(center) - xlo) * px_per_dx
-        half = (max(len(t) for t in ids) * char_px + 14) / 2
-        boxes.append((center, desired, half, ids))
+    def build(mode):
+        """Boxes for a label mode: (center_dt, desired_px, half_px, text, nlines)."""
+        out = []
+        for start, ids in ordered:
+            center = start + box_offset
+            desired = (mdates.date2num(center) - xlo) * px_per_dx
+            if mode == "count":
+                text, width_chars, nlines = str(len(ids)), len(str(len(ids))), 1
+            else:
+                text, width_chars, nlines = "\n".join(ids), max(len(t) for t in ids), len(ids)
+            half = (width_chars * char_px + 14) / 2
+            out.append((center, desired, half, text, nlines))
+        return out
 
-    # How many rows are needed for the boxes to fit horizontally without overlap.
-    total_px = sum(2 * b[2] for b in boxes) + gap_px * (len(boxes) - 1)
-    rows = max(1, math.ceil(total_px / usable_px)) if usable_px else 1
+    def layout(bxs):
+        """(rows_needed for horizontal fit, uniform row height px) for a box set."""
+        total_px = sum(2 * b[2] for b in bxs) + gap_px * (len(bxs) - 1)
+        rows_needed = max(1, math.ceil(total_px / usable_px)) if usable_px else 1
+        row_h = max((b[4] for b in bxs), default=1) * line_px + 12
+        return rows_needed, row_h
+
+    def vpx(rows_needed, row_h):
+        """Vertical pixels a layout wants: rows_needed rows, each row_h tall."""
+        return rows_needed * (row_h + gap_px)
+
+    # Resolve auto label mode: prefer ids only if the id boxes genuinely fit inside the
+    # capped band (a single day's box can be dozens of ids tall — taller than the whole
+    # band — in which case we must fall back to counts, not silently overflow).
+    mode = labels
+    if mode == "auto":
+        rn, rh = layout(build("ids"))
+        mode = "ids" if band_budget_px and vpx(rn, rh) <= band_budget_px else "count"
+
+    boxes = build(mode)
+    rows_needed, row_h = layout(boxes)
+    # `rows_needed` is how many rows the boxes need to sit side-by-side without overlap;
+    # `fit_rows` is how many rows the capped band can hold. When the boxes need more rows
+    # than fit (a wide window with more merges than 25% of the axis can legibly hold), we
+    # keep only as many boxes as those rows can show — evenly sampled across the window —
+    # and note the drop. This bounds the layout so boxes never overrun the axis. Auto-mode
+    # counts are narrow enough that this rarely triggers; it mostly guards forced ids.
+    fit_rows = int(band_budget_px // (row_h + gap_px)) if band_budget_px else 1
+    fit_rows = max(1, fit_rows)
+    if rows_needed > fit_rows and len(boxes) > 1:
+        keep = max(1, int(len(boxes) * fit_rows / rows_needed))
+        step = len(boxes) / keep
+        idxs = sorted({int(i * step) for i in range(keep)})
+        idxs = [i for i in idxs if i < len(boxes)]
+        dropped = len(boxes) - len(idxs)
+        boxes = [boxes[i] for i in idxs]
+        rows_needed, row_h = layout(boxes)
+        print(f"note: showing {len(boxes)} of {len(boxes) + dropped} merge boxes — the "
+              f"{band:.0%} band can't hold them all; use --merge-labels count, "
+              f"--merge-bucket day, or a shorter window (--start/--hours)", file=sys.stderr)
+    rows = max(1, min(rows_needed, fit_rows))
 
     # Assign boxes to rows round-robin (in time order) so each row stays sparse,
     # then spread each row so its boxes don't overlap.
@@ -333,47 +401,57 @@ def _draw_merges(ax, merges):
         for b, x in zip(rb, adj):
             row_x[id(b)] = x
 
-    # Vertical: stack the rows below zero, each tall enough for its tallest box.
-    # Solve the new axis bottom so the whole band fits the pixels we need (the axis
-    # grows to make room, so lane spacing must track the final data range).
-    row_h_px = [max((len(b[3]) for b in rb), default=1) * line_px + 12 for rb in row_boxes]
-    band_px = sum(row_h_px) + gap_px * rows
-    span = max(dmax, 1.0)
-    g = span * 0.05
-    k = min(band_px / axheight_px, 0.85) if axheight_px else 0.5
-    newmin = -(g + k * dmax) / (1 - k)
-    ax.set_ylim(newmin, dmax)
-    dy_per_px = (dmax - newmin) / axheight_px if axheight_px else 1.0
+    # Vertical: stack the rows below zero, each tall enough for its tallest box. Solve
+    # the new axis bottom so the band occupies at most ``band`` of the axis (no g gap
+    # in data space keeps the negative fraction exactly k <= band).
+    row_h_px = [max((b[4] for b in rb), default=1) * line_px + 12 for rb in row_boxes]
+    band_px = sum(row_h_px) + gap_px * (rows + 1)
+    k = min(band_px / axheight_px, band) if axheight_px else band
+    newmin = -(k * top) / (1 - k)
+    ax.set_ylim(newmin, top)
+    # Map the band's pixel height onto the reserved data depth so every row lands inside
+    # [newmin, 0] even when the requested boxes are taller than the cap allows (then they
+    # compress). Scaling by band_px (not the full axis height) is what keeps them on-screen.
+    depth = -newmin
+    dy_per_px = depth / band_px if band_px else 0.0
 
     # Row center y (data units), walking down from just below the baseline.
     cursor = gap_px
     row_center_y = []
     for h in row_h_px:
-        row_center_y.append(-(g + (cursor + h / 2) * dy_per_px))
+        row_center_y.append(-((cursor + h / 2) * dy_per_px))
         cursor += h + gap_px
 
     for r, rb in enumerate(row_boxes):
         y = row_center_y[r]
         for b in rb:
-            center, _, _, ids = b
+            center, _, _, text, _ = b
             bx_num = xlo + row_x[id(b)] / px_per_dx
             bx = mdates.num2date(bx_num)
             ax.plot([center, bx], [0, y], color="0.8", linewidth=0.6, alpha=0.5, zorder=0)
             ax.annotate(
-                "\n".join(ids), (bx, y), ha="center", va="center",
+                text, (bx, y), ha="center", va="center",
                 fontsize=fontsize, color="tab:purple", zorder=7,
                 bbox=dict(boxstyle="round", fc="white", ec="tab:purple", alpha=0.9),
             )
 
+    # Pin x to the data range: the boxes are placed in axis pixels and their annotations
+    # must never autoscale the x-axis past where the lines actually end.
+    ax.set_xlim(xlo, xhi)
+
 
 def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_label="",
-               merges=None):
+               merges=None, merge_bucket="auto", merge_labels="auto",
+               merge_band=MERGE_BAND_DEFAULT):
     """Render the 4-series plot to ``out_path``.
 
     Pass ``fig_ax`` (from :func:`make_figure`) to reuse a single figure across
     ticks in ``--watch`` mode; otherwise a throwaway figure is created and closed.
     ``resolution``/``agg_label`` only affect the axis formatter and title text.
-    ``merges`` (list of ``(datetime, task_id)``) is drawn as labeled dots.
+    ``merges`` (list of ``(datetime, task_id)``) is drawn as labeled dots plus a
+    capped band of id/count boxes; ``merge_bucket``/``merge_labels``/``merge_band``
+    control that band (see :func:`_draw_merges`). ``merge_bucket="auto"`` resolves to
+    hourly boxes for short windows and daily boxes for windows spanning over ~2 days.
     """
     import matplotlib.dates as mdates
 
@@ -390,7 +468,13 @@ def render_png(points, out_path, log_path, fig_ax=None, resolution="raw", agg_la
         ys = [float("nan") if getattr(p, attr) is None else getattr(p, attr) for p in points]
         ax.plot(xs, ys, label=label, linewidth=1.2)
 
-    _draw_merges(ax, merges)
+    # Resolve an "auto" merge bucket from the plotted span: daily boxes for windows
+    # spanning more than ~2 days (keeps the box count small), hourly for short ones.
+    bucket = merge_bucket
+    if bucket == "auto":
+        span = (points[-1].when - points[0].when) if points else timedelta(0)
+        bucket = "day" if span > timedelta(hours=48) else "hour"
+    _draw_merges(ax, merges, bucket=bucket, labels=merge_labels, band=merge_band)
 
     unit = _UNIT.get(resolution, "cycles")
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -663,6 +747,17 @@ def main(argv=None):
     ap.add_argument("--merges", action=argparse.BooleanOptionalAction, default=True,
                     help="mark each merge on the graph as a task-id-labeled dot "
                          "(default: on; use --no-merges to hide, --start to declutter)")
+    ap.add_argument("--merge-bucket", choices=("auto", "hour", "day", "off"), default="auto",
+                    help="aggregate merge id boxes by hour or day, one box per bucket "
+                         "(default auto: hourly for short windows, daily for long ones); "
+                         "off = baseline dots only")
+    ap.add_argument("--merge-labels", choices=("auto", "ids", "count", "off"), default="auto",
+                    help="merge box content: task ids, a merge count, or off; auto shows ids "
+                         "when they fit the capped band, else counts (default auto)")
+    ap.add_argument("--merge-band", type=float, default=MERGE_BAND_DEFAULT, metavar="FRAC",
+                    help="max share of vertical space the merge id band may use, so the data "
+                         f"lines stay readable (default {MERGE_BAND_DEFAULT}; clamped to "
+                         f"0.05–{MERGE_BAND_MAX})")
     ap.add_argument("--watch", nargs="?", type=int, const=60, default=None, metavar="N",
                     help="live mode: refresh table + PNG every N seconds (default 60). "
                          "Table shows the most recent --table-rows cycles.")
@@ -696,7 +791,8 @@ def main(argv=None):
         print_merges(merges)
     if not args.no_png:
         render_png(points, args.out, log_path, resolution=args.resolution,
-                   agg_label=agg_label, merges=merges)
+                   agg_label=agg_label, merges=merges, merge_bucket=args.merge_bucket,
+                   merge_labels=args.merge_labels, merge_band=args.merge_band)
     print_summary(points, "(skipped)" if args.no_png else args.out,
                   unit=unit, agg_label=agg_label)
     return 0
@@ -735,7 +831,8 @@ def _watch_loop(args, log_path):
                 if not args.no_png:
                     render_png(points, args.out, log_path, fig_ax=fig_ax,
                                resolution=args.resolution, agg_label=agg_label,
-                               merges=merges)
+                               merges=merges, merge_bucket=args.merge_bucket,
+                               merge_labels=args.merge_labels, merge_band=args.merge_band)
                     print(f"\npng refreshed: {args.out}")
             print(f"\nrefreshing every {interval}s — Ctrl-C to stop", flush=True)
             time.sleep(interval)
