@@ -49,9 +49,10 @@ Please create well-structured release notes that:
 2. Include a summary section with bullet points highlighting the changes users would care about most (new commands, breaking changes, major improvements)
 3. Group changes into categories (e.g., Features, Bug Fixes, Improvements, Documentation, etc.)
 4. Use bullet points for each change
-5. Be concise but informative
-6. Highlight breaking changes if any are evident
-7. Use proper markdown formatting
+5. Prioritize user-facing changes (CLI commands, options, arguments, log files, etc.)
+6. Be concise but informative
+7. Highlight breaking changes if any are evident
+8. Use proper markdown formatting
 
 Output ONLY the markdown release notes, no additional commentary."
 
@@ -66,7 +67,7 @@ mkdir -p "$OUTPUT_DIR"
 # Sanitize the tag name for use as a filename (replace / with -)
 OUTPUT_FILE="$OUTPUT_DIR/${TO_TAG//\//-}.md"
 
-CLAUDE_MODEL="haiku"
+CLAUDE_MODEL="opus"
 
 if command -v claude &> /dev/null; then
     echo "$PROMPT" | claude --model $CLAUDE_MODEL --print > "$OUTPUT_FILE"
