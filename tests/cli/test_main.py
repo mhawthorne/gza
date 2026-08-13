@@ -1,8 +1,7 @@
 """Tests for CLI parser and help output."""
 
-
-import io
 import importlib
+import io
 import os
 import re
 import signal
@@ -19,14 +18,6 @@ from gza.db import SqliteTaskStore
 from gza.runner import _make_review_verify_result
 
 from .conftest import invoke_gza, setup_config
-
-
-def _normalized_markdown_section(path: Path, heading: str) -> str:
-    """Return a whitespace-normalized level-3 markdown section by heading."""
-    pattern = rf"^### {re.escape(heading)}\n(?P<section>.*?)(?=^### |\Z)"
-    match = re.search(pattern, path.read_text(), re.MULTILINE | re.DOTALL)
-    assert match is not None, f"Missing docs section: ### {heading}"
-    return " ".join(match.group(0).split())
 
 
 class TestHelpOutput:
@@ -180,7 +171,6 @@ class TestHelpOutput:
 
         history_help = invoke_gza("history", "--help", "--project", str(tmp_path))
         search_help = invoke_gza("search", "--help", "--project", str(tmp_path))
-        docs_text = Path("docs/configuration.md").read_text()
 
         assert history_help.returncode == 0
         assert "--status-not" in history_help.stdout
@@ -203,7 +193,6 @@ class TestHelpOutput:
         assert "--lineage-of-not" in search_help.stdout
         assert "--root-not" in search_help.stdout
         assert "--all-tags" in search_help.stdout
-        assert docs_text.count("| `--list-fields` | List valid `--fields` values for this command and exit |") >= 4
 
     def test_history_and_search_reject_removed_preset_flag(self, tmp_path):
         setup_config(tmp_path)
@@ -471,7 +460,6 @@ class TestHelpOutput:
         assert "--any-tag" in result.stdout
         assert "live shared lifecycle planner" in result.stdout
         assert "deprecated and no longer supported" not in result.stdout
-        assert "incomplete --blocked-by-dropped --list-fields" in Path("docs/configuration.md").read_text()
         assert result.stderr == ""
 
     def test_incomplete_command_dispatches_through_live_parser(self, tmp_path, monkeypatch):
@@ -509,18 +497,12 @@ class TestHelpOutput:
         help_result = invoke_gza("advance", "--help", "--project", str(tmp_path))
         assert help_result.returncode == 0
         help_text = " ".join(help_result.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert "Skip automatic failed-task recovery decisions (resume/retry/manual-review)" in help_text
         assert "Override max_resume_attempts (0 disables automatic failed-task recovery; any positive value enables the fixed bounded shared recovery policy)" in help_text
         assert "--tag TAG" in help_result.stdout
         assert "--any-tag" in help_result.stdout
         assert "Skip auto-resume of resumable failed tasks" not in help_text
-
-        assert "shared automatic failed-task recovery (resume/retry)" in docs_text
-        assert "Skip automatic failed-task recovery decisions (resume/retry/manual-review)" in docs_text
-        assert "Override `max_resume_attempts`: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared resume/retry policy" in docs_text
-        assert "Skip auto-resume of failed tasks" not in docs_text
 
         config_keys = invoke_gza("config", "keys", "--json", "--project", str(tmp_path))
         assert config_keys.returncode == 0
@@ -579,12 +561,6 @@ class TestHelpOutput:
         assert "interactive for Claude" in result.stdout
         assert "observe-only for Codex/Gemini" in result.stdout
 
-        tmux_docs = Path("docs/tmux.md").read_text()
-        config_docs = Path("docs/configuration.md").read_text()
-        assert "GZA_ENABLE_TMUX_PROXY=1" in tmux_docs
-        assert "Normal interactive Claude exit also auto-resumes in background." in tmux_docs
-        assert "Attach to a running task." in config_docs
-
     def test_stats_help_no_longer_claims_reviews_only(self, tmp_path):
         """Help output should not imply `stats` only supports `reviews`."""
         setup_config(tmp_path)
@@ -594,17 +570,6 @@ class TestHelpOutput:
         assert result.returncode == 0
         assert "Review and iteration analytics" in result.stdout
         assert "Review analytics (use 'gza stats reviews')" not in result.stdout
-
-    def test_ps_docs_describe_worker_prune_without_task_reconciliation(self, tmp_path):
-        """Operator docs for ps should match the non-reconciling startup path."""
-        setup_config(tmp_path)
-
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
-        retired = "gza sta" "tus"
-
-        assert "`gza ps` only prune dead worker metadata" in docs_text
-        assert f"`{retired}`" not in docs_text
-        assert "On CLI startup, `in_progress` tasks are reconciled and auto-failed" not in docs_text
 
     def test_add_next_help_and_docs_describe_front_of_urgent_lane(self, tmp_path):
         """`add --next` contract should explicitly mention bump-to-front urgent-lane behavior."""
@@ -616,10 +581,6 @@ class TestHelpOutput:
         assert "front of the urgent lane" in normalized_help
         assert "picked up before normal queue items" not in normalized_help
 
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
-        assert "front of the urgent lane" in docs_text
-        assert "picked up before normal queue items" not in docs_text
-
     def test_public_pr_help_and_docs_use_completion_time_request_wording(self, tmp_path):
         """Public `--pr` help/docs should use the same deferred request wording."""
         setup_config(tmp_path)
@@ -629,29 +590,13 @@ class TestHelpOutput:
             "evaluated at completion time and skipped without failing when PRs are unavailable"
         )
 
-        for command, section in (
-            ("work", "work"),
-            ("add", "add"),
-            ("edit", "edit"),
-            ("improve", "improve"),
-            ("implement", "implement"),
-            ("extract", "extract"),
-        ):
+        for command in ("work", "add", "edit", "improve", "implement", "extract"):
             help_result = invoke_gza(command, "--help", "--project", str(tmp_path))
             assert help_result.returncode == 0
             normalized_help = " ".join(help_result.stdout.split())
-            docs_text = _normalized_markdown_section(Path("docs/configuration.md"), section)
 
             assert "--pr" in help_result.stdout
             assert expected in normalized_help
-            assert expected in docs_text
-
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
-        assert (
-            "implement --based-on <plan_id> --review --pr` - Build per plan, auto-create review, and request PR "
-            "creation/reuse at successful completion for later review comments when PRs are available"
-        ) in docs_text
-        assert "ensure a PR exists for later review comments" not in docs_text
 
     def test_edit_help_and_docs_describe_non_pending_tag_only_restriction(self, tmp_path):
         """`edit --help` and docs should both explain the non-pending tag-only contract."""
@@ -661,24 +606,16 @@ class TestHelpOutput:
 
         assert help_result.returncode == 0
         normalized_help = " ".join(help_result.stdout.split())
-        docs_text = _normalized_markdown_section(Path("docs/configuration.md"), "edit")
 
         assert "Non-pending tasks may only use tag mutation flags" in normalized_help
-        assert "Non-pending tasks may only use tag mutation flags" in docs_text
         assert "remain pending-only" in normalized_help
-        assert "remain pending-only" in docs_text
         assert "--hold-for-review" in normalized_help
         assert "--no-hold-for-review" in normalized_help
         assert "--auto-implement" in normalized_help
-        assert "--hold-for-review" in docs_text
-        assert "--no-hold-for-review" in docs_text
-        assert "--auto-implement" in docs_text
         assert "Compatibility alias for `--no-hold-for-review`" in normalized_help
-        assert "--no-hold-for-review` (preferred) or `--auto-implement` (compatibility alias)" in docs_text
 
         for flag in ("--add-tag", "--remove-tag", "--clear-tags", "--set-tags"):
             assert flag in normalized_help
-            assert flag in docs_text
 
         for flag in (
             "--based-on",
@@ -692,7 +629,6 @@ class TestHelpOutput:
             "--no-learnings",
         ):
             assert flag in normalized_help
-            assert flag in docs_text
 
     def test_review_scope_help_and_docs_are_aligned_for_add_and_implement(self, tmp_path):
         """`--review-scope` should be documented anywhere CLI help exposes it."""
@@ -700,17 +636,14 @@ class TestHelpOutput:
 
         expected = "authoritative gradeable review"
 
-        for command, section in (("add", "add"), ("implement", "implement")):
+        for command in ("add", "implement"):
             help_result = invoke_gza(command, "--help", "--project", str(tmp_path))
             assert help_result.returncode == 0
 
             normalized_help = " ".join(help_result.stdout.split()).lower()
-            docs_text = _normalized_markdown_section(Path("docs/configuration.md"), section).lower()
 
             assert "--review-scope" in help_result.stdout
-            assert "--review-scope" in docs_text
             assert expected in normalized_help
-            assert expected in docs_text
 
     def test_comment_kind_help_and_docs_are_aligned(self, tmp_path: Path) -> None:
         """`comment --kind` should document the supported kinds and default behavior."""
@@ -720,13 +653,9 @@ class TestHelpOutput:
         assert help_result.returncode == 0
 
         normalized_help = " ".join(help_result.stdout.split()).lower()
-        docs_text = _normalized_markdown_section(Path("docs/configuration.md"), "comment").lower()
 
         assert "--kind {feedback,review_scope}" in normalized_help
         assert "default: feedback" in normalized_help
-        assert "--kind feedback\\|review_scope" in docs_text
-        assert "default improve-actionable comment kind" in docs_text
-        assert "operator-supplied review-scope metadata" in docs_text
 
     def test_sync_help_and_docs_describe_explicit_branch_and_pr_reconciliation(self, tmp_path):
         """`sync --help` and docs should keep sync as the broader explicit maintenance surface."""
@@ -736,22 +665,11 @@ class TestHelpOutput:
         assert sync_help.returncode == 0
 
         help_text = " ".join(sync_help.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert "--git-only" in sync_help.stdout
         assert "--pr-only" in sync_help.stdout
         assert "--no-fetch" in sync_help.stdout
         assert "Skip `git fetch origin`; stale-PR auto-close is disabled without a fresh fetch" in help_text
-
-        assert "### sync" in docs_text
-        assert "uv run gza sync [task_id ...] [options]" in docs_text
-        assert "Use `uv run gza unmerged` for the daily \"what still needs to be merged?\" check." in docs_text
-        assert "`uv run gza sync` remains the broader explicit branch and PR reconciliation command." in docs_text
-        assert "When `pr_integration: true`, it also performs project-level `gh`-backed PR discovery/comment/create flows." in docs_text
-        assert "Set `pr_integration: false` to disable those PR operations." in docs_text
-        assert "The only GitHub-side exceptions outside `uv run gza sync` are improve and fix completion with `--review`" in docs_text
-        assert "With `pr_integration: false`, those same branch-scoped PR checks are skipped." in docs_text
-        assert "Run `uv run gza sync` after those merges" in docs_text
 
     def test_improve_help_and_docs_describe_narrow_pr_sync_before_auto_review(self, tmp_path):
         """`improve --help` and docs should explain the same-branch push-before-review exception."""
@@ -761,12 +679,9 @@ class TestHelpOutput:
         assert improve_help.returncode == 0
 
         help_text = " ".join(improve_help.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         expected = "if the branch already has an open PR, push same-branch improve commits first"
         assert expected in help_text
-        assert expected in docs_text
-        assert "If GitHub is unavailable, lookup fails, or no live PR exists, improve preserves the normal auto-review flow." in docs_text
 
     def test_fix_help_and_docs_describe_narrow_pr_sync_before_auto_review(self, tmp_path):
         """`fix --help` and docs should explain the same-branch push-before-review exception."""
@@ -776,12 +691,9 @@ class TestHelpOutput:
         assert fix_help.returncode == 0
 
         help_text = " ".join(fix_help.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         expected = "if the branch already has an open PR, push same-branch fix commits first"
         assert expected in help_text
-        assert expected in docs_text
-        assert "If GitHub is unavailable, lookup fails, or no live PR exists, fix preserves the normal auto-review flow." in docs_text
 
     def test_watch_and_queue_tag_help_point_to_same_scoped_dispatch_preview(self, tmp_path):
         """Help/docs should describe the queue/watch preview surface and the new mode flags."""
@@ -794,7 +706,6 @@ class TestHelpOutput:
 
         watch_text = " ".join(watch_help.stdout.split())
         queue_text = " ".join(queue_help.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert "use 'uv run gza queue --tag TAG --pending' to preview the matching pending pickup order" in watch_text
         assert "derived blockers" in watch_text
@@ -804,10 +715,6 @@ class TestHelpOutput:
         assert "--recovery-first" in queue_text
         assert "use 'gza queue --tag TAG' to preview scoped pickup order" not in watch_text
         assert "same scoped pickup order used by 'gza watch --tag TAG'" not in queue_text
-        assert "Only preview dispatch rows matching tag filters" in docs_text
-        assert "use `uv run gza queue --tag TAG --pending` to preview the matching pending pickup order" in docs_text
-        assert "use `--pending` for the pending-only view" in docs_text
-        assert "canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order" in docs_text
 
     def test_watch_help_mentions_recovery_lane_flags(self, tmp_path):
         """watch --help should advertise the recovery lane controls."""
@@ -833,33 +740,10 @@ class TestHelpOutput:
         assert help_result.returncode == 0
 
         help_text = " ".join(help_result.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
-        failed_tasks_docs = " ".join(Path("docs/examples/failed-tasks.md").read_text().split())
 
         assert "with --recovery-only, print the failed-recovery report and exit" in help_text
         assert "0 disables automatic failed-task recovery; any positive value enables the fixed bounded shared recovery policy" in help_text
         assert "include skipped failed tasks in the dry-run recovery report and live watch logs" in help_text
-
-        assert "with `--recovery-only`, print the full failed-recovery report and exit" in docs_text
-        assert "Override `max_resume_attempts` for this watch run: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared policy used by both plain watch and the recovery lane" in docs_text
-        assert "`uv run gza watch --recovery-only --dry-run` is the recovery inspection surface" in docs_text
-        assert "`watch.recovery_slots`" in docs_text
-        assert "`--recovery-first`" in docs_text
-        assert "`--pending-only`" in docs_text
-        assert "live watch logs" in docs_text
-
-        assert "`uv run gza watch --recovery-only --dry-run`" in failed_tasks_docs
-        assert "Print the recovery decision report and exit" in failed_tasks_docs
-        assert "--show-skipped" in failed_tasks_docs
-        assert "`--max-resume-attempts` controls that shared policy as a toggle" in failed_tasks_docs
-
-    def test_watch_docs_distinguish_watch_batch_from_global_max_concurrent_fallback(self, tmp_path):
-        """watch docs should explain that only an explicit watch.batch changes the global fallback cap."""
-        setup_config(tmp_path)
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
-
-        assert "when `max_concurrent` is unset, an explicitly configured `watch.batch` also becomes the global cap" in docs_text
-        assert "otherwise the fallback global cap remains `5`" in docs_text
 
     def test_watch_help_and_docs_describe_next_cycle_boundary_drift_restart(self, tmp_path):
         """watch help/docs should describe next-cycle-boundary drift restart without drain gating."""
@@ -868,19 +752,9 @@ class TestHelpOutput:
         assert help_result.returncode == 0
 
         help_text = " ".join(help_result.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
-        internal_docs_text = " ".join(Path("docs/internal/advance-workflow.md").read_text().split())
 
         assert "Re-exec watch at the next cycle boundary when the installed gza code changes" in help_text
         assert "drained batch boundary" not in help_text
-
-        assert "re-exec at the next cycle boundary to load the new code without waiting for running or pending work to drain" in docs_text
-        assert "Detached workers keep running, and the replacement watch process reconciles them after it auto-resumes" in docs_text
-        assert "current batch drains and no worker remains running" not in docs_text
-
-        assert "re-exec itself at the next cycle boundary without waiting for running or pending work to drain" in internal_docs_text
-        assert "detached workers stay alive and the replacement process reconciles them after it auto-resumes" in internal_docs_text
-        assert "current batch drains and no worker remains running" not in internal_docs_text
 
     def test_watch_help_and_docs_distinguish_max_idle_from_no_activity_timeout(self, tmp_path):
         """watch help/docs should distinguish loop idle exit from silent-worker reconciliation."""
@@ -890,23 +764,8 @@ class TestHelpOutput:
         assert help_result.returncode == 0
 
         help_text = " ".join(help_result.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
-        example_text = " ".join(Path("src/gza/gza.yaml.example").read_text().split())
 
         assert "Exit after SECS of consecutive idle watch cycles" in help_text
-        assert "`watch.no_activity_timeout` controls when watch reconciliation marks a silent registered worker for a pending or in-progress task `NO_ACTIVITY`" in docs_text
-        assert "`watch.max_idle` keeps its existing meaning: it exits the `gza watch` loop itself after consecutive idle cycles." in docs_text
-        assert "no_activity_timeout: 60" in example_text
-
-    def test_internal_advance_workflow_docs_describe_watch_failed_recovery(self, tmp_path):
-        """Internal workflow docs should stay aligned with watch failed-task recovery behavior."""
-        setup_config(tmp_path)
-
-        docs_text = " ".join(Path("docs/internal/advance-workflow.md").read_text().split())
-
-        assert "`--recovery-only`" in docs_text
-        assert "`watch.recovery_slots`" in docs_text
-        assert "plain watch, failed-task recovery, and advance-driven improve recovery" in docs_text
 
     def test_watch_help_and_docs_lock_queue_priority_contract(self, tmp_path):
         """Help/docs should keep the two-lane recovery split wording aligned."""
@@ -916,14 +775,8 @@ class TestHelpOutput:
         assert help_result.returncode == 0
 
         help_text = " ".join(help_result.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
-        failed_tasks_docs = " ".join(Path("docs/examples/failed-tasks.md").read_text().split())
-        internal_docs = " ".join(Path("docs/internal/advance-workflow.md").read_text().split())
 
         assert "reserved for worker-consuming failed-task recovery before pending pickup" in help_text
-        assert "default `watch.recovery_slots = 1`" in docs_text
-        assert "`uv run gza watch --recovery-only`" in failed_tasks_docs
-        assert "`watch.recovery_slots`" in internal_docs
 
     def test_queue_help_and_docs_describe_default_limit_and_all_overrides(self, tmp_path):
         """`queue --help` and docs should describe capped default output and all-task overrides."""
@@ -933,12 +786,9 @@ class TestHelpOutput:
         assert queue_help.returncode == 0
 
         help_text = " ".join(queue_help.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert "Show first N runnable dispatch rows in preview order (default: 10; blocked pending and needs-human recovery rows are always shown; use 0, -1, or --all for all runnable rows)" in help_text
         assert "Show all runnable dispatch rows (blocked pending and needs-human recovery rows are always shown)" in help_text
-        assert "Show first N runnable dispatch rows in preview order (default: 10; blocked pending and needs-human recovery rows are always shown; use `0`, `-1`, or `--all` for all runnable rows)" in docs_text
-        assert "By default, `gza queue` shows the first 10 runnable dispatch rows in shared preview order, while blocked pending rows and needs-human recovery rows always remain visible." in docs_text
 
     def test_queue_ordering_language_is_consistent_between_help_docs_and_tag_scope_behavior(self, tmp_path):
         """Queue docs/help should consistently describe tag-scoped explicit ordering semantics."""
@@ -948,12 +798,8 @@ class TestHelpOutput:
         assert queue_help.returncode == 0
 
         queue_help_text = " ".join(queue_help.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
         assert "Assign an explicit queue position (with --tag scope shared across matching tasks; fails if target does not match scope)" in queue_help_text
         assert "Move a pending task to explicit queue position 1 (with --tag scope shared across matching tasks; fails if target does not match scope)" in queue_help_text
-        assert "When `queue move`, `queue next`, or `queue clear` include `--tag` filters, explicit ordering is shared across all tasks matching that tag scope" in docs_text
-        assert "Those commands fail closed when the target task does not match the provided tag scope" in docs_text
-        assert "within each task's current tag-set bucket" not in docs_text
 
     def test_unmerged_help_and_docs_describe_fetch_opt_in_and_fields_projection(self, tmp_path):
         """unmerged help/docs should expose the no-fetch default, opt-in fetch, and `--fields` projection."""
@@ -963,8 +809,6 @@ class TestHelpOutput:
         assert unmerged_help.returncode == 0
 
         help_text = " ".join(unmerged_help.stdout.split())
-        docs_raw = Path("docs/configuration.md").read_text()
-        docs_text = " ".join(docs_raw.split())
 
         assert "--fetch" in unmerged_help.stdout
         assert "--into-current" in unmerged_help.stdout
@@ -982,25 +826,6 @@ class TestHelpOutput:
         assert "Output JSON rows from the unified query API" in help_text
         assert "origin/<default>` merge evidence is current" not in help_text
 
-        assert "uv run gza unmerged [options]" in docs_text
-        assert "\ngza unmerged [options]\n" not in docs_raw
-        assert "`uv run gza unmerged` is the daily merge-truth command" in docs_text
-        assert "`--fetch` | Fetch `origin` before the canonical default-branch refresh" in docs_text
-        assert "host-side publication or PR metadata can use fresh remote-tracking refs" in docs_text
-        assert "Canonical merge proof still uses local branch state only" in docs_text
-        assert "| `--json` | Output JSON rows from the unified query API |" in docs_text
-        assert "| `--fields CSV` | Projection field override" in docs_text
-        assert "| `--list-fields` | List valid `--fields` values for this command and exit |" in docs_text
-        assert "opens the task store read/write" in docs_text
-        assert "By default, plain `uv run gza unmerged` does not initiate network I/O" in docs_text
-        assert "This is the deliberate narrow exception to the usual read-only query convention" in docs_text
-        assert "If the canonical default-branch refresh cannot persist because the database is read-only" in docs_text
-        assert "With `--into-current` or `--target`, `uv run gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged" in docs_text
-        assert "builds an unmerged-specific query preset and then renders that result through the shared query projection/presentation path" in docs_text
-        assert "logs concise progress for the refresh, query, and render phases" in docs_text
-        assert "showing only the selected branch-owner task and its descendants" in docs_text
-        assert "origin/<default>` merge evidence is current" not in docs_text
-
     def test_stale_unmerged_help_and_docs_describe_json_execute_contract(self, tmp_path):
         """stale-unmerged help/docs should state that JSON mode still honors execution."""
         setup_config(tmp_path)
@@ -1009,7 +834,6 @@ class TestHelpOutput:
         assert stale_help.returncode == 0
 
         help_text = " ".join(stale_help.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert "--execute" in stale_help.stdout
         assert "--json" in stale_help.stdout
@@ -1017,15 +841,6 @@ class TestHelpOutput:
         assert "re-proves each candidate against the canonical default target" in help_text
         assert "Output structured JSON rows; with --execute, rows include the applied drops" in help_text
         assert "Resolved external dependency history does not block a stale candidate" in help_text
-
-        assert "uv run gza stale-unmerged [options]" in docs_text
-        assert "| `--json` | Output structured JSON rows; when combined with `--execute`, each row includes the applied drops |" in docs_text
-        assert "JSON mode does not downgrade execution" in docs_text
-        assert "re-checks those candidates against the canonical default target" in docs_text
-        assert "Any candidate proven terminal there (`merged`, `empty`, or `redundant`) is excluded" in docs_text
-        assert "`uv run gza stale-unmerged --execute --json` applies the drops first" in docs_text
-        assert "`applied_drop_task_ids`" in docs_text
-        assert "live unresolved lineages" in docs_text
 
     def test_merged_help_and_docs_describe_default_window_and_all_escape_hatch(self, tmp_path):
         """`merged` help/docs should describe the default 1-day window and `--all` override."""
@@ -1035,7 +850,6 @@ class TestHelpOutput:
         assert merged_help.returncode == 0
 
         help_text = " ".join(merged_help.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert "--all" in merged_help.stdout
         assert "--last-days N" in merged_help.stdout
@@ -1045,12 +859,6 @@ class TestHelpOutput:
         assert "Explicit --last-days and --since filters override that default exactly as provided" in help_text
         assert "Show full merged history instead of the default last-1-day window" in help_text
 
-        assert "uv run gza merged [options]" in docs_text
-        assert "| `--all` | Show full merged history instead of the default last-1-day window |" in docs_text
-        assert "By default, plain `uv run gza merged` shows only units merged in the last 1 day" in docs_text
-        assert "Pass `--all` to see full history" in docs_text
-        assert "use explicit `--last-days` / `--since` filters to request a different window" in docs_text
-
     def test_merge_help_and_docs_describe_force_as_lifecycle_only_override(self, tmp_path):
         """`merge --help` and docs should describe `--force` as a lifecycle override, not a git-conflict override."""
         setup_config(tmp_path)
@@ -1059,15 +867,10 @@ class TestHelpOutput:
         assert merge_help.returncode == 0
 
         help_text = " ".join(merge_help.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert "--force" in merge_help.stdout
         assert "Override lifecycle parked merge gates for manual merge execution" in help_text
         assert "still refuse git conflicts and open review BLOCKER findings unless --defer-blockers is also passed" in help_text
-
-        assert "| `--force` | Override lifecycle parked merge gates for the local merge path; does not bypass git conflicts or open review `BLOCKER`s without `--defer-blockers` |" in docs_text
-        assert "`--force` is the manual break-glass path for lifecycle parked merge gates" in docs_text
-        assert "`manual_force` when `--force` actually overrides a parked lifecycle gate" in docs_text
 
     def test_show_help_and_docs_describe_prompt_as_plain_text(self, tmp_path):
         """`show --prompt` should be documented as plain prompt-text output, not JSON."""
@@ -1077,11 +880,9 @@ class TestHelpOutput:
         assert show_help.returncode == 0
 
         help_text = " ".join(show_help.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert "Print only the fully built prompt text for this task and exit" in help_text
         assert "as JSON" not in help_text
-        assert "| `--prompt` | Print only the fully built prompt text for this task and exit |" in docs_text
 
     def test_artifact_and_clean_help_docs_stay_aligned_on_artifact_operator_surfaces(self, tmp_path: Path) -> None:
         """Artifact retrieval and cleanup docs should match parser help for artifact-aware behavior."""
@@ -1089,50 +890,23 @@ class TestHelpOutput:
 
         artifact_help = invoke_gza("artifact", "--help", "--project", str(tmp_path))
         clean_help = invoke_gza("clean", "--help", "--project", str(tmp_path))
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert artifact_help.returncode == 0
         assert "Print the latest stored task artifact content or path" in artifact_help.stdout
         assert "--kind KIND" in artifact_help.stdout
         assert "--latest" in artifact_help.stdout
         assert "--path" in artifact_help.stdout
-        assert "### artifact" in docs_text
-        assert "gza artifact <task_id> [options]" in docs_text
-        assert "| `--kind KIND` | Filter artifacts by kind (for example `verify_command_output`) |" in docs_text
-        assert "| `--latest` | Select the latest matching artifact (default behavior) |" in docs_text
         assert "Print only the resolved absolute artifact path when the latest row has a content file" in artifact_help.stdout
-        assert (
-            "| `--path` | Print only the resolved absolute artifact path when the latest row has a content file |"
-            in docs_text
-        )
-        assert "both default content retrieval and `--path` fail clearly" in docs_text
 
         assert clean_help.returncode == 0
         assert "task artifacts" in clean_help.stdout
         assert "archived log, artifact, and worker files" in clean_help.stdout
         assert "Only clean up old log files and live task artifacts" in clean_help.stdout
-        assert (
-            "| `--logs` | Only clean up old log files (conversation `.log` and paired `.ops.jsonl` siblings together) and live task artifact files; archived artifacts are left for `--purge` |"
-            in docs_text
-        )
-        assert "| `--keep-unmerged` | Keep logs and task artifacts for tasks that are still unmerged |" in docs_text
         assert "Archive old log, live task artifact, and worker files instead of deleting" in clean_help.stdout
-        assert (
-            "| `--archive` | Archive old log, live task artifact, and worker files instead of deleting; already archived artifacts are skipped |"
-            in docs_text
-        )
-        assert "| `--purge` | Delete previously archived log, artifact, and worker files (default: older than 365 days) |" in docs_text
 
     def test_removed_group_commands_are_absent_from_docs_and_rejected(self, tmp_path):
         """Retired group command spellings should be undocumented and fail in argparse."""
         setup_config(tmp_path)
-
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
-        assert "### groups" not in docs_text
-        groups_cmd = "gza " + "groups"
-        group_cmd = "gza " + "group"
-        assert groups_cmd not in docs_text
-        assert group_cmd not in docs_text
 
         for argv in (
             ("groups",),
@@ -1246,7 +1020,6 @@ class TestHelpOutput:
 
         assert help_result.returncode == 0
         help_text = " ".join(help_result.stdout.split())
-        docs_text = " ".join(Path("docs/configuration.md").read_text().split())
 
         assert "--commit REV" in help_result.stdout
         assert "--per-commit" in help_result.stdout
@@ -1254,12 +1027,6 @@ class TestHelpOutput:
         assert "applied in the order provided" in help_text
         assert "create one extracted task per selected commit" in help_text
         assert "with --background, workers still start in parallel" in help_text
-
-        assert "--commit REV" in docs_text
-        assert "--per-commit" in docs_text
-        assert "applied in the order provided" in docs_text
-        assert "one extracted task per selected commit" in docs_text
-        assert "execution starts in parallel rather than as a serialized commit-by-commit run" in docs_text
 
 class TestReconciliationWarnings:
     """Tests for reconciliation failure visibility during CLI dispatch."""

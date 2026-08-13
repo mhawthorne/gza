@@ -61,6 +61,18 @@ A specific failure mode: pairing an infrastructure refactor with a policy
 change in one PR. ("Refactor tests that assert X, and while we're here,
 change X.") Different decisions; separate them.
 
+## Unit tests are for code, not docs
+
+Unit tests verify code behavior. Don't write unit tests that assert
+documentation content or wording. Docs change for legitimate reasons —
+rewording, restructuring, dropping an implied prefix — and are reviewed
+through separate doc-review processes. A test that fails because prose
+changed caught a reword, not a bug; it only taxes every future edit.
+
+Likewise, don't assert that a specific file exists on disk. File presence
+is not code behavior, and pinning a test to an incidental artifact (a dated
+review file, a generated report) guarantees rot.
+
 ## A subprocess belongs in `tests_functional/`
 
 If a test spawns a subprocess, it's a functional test — not a unit test —

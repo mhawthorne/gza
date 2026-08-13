@@ -91,16 +91,6 @@ def _assert_summary_checklist_contract(text: str) -> None:
         assert item in text
 
 
-def _extract_ai_review_fallback_prompt(script_content: str) -> str:
-    match = re.search(
-        r"read -r -d '' PROMPT <<'EOF' \|\| true\n(.*?)\nEOF",
-        script_content,
-        flags=re.DOTALL,
-    )
-    assert match is not None
-    return match.group(1)
-
-
 class TestPromptBuilderBuild:
     """Tests for PromptBuilder.build()."""
 
@@ -1246,37 +1236,6 @@ class TestPromptBuilderBuild:
 
         assert "Review Guidelines" in result
         assert "Check for security issues." in result
-
-    def test_review_guidance_surfaces_match_blockers_followups_contract(self):
-        root = Path(__file__).resolve().parents[1]
-        review_md_content = (root / "REVIEW.md").read_text()
-        ai_review_script_content = (root / "bin" / "ai_review.sh").read_text()
-        fallback_prompt = _extract_ai_review_fallback_prompt(ai_review_script_content)
-        example_doc_content = (
-            root / "docs" / "examples" / "plan-implement-review.md"
-        ).read_text()
-
-        assert "## Blockers" in review_md_content
-        assert "## Follow-Ups" in review_md_content
-        assert "Verdict: APPROVED_WITH_FOLLOWUPS" in review_md_content
-        assert "Every blocker must be falsifiable" in review_md_content
-        assert "Open-state citation:" in review_md_content
-        assert "Required fix:" in review_md_content
-        assert "Must-fix issues" not in review_md_content
-        assert "Suggestions" not in review_md_content
-
-        assert "## Blockers" in fallback_prompt
-        assert "## Follow-Ups" in fallback_prompt
-        assert "Verdict: APPROVED_WITH_FOLLOWUPS" in fallback_prompt
-        assert "Every blocker must be falsifiable" in fallback_prompt
-        assert "Open-state citation" in fallback_prompt
-        assert "Required fix" in fallback_prompt
-        assert "Must-fix issues" not in fallback_prompt
-        assert "Suggestions" not in fallback_prompt
-
-        assert "## Blockers" in example_doc_content
-        assert "## Must-Fix" not in example_doc_content
-        assert "## Verdict:" not in example_doc_content
 
     def test_build_spec_file_included(self, tmp_path: Path):
         """Test that spec file content is included when task.spec is set."""

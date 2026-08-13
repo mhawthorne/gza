@@ -1615,12 +1615,6 @@ class TestLocalConfigOverrides:
         with pytest.raises(ConfigError, match=re.escape(expected)):
             Config.load(tmp_path)
 
-    def test_docs_configuration_mentions_gza_db_path_override(self):
-        """Operator docs should document GZA_DB_PATH override and precedence."""
-        docs_text = Path("docs/configuration.md").read_text()
-        assert "GZA_DB_PATH" in docs_text
-        assert "`~/.gza/config.yaml` < `gza.yaml` < `gza.local.yaml` < `GZA_DB_PATH`" in docs_text
-
     def test_config_keys_table_lists_all_registered_keys_and_columns(self, tmp_path: Path):
         """`gza config keys` should render a tabular registry with stable columns."""
         from gza.config_schema import CONFIG_KEY_REGISTRY
