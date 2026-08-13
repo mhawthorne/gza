@@ -1,12 +1,12 @@
 # Docker Configuration
 
-Gza runs AI providers (Claude, Gemini, Codex) in Docker containers by default for isolation and reproducibility. This document explains how to customize the Docker environment for your project's needs.
+Gza runs AI providers (Claude, Codex) in Docker containers by default for isolation and reproducibility. This document explains how to customize the Docker environment for your project's needs.
 
 ## Default Behavior
 
 When you first run `gza work`, it automatically:
 
-1. Generates a minimal Dockerfile at `etc/Dockerfile.claude` (or `etc/Dockerfile.gemini`)
+1. Generates a minimal Dockerfile at `etc/Dockerfile.claude` (or `etc/Dockerfile.codex`)
 2. Builds a Docker image named `{project_name}-gza`
 3. Runs the AI provider inside that container
 
@@ -58,7 +58,7 @@ For projects that need additional tools (Python, compilers, test frameworks, etc
 
 ### Creating a Custom Dockerfile
 
-1. Create or edit `etc/Dockerfile.claude` (or `etc/Dockerfile.gemini` for Gemini)
+1. Create or edit `etc/Dockerfile.claude` (or `etc/Dockerfile.codex` for Codex)
 2. Add your project's dependencies
 3. The image will be rebuilt automatically on the next `gza work`
 
@@ -173,7 +173,6 @@ use_docker: false
 | File | Purpose |
 |------|---------|
 | `etc/Dockerfile.claude` | Custom Dockerfile for Claude provider |
-| `etc/Dockerfile.gemini` | Custom Dockerfile for Gemini provider |
 | `etc/Dockerfile.codex` | Custom Dockerfile for Codex provider |
 
 ## Troubleshooting

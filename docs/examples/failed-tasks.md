@@ -7,14 +7,14 @@ How to recover when tasks fail or hit limits.
 Tasks can fail for several reasons:
 
 - **Timeout** - Task exceeded `timeout_minutes`
-- **Max turns** - Task hit `max_turns` limit without completing
+- **Max steps** - Task hit `max_steps` limit without completing
 - **Error** - Claude encountered an unrecoverable error
 - **Interrupted** - Worker was stopped or crashed
 
 ## Check the failure
 
 ```bash
-$ uv run gza show gza-5
+$ gza show gza-5
 Task gza-5: 20260108-add-user-auth
 Status: failed
 Branch: feature/20260108-add-user-auth
@@ -26,12 +26,12 @@ Cost: $0.89
 Error: max turns of 50 exceeded
 ```
 
-If git worktree metadata is unavailable, `uv run gza show` prints a warning so lookup failures are distinct from "no active worktree".
+If git worktree metadata is unavailable, `gza show` prints a warning so lookup failures are distinct from "no active worktree".
 
 View the merged log to understand what happened:
 
 ```bash
-$ uv run gza log gza-5 --steps
+$ gza log gza-5 --steps
 ```
 
 ## Resume vs Retry
@@ -40,26 +40,26 @@ You have two options for recovering:
 
 | Command | Behavior | Use when |
 |---------|----------|----------|
-| `uv run gza resume` | Continue from where it left off | Task was making progress, just needs more turns |
-| `uv run gza retry` | Create a new retry attempt | Task needs another run; implement retries fork fresh, same-branch follow-ups stay on the shared branch |
+| `gza resume` | Continue from where it left off | Task was making progress, just needs more turns |
+| `gza retry` | Create a new retry attempt | Task needs another run; implement retries fork fresh, same-branch follow-ups stay on the shared branch |
 
 For bulk unattended recovery after fixing an environment issue, use the watch recovery lane:
 
 | Command | Behavior | Use when |
 |---------|----------|----------|
-| `uv run gza watch --recovery-only` | Send the full watch batch to failed-task recovery, choosing `resume` or `retry` per task | You want watch to drain the failed queue before resuming normal pending processing |
-| `uv run gza watch --recovery-only --dry-run` | Print the recovery decision report and exit | You want to inspect which failed tasks would `resume`, `retry`, or need operator attention before starting recovery |
-| `uv run gza watch --recovery-only --dry-run --show-skipped` | Include ordinary skipped failed tasks in the recovery decision report | You want to inspect why some non-attention failed tasks would still be skipped |
-| `uv run gza watch --recovery-only --show-skipped` | Include skipped failed tasks in live watch logs | You want recovery-only watch logs to explain why some failed tasks are being skipped |
+| `gza watch --recovery-only` | Send the full watch batch to failed-task recovery, choosing `resume` or `retry` per task | You want watch to drain the failed queue before resuming normal pending processing |
+| `gza watch --recovery-only --dry-run` | Print the recovery decision report and exit | You want to inspect which failed tasks would `resume`, `retry`, or need operator attention before starting recovery |
+| `gza watch --recovery-only --dry-run --show-skipped` | Include ordinary skipped failed tasks in the recovery decision report | You want to inspect why some non-attention failed tasks would still be skipped |
+| `gza watch --recovery-only --show-skipped` | Include skipped failed tasks in live watch logs | You want recovery-only watch logs to explain why some failed tasks are being skipped |
 
 ## Resume a task
 
 Resume continues the existing conversation. The AI picks up where it left off with full context of what it already did.
 
-Bare `uv run gza resume` now creates the resumed task and leaves it pending. Use `--run` for immediate foreground execution, or `--queue` if you want the intent spelled out explicitly:
+Bare `gza resume` now creates the resumed task and leaves it pending. Use `--run` for immediate foreground execution, or `--queue` if you want the intent spelled out explicitly:
 
 ```bash
-$ uv run gza resume gza-5 --run
+$ gza resume gza-5 --run
 === Resuming Task gza-5: 20260108-add-user-auth ===
 ...
 === Done ===
@@ -69,23 +69,23 @@ Stats: Runtime: 5m 23s | Turns: 15 | Cost: $0.34
 Increase the turn limit if the original was too low:
 
 ```bash
-$ uv run gza resume gza-5 --run --max-turns 100
+$ gza resume gza-5 --run --max-turns 100
 ```
 
 Add to queue without running immediately:
 
 ```bash
-$ uv run gza resume gza-5 --queue
+$ gza resume gza-5 --queue
 ```
 
 ## Retry a task
 
 Retry creates a fresh attempt. Use this when the AI went down a wrong path and you want it to start over.
 
-Bare `uv run gza retry` now creates the retry task and leaves it pending. Use `--run` for immediate foreground execution, or `--queue` if you want the intent spelled out explicitly:
+Bare `gza retry` now creates the retry task and leaves it pending. Use `--run` for immediate foreground execution, or `--queue` if you want the intent spelled out explicitly:
 
 ```bash
-$ uv run gza retry gza-5 --run
+$ gza retry gza-5 --run
 Created task gza-6 (retry of gza-5)
 === Task gza-6: 20260108-add-user-auth ===
 ...
@@ -97,12 +97,12 @@ Retry creates a new task that reuses the same branch (if it exists) but starts a
 
 ## Recover failed tasks with watch
 
-`uv run gza watch` now has a built-in two-lane split. By default, `watch.recovery_slots = 1`, so each watch pass reserves one slot for worker-consuming failed-task recovery before pending pickup and leaves the remaining slots for pending work. Use `uv run gza watch --recovery-only` to dedicate the full batch to failed-task recovery, `uv run gza watch --recovery-first` to allow only explicitly positioned pending work after recovery, or `uv run gza watch --pending-only` to disable recovery and keep the watch loop pending-only.
+`gza watch` now has a built-in two-lane split. By default, `watch.recovery_slots = 1`, so each watch pass reserves one slot for worker-consuming failed-task recovery before pending pickup and leaves the remaining slots for pending work. Use `gza watch --recovery-only` to dedicate the full batch to failed-task recovery, `gza watch --recovery-first` to allow only explicitly positioned pending work after recovery, or `gza watch --pending-only` to disable recovery and keep the watch loop pending-only.
 
 Preview the recovery plan first:
 
 ```bash
-$ uv run gza watch --recovery-only --dry-run
+$ gza watch --recovery-only --dry-run
 Failed recovery plan (tags=*, mode=recovery-only)
 
 resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/2
@@ -114,12 +114,12 @@ Needs attention (1 task):
 Summary: 2 actionable (1 resume, 1 retry), 1 needs attention, 0 skipped hidden
 ```
 
-Fully recovered failed ancestors are omitted from this report entirely. Once a retry/resume descendant completes, normal `uv run gza advance`, `uv run gza watch`, and dry-run planning in `uv run gza iterate <failed-id>` treat that completed descendant as the actionable node for merge/review/rebase decisions instead of repeating a permanent recovery skip on the failed ancestor. By contrast, chains that terminate in a failed or dropped recovery descendant stay visible under `Needs attention` until an operator intervenes.
+Fully recovered failed ancestors are omitted from this report entirely. Once a retry/resume descendant completes, normal `gza advance`, `gza watch`, and dry-run planning in `gza iterate <failed-id>` treat that completed descendant as the actionable node for merge/review/rebase decisions instead of repeating a permanent recovery skip on the failed ancestor. By contrast, chains that terminate in a failed or dropped recovery descendant stay visible under `Needs attention` until an operator intervenes.
 
 Include ordinary skipped tasks when you need the full picture:
 
 ```bash
-$ uv run gza watch --recovery-only --dry-run --show-skipped
+$ gza watch --recovery-only --dry-run --show-skipped
 Failed recovery plan (tags=*, mode=recovery-only)
 
 resume gza-101 implement via iterate reason=MAX_TURNS attempt=1/2
@@ -132,12 +132,12 @@ Needs attention (1 task):
 Summary: 2 actionable (1 resume, 1 retry), 1 needs attention, 1 skipped
 ```
 
-The same `--show-skipped` flag also controls live `uv run gza watch --recovery-only` logging. Shared needs-attention recovery rows are shown by default; without `--show-skipped`, only ordinary non-attention skip decisions stay silent in the watch log.
+The same `--show-skipped` flag also controls live `gza watch --recovery-only` logging. Shared needs-attention recovery rows are shown by default; without `--show-skipped`, only ordinary non-attention skip decisions stay silent in the watch log.
 
 Then run recovery mode for real:
 
 ```bash
-$ uv run gza watch --recovery-only
+$ gza watch --recovery-only
 ```
 
 `--max-resume-attempts` controls that shared policy as a toggle: set it to `0` to disable unattended recovery entirely; any positive value enables the same fixed bounded automatic recovery policy used by plain watch and by the recovery lane. Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to `--recovery-only` and `--restart-failed-batch` maps to `--recovery-slots`.
@@ -145,7 +145,7 @@ $ uv run gza watch --recovery-only
 ## Check history for failed tasks
 
 ```bash
-$ uv run gza history --status failed
+$ gza history --status failed
 Recent failed tasks:
 
 failed    gza-5 (2026-01-08 14:12) add user auth
@@ -173,10 +173,10 @@ failed    gza-3 (2026-01-07 09:44) refactor api
 
 3. **Use `--max-turns` for one-off increases:**
    ```bash
-   $ uv run gza work gza-5 --max-turns 100
+   $ gza work gza-5 --max-turns 100
    ```
 
 4. **Check progress mid-task:**
    ```bash
-   $ uv run gza log gza-5 --steps
+   $ gza log gza-5 --steps
    ```

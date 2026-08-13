@@ -25,6 +25,7 @@ Linked from `AGENTS.md` so these are reachable in one hop instead of by grep.
 ## Practices & ops
 
 - [practices.md](practices.md) — engineering practices (test guardrails, scope discipline, fixtures, subprocess rules).
+- [writing-docs.md](writing-docs.md) — how to write/maintain user-facing docs (style + the canonical workflow the top-level docs teach).
 - [releasing.md](releasing.md) — the release process.
 - [release-notes-generator.md](release-notes-generator.md) — how release notes are produced.
 - [profiling.md](profiling.md) — profiling gza with py-spy.

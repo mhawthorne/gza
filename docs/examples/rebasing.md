@@ -16,7 +16,7 @@ Rebase the branch first:
 ## Check for conflicts
 
 ```bash
-$ uv run gza unmerged
+$ gza unmerged
 Unmerged branches:
 
   gza-3 20260108-add-user-auth
@@ -59,13 +59,13 @@ or run an AI-assisted resolution:
 
 `gza rebase` has no `--continue`/`--abort` flags. Resolve conflicts one of two ways:
 
-- **Interactive:** use the `/gza-rebase` skill in your active runtime (Claude, Codex, or Gemini).
+- **Interactive:** use the `/gza-rebase` skill in your active runtime (Claude or Codex).
 - **Non-interactive:** pass `--resolve` to have the agent auto-resolve conflicts.
 
 If `gza rebase --resolve` reports the skill is missing, install it for the active runtime first, for example:
 
 ```bash
-uv run gza skills-install --target codex gza-rebase --project .
+gza skills-install --target codex gza-rebase --project .
 ```
 
 ## Rebase against remote
@@ -102,7 +102,7 @@ PR created: https://github.com/myorg/myapp/pull/145
 If you have several tasks that need rebasing:
 
 ```bash
-$ uv run gza unmerged
+$ gza unmerged
 Unmerged branches:
 
   gza-3 20260108-add-user-auth (needs rebase)

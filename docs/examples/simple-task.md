@@ -19,11 +19,9 @@ $ gza add
 ## View pending tasks
 
 ```bash
-$ gza next
-Pending tasks:
-
-  gza-1 20260108-fix-the-login-button
-     Fix the login button not responding on mobile devices
+$ gza queue
+Pending lane (watch will run after recovery policy allows slots):
+1  gza-1  [implement]  Fix the login button not responding on mobile...
 ```
 
 ## Run the task
@@ -72,7 +70,7 @@ $ gza log gza-1 --conversation-only --steps
 ## Check unmerged work
 
 ```bash
-$ uv run gza unmerged
+$ gza unmerged
 Unmerged branches:
 
   gza-1 20260108-fix-the-login-button
