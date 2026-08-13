@@ -257,6 +257,18 @@ class TestHelpOutput:
         assert result.returncode == 0
         assert "incomplete" in result.stdout
 
+    def test_version_flag_prints_resolved_package_version(self) -> None:
+        """`gza --version` prints the installed package version and exits 0."""
+        result = invoke_gza("--version")
+
+        assert result.returncode == 0
+        # argparse's version action prints "gza <version>" to stdout.
+        assert result.stdout.startswith("gza ")
+        version_str = result.stdout.split(maxsplit=1)[1].strip()
+        # Guards the "gza-agent" distribution name: a wrong name resolves to "unknown".
+        assert version_str
+        assert version_str != "unknown"
+
     def test_profile_exit_summary_emits_once_to_stderr(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         setup_config(tmp_path)
         monkeypatch.setenv("GZA_PROFILE", "1")

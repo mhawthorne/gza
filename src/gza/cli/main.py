@@ -2,6 +2,7 @@
 
 import argparse
 import atexit
+import importlib.metadata
 import sys
 import time
 from collections.abc import Sequence
@@ -274,6 +275,11 @@ def main() -> int:
         description="Gza - AI agent task runner",
         formatter_class=SortingHelpFormatter,
     )
+    try:
+        _v = importlib.metadata.version("gza-agent")
+    except importlib.metadata.PackageNotFoundError:
+        _v = "unknown"
+    parser.add_argument("--version", action="version", version=f"%(prog)s {_v}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # work command
