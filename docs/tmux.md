@@ -3,7 +3,7 @@
 Tmux behavior is provider-specific:
 
 - Claude background workers default to pipe mode (no tmux proxy).
-- Codex and Gemini background workers can run in tmux when `tmux.enabled: true`.
+- Codex background workers can run in tmux when `tmux.enabled: true`.
 - Claude interactive attach uses a dedicated tmux session that performs a kill/resume handoff.
 
 ## How It Works
@@ -28,7 +28,7 @@ gza attach w-20260301-143025
 
 When you attach:
 1. Claude: current worker is stopped and replaced by an interactive resume session.
-2. Codex/Gemini: attach is read-only observe mode.
+2. Codex: attach is read-only observe mode.
 3. You can type only in Claude interactive attach sessions.
 
 For Claude:
@@ -55,9 +55,8 @@ Tmux attach works differently depending on the AI provider:
 |----------|-------------|-----------------|
 | Claude | Interactive kill/resume handoff | Type messages, approve/deny tools, redirect approach |
 | Codex | Observe only | Watch terminal output (read-only) |
-| Gemini | Observe only | Watch terminal output (read-only) |
 
-Codex and Gemini run in headless mode and don't accept mid-run input. Attaching to these sessions is like a richer version of `gza log -f`. The session attaches with the `-r` (read-only) flag to prevent stray keystrokes from interfering.
+Codex runs in headless mode and doesn't accept mid-run input. Attaching to the session is like a richer version of `gza log -f`. The session attaches with the `-r` (read-only) flag to prevent stray keystrokes from interfering.
 
 ```
 $ gza attach gza-17

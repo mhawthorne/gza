@@ -24,18 +24,18 @@ Skills are installed to `.claude/skills/` in your project directory and become a
 
 **Create a well-formed gza task with appropriate type, tags, and prompt.**
 
-Use `/gza-task-add` when you want to add a task to the gza queue during a Claude Code session. The skill reads your project's AGENTS.md conventions, asks clarifying questions, constructs a well-scoped prompt, and runs `uv run gza add` with the right flags.
+Use `/gza-task-add` when you want to add a task to the gza queue during a Claude Code session. The skill reads your project's AGENTS.md conventions, asks clarifying questions, constructs a well-scoped prompt, and runs `gza add` with the right flags.
 
 **Key behaviors:**
 - Asks about task type (`explore`, `plan`, `implement`, `review`, `improve`)
 - Prompts for optional flags: `--tag`, `--depends-on`, `--based-on`, `--review`
 - Generates a specific prompt (not vague) and shows the task ID on success
-- Always uses `uv run gza add` — never edits task files manually
+- Always uses `gza add` — never edits task files manually
 
 **Example output:**
 
 ```bash
-uv run gza add --type implement --review "add JWT authentication to src/api/routes.py"
+gza add --type implement --review "add JWT authentication to src/api/routes.py"
 # Created task gza-16 (implement)
 ```
 
@@ -43,7 +43,7 @@ uv run gza add --type implement --review "add JWT authentication to src/api/rout
 
 ## gza-task-draft
 
-**Guide user through deliberate task creation with clarification and refinement before running `uv run gza add`.**
+**Guide user through deliberate task creation with clarification and refinement before running `gza add`.**
 
 Use `/gza-task-draft` when the task idea needs more thinking before committing. Unlike `gza-task-add`, this skill explicitly surfaces risks, ambiguities, and alternative approaches before finalizing the task.
 
@@ -95,7 +95,7 @@ Use `/gza-task-fix` when an implementation is stuck after repeated `CHANGES_REQU
 **Key behaviors:**
 - Starts from a full prefixed task ID (for example, `gza-1234`) and resolves to the root implementation lineage
 - Only applies when that resolved implementation already completed; never-completed work should be retried or re-implemented instead
-- Uses `uv run gza fix <task_id>` instead of ad hoc manual repair steps
+- Uses `gza fix <task_id>` instead of ad hoc manual repair steps
 - Enforces bounded blocker-driven scope with explicit rescue guardrails
 - Requires machine-readable closure ledger output (`fix_result`, `verify`, plus blocker entries)
 - Requires a fresh independent review after code-changing rescue runs
@@ -132,11 +132,11 @@ Use `/gza-task-debug` when a task has failed and you need to understand why befo
 Use `/gza-summary` when you want a synthesized "what should I do next?" view that sits above the factual CLI surfaces such as `gza incomplete`, `gza next --all`, and `gza history --status failed`.
 
 **Key behaviors:**
-- Runs `uv run gza history --status failed`, `uv run gza advance --unimplemented`, `uv run gza unmerged`, and `uv run gza next --all`
-- Optionally uses `uv run gza watch --restart-failed --dry-run` when failed-task recovery needs a decision surface
-- Treats `uv run gza history --status failed` as factual failed-attempt history, not an unresolved-only recovery queue
+- Runs `gza history --status failed`, `gza advance --unimplemented`, `gza unmerged`, and `gza next --all`
+- Optionally uses `gza watch --restart-failed --dry-run` when failed-task recovery needs a decision surface
+- Treats `gza history --status failed` as factual failed-attempt history, not an unresolved-only recovery queue
 - Distinguishes factual history filters from recommendation synthesis
-- Suggests gza-native follow-up commands such as `uv run gza work`, `uv run gza merge <id>`, `uv run gza sync <id>`, and `uv run gza log <id>`
+- Suggests gza-native follow-up commands such as `gza work`, `gza merge <id>`, `gza sync <id>`, and `gza log <id>`
 
 **Output sections:**
 
@@ -163,7 +163,7 @@ Use `/gza-rebase` when your branch has fallen behind its merge target and needs 
 - Pins git operations to `GZA_WORKTREE_ROOT` (Docker default: `/workspace`) instead of relying on the shell's current directory
 - In `--auto` mode, stashes uncommitted changes before rebasing, restores them before final verification, stops on confused worktree metadata, and relies only on local refs already present unless the caller explicitly requested a remote rebase outside auto mode
 - For each conflict: explains what both sides are doing, proposes a resolution, asks for approval, edits the file, and stages the file
-- Reads the configured project `verify_command` from `gza.yaml` for the final rebased checkout, may use `uv run gza config` only as an optional confirmation, and runs the configured full verify after any stash restoration before declaring success
+- Reads the configured project `verify_command` from `gza.yaml` for the final rebased checkout, may use `gza config` only as an optional confirmation, and runs the configured full verify after any stash restoration before declaring success
 - Supports `--auto` mode for automation: resolves conflicts using best judgment, aborts on low-confidence conflicts, and avoids remote creativity when the local target ref is missing
 - Never force-pushes automatically — shows the push command for you to run
 
@@ -195,7 +195,7 @@ Use `/gza-code-review-full` before a release or when you want a full quality ass
 
 **Run `verify_command` from `gza.yaml`, fix any errors found, then commit all fixes.**
 
-Use `/gza-test-and-fix` before declaring any task complete. It reads `verify_command` from `gza.yaml` first, treats `uv run gza config` as optional when available, and stops if `verify_command` is unset.
+Use `/gza-test-and-fix` before declaring any task complete. It reads `verify_command` from `gza.yaml` first, treats `gza config` as optional when available, and stops if `verify_command` is unset.
 
 ---
 
@@ -232,7 +232,7 @@ Use `/gza-explore-summarize` when an explore task produced useful markdown but y
 - Starts from a full prefixed explore task ID like `gza-1234`
 - Synthesizes the report into key findings, implications, and remaining uncertainty
 - Avoids raw dump output in favor of operator-facing summary
-- Recommends the most likely next workflow and concrete `uv run gza add --based-on <TASK_ID>` commands
+- Recommends the most likely next workflow and concrete `gza add --based-on <TASK_ID>` commands
 - Falls back to clarifying questions only when the report is too thin or the desired decision is unclear
 
 ---
@@ -273,7 +273,7 @@ New skills are auto-discovered — adding a directory under `src/gza/skills/` wi
 ---
 name: gza-task-add
 description: Create a well-formed gza task with appropriate type, tags, and prompt
-allowed-tools: Read, Bash(uv run gza add:*), AskUserQuestion
+allowed-tools: Read, Bash(gza add:*), AskUserQuestion
 version: 1.0.0
 public: true
 ---

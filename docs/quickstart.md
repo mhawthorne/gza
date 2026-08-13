@@ -1,220 +1,96 @@
 # Quick Start
 
-Get up and running with Gza — from install to your first merged branch.
+From install to your first merged branch.
 
-## Prerequisites
-
-- **Docker** - Tasks run in isolated containers by default. [Install Docker](https://docs.docker.com/get-docker/)
-- **Node.js** - Required for Claude Code CLI. [Install Node.js](https://nodejs.org/)
-
-## 1. Install Gza and an AI CLI
+## 1. Install
 
 ```bash
-# Install Gza
-pip install gza-agent
-
-# Install Claude Code (default provider)
-npm install -g @anthropic-ai/claude-code
-claude --version
+uv tool install gza-agent          # the `gza` command
 ```
 
-<details>
-<summary>Other providers</summary>
+Or add it as a project dependency, if you'd rather scope it per-project:
 
 ```bash
-# OpenAI Codex
-npm install -g @openai/codex
-codex --version
-
-# Gemini CLI (experimental)
-npm install -g @google/gemini-cli
-gemini --version
+uv add gza-agent                   # then run via `uv run gza`
 ```
 
-</details>
-
-## 2. Set up authentication
-
-**Claude:**
-- **OAuth (recommended):** Run `claude login`
-- **API key:** Set `ANTHROPIC_API_KEY` in `~/.gza/.env`
-
-<details>
-<summary>Other providers</summary>
-
-**Codex:**
-- **OAuth (recommended):** Run `codex login`
-- **API key:** Set `CODEX_API_KEY` in `~/.gza/.env`
-
-**Gemini:**
-- **OAuth:** Run `gemini login`
-- **API key:** Set `GEMINI_API_KEY` in `~/.gza/.env`
-
-</details>
-
-See [Configuration](configuration.md#provider-credentials) for details on credential precedence.
-
-## 3. Initialize your project
-
-In your project directory:
+Plus a provider CLI (at least one), authenticated:
 
 ```bash
-gza init
+npm install -g @anthropic-ai/claude-code && claude login   # or:
+npm install -g @openai/codex && codex login
 ```
 
-This creates a `gza.yaml` configuration file. Key settings you may want to change:
+Docker is optional — tasks run in isolated containers when it's available.
 
-```yaml
-# gza.yaml
-project_name: my-app
-use_docker: true          # Set to false to run agents locally (no Docker)
-timeout_minutes: 15       # Max time per task
-max_steps: 80             # Max conversation steps per task
-```
-
-> **Docker vs local:** Docker provides isolation — each task runs in its own container and can't affect your host. Set `use_docker: false` if you don't need isolation or want faster startup. You can also pass `--no-docker` per-run: `gza work --no-docker`.
-
-Add `.gza/` to your `.gitignore` — it contains local state (database, logs) that shouldn't be committed:
+## 2. Set up your project
 
 ```bash
-echo ".gza/" >> .gitignore
+cd my-project
+gza init                    # writes gza.yaml
+echo ".gza/" >> .gitignore  # local state (db, logs) — don't commit
 ```
 
-## 4. Your first task
+Edit `gza.yaml` if needed: `use_docker: false` to run without Docker, `timeout_minutes`, `max_steps`. See [Configuration](configuration.md).
+
+## 3. Add tasks
+
+### Add with prompt as argument
 
 ```bash
-# Add a task
-gza add "Fix the login button not responding on mobile devices"
-# Created task gza-1: 20260108-fix-the-login-button (implement)
-
-# Run it
-gza work
+gza add "Fix login button on mobile"
+# ✓ Added task gza-1
 ```
 
-Write task prompts with explicit acceptance criteria when you want fewer review/improve iterations. A good implementation prompt usually includes:
-
-- The exact behavior to change
-- Non-goals or out-of-scope areas
-- The files or modules likely to be involved
-- Required tests or failure modes to cover
-- Any docs/help/config updates that must ship with the change
-
-Example:
+### Add with prompt from `$EDITOR`
 
 ```bash
-gza add "Fix the login button not responding on mobile devices.
-
-Acceptance criteria:
-- Taps on iOS Safari and Chrome Android submit the login form once.
-- Preserve current desktop behavior and loading-state UI.
-- Add a regression test covering the touch/click path.
-- Update any user-facing help or comments if the interaction contract changes.
-
-Non-goals:
-- Do not redesign the login form.
-- Do not touch password reset flows."
+gza add
 ```
 
-Gza creates a git branch, runs the AI agent in Docker, and commits the changes. When it finishes:
+omitting the prompt opens `$EDITOR`
+
+
+### Add with tag
+```bash
+gza add --tag v0.6.0
+```
+
+- Tags can be used by `gza queue` to list queued tasks, or in `gza watch` to query for tasks to implement.
+
+The most convenient way to add tasks is to install the skills:
 
 ```bash
-# See what was done
-gza log gza-1
-
-# Check the branch
-uv run gza unmerged
-#   gza-1 20260108-fix-the-login-button
-#      Branch: my-app/20260108-fix-the-login-button
-#      +42 -8 across 3 files
+gza skills-install
 ```
 
-## 5. Review and merge
+And then either run the `gza-task-add` skill in your LLM session, or just ask Claude/Codex conversationally to "add a GZA task"
 
-For a quick fix, merge directly:
+
+## 4. Run your tasks
+
+### Hands-on — one task at a time
 
 ```bash
-gza merge gza-1 --squash
+gza iterate gza-1 --max-iterations 3   # implement → review → improve, up to 3 rounds
+gza merge gza-1                         # merge once the review is clean
 ```
 
-For anything nontrivial, run a review first:
+### Async — a background loop
 
 ```bash
-# AI reviews the implementation
-gza review gza-1 --run
-# Created review task gza-2 — runs immediately
-
-# Read the review
-cat .gza/reviews/20260108-review-fix-the-login-button.md
+gza watch --tag v0.6.0 --batch 4 --poll 300
 ```
 
-If the review requests changes, improve and re-review:
+- Watch runs matching tasks in parallel, drives each through its lifecycle — implement → review → improve — and **auto-merges what passes review** (no `BLOCKER`).
+- Tune `--batch` (how many at once) and `--poll` (seconds between cycles); go wider when things are stable or the backlog is deep.
+
+## 5. Investigate stuck tasks
+
+Not everything completes cleanly — provider outages, stuck tests, and gza bugs all happen.
+
+Watch retries within limits, then flags what stalled. Inspect one with:
 
 ```bash
-# Address review feedback (continues on the same branch)
-# You can pass the implement, improve, or review task ID — gza auto-resolves to the root implementation.
-gza improve gza-1 --run
-
-# Review again
-gza review gza-1 --run
+gza log <task_id>
 ```
-
-When you're satisfied, merge or create a PR:
-
-```bash
-# Merge locally
-gza merge gza-1 --squash
-
-# Or create a GitHub PR
-gza pr gza-1
-```
-
-## 6. Scaling up
-
-The real power of gza is running many tasks in parallel.
-
-### Queue multiple tasks
-
-```bash
-gza add "Add input validation to the registration form"
-gza add "Refactor the payment module to use the new API"
-gza add "Add unit tests for the email service"
-```
-
-### Run them in parallel
-
-```bash
-# Run 3 tasks simultaneously in background
-gza work --background --count 3
-gza work --background --count 3
-gza work --background --count 3
-
-# Watch progress
-gza ps
-```
-
-### Let gza manage the lifecycle
-
-The `advance` command handles the full lifecycle automatically — creating reviews, running improvements, and merging approved work:
-
-```bash
-# Preview what advance would do
-gza advance --dry-run
-
-# Execute: run up to 3 workers, auto-review, auto-merge
-gza advance --auto --batch 3
-```
-
-### Automate iterate loops
-
-For a single implementation, `--max-iterations` counts full iteration pairs. One iteration is one code-change task (implement or improve) plus its review:
-
-```bash
-gza iterate gza-1 --max-iterations 3
-```
-
-## Next steps
-
-- [Simple Task](examples/simple-task.md) — complete walkthrough of a single task
-- [Plan → Implement → Review](examples/plan-implement-review.md) — multi-phase workflow for larger features
-- [Parallel Workers](examples/parallel-workers.md) — running tasks concurrently
-- [Configuration Reference](configuration.md) — all commands, options, and settings

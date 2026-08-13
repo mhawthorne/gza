@@ -41,7 +41,7 @@ Gza reads configuration from three YAML layers:
 | `max_turns` | Integer | `50` | Legacy alias for `max_steps` |
 | `worktree_dir` | String | `/tmp/gza-worktrees` | Directory for git worktrees |
 | `work_count` | Integer | `1` | Number of tasks to run in a single work session |
-| `provider` | String | `claude` | AI provider: `claude`, `codex`, or `gemini` |
+| `provider` | String | `claude` | AI provider: `claude` or `codex` |
 | `task_providers` | Dict | `{}` | Route task types to providers (e.g., `review: claude`) |
 | `providers` | Dict | `{}` | Provider-scoped model/task-type config (preferred) |
 | `model` | String | *(empty)* | Default model fallback (compatible) |
@@ -136,7 +136,7 @@ db_path: ~/.gza/gza.db
 `GZA_DB_PATH` is the supported environment override for the task database path. This is useful for one-off runs against a shared DB:
 
 ```bash
-GZA_DB_PATH=~/.gza/gza.db uv run gza next
+GZA_DB_PATH=~/.gza/gza.db gza next
 ```
 
 Example:
@@ -367,7 +367,7 @@ claude:
 
 ### Tmux Sessions
 
-Tmux behavior is provider-specific. By default, Claude background workers run in pipe mode (no tmux proxy), while Codex/Gemini can run in tmux when enabled. Claude interactive attach still uses tmux for kill/resume handoff sessions. Set `GZA_ENABLE_TMUX_PROXY=1` to force legacy Claude tmux proxy mode. See [Tmux Sessions](tmux.md) for full details.
+Tmux behavior is provider-specific. By default, Claude background workers run in pipe mode (no tmux proxy), while Codex can run in tmux when enabled. Claude interactive attach still uses tmux for kill/resume handoff sessions. Set `GZA_ENABLE_TMUX_PROXY=1` to force legacy Claude tmux proxy mode. See [Tmux Sessions](tmux.md) for full details.
 
 ```yaml
 tmux:
@@ -519,7 +519,6 @@ Gza supports multiple AI providers for task execution:
 |----------|--------|-------------|
 | `claude` | **Supported** | Claude Code CLI (default) |
 | `codex` | **Supported** | OpenAI Codex CLI |
-| `gemini` | *Experimental* | Gemini CLI - partially implemented |
 
 Set your provider in `gza.yaml`:
 
@@ -553,15 +552,6 @@ Claude supports two authentication methods:
 Codex authentication priority:
 1. OAuth (`~/.codex/auth.json`) - preferred, uses ChatGPT pricing
 2. `CODEX_API_KEY` - fallback, uses standard OpenAI API pricing
-
-**Gemini:**
-
-| Variable | Description |
-|----------|-------------|
-| `GEMINI_API_KEY` | Primary API key for Gemini |
-| `GOOGLE_API_KEY` | Alternative API key (Vertex AI) |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Path to service account JSON file |
-| `GEMINI_SHELL_ENABLED` | Enable shell commands (`true`) |
 
 ---
 
@@ -630,9 +620,9 @@ gza work [task_id...] [options]
 | `--tag TAG` | Only pick pending tasks matching tag filters when no task IDs are specified (repeatable) |
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 
-`uv run gza work` starts pending tasks only. It does not run failed-task recovery (`resume` / `retry` / manual-review parking) and it does not progress review/rebase/merge lifecycle work for already-started lineages. If recovery candidates exist, `work` leaves them untouched and starts from the pending lane anyway.
+`gza work` starts pending tasks only. It does not run failed-task recovery (`resume` / `retry` / manual-review parking) and it does not progress review/rebase/merge lifecycle work for already-started lineages. If recovery candidates exist, `work` leaves them untouched and starts from the pending lane anyway.
 
-When `uv run gza work --background` starts a detached worker that then exits before the task actually begins running, the startup refusal is mirrored into the task log path (or startup fallback) so `uv run gza log <task-id>` surfaces the reason instead of leaving a silent 0-byte log.
+When `gza work --background` starts a detached worker that then exits before the task actually begins running, the startup refusal is mirrored into the task log path (or startup fallback) so `gza log <task-id>` surfaces the reason instead of leaving a silent 0-byte log.
 
 ### work / advance / watch operating surface
 
@@ -640,14 +630,14 @@ Use this matrix when deciding "what will this command actually touch?"
 
 | Command | Starts new pending tasks? | Runs failed-task recovery? | Runs review / merge lifecycle? | Continuous loop? |
 |--------|----------------------------|----------------------------|--------------------------------|------------------|
-| `uv run gza work` | Yes. Pending lane only. | No. | No. | No. |
-| `uv run gza advance` | No by default. Yes with `--new` after lifecycle/recovery planning. | Yes. Shared bounded `resume` / `retry` / manual-review decisions. | Yes. Review, improve, rebase, merge, held-plan follow-up, and related lifecycle work. | No. |
-| `uv run gza watch` | Yes. Maintains the configured batch from the pending lane. | Yes. Uses the same bounded recovery policy as `advance`. | Yes. Reuses the same lifecycle planner and follow-on actions. | Yes. |
+| `gza work` | Yes. Pending lane only. | No. | No. | No. |
+| `gza advance` | No by default. Yes with `--new` after lifecycle/recovery planning. | Yes. Shared bounded `resume` / `retry` / manual-review decisions. | Yes. Review, improve, rebase, merge, held-plan follow-up, and related lifecycle work. | No. |
+| `gza watch` | Yes. Maintains the configured batch from the pending lane. | Yes. Uses the same bounded recovery policy as `advance`. | Yes. Reuses the same lifecycle planner and follow-on actions. | Yes. |
 
 Two operator-facing queue surfaces show these sets separately:
 
-- `uv run gza next` shows recovery, lifecycle actions, and pending as distinct sections.
-- `uv run gza queue` shows the shared dispatch preview by default; use `--pending` for the pending-only view, `--recovery` for recovery-only, or `--recovery-first` to limit pending rows to explicit queue positions.
+- `gza next` shows recovery, lifecycle actions, and pending as distinct sections.
+- `gza queue` shows the shared dispatch preview by default; use `--pending` for the pending-only view, `--recovery` for recovery-only, or `--recovery-first` to limit pending rows to explicit queue positions.
 - Recovery lane entries belong to `advance` / `watch`, not `work`.
 - Lifecycle-action entries belong to `advance` / `watch`, not `work`.
 - Pending lane entries belong to `work` / `watch`.
@@ -678,14 +668,14 @@ gza add [prompt] [options]
 | `--review-scope TEXT` | For direct implement tasks, set the authoritative gradeable review boundary |
 | `--prompt-file FILE` | Read prompt from file (for non-interactive use) |
 | `--model MODEL` | Override model for this task (e.g., `claude-3-5-haiku-latest`) |
-| `--provider PROVIDER` | Override provider for this task (`claude`, `codex`, or `gemini`) |
+| `--provider PROVIDER` | Override provider for this task (`claude` or `codex`) |
 | `--no-learnings` | Skip injecting `.gza/learnings.md` context into this task's prompt |
 | `--next` | Mark the new task urgent and bump it to the front of the urgent lane (same as add + queue bump) |
 
 Held completed plans are not valid sources for pre-created implement children. If `--type implement`
 uses `--depends-on <plan-id>` and that plan is held for review, or `--based-on` points into a lineage
 rooted at a held plan, `gza add` fails and tells you to release the plan first with
-`uv run gza implement <plan-id>` or `uv run gza edit <plan-id> --no-hold-for-review`.
+`gza implement <plan-id>` or `gza edit <plan-id> --no-hold-for-review`.
 
 ### edit
 
@@ -809,7 +799,7 @@ gza pr <task_id> [options]
 
 `gza pr` reuses an open PR when the branch already has one. If the most recent associated PR is closed or merged while the branch is still unmerged, `gza pr` creates a new PR and updates the cached `pr_number`.
 
-`gza pr` does not reconcile or close stale GitHub PRs after manual or squash merges outside GitHub. Run `uv run gza sync` after those merges to refresh cached PR state and close stale open PRs only when `origin/<default-branch>` proves the branch changes already landed.
+`gza pr` does not reconcile or close stale GitHub PRs after manual or squash merges outside GitHub. Run `gza sync` after those merges to refresh cached PR state and close stale open PRs only when `origin/<default-branch>` proves the branch changes already landed.
 
 ### delete
 
@@ -827,7 +817,7 @@ gza delete <task_id> [options]
 
 ### attach
 
-Attach to a running task. Claude uses an interactive kill/resume handoff session; Codex/Gemini attach read-only. See [Tmux Sessions](tmux.md) for details.
+Attach to a running task. Claude uses an interactive kill/resume handoff session; Codex attaches read-only. See [Tmux Sessions](tmux.md) for details.
 
 ```bash
 gza attach <worker_id_or_task_id>
@@ -1233,14 +1223,14 @@ gza merge <task_id> [task_id...] [options]
 | `--no-followups` | Skip materializing review FOLLOWUP tasks after a successful merge or mark-only |
 | `--resolve` | Auto-resolve conflicts using AI when rebasing (requires --rebase) |
 
-`gza merge` only performs the local git merge/rebase path and updates local merge state. Merge units are the canonical persisted merge-truth model; compatibility task-row `merge_status` is dual-written from the selected unit during the migration window. Task selectors resolve through merge-unit membership first, so `uv run gza merge <review-task-id>` and same-branch follow-up task IDs merge the shared implementation branch/unit they belong to. Successful merges and `--mark-only` now also materialize review FOLLOWUP findings into implement tasks by default, reusing existing deterministic follow-up tasks when they were already created by `advance`, `watch`, or `iterate`; pass `--no-followups` to skip that step. `--force` is the manual break-glass path for lifecycle parked merge gates such as malformed resolution-review metadata: it still requires a clean git merge and it still refuses open review `BLOCKER` findings unless the operator also passes `--defer-blockers`. Merged units also persist a `merge_source` provenance label (`manual` for ordinary merges, `manual_force` when `--force` actually overrides a parked lifecycle gate). `gza merge` does not reconcile GitHub PR state. After merge, run `uv run gza sync` to refresh cached PR metadata and close any stale still-open PRs when remote default-branch state proves the changes already landed.
+`gza merge` only performs the local git merge/rebase path and updates local merge state. Merge units are the canonical persisted merge-truth model; compatibility task-row `merge_status` is dual-written from the selected unit during the migration window. Task selectors resolve through merge-unit membership first, so `gza merge <review-task-id>` and same-branch follow-up task IDs merge the shared implementation branch/unit they belong to. Successful merges and `--mark-only` now also materialize review FOLLOWUP findings into implement tasks by default, reusing existing deterministic follow-up tasks when they were already created by `advance`, `watch`, or `iterate`; pass `--no-followups` to skip that step. `--force` is the manual break-glass path for lifecycle parked merge gates such as malformed resolution-review metadata: it still requires a clean git merge and it still refuses open review `BLOCKER` findings unless the operator also passes `--defer-blockers`. Merged units also persist a `merge_source` provenance label (`manual` for ordinary merges, `manual_force` when `--force` actually overrides a parked lifecycle gate). `gza merge` does not reconcile GitHub PR state. After merge, run `gza sync` to refresh cached PR metadata and close any stale still-open PRs when remote default-branch state proves the changes already landed.
 
 ### merged
 
 List merged merge units, optionally filtered by merge-source provenance and merge time.
 
 ```bash
-uv run gza merged [options]
+gza merged [options]
 ```
 
 | Option | Description |
@@ -1253,17 +1243,17 @@ uv run gza merged [options]
 | `--fields CSV` | Projection field override (for example `merge_unit_id,merge_source,branch`) |
 | `--list-fields` | List valid `--fields` values for this command and exit |
 
-`uv run gza merged` is the audit surface for persisted merge provenance. It reads canonical merge-unit state and renders merged units newest-first, with default columns for unit ID, owner task, source, merge timestamp, and source branch. By default, plain `uv run gza merged` shows only units merged in the last 1 day. Pass `--all` to see full history, or use explicit `--last-days` / `--since` filters to request a different window. Use it to answer questions like `uv run gza merged --source manual --last-days 7`.
+`gza merged` is the audit surface for persisted merge provenance. It reads canonical merge-unit state and renders merged units newest-first, with default columns for unit ID, owner task, source, merge timestamp, and source branch. By default, plain `gza merged` shows only units merged in the last 1 day. Pass `--all` to see full history, or use explicit `--last-days` / `--since` filters to request a different window. Use it to answer questions like `gza merged --source manual --last-days 7`.
 
 ### lineage
 
 Show a task's lineage from the selected task outward.
 
 ```bash
-uv run gza lineage <task_id> [--full | --parents-only | --children-only]
+gza lineage <task_id> [--full | --parents-only | --children-only]
 ```
 
-By default, `uv run gza lineage <task_id>` keeps the existing children-focused view: it renders the selected task and its descendants. When the selected task has immediate parents, the default output also prints a short parent hint so resume/retry or dependency ancestry is visible without switching modes.
+By default, `gza lineage <task_id>` keeps the existing children-focused view: it renders the selected task and its descendants. When the selected task has immediate parents, the default output also prints a short parent hint so resume/retry or dependency ancestry is visible without switching modes.
 
 | Option | Description |
 |--------|-------------|
@@ -1277,7 +1267,7 @@ By default, `uv run gza lineage <task_id>` keeps the existing children-focused v
 List tasks with merge units that have not been merged to the default branch.
 
 ```bash
-uv run gza unmerged [options]
+gza unmerged [options]
 ```
 
 | Option | Description |
@@ -1290,19 +1280,19 @@ uv run gza unmerged [options]
 | `--fields CSV` | Projection field override (for example `id,prompt`). In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
 | `--list-fields` | List valid `--fields` values for this command and exit |
 
-`uv run gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills merge units when needed, refreshes canonical branch-cohort merge truth from local git, persists merge-unit state and diff stats for the real default target branch, dual-writes compatibility task merge fields, and then prints the reconciled default-branch unmerged list. Same-branch improve/fix/rebase/review follow-ups may validly keep `merge_status = NULL` because the owning implementation row carries the shared branch merge truth while all related rows remain attached to the same merge unit.
+`gza unmerged` is the daily merge-truth command. In the default-branch view, it opens the task store read/write, backfills merge units when needed, refreshes canonical branch-cohort merge truth from local git, persists merge-unit state and diff stats for the real default target branch, dual-writes compatibility task merge fields, and then prints the reconciled default-branch unmerged list. Same-branch improve/fix/rebase/review follow-ups may validly keep `merge_status = NULL` because the owning implementation row carries the shared branch merge truth while all related rows remain attached to the same merge unit.
 
-This is the deliberate narrow exception to the usual read-only query convention: only plain default-branch `uv run gza unmerged` mutates, because its entire purpose is to answer the canonical question "what still needs to be merged?" without leaving stale cached rows behind.
+This is the deliberate narrow exception to the usual read-only query convention: only plain default-branch `gza unmerged` mutates, because its entire purpose is to answer the canonical question "what still needs to be merged?" without leaving stale cached rows behind.
 
-By default, plain `uv run gza unmerged` does not initiate network I/O and relies on local branch state for merge proof. Pass `--fetch` when a host-side sync flow also needs refreshed remote-tracking refs for publication or PR metadata work.
+By default, plain `gza unmerged` does not initiate network I/O and relies on local branch state for merge proof. Pass `--fetch` when a host-side sync flow also needs refreshed remote-tracking refs for publication or PR metadata work.
 
 Deleted local feature branches are not treated as merge proof by themselves. Canonical reconciliation keeps them unmerged and visible until a local proof path or separate publication/PR evidence confirms the work landed; remote-tracking refs are not persisted as merge proof.
 
-If the canonical default-branch refresh cannot persist because the database is read-only, `uv run gza unmerged` fails with a targeted error instead of silently falling back to stale split-brain behavior.
+If the canonical default-branch refresh cannot persist because the database is read-only, `gza unmerged` fails with a targeted error instead of silently falling back to stale split-brain behavior.
 
-With `--into-current` or `--target`, `uv run gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged. If a live branch comparison or diff-stat refresh fails for any branch, the command exits non-zero and does not print a potentially stale unmerged list from fallback state.
+With `--into-current` or `--target`, `gza unmerged` always does ad hoc live git comparisons and leaves the database unchanged. If a live branch comparison or diff-stat refresh fails for any branch, the command exits non-zero and does not print a potentially stale unmerged list from fallback state.
 
-`uv run gza unmerged` now builds an unmerged-specific query preset and then renders that result through the shared query projection/presentation path. The default text view is the slim operator-focused summary. Any explicit `--fields` switches to the generic projection renderer in either text or JSON mode, so `uv run gza unmerged --fields id` prints bare IDs and `uv run gza unmerged --json --fields id,prompt,merge_unit_id,merge_unit_state,source_branch,target_branch` returns structured rows that expose both task and merge-unit context.
+`gza unmerged` now builds an unmerged-specific query preset and then renders that result through the shared query projection/presentation path. The default text view is the slim operator-focused summary. Any explicit `--fields` switches to the generic projection renderer in either text or JSON mode, so `gza unmerged --fields id` prints bare IDs and `gza unmerged --json --fields id,prompt,merge_unit_id,merge_unit_state,source_branch,target_branch` returns structured rows that expose both task and merge-unit context.
 
 During execution, the command logs concise progress for the refresh, query, and render phases. Those lines include counts for how many candidate tasks are being refreshed, how many task rows the query scans, and how many filtered rows are rendered.
 
@@ -1321,7 +1311,7 @@ For each unmerged implementation in the default text view, output includes:
 Report or drop stale never-merged merge units whose attached tasks are terminal, old, and not linked by live dependency edges.
 
 ```bash
-uv run gza stale-unmerged [options]
+gza stale-unmerged [options]
 ```
 
 | Option | Description |
@@ -1330,7 +1320,7 @@ uv run gza stale-unmerged [options]
 | `--execute` | Apply the drops instead of only reporting candidates |
 | `--json` | Output structured JSON rows; when combined with `--execute`, each row includes the applied drops |
 
-`uv run gza stale-unmerged` is intentionally conservative. It only considers active merge units still recorded as `unmerged`, `blocked`, or `stale`, then re-checks those candidates against the canonical default target using the same local merge-truth proof semantics as plain `uv run gza unmerged`. Any candidate proven terminal there (`merged`, `empty`, or `redundant`) is excluded instead of being reported or dropped, and any proof error aborts the command before mutation. The sweep also skips anything with attached `pending` or `in_progress` work, and skips units whose external dependency edges still point to live unresolved lineages. Historical edges to already resolved external work, for example a prerequisite or dependent whose merge unit is already `merged`, do not keep a stale unit visible on their own. Dry-run is the default so operators can audit what would be dropped before mutating task state. `--execute` drops only the attached task rows via the same manual drop path used by `uv run gza set-status <id> dropped`; it never deletes branches. JSON mode does not downgrade execution: `uv run gza stale-unmerged --execute --json` applies the drops first and then emits rows with both the candidate `drop_task_ids` and the `applied_drop_task_ids` actually mutated.
+`gza stale-unmerged` is intentionally conservative. It only considers active merge units still recorded as `unmerged`, `blocked`, or `stale`, then re-checks those candidates against the canonical default target using the same local merge-truth proof semantics as plain `gza unmerged`. Any candidate proven terminal there (`merged`, `empty`, or `redundant`) is excluded instead of being reported or dropped, and any proof error aborts the command before mutation. The sweep also skips anything with attached `pending` or `in_progress` work, and skips units whose external dependency edges still point to live unresolved lineages. Historical edges to already resolved external work, for example a prerequisite or dependent whose merge unit is already `merged`, do not keep a stale unit visible on their own. Dry-run is the default so operators can audit what would be dropped before mutating task state. `--execute` drops only the attached task rows via the same manual drop path used by `gza set-status <id> dropped`; it never deletes branches. JSON mode does not downgrade execution: `gza stale-unmerged --execute --json` applies the drops first and then emits rows with both the candidate `drop_task_ids` and the `applied_drop_task_ids` actually mutated.
 
 ### history
 
@@ -1392,9 +1382,9 @@ gza incomplete [options]
 
 Use `gza incomplete` for unresolved lineage triage. Use the more specific command surfaces when you want one domain only:
 
-Projected `next_action` values come from the shared live lifecycle planner. Cleanly mergeable branches continue to the normal review or merge actions even when they are behind the target branch. Completed held plan tasks surface `awaiting_human` until you run `uv run gza implement <plan-id>` or `uv run gza edit <plan-id> --no-hold-for-review` (preferred; `--auto-implement` also works). Those held-plan rows now carry `reason=awaiting-human-review`. If an approved plan review has partial implement descendants and the durable materialization record is missing, incomplete, or already complete while stale extra pending duplicate slice descendants remain outside the recorded set, lifecycle now first attempts deterministic repair when the current partial slice set is a proven safe pending subset of the validated manifest, and only parks with `reason=plan-review-materialization-repair-needed` when that state is ambiguous or unsafe. Needs-attention rows now carry an explicit subject task, so `gza incomplete` roots attention rows at the plan/explore/implementation the operator should inspect instead of inferring that identity from lineage ownership alone. If older or malformed action data is missing that subject, the shared resolver falls back conservatively and emits a warning instead of silently re-inferring identity.
+Projected `next_action` values come from the shared live lifecycle planner. Cleanly mergeable branches continue to the normal review or merge actions even when they are behind the target branch. Completed held plan tasks surface `awaiting_human` until you run `gza implement <plan-id>` or `gza edit <plan-id> --no-hold-for-review` (preferred; `--auto-implement` also works). Those held-plan rows now carry `reason=awaiting-human-review`. If an approved plan review has partial implement descendants and the durable materialization record is missing, incomplete, or already complete while stale extra pending duplicate slice descendants remain outside the recorded set, lifecycle now first attempts deterministic repair when the current partial slice set is a proven safe pending subset of the validated manifest, and only parks with `reason=plan-review-materialization-repair-needed` when that state is ambiguous or unsafe. Needs-attention rows now carry an explicit subject task, so `gza incomplete` roots attention rows at the plan/explore/implementation the operator should inspect instead of inferring that identity from lineage ownership alone. If older or malformed action data is missing that subject, the shared resolver falls back conservatively and emits a warning instead of silently re-inferring identity.
 
-`uv run gza incomplete --list-fields` prints the unresolved-lineage projection set. `uv run gza incomplete --blocked-by-dropped --list-fields` prints the blocked-dropped task projection set.
+`gza incomplete --list-fields` prints the unresolved-lineage projection set. `gza incomplete --blocked-by-dropped --list-fields` prints the blocked-dropped task projection set.
 
 The explicit `verify_*` projection fields have the same meanings here as in `history`: they surface the latest canonical owner verify evidence when available, otherwise the latest legacy review fallback, with `verify_current=false` when freshness cannot be proven for the current epoch.
 
@@ -1402,10 +1392,10 @@ Default text output stays to one wrapped line per lineage: the owner prompt is r
 
 | Need | Command |
 |--------|-------------|
-| Unmerged code work | `uv run gza unmerged` |
-| Completed `plan`/`explore` work without implementation | `uv run gza advance --unimplemented` |
-| Failed-task history | `uv run gza history --status failed` |
-| Pending queue state | `uv run gza next` or `uv run gza next --all` |
+| Unmerged code work | `gza unmerged` |
+| Completed `plan`/`explore` work without implementation | `gza advance --unimplemented` |
+| Failed-task history | `gza history --status failed` |
+| Pending queue state | `gza next` or `gza next --all` |
 | Synthesized next-step guidance | `/gza-summary` |
 
 ### search
@@ -1492,10 +1482,10 @@ gza rebase <task_id> [options]
 
 Bare `gza rebase <task_id>` creates a pending `rebase` child task. Use `--run` to execute that task-backed rebase in the foreground or `--background` to detach a worker.
 
-When `--resolve` is used, gza runs the active task provider (`claude`, `codex`, or `gemini`) and sends the `/gza-rebase --auto` prompt. If the `gza-rebase` skill is missing for that runtime, gza fails fast with an install command such as:
+When `--resolve` is used, gza runs the active task provider (`claude` or `codex`) and sends the `/gza-rebase --auto` prompt. If the `gza-rebase` skill is missing for that runtime, gza fails fast with an install command such as:
 
 ```bash
-uv run gza skills-install --target codex gza-rebase --project /path/to/project
+gza skills-install --target codex gza-rebase --project /path/to/project
 ```
 
 ### clean
@@ -1630,9 +1620,9 @@ gza next [options]
 
 `gza next` now renders three distinct sections:
 
-- Recovery lane: visible failed-task recovery and manual-attention lineages that `uv run gza advance` / `uv run gza watch` act on ahead of ordinary pending pickup.
-- Lifecycle actions: actionable review/rebase/merge/materialization work that `uv run gza advance` / `uv run gza watch` would run ahead of pending pickup.
-- Pending lane: pending tasks that `uv run gza work` / `uv run gza watch` can start, with blocked dependencies separated as before.
+- Recovery lane: visible failed-task recovery and manual-attention lineages that `gza advance` / `gza watch` act on ahead of ordinary pending pickup.
+- Lifecycle actions: actionable review/rebase/merge/materialization work that `gza advance` / `gza watch` would run ahead of pending pickup.
+- Pending lane: pending tasks that `gza work` / `gza watch` can start, with blocked dependencies separated as before.
 
 Use `--tag TAG` (repeatable) to scope all three sections to matching tags. Repeated tags use
 any-tag matching by default; add `--all-tags` to require every requested tag.
@@ -1654,7 +1644,7 @@ gza queue clear <task_id>
 |--------|-------------|
 | `task_id` | Full prefixed task ID to reorder (for example `gza-1234`) |
 | `position` | 1-based explicit queue position for `queue move` |
-| `--tag TAG` | Only preview dispatch rows matching tag filters (repeatable; the pending lane uses the same scoped pickup order as `uv run gza watch --tag TAG`; use `--pending` for the pending-only view, or `--recovery-first` to limit pending display to explicitly positioned tasks) |
+| `--tag TAG` | Only preview dispatch rows matching tag filters (repeatable; the pending lane uses the same scoped pickup order as `gza watch --tag TAG`; use `--pending` for the pending-only view, or `--recovery-first` to limit pending display to explicitly positioned tasks) |
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 | `--pending` | Show only the pending lane preview |
 | `--recovery` | Show the recovery-only dispatch preview (alias for `--recovery-only`) |
@@ -1675,15 +1665,15 @@ Those commands fail closed when the target task does not match the provided tag 
 When no tag scope is provided, queue-position edits keep existing exact tag-set bucket behavior.
 By default, `gza queue` renders the shared dispatch preview:
 
-- Runnable recovery lane, showing failed-task recovery rows that `uv run gza advance` / `uv run gza watch` can run automatically.
-- Lifecycle actions, showing actionable review/rebase/merge/materialization work that belong to `uv run gza advance` / `uv run gza watch`.
-- Pending lane, showing the actual queue ordering that `uv run gza work` / `uv run gza watch` use for new pending starts.
+- Runnable recovery lane, showing failed-task recovery rows that `gza advance` / `gza watch` can run automatically.
+- Lifecycle actions, showing actionable review/rebase/merge/materialization work that belong to `gza advance` / `gza watch`.
+- Pending lane, showing the actual queue ordering that `gza work` / `gza watch` use for new pending starts.
 - Needs-human recovery rows, shown separately so they never consume the runnable preview cap.
 
 Use `--pending` for the git-free pending-only view, `--recovery` for recovery-only, or `--recovery-first` when you want recovery plus only explicitly positioned pending tasks.
 Within the pending lane, runnable pending tasks appear first and pending tasks blocked by unsatisfied direct dependencies appear in their own blocked section. Internal tasks remain excluded.
 By default, `gza queue` shows the first 10 runnable dispatch rows in shared preview order, while blocked pending rows and needs-human recovery rows always remain visible. Use `-n 0`, `-n -1`, or `--all` to show all runnable rows too.
-To treat a tag as a release slice, assign tasks with `uv run gza add --tag release-1.2 ...` and inspect them with `uv run gza queue --tag release-1.2`. That command is the canonical preview for what `uv run gza watch --tag release-1.2` will consider and in what order across recovery and pending lanes. Add `--pending` when you want the matching pending pickup order only, or `--recovery-first` when you want recovery plus only explicitly positioned pending tasks.
+To treat a tag as a release slice, assign tasks with `gza add --tag release-1.2 ...` and inspect them with `gza queue --tag release-1.2`. That command is the canonical preview for what `gza watch --tag release-1.2` will consider and in what order across recovery and pending lanes. Add `--pending` when you want the matching pending pickup order only, or `--recovery-first` when you want recovery plus only explicitly positioned pending tasks.
 Internally, queue-style task listing is routed through the unified task query layer so queue, next, and API consumers can share the same filter/order semantics.
 
 ### implement
@@ -1724,8 +1714,8 @@ gza implement <plan_task_id> [prompt] [options]
 | `--max-turns N` | Override max_turns setting for this run |
 | `--force` | Compatibility flag; dependency-blocked tasks still will not run |
 
-When `uv run gza implement <plan-id>` is used to approve a held completed plan, it also clears that plan's hold so the completed plan no longer remains in `uv run gza incomplete`.
-Using `uv run gza edit <plan-id> --no-hold-for-review` also clears the hold, but that path releases the completed plan back into the automated `plan_review` lifecycle rather than directly creating implementation work.
+When `gza implement <plan-id>` is used to approve a held completed plan, it also clears that plan's hold so the completed plan no longer remains in `gza incomplete`.
+Using `gza edit <plan-id> --no-hold-for-review` also clears the hold, but that path releases the completed plan back into the automated `plan_review` lifecycle rather than directly creating implementation work.
 This explicit release step is mandatory: pre-creating an `implement` task behind a held plan via `gza add --type implement --depends-on <plan-id>` or a `--based-on` lineage rooted at that held plan is rejected instead of leaving a blocked child behind.
 
 ### plan-review
@@ -1825,7 +1815,7 @@ At run time, branch/task-based extracted tasks re-derive their selected patch fr
 Intelligently progress unmerged tasks through their lifecycle. Handles review creation, improve tasks, merging, and shared automatic failed-task recovery (resume/retry).
 
 ```bash
-uv run gza advance [task_id] [options]
+gza advance [task_id] [options]
 ```
 
 | Option | Description |
@@ -1845,29 +1835,29 @@ uv run gza advance [task_id] [options]
 | `--new` | Start new pending tasks to fill remaining `--batch` slots (requires `--batch`) |
 | `--type TYPE` | Only advance tasks of this type (`plan` or `implement`) |
 | `--squash-threshold N` | Squash-merge branches with N or more commits (0 disables) |
-| `--tag TAG` | Only advance, recover, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG` to preview the shared scoped recovery subset |
+| `--tag TAG` | Only advance, recover, and start tasks matching tag filters (repeatable); use `gza queue --tag TAG` to preview the shared scoped recovery subset |
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 | `--any-tag` | With repeated `--tag` values, match any requested tag explicitly (default) |
 
-`uv run gza advance` is the explicit non-looping lifecycle command. It evaluates recovery and existing lineage lifecycle work first. It does not start fresh pending work unless you opt into `--new`, and when `--new` is present the pending lane only fills whatever `--batch` capacity remains after recovery/lifecycle actions.
+`gza advance` is the explicit non-looping lifecycle command. It evaluates recovery and existing lineage lifecycle work first. It does not start fresh pending work unless you opt into `--new`, and when `--new` is present the pending lane only fills whatever `--batch` capacity remains after recovery/lifecycle actions.
 
 `--unimplemented` stays restricted to `plan` and `explore` lineages and only lists completed
 source rows that still need an implementation path. Completed `explore` roots with an active
 pending or in-progress `plan`/`implement` descendant are intentionally suppressed here; find that
-queued follow-up work through `uv run gza next`, `uv run gza next --all`, or other queue surfaces.
+queued follow-up work through `gza next`, `gza next --all`, or other queue surfaces.
 It never shows `implement` tasks directly.
-Only completed plan rows are directly runnable with `uv run gza implement <id>`; use `uv run gza advance --unimplemented --create` to queue implement tasks
+Only completed plan rows are directly runnable with `gza implement <id>`; use `gza advance --unimplemented --create` to queue implement tasks
 for listed explore rows.
 
-When the shared advance/recovery engine decides a task must be skipped for human intervention, `uv run gza advance` prints a dedicated `Needs attention` section. Each entry includes the task id, task type, short prompt, a stable `reason=...` policy slug, and the underlying skip text. This section is shown in the normal pre-confirmation preview and in `--dry-run` output, including when there is otherwise no actionable work to advance.
-Held completed plans use `next_action = awaiting_human` with `reason=awaiting-human-review`, plus guidance to review the plan and then either run `uv run gza implement <plan-id>` for a one-off approval or `uv run gza edit <plan-id> --no-hold-for-review` to restore the normal automatic follow-up path (`--auto-implement` remains a compatibility alias).
+When the shared advance/recovery engine decides a task must be skipped for human intervention, `gza advance` prints a dedicated `Needs attention` section. Each entry includes the task id, task type, short prompt, a stable `reason=...` policy slug, and the underlying skip text. This section is shown in the normal pre-confirmation preview and in `--dry-run` output, including when there is otherwise no actionable work to advance.
+Held completed plans use `next_action = awaiting_human` with `reason=awaiting-human-review`, plus guidance to review the plan and then either run `gza implement <plan-id>` for a one-off approval or `gza edit <plan-id> --no-hold-for-review` to restore the normal automatic follow-up path (`--auto-implement` remains a compatibility alias).
 
 ### unstick
 
 Manually clear currently parked owner state for eligible backstop, retry-limit, or reconcile rows. Optionally dispatch the cleared owners through the shared scoped watch path.
 
 ```bash
-uv run gza unstick [task_id ...] [options]
+gza unstick [task_id ...] [options]
 ```
 
 | Option | Description |
@@ -1880,11 +1870,11 @@ uv run gza unstick [task_id ...] [options]
 | `--run` | After clearing parked state, dispatch only the cleared owners through the shared scoped watch path |
 | `--limit N` | Cap new worker-consuming starts for `--run` (default: `max_concurrent`; actual starts still respect live worker capacity and shared permits) |
 
-`uv run gza unstick` requires at least one explicit selector: one or more `task_id` arguments, `--tag`, `--reason backstop|retry-limit|reconcile`, or `--all`. Combinations narrow the selected parked-owner set: explicit IDs define the starting set, then tag and reason filters further restrict it.
+`gza unstick` requires at least one explicit selector: one or more `task_id` arguments, `--tag`, `--reason backstop|retry-limit|reconcile`, or `--all`. Combinations narrow the selected parked-owner set: explicit IDs define the starting set, then tag and reason filters further restrict it.
 
-Plain `uv run gza unstick` remains the clear-only / no-worker operator command. It clears the shared parked-state exclusion for the selected owner and exits; it does not spawn `watch` or own a second executor. With `--run`, the command still clears first, then reuses the same scoped watch dispatch helper, live slot ceiling, `max_concurrent`, and launch-permit rules that `uv run gza watch` already uses. `--limit N` caps new worker-consuming starts in that scoped pass; existing live workers still count against the shared ceiling first.
+Plain `gza unstick` remains the clear-only / no-worker operator command. It clears the shared parked-state exclusion for the selected owner and exits; it does not spawn `watch` or own a second executor. With `--run`, the command still clears first, then reuses the same scoped watch dispatch helper, live slot ceiling, `max_concurrent`, and launch-permit rules that `gza watch` already uses. `--limit N` caps new worker-consuming starts in that scoped pass; existing live workers still count against the shared ceiling first.
 
-`uv run gza unstick --run` reports three post-clear outcomes for the owners it successfully re-armed:
+`gza unstick --run` reports three post-clear outcomes for the owners it successfully re-armed:
 - `started` — shared dispatch actually launched worker-consuming follow-up work
 - `cleared-only` — the owner was cleared but either only direct shared lifecycle work ran or no worker-consuming action was started in that scoped pass
 - `capacity-blocked` — the next shared worker-consuming action was eligible, but no shared watch worker slots were available
@@ -1893,7 +1883,7 @@ If no shared worker slots are available, `unstick --run` still clears the parked
 
 `backstop` maps to `watch-no-progress-backstop`. `retry-limit` maps to `retry-limit-reached`. `reconcile` maps to `reconcile-needs-manual-resolution`. For all supported reason classes, `unstick` reuses the same landed/moot guardrails before clearing. Rows already proved `merged`, or already terminal as `empty` / `redundant`, are reported as skips instead of being re-armed.
 
-For `retry-limit`, a fresh `retry-limit` clear records one durable manual rearm epoch keyed by the parked subject and reason. Shared failed-task recovery then evaluates automatic retry budget relative to that latest epoch instead of lifetime descendant history, so historical failed recovery rows remain auditable. Re-running `uv run gza unstick` after the owner is no longer currently parked is a safe no-op that reports `not currently parked` instead of creating another effective reset.
+For `retry-limit`, a fresh `retry-limit` clear records one durable manual rearm epoch keyed by the parked subject and reason. Shared failed-task recovery then evaluates automatic retry budget relative to that latest epoch instead of lifetime descendant history, so historical failed recovery rows remain auditable. Re-running `gza unstick` after the owner is no longer currently parked is a safe no-op that reports `not currently parked` instead of creating another effective reset.
 
 `unstick` also reports selector-visible skips when an owner is not currently parked or when merge proof cannot show the branch is still unresolved. Current operator-visible skip reasons include:
 - `already merged`
@@ -1907,16 +1897,16 @@ For `retry-limit`, a fresh `retry-limit` clear records one durable manual rearm 
 Inspect the current local main integration verify gate, or force a fresh rerun of it.
 
 ```bash
-uv run gza main-verify [options]
+gza main-verify [options]
 ```
 
 | Option | Description |
 |--------|-------------|
 | `--force` | Force a fresh local main verify run now, rerun reds to classify flakes, and clear a stale halt if the rerun goes green |
 
-Without `--force`, `uv run gza main-verify` is an inspect-first operator check. It reuses the current checkpoint when that cached result is still fresh and prints whether merges are currently allowed or halted. A current green checkpoint exits `0`; a current red or otherwise halting checkpoint exits `1`.
+Without `--force`, `gza main-verify` is an inspect-first operator check. It reuses the current checkpoint when that cached result is still fresh and prints whether merges are currently allowed or halted. A current green checkpoint exits `0`; a current red or otherwise halting checkpoint exits `1`.
 
-With `--force`, `uv run gza main-verify --force` bypasses checkpoint reuse and runs the gate again against the current local-target tree. The forced path uses the same bounded red-rerun classification as watch: a red that turns green on rerun is treated as flaky, the checkpoint is refreshed to green, and the merge halt clears without requiring a direct commit to main. A red that stays red leaves behind fresh red evidence and exits `1`.
+With `--force`, `gza main-verify --force` bypasses checkpoint reuse and runs the gate again against the current local-target tree. The forced path uses the same bounded red-rerun classification as watch: a red that turns green on rerun is treated as flaky, the checkpoint is refreshed to green, and the merge halt clears without requiring a direct commit to main. A red that stays red leaves behind fresh red evidence and exits `1`.
 
 This command is the operator escape hatch for a wedged or stale main-verify halt. Watch still owns the automatic remediation lane: when watch confirms a flaky or deterministic red, it creates or reuses the corresponding remediation task, deduplicated by failure signature only. The bounded-rerun tree fingerprint remains prompt context and freshness evidence, but fingerprint churn does not create a second open remediation row for the same signature. Watch also carries the observed verify environment identity into that remediation context; if the configured worker environment cannot represent the observed failure environment, or Docker probing leaves the actual worker runtime unknown/unavailable, watch parks the remediation and emits one durable environment-mismatch attention instead of launching an ordinary non-representative repair task. Reused or newly created remediation work is tagged `system-main-verify` alongside `system` and any active watch scope tags, and bumped to the front of the runnable queue.
 
@@ -1925,7 +1915,7 @@ This command is the operator escape hatch for a wedged or stale main-verify halt
 Run the host-side behavior conformance monitor on the live project checkout and DB.
 
 ```bash
-uv run gza behavior-monitor [options]
+gza behavior-monitor [options]
 ```
 
 | Option | Description |
@@ -1938,7 +1928,7 @@ uv run gza behavior-monitor [options]
 | `--dry-run` | Run the behavior check and parse findings without filing follow-up tasks or persisting finding-state updates |
 | `--force` | Run even when `behavior_monitor.enabled=false` |
 
-`uv run gza behavior-monitor` is a separate host-side cadence loop, not part of `gza watch` slot filling. Each pass creates one `internal` check task tagged `behavior-monitor` plus the filing tag, runs `/gza-behavior-check` through the existing non-code runner path, reads the required `## Machine-readable findings` appendix from the generated report, and files deduplicated follow-up tasks into the shared DB. The monitor uses a SQLite-backed per-project lease so only one conformance pass runs at a time, and the internal check task is excluded from normal pending pickup and watch slot accounting.
+`gza behavior-monitor` is a separate host-side cadence loop, not part of `gza watch` slot filling. Each pass creates one `internal` check task tagged `behavior-monitor` plus the filing tag, runs `/gza-behavior-check` through the existing non-code runner path, reads the required `## Machine-readable findings` appendix from the generated report, and files deduplicated follow-up tasks into the shared DB. The monitor uses a SQLite-backed per-project lease so only one conformance pass runs at a time, and the internal check task is excluded from normal pending pickup and watch slot accounting.
 
 This is intentionally a cadence-based whole-system conformance check, not a per-merge gate. The behavior check can surface historical or unrelated divergence anywhere in the codebase, so running it before every merge would block unrelated work. Instead, the monitor keeps re-checking the whole behavior-spec set on a schedule and files follow-up tasks into the normal queue.
 
@@ -1946,7 +1936,7 @@ By default the monitor files only confirmed `DIVERGES` findings. It maps `code b
 
 The `behavior_monitor` config block supports these discoverable keys directly:
 
-- `behavior_monitor.enabled`: defaults to `true`. The monitor ships enabled by default so the load-bearing conformance loop exists as soon as the feature lands. When false, `uv run gza behavior-monitor` exits non-zero unless `--force` is supplied.
+- `behavior_monitor.enabled`: defaults to `true`. The monitor ships enabled by default so the load-bearing conformance loop exists as soon as the feature lands. When false, `gza behavior-monitor` exits non-zero unless `--force` is supplied.
 - `behavior_monitor.interval_seconds`: default sleep interval for looping monitor runs. Default: `14400` seconds (4 hours).
 - `behavior_monitor.tag`: default filing tag applied to the internal check task and any filed follow-up tasks. Default: `behavior-conformance`.
 - `behavior_monitor.max_new_tasks_per_cycle`: maximum number of new follow-up tasks filed in one monitor pass. Default: `5`.
@@ -1969,7 +1959,7 @@ The `spec_coherence` config block supports these discoverable keys directly:
 Run an automated implementation lifecycle loop (review/improve/resume/rebase).
 
 ```bash
-uv run gza iterate <impl_task_id> [options]
+gza iterate <impl_task_id> [options]
 ```
 
 | Option | Description |
@@ -1982,27 +1972,27 @@ uv run gza iterate <impl_task_id> [options]
 
 If `impl_task_id` names a failed implementation whose recovery-only lineage already ends in a completed retry/resume descendant, iterate plans from that completed descendant instead of surfacing a stale `recovery child already completed` skip. If that descendant is already merged or has no remaining commits to land (`empty` merge state) or only has commits already present on target (`redundant` merge state), iterate reports that no remaining lifecycle action is needed. Directly iterating an implementation whose current-target merge state is already terminal also exits early with the same no-op outcome instead of resurfacing historical failed review/improve/rebase side-quests.
 
-When a human runs `uv run gza iterate` against a failed implementation or failed improve chain that has already hit the automatic max-resume cap, iterate now prints a warning to stderr and proceeds with the manual resume. The same manual-only warning path also applies when an older failed task is blocked by a newer failed recovery descendant: iterate warns, reroutes the resume through that newer failed descendant, and still leaves scheduler- or worker-launched `--auto-iterate` runs blocked on the shared `newer-recovery-descendant-needs-attention` stop. These warnings are emitted before either foreground execution or `--background` worker handoff returns. If iterate cannot evaluate the completed-task `--background` preflight at all, it emits a degraded-check warning to `stderr` before detaching instead of failing silently, including for `--auto-iterate`.
+When a human runs `gza iterate` against a failed implementation or failed improve chain that has already hit the automatic max-resume cap, iterate now prints a warning to stderr and proceeds with the manual resume. The same manual-only warning path also applies when an older failed task is blocked by a newer failed recovery descendant: iterate warns, reroutes the resume through that newer failed descendant, and still leaves scheduler- or worker-launched `--auto-iterate` runs blocked on the shared `newer-recovery-descendant-needs-attention` stop. These warnings are emitted before either foreground execution or `--background` worker handoff returns. If iterate cannot evaluate the completed-task `--background` preflight at all, it emits a degraded-check warning to `stderr` before detaching instead of failing silently, including for `--auto-iterate`.
 
 Before `--background` detaches, iterate now also evaluates the current lifecycle decision for completed implementations. If the decision is a true no-worker outcome (for example already merged, no remaining commits to land, plain `merge` readiness, max review cycles reached, waiting on existing work, or another shared skip/needs-attention outcome), iterate prints that decision synchronously to the caller and exits without creating a worker row. `merge_with_followups` is not treated as a no-op here: background iterate still detaches into the normal iterate worker so the shared follow-up task materialization path runs before the implementation becomes merge-ready.
 
-If that manual resume completes successfully, operator-facing lifecycle readouts move forward from the completed resume descendant instead of leaving the capped failed row as the active unit of work. The older failed row remains in task history, but shared lineage/lifecycle surfaces treat it as recovered: owner-row listings continue from the descendant, and `uv run gza show` on the older failed row renders `Lifecycle: recovered, ...` based on the descendant's next action or terminal state.
+If that manual resume completes successfully, operator-facing lifecycle readouts move forward from the completed resume descendant instead of leaving the capped failed row as the active unit of work. The older failed row remains in task history, but shared lineage/lifecycle surfaces treat it as recovered: owner-row listings continue from the descendant, and `gza show` on the older failed row renders `Lifecycle: recovered, ...` based on the descendant's next action or terminal state.
 
-Detached `uv run gza iterate --background` runs follow the same observability rule: if the background worker stops during startup or another no-run preflight path, the task log path and `uv run gza log <impl-task-id>` now retain the refusal reason rather than silently exiting.
+Detached `gza iterate --background` runs follow the same observability rule: if the background worker stops during startup or another no-run preflight path, the task log path and `gza log <impl-task-id>` now retain the refusal reason rather than silently exiting.
 
 When iterate stops with `max_cycles_reached`, it now prints review-iteration accounting with:
 - task `completed` review-iteration count
 - configured `max_review_cycles`
 - `consumed_this_invocation` cycles
 
-When iterate stops on a shared human-required outcome, it also prints the same `Needs attention: <task> ... reason=...` line used by `uv run gza advance`, including the same single-line shortened prompt formatting, so operators can see the exact policy boundary that stopped automation.
+When iterate stops on a shared human-required outcome, it also prints the same `Needs attention: <task> ... reason=...` line used by `gza advance`, including the same single-line shortened prompt formatting, so operators can see the exact policy boundary that stopped automation.
 
 ### watch
 
 Continuously maintain a target number of concurrent workers.
 
 ```bash
-uv run gza watch [options]
+gza watch [options]
 ```
 
 Press `Ctrl+C` to stop the watch loop cleanly. `gza` exits with status `130`
@@ -2025,11 +2015,11 @@ need to break out promptly from a long or blocked watch pass.
 | `--show-skipped` | With `--recovery-only`, include skipped failed tasks in the dry-run recovery report and live watch logs |
 | `--quiet` | Write events to `.gza/watch.log` only |
 | `--[no-]auto-restart-on-drift` | When installed `gza` code changes while watch is running, re-exec at the next cycle boundary to load the new code without waiting for running or pending work to drain (default: enabled) |
-| `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `uv run gza queue --tag TAG --pending` to preview the matching pending pickup order, or plain `uv run gza queue --tag TAG` for the shared recovery+pending preview. Scoped watch reports out-of-scope derived blockers but does not start them |
+| `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `gza queue --tag TAG --pending` to preview the matching pending pickup order, or plain `gza queue --tag TAG` for the shared recovery+pending preview. Scoped watch reports out-of-scope derived blockers but does not start them |
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 
-`uv run gza watch` combines the two surfaces above: it runs recovery decisions, review/rebase/merge lifecycle work, and pending-lane pickup in one loop. Recovery and pending are still distinct sets even when watch is driving both.
-Each watch pass also emits one counted `Lifecycle actions (...)` summary line before execution when actionable lifecycle work is queued for that pass, so operators can see the planned advance work without switching to `uv run gza advance --dry-run`.
+`gza watch` combines the two surfaces above: it runs recovery decisions, review/rebase/merge lifecycle work, and pending-lane pickup in one loop. Recovery and pending are still distinct sets even when watch is driving both.
+Each watch pass also emits one counted `Lifecycle actions (...)` summary line before execution when actionable lifecycle work is queued for that pass, so operators can see the planned advance work without switching to `gza advance --dry-run`.
 
 When `main_checkout_isolate: true`, watch and advance preflight a dedicated detached checkout reset to the default-branch tip whenever the configured verify gate requires pre-promotion proof, and execute merge attempts there. With a configured `verify_command`, the shared merge executor treats that checkout as candidate-only evidence: candidate verify must pass before the real default-branch ref moves, and candidate-red or freshness-unproven results fail closed without marking canonical main red. Watch now stages the selected isolated merge batch in lifecycle order, runs one combined pre-promotion candidate verify for that staged tree, and promotes once on success. If the combined staged verify is red, watch replays from the canonical target to isolate the first red-producing merge unit, files or reuses one queued rework task for that blocked candidate, and leaves the canonical target untouched. Only an exact promoted tree match may adopt the passing candidate checkpoint; otherwise the normal canonical post-merge verify backstop still runs. If a later merge is considered in the same command run, the caller first refreshes or rebuilds the isolated checkout back to the canonical target so a blocked candidate tree cannot leak into the next attempt. If the initial refresh fails because that checkout is stale or conflicted, watch rebuilds it once from scratch before giving up on merge actions for that watch pass. The integration checkout does not directly check out the shared default-branch ref, so an operator checkout already on that branch stays clean. Conflict rebases still run on task branches via standard rebase tasks.
 
@@ -2060,7 +2050,7 @@ When a non-global scope is active, watch emits an explicit scope line to console
 scope, or `INFO      scope: owners=<comma-separated-owner-ids> mode=explicit` for
 positional merge-unit scope.
 
-You can scope watch to explicit merge units with `uv run gza watch <task_id> [<task_id> ...]`.
+You can scope watch to explicit merge units with `gza watch <task_id> [<task_id> ...]`.
 Each supplied task ID is resolved once to its canonical lineage / merge-unit owner, so passing a
 review, improve, rebase, retry, or resume descendant drives the owning unit rather than only that
 leaf. In this mode watch still uses the normal lifecycle, merge, iterate routing, attention, dry-run,
@@ -2074,7 +2064,7 @@ watch auto-reexecs after installed-code drift. The scoped `WAKE` header stays sc
 only the named owners, emits the explicit owner-scope line, and does not include unrelated global
 blocked-pending counts.
 
-Manual-operator advance outcomes such as `needs_discussion`, `max_cycles_reached`, exhausted failed-task recovery, and improve-recovery stop reasons are surfaced as `ATTENTION` lines in watch output instead of one-shot deduped `SKIP` lines. Watch reuses the same formatted task line as `uv run gza advance`, including the stable `reason=...` policy slug. Inline `ATTENTION` is emitted only when an attention row is newly visible for the current watch session or when that row's message changes from the previous watch pass; unchanged inline reminders are suppressed. Each watch pass still prints a counted `Needs attention (...)` roundup for the full current visible set, so unchanged rows stay operator-visible even when no new inline `ATTENTION` line appears. Attention row identity comes from the action's declared subject task, so held plans and similar follow-up gates render against the task the operator should inspect. Guarded pending routing skips use the same centralized attention path on the first observed guarded skip, then follow the same unchanged-inline suppression while remaining present in the roundup. Successful watch-managed merges now surface as exactly one structured `MERGE <owner-task-id> -> <target>` line per landed merge unit at the moment the merge lands; watch suppresses the shared cosmetic `Merging...`, `Successfully squash merged`, and `✓ Reconciled ...` success chatter, but still prints squash-reconcile warning/failure guidance when origin reconciliation diverges. The logged task ID is the merge-unit owner/leader only. Canonical merge credit for attached members persists on the shared merge unit (`state == merged`), while the compatibility task-row `merge_status` field remains owner-scoped during the migration window. For failed-recovery reasons such as `automatic-recovery-disabled`, `retry-limit-reached`, and `retryable-provider-error`, the shared CLI attention recommendation is category-aware: implementations that never completed tell the operator to retry or re-implement instead; completed implementations whose terminal failed task is retryable point at `uv run gza unstick <owner-id> --reason retry-limit` (optionally `--run`); and `gza fix` stays reserved for review/content churn plus completed-implementation failed recovery whose terminal failure category is not retryable. For the review/improve-churn handoff reason `review-max-cycles-reached`, `uv run gza advance` and `uv run gza iterate` print `Recommended next step: uv run gza fix <task-id>`. A `retry-limit-reached` owner stays parked until the operator runs `uv run gza unstick --reason retry-limit` or otherwise changes lineage state; after that durable manual rearm, watch can select fresh shared recovery work again while the historical failed descendants remain in place for audit. When blind parked auto-rearm is enabled, watch may also spend the bounded `watch.parked_auto_rearm` budget to create a fresh effective retry-limit rearm epoch after cooldown and target-advance gating pass; inside one cooldown window, slot reuse stays with the normal watch dispatcher and the same subject/reason pair gets at most one blind attempt. Treat `manual-review-required` as a legacy alias rather than a current parked reason. Ordinary wait/skip states keep the existing `SKIP` dedupe behavior.
+Manual-operator advance outcomes such as `needs_discussion`, `max_cycles_reached`, exhausted failed-task recovery, and improve-recovery stop reasons are surfaced as `ATTENTION` lines in watch output instead of one-shot deduped `SKIP` lines. Watch reuses the same formatted task line as `gza advance`, including the stable `reason=...` policy slug. Inline `ATTENTION` is emitted only when an attention row is newly visible for the current watch session or when that row's message changes from the previous watch pass; unchanged inline reminders are suppressed. Each watch pass still prints a counted `Needs attention (...)` roundup for the full current visible set, so unchanged rows stay operator-visible even when no new inline `ATTENTION` line appears. Attention row identity comes from the action's declared subject task, so held plans and similar follow-up gates render against the task the operator should inspect. Guarded pending routing skips use the same centralized attention path on the first observed guarded skip, then follow the same unchanged-inline suppression while remaining present in the roundup. Successful watch-managed merges now surface as exactly one structured `MERGE <owner-task-id> -> <target>` line per landed merge unit at the moment the merge lands; watch suppresses the shared cosmetic `Merging...`, `Successfully squash merged`, and `✓ Reconciled ...` success chatter, but still prints squash-reconcile warning/failure guidance when origin reconciliation diverges. The logged task ID is the merge-unit owner/leader only. Canonical merge credit for attached members persists on the shared merge unit (`state == merged`), while the compatibility task-row `merge_status` field remains owner-scoped during the migration window. For failed-recovery reasons such as `automatic-recovery-disabled`, `retry-limit-reached`, and `retryable-provider-error`, the shared CLI attention recommendation is category-aware: implementations that never completed tell the operator to retry or re-implement instead; completed implementations whose terminal failed task is retryable point at `gza unstick <owner-id> --reason retry-limit` (optionally `--run`); and `gza fix` stays reserved for review/content churn plus completed-implementation failed recovery whose terminal failure category is not retryable. For the review/improve-churn handoff reason `review-max-cycles-reached`, `gza advance` and `gza iterate` print `Recommended next step: gza fix <task-id>`. A `retry-limit-reached` owner stays parked until the operator runs `gza unstick --reason retry-limit` or otherwise changes lineage state; after that durable manual rearm, watch can select fresh shared recovery work again while the historical failed descendants remain in place for audit. When blind parked auto-rearm is enabled, watch may also spend the bounded `watch.parked_auto_rearm` budget to create a fresh effective retry-limit rearm epoch after cooldown and target-advance gating pass; inside one cooldown window, slot reuse stays with the normal watch dispatcher and the same subject/reason pair gets at most one blind attempt. Treat `manual-review-required` as a legacy alias rather than a current parked reason. Ordinary wait/skip states keep the existing `SKIP` dedupe behavior.
 
 The first watch pass still requires confirmation unless you pass `--yes` / `-y`. If that pass finds work to do and stdout is not a terminal (for example when piping watch output through `tee`), watch aborts with guidance to re-run with `-y` instead of waiting on an invisible prompt.
 
@@ -2084,7 +2074,7 @@ When watch detects that the installed `gza` package fingerprint has changed sinc
 
 If a watch-time merge attempt fails only because the task branch is already merged into the target branch, watch runs the shared branch-truth reconciliation path, marks the task merged, and logs the repair as informational reconciliation instead of surfacing a misleading merge failure.
 
-`uv run gza watch --recovery-only --dry-run` is the recovery inspection surface for unscoped or tag-scoped runs. It prints the failed-task decision report for the current scope, showing actionable `resume` and `retry` decisions plus any shared `Needs attention` rows by default, then exits without entering the normal watch loop. Explicit merge-unit scope keeps that scope hard: `uv run gza watch <task_id>... --recovery-only --dry-run` runs one scoped watch preview pass instead of consulting the global recovery lane report. Plain `uv run gza watch` now reserves a recovery lane by default: default `watch.recovery_slots = 1` means each watch pass allocates up to one slot to worker-consuming failed-task recovery before pending pickup, with the remaining `batch - 1` slots left for pending work. The rule is uniform for worker-consuming recovery: at batch 1, default plain watch gives the single slot to worker-consuming recovery first; use `--pending-only` or `watch.recovery_slots: 0` when you intentionally want pending-only behavior on a single slot. Explicit scoped watch is different because it disables pending pickup entirely: once you run `uv run gza watch <task_id>...`, in-scope worker-consuming recovery can use all currently free slots in that pass unless you explicitly selected `--pending-only`; config/default `watch.recovery_slots: 0` and `--recovery-slots 0` do not disable scoped recovery by themselves. `--recovery-first` keeps the normal recovery preference but only allows pending tasks with an explicit `queue_position` to fill the remaining slots. `--recovery-only` is the other extreme (`recovery_slots = batch`) and suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot. `max_resume_attempts` is still the shared recovery toggle (`0` disables automatic recovery, any positive value enables the same fixed bounded policy). Ordinary skipped tasks stay hidden by default; pass `--show-skipped` to include those non-attention skips with launch mode and attempt counts in both the dry-run report and live watch logs. Failed `review` / `improve` / `rebase` rows whose structured target implementation is already merged are omitted entirely from this recovery surface rather than being counted as skipped. Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to `--recovery-only`, `--restart-failed-batch` maps to `--recovery-slots`, and `watch.restart_failed_batch` maps to `watch.recovery_slots`.
+`gza watch --recovery-only --dry-run` is the recovery inspection surface for unscoped or tag-scoped runs. It prints the failed-task decision report for the current scope, showing actionable `resume` and `retry` decisions plus any shared `Needs attention` rows by default, then exits without entering the normal watch loop. Explicit merge-unit scope keeps that scope hard: `gza watch <task_id>... --recovery-only --dry-run` runs one scoped watch preview pass instead of consulting the global recovery lane report. Plain `gza watch` now reserves a recovery lane by default: default `watch.recovery_slots = 1` means each watch pass allocates up to one slot to worker-consuming failed-task recovery before pending pickup, with the remaining `batch - 1` slots left for pending work. The rule is uniform for worker-consuming recovery: at batch 1, default plain watch gives the single slot to worker-consuming recovery first; use `--pending-only` or `watch.recovery_slots: 0` when you intentionally want pending-only behavior on a single slot. Explicit scoped watch is different because it disables pending pickup entirely: once you run `gza watch <task_id>...`, in-scope worker-consuming recovery can use all currently free slots in that pass unless you explicitly selected `--pending-only`; config/default `watch.recovery_slots: 0` and `--recovery-slots 0` do not disable scoped recovery by themselves. `--recovery-first` keeps the normal recovery preference but only allows pending tasks with an explicit `queue_position` to fill the remaining slots. `--recovery-only` is the other extreme (`recovery_slots = batch`) and suppresses pending pickup until actionable recovery drains, even for direct reconcile actions that do not consume a worker slot. `max_resume_attempts` is still the shared recovery toggle (`0` disables automatic recovery, any positive value enables the same fixed bounded policy). Ordinary skipped tasks stay hidden by default; pass `--show-skipped` to include those non-attention skips with launch mode and attempt counts in both the dry-run report and live watch logs. Failed `review` / `improve` / `rebase` rows whose structured target implementation is already merged are omitted entirely from this recovery surface rather than being counted as skipped. Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to `--recovery-only`, `--restart-failed-batch` maps to `--recovery-slots`, and `watch.restart_failed_batch` maps to `watch.recovery_slots`.
 
 ### learnings
 
@@ -2105,7 +2095,7 @@ gza learnings update
 Explicitly reconcile branch-scoped task state across local git, fetched remote default-branch git state, and GitHub PR metadata.
 
 ```bash
-uv run gza sync [task_id ...] [options]
+gza sync [task_id ...] [options]
 ```
 
 | Option | Description |
@@ -2116,17 +2106,17 @@ uv run gza sync [task_id ...] [options]
 | `--pr-only` | Only reconcile PR metadata and stale-PR cleanup; skip git diff refresh |
 | `--no-fetch` | Skip `git fetch origin`; stale-PR auto-close is disabled without a fresh fetch |
 
-Use `uv run gza unmerged` for the daily "what still needs to be merged?" check. `uv run gza sync` remains the broader explicit branch and PR reconciliation command. When `pr_integration: true`, it also performs project-level `gh`-backed PR discovery/comment/create flows. Set `pr_integration: false` to disable those PR operations. It:
+Use `gza unmerged` for the daily "what still needs to be merged?" check. `gza sync` remains the broader explicit branch and PR reconciliation command. When `pr_integration: true`, it also performs project-level `gh`-backed PR discovery/comment/create flows. Set `pr_integration: false` to disable those PR operations. It:
 - dedupes work by branch, writing shared branch metadata back to every same-branch task row that carries commits while persisting merge status only on the merge-owning row
 - refreshes cached `merge_status`, `diff_*` stats, `pr_number`, `pr_state`, `pr_last_synced_at`, and `sync_last_synced_at`
 - discovers PRs by branch for bounded candidates that need PR reconciliation
 - auto-closes stale open PRs only after posting a comment and only when a fresh `origin/<default-branch>` fetch proves the branch content is already present upstream
 
-The only GitHub-side exceptions outside `uv run gza sync` are improve and fix completion with `--review`: before auto-running the follow-up review, gza may do a narrow branch-scoped live-PR check and push for that same branch when `pr_integration: true`. With `pr_integration: false`, those same branch-scoped PR checks are skipped. It does not replace `uv run gza sync` for broader cache refresh, merge-state reconciliation, or stale-PR cleanup.
+The only GitHub-side exceptions outside `gza sync` are improve and fix completion with `--review`: before auto-running the follow-up review, gza may do a narrow branch-scoped live-PR check and push for that same branch when `pr_integration: true`. With `pr_integration: false`, those same branch-scoped PR checks are skipped. It does not replace `gza sync` for broader cache refresh, merge-state reconciliation, or stale-PR cleanup.
 
-Default `uv run gza sync` scope is intentionally bounded. It includes unresolved branches, tasks with known or unknown open-PR cache state, and recently touched PR-intended work. Pass explicit task IDs to force-sync specific branch cohorts outside that default window. That bounded scope is acceptable because `uv run gza sync` is no longer the primary daily merge-truth refresh surface.
+Default `gza sync` scope is intentionally bounded. It includes unresolved branches, tasks with known or unknown open-PR cache state, and recently touched PR-intended work. Pass explicit task IDs to force-sync specific branch cohorts outside that default window. That bounded scope is acceptable because `gza sync` is no longer the primary daily merge-truth refresh surface.
 
-Branch candidates selected by the default scope are cooldown-filtered by `sync_last_synced_at`. When the bounded candidate set is empty only because that cache is still warm, `uv run gza sync` prints an explicit cooldown message instead of a generic "No sync candidates". During active reconciliation it also emits concise `[sync] ...` progress lines for fetch/auth steps and per-branch cohort progress.
+Branch candidates selected by the default scope are cooldown-filtered by `sync_last_synced_at`. When the bounded candidate set is empty only because that cache is still warm, `gza sync` prints an explicit cooldown message instead of a generic "No sync candidates". During active reconciliation it also emits concise `[sync] ...` progress lines for fetch/auth steps and per-branch cohort progress.
 
 ### tv
 
@@ -2177,7 +2167,7 @@ When shared DB mode is active (explicit `db_path`) and a legacy local `.gza/gza.
 Override a task's status for recovery or correction.
 
 ```bash
-uv run gza set-status <task_id> <status> [--reason <text>]
+gza set-status <task_id> <status> [--reason <text>]
 ```
 
 `task_id` must be a full prefixed task ID (for example `gza-1234`).
@@ -2191,14 +2181,14 @@ Allowed targets:
 Disallowed lifecycle transitions point operators at the canonical commands:
 
 - `completed` is rejected as a target. To complete a task, use
-  `uv run gza mark-completed <task_id>`.
-- `failed -> pending` is rejected. Use `uv run gza retry <task_id>` to re-run
+  `gza mark-completed <task_id>`.
+- `failed -> pending` is rejected. Use `gza retry <task_id>` to re-run
   with the normal worker-registry reset and failure-reason cleanup.
-- `in_progress -> pending` is rejected. Use `uv run gza resume <task_id>` to
+- `in_progress -> pending` is rejected. Use `gza resume <task_id>` to
   reattach to active work, or settle the task as `failed`/`dropped` if the
   worker is gone.
-- `completed -> pending` is rejected. Create a new task with `uv run gza add`
-  for new work, or use `uv run gza set-status <task_id> failed --reason '...'`
+- `completed -> pending` is rejected. Create a new task with `gza add`
+  for new work, or use `gza set-status <task_id> failed --reason '...'`
   to revert a falsely completed task.
 - `in_progress` is not a valid target. That state is set by a running worker,
   not by manual operator action.
@@ -2283,13 +2273,13 @@ Any state can be manually set to `dropped` via `gza set-status`.
 
 **Recovering from failures:**
 
-- Use `uv run gza resume <task_id>` to continue from where the task left off (preserves conversation context)
-- Use `uv run gza retry <task_id>` to create a new retry attempt (`implement` retries fork fresh; same-branch follow-ups stay on the shared branch)
-- `PREREQUISITE_UNMERGED`: the resolved completed dependency is not yet marked merged to the default branch (`main` in most repos). Merge the dependency (`uv run gza merge <dependency_task_id>`) or otherwise mark its merge unit complete first; after that, `uv run gza watch --restart-failed` can pick the task up automatically, or you can retry it manually with `uv run gza retry <task_id>`. `--force` does not bypass dependency merge/readiness guards.
+- Use `gza resume <task_id>` to continue from where the task left off (preserves conversation context)
+- Use `gza retry <task_id>` to create a new retry attempt (`implement` retries fork fresh; same-branch follow-ups stay on the shared branch)
+- `PREREQUISITE_UNMERGED`: the resolved completed dependency is not yet marked merged to the default branch (`main` in most repos). Merge the dependency (`gza merge <dependency_task_id>`) or otherwise mark its merge unit complete first; after that, `gza watch --restart-failed` can pick the task up automatically, or you can retry it manually with `gza retry <task_id>`. `--force` does not bypass dependency merge/readiness guards.
 
 **Dependencies:**
 
-Tasks with `depends_on` set will remain pending until their dependency completes. Use tag-scoped views such as `gza search --tag <tag>` or `gza queue --tag <tag>` to inspect related chains.
+Tasks with `depends_on` set will remain pending until their dependency completes. Use tag-scoped views such as `gza search "" --tag <tag>` or `gza queue --tag <tag>` to inspect related chains.
 
 ---
 
@@ -2325,7 +2315,6 @@ Provider credentials (API keys) have their own precedence — see [Dotenv Files]
 | `.gza/workers/` | Worker metadata and startup logs |
 | `etc/Dockerfile.claude` | Generated Docker image for Claude |
 | `etc/Dockerfile.codex` | Generated Docker image for Codex |
-| `etc/Dockerfile.gemini` | Generated Docker image for Gemini |
 
 > **Note:** `.gza/` and `gza.local.yaml` are machine-specific and should be gitignored.
 
@@ -2337,7 +2326,6 @@ Provider credentials (API keys) have their own precedence — see [Dotenv Files]
 | `~/.gza/.env` | User-level environment variables |
 | `~/.claude/` | Claude OAuth credentials |
 | `~/.codex/` | Codex OAuth credentials |
-| `~/.gemini/` | Gemini OAuth credentials |
 
 ---
 
@@ -2400,13 +2388,13 @@ If a worker crashed or was killed, tasks may be stuck in `in_progress` state:
 
 ```bash
 # Check for running workers
-uv run gza ps
+gza ps
 
 # If no workers are running but task shows in_progress, the worker crashed
 # Resume or retry the task:
-uv run gza resume <task_id>
+gza resume <task_id>
 # or
-uv run gza retry <task_id>
+gza retry <task_id>
 ```
 
 ### "No pending tasks" but tasks exist
@@ -2414,8 +2402,8 @@ uv run gza retry <task_id>
 Tasks with unmet dependencies won't be picked up. Check:
 
 ```bash
-uv run gza next          # Shows pending tasks and their dependencies
-uv run gza search --tag <tag>  # Shows tasks with a tag slice
+gza next          # Shows pending tasks and their dependencies
+gza search "" --tag <tag>  # Shows tasks with a tag slice
 ```
 
 ### Claude Code not found

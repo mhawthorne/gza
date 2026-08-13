@@ -102,8 +102,8 @@ $ gza set-status <task_id> dropped
 ## Extract changes from a branch into a new task
 
 ```bash
-$ uv run gza extract --branch $branch --base-branch $base_branch
-$ uv run gza iterate <new-implement-task-id>
+$ gza extract --branch $branch --base-branch $base_branch
+$ gza iterate <new-implement-task-id>
 ```
 
-Bare `gza implement <plan_task_id>` and `uv run gza extract ...` queue the new implementation task by default. Add `--run` when you want immediate foreground execution instead of queueing.
+Bare `gza implement <plan_task_id>` and `gza extract ...` queue the new implementation task by default. Add `--run` when you want immediate foreground execution instead of queueing.

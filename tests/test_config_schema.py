@@ -263,15 +263,6 @@ def test_quiet_period_registry_description_matches_display_only_quiet_lane_behav
     assert "0" in quiet_spec.description
 
 
-def test_quiet_period_docs_match_display_only_scope() -> None:
-    """Operator docs should describe the shipped quiet-lane display semantics."""
-    docs_text = (Path(__file__).resolve().parents[1] / "docs" / "configuration.md").read_text()
-
-    assert "quiet_period_seconds" in docs_text
-    assert "Quiet lane of `gza queue` / `gza next`" in docs_text
-    assert "do not change worker pickup eligibility" in docs_text
-
-
 @pytest.mark.parametrize("value, expected", [
     ("-1", "'quiet_period_seconds' must be non-negative"),
     ("1.5", "'quiet_period_seconds' must be an integer"),

@@ -458,14 +458,21 @@ def _seed_stale_unmerged_cli_cases(tmp_path: Path) -> tuple[Task, Task, Task]:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
+    # Anchor activity relative to now so the fresh/stale split holds no matter
+    # when the suite runs. A fixed "recent" date eventually ages past --days and
+    # the live unit starts getting flagged as stale.
+    now = datetime.now(UTC)
+    stale_ts = now - timedelta(days=100)  # comfortably past any --days window the tests use
+    fresh_ts = now - timedelta(days=10)  # comfortably within a 45-day window
+
     merged_owner = store.add("Merged implement", task_type="implement")
     assert merged_owner.id is not None
     merged_owner.status = "completed"
-    merged_owner.completed_at = datetime(2026, 4, 1, 9, 0, tzinfo=UTC)
+    merged_owner.completed_at = stale_ts
     merged_owner.branch = "feature/merged"
     merged_owner.has_commits = True
     store.update(merged_owner)
-    _set_task_created_at(store, merged_owner.id, when=datetime(2026, 4, 1, 8, 0, tzinfo=UTC))
+    _set_task_created_at(store, merged_owner.id, when=stale_ts - timedelta(hours=1))
     merged_unit = store.create_merge_unit(
         source_branch=merged_owner.branch,
         target_branch="main",
@@ -478,11 +485,11 @@ def _seed_stale_unmerged_cli_cases(tmp_path: Path) -> tuple[Task, Task, Task]:
     live_owner = store.add("Recent implement", task_type="implement")
     assert live_owner.id is not None
     live_owner.status = "completed"
-    live_owner.completed_at = datetime(2026, 6, 15, 9, 0, tzinfo=UTC)
+    live_owner.completed_at = fresh_ts
     live_owner.branch = "feature/live"
     live_owner.has_commits = True
     store.update(live_owner)
-    _set_task_created_at(store, live_owner.id, when=datetime(2026, 6, 15, 8, 0, tzinfo=UTC))
+    _set_task_created_at(store, live_owner.id, when=fresh_ts - timedelta(hours=1))
     live_unit = store.create_merge_unit(
         source_branch=live_owner.branch,
         target_branch="main",
@@ -495,17 +502,17 @@ def _seed_stale_unmerged_cli_cases(tmp_path: Path) -> tuple[Task, Task, Task]:
     stale_owner = store.add("Old abandoned implement", task_type="implement")
     assert stale_owner.id is not None
     stale_owner.status = "completed"
-    stale_owner.completed_at = datetime(2026, 4, 2, 9, 0, tzinfo=UTC)
+    stale_owner.completed_at = stale_ts + timedelta(days=1)
     stale_owner.branch = "feature/stale"
     stale_owner.has_commits = True
     store.update(stale_owner)
-    _set_task_created_at(store, stale_owner.id, when=datetime(2026, 4, 2, 8, 0, tzinfo=UTC))
+    _set_task_created_at(store, stale_owner.id, when=stale_ts + timedelta(days=1) - timedelta(hours=1))
     stale_review = store.add("Old attached review", task_type="review", depends_on=stale_owner.id)
     assert stale_review.id is not None
     stale_review.status = "completed"
-    stale_review.completed_at = datetime(2026, 4, 3, 9, 0, tzinfo=UTC)
+    stale_review.completed_at = stale_ts + timedelta(days=2)
     store.update(stale_review)
-    _set_task_created_at(store, stale_review.id, when=datetime(2026, 4, 3, 8, 0, tzinfo=UTC))
+    _set_task_created_at(store, stale_review.id, when=stale_ts + timedelta(days=2) - timedelta(hours=1))
     stale_unit = store.create_merge_unit(
         source_branch=stale_owner.branch,
         target_branch="main",

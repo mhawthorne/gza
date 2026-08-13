@@ -49,11 +49,11 @@ Practical examples showing common workflows with Gza.
 | Address feedback immediately | `gza improve <impl_id> --run` |
 | Resume failed task immediately | `gza resume <task_id> --run` |
 | Create a new retry attempt immediately | `gza retry <task_id> --run` |
-| View unmerged work | `uv run gza unmerged` |
+| View unmerged work | `gza unmerged` |
 | Rebase a branch immediately | `gza rebase <task_id> --run` |
 | Create PR | `gza pr <task_id>` |
 | Merge to main | `gza merge <task_id> --squash` |
-| View tasks by tag | `gza search --tag <tag>` |
+| View tasks by tag | `gza search "" --tag <tag>` |
 | View history | `gza history` |
 | View review stats | `gza stats reviews` |
 | View iteration activity | `gza stats iterations --hours 12` |
