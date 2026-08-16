@@ -16,6 +16,7 @@ branch_strategy: date_slug
 max_steps: 100
 
 learnings_max_items: 50
+learnings_interval: 10
 
 merge_squash_threshold: 1
 
