@@ -1273,7 +1273,10 @@ class TestDockerfileTemplate:
         content = _get_default_dockerfile_content(docker_config)
 
         assert content == (repo_root / "etc" / "Dockerfile.codex").read_text()
-        assert "RUN npm install -g @openai/codex@0.128.0" in content
+        codex_install_lines = re.findall(r"^RUN npm install -g (@openai/codex@[^\s]+)$", content, re.MULTILINE)
+        assert len(codex_install_lines) == 1
+        assert re.fullmatch(r"@openai/codex@\d+\.\d+\.\d+(?:[-+][^\s]+)?", codex_install_lines[0])
+        assert codex_install_lines[0] != docker_config.npm_package
 
 
 class TestGeminiCostCalculation:

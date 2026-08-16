@@ -146,7 +146,7 @@ counts, token counts, cost, error type, session ID).
 
 ### Codex (`src/gza/providers/codex.py:278-317`)
 
-- npm package: `@openai/codex` (pinned at `0.128.0` in `etc/Dockerfile.codex:16`)
+- npm package: `@openai/codex` (pinned at `0.147.0` in `etc/Dockerfile.codex:16`)
 - CLI command: `codex`
 - Config dir: `.codex` (only mounted when in OAuth mode)
 - Env vars: `CODEX_API_KEY` or `OPENAI_API_KEY` (`codex.py:270, 290-291`)
@@ -160,7 +160,7 @@ Two separate images:
 
 - `etc/Dockerfile.claude` — `npm install -g @anthropic-ai/claude-code`,
   `CMD ["claude"]`, config mount `.claude`
-- `etc/Dockerfile.codex` — `npm install -g @openai/codex@0.128.0`,
+- `etc/Dockerfile.codex` — `npm install -g @openai/codex@0.147.0`,
   `CMD ["codex"]`, config mount `.codex` (conditional on auth mode)
 
 Shared Docker plumbing — including OAuth config-dir mount logic — lives in
@@ -177,7 +177,7 @@ the provider classes themselves know which CLI they're talking to.
 | Aspect | Claude | Codex |
 |---|---|---|
 | CLI binary | `claude` | `codex` |
-| npm package | `@anthropic-ai/claude-code` | `@openai/codex@0.128.0` |
+| npm package | `@anthropic-ai/claude-code` | `@openai/codex@0.147.0` |
 | JSON output flag | `--output-format stream-json` | `--json` |
 | Prompt-on-stdin | `-p -` | trailing `-` |
 | Step budget | `--max-turns N` | (implicit) |
