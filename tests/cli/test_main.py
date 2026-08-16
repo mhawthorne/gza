@@ -181,6 +181,7 @@ class TestHelpOutput:
         assert "--list-fields" in history_help.stdout
         assert "--" + "incomplete" not in history_help.stdout
         assert "--all-tags" in history_help.stdout
+        assert "--untagged" in history_help.stdout
         assert search_help.returncode == 0
         assert "--status-not" in search_help.stdout
         assert "--type-not" in search_help.stdout
@@ -193,6 +194,44 @@ class TestHelpOutput:
         assert "--lineage-of-not" in search_help.stdout
         assert "--root-not" in search_help.stdout
         assert "--all-tags" in search_help.stdout
+        assert "--untagged" in search_help.stdout
+
+    def test_query_command_docs_tables_list_untagged_when_help_exposes_it(self, tmp_path: Path) -> None:
+        """Documented query commands should keep `--untagged` docs in sync with parser help."""
+        setup_config(tmp_path)
+
+        docs_text = (Path(__file__).resolve().parents[2] / "docs" / "configuration.md").read_text(
+            encoding="utf-8"
+        )
+        expected_rows = {
+            "history": "Match only tasks with no tags; cannot be combined with tag selector flags",
+            "search": "Match only tasks with no tags; cannot be combined with tag selector flags",
+            "incomplete": (
+                "Match only unresolved rows whose owner has no tags; "
+                "cannot be combined with tag selector flags"
+            ),
+            "unmerged": (
+                "Match only unmerged units whose resolved owner has no tags; "
+                "cannot be combined with tag selector flags"
+            ),
+            "merged": (
+                "Match only merged units whose resolved owner has no tags; "
+                "cannot be combined with tag selector flags"
+            ),
+        }
+
+        for command, description in expected_rows.items():
+            help_result = invoke_gza(command, "--help", "--project", str(tmp_path))
+            assert help_result.returncode == 0
+            assert "--untagged" in help_result.stdout
+
+            section_match = re.search(
+                rf"^### {re.escape(command)}\n(.*?)(?=^### |\Z)",
+                docs_text,
+                re.MULTILINE | re.DOTALL,
+            )
+            assert section_match is not None, f"Missing docs section for {command}"
+            assert f"| `--untagged` | {description} |" in section_match.group(1)
 
     def test_history_and_search_reject_removed_preset_flag(self, tmp_path):
         setup_config(tmp_path)

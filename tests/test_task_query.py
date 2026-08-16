@@ -82,6 +82,20 @@ def test_search_default_matches_pending_and_internal(tmp_path: Path) -> None:
     assert internal.prompt in prompts
 
 
+def test_search_untagged_only_filters_out_tagged_tasks(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    untagged = store.add("needle untagged", task_type="implement")
+    tagged = store.add("needle tagged", task_type="implement", tags=("release",))
+
+    service = TaskQueryService(store)
+    query = replace(TaskQueryPresets.search("needle", limit=None), untagged_only=True)
+    result = service.run(query)
+
+    prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
+    assert untagged.prompt in prompts
+    assert tagged.prompt not in prompts
+
+
 def test_task_query_service_run_emits_metrics_without_private_helper_metrics(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -162,6 +176,59 @@ def test_incomplete_preset_projects_next_action_fields(tmp_path: Path) -> None:
     assert hasattr(row, "owner_task")
     assert row.values["next_action"] == "unknown"
     assert "missing config/git context" in str(row.values["next_action_reason"])
+
+
+def test_incomplete_preset_untagged_only_filters_tagged_owner_rows(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    untagged = store.add("untagged failed impl", task_type="implement")
+    untagged.status = "failed"
+    untagged.completed_at = datetime.now(UTC)
+    untagged.failure_reason = "TEST_FAILURE"
+    store.update(untagged)
+
+    tagged = store.add("tagged failed impl", task_type="implement", tags=("release",))
+    tagged.status = "failed"
+    tagged.completed_at = datetime.now(UTC)
+    tagged.failure_reason = "TEST_FAILURE"
+    store.update(tagged)
+
+    service = TaskQueryService(store)
+    query = replace(TaskQueryPresets.incomplete(limit=None), untagged_only=True)
+    result = service.run(query)
+
+    owner_prompts = [row.owner_task.prompt for row in result.rows if hasattr(row, "owner_task")]
+    assert owner_prompts == ["untagged failed impl"]
+
+
+def test_incomplete_preset_untagged_only_keeps_untagged_owner_with_tagged_failed_descendant(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+
+    owner = store.add("untagged owner", task_type="implement")
+    owner.status = "in_progress"
+    owner.branch = "feature/untagged-owner"
+    owner.has_commits = True
+    store.update(owner)
+    assert owner.id is not None
+
+    tagged_descendant = store.add(
+        "tagged failed descendant",
+        task_type="improve",
+        based_on=owner.id,
+        tags=("release",),
+    )
+    tagged_descendant.status = "failed"
+    tagged_descendant.completed_at = datetime.now(UTC)
+    tagged_descendant.failure_reason = "TEST_FAILURE"
+    store.update(tagged_descendant)
+
+    service = TaskQueryService(store)
+    query = replace(TaskQueryPresets.incomplete(limit=None), untagged_only=True)
+    result = service.run(query)
+
+    assert [row.owner_task.id for row in result.rows if hasattr(row, "owner_task")] == [owner.id]
+    row = result.rows[0]
+    assert hasattr(row, "unresolved_tasks")
+    assert [task.id for task in row.unresolved_tasks] == [tagged_descendant.id]
 
 
 def test_incomplete_preset_projects_real_next_action_when_context_available(tmp_path: Path) -> None:

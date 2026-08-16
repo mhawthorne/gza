@@ -104,6 +104,7 @@ class LineageOwnerQuery:
     exclude_task_types: tuple[str, ...] | None = None
     tags: tuple[str, ...] | None = None
     exclude_tags: tuple[str, ...] | None = None
+    untagged_only: bool = False
     any_tag: bool = True
     date_filter: DateFilter | None = None
     include_skipped: bool = False
@@ -284,6 +285,12 @@ def _matches_task_filters(
         return False
     if (
         include_tag_filters
+        and query.untagged_only
+        and task.tags
+    ):
+        return False
+    if (
+        include_tag_filters
         and query.tags is not None
         and not tag_matcher(task_tags=task.tags, tag_filters=query.tags, any_tag=query.any_tag)
     ):
@@ -303,6 +310,8 @@ def _matches_task_filters(
 
 
 def _owner_matches_tag_filters(owner: DbTask, query: LineageOwnerQuery, *, tag_matcher: Any) -> bool:
+    if query.untagged_only and owner.tags:
+        return False
     if query.tags is not None and not tag_matcher(task_tags=owner.tags, tag_filters=query.tags, any_tag=query.any_tag):
         return False
     if query.exclude_tags is not None and tag_matcher(

@@ -145,10 +145,10 @@ from ._common import (
     get_store,
     get_task_status_color,
     pager_context,
+    parse_cli_query_tag_filters,
     parse_cli_tag_filters,
     resolve_effective_plan_review_manifest_state,
     resolve_id,
-    validate_cli_tag_values,
 )
 from ._lifecycle_actions import collect_lifecycle_action_entries, print_lifecycle_action_entries
 from ._queue_render import (
@@ -1095,12 +1095,10 @@ def cmd_history(args: argparse.Namespace) -> int:
         return 2
     use_json = bool(getattr(args, "json", False))
     try:
-        tags = validate_cli_tag_values(tuple(getattr(args, "tags", None) or ()))
-        tags_not = validate_cli_tag_values(tuple(getattr(args, "tags_not", None) or ()))
+        tags, tags_not, any_tag, untagged_only = parse_cli_query_tag_filters(args)
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
-    any_tag = not bool(getattr(args, "all_tags", False))
 
     # If a date-based filter is active and --last/-n wasn't explicitly provided,
     # don't cap results with the default limit.
@@ -1118,8 +1116,9 @@ def cmd_history(args: argparse.Namespace) -> int:
         start_date=start_date,
         end_date=end_date,
         date_field=date_field,
-        tags=tags or None,
-        tags_not=tags_not or None,
+        tags=tags,
+        tags_not=tags_not,
+        untagged_only=untagged_only,
         any_tag=any_tag,
     )
 
@@ -1359,7 +1358,16 @@ def cmd_history(args: argparse.Namespace) -> int:
     orphaned: list[DbTask] = []
     if not status:
         registry = WorkerRegistry(config.workers_path)
-        orphaned = _get_orphaned_tasks(registry, store)
+        orphaned = [
+            task
+            for task in _get_orphaned_tasks(registry, store)
+            if _task_matches_cli_tag_scope(
+                task,
+                tag_filters=tags,
+                any_tag=any_tag,
+                untagged_only=untagged_only,
+            )
+        ]
 
     recent = query_history(store, f)
     if not recent and not orphaned:
@@ -1421,6 +1429,43 @@ def _render_orphaned_task(task: "DbTask", c: dict) -> None:
     print()
 
 
+def _task_matches_cli_tag_scope(
+    task: DbTask,
+    *,
+    tag_filters: tuple[str, ...] | None,
+    exclude_tag_filters: tuple[str, ...] | None = None,
+    any_tag: bool,
+    untagged_only: bool,
+) -> bool:
+    """Return whether a task matches the active CLI tag selector."""
+    if untagged_only and task.tags:
+        return False
+    if not task_matches_tag_filters(
+        task_tags=task.tags,
+        tag_filters=tag_filters,
+        any_tag=any_tag,
+    ):
+        return False
+    if exclude_tag_filters is not None and task_matches_tag_filters(
+        task_tags=task.tags,
+        tag_filters=exclude_tag_filters,
+        any_tag=any_tag,
+    ):
+        return False
+    return True
+
+
+def _task_matches_cli_query_tag_scope(task: DbTask, query: _TaskQuery) -> bool:
+    """Return whether a task matches the full tag selector state of a query."""
+    return _task_matches_cli_tag_scope(
+        task,
+        tag_filters=query.tag_filters,
+        exclude_tag_filters=query.exclude_tag_filters,
+        any_tag=query.any_tag,
+        untagged_only=query.untagged_only,
+    )
+
+
 def cmd_search(args: argparse.Namespace) -> int:
     """Search tasks by substring in prompt text."""
     if getattr(args, "list_fields", False):
@@ -1439,12 +1484,10 @@ def cmd_search(args: argparse.Namespace) -> int:
         return 2
     use_json = bool(getattr(args, "json", False))
     try:
-        tags = validate_cli_tag_values(tuple(getattr(args, "tags", None) or ()))
-        tags_not = validate_cli_tag_values(tuple(getattr(args, "tags_not", None) or ()))
+        tags, tags_not, any_tag, untagged_only = parse_cli_query_tag_filters(args)
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
-    any_tag = not bool(getattr(args, "all_tags", False))
 
     date_filter = _TaskDateFilter(
         field=cast(_QueryDateField, getattr(args, "date_field", "created")),
@@ -1505,8 +1548,9 @@ def cmd_search(args: argparse.Namespace) -> int:
     )
     query = replace(
         query,
-        tag_filters=tags or None,
-        exclude_tag_filters=tags_not or None,
+        tag_filters=tags,
+        exclude_tag_filters=tags_not,
+        untagged_only=untagged_only,
         any_tag=any_tag,
     )
     if projection_fields is not None:
@@ -1596,12 +1640,6 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
     blocked_by_dropped_only = bool(getattr(args, "blocked_by_dropped", False))
     if getattr(args, "list_fields", False):
         return _print_projection_fields("incomplete", blocked_by_dropped=blocked_by_dropped_only)
-    try:
-        tag_filters, any_tag = parse_cli_tag_filters(args)
-    except ValueError as exc:
-        print(f"Error: {exc}")
-        return 1
-
     config = Config.load(args.project_dir)
     store = get_store(config, open_mode="query_only")
     service = _TaskQueryService(store)
@@ -1620,7 +1658,10 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
         days=getattr(args, "days", None),
     )
     try:
-        tag_filters, any_tag = parse_cli_tag_filters(args)
+        tag_filters, _tags_not, any_tag, untagged_only = parse_cli_query_tag_filters(
+            args,
+            any_tag_attr="any_tag",
+        )
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
@@ -1633,6 +1674,7 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
             task_types=(task_type_filter,) if task_type_filter else None,
             dependency_state=("blocked_by_dropped_dep",),
             tag_filters=normalized_tag_filters,
+            untagged_only=untagged_only,
             any_tag=any_tag,
             date_filter=date_filter,
             projection=_TaskProjectionSpec(fields=projection_fields or ("id", "prompt", "status", "task_type", "blocking_id")),
@@ -1643,6 +1685,7 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
             limit=limit,
             task_types=(task_type_filter,) if task_type_filter else None,
             tags=tag_filters,
+            untagged_only=untagged_only,
             any_tag=any_tag,
             max_recovery_attempts=config.max_resume_attempts,
             date_filter=date_filter,
@@ -1754,6 +1797,7 @@ def cmd_incomplete(args: argparse.Namespace) -> int:
         task_type_filter=task_type_filter,
         tag_filters=normalized_tag_filters,
         any_tag=any_tag,
+        untagged_only=untagged_only,
     )
     if blocked_dependents:
         console.print()
@@ -1788,6 +1832,7 @@ def _collect_incomplete_blocked_dependents(
     task_type_filter: str | None,
     tag_filters: tuple[str, ...] | None,
     any_tag: bool,
+    untagged_only: bool,
 ) -> list[tuple[DbTask, DependencyReadiness]]:
     owner_ids: set[str] = set()
     owner_unit_ids: set[str] = set()
@@ -1804,7 +1849,12 @@ def _collect_incomplete_blocked_dependents(
             continue
         if task_type_filter is not None and task.task_type != task_type_filter:
             continue
-        if not task_matches_tag_filters(task_tags=task.tags, tag_filters=tag_filters, any_tag=any_tag):
+        if not _task_matches_cli_tag_scope(
+            task,
+            tag_filters=tag_filters,
+            any_tag=any_tag,
+            untagged_only=untagged_only,
+        ):
             continue
         readiness = store.get_dependency_readiness(task)
         if readiness.ready:
@@ -1905,8 +1955,6 @@ def _normalize_incomplete_result_rows(
     recovery_preview_entries_by_task_id = recovery_preview_entries_by_task_id or {}
     normalized_rows: list[_TaskRow | _LineageRow] = []
     changed = False
-    tag_filters = result.query.tag_filters
-    any_tag = result.query.any_tag
 
     for row in result.rows:
         if not isinstance(row, _LineageRow):
@@ -1945,11 +1993,7 @@ def _normalize_incomplete_result_rows(
         if not unresolved_tasks:
             changed = True
             continue
-        if not task_matches_tag_filters(
-            task_tags=owner_task.tags,
-            tag_filters=tag_filters,
-            any_tag=any_tag,
-        ):
+        if not _task_matches_cli_query_tag_scope(owner_task, result.query):
             changed = True
             continue
 
@@ -1975,6 +2019,9 @@ def _normalize_incomplete_result_rows(
                 recovery_preview_entries_by_task_id=recovery_preview_entries_by_task_id,
                 recovery_preview_read_context=recovery_preview_read_context,
             )
+            if projected_row is None:
+                changed = True
+                continue
             if projected_row.values != row.values:
                 changed = True
             normalized_rows.append(projected_row)
@@ -1998,20 +2045,22 @@ def _normalize_incomplete_result_rows(
             git=git,
             target_branch=target_branch,
         )
-        normalized_rows.append(
-            _apply_incomplete_recovery_identity(
-                projected_row,
-                service=service,
-                query=result.query,
-                store=store,
-                config=config,
-                git=git,
-                target_branch=target_branch,
-                max_recovery_attempts=max_recovery_attempts,
-                recovery_preview_entries_by_task_id=recovery_preview_entries_by_task_id,
-                recovery_preview_read_context=recovery_preview_read_context,
-            )
+        normalized_projection = _apply_incomplete_recovery_identity(
+            projected_row,
+            service=service,
+            query=result.query,
+            store=store,
+            config=config,
+            git=git,
+            target_branch=target_branch,
+            max_recovery_attempts=max_recovery_attempts,
+            recovery_preview_entries_by_task_id=recovery_preview_entries_by_task_id,
+            recovery_preview_read_context=recovery_preview_read_context,
         )
+        if normalized_projection is None:
+            changed = True
+            continue
+        normalized_rows.append(normalized_projection)
 
     if not changed:
         return result
@@ -2030,7 +2079,7 @@ def _apply_incomplete_recovery_identity(
     max_recovery_attempts: int,
     recovery_preview_entries_by_task_id: Mapping[str, DispatchPreviewEntry],
     recovery_preview_read_context: object | None,
-) -> _LineageRow:
+) -> _LineageRow | None:
     recovery_leaf = row.recovery_leaf_task
     if (
         recovery_leaf is None
@@ -2062,6 +2111,9 @@ def _apply_incomplete_recovery_identity(
         )
         if attention_action is not None:
             preview_action = attention_action
+
+    if not _task_matches_cli_query_tag_scope(recovery_leaf, query):
+        return None
 
     recovery_tree = _reroot_lineage_tree_to_task(row.tree, root_task_id=recovery_leaf.id)
 
@@ -2326,7 +2378,7 @@ def cmd_merged(args: argparse.Namespace) -> int:
         return 2
     use_json = bool(getattr(args, "json", False))
     try:
-        tag_filters, any_tag = parse_cli_tag_filters(args)
+        tag_filters, _tags_not, any_tag, untagged_only = parse_cli_query_tag_filters(args)
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
@@ -2351,11 +2403,13 @@ def cmd_merged(args: argparse.Namespace) -> int:
         source=getattr(args, "source", None),
         after=after,
     )
-    if normalized_tag_filters is not None:
+    if normalized_tag_filters is not None or untagged_only:
         filtered_units: list[MergeUnit] = []
         for unit in units:
             owner = store.resolve_merge_unit_owner_task(unit)
             if owner is None:
+                continue
+            if untagged_only and owner.tags:
                 continue
             if task_matches_tag_filters(
                 task_tags=owner.tags,
@@ -2919,7 +2973,7 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
     default_branch = git_client.default_branch()
     current_branch = git_client.current_branch()
     try:
-        tag_filters, any_tag = parse_cli_tag_filters(args)
+        tag_filters, _tags_not, any_tag, untagged_only = parse_cli_query_tag_filters(args)
     except ValueError as exc:
         print(f"Error: {exc}")
         return 1
@@ -3048,10 +3102,11 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
         (_resolve_lineage_owner_task(store, task), task)
         for task in selected_tasks
     ]
-    if normalized_tag_filters is not None:
+    if normalized_tag_filters is not None or untagged_only:
         owner_selected_pairs = [
             (owner, task)
             for owner, task in owner_selected_pairs
+            if not untagged_only or not owner.tags
             if task_matches_tag_filters(
                 task_tags=owner.tags,
                 tag_filters=normalized_tag_filters,

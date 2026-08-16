@@ -554,9 +554,14 @@ def main() -> int:
     )
     incomplete_tag_mode.add_argument(
         "--any-tag",
-        action="store_false",
-        dest="all_tags",
+        action="store_true",
+        dest="any_tag",
         help="With repeated --tag values, match any requested tag (default)",
+    )
+    incomplete_parser.add_argument(
+        "--untagged",
+        action="store_true",
+        help="Match only unresolved rows whose owner has no tags; cannot be combined with tag selector flags",
     )
 
     # unstick command
@@ -742,6 +747,11 @@ def main() -> int:
         dest="all_tags",
         help="With repeated --tag/--tag-not values, require all requested tags instead of the default any-tag matching",
     )
+    search_parser.add_argument(
+        "--untagged",
+        action="store_true",
+        help="Match only tasks with no tags; cannot be combined with tag selector flags",
+    )
 
     # unmerged command
     unmerged_parser = subparsers.add_parser("unmerged", help="List tasks with unmerged work")
@@ -791,6 +801,11 @@ def main() -> int:
         action="store_true",
         dest="all_tags",
         help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
+    )
+    unmerged_parser.add_argument(
+        "--untagged",
+        action="store_true",
+        help="Match only unmerged units whose resolved owner has no tags; cannot be combined with tag selector flags",
     )
     unmerged_parser.add_argument(
         "--all",
@@ -887,6 +902,11 @@ def main() -> int:
         action="store_true",
         dest="all_tags",
         help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
+    )
+    merged_parser.add_argument(
+        "--untagged",
+        action="store_true",
+        help="Match only merged units whose resolved owner has no tags; cannot be combined with tag selector flags",
     )
     merged_parser.add_argument(
         "--list-fields",

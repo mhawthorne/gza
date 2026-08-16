@@ -1239,6 +1239,9 @@ gza merged [options]
 | `--all` | Show full merged history instead of the default last-1-day window |
 | `--last-days N` | Only show units merged in the last N days |
 | `--since DATE` | Only show units merged on or after `YYYY-MM-DD` or another ISO timestamp |
+| `--tag TAG` | Only list merged units whose resolved owner carries a matching tag (repeatable) |
+| `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
+| `--untagged` | Match only merged units whose resolved owner has no tags; cannot be combined with tag selector flags |
 | `--json` | Output structured JSON rows |
 | `--fields CSV` | Projection field override (for example `merge_unit_id,merge_source,branch`) |
 | `--list-fields` | List valid `--fields` values for this command and exit |
@@ -1276,6 +1279,9 @@ gza unmerged [options]
 | `--fetch` | Fetch `origin` before the canonical default-branch refresh so host-side publication or PR metadata can use fresh remote-tracking refs. Canonical merge proof still uses local branch state only. Has no effect with `--into-current` or `--target` |
 | `--into-current` | Compare against the current branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
 | `--target BRANCH` | Compare against the specified branch using live git checks instead of cached default-branch `merge_status`; query-only and never persists reconciliation results |
+| `--tag TAG` | Only list unmerged units whose resolved owner carries a matching tag (repeatable) |
+| `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
+| `--untagged` | Match only unmerged units whose resolved owner has no tags; cannot be combined with tag selector flags |
 | `--json` | Output JSON rows from the unified query API |
 | `--fields CSV` | Projection field override (for example `id,prompt`). In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
 | `--list-fields` | List valid `--fields` values for this command and exit |
@@ -1345,6 +1351,7 @@ gza history [options]
 | `--tag TAG` | Filter by tag (repeatable; matches any requested tag by default) |
 | `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |
 | `--all-tags` | With repeated `--tag` and/or `--tag-not` values, require all requested tags instead of the default any-tag matching |
+| `--untagged` | Match only tasks with no tags; cannot be combined with tag selector flags |
 | `--date-field FIELD` | Date field for date filters: `created`, `completed`, or `effective` (default: `effective`) |
 | `--fields CSV` | Projection field override. In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
 | `--list-fields` | List valid `--fields` values for this command and exit |
@@ -1378,6 +1385,7 @@ gza incomplete [options]
 | `--tag TAG` | Only show unresolved rows matching tag filters (repeatable); recovery rows use the same shared preview scope as `queue`, `watch`, and `advance` |
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 | `--any-tag` | With repeated `--tag` values, match any requested tag explicitly (default) |
+| `--untagged` | Match only unresolved rows whose owner has no tags; cannot be combined with tag selector flags |
 | `--json` | Output JSON rows from the unified query API |
 
 Use `gza incomplete` for unresolved lineage triage. Use the more specific command surfaces when you want one domain only:
@@ -1427,6 +1435,7 @@ gza search <term> [options]
 | `--tag TAG` | Filter by tag (repeatable; matches any requested tag by default) |
 | `--tag-not TAG` | Exclude by tag (repeatable; uses the same all-tags vs any-tag matching mode as `--tag`) |
 | `--all-tags` | With repeated `--tag` and/or `--tag-not` values, require all requested tags instead of the default any-tag matching |
+| `--untagged` | Match only tasks with no tags; cannot be combined with tag selector flags |
 | `--fields CSV` | Projection field override. In text mode, one field prints bare values and multiple fields print `field: value` blocks; in JSON mode rows stay structured objects |
 | `--list-fields` | List valid `--fields` values for this command and exit |
 | `--json` | Output JSON rows from the unified query API |

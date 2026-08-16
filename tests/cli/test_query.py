@@ -2542,6 +2542,28 @@ class TestHistoryCommand:
         assert result.returncode == 0
         assert f"gza work {orphaned_task.id}" in result.stdout
 
+    def test_history_untagged_filters_orphaned_rows(self, tmp_path: Path) -> None:
+        """History --untagged should only render untagged orphaned tasks."""
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        untagged_orphaned = store.add("Untagged orphaned task", task_type="implement")
+        mark_orphaned(store, untagged_orphaned)
+
+        tagged_orphaned = store.add(
+            "Tagged orphaned task",
+            task_type="implement",
+            tags=("release",),
+        )
+        mark_orphaned(store, tagged_orphaned)
+
+        result = invoke_gza("history", "--untagged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Untagged orphaned task" in result.stdout
+        assert "Tagged orphaned task" not in result.stdout
+
     def test_history_no_orphaned_when_status_filter_set(self, tmp_path: Path):
         """History command does not show orphaned tasks when --status filter is active."""
 
@@ -3488,6 +3510,95 @@ class TestSearchCommand:
         rows = json.loads(json_result.stdout)
         prompts = [row["prompt"] for row in rows]
         assert prompts == ["Tagged search task"]
+
+    def test_search_untagged_filter_matches_only_tasks_without_tags_in_text_and_json(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        untagged = store.add("Pending untagged search task", task_type="implement")
+        tagged = store.add("Pending tagged search task", task_type="implement", tags=("release",))
+        completed = store.add("Completed untagged search task", task_type="implement")
+        completed.status = "completed"
+        completed.completed_at = datetime.now(UTC)
+        store.update(completed)
+
+        text_result = invoke_gza(
+            "search",
+            "search task",
+            "--status",
+            "pending",
+            "--untagged",
+            "-n",
+            "0",
+            "--project",
+            str(tmp_path),
+        )
+        json_result = invoke_gza(
+            "search",
+            "search task",
+            "--status",
+            "pending",
+            "--untagged",
+            "--json",
+            "--fields",
+            "id,prompt,tags,status",
+            "-n",
+            "0",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert text_result.returncode == 0
+        assert untagged.prompt in text_result.stdout
+        assert tagged.prompt not in text_result.stdout
+        assert completed.prompt not in text_result.stdout
+
+        assert json_result.returncode == 0
+        assert json.loads(json_result.stdout) == [
+            {
+                "id": untagged.id,
+                "prompt": untagged.prompt,
+                "tags": [],
+                "status": "pending",
+            }
+        ]
+
+    @pytest.mark.parametrize(
+        ("argv", "expected_message"),
+        [
+            (
+                ("search", "needle", "--untagged", "--tag", "release"),
+                "Error: --untagged cannot be combined with --tag",
+            ),
+            (
+                ("search", "needle", "--untagged", "--tag-not", "release"),
+                "Error: --untagged cannot be combined with --tag-not",
+            ),
+            (
+                ("search", "needle", "--untagged", "--all-tags"),
+                "Error: --untagged cannot be combined with --all-tags",
+            ),
+            (
+                ("incomplete", "--untagged", "--any-tag"),
+                "Error: --untagged cannot be combined with --any-tag",
+            ),
+        ],
+    )
+    def test_query_untagged_rejects_conflicting_tag_selector_flags(
+        self,
+        tmp_path: Path,
+        argv: tuple[str, ...],
+        expected_message: str,
+    ) -> None:
+        setup_config(tmp_path)
+
+        result = invoke_gza(*argv, "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert expected_message in result.stdout
 
     def test_search_negative_filters_cover_status_type_tag_and_lineage(self, tmp_path: Path):
         setup_config(tmp_path)
@@ -17917,6 +18028,7 @@ class TestIncompleteCommand:
         tree: bool = False,
         tags: list[str] | None = None,
         all_tags: bool = False,
+        untagged_only: bool = False,
     ) -> argparse.Namespace:
         return argparse.Namespace(
             project_dir=tmp_path,
@@ -17932,6 +18044,7 @@ class TestIncompleteCommand:
             fields=fields,
             tags=tags,
             all_tags=all_tags,
+            untagged=untagged_only,
         )
 
     @staticmethod
@@ -18087,6 +18200,97 @@ class TestIncompleteCommand:
         assert orphan.id is not None
 
         return owner, orphan
+
+    @staticmethod
+    def _setup_incomplete_untagged_owner_with_tagged_failed_descendant_fixture(tmp_path: Path) -> tuple[Task, Task]:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        owner = store.add("Untagged owner with tagged failed descendant", task_type="implement")
+        owner.status = "in_progress"
+        owner.branch = "feature/cli-untagged-owner-descendant"
+        owner.has_commits = True
+        store.update(owner)
+        assert owner.id is not None
+
+        descendant = store.add(
+            "Tagged failed descendant",
+            task_type="improve",
+            based_on=owner.id,
+            tags=("alpha",),
+        )
+        descendant.status = "failed"
+        descendant.completed_at = datetime.now(UTC)
+        descendant.failure_reason = "TEST_FAILURE"
+        store.update(descendant)
+        assert descendant.id is not None
+
+        return owner, descendant
+
+    @staticmethod
+    def _setup_incomplete_untagged_owner_with_tagged_orphan_fixture(tmp_path: Path) -> tuple[Task, Task]:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        owner = store.add("Untagged owner with tagged orphan", task_type="implement")
+        owner.status = "in_progress"
+        owner.branch = "feature/cli-untagged-owner-orphan"
+        owner.has_commits = True
+        store.update(owner)
+        assert owner.id is not None
+
+        orphan = store.add(
+            "Tagged orphan same-branch descendant",
+            task_type="rebase",
+            based_on=owner.id,
+            same_branch=True,
+            tags=("alpha",),
+        )
+        orphan.status = "completed"
+        orphan.completed_at = datetime.now(UTC)
+        orphan.has_commits = True
+        orphan.branch = "feature/cli-untagged-owner-orphan-as-17"
+        orphan.merge_status = "unmerged"
+        store.update(orphan)
+        assert orphan.id is not None
+
+        return owner, orphan
+
+    @staticmethod
+    def _setup_incomplete_untagged_owner_reroot_fixture(tmp_path: Path) -> tuple[Task, Task, Task]:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        plan = store.add("tagged owner reroot plan", task_type="plan")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+        assert plan.id is not None
+
+        impl = store.add(
+            "Tagged implementation owner",
+            task_type="implement",
+            based_on=plan.id,
+            tags=("alpha",),
+        )
+        impl.status = "in_progress"
+        impl.branch = "feature/tagged-owner-reroot"
+        impl.has_commits = True
+        store.update(impl)
+        assert impl.id is not None
+
+        failed_descendant = store.add(
+            "Untagged failed descendant",
+            task_type="improve",
+            based_on=impl.id,
+        )
+        failed_descendant.status = "failed"
+        failed_descendant.completed_at = datetime.now(UTC)
+        failed_descendant.failure_reason = "TEST_FAILURE"
+        store.update(failed_descendant)
+        assert failed_descendant.id is not None
+
+        return plan, impl, failed_descendant
 
     @staticmethod
     def _setup_incomplete_re_root_tag_fixture(
@@ -18370,6 +18574,132 @@ class TestIncompleteCommand:
         assert all_tags_result.returncode == 0
         assert json.loads(all_tags_result.stdout) == [{"id": tasks["both"].id}]
 
+    def test_incomplete_untagged_filter_matches_only_untagged_owner_rows(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        untagged = store.add("Untagged failed owner", task_type="implement")
+        untagged.status = "failed"
+        untagged.completed_at = datetime.now(UTC)
+        untagged.failure_reason = "TEST_FAILURE"
+        store.update(untagged)
+
+        tagged = store.add("Tagged failed owner", task_type="implement", tags=("alpha",))
+        tagged.status = "failed"
+        tagged.completed_at = datetime.now(UTC)
+        tagged.failure_reason = "TEST_FAILURE"
+        store.update(tagged)
+
+        result = invoke_gza(
+            "incomplete",
+            "--json",
+            "--fields",
+            "id,tags",
+            "--last",
+            "0",
+            "--untagged",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == [{"id": untagged.id, "tags": []}]
+
+    def test_incomplete_json_untagged_keeps_untagged_owner_with_tagged_failed_descendant(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        owner, descendant = self._setup_incomplete_untagged_owner_with_tagged_failed_descendant_fixture(tmp_path)
+
+        result = query_cli.cmd_incomplete(
+            self._incomplete_args(tmp_path, fields="id,tags,unresolved_ids", json=True, untagged_only=True)
+        )
+        captured = capsys.readouterr()
+
+        assert result == 0
+        assert json.loads(captured.out) == [
+            {
+                "id": owner.id,
+                "tags": [],
+                "unresolved_ids": [descendant.id],
+            }
+        ]
+
+    def test_incomplete_json_untagged_keeps_untagged_owner_with_tagged_orphan_same_branch_descendant(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        owner, orphan = self._setup_incomplete_untagged_owner_with_tagged_orphan_fixture(tmp_path)
+
+        result = query_cli.cmd_incomplete(
+            self._incomplete_args(tmp_path, fields="id,tags,unresolved_ids", json=True, untagged_only=True)
+        )
+        captured = capsys.readouterr()
+
+        assert result == 0
+        assert json.loads(captured.out) == [
+            {
+                "id": owner.id,
+                "tags": [],
+                "unresolved_ids": [orphan.id],
+            }
+        ]
+
+    def test_incomplete_normalization_drops_tagged_rerooted_owner_for_untagged_query(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        plan, impl, failed_descendant = self._setup_incomplete_untagged_owner_reroot_fixture(tmp_path)
+
+        config = query_cli.Config.load(tmp_path)
+        store = query_cli.get_store(config, open_mode="readwrite")
+        service = query_cli._TaskQueryService(store)
+        result = service.run(
+            query_cli._TaskQueryPresets.incomplete(limit=None, untagged_only=True),
+            config=config,
+            git=None,
+            target_branch="main",
+        )
+
+        assert len(result.rows) == 1
+        row = result.rows[0]
+        assert row.owner_task.id == plan.id
+        assert {task.id for task in row.unresolved_tasks} == {failed_descendant.id}
+
+        normalized = query_cli._normalize_incomplete_result_rows(  # noqa: SLF001
+            result,
+            service=service,
+            store=store,
+            config=config,
+            git=None,
+            target_branch="main",
+        )
+
+        assert normalized.rows == ()
+        assert impl.tags == ("alpha",)
+
+    def test_incomplete_untagged_filter_drops_tagged_owner_after_normalization(self, tmp_path: Path) -> None:
+        _plan, impl, _failed_descendant = self._setup_incomplete_untagged_owner_reroot_fixture(tmp_path)
+
+        result = invoke_gza(
+            "incomplete",
+            "--untagged",
+            "--json",
+            "--fields",
+            "id,tags",
+            "--last",
+            "0",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert json.loads(result.stdout) == []
+        assert result.stderr == ""
+        assert impl.tags == ("alpha",)
+
     def test_incomplete_tag_filter_excludes_owner_when_only_descendant_matches_in_json(
         self,
         tmp_path: Path,
@@ -18443,6 +18773,37 @@ class TestIncompleteCommand:
         assert "Blocked dependents:" in result.stdout
         assert tasks["dependent_alpha"].id in result.stdout
         assert tasks["dependent_beta"].id not in result.stdout
+
+    def test_incomplete_untagged_filters_blocked_dependents_section(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        owner = store.add("Untagged failed owner", task_type="implement")
+        owner.status = "failed"
+        owner.completed_at = datetime.now(UTC)
+        owner.failure_reason = "TEST_FAILURE"
+        store.update(owner)
+        assert owner.id is not None
+
+        untagged_dependent = store.add(
+            "Untagged blocked dependent",
+            task_type="implement",
+            depends_on=owner.id,
+        )
+        tagged_dependent = store.add(
+            "Tagged blocked dependent",
+            task_type="implement",
+            depends_on=owner.id,
+            tags=("release",),
+        )
+
+        result = invoke_gza("incomplete", "--untagged", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert "Blocked dependents:" in result.stdout
+        assert untagged_dependent.id in result.stdout
+        assert tagged_dependent.id not in result.stdout
+        assert "Tagged blocked dependent" not in result.stdout
 
     def test_incomplete_json_tag_filters_keep_owner_when_only_owner_matches(
         self,
@@ -19448,6 +19809,79 @@ class TestIncompleteCommand:
         assert row.lifecycle_action_task is not None
         assert row.lifecycle_action_task.id == completed_retry.id
         assert {task.id for task in row.unresolved_tasks} == {completed_retry.id}
+
+    def test_incomplete_recovery_reroot_drops_tagged_owner_for_untagged_query(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        failed = store.add("Failed untagged recovery owner", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "TIMEOUT"
+        failed.completed_at = datetime(2026, 5, 11, 10, 0, tzinfo=UTC)
+        failed.branch = "feature/recovery-owner"
+        failed.has_commits = True
+        store.update(failed)
+
+        completed_retry = store.add(
+            "Tagged completed retry on same branch",
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+            tags=("alpha",),
+        )
+        assert completed_retry.id is not None
+        completed_retry.status = "completed"
+        completed_retry.completed_at = datetime(2026, 5, 11, 11, 0, tzinfo=UTC)
+        completed_retry.branch = failed.branch
+        completed_retry.has_commits = True
+        completed_retry.merge_status = "unmerged"
+        store.update(completed_retry)
+
+        config = query_cli.Config.load(tmp_path)
+        service = query_cli._TaskQueryService(store)
+        preview_entry = query_cli.DispatchPreviewEntry(
+            lane="recovery",
+            task=failed,
+            runnable=True,
+            worker_consuming=True,
+            owner_task=failed,
+            decision=_recovery_engine_module.FailedRecoveryDecision(
+                task_id=completed_retry.id,
+                action="retry",
+                reason_code="retryable-provider-error",
+                reason_text="retryable provider error",
+                launch_mode="worker",
+                attempt_index=0,
+                attempt_limit=3,
+            ),
+        )
+        row = query_cli._LineageRow(
+            owner_task=failed,
+            members=(failed, completed_retry),
+            tree=None,
+            unresolved_tasks=(completed_retry,),
+            lifecycle_action_task=completed_retry,
+            recovery_leaf_task=completed_retry,
+        )
+
+        rerooted = query_cli._apply_incomplete_recovery_identity(  # noqa: SLF001
+            row,
+            service=service,
+            query=query_cli._TaskQueryPresets.incomplete(limit=None, untagged_only=True),
+            store=store,
+            config=config,
+            git=None,
+            target_branch="main",
+            max_recovery_attempts=3,
+            recovery_preview_entries_by_task_id={completed_retry.id: preview_entry},
+            recovery_preview_read_context=None,
+        )
+
+        assert rerooted is None
 
     def test_incomplete_same_branch_re_root_recomputes_stale_needs_attention_reason_from_live_carrier(
         self,

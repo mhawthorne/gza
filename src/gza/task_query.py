@@ -98,6 +98,7 @@ class TaskQuery:
     merge_unit_ids: tuple[str, ...] | None = None
     tag_filters: tuple[str, ...] | None = None
     exclude_tag_filters: tuple[str, ...] | None = None
+    untagged_only: bool = False
     any_tag: bool = True
     pickup_only: bool = False
     max_recovery_attempts: int | None = None
@@ -344,6 +345,7 @@ class TaskQueryPresets:
         limit: int | None = 5,
         task_types: tuple[str, ...] | None = None,
         tags: tuple[str, ...] | None = None,
+        untagged_only: bool = False,
         any_tag: bool = True,
         max_recovery_attempts: int | None = None,
         date_filter: DateFilter | None = None,
@@ -355,6 +357,7 @@ class TaskQueryPresets:
             task_types=task_types,
             lifecycle_state=("incomplete",),
             tag_filters=normalize_tag_filters(tags),
+            untagged_only=untagged_only,
             any_tag=any_tag,
             max_recovery_attempts=max_recovery_attempts,
             date_filter=date_filter,
@@ -559,6 +562,7 @@ class TaskQueryService:
                     task_types=query.task_types,
                     exclude_task_types=query.exclude_task_types,
                     tags=query.tag_filters,
+                    untagged_only=query.untagged_only,
                     any_tag=query.any_tag,
                     max_recovery_attempts=query.max_recovery_attempts,
                     date_filter=query.date_filter,
@@ -611,6 +615,7 @@ class TaskQueryService:
                     merge_unit_ids=query.merge_unit_ids,
                     tag_filters=query.tag_filters,
                     exclude_tag_filters=query.exclude_tag_filters,
+                    untagged_only=query.untagged_only,
                     any_tag=query.any_tag,
                     pickup_only=query.pickup_only,
                     date_filter=query.date_filter,
@@ -682,6 +687,7 @@ class TaskQueryService:
             and query.merge_unit_ids is None
             and query.tag_filters is None
             and query.exclude_tag_filters is None
+            and not query.untagged_only
             and not query.pickup_only
             and query.max_recovery_attempts is None
             and query.date_filter is None
@@ -829,6 +835,8 @@ class TaskQueryService:
 
         if query.tag_filters is not None or query.exclude_tag_filters is not None:
             filtered = [task for task in filtered if self._matches_tag_filters(task, query)]
+        elif query.untagged_only:
+            filtered = [task for task in filtered if self._matches_tag_filters(task, query)]
 
         if query.merge_chain_state is not None:
             merge_states = set(query.merge_chain_state)
@@ -847,6 +855,9 @@ class TaskQueryService:
         return filtered
 
     def _matches_tag_filters(self, task: DbTask, query: TaskQuery) -> bool:
+        if query.untagged_only and task.tags:
+            return False
+
         if query.tag_filters is not None:
             required = normalize_tag_filters(query.tag_filters)
             if not task_matches_tag_filters(task_tags=task.tags, tag_filters=required, any_tag=query.any_tag):

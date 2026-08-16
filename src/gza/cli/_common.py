@@ -321,6 +321,44 @@ def validate_cli_tag_values(values: tuple[str, ...] | list[str] | None) -> tuple
     return tuple(_validate_tag_value(raw) for raw in (values or ()))
 
 
+def parse_cli_query_tag_filters(
+    args: argparse.Namespace,
+    *,
+    tags_attr: str = "tags",
+    tags_not_attr: str = "tags_not",
+    all_tags_attr: str = "all_tags",
+    any_tag_attr: str | None = None,
+    untagged_attr: str = "untagged",
+) -> tuple[tuple[str, ...] | None, tuple[str, ...] | None, bool, bool]:
+    """Parse query tag filters, including untagged-only selection and conflicts."""
+    tags = validate_cli_tag_values(tuple(getattr(args, tags_attr, None) or ())) or None
+    tags_not = validate_cli_tag_values(tuple(getattr(args, tags_not_attr, None) or ())) or None
+    untagged_only = bool(getattr(args, untagged_attr, False))
+    all_tags = bool(getattr(args, all_tags_attr, False))
+    any_tag_requested = bool(getattr(args, any_tag_attr, False)) if any_tag_attr is not None else False
+
+    if untagged_only:
+        conflicts: list[str] = []
+        if tags:
+            conflicts.append("--tag")
+        if tags_not:
+            conflicts.append("--tag-not")
+        if all_tags:
+            conflicts.append("--all-tags")
+        if any_tag_requested:
+            conflicts.append("--any-tag")
+        if conflicts:
+            if len(conflicts) == 1:
+                conflict_text = conflicts[0]
+            elif len(conflicts) == 2:
+                conflict_text = f"{conflicts[0]} or {conflicts[1]}"
+            else:
+                conflict_text = f"{', '.join(conflicts[:-1])}, or {conflicts[-1]}"
+            raise ValueError(f"--untagged cannot be combined with {conflict_text}")
+
+    return tags, tags_not, not all_tags, untagged_only
+
+
 def format_no_runnable_message_for_tags(
     store: SqliteTaskStore,
     tags: tuple[str, ...],
@@ -4977,6 +5015,11 @@ def _add_query_filter_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         dest="all_tags",
         help="With repeated --tag/--tag-not values, require all requested tags instead of the default any-tag matching",
+    )
+    parser.add_argument(
+        "--untagged",
+        action="store_true",
+        help="Match only tasks with no tags; cannot be combined with tag selector flags",
     )
 
 

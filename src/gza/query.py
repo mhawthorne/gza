@@ -55,6 +55,7 @@ class HistoryFilter:
     lineage_depth: int = 0  # Expand lineage N levels (0 = flat)
     tags: tuple[str, ...] | None = None
     tags_not: tuple[str, ...] | None = None
+    untagged_only: bool = False
     any_tag: bool = True
 
 
@@ -178,6 +179,7 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
             branch_owner_mode=q.branch_owner_mode,
             tag_filters=f.tags,
             exclude_tag_filters=f.tags_not,
+            untagged_only=f.untagged_only,
             any_tag=f.any_tag,
             date_filter=q.date_filter,
             sort=q.sort,
@@ -205,6 +207,7 @@ def query_history(store: SqliteTaskStore, f: HistoryFilter) -> list[Task]:
             branch_owner_mode=q.branch_owner_mode,
             tag_filters=f.tags,
             exclude_tag_filters=f.tags_not,
+            untagged_only=f.untagged_only,
             any_tag=f.any_tag,
             date_filter=q.date_filter,
             sort=q.sort,
@@ -444,6 +447,7 @@ def query_incomplete(
             exclude_task_types=(f.task_type_not,) if f.task_type_not else None,
             tags=normalize_tag_filters(f.tags),
             exclude_tags=normalize_tag_filters(f.tags_not),
+            untagged_only=f.untagged_only,
             any_tag=f.any_tag,
             date_filter=date_filter,
             include_skipped=True,
