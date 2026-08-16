@@ -2,6 +2,7 @@
 
 import importlib
 import inspect
+import sqlite3
 from dataclasses import fields, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -94,6 +95,27 @@ def test_search_untagged_only_filters_out_tagged_tasks(tmp_path: Path) -> None:
     prompts = [row.task.prompt for row in result.rows if hasattr(row, "task")]
     assert untagged.prompt in prompts
     assert tagged.prompt not in prompts
+
+
+def test_query_only_untagged_only_treats_legacy_group_as_effective_tag(tmp_path: Path) -> None:
+    db_path = tmp_path / "test.db"
+    store = SqliteTaskStore(db_path)
+    legacy = store.add("needle legacy group", task_type="implement")
+    untagged = store.add("needle untagged", task_type="implement")
+    assert legacy.id is not None
+    assert untagged.id is not None
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute('UPDATE tasks SET "group" = ? WHERE id = ?', ("legacy", legacy.id))
+        conn.execute("DELETE FROM task_tags WHERE task_id = ?", (legacy.id,))
+
+    query_store = SqliteTaskStore(db_path, open_mode="query_only")
+    service = TaskQueryService(query_store)
+    result = service.run(replace(TaskQueryPresets.search("needle", limit=None), untagged_only=True))
+
+    ids = [row.task.id for row in result.rows if isinstance(row, TaskRow)]
+    assert untagged.id in ids
+    assert legacy.id not in ids
 
 
 def test_task_query_service_run_emits_metrics_without_private_helper_metrics(

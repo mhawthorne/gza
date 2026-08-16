@@ -7,7 +7,8 @@ import json
 import os
 import re
 import signal as signal_mod
-from contextlib import contextmanager
+import sqlite3
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -1218,6 +1219,428 @@ class TestEditCommand:
         assert updated is not None
         assert updated.auto_implement is False
         assert updated.tags == ("backend",)
+
+
+class TestRetagCommand:
+    @staticmethod
+    def _force_legacy_group_without_task_tags(tmp_path: Path, task_id: str, tag: str = "legacy") -> tuple[str, str, str]:
+        db_path = tmp_path / ".gza" / "gza.db"
+        with sqlite3.connect(db_path) as conn:
+            conn.execute('UPDATE tasks SET "group" = ? WHERE id = ?', (tag, task_id))
+            conn.execute("DELETE FROM task_tags WHERE task_id = ?", (task_id,))
+            row = conn.execute('SELECT prompt, status, "group" FROM tasks WHERE id = ?', (task_id,)).fetchone()
+            assert row is not None
+            return tuple(str(value) for value in row)
+
+    @staticmethod
+    def _task_tag_rows(tmp_path: Path, task_id: str) -> tuple[str, ...]:
+        db_path = tmp_path / ".gza" / "gza.db"
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute("SELECT tag FROM task_tags WHERE task_id = ? ORDER BY tag ASC", (task_id,)).fetchall()
+            return tuple(str(row[0]) for row in rows)
+
+    @staticmethod
+    def _task_row_state(tmp_path: Path, task_id: str) -> tuple[str, str, str]:
+        db_path = tmp_path / ".gza" / "gza.db"
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute('SELECT prompt, status, "group" FROM tasks WHERE id = ?', (task_id,)).fetchone()
+            assert row is not None
+            return tuple(str(value) for value in row)
+
+    def test_retag_add_tag_updates_every_match(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        first = store.add("First release task", tags=("v0.6.0",))
+        second = store.add("Second release task", tags=("v0.6.0", "ops"))
+        untouched = store.add("Other task", tags=("backlog",))
+
+        result = invoke_gza(
+            "retag",
+            "--tag",
+            "v0.6.0",
+            "--add-tag",
+            "ship-blocker",
+            "--yes",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert f"  {first.id}" in result.stdout
+        assert f"  {second.id}" in result.stdout
+        assert "Mutation: add tag 'ship-blocker'" in result.stdout
+        assert "Updated 2 task(s)." in result.stdout
+
+        assert store.get(first.id).tags == ("ship-blocker", "v0.6.0")
+        assert store.get(second.id).tags == ("ops", "ship-blocker", "v0.6.0")
+        assert store.get(untouched.id).tags == ("backlog",)
+
+    def test_retag_remove_tag_updates_every_match(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        first = store.add("First release task", tags=("ops", "v0.6.0"))
+        second = store.add("Second release task", tags=("v0.6.0",))
+
+        result = invoke_gza(
+            "retag",
+            "--tag",
+            "v0.6.0",
+            "--remove-tag",
+            "v0.6.0",
+            "--yes",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "Mutation: remove tag 'v0.6.0'" in result.stdout
+        assert "Updated 2 task(s)." in result.stdout
+
+        assert store.get(first.id).tags == ("ops",)
+        assert store.get(second.id).tags == ()
+
+    def test_retag_replace_tag_swaps_matching_rows(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        completed = store.add("Completed release task", tags=("v0.6.0",))
+        completed.status = "completed"
+        completed.completed_at = datetime.now(UTC)
+        store.update(completed)
+
+        failed = store.add("Failed release task", tags=("ops", "v0.6.0"))
+        failed.status = "failed"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+
+        untouched = store.add("Backlog task", tags=("backlog",))
+
+        result = invoke_gza(
+            "retag",
+            "--status",
+            "completed,failed",
+            "--replace-tag",
+            "v0.6.0",
+            "v0.6.1",
+            "--yes",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "Mutation: replace tag 'v0.6.0' with 'v0.6.1'" in result.stdout
+        assert "Updated 2 task(s)." in result.stdout
+
+        assert store.get(completed.id).tags == ("v0.6.1",)
+        assert store.get(failed.id).tags == ("ops", "v0.6.1")
+        assert store.get(untouched.id).tags == ("backlog",)
+
+    def test_retag_requires_selection_filters(self, tmp_path: Path):
+        setup_config(tmp_path)
+        make_store(tmp_path).add("Unscoped task", tags=("v0.6.0",))
+
+        result = invoke_gza("retag", "--add-tag", "v0.6.1", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "retag requires at least one selection filter" in result.stdout
+
+    @pytest.mark.parametrize(
+        ("flag", "value"),
+        [
+            ("--status", ","),
+            ("--status", " , \t "),
+            ("--type", ","),
+            ("--type", " , \t "),
+        ],
+    )
+    def test_retag_rejects_empty_csv_selection_without_mutating(
+        self, tmp_path: Path, flag: str, value: str
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Unscoped task", tags=("v0.6.0",))
+
+        result = invoke_gza("retag", flag, value, "--add-tag", "v0.6.1", "--yes", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "retag requires at least one selection filter" in result.stdout
+        assert store.get(task.id).tags == ("v0.6.0",)
+
+    @pytest.mark.parametrize(
+        "selector_flags",
+        [
+            ("--untagged", "--tag", "v0.6.0"),
+            ("--untagged", "--tag", "v0.6.0", "--all-tags"),
+        ],
+    )
+    def test_retag_untagged_tag_conflicts_use_shared_error_without_mutating(
+        self, tmp_path: Path, selector_flags: tuple[str, ...]
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Tagged task", tags=("v0.6.0",))
+
+        result = invoke_gza("retag", *selector_flags, "--add-tag", "v0.6.1", "--yes", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "Error: --untagged cannot be combined with --tag" in result.stdout
+        assert store.get(task.id).tags == ("v0.6.0",)
+
+    def test_retag_untagged_all_tags_conflict_uses_shared_error_without_mutating(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Untagged task")
+
+        result = invoke_gza(
+            "retag",
+            "--untagged",
+            "--all-tags",
+            "--add-tag",
+            "v0.6.1",
+            "--yes",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "Error: --untagged cannot be combined with --all-tags" in result.stdout
+        assert store.get(task.id).tags == ()
+
+    def test_retag_mutations_are_mutually_exclusive(self, tmp_path: Path):
+        setup_config(tmp_path)
+
+        result = invoke_gza(
+            "retag",
+            "--tag",
+            "v0.6.0",
+            "--add-tag",
+            "v0.6.1",
+            "--remove-tag",
+            "v0.6.0",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 2
+        assert "not allowed with argument" in result.stderr
+
+    def test_retag_untagged_selection_matches_only_rows_without_tags(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        untagged = store.add("Untagged release task")
+        tagged = store.add("Tagged release task", tags=("ops",))
+
+        result = invoke_gza(
+            "retag",
+            "--untagged",
+            "--add-tag",
+            "triage",
+            "--yes",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert f"  {untagged.id}" in result.stdout
+        assert f"  {tagged.id}" not in result.stdout
+        assert store.get(untagged.id).tags == ("triage",)
+        assert store.get(tagged.id).tags == ("ops",)
+
+    def test_retag_untagged_yes_skips_legacy_group_without_task_tags(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Legacy-group task")
+        before_row = self._force_legacy_group_without_task_tags(tmp_path, task.id, tag="legacy")
+        assert self._task_tag_rows(tmp_path, task.id) == ()
+
+        result = invoke_gza(
+            "retag",
+            "--untagged",
+            "--add-tag",
+            "triage",
+            "--yes",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert f"  {task.id}" not in result.stdout
+        assert "Matched 0 task(s):" in result.stdout
+        assert "Updated" not in result.stdout
+        assert "No changes applied." in result.stdout
+        assert self._task_row_state(tmp_path, task.id) == before_row
+        assert self._task_tag_rows(tmp_path, task.id) == ()
+
+    def test_retag_dry_run_does_not_persist_changes(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Release task", tags=("v0.6.0",))
+
+        result = invoke_gza(
+            "retag",
+            "--tag",
+            "v0.6.0",
+            "--replace-tag",
+            "v0.6.0",
+            "v0.6.1",
+            "--dry-run",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert "[dry-run] No changes applied." in result.stdout
+        assert store.get(task.id).tags == ("v0.6.0",)
+
+    def test_retag_requires_confirmation_without_yes(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        task = store.add("Release task", tags=("v0.6.0",))
+
+        with patch("builtins.input", return_value="n") as input_mock:
+            result = invoke_gza(
+                "retag",
+                "--tag",
+                "v0.6.0",
+                "--remove-tag",
+                "v0.6.0",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 1
+        assert "No changes applied." in result.stdout
+        input_mock.assert_called_once_with("\nProceed? [y/N] ")
+        assert store.get(task.id).tags == ("v0.6.0",)
+
+    def test_retag_confirmed_write_preserves_concurrent_non_tag_and_unrelated_tag_changes(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Original prompt", tags=("v0.6.0",))
+
+        def confirm_after_concurrent_change(_prompt: str) -> str:
+            concurrent = store.get(task.id)
+            assert concurrent is not None
+            concurrent.status = "failed"
+            concurrent.prompt = "Concurrent prompt"
+            concurrent.completed_at = datetime.now(UTC)
+            store.update(concurrent)
+            store.add_task_tags(task.id, ("operator",))
+            return "y"
+
+        with patch("builtins.input", side_effect=confirm_after_concurrent_change):
+            result = invoke_gza(
+                "retag",
+                "--tag",
+                "v0.6.0",
+                "--add-tag",
+                "release",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert "Updated 1 task(s)." in result.stdout
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.prompt == "Concurrent prompt"
+        assert refreshed.status == "failed"
+        assert refreshed.tags == ("operator", "release", "v0.6.0")
+
+    def test_retag_confirmed_write_skips_task_deleted_after_preview(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Pending untagged task")
+        assert task.id is not None
+
+        def confirm_after_delete(_prompt: str) -> str:
+            assert store.delete(task.id)
+            return "yes"
+
+        with patch("builtins.input", side_effect=confirm_after_delete):
+            result = invoke_gza(
+                "retag",
+                "--status",
+                "pending",
+                "--add-tag",
+                "triage",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert f"  {task.id}" in result.stdout
+        assert "Updated 0 task(s)." in result.stdout
+        assert f"Skipped missing IDs: {task.id}" in result.stdout
+        assert store.get(task.id) is None
+        assert self._task_tag_rows(tmp_path, task.id) == ()
+
+    def test_retag_replace_uses_current_tags_after_confirmation(self, tmp_path: Path):
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Release task", tags=("old",))
+
+        def confirm_after_old_tag_removed(_prompt: str) -> str:
+            store.remove_task_tags(task.id, ("old",))
+            return "yes"
+
+        with patch("builtins.input", side_effect=confirm_after_old_tag_removed):
+            result = invoke_gza(
+                "retag",
+                "--tag",
+                "old",
+                "--replace-tag",
+                "old",
+                "new",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 0
+        assert "Updated 0 task(s)." in result.stdout
+        assert store.get(task.id).tags == ()
+
+    @pytest.mark.parametrize("confirmation_args", [("--dry-run",), ()])
+    def test_retag_preview_exits_do_not_open_writable_store_or_run_startup_repairs(
+        self, tmp_path: Path, confirmation_args: tuple[str, ...]
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Legacy-group task")
+        before_row = self._force_legacy_group_without_task_tags(tmp_path, task.id, tag="legacy")
+        assert self._task_tag_rows(tmp_path, task.id) == ()
+
+        open_modes: list[str] = []
+        original_get_store = _execution_module.get_store
+
+        def recording_get_store(config: Config, *, open_mode: str = "readwrite"):
+            open_modes.append(open_mode)
+            if open_mode == "readwrite":
+                raise AssertionError("retag preview exit opened a writable store")
+            return original_get_store(config, open_mode=open_mode)
+
+        input_context = patch("builtins.input", return_value="n") if not confirmation_args else nullcontext()
+        with patch("gza.cli.execution.get_store", side_effect=recording_get_store), input_context:
+            result = invoke_gza(
+                "retag",
+                "--status",
+                "pending",
+                "--add-tag",
+                "release",
+                *confirmation_args,
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == (0 if confirmation_args else 1)
+        assert open_modes == ["query_only"]
+        assert self._task_row_state(tmp_path, task.id) == before_row
+        assert self._task_tag_rows(tmp_path, task.id) == ()
 
     def test_edit_auto_implement_rejects_non_plan_task_with_legacy_message(self, tmp_path: Path):
         """Legacy alias preserves its plan-only validation message on non-plan tasks."""

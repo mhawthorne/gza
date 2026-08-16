@@ -71,6 +71,7 @@ from .execution import (
     cmd_plan_improve,
     cmd_plan_review,
     cmd_resume,
+    cmd_retag,
     cmd_retry,
     cmd_review,
     cmd_run,
@@ -2194,6 +2195,74 @@ def main() -> int:
     )
     add_common_args(edit_parser)
 
+    retag_parser = subparsers.add_parser(
+        "retag",
+        help="Bulk-edit tags across tasks selected by query filters",
+        description=(
+            "Select tasks by shared query filters and apply one tag mutation across the matched set. "
+            "Selection filters are required; this command never defaults to all tasks."
+        ),
+    )
+    retag_parser.add_argument(
+        "--tag",
+        action="append",
+        dest="tags",
+        metavar="TAG",
+        help="Select tasks carrying TAG (repeatable; matches any requested tag by default)",
+    )
+    retag_parser.add_argument(
+        "--untagged",
+        action="store_true",
+        help="Select tasks with no tags",
+    )
+    retag_parser.add_argument(
+        "--status",
+        metavar="CSV",
+        help="Select statuses (comma-separated, same syntax as search)",
+    )
+    retag_parser.add_argument(
+        "--type",
+        metavar="CSV",
+        help="Select task types (comma-separated, same syntax as search)",
+    )
+    retag_parser.add_argument(
+        "--all-tags",
+        action="store_true",
+        dest="all_tags",
+        help="With repeated --tag values, require all requested tags instead of the default any-tag matching",
+    )
+    mutation_group = retag_parser.add_mutually_exclusive_group(required=True)
+    mutation_group.add_argument(
+        "--add-tag",
+        metavar="TAG",
+        dest="add_tag",
+        help="Add TAG to every matched task",
+    )
+    mutation_group.add_argument(
+        "--remove-tag",
+        metavar="TAG",
+        dest="remove_tag",
+        help="Remove TAG from every matched task",
+    )
+    mutation_group.add_argument(
+        "--replace-tag",
+        nargs=2,
+        metavar=("OLD", "NEW"),
+        dest="replace_tag",
+        help="Atomically replace OLD with NEW on matched tasks that currently carry OLD",
+    )
+    retag_parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Skip the confirmation prompt",
+    )
+    retag_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the matched set and requested mutation without writing changes",
+    )
+    add_common_args(retag_parser)
+
     # comment command
     comment_parser = subparsers.add_parser("comment", help="Add a comment to a task")
     comment_parser.add_argument(
@@ -3280,6 +3349,8 @@ def main() -> int:
             return cmd_add(args)
         elif args.command == "edit":
             return cmd_edit(args)
+        elif args.command == "retag":
+            return cmd_retag(args)
         elif args.command == "comment":
             return cmd_comment(args)
         elif args.command == "delete":

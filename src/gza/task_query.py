@@ -838,6 +838,9 @@ class TaskQueryService:
         elif query.untagged_only:
             filtered = [task for task in filtered if self._matches_tag_filters(task, query)]
 
+        if query.untagged_only:
+            filtered = [task for task in filtered if not task.tags]
+
         if query.merge_chain_state is not None:
             merge_states = set(query.merge_chain_state)
             filtered = [task for task in filtered if self._matches_merge_chain_state(task, merge_states)]

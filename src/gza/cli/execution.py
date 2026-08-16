@@ -102,6 +102,7 @@ from ..runner import (
     remove_task_startup_artifacts,
 )
 from ..status_ops import apply_manual_task_status
+from ..task_query import TaskQuery, TaskQueryService, TaskRow, parse_csv
 from ..task_types import CLI_ADD_TASK_TYPES
 from ..workers import WorkerRegistry
 from ._common import (
@@ -143,6 +144,7 @@ from ._common import (
     get_review_verdict,
     get_store,
     get_task_step_count,
+    parse_cli_query_tag_filters,
     parse_cli_tag_filters,
     persist_plan_review_override_manifest,
     phase1_error,
@@ -2953,6 +2955,107 @@ def cmd_edit(args: argparse.Namespace) -> int:
         print(f"✓ Updated task {task.id}")
         return 0
     return 1
+
+
+@dataclass(frozen=True)
+class _RetagMutation:
+    kind: Literal["add", "remove", "replace"]
+    old_tag: str | None
+    new_tag: str
+
+
+def _parse_retag_mutation(args: argparse.Namespace) -> _RetagMutation:
+    if getattr(args, "add_tag", None) is not None:
+        return _RetagMutation(kind="add", old_tag=None, new_tag=_normalize_tags((args.add_tag,))[0])
+    if getattr(args, "remove_tag", None) is not None:
+        return _RetagMutation(kind="remove", old_tag=None, new_tag=_normalize_tags((args.remove_tag,))[0])
+    replace_tag = getattr(args, "replace_tag", None)
+    if replace_tag is None:
+        raise ValueError("exactly one mutation is required")
+    old_tag = _normalize_tags((replace_tag[0],))[0]
+    new_tag = _normalize_tags((replace_tag[1],))[0]
+    return _RetagMutation(kind="replace", old_tag=old_tag, new_tag=new_tag)
+
+
+def _build_retag_selection_query(args: argparse.Namespace) -> TaskQuery:
+    statuses = parse_csv(getattr(args, "status", None))
+    task_types = parse_csv(getattr(args, "type", None))
+    tags, _tags_not, any_tag, untagged_only = parse_cli_query_tag_filters(args)
+
+    if not (tags or untagged_only or statuses or task_types):
+        raise ValueError("retag requires at least one selection filter: --tag, --untagged, --status, or --type.")
+
+    return TaskQuery(
+        scope="tasks",
+        limit=None,
+        statuses=statuses,
+        task_types=task_types,
+        tag_filters=tags,
+        untagged_only=untagged_only,
+        any_tag=any_tag,
+    )
+
+
+def _retag_mutation_summary(mutation: _RetagMutation) -> str:
+    if mutation.kind == "add":
+        return f"add tag '{mutation.new_tag}'"
+    if mutation.kind == "remove":
+        return f"remove tag '{mutation.new_tag}'"
+    assert mutation.old_tag is not None
+    return f"replace tag '{mutation.old_tag}' with '{mutation.new_tag}'"
+
+
+def cmd_retag(args: argparse.Namespace) -> int:
+    """Bulk-edit tags across tasks selected by shared query filters."""
+    try:
+        mutation = _parse_retag_mutation(args)
+        selection_query = _build_retag_selection_query(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    config = Config.load(args.project_dir)
+    query_store = get_store(config, open_mode="query_only")
+    service = TaskQueryService(query_store)
+    matches = [row.task for row in service.run(selection_query).rows if isinstance(row, TaskRow)]
+    matched_ids = tuple(task.id for task in matches if task.id is not None)
+
+    print(f"Matched {len(matches)} task(s):")
+    for task in matches:
+        assert task.id is not None
+        print(f"  {task.id}")
+    print(f"Mutation: {_retag_mutation_summary(mutation)}")
+
+    if getattr(args, "dry_run", False):
+        print("[dry-run] No changes applied.")
+        return 0
+
+    if not matches:
+        print("No changes applied.")
+        return 0
+
+    if not getattr(args, "yes", False):
+        answer = input("\nProceed? [y/N] ").strip().lower()
+        if answer not in {"y", "yes"}:
+            print("No changes applied.")
+            return 1
+
+    store = get_store(config)
+    changed_by_id = store.mutate_task_tags(
+        matched_ids,
+        action=mutation.kind,
+        tag=mutation.new_tag,
+        old_tag=mutation.old_tag,
+    )
+    changed_ids = [task_id for task_id in matched_ids if changed_by_id.get(task_id)]
+    missing_ids = [task_id for task_id in matched_ids if task_id not in changed_by_id]
+
+    print(f"Updated {len(changed_ids)} task(s).")
+    if changed_ids:
+        print("Changed IDs: " + ", ".join(changed_ids))
+    if missing_ids:
+        print("Skipped missing IDs: " + ", ".join(missing_ids))
+    return 0
 
 
 def cmd_retry(args: argparse.Namespace) -> int:

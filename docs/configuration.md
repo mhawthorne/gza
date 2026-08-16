@@ -714,6 +714,33 @@ Pending `implement` tasks also cannot be edited onto a held-plan dependency or a
 
 Non-conflicting edit mutations can be combined in one invocation. Tag mutation flags remain mutually exclusive with each other.
 
+### retag
+
+Bulk-edit tags across tasks selected by shared query filters.
+
+```bash
+gza retag [selection options] [mutation option]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--tag TAG` | Select tasks carrying `TAG` (repeatable; matches any requested tag by default) |
+| `--untagged` | Select only tasks with no tags |
+| `--status CSV` | Select statuses (comma-separated, same syntax as `search`) |
+| `--type CSV` | Select task types (comma-separated, same syntax as `search`) |
+| `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
+| `--add-tag TAG` | Add `TAG` to every matched task |
+| `--remove-tag TAG` | Remove `TAG` from every matched task |
+| `--replace-tag OLD NEW` | Replace `OLD` with `NEW` on matched tasks that currently carry `OLD` |
+| `--yes`, `-y` | Skip the confirmation prompt |
+| `--dry-run` | Show the matched set and mutation without writing changes |
+
+Selection is required: `gza retag` refuses to run with no `--tag`, `--untagged`, `--status`, or `--type` filter, so it never defaults to retagging every task in the database.
+Exactly one mutation flag is required and the mutation options are mutually exclusive.
+Before live changes, `gza retag` prints the matched task IDs plus the requested mutation and asks for confirmation unless `--yes` is supplied.
+Dry-run and declined confirmations use a query-only preview path; confirmed writes re-read current task tags before applying the requested tag-only mutation, and skip any previewed task IDs that no longer exist.
+Like `gza edit`, this command only changes tags, so it remains valid for non-pending tasks.
+
 ### log
 
 View task or worker logs.

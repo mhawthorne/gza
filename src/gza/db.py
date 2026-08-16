@@ -5107,6 +5107,18 @@ class SqliteTaskStore:
             by_task.setdefault(str(row["task_id"]), []).append(str(row["tag"]))
         return {task_id: tuple(tags) for task_id, tags in by_task.items()}
 
+    def _effective_tags_for_row(self, row: sqlite3.Row, tags: tuple[str, ...]) -> tuple[str, ...]:
+        """Return task_tags, falling back to a valid legacy group when needed."""
+        if tags:
+            return tags
+        group_value = row["group"] if "group" in row.keys() else None
+        if group_value is None:
+            return ()
+        try:
+            return (_normalize_tag(str(group_value)),)
+        except ValueError:
+            return ()
+
     def _rows_to_tasks(self, conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[Task]:
         """Hydrate rows into tasks and attach tags in batch."""
         if not rows:
@@ -5115,7 +5127,7 @@ class SqliteTaskStore:
         tasks: list[Task] = []
         for row in rows:
             task_id = str(row["id"])
-            tags = tag_map.get(task_id, ())
+            tags = self._effective_tags_for_row(row, tag_map.get(task_id, ()))
             task = self._row_to_task(row, tags=tags)
             task.group = tags[0] if len(tags) == 1 else task.group
             tasks.append(task)
@@ -5132,6 +5144,23 @@ class SqliteTaskStore:
                 "INSERT INTO task_tags(project_id, task_id, tag) VALUES (?, ?, ?)",
                 [(self._project_id, task_id, tag) for tag in tags],
             )
+
+    def _fetch_existing_task_ids(self, conn: sqlite3.Connection, task_ids: Iterable[str]) -> set[str]:
+        """Fetch the subset of task IDs that still exist for this project."""
+        ids = tuple(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        if not ids:
+            return set()
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"""
+            SELECT id
+            FROM tasks
+            WHERE project_id = ?
+              AND id IN ({placeholders})
+            """,
+            (self._project_id, *ids),
+        ).fetchall()
+        return {str(row["id"]) for row in rows}
 
     def _row_to_run_step(self, row: sqlite3.Row) -> RunStep:
         """Convert a database row to a RunStep."""
@@ -10352,6 +10381,60 @@ class SqliteTaskStore:
         removed = set(_normalize_tags(tags))
         current = [tag for tag in self.get_task_tags(task_id) if tag not in removed]
         return self.replace_task_tags(task_id, current)
+
+    def mutate_task_tags(
+        self,
+        task_ids: Iterable[str],
+        *,
+        action: Literal["add", "remove", "replace"],
+        tag: str,
+        old_tag: str | None = None,
+    ) -> dict[str, bool]:
+        """Apply a tag-only mutation to current task tags in one transaction."""
+        ordered_ids = tuple(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        if not ordered_ids:
+            return {}
+
+        normalized_tag = _normalize_tags((tag,))[0]
+        normalized_old_tag = _normalize_tags((old_tag,))[0] if old_tag is not None else None
+        changed_by_id: dict[str, bool] = {}
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing_ids = self._fetch_existing_task_ids(conn, ordered_ids)
+                current_by_id = self._fetch_tags_for_task_ids(conn, ordered_ids)
+                for task_id in ordered_ids:
+                    if task_id not in existing_ids:
+                        continue
+                    current = current_by_id.get(task_id, ())
+                    if action == "add":
+                        final_tags = _normalize_tags((*current, normalized_tag))
+                    elif action == "remove":
+                        final_tags = tuple(existing for existing in current if existing != normalized_tag)
+                    else:
+                        if normalized_old_tag is None:
+                            raise ValueError("old_tag is required for replace")
+                        final_tags = _normalize_tags(
+                            normalized_tag if existing == normalized_old_tag else existing
+                            for existing in current
+                        )
+
+                    changed = final_tags != current
+                    changed_by_id[task_id] = changed
+                    if not changed:
+                        continue
+                    self._replace_task_tags_conn(conn, task_id, final_tags)
+                    conn.execute(
+                        'UPDATE tasks SET "group" = ? WHERE project_id = ? AND id = ?',
+                        (final_tags[0] if len(final_tags) == 1 else None, self._project_id, task_id),
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+
+        return changed_by_id
 
     def get_tag_counts(self) -> dict[str, int]:
         """Return counts for every known tag."""

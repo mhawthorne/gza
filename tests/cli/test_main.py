@@ -171,6 +171,7 @@ class TestHelpOutput:
 
         history_help = invoke_gza("history", "--help", "--project", str(tmp_path))
         search_help = invoke_gza("search", "--help", "--project", str(tmp_path))
+        retag_help = invoke_gza("retag", "--help", "--project", str(tmp_path))
 
         assert history_help.returncode == 0
         assert "--status-not" in history_help.stdout
@@ -195,6 +196,10 @@ class TestHelpOutput:
         assert "--root-not" in search_help.stdout
         assert "--all-tags" in search_help.stdout
         assert "--untagged" in search_help.stdout
+        assert retag_help.returncode == 0
+        assert "--replace-tag OLD NEW" in retag_help.stdout
+        assert "--dry-run" in retag_help.stdout
+        assert "--untagged" in retag_help.stdout
 
     def test_query_command_docs_tables_list_untagged_when_help_exposes_it(self, tmp_path: Path) -> None:
         """Documented query commands should keep `--untagged` docs in sync with parser help."""
