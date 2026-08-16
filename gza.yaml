@@ -1,6 +1,7 @@
 # Gza Configuration
 
 project_name: gza
+project_id: gza
 
 verify_command: './bin/tests'
 unit_verify_command: './bin/test-unit --summary -- tests/ -n 2 --dist loadscope'
@@ -28,20 +29,11 @@ watch:
   no_activity_timeout: 120
   no_progress_cycles: 2
   
-#provider: claude
-#model: claude-sonnet-4-6
 provider: codex
 model: gpt-5.5
 
-#task_types:
-#  plan:
-#    model: claude-opus-4-6
-#  review:
-#    model: claude-haiku-4-5-20251001
-project_id: gza
-
-# The gza dev repo always uses its own project-local task DB. Pin it explicitly
-# so it ignores any user-level shared db_path in ~/.gza/config.yaml (its dev/test
-# tasks must never be merged into a personal shared DB). Equals the built-in
-# default, so it is a no-op for anyone without a global shared config.
+# The gza dev repo always uses its own project-local task DB.
+# Pin it explicitlyso it ignores any user-level shared db_path in ~/.gza/config.yaml 
+# (its dev/test # tasks must never be merged into a personal shared DB).
+# Equals the built-in default, so it is a no-op for anyone without a global shared config.
 db_path: .gza/gza.db
