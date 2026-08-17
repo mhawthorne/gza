@@ -724,6 +724,7 @@ class Task:
     review_verify_markdown: str | None = None  # Exact rendered verify section injected into the review prompt
     review_verify_cwd: str | None = None  # Working directory used for review-time verify execution
     review_verify_artifact_file: str | None = None  # Full captured verify artifact for later audit/debugging
+    verify_fix_completion_outcome_json: str | None = None  # Structured verify_fix no-source completion outcome
     log_schema_version: int = 1  # 1=legacy logs, 2=message-step logs
     execution_mode: str | None = None  # worker_background, worker_foreground, foreground_inline, foreground_attach_resume, manual, skill_inline
 
@@ -1537,8 +1538,13 @@ ALTER TABLE main_verify_remediation_attempts
     ADD COLUMN greenlit_while_in_progress_at TEXT;
 """
 
+# Migration from v65 to v66: preserve gradeable review scope on verify_fix completion
+MIGRATION_V65_TO_V66 = """
+ALTER TABLE tasks ADD COLUMN verify_fix_completion_outcome_json TEXT;
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 65
+SCHEMA_VERSION = 66
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -1897,6 +1903,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 review_verify_markdown TEXT,
                 review_verify_cwd TEXT,
                 review_verify_artifact_file TEXT,
+                verify_fix_completion_outcome_json TEXT,
                 log_schema_version INTEGER DEFAULT 1,
                 execution_mode TEXT,
                 base_branch TEXT,
@@ -1994,6 +2001,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             "review_verify_command", "review_verify_status", "review_verify_exit_status", "review_verify_failure",
             "review_verify_captured_at", "review_verify_head_sha", "review_verify_base_sha", "review_verify_branch",
             "review_verify_markdown", "review_verify_cwd", "review_verify_artifact_file",
+            "verify_fix_completion_outcome_json",
             "log_schema_version", "execution_mode", "base_branch", "recovery_origin",
             "trigger_source",
         )
@@ -2041,7 +2049,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 review_verify_command, review_verify_status, review_verify_exit_status, review_verify_failure,
                 review_verify_captured_at, review_verify_head_sha, review_verify_base_sha, review_verify_branch,
                 review_verify_markdown, review_verify_cwd, review_verify_artifact_file,
-                log_schema_version, execution_mode, base_branch, recovery_origin,
+                verify_fix_completion_outcome_json, log_schema_version, execution_mode, base_branch, recovery_origin,
                 trigger_source
             )
             SELECT
@@ -2391,6 +2399,7 @@ _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
         63,
         64,
         65,
+        66,
     }
 )
 
@@ -2939,6 +2948,12 @@ def _ensure_required_auto_migration_artifacts(
             "main_verify_remediation_attempts",
             "greenlit_while_in_progress_at",
             "ALTER TABLE main_verify_remediation_attempts ADD COLUMN greenlit_while_in_progress_at TEXT",
+        ),
+        (
+            66,
+            "tasks",
+            "verify_fix_completion_outcome_json",
+            "ALTER TABLE tasks ADD COLUMN verify_fix_completion_outcome_json TEXT",
         ),
     )
     for min_version, table, column, alter_sql in required_columns:
@@ -3562,6 +3577,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     review_verify_markdown TEXT,
     review_verify_cwd TEXT,
     review_verify_artifact_file TEXT,
+    verify_fix_completion_outcome_json TEXT,
     log_schema_version INTEGER DEFAULT 1,
     execution_mode TEXT,
     base_branch TEXT,
@@ -4073,6 +4089,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (63, MIGRATION_V62_TO_V63),
     (64, MIGRATION_V63_TO_V64),
     (65, MIGRATION_V64_TO_V65),
+    (66, MIGRATION_V65_TO_V66),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -5076,6 +5093,11 @@ class SqliteTaskStore:
             review_verify_artifact_file=(
                 row["review_verify_artifact_file"] if "review_verify_artifact_file" in keys else None
             ),
+            verify_fix_completion_outcome_json=(
+                row["verify_fix_completion_outcome_json"]
+                if "verify_fix_completion_outcome_json" in keys
+                else None
+            ),
             log_schema_version=(
                 row["log_schema_version"]
                 if "log_schema_version" in keys and row["log_schema_version"] is not None
@@ -5594,6 +5616,7 @@ class SqliteTaskStore:
                     review_verify_markdown = ?,
                     review_verify_cwd = ?,
                     review_verify_artifact_file = ?,
+                    verify_fix_completion_outcome_json = ?,
                     log_schema_version = ?,
                     execution_mode = ?
                 WHERE project_id = ? AND id = ?
@@ -5669,6 +5692,7 @@ class SqliteTaskStore:
                     task.review_verify_markdown,
                     task.review_verify_cwd,
                     task.review_verify_artifact_file,
+                    task.verify_fix_completion_outcome_json,
                     task.log_schema_version,
                     task.execution_mode,
                     self._project_id,
@@ -10786,6 +10810,19 @@ class SqliteTaskStore:
         task.diff_lines_removed = diff_lines_removed
         if changed_diff is not DB_UNSET:
             task.changed_diff = cast("bool | None", changed_diff)
+        if task.task_type == "verify_fix" and task.changed_diff is not None:
+            from gza.verify_fix_outcome import apply_verify_fix_completion_outcome, parse_verify_fix_completion_outcome
+
+            completion_head_sha = head_sha if isinstance(head_sha, str) else task.review_verify_head_sha
+            existing_outcome = parse_verify_fix_completion_outcome(task)
+            apply_verify_fix_completion_outcome(
+                task,
+                no_source_changes=task.changed_diff is False,
+                completion_head_sha=completion_head_sha,
+                recovery_rerun_attempted=(
+                    existing_outcome.recovery_rerun_attempted if existing_outcome is not None else False
+                ),
+            )
         self.update(task)
         if (
             (has_commits or terminal_merge_state is not None)
@@ -11265,6 +11302,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "review_verify_command", "review_verify_status", "review_verify_exit_status", "review_verify_failure",
         "review_verify_captured_at", "review_verify_head_sha", "review_verify_base_sha", "review_verify_branch",
         "review_verify_markdown", "review_verify_cwd", "review_verify_artifact_file",
+        "verify_fix_completion_outcome_json",
         "log_schema_version", "execution_mode", "base_branch",
         "recovery_origin", "trigger_source",
     )
@@ -11293,6 +11331,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         "review_verify_markdown": "NULL",
         "review_verify_cwd": "NULL",
         "review_verify_artifact_file": "NULL",
+        "verify_fix_completion_outcome_json": "NULL",
         "review_scope": "NULL",
     }
     project_id, project_prefix = _project_identity_from_config(config)
@@ -11895,6 +11934,7 @@ def _task_to_dict(task: "Task") -> dict:
         "review_verify_markdown": task.review_verify_markdown,
         "review_verify_cwd": task.review_verify_cwd,
         "review_verify_artifact_file": task.review_verify_artifact_file,
+        "verify_fix_completion_outcome_json": task.verify_fix_completion_outcome_json,
         "log_schema_version": task.log_schema_version,
         "execution_mode": task.execution_mode,
     }

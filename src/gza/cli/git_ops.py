@@ -482,6 +482,11 @@ def complete_branch_unpushable_after_reconcile(
     default_branch = git.default_branch()
     publication_state = load_branch_publication_state(store, task.id)
     publication_retry_task = task if _should_retry_pr_publication_after_reconcile(task) else replace(task, create_pr=False)
+    verify_fix_worktree_path = None
+    if task.task_type == "verify_fix" and task.slug:
+        configured_worktree_root = getattr(config, "worktree_path", None)
+        if isinstance(configured_worktree_root, Path):
+            verify_fix_worktree_path = configured_worktree_root / task.slug
     return _complete_failed_code_task_after_pr_publication(
         task=publication_retry_task,
         config=config,
@@ -511,6 +516,7 @@ def complete_branch_unpushable_after_reconcile(
         fix_default_branch=publication_state.fix_default_branch,
         fix_was_merged_before_run=publication_state.fix_was_merged_before_run,
         record_reconcile_attempt=True,
+        worktree_path=verify_fix_worktree_path,
     )
 
 

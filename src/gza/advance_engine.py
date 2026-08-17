@@ -26,7 +26,7 @@ from gza.db import (
 from gza.flaky_investigations import (
     FlakyInvestigationEvidence,
 )
-from gza.git import ResolvedMergeSourceRef
+from gza.git import GitError, ResolvedMergeSourceRef
 from gza.lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from gza.lineage import resolve_impl_task, walk_ancestors, walk_based_on_descendants
 from gza.merge_state import (
@@ -110,7 +110,7 @@ from gza.review_verdict import (
     is_verify_timeout_only_review,
     summarize_review_blockers,
 )
-from gza.review_verify_state import VerifyGateDecision, resolve_verify_gate_decision
+from gza.review_verify_state import VerifyGateDecision, resolve_verify_gate_decision, verify_result_is_timeout_origin
 from gza.runner import (
     CROSS_PROJECT_TAG,
     PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
@@ -129,6 +129,11 @@ from gza.source_followup import (
     resolve_source_followup_state,
     source_task_has_implementation_followup,
 )
+from gza.verify_fix_outcome import (
+    effective_verify_fix_completion_outcome,
+    inspect_legacy_review_scope_completion_outcome,
+    inspect_verify_fix_completion_outcome,
+)
 
 NEEDS_ATTENTION_LABEL = "Needs attention"
 PARK_REASON_IMPROVE_NO_OP = "improve-no-op"
@@ -137,6 +142,7 @@ PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE = "verify-noop-improve-diff-probe
 PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES = "verify-blocked-no-code-issues"
 PARK_REASON_VERIFY_FAILED_NEEDS_FIX = "verify-failed-needs-fix"
 PARK_REASON_VERIFY_FIX_FAILED = "verify-fix-failed"
+PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE = "verify-fix-proof-unavailable"
 PARK_REASON_VERIFY_UNAVAILABLE = "verify-unavailable"
 PARK_REASON_VERIFY_UNAVAILABLE_AFTER_FIX = "verify-unavailable-after-fix"
 PARK_REASON_REVIEW_BLOCKER_ADJUDICATION_NEEDED = "review-blocker-adjudication-needed"
@@ -177,6 +183,7 @@ WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS = frozenset(
         "stale-review-needs-manual-refresh",
         PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
         PARK_REASON_VERIFY_FIX_FAILED,
+        PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
         PARK_REASON_VERIFY_UNAVAILABLE,
         PARK_REASON_VERIFY_UNAVAILABLE_AFTER_FIX,
         PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES,
@@ -359,6 +366,7 @@ class AdvanceContext:
 
     store: SqliteTaskStore
     git: Any
+    config: Any
     task: DbTask
     task_type: str
     has_branch: bool
@@ -4320,6 +4328,7 @@ def _resolve_review_state(
         for t in get_code_changing_descendants_for_root(store, task)
         if t.status == "completed"
         and not (t.task_type == "improve" and t.changed_diff is False)
+        and not (t.task_type == "verify_fix" and t.changed_diff is False)
     ]
     if completed_descendant_code_changes:
         latest_completed_code_change = max(completed_descendant_code_changes, key=_task_event_time)
@@ -4688,6 +4697,21 @@ def _verify_gate_owner_task(ctx: AdvanceContext) -> DbTask | None:
     return getattr(ctx, "review_root_task", None) or ctx.task
 
 
+@dataclass(frozen=True)
+class LegacyVerifyFixCompletionProof:
+    """Planner-only proof that a legacy verify_fix can be repaired by a writer."""
+
+    branch_name: str
+    expected_head_sha: str
+
+
+@dataclass(frozen=True)
+class LegacyVerifyFixProofUnavailable:
+    """Expected infrastructure failure while proving legacy verify_fix repair eligibility."""
+
+    diagnostic: str
+
+
 def _verify_gate_blocks_closing_review(ctx: AdvanceContext) -> bool:
     if not _is_implementation_owned_lineage(ctx):
         return False
@@ -4711,6 +4735,33 @@ def _pre_review_verify_fix_required(ctx: AdvanceContext) -> bool:
         return False
     decision = getattr(ctx, "verify_gate_decision", None)
     return decision is not None and decision.state in {"failed", "unavailable"}
+
+
+def _prove_legacy_verify_fix_completion_repair(
+    ctx: AdvanceContext,
+    *,
+    verify_fix_task: DbTask,
+    owner_task: DbTask,
+    verify_epoch: Any,
+) -> LegacyVerifyFixCompletionProof | LegacyVerifyFixProofUnavailable | None:
+    """Return planner-safe proof that a legacy completed verify_fix can be repaired by a writer."""
+    if verify_fix_task.task_type != "verify_fix" or verify_fix_task.status != "completed":
+        return None
+    if verify_fix_task.changed_diff is not None or verify_fix_task.review_verify_head_sha:
+        return None
+    expected_head = getattr(verify_epoch, "reviewed_head_sha", None)
+    if not expected_head:
+        return None
+    branch_name = getattr(verify_epoch, "reviewed_branch", None) or verify_fix_task.branch or owner_task.branch
+    if not branch_name:
+        return None
+    try:
+        live_head = ctx.git.rev_parse_if_exists(branch_name)
+    except (GitError, OSError) as exc:
+        return LegacyVerifyFixProofUnavailable(str(exc))
+    if live_head != expected_head:
+        return None
+    return LegacyVerifyFixCompletionProof(branch_name=branch_name, expected_head_sha=expected_head)
 
 
 def _pre_review_verify_fix_action(ctx: AdvanceContext) -> dict[str, Any]:
@@ -4762,6 +4813,128 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext) -> dict[str, Any]:
                 "verify_epoch": current_epoch,
             }
         if existing.status == "completed":
+            if (
+                decision.state == "failed"
+                and verify_result_is_timeout_origin(decision.lookup.result)
+            ):
+                canonical_outcome = inspect_verify_fix_completion_outcome(existing)
+                if canonical_outcome.state == "invalid":
+                    return with_needs_attention(
+                        {
+                            "type": "needs_discussion",
+                            "description": (
+                                f"SKIP: completed verify_fix {_task_id(existing)} has invalid canonical "
+                                "completion proof; repair or rerun that verify_fix before lifecycle can "
+                                f"consume timeout-origin recovery. Proof failure: {canonical_outcome.invalid_reason}"
+                            ),
+                            "verify_fix_task": existing,
+                            "verify_epoch": current_epoch,
+                        },
+                        reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+                        subject_task_id=owner_task.id,
+                    )
+                legacy_scope_outcome = (
+                    inspect_legacy_review_scope_completion_outcome(existing.review_scope)
+                    if canonical_outcome.state == "absent"
+                    else None
+                )
+                if legacy_scope_outcome is not None and legacy_scope_outcome.state == "invalid":
+                    return with_needs_attention(
+                        {
+                            "type": "needs_discussion",
+                            "description": (
+                                f"SKIP: completed verify_fix {_task_id(existing)} has invalid legacy "
+                                "completion proof; repair or rerun that verify_fix before lifecycle can "
+                                f"consume timeout-origin recovery. Proof failure: {legacy_scope_outcome.invalid_reason}"
+                            ),
+                            "verify_fix_task": existing,
+                            "verify_epoch": current_epoch,
+                        },
+                        reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+                        subject_task_id=owner_task.id,
+                    )
+                outcome = effective_verify_fix_completion_outcome(existing)
+                legacy_completion_proof: LegacyVerifyFixCompletionProof | None = None
+                if outcome is None:
+                    legacy_repair = _prove_legacy_verify_fix_completion_repair(
+                        ctx,
+                        verify_fix_task=existing,
+                        owner_task=owner_task,
+                        verify_epoch=current_epoch,
+                    )
+                    if isinstance(legacy_repair, LegacyVerifyFixProofUnavailable):
+                        return with_needs_attention(
+                            {
+                                "type": "needs_discussion",
+                                "description": (
+                                    f"SKIP: completed verify_fix {_task_id(existing)} exact-head proof is unavailable; "
+                                    "repair the branch/status probe or retry from a healthy checkout. "
+                                    f"Proof failure: {legacy_repair.diagnostic}"
+                                ),
+                                "verify_fix_task": existing,
+                                "verify_epoch": current_epoch,
+                            },
+                            reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+                            subject_task_id=owner_task.id,
+                        )
+                    if isinstance(legacy_repair, LegacyVerifyFixCompletionProof):
+                        legacy_completion_proof = legacy_repair
+                if outcome is not None and outcome.no_source_changes and outcome.completion_head_sha:
+                    if outcome.recovery_rerun_attempted:
+                        return with_needs_attention(
+                            {
+                                "type": "needs_discussion",
+                                "description": (
+                                    f"SKIP: completed verify_fix {_task_id(existing)} already consumed its exact-head "
+                                    "recovery rerun and verify evidence remains red for the current epoch"
+                                ),
+                                "verify_fix_task": existing,
+                                "verify_epoch": current_epoch,
+                            },
+                            reason=PARK_REASON_VERIFY_FIX_FAILED,
+                            subject_task_id=owner_task.id,
+                        )
+                    if (
+                        decision.lookup.result is not None
+                        and decision.lookup.result.source_task_id == existing.id
+                        and decision.lookup.result.status != "passed"
+                    ):
+                        return with_needs_attention(
+                            {
+                                "type": "needs_discussion",
+                                "description": (
+                                    f"SKIP: completed verify_fix {_task_id(existing)} already produced non-green "
+                                    "exact-head recovery rerun evidence for the current epoch; park instead of "
+                                    "scheduling another rerun."
+                                ),
+                                "verify_fix_task": existing,
+                                "verify_epoch": current_epoch,
+                            },
+                            reason=PARK_REASON_VERIFY_FIX_FAILED,
+                            subject_task_id=owner_task.id,
+                        )
+                    return {
+                        "type": "rerun_completed_verify_fix",
+                        "description": (
+                            f"Rerun exact-head verify for completed no-source verify_fix {_task_id(existing)} "
+                            "before treating timeout-origin red evidence as terminal"
+                        ),
+                        "verify_fix_task": existing,
+                        "verify_owner_task": owner_task,
+                        "verify_epoch": current_epoch,
+                    }
+                if legacy_completion_proof is not None:
+                    return {
+                        "type": "rerun_completed_verify_fix",
+                        "description": (
+                            f"Repair legacy no-source completion proof for completed verify_fix {_task_id(existing)} "
+                            "inside the writable executor, then rerun exact-head verify"
+                        ),
+                        "verify_fix_task": existing,
+                        "verify_owner_task": owner_task,
+                        "verify_epoch": current_epoch,
+                        "legacy_completion_proof": legacy_completion_proof,
+                    }
             reason = (
                 PARK_REASON_VERIFY_FIX_FAILED
                 if decision.state == "failed"
@@ -4850,6 +5023,8 @@ def _verify_gate_action(ctx: AdvanceContext, *, phase: str) -> dict[str, Any]:
             "type": "skip",
             "description": "SKIP: verify gate context unavailable",
         }
+    if phase == "pre_merge" and decision.state == "failed":
+        return _pre_review_verify_fix_action(ctx)
     owner_task = _verify_gate_owner_task(ctx)
     description_suffix = "review" if phase == "pre_review" else "merge"
     if decision.state in {"missing", "stale"}:
@@ -5087,6 +5262,7 @@ def _build_base_advance_context(
     return AdvanceContext(
         store=store,
         git=git,
+        config=config,
         task=task,
         task_type=task.task_type,
         has_branch=has_branch,

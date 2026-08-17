@@ -5183,10 +5183,9 @@ def test_query_lineage_owner_rows_keeps_visible_main_verify_attention_when_defau
     assert row.owner_task.id == main_verify_task.id
     assert row.next_action is not None
     assert row.next_action["needs_attention_reason"] == "main-integration-verify-red"
-    assert (
-        "main verify freshness unproven at `abc123` - merges halted; exact tree fingerprint unavailable"
-        in row.next_action["description"]
-    )
+    assert "main verify freshness unproven; exact tree fingerprint unavailable" in row.next_action["description"]
+    assert "abc123" not in row.next_action["description"]
+    assert "merges halted" not in row.next_action["description"]
 
 
 def test_build_merge_context_from_git_records_warning_and_clears_existing_branches_on_git_error(

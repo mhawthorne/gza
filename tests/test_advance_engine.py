@@ -59,8 +59,11 @@ from gza.review_scope import (
     build_spec_coherence_review_scope,
     parse_resolution_review_scope,
 )
-from gza.review_tasks import OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND
-from gza.review_tasks import OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND, create_or_reuse_verify_fix_task
+from gza.review_tasks import (
+    OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
+    build_verify_fix_prompt,
+    create_or_reuse_verify_fix_task,
+)
 from gza.review_verdict import ParsedReviewReport, ReviewFinding
 from gza.review_verify_state import (
     VerifyEpoch,
@@ -94,6 +97,8 @@ class _FakeGit:
         default_branch_name: str = "main",
         resolved_tree_shas: dict[str, str | None] | None = None,
         merge_base_by_ref: dict[tuple[str, str], str | None] | None = None,
+        status_entries: set[tuple[str, str]] | None = None,
+        status_error: Exception | None = None,
     ):
         self._can_merge = can_merge
         self._can_merge_by_ref = can_merge_by_ref or {}
@@ -115,6 +120,8 @@ class _FakeGit:
         self._default_branch_name = default_branch_name
         self._resolved_tree_shas = resolved_tree_shas or {}
         self._merge_base_by_ref = merge_base_by_ref or {}
+        self._status_entries = status_entries or set()
+        self._status_error = status_error
         self.can_merge_calls: list[tuple[str, str]] = []
         self.rev_parse_calls: list[str] = []
         self.is_ancestor_calls: list[tuple[str, str]] = []
@@ -154,6 +161,11 @@ class _FakeGit:
     def rev_parse_if_exists(self, ref: str) -> str | None:
         self.rev_parse_calls.append(ref)
         error = self._rev_parse_errors.get(ref)
+        if isinstance(error, list):
+            next_error = error.pop(0) if error else None
+            if next_error is not None:
+                raise next_error
+            return self._ref_shas.get(ref)
         if error is not None:
             raise error
         return self._ref_shas.get(ref)
@@ -226,6 +238,11 @@ class _FakeGit:
         if error is not None:
             raise error
         return self._name_status_by_range.get(revision_range, "")
+
+    def status_porcelain(self) -> set[tuple[str, str]]:
+        if self._status_error is not None:
+            raise self._status_error
+        return self._status_entries
 
 
 def _make_store(tmp_path: Path) -> SqliteTaskStore:
@@ -3750,6 +3767,649 @@ def test_stale_verify_gate_preempts_merge_with_shared_action(tmp_path: Path, mon
     assert action["type"] == "verify_gate"
     assert action["verify_gate_state"] == "stale"
     assert action["description"] == "Run verify gate before merge"
+
+
+def test_noop_verify_fix_after_timeout_red_and_later_green_allows_merge(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/noop-verify-fix-timeout-green",
+        when=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 8, 17, 10, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/worktree",
+            failure="verify_command timed out after 120s",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    verify_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.status = "completed"
+    verify_fix.completed_at = datetime(2026, 8, 17, 10, 20, tzinfo=UTC)
+    verify_fix.branch = impl.branch
+    verify_fix.has_commits = False
+    store.update(verify_fix)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=verify_fix,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 25, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/worktree",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="verify_fix",
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "head-1", "main": "base-1"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "merge"
+
+
+@pytest.mark.parametrize(
+    ("changed_diff", "review_verify_head_sha", "status_entries", "expected_type", "expected_text"),
+    [
+        (False, "head-1", set(), "rerun_completed_verify_fix", "Rerun exact-head verify"),
+        (None, None, set(), "rerun_completed_verify_fix", "Repair legacy no-source completion proof"),
+        (
+            None,
+            None,
+            {("M", "src/impl.py")},
+            "rerun_completed_verify_fix",
+            "Repair legacy no-source completion proof",
+        ),
+    ],
+)
+def test_completed_timeout_verify_fix_legacy_planning_ignores_canonical_checkout_cleanliness(
+    tmp_path: Path,
+    monkeypatch,
+    changed_diff: bool | None,
+    review_verify_head_sha: str | None,
+    status_entries: set[tuple[str, str]],
+    expected_type: str,
+    expected_text: str,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.advance_create_reviews = True
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/completed-timeout-verify-fix",
+        when=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 8, 17, 10, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/worktree",
+            failure="verify_command timed out after 120s",
+            failure_origin="timeout",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    verify_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.status = "completed"
+    verify_fix.completed_at = datetime(2026, 8, 17, 10, 20, tzinfo=UTC)
+    verify_fix.branch = impl.branch
+    verify_fix.has_commits = False
+    verify_fix.changed_diff = changed_diff
+    verify_fix.review_verify_head_sha = review_verify_head_sha
+    store.update(verify_fix)
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "head-1", "main": "base-1"},
+            status_entries=status_entries,
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == expected_type
+    assert expected_text in action["description"]
+    refreshed_fix = store.get(verify_fix.id)
+    assert refreshed_fix is not None
+    assert refreshed_fix.changed_diff is changed_diff
+    assert refreshed_fix.review_verify_head_sha == review_verify_head_sha
+    if changed_diff is None:
+        proof = action.get("legacy_completion_proof")
+        assert proof is not None
+        assert proof.branch_name == impl.branch
+        assert proof.expected_head_sha == "head-1"
+    if expected_type == "needs_discussion":
+        assert action["needs_attention_reason"] == "verify-fix-failed"
+
+
+def test_legacy_timeout_verify_fix_branch_head_mismatch_does_not_plan_legacy_rerun(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.advance_create_reviews = True
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/completed-timeout-verify-fix",
+        when=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 8, 17, 10, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/worktree",
+            failure="verify_command timed out after 120s",
+            failure_origin="timeout",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    verify_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.status = "completed"
+    verify_fix.completed_at = datetime(2026, 8, 17, 10, 20, tzinfo=UTC)
+    verify_fix.branch = impl.branch
+    verify_fix.has_commits = False
+    store.update(verify_fix)
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "head-2", "main": "base-1"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "verify_gate"
+    assert "legacy_completion_proof" not in action
+
+
+@pytest.mark.parametrize(
+    "raw_outcome",
+    [
+        "{not-json",
+        json.dumps({"kind": "wrong", "schema_version": 1, "no_source_changes": True}),
+        json.dumps(
+            {
+                "kind": "verify_fix_completion_outcome",
+                "schema_version": 999,
+                "no_source_changes": True,
+            }
+        ),
+        json.dumps(
+            {
+                "kind": "verify_fix_completion_outcome",
+                "schema_version": 1,
+                "completion_head_sha": "head-1",
+                "recovery_rerun_attempted": False,
+            }
+        ),
+        json.dumps(
+            {
+                "kind": "verify_fix_completion_outcome",
+                "schema_version": 1,
+                "no_source_changes": 1,
+                "completion_head_sha": "head-1",
+                "recovery_rerun_attempted": False,
+            }
+        ),
+        json.dumps(
+            {
+                "kind": "verify_fix_completion_outcome",
+                "schema_version": 1,
+                "no_source_changes": True,
+                "completion_head_sha": "",
+                "recovery_rerun_attempted": False,
+            }
+        ),
+        json.dumps(
+            {
+                "kind": "verify_fix_completion_outcome",
+                "schema_version": 1,
+                "no_source_changes": True,
+                "completion_head_sha": "head-1",
+                "recovery_rerun_attempted": None,
+            }
+        ),
+    ],
+)
+def test_invalid_canonical_timeout_verify_fix_outcome_fails_closed_without_legacy_fallback(
+    tmp_path: Path,
+    monkeypatch,
+    raw_outcome: str,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.advance_create_reviews = True
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/invalid-canonical-verify-fix",
+        when=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 8, 17, 10, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/worktree",
+            failure="verify_command timed out after 120s",
+            failure_origin="timeout",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    verify_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.status = "completed"
+    verify_fix.completed_at = datetime(2026, 8, 17, 10, 20, tzinfo=UTC)
+    verify_fix.branch = impl.branch
+    verify_fix.has_commits = False
+    verify_fix.changed_diff = False
+    verify_fix.review_verify_head_sha = "head-1"
+    verify_fix.verify_fix_completion_outcome_json = raw_outcome
+    store.update(verify_fix)
+    before_artifacts = store.list_artifacts(impl.id, kind="verify_gate_result")
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "head-1", "main": "base-1"},
+            status_entries=set(),
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-fix-proof-unavailable"
+    assert "legacy_completion_proof" not in action
+    assert "invalid canonical completion proof" in action["description"]
+    assert "Proof failure:" in action["description"]
+    refreshed_fix = store.get(verify_fix.id)
+    assert refreshed_fix is not None
+    assert refreshed_fix.changed_diff is False
+    assert refreshed_fix.review_verify_head_sha == "head-1"
+    assert refreshed_fix.verify_fix_completion_outcome_json == raw_outcome
+    assert store.list_artifacts(impl.id, kind="verify_gate_result") == before_artifacts
+
+
+def test_completed_timeout_verify_fix_with_existing_rerun_red_artifact_parks_even_if_legacy_flag_unconsumed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.advance_create_reviews = True
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/completed-timeout-verify-fix",
+        when=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 8, 17, 10, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    verify_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.status = "completed"
+    verify_fix.completed_at = datetime(2026, 8, 17, 10, 20, tzinfo=UTC)
+    verify_fix.branch = impl.branch
+    verify_fix.has_commits = False
+    verify_fix.changed_diff = False
+    verify_fix.review_verify_head_sha = "head-1"
+    store.update(verify_fix)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=verify_fix,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 17, 10, 25, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/worktree",
+            failure="verify_command timed out after 120s",
+            failure_origin="timeout",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="verify_fix",
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "head-1", "main": "base-1"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-fix-failed"
+    assert "already produced non-green exact-head recovery rerun evidence" in action["description"]
+
+
+def test_noop_verify_fix_after_real_verify_failure_still_parks(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.advance_create_reviews = True
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/noop-verify-fix-real-red",
+        when=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 8, 17, 10, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    store.update(review)
+    improve = _add_completed_improve_for_review(
+        store,
+        impl,
+        review,
+        when=datetime(2026, 8, 17, 10, 10, tzinfo=UTC),
+        changed_diff=True,
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=improve,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 8, 17, 10, 15, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/worktree",
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    verify_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=improve.id,
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.status = "completed"
+    verify_fix.completed_at = datetime(2026, 8, 17, 10, 25, tzinfo=UTC)
+    verify_fix.branch = impl.branch
+    verify_fix.has_commits = False
+    store.update(verify_fix)
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="CHANGES_REQUESTED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "head-1", "main": "base-1"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-fix-failed"
+    assert "verify gate is still red after completed verify_fix" in action["description"]
 
 
 def test_review_freshness_probe_failure_preempts_review_max_cycles(
@@ -18073,10 +18733,8 @@ def test_pre_review_failed_verify_creates_verify_fix(tmp_path: Path) -> None:
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_merge"
-    assert action["verify_gate_state"] == "failed"
-    assert action["description"] == "SKIP: current verify gate is red; merge is blocked"
+    assert action["type"] == "create_verify_fix"
+    assert action["verify_epoch"].reviewed_head_sha == "verify-head"
 
 
 def test_pre_review_failed_verify_reuses_pending_verify_fix(tmp_path: Path) -> None:
@@ -18150,10 +18808,8 @@ def test_pre_review_failed_verify_reuses_pending_verify_fix(tmp_path: Path) -> N
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_merge"
-    assert action["verify_gate_state"] == "failed"
-    assert action["description"] == "SKIP: current verify gate is red; merge is blocked"
+    assert action["type"] == "run_verify_fix"
+    assert action["verify_fix_task"].id == verify_fix.id
 
 
 def test_pre_review_failed_verify_parks_after_completed_verify_fix(tmp_path: Path) -> None:
@@ -18230,10 +18886,9 @@ def test_pre_review_failed_verify_parks_after_completed_verify_fix(tmp_path: Pat
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_merge"
-    assert action["verify_gate_state"] == "failed"
-    assert action["description"] == "SKIP: current verify gate is red; merge is blocked"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-fix-failed"
+    assert "verify gate is still red after completed verify_fix" in action["description"]
 
 
 def test_post_improve_failed_verify_routes_to_verify_fix_before_another_improve(

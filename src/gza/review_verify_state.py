@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from gza.artifacts import store_command_output_artifact
+from gza.artifacts import prepare_command_output_artifact, store_command_output_artifact
 from gza.db import SqliteTaskStore, Task
 from gza.git import GitError
 
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 VERIFY_GATE_ARTIFACT_KIND = "verify_gate_result"
 VERIFY_GATE_ARTIFACT_LABEL = "verify_gate_result"
 VERIFY_GATE_ARTIFACT_SCHEMA_VERSION = 1
+INVALID_STRUCTURED_FAILURE_ORIGIN = "__invalid_structured_failure_origin__"
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class VerifyGateResult:
     output_artifact_id: int | None = None
     output_artifact_task_id: str | None = None
     output_artifact_path: str | None = None
+    failure_origin: str | None = None
 
 
 @dataclass(frozen=True)
@@ -94,6 +96,20 @@ class VerifyGateDecision:
     current_epoch: VerifyEpoch | None
     lookup: VerifyGateLookup
     state: Literal["passed", "missing", "stale", "failed", "unavailable"]
+
+
+def verify_result_is_timeout_origin(result: VerifyGateResult | None) -> bool:
+    """Return whether a red verify result is structured timeout evidence."""
+    if result is None or result.status != "failed":
+        return False
+    failure_origin = getattr(result, "failure_origin", None)
+    if failure_origin is not None:
+        return failure_origin == "timeout"
+    exit_status = result.exit_status.strip().lower()
+    failure = (result.failure or "").strip().lower()
+    if exit_status in {"timed out", "timeout"}:
+        return True
+    return "verify_command timed out" in failure
 
 
 def normalized_verify_command(command: str | None) -> str | None:
@@ -191,6 +207,15 @@ def _coerce_optional_float(value: object) -> float | None:
     return None
 
 
+def _coerce_failure_origin(result_payload: dict[str, Any]) -> str | None:
+    if "failure_origin" not in result_payload:
+        return None
+    value = result_payload["failure_origin"]
+    if isinstance(value, str) and value:
+        return value
+    return INVALID_STRUCTURED_FAILURE_ORIGIN
+
+
 def _artifact_verify_result(metadata: dict[str, Any]) -> VerifyGateResult | None:
     result_payload = metadata.get("result")
     if not isinstance(result_payload, dict):
@@ -222,6 +247,7 @@ def _artifact_verify_result(metadata: dict[str, Any]) -> VerifyGateResult | None
         output_artifact_id=_coerce_optional_int(metadata.get("output_artifact_id")),
         output_artifact_task_id=_coerce_optional_str(metadata.get("output_artifact_task_id")),
         output_artifact_path=_coerce_optional_str(metadata.get("output_artifact_path")),
+        failure_origin=_coerce_failure_origin(result_payload),
     )
 
 
@@ -525,44 +551,17 @@ def persist_verify_gate_artifact(
     """Persist canonical owner-attached verify-gate evidence."""
     if owner_task.id is None:
         return
-
-    epoch = make_verify_epoch(
-        reviewed_branch=getattr(result, "reviewed_branch", None),
-        reviewed_head_sha=getattr(result, "reviewed_head_sha", None),
-        verify_command=getattr(result, "command", None),
+    payload = build_verify_gate_artifact_payload(
+        result=result,
+        source_task=source_task,
         verify_timeout_seconds=verify_timeout_seconds,
         verify_timeout_grace_seconds=verify_timeout_grace_seconds,
+        output_artifact_id=output_artifact_id,
+        output_artifact_task_id=output_artifact_task_id,
+        output_artifact_path=output_artifact_path,
+        provenance=provenance,
+        aggregate_details=aggregate_details,
     )
-    payload = {
-        "schema_version": VERIFY_GATE_ARTIFACT_SCHEMA_VERSION,
-        "verify_epoch": {
-            "reviewed_branch": epoch.reviewed_branch,
-            "reviewed_head_sha": epoch.reviewed_head_sha,
-            "verify_command": epoch.verify_command,
-            "verify_timeout_seconds": epoch.verify_timeout_seconds,
-            "verify_timeout_grace_seconds": epoch.verify_timeout_grace_seconds,
-        },
-        "result": {
-            "command": getattr(result, "command", None),
-            "status": getattr(result, "status", None),
-            "exit_status": getattr(result, "exit_status", None),
-            "captured_at": getattr(result, "captured_at").isoformat(),
-            "reviewed_branch": getattr(result, "reviewed_branch", None),
-            "reviewed_head_sha": getattr(result, "reviewed_head_sha", None),
-            "reviewed_base_sha": getattr(result, "reviewed_base_sha", None),
-            "working_directory": getattr(result, "working_directory", None),
-            "failure": getattr(result, "failure", None),
-        },
-        "source_task_id": source_task.id,
-        "source_task_type": source_task.task_type,
-        "output_artifact_id": output_artifact_id,
-        "output_artifact_task_id": output_artifact_task_id,
-        "output_artifact_path": output_artifact_path,
-    }
-    if provenance is not None:
-        payload["provenance"] = provenance
-    if aggregate_details is not None:
-        payload["aggregate_details"] = aggregate_details
     store_command_output_artifact(
         store,
         owner_task,
@@ -579,6 +578,151 @@ def persist_verify_gate_artifact(
         created_at=getattr(result, "captured_at"),
         content_type="application/json",
     )
+
+
+def build_verify_gate_artifact_payload(
+    *,
+    result: Any,
+    source_task: Task,
+    verify_timeout_seconds: int | None,
+    verify_timeout_grace_seconds: float | None,
+    output_artifact_id: int | None = None,
+    output_artifact_task_id: str | None = None,
+    output_artifact_path: str | None = None,
+    provenance: dict[str, Any] | None = None,
+    aggregate_details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build canonical owner-attached verify-gate artifact metadata."""
+
+    epoch = make_verify_epoch(
+        reviewed_branch=getattr(result, "reviewed_branch", None),
+        reviewed_head_sha=getattr(result, "reviewed_head_sha", None),
+        verify_command=getattr(result, "command", None),
+        verify_timeout_seconds=verify_timeout_seconds,
+        verify_timeout_grace_seconds=verify_timeout_grace_seconds,
+    )
+    result_payload = {
+        "command": getattr(result, "command", None),
+        "status": getattr(result, "status", None),
+        "exit_status": getattr(result, "exit_status", None),
+        "captured_at": getattr(result, "captured_at").isoformat(),
+        "reviewed_branch": getattr(result, "reviewed_branch", None),
+        "reviewed_head_sha": getattr(result, "reviewed_head_sha", None),
+        "reviewed_base_sha": getattr(result, "reviewed_base_sha", None),
+        "working_directory": getattr(result, "working_directory", None),
+        "failure": getattr(result, "failure", None),
+    }
+    failure_origin = getattr(result, "failure_origin", None)
+    if failure_origin is not None:
+        result_payload["failure_origin"] = failure_origin
+    payload = {
+        "schema_version": VERIFY_GATE_ARTIFACT_SCHEMA_VERSION,
+        "verify_epoch": {
+            "reviewed_branch": epoch.reviewed_branch,
+            "reviewed_head_sha": epoch.reviewed_head_sha,
+            "verify_command": epoch.verify_command,
+            "verify_timeout_seconds": epoch.verify_timeout_seconds,
+            "verify_timeout_grace_seconds": epoch.verify_timeout_grace_seconds,
+        },
+        "result": result_payload,
+        "source_task_id": source_task.id,
+        "source_task_type": source_task.task_type,
+        "output_artifact_id": output_artifact_id,
+        "output_artifact_task_id": output_artifact_task_id,
+        "output_artifact_path": output_artifact_path,
+    }
+    if provenance is not None:
+        payload["provenance"] = provenance
+    if aggregate_details is not None:
+        payload["aggregate_details"] = aggregate_details
+    return payload
+
+
+def persist_verify_gate_artifact_with_verify_fix_outcome(
+    store: SqliteTaskStore,
+    config: Config,
+    *,
+    owner_task: Task,
+    source_task: Task,
+    result: Any,
+    verify_timeout_seconds: int | None,
+    verify_timeout_grace_seconds: float | None,
+    verify_fix_task: Task,
+    verify_fix_outcome_json: str,
+    no_source_changes: bool,
+    completion_head_sha: str | None,
+    output_artifact_id: int | None = None,
+    output_artifact_task_id: str | None = None,
+    output_artifact_path: str | None = None,
+    producer: str,
+    provenance: dict[str, Any] | None = None,
+    aggregate_details: dict[str, Any] | None = None,
+) -> None:
+    """Persist authoritative rerun evidence and consumed outcome in one DB transaction."""
+    if owner_task.id is None or verify_fix_task.id is None:
+        return
+    payload = build_verify_gate_artifact_payload(
+        result=result,
+        source_task=source_task,
+        verify_timeout_seconds=verify_timeout_seconds,
+        verify_timeout_grace_seconds=verify_timeout_grace_seconds,
+        output_artifact_id=output_artifact_id,
+        output_artifact_task_id=output_artifact_task_id,
+        output_artifact_path=output_artifact_path,
+        provenance=provenance,
+        aggregate_details=aggregate_details,
+    )
+    output = json.dumps(payload, sort_keys=True, indent=2) + "\n"
+    prepared = prepare_command_output_artifact(
+        Path(config.project_dir).resolve(),
+        owner_task.id,
+        label=VERIFY_GATE_ARTIFACT_LABEL,
+        output=output,
+        created_at=getattr(result, "captured_at"),
+    )
+    with store._connect() as conn:  # noqa: SLF001 - shared persistence invariant needs one transaction.
+        conn.execute("BEGIN")
+        try:
+            store._add_artifact_conn(  # noqa: SLF001
+                conn,
+                owner_task.id,
+                kind=VERIFY_GATE_ARTIFACT_KIND,
+                label=VERIFY_GATE_ARTIFACT_LABEL,
+                path=prepared.path,
+                content_type="application/json",
+                byte_size=prepared.bytes,
+                sha256=prepared.digest,
+                created_at=getattr(result, "captured_at"),
+                producer=producer,
+                command=getattr(result, "command", None),
+                status=getattr(result, "status", None),
+                exit_status=getattr(result, "exit_status", None),
+                head_sha=getattr(result, "reviewed_head_sha", None),
+                metadata=payload,
+            )
+            conn.execute(
+                """
+                UPDATE tasks
+                SET changed_diff = ?,
+                    review_verify_head_sha = ?,
+                    verify_fix_completion_outcome_json = ?
+                WHERE project_id = ? AND id = ?
+                """,
+                (
+                    0 if no_source_changes else 1,
+                    completion_head_sha,
+                    verify_fix_outcome_json,
+                    store._project_id,  # noqa: SLF001
+                    verify_fix_task.id,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    verify_fix_task.changed_diff = not no_source_changes
+    verify_fix_task.review_verify_head_sha = completion_head_sha
+    verify_fix_task.verify_fix_completion_outcome_json = verify_fix_outcome_json
 
 
 def refresh_preserved_rebase_review_verify_heads(

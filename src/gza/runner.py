@@ -53,6 +53,7 @@ from .console import (
     task_header,
 )
 from .db import (
+    DB_UNSET,
     TASK_COMMENT_KIND_FEEDBACK,
     SqliteTaskStore,
     Task,
@@ -145,6 +146,7 @@ from .review_tasks import (
     format_verify_fix_context,
     format_verify_fix_context_error,
     resolve_verify_fix_context,
+    resolve_verify_fix_task_identity,
 )
 from .review_verdict import (
     ReviewFinding,
@@ -160,10 +162,14 @@ from .review_verdict import (
     validate_review_report_contract,
 )
 from .review_verify_state import (
+    VerifyEpoch,
+    latest_verify_result_for_epoch,
     normalized_verify_command,
     persist_verify_gate_artifact,
+    persist_verify_gate_artifact_with_verify_fix_outcome,
     refresh_preserved_rebase_review_verify_heads,
     resolve_verify_owner_task,
+    verify_result_is_timeout_origin,
 )
 from .sync_ops import resolve_branch_pr
 from .task_slug import (
@@ -171,6 +177,7 @@ from .task_slug import (
     get_base_task_slug,
     strip_derived_implement_prefixes,
 )
+from .verify_fix_outcome import apply_verify_fix_completion_outcome
 from .worktree_roots import managed_worktree_root_paths
 
 logger = logging.getLogger(__name__)
@@ -1078,6 +1085,7 @@ def _finalize_completed_code_task(
     has_commits: bool = True,
     terminal_merge_state: str | None = None,
     completion_reason: str | None = None,
+    changed_diff: bool | None | object = DB_UNSET,
     outcome_message: str = "Outcome: completed",
 ) -> None:
     """Write terminal success logs and persist completed state for a code task."""
@@ -1111,6 +1119,7 @@ def _finalize_completed_code_task(
         base_sha=base_sha,
         completion_reason=completion_reason,
         terminal_merge_state=terminal_merge_state,
+        changed_diff=changed_diff,
     )
 
 
@@ -1455,10 +1464,12 @@ def _complete_failed_code_task_after_pr_publication(
     fix_default_branch: str | None = None,
     fix_was_merged_before_run: bool = False,
     record_reconcile_attempt: bool = False,
+    worktree_path: Path | None = None,
 ) -> int:
     """Retry PR publication for a previously failed completed code task."""
+    canonical_git = git
     if task.create_pr:
-        pr_outcome = _ensure_work_pr_for_completed_code_task(task, config, store, git)
+        pr_outcome = _ensure_work_pr_for_completed_code_task(task, config, store, canonical_git)
         if pr_outcome.kind == "nonfatal_missing_pr":
             _record_pr_publication_note(
                 task=task,
@@ -1488,6 +1499,73 @@ def _complete_failed_code_task_after_pr_publication(
                 record_reconcile_attempt=record_reconcile_attempt,
             )
 
+    verification_git = canonical_git
+    if task.task_type == "verify_fix":
+        rerun_needed = _verify_fix_timeout_rerun_needed(
+            store=store,
+            task=task,
+            changed_source=task.changed_diff,
+        )
+        if rerun_needed is None:
+            return 1
+        if rerun_needed:
+            identity = resolve_verify_fix_task_identity(store, task)
+            if identity is None:
+                return 1
+            _impl_task_id, verify_epoch = identity
+            if worktree_path is None:
+                worktree_path = _verify_fix_completion_worktree_path(config, task)
+            if worktree_path is None:
+                _warn_verify_fix_timeout_rerun_prerequisite(
+                    f"Cannot resolve managed verify_fix worktree for task {task.id}; leaving task retryable"
+                )
+                return 1
+            resolved_verification_git = _verification_worktree_git_for_timeout_rerun(
+                task=task,
+                worktree_path=worktree_path,
+                branch_name=branch_name,
+                head_sha=head_sha,
+                verify_epoch=verify_epoch,
+            )
+            if resolved_verification_git is None:
+                return 1
+            verification_git = resolved_verification_git
+
+    if not _ensure_noop_verify_fix_timeout_rerun_before_completion(
+        config=config,
+        store=store,
+        task=task,
+        worktree_git=verification_git,
+        worktree_path=worktree_path,
+        branch_name=branch_name,
+        head_sha=head_sha,
+        base_sha=base_sha,
+        task_logger=task_logger,
+        changed_source=task.changed_diff,
+        log_file=log_file,
+    ):
+        if task.status == "failed" and task.failure_reason is None:
+            _mark_task_failed(
+                task=task,
+                config=config,
+                store=store,
+                log_file=log_file,
+                has_commits=True,
+                stats=stats,
+                branch=branch_name,
+                explicit_reason=BRANCH_UNPUSHABLE_FAILURE_REASON,
+                error_type=None,
+                exit_code=1,
+                head_sha=head_sha,
+                base_sha=base_sha,
+            )
+        return 1
+
+    changed_diff: bool | None | object = (
+        task.changed_diff
+        if task.task_type == "verify_fix" and task.changed_diff is not None
+        else DB_UNSET
+    )
     if log_file is not None:
         _finalize_completed_code_task(
             task=task,
@@ -1502,6 +1580,7 @@ def _complete_failed_code_task_after_pr_publication(
             diff_removed=diff_removed,
             head_sha=head_sha,
             base_sha=base_sha,
+            changed_diff=changed_diff,
         )
     else:
         store.mark_completed(
@@ -1516,6 +1595,7 @@ def _complete_failed_code_task_after_pr_publication(
             diff_lines_removed=diff_removed,
             head_sha=head_sha,
             base_sha=base_sha,
+            changed_diff=changed_diff,
         )
     if task.task_type == "rebase":
         return 0
@@ -1523,7 +1603,7 @@ def _complete_failed_code_task_after_pr_publication(
         task,
         config,
         store,
-        git,
+        canonical_git,
         branch_name,
         stats,
         task_logger=task_logger,
@@ -3076,6 +3156,7 @@ class ReviewVerifyResult:
     output: str | None = None
     artifact_id: int | None = None
     artifact_path: str | None = None
+    failure_origin: str | None = None
 
 
 @dataclass(frozen=True)
@@ -3146,9 +3227,12 @@ def _make_verify_result(
     reviewed_base_sha: str | None = None,
     working_directory: str | None = None,
     failure: str | None = None,
+    failure_origin: str | None = None,
     output: str | bytes | None = None,
 ) -> VerificationResult:
     """Build a structured lifecycle verify result."""
+    if status == "failed" and failure_origin is None:
+        failure_origin = _classify_failed_verify_origin(exit_status=exit_status, failure=failure)
     return ReviewVerifyResult(
         command=command,
         status=status,
@@ -3159,8 +3243,18 @@ def _make_verify_result(
         reviewed_base_sha=reviewed_base_sha,
         working_directory=working_directory,
         failure=failure,
+        failure_origin=failure_origin,
         output=_combine_verify_output(output),
     )
+
+
+def _classify_failed_verify_origin(*, exit_status: str, failure: str | None = None) -> str:
+    """Classify newly produced failed verify results into closed origin values."""
+    normalized_exit = exit_status.strip().lower()
+    normalized_failure = (failure or "").strip().lower()
+    if normalized_exit in {"timed out", "timeout"} or "verify_command timed out" in normalized_failure:
+        return "timeout"
+    return "test_failure"
 
 
 def _make_review_verify_result(
@@ -3427,6 +3521,23 @@ def _build_cross_project_verify_aggregate_details(
     unavailable_count = sum(1 for entry in project_results if _entry_status(entry) == "unavailable")
     skipped_count = sum(1 for entry in project_results if _entry_status(entry) == "skipped")
     runnable_count = len(project_results) - skipped_count
+    def _failure_origin(result: VerificationResult | None) -> str | None:
+        if result is None or result.status != "failed":
+            return None
+        if result.failure_origin is not None:
+            return result.failure_origin
+        return _classify_failed_verify_origin(exit_status=result.exit_status, failure=result.failure)
+
+    failed_origins = [
+        origin
+        for entry in project_results
+        if (origin := _failure_origin(entry.result)) is not None
+    ]
+    aggregate_failure_origin = (
+        "timeout"
+        if failed_origins and all(origin == "timeout" for origin in failed_origins)
+        else ("test_failure" if failed_origins else None)
+    )
     return {
         "affected_scope_count": len(project_results),
         "runnable_count": runnable_count,
@@ -3434,12 +3545,14 @@ def _build_cross_project_verify_aggregate_details(
         "failed_count": failed_count,
         "unavailable_count": unavailable_count,
         "skipped_count": skipped_count,
+        "failure_origin": aggregate_failure_origin,
         "scopes": [
             {
                 "scope": entry.scope,
                 "working_directory": entry.working_directory,
                 "status": _entry_status(entry),
                 "exit_status": entry.result.exit_status if entry.result is not None else None,
+                "failure_origin": _failure_origin(entry.result),
                 "command_identity": (
                     normalized_verify_command(entry.result.command) if entry.result is not None else None
                 ),
@@ -3465,6 +3578,9 @@ def _persist_lifecycle_verify_execution(
     artifact_task: Task | None = None,
     allow_metadata_only_artifacts: bool = True,
     metadata: dict[str, Any] | None = None,
+    consumed_verify_fix_task: Task | None = None,
+    consumed_verify_fix_no_source_changes: bool | None = None,
+    consumed_verify_fix_completion_head_sha: str | None = None,
 ) -> tuple[VerificationResult, str]:
     stored_artifacts = _store_review_verify_artifact_records(
         task,
@@ -3488,26 +3604,56 @@ def _persist_lifecycle_verify_execution(
     )
     verify_gate_owner = _resolve_verify_gate_owner_task(store, task, artifact_task=artifact_task)
     if verify_gate_owner is not None:
-        persist_verify_gate_artifact(
-            store,
-            config,
-            owner_task=verify_gate_owner,
-            source_task=task,
+        provenance = _build_verify_gate_provenance(
             result=persisted_result,
-            verify_timeout_seconds=timeout_seconds,
-            verify_timeout_grace_seconds=timeout_grace_seconds,
-            output_artifact_id=stored_artifacts.artifact_id,
-            output_artifact_task_id=stored_artifacts.artifact_task_id,
-            output_artifact_path=stored_artifacts.artifact_path,
-            producer=producer,
-            provenance=_build_verify_gate_provenance(
-                result=persisted_result,
-                timeout_seconds=timeout_seconds,
-                timeout_grace_seconds=timeout_grace_seconds,
-                project_results=execution.project_results,
-            ),
-            aggregate_details=_build_cross_project_verify_aggregate_details(execution.project_results),
+            timeout_seconds=timeout_seconds,
+            timeout_grace_seconds=timeout_grace_seconds,
+            project_results=execution.project_results,
         )
+        aggregate_details = _build_cross_project_verify_aggregate_details(execution.project_results)
+        if consumed_verify_fix_task is not None and consumed_verify_fix_no_source_changes is not None:
+            apply_verify_fix_completion_outcome(
+                consumed_verify_fix_task,
+                no_source_changes=consumed_verify_fix_no_source_changes,
+                completion_head_sha=consumed_verify_fix_completion_head_sha,
+                recovery_rerun_attempted=True,
+            )
+            assert consumed_verify_fix_task.verify_fix_completion_outcome_json is not None
+            persist_verify_gate_artifact_with_verify_fix_outcome(
+                store,
+                config,
+                owner_task=verify_gate_owner,
+                source_task=task,
+                result=persisted_result,
+                verify_timeout_seconds=timeout_seconds,
+                verify_timeout_grace_seconds=timeout_grace_seconds,
+                output_artifact_id=stored_artifacts.artifact_id,
+                output_artifact_task_id=stored_artifacts.artifact_task_id,
+                output_artifact_path=stored_artifacts.artifact_path,
+                producer=producer,
+                provenance=provenance,
+                aggregate_details=aggregate_details,
+                verify_fix_task=consumed_verify_fix_task,
+                verify_fix_outcome_json=consumed_verify_fix_task.verify_fix_completion_outcome_json,
+                no_source_changes=consumed_verify_fix_no_source_changes,
+                completion_head_sha=consumed_verify_fix_completion_head_sha,
+            )
+        else:
+            persist_verify_gate_artifact(
+                store,
+                config,
+                owner_task=verify_gate_owner,
+                source_task=task,
+                result=persisted_result,
+                verify_timeout_seconds=timeout_seconds,
+                verify_timeout_grace_seconds=timeout_grace_seconds,
+                output_artifact_id=stored_artifacts.artifact_id,
+                output_artifact_task_id=stored_artifacts.artifact_task_id,
+                output_artifact_path=stored_artifacts.artifact_path,
+                producer=producer,
+                provenance=provenance,
+                aggregate_details=aggregate_details,
+            )
     return persisted_result, stored_artifacts.artifact_path or ""
 
 
@@ -4357,6 +4503,187 @@ def _run_review_verify_command(
     )
 
 
+def _status_has_tracked_source_changes(
+    status_entries: set[tuple[str, str]],
+    *,
+    boundary: ProjectBoundary,
+) -> bool:
+    """Return whether porcelain status contains changes outside allowed runtime artifacts."""
+    for status, path in status_entries:
+        if status == "??" and _is_gza_owned_path(path, boundary=boundary):
+            continue
+        return True
+    return False
+
+
+def _warn_verify_fix_timeout_rerun_prerequisite(message: str) -> None:
+    print(f"Warning: {message}")
+
+
+def _restore_claimed_task_retryable_after_verify_rerun_refusal(task: Task, store: SqliteTaskStore) -> None:
+    """Return a normally claimed task to a runnable state after non-terminal verify proof refusal."""
+    if task.status != "in_progress":
+        return
+    task.status = "pending"
+    task.running_pid = None
+    task.execution_mode = None
+    task.completed_at = None
+    task.failure_reason = None
+    task.completion_reason = None
+    store.update(task)
+
+
+def _verification_worktree_git_for_timeout_rerun(
+    *,
+    task: Task,
+    worktree_path: Path,
+    branch_name: str,
+    head_sha: str | None,
+    verify_epoch: VerifyEpoch,
+) -> Git | None:
+    """Construct a Git handle rooted at the managed verification worktree and prove its head."""
+    if not worktree_path.exists():
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            f"Cannot prove verify_fix worktree for task {task.id}: missing worktree path {worktree_path}"
+        )
+        return None
+    try:
+        worktree_git = Git(worktree_path)
+        proven_head = _prove_verify_fix_rerun_head(
+            task=task,
+            worktree_git=worktree_git,
+            branch_name=branch_name,
+            head_sha=head_sha,
+            verify_epoch=verify_epoch,
+            phase="before rerun",
+        )
+    except GitError as exc:
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            f"Cannot prove verify_fix worktree for task {task.id}: {exc}"
+        )
+        return None
+    if proven_head is None:
+        return None
+    return worktree_git
+
+
+def _prove_verify_fix_rerun_head(
+    *,
+    task: Task,
+    worktree_git: Git,
+    branch_name: str,
+    head_sha: str | None,
+    verify_epoch: VerifyEpoch,
+    phase: str,
+) -> str | None:
+    """Return the checked-out head only when every verify-fix rerun identity agrees."""
+    expected_epoch_sha = verify_epoch.reviewed_head_sha
+    if not head_sha:
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            f"Cannot prove verify_fix worktree head for task {task.id} {phase}: completion head SHA is missing"
+        )
+        return None
+    if not expected_epoch_sha:
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            f"Cannot prove verify_fix worktree head for task {task.id} {phase}: verify epoch head SHA is missing"
+        )
+        return None
+    try:
+        checked_head = worktree_git.rev_parse_if_exists("HEAD")
+        branch_head = worktree_git.rev_parse_if_exists(branch_name) if branch_name else None
+    except GitError as exc:
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            f"Cannot prove verify_fix worktree head for task {task.id} {phase}: {exc}"
+        )
+        return None
+    if not checked_head or not branch_head:
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            "Cannot prove verify_fix worktree head for task "
+            f"{task.id} {phase}: checked HEAD={checked_head!r}, branch {branch_name!r}={branch_head!r}"
+        )
+        return None
+    if checked_head != branch_head or checked_head != expected_epoch_sha or checked_head != head_sha:
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            "Cannot prove verify_fix worktree head for task "
+            f"{task.id} {phase}: checked HEAD={checked_head!r}, branch {branch_name!r}={branch_head!r}, "
+            f"verify epoch={expected_epoch_sha!r}, completion head={head_sha!r}"
+        )
+        return None
+    return checked_head
+
+
+def _verify_fix_timeout_rerun_needed(
+    *,
+    store: SqliteTaskStore,
+    task: Task,
+    changed_source: bool | None,
+) -> bool | None:
+    """Return whether no-op timeout rerun proof is required, or None when prerequisites are missing."""
+    if task.id is None or task.task_type != "verify_fix":
+        return False
+    if changed_source is None:
+        changed_source = task.changed_diff
+    if changed_source is True:
+        return False
+    identity = resolve_verify_fix_task_identity(store, task)
+    if identity is None:
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            f"Cannot determine verify_fix timeout rerun identity for task {task.id}; leaving task retryable"
+        )
+        return None
+    impl_task_id, verify_epoch = identity
+    impl_task = store.get(impl_task_id)
+    if impl_task is None:
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            f"Cannot resolve verify_fix implementation owner {impl_task_id} for task {task.id}; leaving task retryable"
+        )
+        return None
+    lookup = latest_verify_result_for_epoch(store, impl_task, current_epoch=verify_epoch)
+    if not lookup.is_current or lookup.result is None:
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            f"Cannot find current verify evidence for verify_fix timeout epoch on task {task.id}; leaving task retryable"
+        )
+        return None
+    return verify_result_is_timeout_origin(lookup.result)
+
+
+def _verify_fix_changed_source_for_epoch(
+    *,
+    store: SqliteTaskStore,
+    task: Task,
+    worktree_git: Git,
+    branch_name: str,
+    boundary: ProjectBoundary,
+    pre_run_status: set[tuple[str, str]] | None = None,
+    post_run_status: set[tuple[str, str]] | None = None,
+    current_head_sha: str | None = None,
+) -> bool:
+    """Fail-closed source-change proof for verify-fix gate evidence."""
+    identity = resolve_verify_fix_task_identity(store, task)
+    if identity is None:
+        return True
+    _impl_task_id, verify_epoch = identity
+    current_head = current_head_sha
+    if current_head is None:
+        current_head = _prove_verify_fix_rerun_head(
+            task=task,
+            worktree_git=worktree_git,
+            branch_name=branch_name,
+            head_sha=verify_epoch.reviewed_head_sha,
+            verify_epoch=verify_epoch,
+            phase="while checking source changes",
+        )
+    if not current_head or current_head != verify_epoch.reviewed_head_sha:
+        return True
+    if pre_run_status is not None and _status_has_tracked_source_changes(pre_run_status, boundary=boundary):
+        return True
+    try:
+        status_entries = post_run_status if post_run_status is not None else worktree_git.status_porcelain()
+    except GitStatusError:
+        return True
+    return _status_has_tracked_source_changes(status_entries, boundary=boundary)
+
+
 def _format_review_verify_skip(project: RepoProjectConfig, reason: str, *, working_directory: str) -> str:
     """Format an explicit skipped verification entry for a discovered project."""
     scope = _format_repo_project_scope(project.scope_root)
@@ -4423,6 +4750,22 @@ def _aggregate_cross_project_verify_result(
         else:
             failure = "no affected project had a runnable verify_command"
 
+    def _failure_origin(result: ReviewVerifyResult) -> str:
+        if result.failure_origin is not None:
+            return result.failure_origin
+        return _classify_failed_verify_origin(exit_status=result.exit_status, failure=result.failure)
+
+    failed_origins = [
+        _failure_origin(result)
+        for result in runnable_results
+        if result.status == "failed"
+    ]
+    failure_origin = (
+        "timeout"
+        if failed_origins and all(origin == "timeout" for origin in failed_origins)
+        else ("test_failure" if failed_origins else None)
+    )
+
     return _make_verify_result(
         command,
         status=status,
@@ -4433,6 +4776,7 @@ def _aggregate_cross_project_verify_result(
         reviewed_base_sha=reviewed_base_sha,
         working_directory="(per-project; see artifact)",
         failure=failure,
+        failure_origin=failure_origin,
     )
 
 
@@ -4648,6 +4992,232 @@ def _run_lifecycle_verify(
         markdown=_format_review_verify_result(result),
         aggregate_result=result,
     )
+
+
+def _capture_noop_verify_fix_timeout_rerun(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    task: Task,
+    worktree_git: Git,
+    worktree_path: Path,
+    branch_name: str,
+    head_sha: str | None,
+    base_sha: str | None,
+    task_logger: TaskExecutionLogger | None,
+    changed_source: bool | None = None,
+) -> bool:
+    """Persist fresh verify evidence for a no-change verify_fix of a timeout red.
+
+    Returns whether completion may continue. A timeout-origin red after a no-op
+    verify_fix must be replaced by durable same-head green evidence before the
+    verify_fix can be terminal-completed.
+    """
+    if task.id is None or task.task_type != "verify_fix":
+        return True
+    if changed_source is None:
+        changed_source = task.changed_diff
+    if changed_source is True:
+        return True
+    rerun_needed = _verify_fix_timeout_rerun_needed(
+        store=store,
+        task=task,
+        changed_source=changed_source,
+    )
+    if rerun_needed is False:
+        return True
+    if rerun_needed is None:
+        return False
+    identity = resolve_verify_fix_task_identity(store, task)
+    assert identity is not None
+    impl_task_id, verify_epoch = identity
+    impl_task = store.get(impl_task_id)
+    assert impl_task is not None
+    if changed_source is not False:
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            f"Cannot prove whether verify_fix task {task.id} changed source; leaving task retryable"
+        )
+        return False
+    boundary = _project_boundary(config)
+    proven_head = _prove_verify_fix_rerun_head(
+        task=task,
+        worktree_git=worktree_git,
+        branch_name=branch_name,
+        head_sha=head_sha,
+        verify_epoch=verify_epoch,
+        phase="before rerun",
+    )
+    if proven_head is None:
+        return False
+    if _verify_fix_changed_source_for_epoch(
+        store=store,
+        task=task,
+        worktree_git=worktree_git,
+        branch_name=branch_name,
+        boundary=boundary,
+        current_head_sha=proven_head,
+    ):
+        return False
+    timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(config)
+    rerun_cwd = _worktree_execution_dir(worktree_path, boundary)
+    execution = _run_lifecycle_verify(
+        config=config,
+        task=task,
+        worktree_git=worktree_git,
+        worktree_path=worktree_path,
+        cwd=rerun_cwd,
+        timeout_seconds=timeout_seconds,
+        timeout_grace_seconds=timeout_grace_seconds,
+        reviewed_branch=branch_name,
+        reviewed_head_sha=proven_head,
+        reviewed_base_sha=base_sha,
+    )
+    if execution is None:
+        return False
+    proven_head_after = _prove_verify_fix_rerun_head(
+        task=task,
+        worktree_git=worktree_git,
+        branch_name=branch_name,
+        head_sha=proven_head,
+        verify_epoch=verify_epoch,
+        phase="after rerun",
+    )
+    if proven_head_after is None:
+        return False
+    if _verify_fix_changed_source_for_epoch(
+        store=store,
+        task=task,
+        worktree_git=worktree_git,
+        branch_name=branch_name,
+        boundary=boundary,
+        current_head_sha=proven_head_after,
+    ):
+        return False
+    persisted_result, artifact_path = _persist_lifecycle_verify_execution(
+        config,
+        store,
+        task,
+        execution,
+        producer="verify_fix",
+        timeout_seconds=timeout_seconds,
+        timeout_grace_seconds=timeout_grace_seconds,
+        artifact_task=impl_task,
+        consumed_verify_fix_task=task,
+        consumed_verify_fix_no_source_changes=True,
+        consumed_verify_fix_completion_head_sha=proven_head,
+    )
+    if task_logger is not None:
+        task_logger.phase(
+            f"Captured verify_fix rerun result: {persisted_result.status} ({persisted_result.exit_status})",
+            extra={
+                "event": "verify_fix_rerun_result",
+                "review_verify_status": persisted_result.status,
+                "review_verify_exit_status": persisted_result.exit_status,
+                "review_verify_command": persisted_result.command,
+                "review_verify_captured_at": persisted_result.captured_at.isoformat(),
+                "review_verify_branch": persisted_result.reviewed_branch,
+                "review_verify_head_sha": persisted_result.reviewed_head_sha,
+                "review_verify_base_sha": persisted_result.reviewed_base_sha,
+                "review_verify_cwd": persisted_result.working_directory,
+                "review_verify_artifact_file": artifact_path,
+            },
+        )
+    return persisted_result.status == "passed"
+
+
+def _verify_fix_completion_worktree_path(config: Config, task: Task) -> Path | None:
+    """Return the managed worktree path used for verify-fix completion evidence."""
+    if task.task_type != "verify_fix" or not task.slug:
+        return None
+    configured_worktree_root = getattr(config, "worktree_path", None)
+    if not isinstance(configured_worktree_root, Path):
+        return None
+    return configured_worktree_root / task.slug
+
+
+def _ensure_noop_verify_fix_timeout_rerun_before_completion(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    task: Task,
+    worktree_git: Git,
+    worktree_path: Path | None,
+    branch_name: str,
+    head_sha: str | None,
+    base_sha: str | None,
+    task_logger: TaskExecutionLogger | None,
+    changed_source: bool | None = None,
+    log_file: Path | None = None,
+) -> bool:
+    """Fail closed when a no-op timeout-origin verify_fix lacks durable green rerun evidence."""
+    if task.task_type != "verify_fix":
+        return True
+    if worktree_path is None:
+        worktree_path = _verify_fix_completion_worktree_path(config, task)
+    if worktree_path is None:
+        rerun_needed = _verify_fix_timeout_rerun_needed(
+            store=store,
+            task=task,
+            changed_source=changed_source,
+        )
+        if rerun_needed is False:
+            return True
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            f"Cannot resolve managed verify_fix worktree for task {task.id}; leaving task retryable"
+        )
+        return False
+    try:
+        can_complete = _capture_noop_verify_fix_timeout_rerun(
+            config=config,
+            store=store,
+            task=task,
+            worktree_git=worktree_git,
+            worktree_path=worktree_path,
+            branch_name=branch_name,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            task_logger=task_logger,
+            changed_source=changed_source,
+        )
+    except Exception as exc:
+        refreshed = store.get(task.id) if task.id is not None else None
+        if refreshed is not None:
+            task.changed_diff = refreshed.changed_diff
+            task.review_verify_head_sha = refreshed.review_verify_head_sha
+            task.verify_fix_completion_outcome_json = refreshed.verify_fix_completion_outcome_json
+        message = (
+            "Could not persist required same-head verify_fix timeout rerun evidence; "
+            "leaving task retryable instead of completing against stale red verify evidence"
+        )
+        print(f"Warning: {message}: {exc}")
+        if log_file is not None:
+            write_log_entry(
+                log_file,
+                {
+                    "type": "gza",
+                    "subtype": "warning",
+                    "message": message,
+                    "error": str(exc),
+                },
+            )
+        return False
+    if can_complete:
+        return True
+    message = (
+        "Required same-head verify_fix timeout rerun did not produce durable green evidence; "
+        "leaving task retryable instead of completing against stale red verify evidence"
+    )
+    print(f"Warning: {message}")
+    if log_file is not None:
+        write_log_entry(
+            log_file,
+            {
+                "type": "gza",
+                "subtype": "warning",
+                "message": message,
+            },
+        )
+    return False
 
 
 def _default_code_task_commit_subject(task_slug: str | None, task_db_id: str | None) -> str:
@@ -8040,6 +8610,7 @@ def _complete_code_task(
     """
     complete_as_verified_empty_noop = False
     verified_empty_noop_terminal_merge_state: str | None = None
+    verify_fix_changed_source: bool | None = None
     if skip_commit:
         has_uncommitted = False
     else:
@@ -8121,6 +8692,16 @@ def _complete_code_task(
                 )
                 return 0
         has_uncommitted = bool(files_to_stage)
+        if task.task_type == "verify_fix":
+            verify_fix_changed_source = _verify_fix_changed_source_for_epoch(
+                store=store,
+                task=task,
+                worktree_git=worktree_git,
+                branch_name=branch_name,
+                boundary=boundary,
+                pre_run_status=pre_run_status,
+                post_run_status=post_run_status,
+            )
 
         if not has_uncommitted:
             # Check if branch already has commits from a previous run
@@ -8313,6 +8894,9 @@ def _complete_code_task(
             fix_was_merged_before_run = (
                 (root_impl_unit.state if root_impl_unit is not None else root_impl.merge_status) == "merged"
             )
+    if task.task_type == "verify_fix" and task.id is not None and verify_fix_changed_source is not None:
+        store.set_task_changed_diff(task.id, verify_fix_changed_source)
+        task.changed_diff = verify_fix_changed_source
     if create_pr and task.task_type != "rebase" and not complete_as_verified_empty_noop:
         pr_outcome = _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
         if pr_outcome.kind == "nonfatal_missing_pr":
@@ -8369,6 +8953,23 @@ def _complete_code_task(
             rebase_diff_baseline=rebase_diff_baseline,
         )
 
+    verify_fix_worktree_path = _verify_fix_completion_worktree_path(config, task)
+    if not _ensure_noop_verify_fix_timeout_rerun_before_completion(
+        config=config,
+        store=store,
+        task=task,
+        worktree_git=worktree_git,
+        worktree_path=verify_fix_worktree_path,
+        branch_name=branch_name,
+        head_sha=head_sha,
+        base_sha=base_sha,
+        task_logger=task_logger,
+        changed_source=verify_fix_changed_source,
+        log_file=log_file,
+    ):
+        _restore_claimed_task_retryable_after_verify_rerun_refusal(task, store)
+        return 1
+
     _finalize_completed_code_task(
         task=task,
         config=config,
@@ -8387,12 +8988,18 @@ def _complete_code_task(
         completion_reason=(
             VERIFIED_EMPTY_NOOP_COMPLETION_REASON if complete_as_verified_empty_noop else None
         ),
+        changed_diff=(
+            verify_fix_changed_source
+            if task.task_type == "verify_fix" and verify_fix_changed_source is not None
+            else DB_UNSET
+        ),
         outcome_message=(
             "Outcome: completed (moot: no unique commits vs target)"
             if complete_as_verified_empty_noop
             else "Outcome: completed"
         ),
     )
+
     return _post_complete_code_task(
         task,
         config,
@@ -8886,6 +9493,7 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
             return 1
 
     publication_state = load_branch_publication_state(store, task.id)
+    verify_fix_worktree_path = _verify_fix_completion_worktree_path(config, task)
     return _complete_failed_code_task_after_pr_publication(
         task=replace(task, create_pr=True),
         config=config,
@@ -8905,6 +9513,7 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
         fix_commits_ahead_before_run=publication_state.fix_commits_ahead_before_run,
         fix_default_branch=publication_state.fix_default_branch,
         fix_was_merged_before_run=publication_state.fix_was_merged_before_run,
+        worktree_path=verify_fix_worktree_path,
     )
 
 

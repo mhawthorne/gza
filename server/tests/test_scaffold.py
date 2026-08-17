@@ -6,6 +6,4 @@ def test_package_imports():
 
 
 def test_gza_api_importable():
-    # The server consumes gza through its Python APIs; the editable
-    # path dependency must resolve inside this environment.
     import gza  # noqa: F401

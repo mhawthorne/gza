@@ -13,6 +13,7 @@ from typing import Any, Literal, Protocol
 from ..advance_engine import (
     NOOP_IMPROVE_KIND_VERIFY_ONLY,
     PARK_REASON_IMPROVE_NO_OP,
+    PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
     REVIEW_CLEARANCE_ARTIFACT_KIND,
     VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND,
     VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_STATUS,
@@ -46,6 +47,7 @@ from ..review_verify_state import VerifyEpoch, resolve_verify_gate_decision
 from ..runner import (
     LifecycleVerifyExecution,
     ProjectReviewVerifyResult,
+    _capture_noop_verify_fix_timeout_rerun,
     _capture_review_verify_result,
     _format_review_verify_result,
     _make_review_verify_result,
@@ -57,7 +59,14 @@ from ..runner import (
     _run_review_verify_command,
     _run_review_verify_commands_for_projects,
     _task_is_cross_project,
+    _verify_fix_completion_worktree_path,
     _worktree_execution_dir,
+)
+from ..verify_fix_outcome import (
+    effective_verify_fix_completion_outcome,
+    inspect_legacy_review_scope_completion_outcome,
+    inspect_verify_fix_completion_outcome,
+    persist_verify_fix_completion_outcome,
 )
 from ._common import (
     PlanReviewMaterializationRepairBlocked,
@@ -210,7 +219,9 @@ _WORKER_ACTIONS = frozenset(
     }
 )
 
-_DIRECT_ACTIONS = frozenset({"release_approved_plan_review", "repair_plan_slice_materialization"})
+_DIRECT_ACTIONS = frozenset(
+    {"release_approved_plan_review", "repair_plan_slice_materialization", "rerun_completed_verify_fix"}
+)
 
 
 def _should_continue_branch_publication_after_reconcile(
@@ -1108,6 +1119,317 @@ def _execute_create_verify_fix(
     )
 
 
+def _execute_rerun_completed_verify_fix(
+    *,
+    task: DbTask,
+    action_type: str,
+    action: dict[str, Any],
+    context: AdvanceActionExecutionContext,
+) -> AdvanceActionExecutionResult:
+    verify_fix_task = action.get("verify_fix_task")
+    owner_task = action.get("verify_owner_task")
+    verify_epoch = action.get("verify_epoch")
+    if (
+        not isinstance(verify_fix_task, DbTask)
+        or verify_fix_task.id is None
+        or not isinstance(owner_task, DbTask)
+        or owner_task.id is None
+        or not isinstance(verify_epoch, VerifyEpoch)
+        or context.config is None
+    ):
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message="missing completed verify_fix rerun inputs",
+        )
+    verify_fix_task_id = verify_fix_task.id
+    if context.dry_run:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="dry_run",
+            message=action.get("description", "Rerun completed verify_fix"),
+            work_done=True,
+            handled_task_id=verify_fix_task_id,
+            created_task=verify_fix_task,
+        )
+
+    canonical_outcome = inspect_verify_fix_completion_outcome(verify_fix_task)
+    if canonical_outcome.state == "invalid":
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=(
+                f"SKIP: completed verify_fix {verify_fix_task.id} has invalid canonical completion proof; "
+                "repair or rerun that verify_fix before lifecycle can consume timeout-origin recovery. "
+                f"Proof failure: {canonical_outcome.invalid_reason}"
+            ),
+            attention_type="needs_discussion",
+            attention_reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+            handled_task_id=verify_fix_task_id,
+            created_task=verify_fix_task,
+        )
+    legacy_scope_outcome = (
+        inspect_legacy_review_scope_completion_outcome(verify_fix_task.review_scope)
+        if canonical_outcome.state == "absent"
+        else None
+    )
+    if legacy_scope_outcome is not None and legacy_scope_outcome.state == "invalid":
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=(
+                f"SKIP: completed verify_fix {verify_fix_task.id} has invalid legacy completion proof; "
+                "repair or rerun that verify_fix before lifecycle can consume timeout-origin recovery. "
+                f"Proof failure: {legacy_scope_outcome.invalid_reason}"
+            ),
+            attention_type="needs_discussion",
+            attention_reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+            handled_task_id=verify_fix_task_id,
+            created_task=verify_fix_task,
+        )
+    outcome = effective_verify_fix_completion_outcome(verify_fix_task)
+    worktree_path = _verify_fix_completion_worktree_path(context.config, verify_fix_task)
+    legacy_completion_proof = action.get("legacy_completion_proof")
+    if outcome is None and legacy_completion_proof is not None:
+        proof_branch_name = getattr(legacy_completion_proof, "branch_name", None)
+        proof_head_sha = getattr(legacy_completion_proof, "expected_head_sha", None)
+        if (
+            not isinstance(proof_branch_name, str)
+            or not proof_branch_name
+            or not isinstance(proof_head_sha, str)
+            or not proof_head_sha
+        ):
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message=(
+                    f"SKIP: completed verify_fix {verify_fix_task.id} has invalid legacy repair proof; "
+                    "retry or repair that verify_fix before lifecycle can rerun timeout-origin verify evidence."
+                ),
+                attention_type="needs_discussion",
+                attention_reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+                handled_task_id=verify_fix_task.id,
+                created_task=verify_fix_task,
+            )
+        if worktree_path is None or not worktree_path.exists():
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message=(
+                    f"SKIP: completed verify_fix {verify_fix_task.id} legacy repair proof is unavailable; "
+                    "the managed worktree is missing. Retry or repair that verify_fix before lifecycle can rerun "
+                    "timeout-origin verify evidence."
+                ),
+                attention_type="needs_discussion",
+                attention_reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+                handled_task_id=verify_fix_task.id,
+                created_task=verify_fix_task,
+            )
+        try:
+            proof_git = Git(worktree_path)
+            live_head = proof_git.rev_parse_if_exists(proof_branch_name)
+            status_entries = proof_git.status_porcelain()
+        except (GitError, OSError) as exc:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message=(
+                    f"SKIP: completed verify_fix {verify_fix_task.id} legacy repair proof is unavailable; "
+                    f"repair the branch/status probe or retry from a healthy checkout. Proof failure: {exc}"
+                ),
+                attention_type="needs_discussion",
+                attention_reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+                handled_task_id=verify_fix_task.id,
+                created_task=verify_fix_task,
+            )
+        if live_head != proof_head_sha or status_entries:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message=(
+                    f"SKIP: completed verify_fix {verify_fix_task.id} legacy repair proof no longer matches "
+                    "the exact verify epoch or clean managed worktree; retry or repair that verify_fix before "
+                    "lifecycle can rerun timeout-origin verify evidence."
+                ),
+                attention_type="needs_discussion",
+                attention_reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+                handled_task_id=verify_fix_task.id,
+                created_task=verify_fix_task,
+            )
+        try:
+            persist_verify_fix_completion_outcome(
+                context.store,
+                verify_fix_task,
+                no_source_changes=True,
+                completion_head_sha=proof_head_sha,
+                recovery_rerun_attempted=False,
+            )
+        except Exception as exc:
+            refreshed_verify_fix = context.store.get(verify_fix_task_id)
+            if refreshed_verify_fix is not None:
+                verify_fix_task = refreshed_verify_fix
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message=(
+                    f"SKIP: completed verify_fix {verify_fix_task.id} legacy repair proof could not be persisted; "
+                    "retry or repair that verify_fix before lifecycle can rerun timeout-origin verify evidence. "
+                    f"Persistence failure: {exc}"
+                ),
+                attention_type="needs_discussion",
+                attention_reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+                handled_task_id=verify_fix_task.id,
+                created_task=verify_fix_task,
+            )
+        refreshed_verify_fix = context.store.get(verify_fix_task_id)
+        if refreshed_verify_fix is not None:
+            verify_fix_task = refreshed_verify_fix
+        outcome = effective_verify_fix_completion_outcome(verify_fix_task)
+    if outcome is None or not outcome.no_source_changes:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=(
+                f"SKIP: completed verify_fix {verify_fix_task.id} lacks durable no-source proof; "
+                "retry or repair that verify_fix before lifecycle can rerun timeout-origin verify evidence."
+            ),
+            attention_type="needs_discussion",
+            attention_reason="verify-failed-needs-fix",
+            handled_task_id=verify_fix_task_id,
+            created_task=verify_fix_task,
+        )
+    if outcome.recovery_rerun_attempted:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=(
+                f"SKIP: completed verify_fix {verify_fix_task.id} already consumed its exact-head recovery rerun; "
+                "verify gate remains red for the current epoch."
+            ),
+            attention_type="needs_discussion",
+            attention_reason="verify-fix-failed",
+            handled_task_id=verify_fix_task_id,
+            created_task=verify_fix_task,
+        )
+    completion_head_sha = outcome.completion_head_sha
+    if not completion_head_sha:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=(
+                f"SKIP: completed verify_fix {verify_fix_task.id} lacks a persisted completion head SHA; "
+                "retry or repair that verify_fix before lifecycle can rerun timeout-origin verify evidence."
+            ),
+            attention_type="needs_discussion",
+            attention_reason="verify-failed-needs-fix",
+            handled_task_id=verify_fix_task_id,
+            created_task=verify_fix_task,
+        )
+
+    if worktree_path is None or not worktree_path.exists():
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=(
+                f"SKIP: completed verify_fix {verify_fix_task.id} has no available managed worktree path; "
+                "retry or repair that verify_fix before lifecycle can rerun timeout-origin verify evidence."
+            ),
+            attention_type="needs_discussion",
+            attention_reason="verify-failed-needs-fix",
+            handled_task_id=verify_fix_task_id,
+            created_task=verify_fix_task,
+        )
+
+    branch_name = verify_epoch.reviewed_branch or verify_fix_task.branch or owner_task.branch
+    if not branch_name:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=(
+                f"SKIP: completed verify_fix {verify_fix_task.id} has no verify branch identity; "
+                "retry or repair that verify_fix before lifecycle can rerun timeout-origin verify evidence."
+            ),
+            attention_type="needs_discussion",
+            attention_reason="verify-failed-needs-fix",
+            handled_task_id=verify_fix_task_id,
+            created_task=verify_fix_task,
+        )
+
+    try:
+        worktree_git = Git(worktree_path)
+        can_complete = _capture_noop_verify_fix_timeout_rerun(
+            config=context.config,
+            store=context.store,
+            task=verify_fix_task,
+            worktree_git=worktree_git,
+            worktree_path=worktree_path,
+            branch_name=branch_name,
+            head_sha=completion_head_sha,
+            base_sha=action.get("verify_base_sha"),
+            task_logger=None,
+            changed_source=not outcome.no_source_changes,
+        )
+    except (GitError, OSError) as exc:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=(
+                f"SKIP: completed verify_fix {verify_fix_task.id} exact-head rerun proof is unavailable; "
+                f"retry or repair that verify_fix. Proof failure: {exc}"
+            ),
+            attention_type="needs_discussion",
+            attention_reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+            handled_task_id=verify_fix_task.id,
+            created_task=verify_fix_task,
+        )
+    except Exception as exc:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=(
+                f"SKIP: completed verify_fix {verify_fix_task.id} exact-head rerun result could not be persisted; "
+                f"retry or repair persistence before lifecycle can consume that recovery attempt. Persistence failure: {exc}"
+            ),
+            attention_type="needs_discussion",
+            attention_reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+            handled_task_id=verify_fix_task.id,
+            created_task=verify_fix_task,
+        )
+
+    refreshed_decision = resolve_verify_gate_decision(
+        context.store,
+        owner_task,
+        config=context.config,
+        git=context.git,
+    )
+    if can_complete and refreshed_decision.state == "passed":
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="success",
+            success_message=(
+                f"Fresh exact-head verify passed for completed verify_fix {verify_fix_task.id}; "
+                "advance can continue to the next lifecycle action."
+            ),
+            work_done=True,
+            handled_task_id=verify_fix_task.id,
+            created_task=context.store.get(verify_fix_task_id) or verify_fix_task,
+        )
+
+    status_word = "red" if refreshed_decision.state == "failed" else refreshed_decision.state
+    return AdvanceActionExecutionResult(
+        action_type=action_type,
+        status="skip",
+        message=(
+            f"SKIP: completed verify_fix {verify_fix_task.id} exact-head rerun did not produce current green "
+            f"evidence; verify gate is {status_word}. Inspect or retry the verify_fix before merge."
+        ),
+        attention_type="needs_discussion",
+        attention_reason="verify-fix-failed" if refreshed_decision.state == "failed" else "verify-unavailable-after-fix",
+        handled_task_id=verify_fix_task_id,
+        created_task=context.store.get(verify_fix_task_id) or verify_fix_task,
+    )
+
+
 def _execute_run_verify_fix(
     *,
     action_type: str,
@@ -1523,6 +1845,14 @@ def execute_advance_action(
 
     if action_type == "run_verify_fix":
         return _execute_run_verify_fix(
+            action_type=action_type,
+            action=action,
+            context=context,
+        )
+
+    if action_type == "rerun_completed_verify_fix":
+        return _execute_rerun_completed_verify_fix(
+            task=task,
             action_type=action_type,
             action=action,
             context=context,

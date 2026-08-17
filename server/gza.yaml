@@ -10,3 +10,5 @@ docker_setup_command: 'uv sync'
 branch_strategy: date_slug
 
 advance_mode: iterate
+
+provider: codex

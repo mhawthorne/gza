@@ -121,8 +121,11 @@ Each watch cycle MUST execute these phases in order:
    default-branch checkout cannot produce an exact tree fingerprint before or after that
    verify, watch MUST treat freshness as unproven instead of reusing `HEAD` equality
    alone; it MUST halt further merges for the current cycle and surface one visible
-   durable attention row explaining that exact-tree freshness could not be proven. More
-   generally, if that verify is not `passed`, watch MUST first perform the bounded
+   durable attention row explaining that exact-tree freshness could not be proven. That
+   persisted row MUST NOT embed a target SHA; watch may render a SHA-bearing
+   `merges halted` freshness message only after proving the recorded SHA still matches
+   the current local target HEAD. More generally, if that verify is not `passed`, watch
+   MUST first perform the bounded
    rerun-before-halt sequence owned by
    [main-verify-self-heal.md](main-verify-self-heal.md). A flaky red that turns green in
    that sequence MUST clear the halt for the current cycle and MUST create or reuse
@@ -130,9 +133,12 @@ Each watch cycle MUST execute these phases in order:
    red that stays red across the full bounded sequence MUST halt further merges for the
    current cycle, MUST create or reuse exactly one active fix-remediation attempt for that
    failure identity, and MUST emit one visible durable attention row with reason
-   `main-integration-verify-red` naming the failing target SHA and, when structured phase
-   output exists, the failing phase. The convergence requirements for how that red state
-   self-heals or escalates over time are owned by
+   `main-integration-verify-red` naming the failing target SHA only while that SHA still
+   matches the current local target HEAD and, when structured phase output exists, the
+   failing phase. If the local target HEAD advances before the attention summary is
+   rendered, watch MUST NOT assert that the recorded SHA is still red or that merges are
+   currently halted based only on that stale red evidence. The convergence requirements
+   for how that red state self-heals or escalates over time are owned by
    [main-verify-self-heal.md](main-verify-self-heal.md). If no `verify_command` is
    configured for the project, that is an explicit no-gate
    exception: watch MAY record an `unavailable` checkpoint with

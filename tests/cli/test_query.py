@@ -40,8 +40,9 @@ from gza.pr_ops import LookupTaskPrResult
 from gza.rebase_diff import parse_rebase_diff_provenance
 from gza.review_scope import parse_resolution_review_scope
 from gza.recovery_read_context import RecoveryReadContext
+from gza.review_tasks import build_verify_fix_prompt
 from gza.review_verdict import ParsedReviewReport
-from gza.review_verify_state import persist_verify_gate_artifact
+from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
 from gza.sync_ops import BranchSyncResult
 
 from .conftest import (
@@ -145,6 +146,9 @@ def _mock_unmerged_git() -> Git:
         def get_diff_name_status(self, revision_range: str, **_kwargs) -> str:
             del revision_range
             return ""
+
+        def status_porcelain(self) -> set[tuple[str, str]]:
+            return set()
 
         def worktree_list(self) -> list[dict[str, object]]:
             return []
@@ -6839,6 +6843,102 @@ class TestShowCommand:
         assert stored.path in output
         assert "owner artifact output" in output
         assert "Review Verify" not in output
+
+    def test_show_lifecycle_summary_does_not_persist_legacy_verify_fix_upgrade(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.query import cmd_show
+
+        setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            config_path.read_text() + "verify_command: ./bin/tests\nadvance_create_reviews: true\n",
+            encoding="utf-8",
+        )
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        impl = store.add("Implement timeout recovery", task_type="implement")
+        assert impl.id is not None
+        store.mark_completed(impl, has_commits=True, branch="feature/legacy-show-timeout")
+        impl = store.get(impl.id)
+        assert impl is not None
+        review = store.add("Review timeout recovery", task_type="review", depends_on=impl.id, based_on=impl.id)
+        assert review.id is not None
+        store.mark_completed(review, has_commits=False)
+        review = store.get(review.id)
+        assert review is not None
+        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        store.update(review)
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="a" * 40,
+            verify_command="./bin/tests",
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=SimpleNamespace(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="a" * 40,
+                reviewed_base_sha="b" * 40,
+                working_directory="/tmp/worktree",
+                failure="verify_command timed out after 120s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+            verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+            producer="review_verify",
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.status = "completed"
+        verify_fix.branch = impl.branch
+        verify_fix.has_commits = False
+        store.update(verify_fix)
+
+        with (
+            patch("gza.cli.query.Git", return_value=_mock_unmerged_git()),
+            patch(
+                "gza.advance_engine.get_review_report",
+                return_value=ParsedReviewReport(verdict="APPROVED", findings=(), format_version="legacy"),
+            ),
+        ):
+            exit_code = cmd_show(
+                argparse.Namespace(
+                    project_dir=tmp_path,
+                    task_id=str(impl.id),
+                    prompt=False,
+                    path=False,
+                    output=False,
+                    page=False,
+                    full=False,
+                    metadata_only=False,
+                )
+            )
+
+        output = capsys.readouterr().out
+        assert exit_code == 0
+        assert "Repair legacy no-source completion proof" in output
+        refreshed_fix = store.get(verify_fix.id)
+        assert refreshed_fix is not None
+        assert refreshed_fix.changed_diff is None
+        assert refreshed_fix.review_verify_head_sha is None
+        assert refreshed_fix.verify_fix_completion_outcome_json is None
 
     def test_show_implement_keeps_latest_owner_verify_evidence_when_git_probe_fails(
         self,

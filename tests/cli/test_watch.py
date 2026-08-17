@@ -28,6 +28,7 @@ from gza.advance_engine import (
     failed_recovery_decision_to_action,
 )
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
+from gza.canonical_checkout import CanonicalCheckoutStatus
 from gza.cli._common import reconcile_in_progress_tasks, set_task_queue_position_scoped
 from gza.cli._lifecycle_actions import should_execute_lifecycle_action as real_should_execute_lifecycle_action
 from gza.cli._recovery_lane import collect_recovery_lane_entries
@@ -69,6 +70,7 @@ from gza.cli.watch import (
     _emit_main_verify_attention,
     _emit_transition_events,
     _evaluate_blind_parked_auto_rearm,
+    _finalize_main_verify_attention,
     _finalize_watch_no_progress_after_execution,
     _find_open_main_verify_remediation_tasks,
     _format_elapsed,
@@ -11914,6 +11916,7 @@ def test_watch_cycle_red_main_after_merge_halts_later_merges_and_emits_single_at
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "deadbeefcafe" if ref == "HEAD" else None)  # type: ignore[method-assign]
 
     merge_calls: list[str] = []
 
@@ -11931,6 +11934,8 @@ def test_watch_cycle_red_main_after_merge_halts_later_merges_and_emits_single_at
         merges_halted=True,
         state=SimpleNamespace(
             task=main_verify_task,
+            head_sha="deadbeefcafe",
+            failing_phase="unit",
             alert_message="main verify RED at `deadbeefcafe` - merges halted; phase `unit` failing",
             red_since=datetime(2026, 6, 24, 10, 0, tzinfo=UTC),
         ),
@@ -13344,6 +13349,7 @@ def test_watch_cycle_deterministic_main_verify_halts_and_files_fix_task(tmp_path
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref == "HEAD" else None)  # type: ignore[method-assign]
 
     deterministic_red = SimpleNamespace(
         merges_halted=True,
@@ -13619,6 +13625,7 @@ def test_watch_cycle_red_main_freeze_allows_only_active_fix_remediation_merge(tm
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "deadbeefcafe" if ref == "HEAD" else None)  # type: ignore[method-assign]
 
     merge_calls: list[str] = []
 
@@ -13918,6 +13925,7 @@ def test_watch_cycle_red_post_merge_verify_keeps_freeze_and_files_updated_remedi
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref == "HEAD" else None)  # type: ignore[method-assign]
 
     merge_calls: list[str] = []
 
@@ -15616,13 +15624,15 @@ def test_main_verify_exhausted_attention_uses_non_phase_signature_for_key_and_me
     attention_lines = [line for line in log_path.read_text().splitlines() if " ATTENTION " in line]
     assert len(attention_lines) == 2
     assert (
-        "automatic remediation exhausted after 2/2 attempts for status:failed:exit:1 on fp-a; "
+        "main verify remediation exhausted for status:failed:exit:1 after 2/2 attempts; "
         "human intervention required"
     ) in attention_lines[0]
     assert (
-        "automatic remediation exhausted after 2/2 attempts for status:failed:exit:2 on fp-b; "
+        "main verify remediation exhausted for status:failed:exit:2 after 2/2 attempts; "
         "human intervention required"
     ) in attention_lines[1]
+    assert "feedfacecafe" not in "\n".join(attention_lines)
+    assert "merges halted" not in "\n".join(attention_lines)
 
 
 def test_watch_cycle_green_skips_stale_main_verify_remediation_merge_and_consumption(
@@ -15871,11 +15881,14 @@ def test_watch_cycle_emits_attention_for_main_verify_launch_issue_without_freezi
         state=SimpleNamespace(
             task=main_verify_task,
             alert_message=(
-                "main verify misconfigured at `feedfacecafe` - could not launch `ruff` "
+                "main verify misconfigured - could not launch `ruff` "
                 "for phase `ruff` (not on PATH); fix the environment, not the code"
             ),
             red_since=None,
             head_sha="feedfacecafe",
+            verify_status="unavailable",
+            verify_exit_status="launch failed",
+            failing_phase="ruff",
         ),
     )
 
@@ -15909,9 +15922,459 @@ def test_watch_cycle_emits_attention_for_main_verify_launch_issue_without_freezi
     ]
     assert remediation_tasks == []
     log_text = log_path.read_text()
-    assert "ATTENTION" in log_text
-    assert "could not launch `ruff`" in log_text
-    assert "fix the environment, not the code" in log_text
+    assert sum(1 for line in log_text.splitlines() if " ATTENTION " in line) == 1
+    assert log_text.count("Needs attention (1 task):") == 1
+    summary_tail = log_text.split("Needs attention (1 task):", maxsplit=1)[1]
+    assert summary_tail.count("could not launch `ruff`") == 1
+    assert "fix the environment, not the code" in summary_tail
+    assert "main verify RED" not in log_text
+    assert "merges halted" not in log_text
+
+
+def test_watch_cycle_keeps_unchanged_main_verify_launch_issue_sticky_across_cycles(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    merge_task = _make_completed_watch_merge_task(
+        store,
+        "Completed normal merge task",
+        branch="feature/normal-merge",
+        tags=("202606-recovery",),
+    )
+    main_verify_task = _make_main_verify_internal_task(store)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    def fake_execute_merge_action(*args, **kwargs):
+        task = args[3]
+        store.set_merge_status(task.id, "merged")
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    launch_issue_check = SimpleNamespace(
+        merges_halted=False,
+        needs_attention=True,
+        remediation=None,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            alert_message=(
+                "main verify misconfigured - could not launch `ruff` "
+                "for phase `ruff` (not on PATH); fix the environment, not the code"
+            ),
+            red_since=None,
+            head_sha="feedfacecafe",
+            verify_status="unavailable",
+            verify_exit_status="launch failed",
+            failing_phase="ruff",
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=launch_issue_check),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    log_text = log_path.read_text()
+    attention_lines = [line for line in log_text.splitlines() if " ATTENTION " in line]
+    assert len(attention_lines) == 1
+    assert "could not launch `ruff`" in attention_lines[0]
+    assert log_text.count("Needs attention (1 task):") == 1
+    assert log_text.count("1 task still need attention (unchanged)") == 1
+    assert "main verify RED" not in log_text
+    assert "merges halted" not in log_text
+
+
+def test_watch_cycle_clears_main_verify_launch_issue_after_green_check(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    merge_task = _make_completed_watch_merge_task(
+        store,
+        "Completed normal merge task",
+        branch="feature/normal-merge",
+        tags=("202606-recovery",),
+    )
+    main_verify_task = _make_main_verify_internal_task(store)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+
+    def fake_execute_merge_action(*args, **kwargs):
+        task = args[3]
+        store.set_merge_status(task.id, "merged")
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    launch_issue_check = SimpleNamespace(
+        merges_halted=False,
+        needs_attention=True,
+        remediation=None,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            alert_message=(
+                "main verify misconfigured - could not launch `ruff` "
+                "for phase `ruff` (not on PATH); fix the environment, not the code"
+            ),
+            red_since=None,
+            head_sha="feedfacecafe",
+            verify_status="unavailable",
+            verify_exit_status="launch failed",
+            failing_phase="ruff",
+        ),
+    )
+    green_check = _main_verify_green_check(main_verify_task)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            side_effect=[launch_issue_check, launch_issue_check, green_check],
+        ),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    log_text = log_path.read_text()
+    assert sum(1 for line in log_text.splitlines() if " ATTENTION " in line) == 1
+    assert log_text.count("Needs attention (1 task):") == 1
+    assert "still need attention (unchanged)" not in log_text
+    second_cycle_text = log_text.split("\n\n", maxsplit=1)[1]
+    assert "Needs attention" not in second_cycle_text
+    assert "could not launch `ruff`" not in second_cycle_text
+
+
+def test_watch_cycle_clears_buffered_main_verify_red_after_remediation_merge_goes_green(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    main_verify_task = _make_main_verify_internal_task(store, head_sha="feedfacecafe")
+    remediation_task = _make_completed_watch_merge_task(
+        store,
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-functional-a",
+                "Observed main HEAD: feedfacecafe",
+            ]
+        ),
+        branch="feature/main-verify-remediation-fix",
+        tags=("202606-recovery",),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    store.record_main_verify_remediation_active_task(
+        signature="phase:functional",
+        tree_fingerprint="fp-functional-a",
+        task_id=remediation_task.id,
+    )
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    current_head = "feedfacecafe"
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda _ref: current_head)  # type: ignore[method-assign]
+    merge_calls: list[str] = []
+
+    def fake_execute_merge_action(*args, **kwargs):
+        nonlocal current_head
+        task = args[3]
+        merge_calls.append(task.id)
+        store.set_merge_status(task.id, "merged")
+        current_head = "cafebabecafe"
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    green_after_merge = _main_verify_green_check(main_verify_task, head_sha="cafebabecafe")
+    merge_row = LineageOwnerRow(
+        owner_task=remediation_task,
+        members=(remediation_task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "merge", "description": "Merge completed task"},
+        next_action_reason="merge",
+        unresolved_tasks=(remediation_task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=remediation_task,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.reconcile_task_branch_merge_truth", return_value=SimpleNamespace(ok=False)),
+        patch("gza.cli.watch.effective_no_work_merge_state", return_value="unmerged"),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([merge_row], RecoveryReadContext())),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._maybe_file_main_verify_remediation", return_value=None),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            side_effect=[
+                _main_verify_red_check(main_verify_task, tree_fingerprint="fp-functional-a", head_sha="feedfacecafe"),
+                green_after_merge,
+            ],
+        ),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    assert merge_calls == [remediation_task.id]
+    assert "INFO      Needs attention" not in log_path.read_text()
+
+
+def test_watch_cycle_replaces_buffered_main_verify_red_with_exhausted_after_remediation_merge(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    main_verify_task = _make_main_verify_internal_task(store, head_sha="feedfacecafe")
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "failed"
+    main_verify_task.review_verify_exit_status = "1"
+    main_verify_task.review_verify_failure = "verify_command failed"
+    store.update(main_verify_task)
+
+    remediation_task = _make_completed_watch_merge_task(
+        store,
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-functional-a",
+                "Observed main HEAD: feedfacecafe",
+            ]
+        ),
+        branch="feature/main-verify-remediation-exhausts",
+        tags=("202606-recovery",),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    store.record_main_verify_remediation_consumed_attempt(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        task_id="gza-prior-remediation",
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure="verify stayed red after prior remediation",
+    )
+    store.record_main_verify_remediation_active_task(
+        signature="phase:functional",
+        tree_fingerprint="fp-functional-a",
+        task_id=remediation_task.id,
+    )
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    current_head = "feedfacecafe"
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda _ref: current_head)  # type: ignore[method-assign]
+    merge_calls: list[str] = []
+
+    def fake_execute_merge_action(*args, **kwargs):
+        nonlocal current_head
+        task = args[3]
+        merge_calls.append(task.id)
+        store.set_merge_status(task.id, "merged")
+        current_head = "cafebabecafe"
+        return SimpleNamespace(rc=0, created_followups=[], reused_followups=[])
+
+    merge_row = LineageOwnerRow(
+        owner_task=remediation_task,
+        members=(remediation_task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "merge", "description": "Merge completed task"},
+        next_action_reason="merge",
+        unresolved_tasks=(remediation_task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=remediation_task,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.reconcile_task_branch_merge_truth", return_value=SimpleNamespace(ok=False)),
+        patch("gza.cli.watch.effective_no_work_merge_state", return_value="unmerged"),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([merge_row], RecoveryReadContext())),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            side_effect=[
+                _main_verify_red_check(main_verify_task, tree_fingerprint="fp-functional-a", head_sha="feedfacecafe"),
+                _main_verify_red_check(main_verify_task, tree_fingerprint="fp-functional-c", head_sha="cafebabecafe"),
+            ],
+        ),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute_merge_action),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+    )
+
+    assert merge_calls == [remediation_task.id]
+    log_text = log_path.read_text()
+    summary_tail = log_text.split("INFO      Needs attention (1 task):", maxsplit=1)[1]
+    summary_block = summary_tail.splitlines()[1]
+    assert "main verify remediation exhausted for phase:functional after 2/2 attempts" in summary_block
+    assert "human intervention required" in summary_block
+    assert "main verify RED at `feedfacecafe`" not in summary_block
+    assert "feedfacecafe" not in summary_block
+    assert "merges halted" not in summary_block
+
+
+def test_watch_cycle_keeps_current_main_verify_red_attention_when_head_unchanged(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store, head_sha="feedfacecafe")
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref == "HEAD" else None)  # type: ignore[method-assign]
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=_main_verify_red_check(main_verify_task)),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    execute_merge.assert_not_called()
+    assert "main verify RED at `feedfacecafe` - merges halted; phase `functional` failing" in log_path.read_text()
+
+
+def test_main_verify_attention_renders_current_freshness_unavailable_message(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        alert_message="main verify freshness unproven; exact tree fingerprint unavailable",
+        red_since=None,
+        head_sha="feedfacecafe",
+        verify_status="unavailable",
+        verify_exit_status="tree fingerprint unavailable",
+        failing_phase="functional",
+    )
+
+    _emit_main_verify_attention(log=log, state=state, now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC), git=git)
+
+    log_text = log_path.read_text()
+    assert "main verify freshness unproven at `feedfacecafe` - merges halted" in log_text
+    assert "exact tree fingerprint unavailable" in log_text
+    assert "main verify RED" not in log_text
 
 
 def test_watch_cycle_failed_then_merged_same_remediation_exhausts_shared_attempt_budget(
@@ -16201,7 +16664,7 @@ def test_watch_cycle_green_drops_failed_main_verify_remediation_with_real_check_
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
     git.repo_dir = tmp_path
-    git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref == "HEAD" else None)  # type: ignore[method-assign]
 
     green_result = _make_review_verify_result(
         "./bin/tests",
@@ -17023,7 +17486,7 @@ def test_watch_stale_green_main_verify_rerun_retries_pending_retirement_after_li
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
     git.repo_dir = tmp_path
-    git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref == "HEAD" else None)  # type: ignore[method-assign]
     green_result = _make_review_verify_result(
         "./bin/tests",
         status="passed",
@@ -18537,9 +19000,8 @@ def test_watch_cycle_legacy_failed_main_verify_remediation_exhausts_with_signatu
     assert (
         len(
             re.findall(
-                r"ATTENTION .*remediation "
-                + re.escape(remediation_task.id)
-                + r"; signature phase:functional; human intervention required",
+                r"ATTENTION main verify remediation exhausted for phase:functional after 2/2 attempts; "
+                r"human intervention required",
                 log_text,
             )
         )
@@ -18794,6 +19256,7 @@ def test_watch_cycle_configured_unavailable_main_verify_halts_later_merges(tmp_p
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "deadbeefcafe" if ref == "HEAD" else None)  # type: ignore[method-assign]
 
     merge_calls: list[str] = []
 
@@ -18811,6 +19274,8 @@ def test_watch_cycle_configured_unavailable_main_verify_halts_later_merges(tmp_p
         merges_halted=True,
         state=SimpleNamespace(
             task=main_verify_task,
+            head_sha="deadbeefcafe",
+            verify_status="unavailable",
             alert_message="main verify RED at `deadbeefcafe` - merges halted; verify status `unavailable`",
         ),
     )
@@ -18879,11 +19344,14 @@ def test_watch_cycle_head_change_reverifies_main_and_surfaces_attention_without_
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref == "HEAD" else None)  # type: ignore[method-assign]
 
     red = SimpleNamespace(
         merges_halted=True,
         state=SimpleNamespace(
             task=main_verify_task,
+            head_sha="feedfacecafe",
+            failing_phase="unit",
             alert_message="main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
             red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
         ),
@@ -18913,6 +19381,98 @@ def test_watch_cycle_head_change_reverifies_main_and_surfaces_attention_without_
     assert (
         "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing (red for 8m)" in log_path.read_text()
     )
+
+
+def test_watch_cycle_isolated_main_verify_summary_uses_real_target_ref(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+
+    class FrozenDateTime(datetime):
+        current = datetime(2026, 6, 24, 12, 13, tzinfo=UTC)
+
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            assert tz is not None
+            return cls.current.astimezone(tz)
+
+    monkeypatch.setattr("gza.cli.watch.datetime", FrozenDateTime)
+
+    task = store.add("Completed task", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/watch-isolated-main-verify-stale"
+    task.has_commits = True
+    store.update(task)
+    store.set_merge_status(task.id, "unmerged")
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    store.update(main_verify_task)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    repo_git = _make_watch_git()
+    repo_git.current_branch = MagicMock(return_value="feature/local")  # type: ignore[method-assign]
+    repo_git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "cafebabecafe" if ref == "refs/heads/main" else "feedfacecafe"
+    )
+    isolated_git = _make_watch_git()
+    isolated_git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref == "HEAD" else None)  # type: ignore[method-assign]
+
+    red = SimpleNamespace(
+        merges_halted=True,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            head_sha="feedfacecafe",
+            failing_phase="unit",
+            verify_status="failed",
+            verify_exit_status="1",
+            alert_message="main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
+            red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
+        patch(
+            "gza.cli.watch.check_canonical_checkout_invariant",
+            return_value=CanonicalCheckoutStatus(state="ok", expected_branch="main", current_branch="feature/local"),
+        ),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=red) as check_main_verify,
+        patch("gza.cli.watch._execute_merge_action") as execute_merge,
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    execute_merge.assert_not_called()
+    check_main_verify.assert_called_once()
+    log_text = log_path.read_text()
+    summary_text = log_text.split("INFO      ", maxsplit=1)[1] if "INFO      " in log_text else ""
+    assert "Needs attention" not in summary_text
+    assert "main verify RED at `feedfacecafe` - merges halted" not in summary_text
+    assert call("refs/heads/main") in repo_git.rev_parse_if_exists.call_args_list
 
 
 def test_format_red_duration_formats_minute_hour_and_day_boundaries() -> None:
@@ -18960,12 +19520,14 @@ def test_watch_cycle_idle_head_change_reverifies_main_and_surfaces_attention_row
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
-    git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref == "HEAD" else None)  # type: ignore[method-assign]
 
     red = SimpleNamespace(
         merges_halted=True,
         state=SimpleNamespace(
             task=main_verify_task,
+            head_sha="feedfacecafe",
+            failing_phase="unit",
             alert_message="main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
         ),
     )
@@ -29060,6 +29622,338 @@ def test_watch_log_suppresses_unchanged_attention_inline_across_cycles_but_keeps
     assert text.count("INFO      1 task still need attention (unchanged)") == 1
     assert text.count("  gza-1 review needs manual attention") == 1
     assert text.count("  gza-1 review still needs manual attention") == 1
+
+
+def test_main_verify_attention_summary_keeps_red_line_when_head_is_unchanged(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref == "HEAD" else None)  # type: ignore[method-assign]
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha="feedfacecafe",
+        failing_phase="unit",
+        verify_status="failed",
+        alert_message="main verify RED - merges halted; phase `unit` failing",
+        red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
+    )
+
+    log.begin_cycle()
+    _emit_main_verify_attention(log=log, state=state, now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC), git=git)
+    _finalize_main_verify_attention(
+        log=log,
+        state=state,
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+        git=git,
+    )
+    _emit_cycle_attention_summary(log)
+
+    text = log_path.read_text()
+    assert "Needs attention (1 task):" in text
+    assert "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing (red for 8m)" in text
+
+
+def test_main_verify_attention_summary_suppresses_red_line_when_head_advanced(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=["feedfacecafe", "cafebabecafe"])  # type: ignore[method-assign]
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha="feedfacecafe",
+        failing_phase="unit",
+        verify_status="failed",
+        alert_message="main verify RED - merges halted; phase `unit` failing",
+        red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
+    )
+
+    log.begin_cycle()
+    _emit_main_verify_attention(log=log, state=state, now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC), git=git)
+    _finalize_main_verify_attention(
+        log=log,
+        state=state,
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+        git=git,
+    )
+    _emit_cycle_attention_summary(log)
+
+    text = log_path.read_text()
+    summary_text = text.split("INFO      ", maxsplit=1)[1] if "INFO      " in text else ""
+    assert "Needs attention" not in summary_text
+    assert "main verify RED at `feedfacecafe` - merges halted" not in summary_text
+
+
+def test_main_verify_attention_summary_replaces_matching_emission_when_render_head_unproven(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=["feedfacecafe", None])  # type: ignore[method-assign]
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha="feedfacecafe",
+        failing_phase="unit",
+        verify_status="failed",
+        verify_exit_status="1",
+        alert_message="main verify RED - merges halted; phase `unit` failing",
+        red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
+    )
+
+    log.begin_cycle()
+    _emit_main_verify_attention(log=log, state=state, now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC), git=git)
+    _finalize_main_verify_attention(
+        log=log,
+        state=state,
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+        git=git,
+    )
+    _emit_cycle_attention_summary(log)
+
+    text = log_path.read_text()
+    summary_text = text.split("INFO      ", maxsplit=1)[1] if "INFO      " in text else ""
+    assert "main verify red evidence unproven at current HEAD; current HEAD identity unavailable" in summary_text
+    assert "main verify RED at `feedfacecafe` - merges halted" not in summary_text
+    assert "phase `unit` failing" not in summary_text
+
+
+def test_main_verify_attention_summary_replaces_unproven_emission_when_render_head_matches(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=[None, "feedfacecafe"])  # type: ignore[method-assign]
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha="feedfacecafe",
+        failing_phase="unit",
+        verify_status="failed",
+        verify_exit_status="1",
+        alert_message="main verify RED - merges halted; phase `unit` failing",
+        red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
+    )
+
+    log.begin_cycle()
+    _emit_main_verify_attention(log=log, state=state, now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC), git=git)
+    _finalize_main_verify_attention(
+        log=log,
+        state=state,
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+        git=git,
+    )
+    _emit_cycle_attention_summary(log)
+
+    text = log_path.read_text()
+    summary_text = text.split("INFO      ", maxsplit=1)[1] if "INFO      " in text else ""
+    assert "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing (red for 8m)" in summary_text
+    assert "main verify red evidence unproven" not in summary_text
+
+
+def test_main_verify_attention_summary_uses_real_target_ref_for_isolated_checkout(
+    tmp_path: Path,
+) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    detached_git = _make_watch_git()
+    detached_git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
+    repo_git = _make_watch_git()
+    repo_git.current_branch = MagicMock(return_value="feature/local")  # type: ignore[method-assign]
+    repo_git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "cafebabecafe" if ref == "refs/heads/main" else "feedfacecafe"
+    )
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha="feedfacecafe",
+        failing_phase="unit",
+        verify_status="failed",
+        verify_exit_status="1",
+        alert_message="main verify RED - merges halted; phase `unit` failing",
+        red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
+    )
+
+    log.begin_cycle()
+    _emit_main_verify_attention(
+        log=log,
+        state=state,
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+        git=detached_git,
+    )
+    _finalize_main_verify_attention(
+        log=log,
+        state=state,
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+        git=repo_git,
+        target_branch="main",
+    )
+    _emit_cycle_attention_summary(log)
+
+    text = log_path.read_text()
+    summary_text = text.split("INFO      ", maxsplit=1)[1] if "INFO      " in text else ""
+    assert "Needs attention" not in summary_text
+    assert "main verify RED at `feedfacecafe` - merges halted" not in summary_text
+    assert repo_git.rev_parse_if_exists.call_args_list[-1] == call("refs/heads/main")
+
+
+@pytest.mark.parametrize(
+    ("head_side_effect", "head_sha", "expected"),
+    [
+        (None, "feedfacecafe", "current HEAD identity unavailable"),
+        (GitError("HEAD lookup failed"), "feedfacecafe", "current HEAD identity unavailable"),
+        ("feedfacecafe", None, "recorded target SHA unavailable"),
+    ],
+)
+def test_main_verify_attention_summary_marks_red_claim_unproven_without_head_proof(
+    tmp_path: Path,
+    head_side_effect: object,
+    head_sha: str | None,
+    expected: str,
+) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    if isinstance(head_side_effect, BaseException):
+        git.rev_parse_if_exists = MagicMock(side_effect=head_side_effect)  # type: ignore[method-assign]
+    else:
+        git.rev_parse_if_exists = MagicMock(return_value=head_side_effect)  # type: ignore[method-assign]
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha=head_sha,
+        failing_phase="unit",
+        verify_status="failed",
+        verify_exit_status="1",
+        alert_message="main verify RED - merges halted; phase `unit` failing",
+        red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
+    )
+
+    log.begin_cycle()
+    _emit_main_verify_attention(log=log, state=state, now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC), git=git)
+    _finalize_main_verify_attention(
+        log=log,
+        state=state,
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+        git=git,
+    )
+    _emit_cycle_attention_summary(log)
+
+    text = log_path.read_text()
+    assert expected in text
+    assert "feedfacecafe" not in text
+    assert "main verify RED" not in text
+    assert "merges halted" not in text
+
+
+@pytest.mark.parametrize(
+    ("head_side_effect", "expected"),
+    [
+        ("cafebabecafe", "main verify freshness unproven at current HEAD; exact tree fingerprint unavailable"),
+        (None, "main verify freshness unproven at current HEAD; exact tree fingerprint unavailable"),
+    ],
+)
+def test_main_verify_attention_summary_weakens_stale_freshness_unavailable_claim(
+    tmp_path: Path,
+    head_side_effect: str | None,
+    expected: str,
+) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value=head_side_effect)  # type: ignore[method-assign]
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha="feedfacecafe",
+        failing_phase="unit",
+        verify_status="unavailable",
+        verify_exit_status="tree fingerprint unavailable",
+        alert_message="main verify freshness unproven; exact tree fingerprint unavailable",
+        red_since=None,
+    )
+
+    log.begin_cycle()
+    _emit_main_verify_attention(log=log, state=state, now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC), git=git)
+    _finalize_main_verify_attention(
+        log=log,
+        state=state,
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+        git=git,
+    )
+    _emit_cycle_attention_summary(log)
+
+    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
+    assert expected in summary_text
+    assert "feedfacecafe" not in summary_text
+    assert "merges halted" not in summary_text
+
+
+def test_main_verify_attention_summary_keeps_freshness_halt_when_head_matches(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe")  # type: ignore[method-assign]
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha="feedfacecafe",
+        failing_phase="unit",
+        verify_status="unavailable",
+        verify_exit_status="tree fingerprint unavailable",
+        alert_message="main verify freshness unproven; exact tree fingerprint unavailable",
+        red_since=None,
+    )
+
+    log.begin_cycle()
+    _emit_main_verify_attention(log=log, state=state, now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC), git=git)
+    _finalize_main_verify_attention(
+        log=log,
+        state=state,
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+        git=git,
+    )
+    _emit_cycle_attention_summary(log)
+
+    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
+    assert "main verify freshness unproven at `feedfacecafe` - merges halted" in summary_text
+    assert "exact tree fingerprint unavailable" in summary_text
+
+
+def test_main_verify_attention_summary_clears_exhausted_key_after_green_resolution(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    exhausted_state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha="feedfacecafe",
+        failing_phase="functional",
+        verify_status="failed",
+        verify_exit_status="1",
+        alert_message=(
+            "main verify RED - merges halted; automatic remediation exhausted after 2/2 attempts "
+            "for phase:functional on fp-functional-a; remediation no-open-task; signature phase:functional; "
+            "human intervention required"
+        ),
+        red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
+    )
+    green_state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha="cafebabecafe",
+        alert_message=None,
+    )
+
+    log.begin_cycle()
+    _emit_main_verify_attention(
+        log=log,
+        state=exhausted_state,
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+    )
+    _finalize_main_verify_attention(
+        log=log,
+        state=green_state,
+        now=datetime(2026, 6, 24, 12, 14, tzinfo=UTC),
+        git=None,
+    )
+    _emit_cycle_attention_summary(log)
+
+    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1] if "INFO      " in log_path.read_text() else ""
+    assert "Needs attention" not in summary_text
+    assert "remediation exhausted" not in summary_text
 
 
 def test_watch_cycle_logs_one_quiet_skip_per_stable_hold_window(tmp_path: Path) -> None:
