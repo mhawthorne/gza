@@ -310,6 +310,21 @@ def _startup_diagnostic(stream: IO[str]) -> str:
     return f"; startup output: {output[-2000:]}"
 
 
+def _exception_diagnostic(exc: BaseException) -> str:
+    message = str(exc)
+    if message:
+        return f"{type(exc).__name__}: {message}"
+    return type(exc).__name__
+
+
+def _report_preserved_exception_failure(
+    exc: BaseException, diagnostic: str
+) -> None:
+    """Make cleanup failures visible while preserving the startup exception."""
+    print(f"error: {diagnostic}", file=sys.stderr, flush=True)
+    exc.add_note(diagnostic)
+
+
 def start_server(path: Path) -> str:
     with server_lock(path):
         current = read_state(path)
@@ -359,18 +374,48 @@ def start_server(path: Path) -> str:
                 wait_until_ready(process, state)
                 write_state(path, state)
             except BaseException as exc:
+                startup_diagnostic = (
+                    f"{_exception_diagnostic(exc)}"
+                    f"{_startup_diagnostic(startup_output)}"
+                )
                 try:
                     _cleanup_child(process)
-                except Exception:
-                    # Cleanup must not replace KeyboardInterrupt/SystemExit or the
-                    # original startup failure. The unpublished state is still removed.
-                    pass
-                finally:
+                except BaseException as cleanup_exc:
+                    try:
+                        write_state(path, state)
+                    except BaseException as recovery_exc:
+                        recovery_diagnostic = (
+                            f"recovery state could not be written to {path}: "
+                            f"{_exception_diagnostic(recovery_exc)}; "
+                            "recovery metadata: "
+                            f"{json.dumps(asdict(state), sort_keys=True)}"
+                        )
+                    else:
+                        recovery_diagnostic = f"recovery state was preserved at {path}"
+                    failure_diagnostic = (
+                        f"gza-server startup failed for PID {state.pid}: "
+                        f"{startup_diagnostic}; cleanup failed: "
+                        f"{_exception_diagnostic(cleanup_exc)}; {recovery_diagnostic}"
+                    )
+                    if isinstance(exc, LifecycleError):
+                        raise LifecycleError(failure_diagnostic) from cleanup_exc
+                    _report_preserved_exception_failure(exc, failure_diagnostic)
+                    raise exc from cleanup_exc
+                try:
                     path.unlink(missing_ok=True)
+                except BaseException as cleanup_exc:
+                    failure_diagnostic = (
+                        f"gza-server startup failed for PID {state.pid}: "
+                        f"{startup_diagnostic}; child exit was confirmed, but failed "
+                        f"to remove state at {path}: "
+                        f"{_exception_diagnostic(cleanup_exc)}"
+                    )
+                    if isinstance(exc, LifecycleError):
+                        raise LifecycleError(failure_diagnostic) from cleanup_exc
+                    _report_preserved_exception_failure(exc, failure_diagnostic)
+                    raise exc from cleanup_exc
                 if isinstance(exc, LifecycleError):
-                    raise LifecycleError(
-                        f"{exc}{_startup_diagnostic(startup_output)}"
-                    ) from exc
+                    raise LifecycleError(startup_diagnostic) from exc
                 raise
 
         url = server_url(state)

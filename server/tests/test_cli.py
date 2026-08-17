@@ -574,6 +574,156 @@ def test_start_timeout_terminates_and_reaps_child_without_publishing(tmp_path):
     assert not path.exists()
 
 
+def test_start_cleanup_failure_preserves_recovery_state_and_reports_both_errors(
+    tmp_path,
+):
+    path = tmp_path / "gza-server.json"
+    process = Mock(pid=222)
+    with (
+        patch("gza_server.cli.find_free_port", return_value=8765),
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
+        patch("gza_server.cli.subprocess.Popen", return_value=process),
+        patch(
+            "gza_server.cli.wait_until_ready",
+            side_effect=LifecycleError("gza-server did not become ready"),
+        ),
+        patch("gza_server.cli._cleanup_child", side_effect=OSError("wait failed")),
+        patch("gza_server.cli.webbrowser.open") as browser_open,
+    ):
+        with pytest.raises(LifecycleError) as exc_info:
+            start_server(path)
+
+    message = str(exc_info.value)
+    assert "gza-server did not become ready" in message
+    assert "cleanup failed: OSError: wait failed" in message
+    assert "PID 222" in message
+    assert f"recovery state was preserved at {path}" in message
+    state = read_state(path)
+    assert state is not None
+    assert (state.pid, state.port) == (222, 8765)
+    assert state.instance_id
+    assert state.process_start_id == "spawn-start"
+    browser_open.assert_not_called()
+
+
+def test_start_cleanup_and_recovery_write_failures_report_recovery_metadata(tmp_path):
+    path = tmp_path / "gza-server.json"
+    process = Mock(pid=222)
+    with (
+        patch("gza_server.cli.find_free_port", return_value=8765),
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
+        patch("gza_server.cli.subprocess.Popen", return_value=process),
+        patch(
+            "gza_server.cli.wait_until_ready",
+            side_effect=LifecycleError("gza-server did not become ready"),
+        ),
+        patch("gza_server.cli._cleanup_child", side_effect=OSError("wait failed")),
+        patch("gza_server.cli.write_state", side_effect=OSError("disk full")),
+    ):
+        with pytest.raises(LifecycleError) as exc_info:
+            start_server(path)
+
+    message = str(exc_info.value)
+    assert "gza-server did not become ready" in message
+    assert "cleanup failed: OSError: wait failed" in message
+    assert "PID 222" in message
+    assert (
+        f"recovery state could not be written to {path}: OSError: disk full" in message
+    )
+    assert '"pid": 222' in message
+    assert '"port": 8765' in message
+    assert '"process_start_id": "spawn-start"' in message
+    assert '"instance_id":' in message
+
+
+def test_start_interruption_cleanup_failure_preserves_state_and_interrupt(tmp_path):
+    path = tmp_path / "gza-server.json"
+    process = Mock(pid=222)
+    with (
+        patch("gza_server.cli.find_free_port", return_value=8765),
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
+        patch("gza_server.cli.subprocess.Popen", return_value=process),
+        patch("gza_server.cli.wait_until_ready", side_effect=KeyboardInterrupt),
+        patch("gza_server.cli._cleanup_child", side_effect=OSError("wait failed")),
+    ):
+        with pytest.raises(KeyboardInterrupt) as exc_info:
+            start_server(path)
+
+    assert isinstance(exc_info.value.__cause__, OSError)
+    diagnostic = "\n".join(exc_info.value.__notes__)
+    assert "startup failed for PID 222: KeyboardInterrupt" in diagnostic
+    assert "cleanup failed: OSError: wait failed" in diagnostic
+    assert f"recovery state was preserved at {path}" in diagnostic
+    state = read_state(path)
+    assert state is not None
+    assert (state.pid, state.port, state.process_start_id) == (
+        222,
+        8765,
+        "spawn-start",
+    )
+
+
+def test_start_system_exit_cleanup_failure_is_visible_and_preserves_state(
+    tmp_path, capsys
+):
+    path = tmp_path / "gza-server.json"
+    process = Mock(pid=222)
+    with (
+        patch("gza_server.cli.find_free_port", return_value=8765),
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
+        patch("gza_server.cli.subprocess.Popen", return_value=process),
+        patch(
+            "gza_server.cli.wait_until_ready",
+            side_effect=SystemExit("startup aborted"),
+        ),
+        patch("gza_server.cli._cleanup_child", side_effect=OSError("wait failed")),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            start_server(path)
+
+    assert exc_info.value.code == "startup aborted"
+    assert isinstance(exc_info.value.__cause__, OSError)
+    diagnostic = capsys.readouterr().err
+    assert "startup failed for PID 222: SystemExit: startup aborted" in diagnostic
+    assert "cleanup failed: OSError: wait failed" in diagnostic
+    assert f"recovery state was preserved at {path}" in diagnostic
+    state = read_state(path)
+    assert state is not None
+    assert (state.pid, state.port, state.process_start_id) == (
+        222,
+        8765,
+        "spawn-start",
+    )
+
+
+def test_start_system_exit_state_unlink_failure_is_visible_and_preserves_exit(
+    tmp_path, capsys
+):
+    path = tmp_path / "gza-server.json"
+    process = Mock(pid=222)
+    with (
+        patch("gza_server.cli.find_free_port", return_value=8765),
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
+        patch("gza_server.cli.subprocess.Popen", return_value=process),
+        patch(
+            "gza_server.cli.wait_until_ready",
+            side_effect=SystemExit("startup aborted"),
+        ),
+        patch("gza_server.cli._cleanup_child") as cleanup_child,
+        patch.object(Path, "unlink", side_effect=OSError("unlink failed")),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            start_server(path)
+
+    assert exc_info.value.code == "startup aborted"
+    assert isinstance(exc_info.value.__cause__, OSError)
+    cleanup_child.assert_called_once_with(process)
+    diagnostic = capsys.readouterr().err
+    assert "startup failed for PID 222: SystemExit: startup aborted" in diagnostic
+    assert "child exit was confirmed" in diagnostic
+    assert f"failed to remove state at {path}: OSError: unlink failed" in diagnostic
+
+
 def test_start_keyboard_interrupt_force_cleans_child_and_reraises(tmp_path):
     path = tmp_path / "gza-server.json"
     process = Mock(pid=222)
