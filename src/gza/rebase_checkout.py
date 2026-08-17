@@ -113,11 +113,12 @@ def create_isolated_rebase_checkout(
         checkout_git._run("init")
         _copy_git_identity(source_git=source_git, checkout_git=checkout_git)
 
+        source_repo = source_git.toplevel()
         imported_refs = _build_import_refspecs(source_git, branch=branch, target_ref=target_ref)
         checkout_git._run(
             "fetch",
             "--no-tags",
-            str(source_git.repo_dir.resolve()),
+            str(source_repo),
             *imported_refs,
         )
         checkout_git.checkout(branch)
@@ -137,7 +138,7 @@ def create_isolated_rebase_checkout(
         branch=branch,
         target_ref=target_ref,
         imported_refs=imported_refs,
-        source_repo=source_git.repo_dir.resolve(),
+        source_repo=source_repo,
     )
 
 

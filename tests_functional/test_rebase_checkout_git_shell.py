@@ -1,5 +1,8 @@
 from pathlib import Path
 
+import pytest
+
+from gza.git import Git
 from gza.config import Config
 from gza.rebase_checkout import isolated_rebase_checkout
 from tests_functional.git_helpers import init_basic_repo
@@ -59,3 +62,40 @@ def test_private_rebase_checkout_prune_isolated_from_canonical_worktree_registry
         canonical_list = git._run("worktree", "list", "--porcelain").stdout
         assert str(canonical_worktree) in canonical_list
         assert canonical_metadata_dir.exists()
+
+
+@pytest.mark.functional
+def test_private_rebase_checkout_fetches_from_enclosing_repo_for_subdirectory_project(tmp_path: Path) -> None:
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    root_git = init_basic_repo(repo_dir)
+
+    project_dir = repo_dir / "server"
+    project_dir.mkdir()
+    (project_dir / "app.py").write_text("print('main')\n", encoding="utf-8")
+    root_git._run("add", "server/app.py")
+    root_git._run("commit", "-m", "Add server project")
+
+    root_git._run("checkout", "-b", "feature/server-rebase")
+    (project_dir / "app.py").write_text("print('feature')\n", encoding="utf-8")
+    root_git._run("add", "server/app.py")
+    root_git._run("commit", "-m", "Update server project")
+    root_git._run("checkout", "main")
+
+    config = Config(
+        project_dir=project_dir,
+        project_name="server",
+        worktree_dir=str(tmp_path / "managed-worktrees"),
+    )
+    source_git = Git(project_dir)
+
+    with isolated_rebase_checkout(
+        config=config,
+        source_git=source_git,
+        branch="feature/server-rebase",
+        target_ref="main",
+        checkout_name="gzaserver-36",
+    ) as checkout:
+        assert checkout.source_repo == repo_dir.resolve()
+        assert checkout.git.current_branch() == "feature/server-rebase"
+        assert (checkout.path / "server" / "app.py").read_text(encoding="utf-8") == "print('feature')\n"

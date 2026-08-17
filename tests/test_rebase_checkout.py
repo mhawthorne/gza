@@ -26,6 +26,7 @@ class _FakeGit:
 
     def __init__(self, repo_dir: Path):
         self.repo_dir = Path(repo_dir)
+        self.repo_toplevel = self.repo_dir.resolve()
         self.commands: list[tuple[str, ...]] = []
         self.checked_out: str | None = None
         self.reset_to: str | None = None
@@ -55,6 +56,9 @@ class _FakeGit:
 
     def clean_force(self) -> None:
         self.cleaned = True
+
+    def toplevel(self) -> Path:
+        return self.repo_toplevel
 
     def rev_parse(self, ref: str) -> str:
         value = _FakeGit.rev_parse_values.get(ref)
@@ -161,6 +165,45 @@ def test_create_isolated_rebase_checkout_removes_temp_dir_when_fetch_fails(monke
     assert excinfo.value is expected_error
     created_checkout_dirs = list(config.worktree_path.glob("*-rebase-git-*"))
     assert created_checkout_dirs == []
+
+
+def test_create_isolated_rebase_checkout_fetches_from_source_toplevel(monkeypatch, tmp_path: Path) -> None:
+    _FakeGit.instances = []
+    _FakeGit.existing_refs = set()
+    _FakeGit.config_values = {}
+    _FakeGit.rev_parse_values = {}
+    _FakeGit.update_ref_error = None
+    _FakeGit.run_error_command = None
+    _FakeGit.run_error = None
+    monkeypatch.setattr("gza.rebase_checkout.Git", _FakeGit)
+
+    source_repo = tmp_path / "repo"
+    project_dir = source_repo / "server"
+    project_dir.mkdir(parents=True)
+    source_git = _FakeGit(project_dir)
+    source_git.repo_toplevel = source_repo.resolve()
+    config = Config(
+        project_dir=project_dir,
+        project_name="server",
+        worktree_dir=str(tmp_path / "managed-worktrees"),
+    )
+
+    checkout = create_isolated_rebase_checkout(
+        config=config,
+        source_git=source_git,
+        branch="feature/private-rebase",
+        target_ref="main",
+        checkout_name="gzaserver-36",
+    )
+
+    assert checkout.source_repo == source_repo.resolve()
+    assert (
+        "fetch",
+        "--no-tags",
+        str(source_repo.resolve()),
+        "+refs/heads/feature/private-rebase:refs/heads/feature/private-rebase",
+        "+refs/heads/main:refs/heads/main",
+    ) in checkout.git.commands
 
 
 def test_create_isolated_rebase_checkout_preserves_canonical_admin_files(monkeypatch, tmp_path: Path) -> None:

@@ -7,7 +7,6 @@ import json
 import math
 import os
 import signal
-import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -19,6 +18,8 @@ from types import FrameType
 from typing import Any, TypeAlias, cast
 
 import pytest
+
+from gza.git import Git
 
 
 @dataclass(frozen=True)
@@ -383,13 +384,7 @@ def _write_output(text: str, output_path: str | None) -> None:
 
 def _repo_root() -> Path:
     """Return the git repository top-level for the current working directory."""
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return Path(result.stdout.strip())
+    return Git(Path.cwd()).toplevel()
 
 
 def _default_report_path(json_mode: bool) -> str:

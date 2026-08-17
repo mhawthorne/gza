@@ -193,6 +193,56 @@ def test_recover_rebase_diff_provenance_from_reflogs(tmp_path: Path) -> None:
     assert recovered.resolved_target_sha == "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 
 
+def test_recover_rebase_diff_provenance_uses_containing_worktree_root_for_nested_project(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    project_dir = repo / "server"
+    project_dir.mkdir(parents=True)
+    git_dir = repo / ".git" / "logs" / "refs" / "heads"
+    git_dir.mkdir(parents=True)
+    branch = "feature/rebase-backfill"
+    target = "main"
+    (git_dir / "feature").mkdir(parents=True, exist_ok=True)
+    (git_dir / branch).write_text(
+        "\n".join(
+            (
+                "1111111111111111111111111111111111111111 "
+                "2222222222222222222222222222222222222222 user <u@example.com> 1000 +0000\tcommit: prior",
+                "2222222222222222222222222222222222222222 "
+                "3333333333333333333333333333333333333333 user <u@example.com> 2000 +0000\t"
+                "rebase (finish): refs/heads/feature/rebase-backfill onto "
+                "4444444444444444444444444444444444444444",
+            )
+        )
+        + "\n"
+    )
+    (git_dir / target).write_text(
+        "4444444444444444444444444444444444444444 "
+        "5555555555555555555555555555555555555555 user <u@example.com> 1999 +0000\tcommit: target moved\n"
+    )
+
+    git = MagicMock(spec=Git)
+    git.repo_dir = project_dir
+    git.toplevel.return_value = repo
+    git.merge_base.return_value = "6666666666666666666666666666666666666666"
+
+    recovered = recover_rebase_diff_provenance(
+        git,
+        branch=branch,
+        target_branch=target,
+        completed_at=datetime.fromtimestamp(2001, UTC),
+        review_scope="Review only the custom lifecycle slice.",
+    )
+
+    assert recovered is not None
+    assert recovered.old_tip == "2222222222222222222222222222222222222222"
+    assert recovered.target_at_start == "4444444444444444444444444444444444444444"
+    assert recovered.merge_base_at_start == "6666666666666666666666666666666666666666"
+    assert recovered.resolved_head_sha == "3333333333333333333333333333333333333333"
+    assert recovered.resolved_target_sha == "5555555555555555555555555555555555555555"
+
+
 def test_recover_rebase_diff_provenance_fails_closed_without_rebase_reflog_proof(tmp_path: Path) -> None:
     git_dir = tmp_path / ".git" / "logs" / "refs" / "heads"
     git_dir.mkdir(parents=True)

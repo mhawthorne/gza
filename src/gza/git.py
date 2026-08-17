@@ -1119,6 +1119,11 @@ class Git:
         self._store_cached_resolved_ref(ref, "commit", sha)
         return sha
 
+    def toplevel(self) -> Path:
+        """Return the git worktree top-level containing ``repo_dir``."""
+        result = self._run_readonly_success_cached("rev-parse", "--show-toplevel")
+        return Path(result.stdout.strip()).resolve()
+
     def rev_parse_if_exists(self, ref: str) -> str | None:
         """Resolve a ref to its commit SHA when it exists."""
         hit, sha = self._lookup_cached_resolved_ref(ref, "commit")

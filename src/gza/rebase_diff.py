@@ -246,10 +246,10 @@ def recover_rebase_diff_provenance(
 ) -> RebaseDiffProvenance | None:
     """Recover missing rebase provenance from local reflogs and persisted hints."""
     existing = parse_rebase_diff_provenance(review_scope)
-    repo_dir = getattr(git, "repo_dir", None)
-    if not isinstance(repo_dir, Path):
+    common_dir = _git_common_dir(git)
+    if common_dir is None:
         return existing
-    branch_entries = _read_reflog_entries(_reflog_path(git, branch))
+    branch_entries = _read_reflog_entries(_reflog_path(common_dir, branch))
     if not branch_entries:
         return existing
 
@@ -262,7 +262,7 @@ def recover_rebase_diff_provenance(
     if branch_entry is None:
         return existing
 
-    target_entries = _read_reflog_entries(_reflog_path(git, target_branch))
+    target_entries = _read_reflog_entries(_reflog_path(common_dir, target_branch))
     resolved_target_entry = _select_latest_reflog_entry_at_or_before(target_entries, branch_entry.timestamp)
     target_at_start = _parse_rebase_target_from_message(branch_entry.message)
     if target_at_start is None and resolved_target_entry is not None:
@@ -398,9 +398,40 @@ def _normalize_oid(value: str | None) -> str | None:
     return value
 
 
-def _reflog_path(git: Git, ref: str) -> Path:
-    common_dir = _git_common_dir_from_repo(git.repo_dir)
+def _reflog_path(common_dir: Path, ref: str) -> Path:
     return common_dir / "logs" / "refs" / "heads" / ref
+
+
+def _git_common_dir(git: Git) -> Path | None:
+    worktree_root = _git_worktree_root(git)
+    if worktree_root is None:
+        return None
+    return _git_common_dir_from_repo(worktree_root)
+
+
+def _git_worktree_root(git: Git) -> Path | None:
+    repo_dir = getattr(git, "repo_dir", None)
+    if not isinstance(repo_dir, Path):
+        return None
+
+    toplevel = getattr(git, "toplevel", None)
+    if callable(toplevel) and _should_use_git_toplevel(git):
+        try:
+            resolved = toplevel()
+        except (GitError, OSError, RuntimeError):
+            resolved = None
+        if isinstance(resolved, Path):
+            return resolved.resolve()
+
+    return repo_dir
+
+
+def _should_use_git_toplevel(git: Git) -> bool:
+    if type(git) is Git:
+        return True
+    if isinstance(git, Git) and getattr(type(git), "toplevel", None) is Git.toplevel:
+        return False
+    return True
 
 
 def _git_common_dir_from_repo(repo_dir: Path) -> Path:
