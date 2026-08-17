@@ -109,6 +109,9 @@ def test_start_spawns_uvicorn_records_state_opens_browser_and_returns_url(tmp_pa
     command = popen.call_args.args[0]
     assert command[-5:] == ["--factory", "--host", "127.0.0.1", "--port", "8765"]
     assert "gza_server.app:create_app" in command
+    assert "--no-access-log" in command
+    assert popen.call_args.kwargs["stdout"] is not subprocess.DEVNULL
+    assert popen.call_args.kwargs["stderr"] is subprocess.STDOUT
     assert popen.call_args.kwargs["env"]["GZA_SERVER_INSTANCE_ID"] == state.instance_id
     browser_open.assert_called_once_with(url)
 
@@ -525,13 +528,17 @@ def test_positive_endpoint_mismatch_is_safe_stale_state(tmp_path):
     assert not path.exists()
 
 
-def test_start_early_exit_reaps_child_and_reports_startup_output(tmp_path):
+def test_start_early_exit_reaps_child_and_reports_bounded_startup_output(tmp_path):
     path = tmp_path / "gza-server.json"
     process = Mock(pid=222)
     process.poll.return_value = 3
 
     def spawn(*args, **kwargs):
-        kwargs["stdout"].write("address already in use\n")
+        kwargs["stdout"].write(
+            b"discarded startup output\n"
+            + (b"x" * 2100)
+            + b"\naddress already in use\n"
+        )
         return process
 
     with (
@@ -539,9 +546,11 @@ def test_start_early_exit_reaps_child_and_reports_startup_output(tmp_path):
         patch("gza_server.cli.subprocess.Popen", side_effect=spawn),
         patch("gza_server.cli.webbrowser.open") as browser_open,
     ):
-        with pytest.raises(LifecycleError, match="status 3.*address already in use"):
+        with pytest.raises(LifecycleError, match="status 3") as exc_info:
             start_server(path)
 
+    assert "address already in use" in str(exc_info.value)
+    assert "discarded startup output" not in str(exc_info.value)
     process.terminate.assert_not_called()
     process.wait.assert_called_once_with()
     browser_open.assert_not_called()
