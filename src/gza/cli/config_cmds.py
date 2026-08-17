@@ -1694,6 +1694,16 @@ def run_preflight_target(
     cfg.max_steps = 3
     cfg.max_turns = 3
 
+    if use_docker:
+        # Mirror real task runs: for a subproject (e.g. server/), mount the repo
+        # root and execute in the subdirectory. Mounting only the project dir
+        # breaks in-repo relative dependencies such as `path = ".."`.
+        from ..runner import _container_execution_dir, _project_boundary
+
+        boundary = _project_boundary(cfg)
+        cfg.docker_workdir = str(_container_execution_dir(boundary))
+        work_dir = boundary.repo_root
+
     from ..providers.base import get_provider
 
     provider = get_provider(cfg)
