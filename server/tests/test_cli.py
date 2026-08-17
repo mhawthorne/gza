@@ -663,6 +663,67 @@ def test_start_interruption_cleanup_failure_preserves_state_and_interrupt(tmp_pa
     )
 
 
+def test_start_system_exit_cleanup_failure_is_visible_and_preserves_state(
+    tmp_path, capsys
+):
+    path = tmp_path / "gza-server.json"
+    process = Mock(pid=222)
+    with (
+        patch("gza_server.cli.find_free_port", return_value=8765),
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
+        patch("gza_server.cli.subprocess.Popen", return_value=process),
+        patch(
+            "gza_server.cli.wait_until_ready",
+            side_effect=SystemExit("startup aborted"),
+        ),
+        patch("gza_server.cli._cleanup_child", side_effect=OSError("wait failed")),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            start_server(path)
+
+    assert exc_info.value.code == "startup aborted"
+    assert isinstance(exc_info.value.__cause__, OSError)
+    diagnostic = capsys.readouterr().err
+    assert "startup failed for PID 222: SystemExit: startup aborted" in diagnostic
+    assert "cleanup failed: OSError: wait failed" in diagnostic
+    assert f"recovery state was preserved at {path}" in diagnostic
+    state = read_state(path)
+    assert state is not None
+    assert (state.pid, state.port, state.process_start_id) == (
+        222,
+        8765,
+        "spawn-start",
+    )
+
+
+def test_start_system_exit_state_unlink_failure_is_visible_and_preserves_exit(
+    tmp_path, capsys
+):
+    path = tmp_path / "gza-server.json"
+    process = Mock(pid=222)
+    with (
+        patch("gza_server.cli.find_free_port", return_value=8765),
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
+        patch("gza_server.cli.subprocess.Popen", return_value=process),
+        patch(
+            "gza_server.cli.wait_until_ready",
+            side_effect=SystemExit("startup aborted"),
+        ),
+        patch("gza_server.cli._cleanup_child") as cleanup_child,
+        patch.object(Path, "unlink", side_effect=OSError("unlink failed")),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            start_server(path)
+
+    assert exc_info.value.code == "startup aborted"
+    assert isinstance(exc_info.value.__cause__, OSError)
+    cleanup_child.assert_called_once_with(process)
+    diagnostic = capsys.readouterr().err
+    assert "startup failed for PID 222: SystemExit: startup aborted" in diagnostic
+    assert "child exit was confirmed" in diagnostic
+    assert f"failed to remove state at {path}: OSError: unlink failed" in diagnostic
+
+
 def test_start_keyboard_interrupt_force_cleans_child_and_reraises(tmp_path):
     path = tmp_path / "gza-server.json"
     process = Mock(pid=222)

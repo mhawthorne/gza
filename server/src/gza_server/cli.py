@@ -317,6 +317,14 @@ def _exception_diagnostic(exc: BaseException) -> str:
     return type(exc).__name__
 
 
+def _report_preserved_exception_failure(
+    exc: BaseException, diagnostic: str
+) -> None:
+    """Make cleanup failures visible while preserving the startup exception."""
+    print(f"error: {diagnostic}", file=sys.stderr, flush=True)
+    exc.add_note(diagnostic)
+
+
 def start_server(path: Path) -> str:
     with server_lock(path):
         current = read_state(path)
@@ -391,7 +399,7 @@ def start_server(path: Path) -> str:
                     )
                     if isinstance(exc, LifecycleError):
                         raise LifecycleError(failure_diagnostic) from cleanup_exc
-                    exc.add_note(failure_diagnostic)
+                    _report_preserved_exception_failure(exc, failure_diagnostic)
                     raise exc from cleanup_exc
                 try:
                     path.unlink(missing_ok=True)
@@ -404,7 +412,7 @@ def start_server(path: Path) -> str:
                     )
                     if isinstance(exc, LifecycleError):
                         raise LifecycleError(failure_diagnostic) from cleanup_exc
-                    exc.add_note(failure_diagnostic)
+                    _report_preserved_exception_failure(exc, failure_diagnostic)
                     raise exc from cleanup_exc
                 if isinstance(exc, LifecycleError):
                     raise LifecycleError(startup_diagnostic) from exc
