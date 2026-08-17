@@ -343,9 +343,35 @@ epoch.
   `verify_fix` task keyed by the exact current verify epoch and implementation owner.
 - If a same-epoch `verify_fix` is already `pending`, lifecycle MUST `run_verify_fix`. If
   it is already `in_progress`, lifecycle MUST `wait_verify_fix`.
-- If one same-epoch `verify_fix` attempt already completed and the current verify gate is
-  still red for that epoch, lifecycle MUST park with reason `verify-fix-failed` instead
-  of spawning another `verify_fix`.
+- If one same-epoch `verify_fix` attempt completed without source changes and the current
+  red verify evidence is structurally classified as timeout-origin, lifecycle MUST rerun
+  verification for the exact same head once before treating that `verify_fix` as
+  terminally complete for the epoch. That rerun MUST persist SHA-keyed green evidence
+  only when the tested tracked tree is clean for the recorded head and the verify-fix
+  task is proven not to have restored, edited, or committed source relative to that head.
+  During verify-fix completion, if the rerun cannot be performed, cannot be persisted, or
+  does not produce green evidence, lifecycle MUST leave the `verify_fix`
+  non-completed/retryable rather than completing against the timeout-origin red. For an
+  already-completed same-epoch `verify_fix` that has durable no-source proof, a
+  persisted completion head SHA, and no consumed recovery rerun, lifecycle MUST select an
+  exact-head rerun action before parking the epoch as terminally failed. A completed
+  legacy row missing the structured outcome MAY be upgraded to that durable no-source
+  outcome only when lifecycle can prove the live branch head exactly equals the verify
+  epoch head and the worktree is clean. A present-but-invalid canonical completion
+  outcome, including malformed JSON, wrong kind, or unsupported schema version, MUST NOT
+  fall back to legacy columns and MUST fail closed with actionable proof-unavailable
+  recovery guidance instead of scheduling a rerun; otherwise legacy upgrade failures MUST
+  fail closed with actionable recovery guidance. Once an already-completed verify-fix
+  recovery rerun persists any
+  non-green result, including another timeout, lifecycle MUST record the rerun as consumed
+  and the next decision MUST park rather than rerun indefinitely.
+- Latest same-head verify evidence wins inside a verify epoch: a newer persisted green
+  result for the exact epoch supersedes older same-epoch red evidence.
+- If one same-epoch `verify_fix` attempt already completed and the latest current verify
+  gate remains red for that epoch, lifecycle MUST park with reason `verify-fix-failed`
+  instead of spawning another `verify_fix`. Deterministic test failures and unknown
+  structured failure origins are not timeout-origin and MUST remain blocking unless a
+  later source-changing fix or valid same-head green verify result replaces them.
 - If the current pre-review verify gate is unavailable and lifecycle cannot safely route
   through `verify_fix`, it MUST park with `verify-unavailable`. If that same unavailable
   state persists after one completed same-epoch `verify_fix`, it MUST park with

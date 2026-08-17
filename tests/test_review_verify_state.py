@@ -4,10 +4,13 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from pathlib import Path
 
+import pytest
+
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.review_verify_state import (
     VERIFY_GATE_ARTIFACT_KIND,
+    build_verify_gate_artifact_payload,
     latest_verify_result_for_epoch,
     make_verify_epoch,
     owner_task_verify_epoch,
@@ -16,6 +19,7 @@ from gza.review_verify_state import (
     resolve_verify_read_model,
     review_task_verify_epoch,
     task_has_current_passing_verify_evidence,
+    verify_result_is_timeout_origin,
 )
 from gza.git import GitError
 
@@ -95,6 +99,68 @@ def test_latest_verify_result_for_epoch_prefers_current_owner_artifact(tmp_path:
     assert lookup.result is not None
     assert lookup.result.reviewed_head_sha == "head-1"
     assert len(store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)) == 1
+
+
+@pytest.mark.parametrize(
+    "failure_origin,expected_timeout",
+    [
+        ("absent", True),
+        (123, False),
+        (None, False),
+        ("", False),
+        ("test_failure", False),
+    ],
+)
+def test_artifact_verify_result_only_uses_timeout_text_when_failure_origin_is_absent(
+    tmp_path: Path,
+    failure_origin: object,
+    expected_timeout: bool,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    impl = store.add("Implement timeout origin parsing", task_type="implement")
+    assert impl.id is not None
+    review = store.add("Review timeout origin parsing", task_type="review", based_on=impl.id, depends_on=impl.id)
+    captured_at = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+    result = SimpleNamespace(
+        command="./bin/tests",
+        status="failed",
+        exit_status="timed out",
+        captured_at=captured_at,
+        reviewed_branch="feature/verify",
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory="/tmp/worktree",
+        failure="verify_command timed out after 120s",
+    )
+    metadata = build_verify_gate_artifact_payload(
+        result=result,
+        source_task=review,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    if failure_origin == "absent":
+        metadata["result"].pop("failure_origin", None)
+    else:
+        metadata["result"]["failure_origin"] = failure_origin
+    store.add_artifact(
+        impl.id,
+        kind=VERIFY_GATE_ARTIFACT_KIND,
+        label="verify_gate_result",
+        path=".gza/artifacts/verify.json",
+        byte_size=2,
+        sha256="0" * 64,
+        created_at=captured_at,
+        producer="review_verify",
+        status="failed",
+        exit_status="timed out",
+        head_sha="head-1",
+        metadata=metadata,
+    )
+
+    lookup = latest_verify_result_for_epoch(store, impl, current_epoch=_epoch())
+
+    assert lookup.result is not None
+    assert verify_result_is_timeout_origin(lookup.result) is expected_timeout
 
 
 def test_persist_verify_gate_artifact_stores_provenance_and_cross_project_aggregate_details(tmp_path: Path) -> None:
@@ -413,6 +479,90 @@ def test_resolve_verify_gate_decision_marks_current_failed_owner_artifact_red(tm
 
     assert decision.state == "failed"
     assert task_has_current_passing_verify_evidence(store, impl, config=config, git=git) is False
+
+
+def test_later_current_green_verify_evidence_supersedes_stale_red_at_same_head(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _config(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement verify gate decision", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/verify"
+    store.update(impl)
+    review = store.add("Review verify gate decision", task_type="review", based_on=impl.id, depends_on=impl.id)
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+            reviewed_branch="feature/verify",
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/worktree",
+            failure="verify_command timed out after 120s",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=_result(captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC)),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="verify_fix",
+    )
+
+    git = SimpleNamespace(rev_parse_if_exists=lambda _ref: "head-1")
+    decision = resolve_verify_gate_decision(store, impl, config=config, git=git)
+
+    assert decision.state == "passed"
+    assert decision.lookup.result is not None
+    assert decision.lookup.result.status == "passed"
+
+
+def test_verify_result_is_timeout_origin_uses_structured_exit_status_and_failure(tmp_path: Path) -> None:
+    del tmp_path
+    timeout_result = _result(captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC))
+    timeout_result.status = "failed"
+    timeout_result.exit_status = "timed out"
+    timeout_result.failure = "verify_command timed out after 120s"
+    timeout_result.failure_origin = "timeout"
+
+    failed_result = _result(captured_at=datetime(2026, 6, 29, 12, 1, tzinfo=UTC))
+    failed_result.status = "failed"
+    failed_result.exit_status = "timed out"
+    failed_result.failure = "verify_command timed out after 120s"
+    failed_result.failure_origin = "test_failure"
+
+    unknown_result = _result(captured_at=datetime(2026, 6, 29, 12, 2, tzinfo=UTC))
+    unknown_result.status = "failed"
+    unknown_result.exit_status = "timed out"
+    unknown_result.failure = "verify_command timed out after 120s"
+    unknown_result.failure_origin = "unknown"
+
+    legacy_timeout_result = _result(captured_at=datetime(2026, 6, 29, 12, 3, tzinfo=UTC))
+    legacy_timeout_result.status = "failed"
+    legacy_timeout_result.exit_status = "timed out"
+    legacy_timeout_result.failure = "verify_command timed out after 120s"
+    legacy_timeout_result.failure_origin = None
+
+    assert verify_result_is_timeout_origin(timeout_result) is True
+    assert verify_result_is_timeout_origin(failed_result) is False
+    assert verify_result_is_timeout_origin(unknown_result) is False
+    assert verify_result_is_timeout_origin(legacy_timeout_result) is True
 
 
 def test_resolve_verify_gate_decision_marks_missing_current_verify_state(tmp_path: Path) -> None:

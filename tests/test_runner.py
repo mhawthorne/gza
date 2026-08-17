@@ -7,8 +7,10 @@ import os
 import sqlite3
 import stat
 import subprocess
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
@@ -31,8 +33,14 @@ from gza.rebase_diff import RebaseDiffBaseline, parse_rebase_diff_provenance
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.recovery_transients import classify_transient_recovery_terminal
 from gza.review_clearance import VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS
-from gza.review_verify_state import VERIFY_GATE_ARTIFACT_KIND
-from gza.review_tasks import DuplicateReviewError, create_or_reuse_followup_task
+from gza.review_verify_state import (
+    VERIFY_GATE_ARTIFACT_KIND,
+    VerifyEpoch,
+    latest_verify_result_for_epoch,
+    persist_verify_gate_artifact,
+)
+from gza.verify_fix_outcome import effective_verify_fix_completion_outcome
+from gza.review_tasks import DuplicateReviewError, build_verify_fix_prompt, create_or_reuse_followup_task
 from gza.review_verdict import ParsedReviewReport, ReviewFinding, parse_review_report
 from gza.runner import (
     BACKUP_DIR,
@@ -54,12 +62,14 @@ from gza.runner import (
     RunInvocationContext,
     WorkspaceSetupResult,
     _apply_transcript_stats_fallback,
+    _aggregate_cross_project_verify_result,
     _build_code_task_commit_subject,
     _build_context_from_chain,
     _build_review_improve_lineage_context,
     _build_timeout_resume_context,
     _capture_review_verify_result,
     _capture_noop_improve_review_verify_result,
+    _capture_noop_verify_fix_timeout_rerun,
     _check_dependency_merge_precondition,
     _complete_code_task,
     _complete_failed_code_task_after_pr_publication,
@@ -80,6 +90,7 @@ from gza.runner import (
     _resolve_task_timeout_budget,
     _restore_wip_changes,
     _run_inner,
+    _run_verify_command,
     _run_non_code_task,
     _run_result_to_stats,
     _run_review_verify_command,
@@ -87,6 +98,7 @@ from gza.runner import (
     _select_worktree_base_ref,
     _setup_code_task_worktree,
     _slug_exists,
+    _retry_pr_required_code_task_completion,
     _snapshot_task_db_to_worktree,
     _stage_worktree_agent_resources,
     backup_database,
@@ -1801,6 +1813,91 @@ class TestReviewContextFromChain:
         assert "verify_command exceeded 120s; sent SIGTERM, waited 5s, then sent SIGKILL" in rendered
         assert "partial pytest output" in rendered
         assert "still running" in rendered
+
+    @pytest.mark.parametrize(
+        ("helper_result", "expected_origin"),
+        [
+            (
+                Mock(
+                    timed_out=True,
+                    forced_kill=True,
+                    stdout="partial pytest output\n",
+                    stderr="still running\n",
+                ),
+                "timeout",
+            ),
+            (
+                Mock(
+                    timed_out=False,
+                    forced_kill=False,
+                    returncode=7,
+                    stdout="lint failed\n",
+                    stderr="",
+                ),
+                "test_failure",
+            ),
+        ],
+    )
+    def test_single_project_verify_command_persists_structured_failed_origin(
+        self,
+        tmp_path: Path,
+        helper_result: Mock,
+        expected_origin: str,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/verify"
+        store.update(impl)
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert source.id is not None
+
+        with patch(
+            "gza.runner._run_review_verify_command_with_timeout_diagnostics",
+            return_value=helper_result,
+        ):
+            result = _run_verify_command(
+                "./bin/tests",
+                cwd=tmp_path,
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                timeout_seconds=120,
+                timeout_grace_seconds=5.0,
+            )
+
+        assert result.status == "failed"
+        assert result.failure_origin == expected_origin
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=result,
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.failure_origin == expected_origin
 
     def test_run_review_verify_command_reports_custom_timeout(self, tmp_path: Path):
         """Timeout wording should reflect the configured autonomous review timeout."""
@@ -15635,6 +15732,284 @@ class TestExtractedRunInnerHelpers:
         assert refreshed.status == "completed"
         assert refreshed.failure_reason is None
 
+    def _setup_branch_unpushable_noop_timeout_verify_fix(
+        self,
+        tmp_path: Path,
+    ) -> tuple[SqliteTaskStore, Config, Task, Task, VerifyEpoch, Mock]:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix-publication"
+        impl.has_commits = True
+        store.update(impl)
+
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert source.id is not None
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 120s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+            create_pr=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.slug = "20260817-noop-timeout-verify-fix"
+        verify_fix.status = "failed"
+        verify_fix.failure_reason = BRANCH_UNPUSHABLE_FAILURE_REASON
+        verify_fix.branch = impl.branch
+        verify_fix.log_file = "logs/noop-timeout-verify-fix.log"
+        verify_fix.output_content = "summary"
+        verify_fix.has_commits = True
+        verify_fix.changed_diff = False
+        verify_fix.head_sha = "head-1"
+        verify_fix.diff_files_changed = 0
+        verify_fix.diff_lines_added = 0
+        verify_fix.diff_lines_removed = 0
+        store.update(verify_fix)
+        (tmp_path / verify_fix.log_file).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / verify_fix.log_file).write_text("")
+        (config.worktree_path / verify_fix.slug).mkdir(parents=True, exist_ok=True)
+
+        git = Mock(spec=Git)
+        git.default_branch.return_value = "main"
+        git.rev_parse_if_exists.side_effect = lambda ref: {
+            "HEAD": "head-1",
+            impl.branch: "head-1",
+            "main": "base-1",
+        }.get(ref)
+        git.status_porcelain.return_value = set()
+        return store, config, impl, verify_fix, verify_epoch, git
+
+    @pytest.mark.parametrize("entrypoint", ["pr_required_retry", "branch_reconcile"])
+    def test_publication_recovery_noop_timeout_verify_fix_persists_green_before_completion(
+        self,
+        tmp_path: Path,
+        entrypoint: str,
+    ) -> None:
+        store, config, impl, verify_fix, verify_epoch, git = (
+            self._setup_branch_unpushable_noop_timeout_verify_fix(tmp_path)
+        )
+        rerun_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(config.worktree_path / verify_fix.slug),
+            output="passed\n",
+        )
+
+        with (
+            patch("gza.runner.Git", return_value=git),
+            patch(
+                "gza.runner._ensure_work_pr_for_completed_code_task",
+                return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+            ),
+            patch(
+                "gza.runner._run_lifecycle_verify",
+                return_value=SimpleNamespace(aggregate_result=rerun_result, project_results=()),
+            ) as run_verify,
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            if entrypoint == "pr_required_retry":
+                rc = _retry_pr_required_code_task_completion(verify_fix, config, store)
+            else:
+                from gza.cli.git_ops import complete_branch_unpushable_after_reconcile
+
+                rc = complete_branch_unpushable_after_reconcile(
+                    config=config,
+                    store=store,
+                    git=git,
+                    task=verify_fix,
+                )
+
+        assert rc == 0
+        run_verify.assert_called_once()
+        refreshed_fix = store.get(verify_fix.id)
+        assert refreshed_fix is not None
+        assert refreshed_fix.status == "completed"
+        assert refreshed_fix.failure_reason is None
+        assert refreshed_fix.changed_diff is False
+        assert refreshed_fix.review_verify_head_sha == "head-1"
+        outcome = effective_verify_fix_completion_outcome(refreshed_fix)
+        assert outcome is not None
+        assert outcome.no_source_changes is True
+        assert outcome.completion_head_sha == "head-1"
+        assert outcome.recovery_rerun_attempted is True
+
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "passed"
+        assert lookup.result.source_task_id == verify_fix.id
+        assert lookup.result.source_task_type == "verify_fix"
+
+    @pytest.mark.parametrize("entrypoint", ["pr_required_retry", "branch_reconcile"])
+    def test_publication_recovery_noop_timeout_verify_fix_persistence_failure_stays_retryable(
+        self,
+        tmp_path: Path,
+        entrypoint: str,
+    ) -> None:
+        store, config, impl, verify_fix, verify_epoch, git = (
+            self._setup_branch_unpushable_noop_timeout_verify_fix(tmp_path)
+        )
+        rerun_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(config.worktree_path / verify_fix.slug),
+            output="passed\n",
+        )
+
+        with (
+            patch("gza.runner.Git", return_value=git),
+            patch(
+                "gza.runner._ensure_work_pr_for_completed_code_task",
+                return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+            ),
+            patch(
+                "gza.runner._run_lifecycle_verify",
+                return_value=SimpleNamespace(aggregate_result=rerun_result, project_results=()),
+            ),
+            patch("gza.runner._persist_lifecycle_verify_execution", side_effect=RuntimeError("persist failed")),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            if entrypoint == "pr_required_retry":
+                rc = _retry_pr_required_code_task_completion(verify_fix, config, store)
+            else:
+                from gza.cli.git_ops import complete_branch_unpushable_after_reconcile
+
+                rc = complete_branch_unpushable_after_reconcile(
+                    config=config,
+                    store=store,
+                    git=git,
+                    task=verify_fix,
+                )
+
+        assert rc == 1
+        refreshed_fix = store.get(verify_fix.id)
+        assert refreshed_fix is not None
+        assert refreshed_fix.status == "failed"
+        assert refreshed_fix.failure_reason == BRANCH_UNPUSHABLE_FAILURE_REASON
+        assert refreshed_fix.changed_diff is False
+
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "failed"
+
+    @pytest.mark.parametrize("entrypoint", ["pr_required_retry", "branch_reconcile"])
+    @pytest.mark.parametrize("rerun_status", ["passed", "failed"])
+    def test_publication_recovery_noop_timeout_verify_fix_atomic_gate_outcome_failure_stays_retryable(
+        self,
+        tmp_path: Path,
+        entrypoint: str,
+        rerun_status: str,
+    ) -> None:
+        store, config, impl, verify_fix, verify_epoch, git = (
+            self._setup_branch_unpushable_noop_timeout_verify_fix(tmp_path)
+        )
+        rerun_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status=rerun_status,
+            exit_status="0" if rerun_status == "passed" else "7",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(config.worktree_path / verify_fix.slug),
+            output="passed\n" if rerun_status == "passed" else "",
+            failure=None if rerun_status == "passed" else "pytest failed",
+        )
+
+        with (
+            patch("gza.runner.Git", return_value=git),
+            patch(
+                "gza.runner._ensure_work_pr_for_completed_code_task",
+                return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+            ),
+            patch(
+                "gza.runner._run_lifecycle_verify",
+                return_value=SimpleNamespace(aggregate_result=rerun_result, project_results=()),
+            ),
+            patch(
+                "gza.runner.persist_verify_gate_artifact_with_verify_fix_outcome",
+                side_effect=RuntimeError("atomic gate/outcome commit failed"),
+            ),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            if entrypoint == "pr_required_retry":
+                rc = _retry_pr_required_code_task_completion(verify_fix, config, store)
+            else:
+                from gza.cli.git_ops import complete_branch_unpushable_after_reconcile
+
+                rc = complete_branch_unpushable_after_reconcile(
+                    config=config,
+                    store=store,
+                    git=git,
+                    task=verify_fix,
+                )
+
+        assert rc == 1
+        refreshed_fix = store.get(verify_fix.id)
+        assert refreshed_fix is not None
+        assert refreshed_fix.status == "failed"
+        assert refreshed_fix.failure_reason == BRANCH_UNPUSHABLE_FAILURE_REASON
+        outcome = effective_verify_fix_completion_outcome(refreshed_fix)
+        if outcome is not None:
+            assert outcome.recovery_rerun_attempted is False
+
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "failed"
+        assert lookup.result.source_task_id != verify_fix.id
+
     def test_run_can_retry_pr_required_failure_via_work_pr(self, tmp_path: Path):
         """`gza work <task> --pr` should recover failed PR_REQUIRED tasks without rerunning provider."""
         (tmp_path / "gza.yaml").write_text(
@@ -20323,6 +20698,1543 @@ class TestProviderPromptSanitization:
         assert owner_artifacts[0].metadata is not None
         assert owner_artifacts[0].metadata["source_task_id"] == review.id
 
+    @pytest.mark.parametrize(
+        ("exit_status", "failure", "should_rerun"),
+        [
+            ("timed out", "verify_command timed out after 120s", True),
+            ("1", "pytest failed", False),
+        ],
+    )
+    def test_capture_noop_verify_fix_reruns_only_timeout_origin_red(
+        self,
+        tmp_path: Path,
+        exit_status: str,
+        failure: str,
+        should_rerun: bool,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/verify-fix"
+        store.update(impl)
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status=exit_status,
+                captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure=failure,
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.status = "completed"
+        verify_fix.branch = impl.branch
+        verify_fix.has_commits = False
+        verify_fix.changed_diff = False
+        store.update(verify_fix)
+
+        rerun_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path / "worktree"),
+        )
+        worktree_git = MagicMock()
+        worktree_git.rev_parse_if_exists.return_value = "head-1"
+        worktree_git.status_porcelain.return_value = set()
+
+        with (
+            patch(
+                "gza.runner._run_lifecycle_verify",
+                return_value=SimpleNamespace(aggregate_result=rerun_result, project_results=()),
+            ) as run_verify,
+            patch(
+                "gza.runner._persist_lifecycle_verify_execution",
+                return_value=(rerun_result, ".gza/artifacts/verify.txt"),
+            ) as persist_verify,
+        ):
+            _capture_noop_verify_fix_timeout_rerun(
+                config=config,
+                store=store,
+                task=verify_fix,
+                worktree_git=worktree_git,
+                worktree_path=tmp_path / "worktree",
+                branch_name=impl.branch,
+                head_sha="head-1",
+                base_sha="base-1",
+                task_logger=None,
+            )
+
+        assert run_verify.called is should_rerun
+        assert persist_verify.called is should_rerun
+
+    def test_capture_noop_verify_fix_uses_structured_origin_before_legacy_timeout_text(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/verify-fix"
+        store.update(impl)
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert source.id is not None
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 120s",
+                failure_origin="test_failure",
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.status = "completed"
+        verify_fix.branch = impl.branch
+        verify_fix.changed_diff = False
+        store.update(verify_fix)
+
+        with patch("gza.runner._run_lifecycle_verify") as run_verify:
+            _capture_noop_verify_fix_timeout_rerun(
+                config=config,
+                store=store,
+                task=verify_fix,
+                worktree_git=Mock(spec=Git),
+                worktree_path=tmp_path / "worktree",
+                branch_name=impl.branch,
+                head_sha="head-1",
+                base_sha="base-1",
+                task_logger=None,
+            )
+
+        run_verify.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("head_arg", "head_sequence", "expect_verify_run"),
+        [
+            ("head-1", ["detached-head", "head-1"], False),
+            (None, [], False),
+            ("head-1", ["head-1", "head-2"], True),
+        ],
+    )
+    def test_capture_noop_verify_fix_requires_exact_checked_out_head_before_and_after_rerun(
+        self,
+        tmp_path: Path,
+        head_arg: str | None,
+        head_sequence: list[str],
+        expect_verify_run: bool,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix-head-proof"
+        impl.has_commits = True
+        store.update(impl)
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert source.id is not None
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 120s",
+                failure_origin="timeout",
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.status = "completed"
+        verify_fix.branch = impl.branch
+        verify_fix.changed_diff = False
+        store.update(verify_fix)
+
+        head_iter = iter(head_sequence)
+
+        def resolve_ref(ref: str) -> str | None:
+            if ref == "HEAD":
+                return next(head_iter)
+            return {"main": "base-1", impl.branch: "head-1"}.get(ref)
+
+        rerun_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path / "worktree"),
+        )
+        worktree_git = Mock(spec=Git)
+        worktree_git.rev_parse_if_exists.side_effect = resolve_ref
+        worktree_git.status_porcelain.return_value = set()
+
+        with (
+            patch(
+                "gza.runner._run_lifecycle_verify",
+                return_value=SimpleNamespace(aggregate_result=rerun_result, project_results=()),
+            ) as run_verify,
+            patch(
+                "gza.runner._persist_lifecycle_verify_execution",
+                return_value=(rerun_result, ".gza/artifacts/verify.txt"),
+            ) as persist_verify,
+        ):
+            can_complete = _capture_noop_verify_fix_timeout_rerun(
+                config=config,
+                store=store,
+                task=verify_fix,
+                worktree_git=worktree_git,
+                worktree_path=tmp_path / "worktree",
+                branch_name=impl.branch,
+                head_sha=head_arg,
+                base_sha="base-1",
+                task_logger=None,
+            )
+
+        assert can_complete is False
+        assert run_verify.called is expect_verify_run
+        persist_verify.assert_not_called()
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "failed"
+
+    def test_capture_noop_verify_fix_refuses_dirty_restored_source_for_clean_head(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix"
+        impl.has_commits = True
+        store.update(impl)
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert source.id is not None
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 120s",
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.status = "completed"
+        verify_fix.branch = impl.branch
+        verify_fix.changed_diff = False
+        store.update(verify_fix)
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.status_porcelain.return_value = {("M", "src/impl.py")}
+
+        with (
+            patch("gza.runner._run_lifecycle_verify") as run_verify,
+            patch("gza.runner._persist_lifecycle_verify_execution") as persist_verify,
+        ):
+            _capture_noop_verify_fix_timeout_rerun(
+                config=config,
+                store=store,
+                task=verify_fix,
+                worktree_git=worktree_git,
+                worktree_path=tmp_path / "worktree",
+                branch_name=impl.branch,
+                head_sha="head-1",
+                base_sha="base-1",
+                task_logger=None,
+            )
+
+        run_verify.assert_not_called()
+        persist_verify.assert_not_called()
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "failed"
+
+    @pytest.mark.parametrize(
+        ("status_entries", "run_expected"),
+        [
+            ({("??", "tests/test_new_behavior.py")}, False),
+            ({("??", ".gza/runtime/checkpoint.json")}, True),
+            ({("M", ".gza/runtime/checkpoint.json")}, False),
+            ({("A", ".claude/settings.local.json")}, False),
+            ({("R", "src/impl.py -> .gza/runtime/checkpoint.json")}, False),
+        ],
+    )
+    def test_capture_noop_verify_fix_treats_non_gza_untracked_as_dirty_before_rerun(
+        self,
+        tmp_path: Path,
+        status_entries: set[tuple[str, str]],
+        run_expected: bool,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix"
+        impl.has_commits = True
+        store.update(impl)
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert source.id is not None
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 120s",
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.status = "completed"
+        verify_fix.branch = impl.branch
+        verify_fix.changed_diff = False
+        store.update(verify_fix)
+
+        rerun_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path / "worktree"),
+        )
+        worktree_git = Mock(spec=Git)
+        worktree_git.rev_parse_if_exists.return_value = "head-1"
+        worktree_git.status_porcelain.return_value = status_entries
+
+        with patch(
+            "gza.runner._run_lifecycle_verify",
+            return_value=SimpleNamespace(aggregate_result=rerun_result, project_results=()),
+        ) as run_verify:
+            _capture_noop_verify_fix_timeout_rerun(
+                config=config,
+                store=store,
+                task=verify_fix,
+                worktree_git=worktree_git,
+                worktree_path=tmp_path / "worktree",
+                branch_name=impl.branch,
+                head_sha="head-1",
+                base_sha="base-1",
+                task_logger=None,
+            )
+
+        assert run_verify.called is run_expected
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == ("passed" if run_expected else "failed")
+
+    @pytest.mark.parametrize(
+        "post_status",
+        [
+            {("??", "src/generated_by_verify.py")},
+            {("M", ".gza/runtime/checkpoint.json")},
+            {("A", ".claude/settings.local.json")},
+            {("R", "src/generated_by_verify.py -> .gza/runtime/checkpoint.json")},
+        ],
+    )
+    def test_capture_noop_verify_fix_refuses_tracked_or_source_changes_created_by_rerun(
+        self,
+        tmp_path: Path,
+        post_status: set[tuple[str, str]],
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix"
+        impl.has_commits = True
+        store.update(impl)
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert source.id is not None
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 120s",
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.status = "completed"
+        verify_fix.branch = impl.branch
+        verify_fix.changed_diff = False
+        store.update(verify_fix)
+
+        rerun_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path / "worktree"),
+        )
+        worktree_git = Mock(spec=Git)
+        worktree_git.rev_parse_if_exists.return_value = "head-1"
+        worktree_git.status_porcelain.side_effect = [
+            set(),
+            post_status,
+        ]
+
+        with (
+            patch(
+                "gza.runner._run_lifecycle_verify",
+                return_value=SimpleNamespace(aggregate_result=rerun_result, project_results=()),
+            ) as run_verify,
+            patch("gza.runner._persist_lifecycle_verify_execution") as persist_verify,
+        ):
+            _capture_noop_verify_fix_timeout_rerun(
+                config=config,
+                store=store,
+                task=verify_fix,
+                worktree_git=worktree_git,
+                worktree_path=tmp_path / "worktree",
+                branch_name=impl.branch,
+                head_sha="head-1",
+                base_sha="base-1",
+                task_logger=None,
+            )
+
+        run_verify.assert_called_once()
+        persist_verify.assert_not_called()
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "failed"
+
+    def test_complete_same_branch_noop_verify_fix_persists_green_on_impl_owner_and_allows_merge(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix"
+        impl.has_commits = True
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 8, 17, 9, 0, tzinfo=UTC)
+        review.output_content = "# Review\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        timeout_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+            failure="verify_command timed out after 120s",
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=timeout_result,
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.branch = impl.branch
+        verify_fix.slug = "20260817-verify-fix"
+        store.update(verify_fix)
+
+        worktree_path = config.worktree_path / verify_fix.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        log_file = tmp_path / ".gza" / "logs" / "verify-fix.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        summary_dir = tmp_path / ".gza" / "summaries"
+        worktree_summary_path = worktree_path / ".gza" / "summaries" / "verify-fix.md"
+        summary_path = summary_dir / "verify-fix.md"
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.repo_dir = worktree_path
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.count_commits_ahead.return_value = 1
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = ""
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "HEAD": "head-1",
+            "main": "base-1",
+            impl.branch: "head-1",
+        }.get(ref)
+
+        rerun_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(worktree_path),
+            output="passed\n",
+        )
+
+        with (
+            patch(
+                "gza.runner._run_lifecycle_verify",
+                return_value=SimpleNamespace(aggregate_result=rerun_result, project_results=()),
+            ) as run_verify,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                verify_fix,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                impl.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=1),
+                0,
+                set(),
+                worktree_summary_path,
+                summary_path,
+                summary_dir,
+                target_branch="main",
+            )
+
+        assert rc == 0
+        run_verify.assert_called_once()
+
+        refreshed_fix = store.get(verify_fix.id)
+        assert refreshed_fix is not None
+        assert refreshed_fix.has_commits is True
+        assert refreshed_fix.changed_diff is False
+        assert refreshed_fix.review_verify_head_sha == "head-1"
+        outcome = effective_verify_fix_completion_outcome(refreshed_fix)
+        assert outcome is not None
+        assert outcome.no_source_changes is True
+        assert outcome.completion_head_sha == "head-1"
+        assert outcome.recovery_rerun_attempted is True
+
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "passed"
+        assert lookup.result.source_task_id == verify_fix.id
+        assert lookup.result.source_task_type == "verify_fix"
+
+        owner_artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+        assert len(owner_artifacts) == 2
+        assert owner_artifacts[0].metadata is not None
+        assert owner_artifacts[0].metadata["source_task_id"] == verify_fix.id
+
+        lifecycle_git = Mock()
+        lifecycle_git.can_merge.return_value = True
+        lifecycle_git.is_merged.return_value = False
+        lifecycle_git.branch_exists.return_value = True
+        lifecycle_git.ref_exists.return_value = False
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
+        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.count_commits_behind_checked.return_value = 0
+        lifecycle_git.count_commits_ahead_checked.return_value = 1
+        lifecycle_git.get_diff_name_status.return_value = ""
+        lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+
+        action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
+        assert action["type"] != "verify_gate"
+
+    @pytest.mark.parametrize(
+        "pre_run_status",
+        [
+            {("M", "src/impl.py")},
+            {("??", "src/restored_before_completion.py")},
+        ],
+    )
+    def test_complete_noop_verify_fix_refuses_dirty_pre_run_source_restored_to_clean_head(
+        self,
+        tmp_path: Path,
+        pre_run_status: set[tuple[str, str]],
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix-pre-run-dirty"
+        impl.has_commits = True
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 8, 17, 9, 0, tzinfo=UTC)
+        review.output_content = "# Review\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        timeout_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+            failure="verify_command timed out after 120s",
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=timeout_result,
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.branch = impl.branch
+        verify_fix.slug = "20260817-verify-fix-pre-run-dirty"
+        store.update(verify_fix)
+
+        worktree_path = config.worktree_path / verify_fix.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        log_file = tmp_path / ".gza" / "logs" / "verify-fix-pre-run-dirty.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        summary_dir = tmp_path / ".gza" / "summaries"
+        worktree_summary_path = worktree_path / ".gza" / "summaries" / "verify-fix-pre-run-dirty.md"
+        summary_path = summary_dir / "verify-fix-pre-run-dirty.md"
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.repo_dir = worktree_path
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.count_commits_ahead.return_value = 1
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = ""
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "HEAD": "head-1",
+            "main": "base-1",
+            impl.branch: "head-1",
+        }.get(ref)
+
+        with (
+            patch("gza.runner._run_lifecycle_verify") as run_verify,
+            patch("gza.runner._persist_lifecycle_verify_execution") as persist_verify,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                verify_fix,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                impl.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=1),
+                0,
+                pre_run_status,
+                worktree_summary_path,
+                summary_path,
+                summary_dir,
+                target_branch="main",
+            )
+
+        assert rc == 0
+        run_verify.assert_not_called()
+        persist_verify.assert_not_called()
+
+        refreshed_fix = store.get(verify_fix.id)
+        assert refreshed_fix is not None
+        assert refreshed_fix.changed_diff is True
+
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "failed"
+        assert lookup.result.source_task_id == review.id
+
+        owner_artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+        assert len(owner_artifacts) == 1
+        assert owner_artifacts[0].metadata is not None
+        assert owner_artifacts[0].metadata["source_task_id"] == review.id
+
+    @pytest.mark.parametrize("failure_site", ["run", "persist", "atomic_green", "atomic_non_green"])
+    def test_complete_noop_verify_fix_keeps_task_rerunnable_when_rerun_evidence_is_not_durable(
+        self,
+        tmp_path: Path,
+        failure_site: str,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix-rerunnable"
+        impl.has_commits = True
+        store.update(impl)
+
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 8, 17, 9, 0, tzinfo=UTC)
+        review.output_content = "# Review\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        timeout_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+            failure="verify_command timed out after 120s",
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=timeout_result,
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.branch = impl.branch
+        verify_fix.slug = f"20260817-verify-fix-{failure_site}"
+        verify_fix.status = "in_progress"
+        verify_fix.running_pid = 12345
+        verify_fix.execution_mode = "worker_foreground"
+        store.update(verify_fix)
+
+        worktree_path = config.worktree_path / verify_fix.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        log_file = tmp_path / ".gza" / "logs" / f"verify-fix-{failure_site}.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        summary_dir = tmp_path / ".gza" / "summaries"
+        worktree_summary_path = worktree_path / ".gza" / "summaries" / f"verify-fix-{failure_site}.md"
+        summary_path = summary_dir / f"verify-fix-{failure_site}.md"
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.repo_dir = worktree_path
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.count_commits_ahead.return_value = 1
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = ""
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "HEAD": "head-1",
+            "main": "base-1",
+            impl.branch: "head-1",
+        }.get(ref)
+
+        rerun_status = "failed" if failure_site == "atomic_non_green" else "passed"
+        rerun_exit_status = "7" if failure_site == "atomic_non_green" else "0"
+        rerun_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status=rerun_status,
+            exit_status=rerun_exit_status,
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(worktree_path),
+            output="passed\n",
+        )
+        run_side_effect = RuntimeError("interrupted before persistence") if failure_site == "run" else None
+        persist_side_effect = RuntimeError("interrupted during persistence") if failure_site == "persist" else None
+        atomic_persist_side_effect = (
+            RuntimeError("interrupted during atomic gate/outcome persistence")
+            if failure_site in {"atomic_green", "atomic_non_green"}
+            else None
+        )
+
+        persist_context = (
+            patch(
+                "gza.runner._persist_lifecycle_verify_execution",
+                side_effect=persist_side_effect,
+                return_value=(rerun_result, ".gza/artifacts/verify.txt"),
+            )
+            if failure_site == "persist"
+            else nullcontext()
+        )
+        with (
+            patch(
+                "gza.runner._run_lifecycle_verify",
+                side_effect=run_side_effect,
+                return_value=SimpleNamespace(aggregate_result=rerun_result, project_results=()),
+            ),
+            persist_context,
+            patch(
+                "gza.runner.persist_verify_gate_artifact_with_verify_fix_outcome",
+                side_effect=atomic_persist_side_effect,
+            ),
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                verify_fix,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                impl.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=1),
+                0,
+                set(),
+                worktree_summary_path,
+                summary_path,
+                summary_dir,
+                target_branch="main",
+            )
+
+        assert rc == 1
+        refreshed_fix = store.get(verify_fix.id)
+        assert refreshed_fix is not None
+        assert refreshed_fix.status == "pending"
+        assert refreshed_fix.running_pid is None
+        assert refreshed_fix.execution_mode is None
+        assert refreshed_fix.changed_diff is False
+        outcome = effective_verify_fix_completion_outcome(refreshed_fix)
+        if outcome is not None:
+            assert outcome.recovery_rerun_attempted is False
+
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "failed"
+        assert lookup.result.source_task_id == review.id
+
+        lifecycle_git = Mock()
+        lifecycle_git.can_merge.return_value = True
+        lifecycle_git.is_merged.return_value = False
+        lifecycle_git.branch_exists.return_value = True
+        lifecycle_git.ref_exists.return_value = False
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
+        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.count_commits_behind_checked.return_value = 0
+        lifecycle_git.count_commits_ahead_checked.return_value = 1
+        lifecycle_git.get_diff_name_status.return_value = ""
+        lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+
+        action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
+        assert action["type"] != "needs_discussion" or action.get("needs_attention_reason") != "verify-fix-failed"
+        assert action["type"] != "wait_verify_fix"
+
+    def test_complete_noop_verify_fix_with_prior_source_commit_does_not_persist_green(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        config.log_path.mkdir(parents=True, exist_ok=True)
+        config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/verify-fix"
+        impl.has_commits = True
+        store.update(impl)
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert source.id is not None
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                working_directory=str(tmp_path),
+                failure="verify_command timed out after 120s",
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.branch = impl.branch
+        verify_fix.slug = "20260817-verify-fix-prior-commit"
+        store.update(verify_fix)
+
+        worktree_path = config.worktree_path / verify_fix.slug
+        worktree_path.mkdir(parents=True, exist_ok=True)
+        log_file = tmp_path / ".gza" / "logs" / "verify-fix-prior-commit.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        summary_dir = tmp_path / ".gza" / "summaries"
+        worktree_summary_path = worktree_path / ".gza" / "summaries" / "verify-fix-prior-commit.md"
+        summary_path = summary_dir / "verify-fix-prior-commit.md"
+
+        worktree_git = Mock(spec=Git)
+        worktree_git.repo_dir = worktree_path
+        worktree_git.status_porcelain.return_value = set()
+        worktree_git.count_commits_ahead.return_value = 1
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_numstat.return_value = "1\t0\tsrc/impl.py"
+        worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+            "HEAD": "head-2",
+            "main": "base-1",
+            impl.branch: "head-2",
+        }.get(ref)
+
+        with (
+            patch("gza.runner._run_lifecycle_verify") as run_verify,
+            patch("gza.runner.task_footer"),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+        ):
+            rc = _complete_code_task(
+                verify_fix,
+                config,
+                store,
+                worktree_git,
+                log_file,
+                impl.branch,
+                TaskStats(duration_seconds=1.0, num_steps_reported=1),
+                0,
+                set(),
+                worktree_summary_path,
+                summary_path,
+                summary_dir,
+                target_branch="main",
+            )
+
+        assert rc == 0
+        run_verify.assert_not_called()
+        refreshed_fix = store.get(verify_fix.id)
+        assert refreshed_fix is not None
+        assert refreshed_fix.changed_diff is True
+
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "failed"
+        assert lookup.result.source_task_id == source.id
+
+    def test_capture_noop_verify_fix_reruns_timeout_only_cross_project_aggregate(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/cross-timeout"
+        store.update(impl)
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert source.id is not None
+
+        project_results = [
+            ProjectReviewVerifyResult(
+                project=None,
+                scope="services/foo",
+                working_directory="services/foo",
+                result=ReviewVerifyResult(
+                    command="./bin/foo-verify",
+                    status="failed",
+                    exit_status="timed out",
+                    captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                    failure="verify_command timed out after 120s",
+                ),
+            ),
+            ProjectReviewVerifyResult(
+                project=None,
+                scope="libs/bar",
+                working_directory="libs/bar",
+                result=ReviewVerifyResult(
+                    command="./bin/bar-verify",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                ),
+            ),
+        ]
+        aggregate = _aggregate_cross_project_verify_result(
+            command="(per-project verify_command)",
+            captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            project_results=project_results,
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=aggregate,
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+            aggregate_details=None,
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="(per-project verify_command)",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.branch = impl.branch
+        verify_fix.changed_diff = False
+        verify_fix.tags = ("cross-project",)
+        store.update(verify_fix)
+
+        green = ReviewVerifyResult(
+            command="(per-project verify_command)",
+            status="passed",
+            exit_status="1 passed, 0 failed, 0 unavailable",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+        )
+        worktree_git = Mock(spec=Git)
+        worktree_git.rev_parse_if_exists.return_value = "head-1"
+        worktree_git.status_porcelain.return_value = set()
+        with patch(
+            "gza.runner._run_lifecycle_verify",
+            return_value=SimpleNamespace(aggregate_result=green, project_results=()),
+        ) as run_verify:
+            _capture_noop_verify_fix_timeout_rerun(
+                config=config,
+                store=store,
+                task=verify_fix,
+                worktree_git=worktree_git,
+                worktree_path=tmp_path / "worktree",
+                branch_name=impl.branch,
+                head_sha="head-1",
+                base_sha="base-1",
+                task_logger=None,
+            )
+
+        run_verify.assert_called_once()
+
+    def test_capture_noop_verify_fix_does_not_rerun_mixed_cross_project_aggregate_and_parks(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="(per-project verify_command)",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/cross-mixed"
+        impl.has_commits = True
+        store.update(impl)
+        review = store.add("Review feature", task_type="review", depends_on=impl.id)
+        assert review.id is not None
+        review.status = "pending"
+        store.update(review)
+
+        project_results = [
+            ProjectReviewVerifyResult(
+                project=None,
+                scope="services/foo",
+                working_directory="services/foo",
+                result=ReviewVerifyResult(
+                    command="./bin/foo-verify",
+                    status="failed",
+                    exit_status="timed out",
+                    captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                    failure="verify_command timed out after 120s",
+                ),
+            ),
+            ProjectReviewVerifyResult(
+                project=None,
+                scope="libs/bar",
+                working_directory="libs/bar",
+                result=ReviewVerifyResult(
+                    command="./bin/bar-verify",
+                    status="failed",
+                    exit_status="7",
+                    captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                    failure="pytest failed",
+                ),
+            ),
+        ]
+        aggregate = _aggregate_cross_project_verify_result(
+            command="(per-project verify_command)",
+            captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            project_results=project_results,
+        )
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=review,
+            result=aggregate,
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="(per-project verify_command)",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.status = "completed"
+        verify_fix.branch = impl.branch
+        verify_fix.changed_diff = False
+        store.update(verify_fix)
+
+        with patch("gza.runner._run_lifecycle_verify") as run_verify:
+            _capture_noop_verify_fix_timeout_rerun(
+                config=config,
+                store=store,
+                task=verify_fix,
+                worktree_git=Mock(spec=Git),
+                worktree_path=tmp_path / "worktree",
+                branch_name=impl.branch,
+                head_sha="head-1",
+                base_sha="base-1",
+                task_logger=None,
+            )
+
+        run_verify.assert_not_called()
+
+        lifecycle_git = Mock()
+        lifecycle_git.can_merge.return_value = True
+        lifecycle_git.is_merged.return_value = False
+        lifecycle_git.branch_exists.return_value = True
+        lifecycle_git.ref_exists.return_value = False
+        lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
+        lifecycle_git.is_ancestor.return_value = False
+        lifecycle_git.count_commits_behind_checked.return_value = 0
+        lifecycle_git.count_commits_ahead_checked.return_value = 1
+        lifecycle_git.get_diff_name_status.return_value = ""
+        lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+
+        action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
+        assert action["type"] == "needs_discussion"
+        assert action["needs_attention_reason"] == "verify-fix-failed"
+
+    def test_capture_noop_verify_fix_uses_nested_project_execution_dir_and_impl_owner(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        repo_root = tmp_path / "repo"
+        project_dir = repo_root / "services" / "foo"
+        project_dir.mkdir(parents=True)
+        (repo_root / ".git").mkdir()
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=project_dir,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/nested-verify-fix"
+        store.update(impl)
+        source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert source.id is not None
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=impl,
+            source_task=source,
+            result=ReviewVerifyResult(
+                command="./bin/tests",
+                status="failed",
+                exit_status="timed out",
+                captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="head-1",
+                reviewed_base_sha="base-1",
+                failure="verify_command timed out after 120s",
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+        verify_epoch = VerifyEpoch(
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        )
+        verify_fix = store.add(
+            build_verify_fix_prompt(impl.id, verify_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert verify_fix.id is not None
+        verify_fix.branch = impl.branch
+        verify_fix.changed_diff = False
+        store.update(verify_fix)
+
+        worktree_path = tmp_path / "worktree"
+        expected_cwd = worktree_path / "services" / "foo"
+        rerun_result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(expected_cwd),
+        )
+        worktree_git = Mock(spec=Git)
+        worktree_git.rev_parse_if_exists.return_value = "head-1"
+        worktree_git.status_porcelain.return_value = set()
+
+        with patch(
+            "gza.runner._run_lifecycle_verify",
+            return_value=SimpleNamespace(aggregate_result=rerun_result, project_results=()),
+        ) as run_verify:
+            _capture_noop_verify_fix_timeout_rerun(
+                config=config,
+                store=store,
+                task=verify_fix,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                branch_name=impl.branch,
+                head_sha="head-1",
+                base_sha="base-1",
+                task_logger=None,
+            )
+
+        run_verify.assert_called_once()
+        assert run_verify.call_args.kwargs["cwd"] == expected_cwd
+        lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+        assert lookup.is_current
+        assert lookup.result is not None
+        assert lookup.result.status == "passed"
+        assert lookup.result.source_task_id == verify_fix.id
+        assert lookup.result.reviewed_branch == impl.branch
+        assert lookup.result.reviewed_head_sha == "head-1"
+
     def test_cross_project_review_artifact_does_not_persist_per_project_verify_phase_results(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl = store.add(prompt="Implement feature X", task_type="implement")
@@ -21637,3 +23549,352 @@ class TestProviderModelParityGate:
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.failure_reason == "CONFIG_ERROR"
+
+
+def _timeout_verify_fix_fixture(tmp_path: Path, *, cross_project: bool = False):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = Config(
+        project_dir=tmp_path,
+        project_name="test-project",
+        verify_command="./bin/tests",
+        autonomous_verify_timeout_seconds=120,
+        review_verify_timeout_grace_seconds=5.0,
+    )
+    config.log_path.mkdir(parents=True, exist_ok=True)
+    config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.branch = "feature/verify-fix"
+    impl.has_commits = True
+    store.update(impl)
+    source = store.add("Verify source", task_type="review", based_on=impl.id, depends_on=impl.id)
+    assert source.id is not None
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=source,
+        result=ReviewVerifyResult(
+            command="(per-project verify_command)" if cross_project else "./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+            failure="verify_command timed out after 120s",
+            failure_origin="timeout",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    verify_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        verify_command="(per-project verify_command)" if cross_project else "./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=impl.id,
+        same_branch=True,
+        create_pr=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.slug = f"20260817-noop-timeout-verify-fix-{tmp_path.name}"
+    verify_fix.status = "failed"
+    verify_fix.failure_reason = BRANCH_UNPUSHABLE_FAILURE_REASON
+    verify_fix.branch = impl.branch
+    verify_fix.log_file = "logs/noop-timeout-verify-fix.log"
+    verify_fix.output_content = "summary"
+    verify_fix.has_commits = True
+    verify_fix.changed_diff = False
+    verify_fix.head_sha = "head-1"
+    verify_fix.tags = ("cross-project",) if cross_project else ()
+    store.update(verify_fix)
+    (tmp_path / verify_fix.log_file).parent.mkdir(parents=True, exist_ok=True)
+    (tmp_path / verify_fix.log_file).write_text("")
+    (config.worktree_path / verify_fix.slug).mkdir(parents=True, exist_ok=True)
+    return store, config, impl, verify_fix, verify_epoch
+
+
+@pytest.mark.parametrize("entrypoint", ["pr_required_retry", "branch_reconcile"])
+def test_publication_recovery_refuses_detached_worktree_head_for_noop_timeout_verify_fix(
+    tmp_path: Path,
+    entrypoint: str,
+) -> None:
+    store, config, impl, verify_fix, verify_epoch = _timeout_verify_fix_fixture(tmp_path)
+    canonical_git = Mock(spec=Git)
+    canonical_git.default_branch.return_value = "main"
+    canonical_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "HEAD": "head-1",
+        impl.branch: "head-1",
+        "main": "base-1",
+    }.get(ref)
+    canonical_git.status_porcelain.return_value = set()
+
+    worktree_git = Mock(spec=Git)
+    worktree_git.repo_dir = config.worktree_path / verify_fix.slug
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "HEAD": "detached-clean-head",
+        impl.branch: "head-1",
+        "main": "base-1",
+    }.get(ref)
+    worktree_git.status_porcelain.return_value = set()
+
+    git_side_effect = [canonical_git, worktree_git] if entrypoint == "pr_required_retry" else [worktree_git]
+    with (
+        patch("gza.runner.Git", side_effect=git_side_effect),
+        patch(
+            "gza.runner._ensure_work_pr_for_completed_code_task",
+            return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+        ),
+        patch("gza.runner._run_lifecycle_verify") as run_verify,
+        patch("gza.runner._persist_lifecycle_verify_execution") as persist_verify,
+    ):
+        if entrypoint == "pr_required_retry":
+            rc = _retry_pr_required_code_task_completion(verify_fix, config, store)
+        else:
+            from gza.cli.git_ops import complete_branch_unpushable_after_reconcile
+
+            rc = complete_branch_unpushable_after_reconcile(
+                config=config,
+                store=store,
+                git=canonical_git,
+                task=verify_fix,
+            )
+
+    assert rc == 1
+    run_verify.assert_not_called()
+    persist_verify.assert_not_called()
+    lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+    assert lookup.is_current
+    assert lookup.result is not None
+    assert lookup.result.status == "failed"
+
+
+@pytest.mark.parametrize("entrypoint", ["pr_required_retry", "branch_reconcile"])
+def test_publication_recovery_uses_worktree_git_cleanliness_for_noop_timeout_verify_fix(
+    tmp_path: Path,
+    entrypoint: str,
+) -> None:
+    store, config, impl, verify_fix, verify_epoch = _timeout_verify_fix_fixture(tmp_path)
+    canonical_git = Mock(spec=Git)
+    canonical_git.default_branch.return_value = "main"
+    canonical_git.rev_parse_if_exists.side_effect = lambda ref: {"HEAD": "head-1", impl.branch: "head-1", "main": "base-1"}.get(ref)
+    canonical_git.status_porcelain.return_value = set()
+
+    worktree_git = Mock(spec=Git)
+    worktree_git.repo_dir = config.worktree_path / verify_fix.slug
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {"HEAD": "head-1", impl.branch: "head-1", "main": "base-1"}.get(ref)
+    worktree_git.status_porcelain.return_value = {("M", "src/impl.py")}
+
+    git_side_effect = [canonical_git, worktree_git] if entrypoint == "pr_required_retry" else [worktree_git]
+    with (
+        patch("gza.runner.Git", side_effect=git_side_effect),
+        patch(
+            "gza.runner._ensure_work_pr_for_completed_code_task",
+            return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+        ),
+        patch("gza.runner._run_lifecycle_verify") as run_verify,
+        patch("gza.runner._persist_lifecycle_verify_execution") as persist_verify,
+    ):
+        if entrypoint == "pr_required_retry":
+            rc = _retry_pr_required_code_task_completion(verify_fix, config, store)
+        else:
+            from gza.cli.git_ops import complete_branch_unpushable_after_reconcile
+
+            rc = complete_branch_unpushable_after_reconcile(
+                config=config,
+                store=store,
+                git=canonical_git,
+                task=verify_fix,
+            )
+
+    assert rc == 1
+    canonical_git.status_porcelain.assert_not_called()
+    worktree_git.status_porcelain.assert_called()
+    run_verify.assert_not_called()
+    persist_verify.assert_not_called()
+    lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+    assert lookup.is_current
+    assert lookup.result is not None
+    assert lookup.result.status == "failed"
+
+
+@pytest.mark.parametrize("entrypoint", ["pr_required_retry", "branch_reconcile"])
+def test_publication_recovery_cross_project_diff_scope_comes_from_worktree_head(
+    tmp_path: Path,
+    entrypoint: str,
+) -> None:
+    (tmp_path / "services" / "foo").mkdir(parents=True)
+    (tmp_path / "libs" / "bar").mkdir(parents=True)
+    (tmp_path / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (tmp_path / "libs" / "bar" / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+    store, config, impl, verify_fix, verify_epoch = _timeout_verify_fix_fixture(tmp_path, cross_project=True)
+    worktree_path = config.worktree_path / verify_fix.slug
+    (worktree_path / "services" / "foo").mkdir(parents=True, exist_ok=True)
+    (worktree_path / "libs" / "bar").mkdir(parents=True, exist_ok=True)
+    (worktree_path / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (worktree_path / "libs" / "bar" / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+
+    canonical_git = Mock(spec=Git)
+    canonical_git.default_branch.return_value = "main"
+    canonical_git.rev_parse_if_exists.side_effect = lambda ref: {"HEAD": "head-1", impl.branch: "head-1", "main": "base-1"}.get(ref)
+    canonical_git.status_porcelain.return_value = set()
+    canonical_git.get_diff_name_status.return_value = "M\tservices/foo/app.py\n"
+
+    worktree_git = Mock(spec=Git)
+    worktree_git.repo_dir = worktree_path
+    worktree_git.default_branch.return_value = "main"
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {"HEAD": "head-1", impl.branch: "head-1", "main": "base-1"}.get(ref)
+    worktree_git.status_porcelain.return_value = set()
+    worktree_git.get_diff_name_status.return_value = "M\tlibs/bar/lib.py\n"
+
+    git_side_effect = [canonical_git, worktree_git] if entrypoint == "pr_required_retry" else [worktree_git]
+    with (
+        patch("gza.runner.Git", side_effect=git_side_effect),
+        patch(
+            "gza.runner._ensure_work_pr_for_completed_code_task",
+            return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
+        ),
+        patch(
+            "gza.runner._run_review_verify_command",
+            return_value=ReviewVerifyResult(
+                command="./bin/bar-verify",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            ),
+        ) as run_project_verify,
+        patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+    ):
+        if entrypoint == "pr_required_retry":
+            rc = _retry_pr_required_code_task_completion(verify_fix, config, store)
+        else:
+            from gza.cli.git_ops import complete_branch_unpushable_after_reconcile
+
+            rc = complete_branch_unpushable_after_reconcile(
+                config=config,
+                store=store,
+                git=canonical_git,
+                task=verify_fix,
+            )
+
+    assert rc == 0
+    canonical_git.get_diff_name_status.assert_not_called()
+    worktree_git.get_diff_name_status.assert_called_once_with("main...HEAD", check=True)
+    run_project_verify.assert_called_once()
+    assert run_project_verify.call_args.args[0] == "./bin/bar-verify"
+    owner_artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    verify_fix_artifacts = [
+        artifact
+        for artifact in owner_artifacts
+        if artifact.metadata is not None and artifact.metadata.get("source_task_id") == verify_fix.id
+    ]
+    assert verify_fix_artifacts
+    assert verify_fix_artifacts[0].status == "passed"
+
+
+def test_capture_noop_verify_fix_fails_closed_when_identity_is_missing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = Config(project_dir=tmp_path, project_name="test-project", verify_command="./bin/tests")
+    verify_fix = store.add("Unstructured verify fix prompt", task_type="verify_fix", same_branch=True)
+    assert verify_fix.id is not None
+    verify_fix.branch = "feature/verify-fix"
+    verify_fix.changed_diff = False
+    store.update(verify_fix)
+
+    with (
+        patch("gza.runner._run_lifecycle_verify") as run_verify,
+        patch("gza.runner._persist_lifecycle_verify_execution") as persist_verify,
+    ):
+        can_complete = _capture_noop_verify_fix_timeout_rerun(
+            config=config,
+            store=store,
+            task=verify_fix,
+            worktree_git=Mock(spec=Git),
+            worktree_path=tmp_path / "worktree",
+            branch_name="feature/verify-fix",
+            head_sha="head-1",
+            base_sha="base-1",
+            task_logger=None,
+        )
+
+    assert can_complete is False
+    assert "Cannot determine verify_fix timeout rerun identity" in capsys.readouterr().out
+    run_verify.assert_not_called()
+    persist_verify.assert_not_called()
+
+
+def test_capture_noop_verify_fix_fails_closed_when_owner_is_missing(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = Config(project_dir=tmp_path, project_name="test-project", verify_command="./bin/tests")
+    verify_epoch = VerifyEpoch(
+        reviewed_branch="feature/verify-fix",
+        reviewed_head_sha="head-1",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt("gza-999999", verify_epoch),
+        task_type="verify_fix",
+        based_on="gza-999999",
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.branch = "feature/verify-fix"
+    verify_fix.changed_diff = False
+    store.update(verify_fix)
+
+    with patch("gza.runner._run_lifecycle_verify") as run_verify:
+        can_complete = _capture_noop_verify_fix_timeout_rerun(
+            config=config,
+            store=store,
+            task=verify_fix,
+            worktree_git=Mock(spec=Git),
+            worktree_path=tmp_path / "worktree",
+            branch_name="feature/verify-fix",
+            head_sha="head-1",
+            base_sha="base-1",
+            task_logger=None,
+        )
+
+    assert can_complete is False
+    assert "Cannot resolve verify_fix implementation owner" in capsys.readouterr().out
+    run_verify.assert_not_called()
+
+
+def test_completion_guard_fails_closed_when_verify_fix_worktree_is_unresolved(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store, config, _impl, verify_fix, _verify_epoch = _timeout_verify_fix_fixture(tmp_path)
+    verify_fix.slug = None
+    store.update(verify_fix)
+
+    with patch("gza.runner._run_lifecycle_verify") as run_verify:
+        from gza.runner import _ensure_noop_verify_fix_timeout_rerun_before_completion
+
+        can_complete = _ensure_noop_verify_fix_timeout_rerun_before_completion(
+            config=config,
+            store=store,
+            task=verify_fix,
+            worktree_git=Mock(spec=Git),
+            worktree_path=None,
+            branch_name=verify_fix.branch or "feature/verify-fix",
+            head_sha="head-1",
+            base_sha="base-1",
+            task_logger=None,
+        )
+
+    assert can_complete is False
+    assert "Cannot resolve managed verify_fix worktree" in capsys.readouterr().out
+    run_verify.assert_not_called()

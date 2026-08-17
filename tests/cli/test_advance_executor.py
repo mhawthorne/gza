@@ -59,7 +59,7 @@ from gza.plan_review_materialization import (
 )
 from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
-from gza.review_tasks import OffTopicVerifyPersistenceError
+from gza.review_tasks import OffTopicVerifyPersistenceError, build_verify_fix_prompt
 from gza.review_verify_state import (
     VerifyEpoch,
     VERIFY_GATE_ARTIFACT_KIND,
@@ -69,6 +69,7 @@ from gza.review_verify_state import (
 )
 from gza.review_verdict import ReviewFinding
 from gza.runner import CROSS_PROJECT_TAG, _make_review_verify_result
+from gza.verify_fix_outcome import effective_verify_fix_completion_outcome
 from gza.git import Git, GitError, ResolvedMergeSourceRef
 
 from .conftest import make_store, setup_config
@@ -3460,6 +3461,978 @@ def test_verify_gate_execution_blocks_current_red_evidence_without_rerun(tmp_pat
     assert result.status == "skip"
     assert result.attention_reason == "verify-gate-blocked"
     assert "current verify gate is red" in result.message
+
+
+def test_completed_no_source_timeout_verify_fix_rerun_persists_green_then_plans_merge(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+    impl = store.add("Implement timeout verify fix", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/completed-timeout-verify-fix")
+    impl.has_commits = True
+    store.update(impl)
+    review = store.add("Review timeout verify fix", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    timeout_result = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="timed out",
+        captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+        failure="verify_command timed out after 120s",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=timeout_result,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    verify_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.slug = "20260817-completed-timeout-verify-fix"
+    store.update(verify_fix)
+    store.mark_completed(
+        verify_fix,
+        branch=impl.branch,
+        has_commits=False,
+        changed_diff=False,
+        head_sha="head-1",
+        base_sha="base-1",
+    )
+    verify_fix = store.get(verify_fix.id)
+    assert verify_fix is not None
+    assert verify_fix.review_verify_head_sha == "head-1"
+    worktree_path = config.worktree_path / verify_fix.slug
+    worktree_path.mkdir(parents=True)
+
+    lifecycle_git = MagicMock()
+    lifecycle_git.can_merge.return_value = True
+    lifecycle_git.is_merged.return_value = False
+    lifecycle_git.branch_exists.return_value = True
+    lifecycle_git.ref_exists.return_value = False
+    lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
+    lifecycle_git.is_ancestor.return_value = False
+    lifecycle_git.count_commits_behind_checked.return_value = 0
+    lifecycle_git.count_commits_ahead_checked.return_value = 1
+    lifecycle_git.get_diff_name_status.return_value = ""
+    lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
+    assert action["type"] == "rerun_completed_verify_fix"
+
+    worktree_git = MagicMock()
+    worktree_git.repo_dir = worktree_path
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "HEAD": "head-1",
+        "main": "base-1",
+        impl.branch: "head-1",
+    }.get(ref)
+    worktree_git.status_porcelain.return_value = set()
+    rerun_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 8, 17, 10, 20, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory=str(worktree_path),
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=lifecycle_git,
+    )
+
+    with (
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch(
+            "gza.runner._run_lifecycle_verify",
+            return_value=SimpleNamespace(markdown="verify passed", aggregate_result=rerun_result, project_results=()),
+        ),
+    ):
+        result = execute_advance_action(task=impl, action=action, context=context)
+
+    assert result.status == "success"
+    lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+    assert lookup.is_current
+    assert lookup.result is not None
+    assert lookup.result.status == "passed"
+    assert lookup.result.source_task_id == verify_fix.id
+
+    next_action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
+    assert next_action["type"] == "merge"
+
+
+def test_completed_legacy_timeout_verify_fix_dry_run_does_not_persist_upgrade(tmp_path: Path, monkeypatch) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+    impl = store.add("Implement timeout verify fix", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/completed-timeout-dry-run")
+    impl.has_commits = True
+    store.update(impl)
+    review = store.add("Review timeout verify fix", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    timeout_result = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="timed out",
+        captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+        failure="verify_command timed out after 120s",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=timeout_result,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    verify_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.status = "completed"
+    verify_fix.branch = impl.branch
+    verify_fix.slug = "20260817-completed-timeout-dry-run"
+    verify_fix.has_commits = False
+    store.update(verify_fix)
+    (config.worktree_path / verify_fix.slug).mkdir(parents=True)
+
+    lifecycle_git = MagicMock()
+    lifecycle_git.can_merge.return_value = True
+    lifecycle_git.is_merged.return_value = False
+    lifecycle_git.branch_exists.return_value = True
+    lifecycle_git.ref_exists.return_value = False
+    lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
+    lifecycle_git.is_ancestor.return_value = False
+    lifecycle_git.count_commits_behind_checked.return_value = 0
+    lifecycle_git.count_commits_ahead_checked.return_value = 1
+    lifecycle_git.get_diff_name_status.return_value = ""
+    lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+    lifecycle_git.status_porcelain.return_value = set()
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
+    assert action["type"] == "rerun_completed_verify_fix"
+    assert action.get("legacy_completion_proof") is not None
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=True,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=lifecycle_git,
+    )
+
+    result = execute_advance_action(task=impl, action=action, context=context)
+
+    assert result.status == "dry_run"
+    refreshed_fix = store.get(verify_fix.id)
+    assert refreshed_fix is not None
+    assert refreshed_fix.changed_diff is None
+    assert refreshed_fix.review_verify_head_sha is None
+    assert refreshed_fix.verify_fix_completion_outcome_json is None
+
+
+def test_completed_legacy_timeout_verify_fix_rerun_uses_managed_worktree_not_dirty_canonical_checkout(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+    impl = store.add("Implement timeout verify fix", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/completed-timeout-managed-clean")
+    impl.has_commits = True
+    store.update(impl)
+    review = store.add("Review timeout source", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    timeout_result = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="timed out",
+        captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+        failure="verify_command timed out after 120s",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=timeout_result,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    verify_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.status = "completed"
+    verify_fix.branch = impl.branch
+    verify_fix.slug = "20260817-completed-timeout-managed-clean"
+    verify_fix.has_commits = False
+    store.update(verify_fix)
+    worktree_path = config.worktree_path / verify_fix.slug
+    worktree_path.mkdir(parents=True)
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    lifecycle_git = MagicMock()
+    lifecycle_git.can_merge.return_value = True
+    lifecycle_git.is_merged.return_value = False
+    lifecycle_git.branch_exists.return_value = True
+    lifecycle_git.ref_exists.return_value = False
+    lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
+    lifecycle_git.is_ancestor.return_value = False
+    lifecycle_git.count_commits_behind_checked.return_value = 0
+    lifecycle_git.count_commits_ahead_checked.return_value = 1
+    lifecycle_git.get_diff_name_status.return_value = ""
+    lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+    lifecycle_git.status_porcelain.return_value = {("M", "src/local.py")}
+
+    action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
+    assert action["type"] == "rerun_completed_verify_fix"
+    assert action.get("legacy_completion_proof") is not None
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=lifecycle_git,
+    )
+    worktree_git = MagicMock()
+    worktree_git.repo_dir = worktree_path
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "HEAD": "head-1",
+        "main": "base-1",
+        impl.branch: "head-1",
+    }.get(ref)
+    worktree_git.status_porcelain.return_value = set()
+    rerun_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 8, 17, 10, 20, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory=str(worktree_path),
+    )
+
+    with (
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch(
+            "gza.runner._run_lifecycle_verify",
+            return_value=SimpleNamespace(markdown="verify", aggregate_result=rerun_result, project_results=()),
+        ),
+    ):
+        result = execute_advance_action(task=impl, action=action, context=context)
+
+    assert result.status == "success"
+    refreshed_fix = store.get(verify_fix.id)
+    assert refreshed_fix is not None
+    outcome = effective_verify_fix_completion_outcome(refreshed_fix)
+    assert outcome is not None
+    assert outcome.recovery_rerun_attempted is True
+    next_action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
+    assert next_action["type"] == "merge"
+
+
+@pytest.mark.parametrize("rerun_status", ["passed", "failed"])
+def test_completed_no_source_timeout_verify_fix_rerun_atomic_persistence_failure_stays_retryable(
+    tmp_path: Path,
+    rerun_status: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+    impl = store.add("Implement timeout verify fix", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/completed-timeout-consume-fails")
+    impl.has_commits = True
+    store.update(impl)
+    source = store.add("Verify timeout source", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert source.id is not None
+    _mark_completed(source)
+    source.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(source)
+    timeout_result = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="timed out",
+        captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+        failure="verify_command timed out after 120s",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=source,
+        result=timeout_result,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    verify_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.status = "completed"
+    verify_fix.branch = impl.branch
+    verify_fix.slug = "20260817-completed-timeout-consume-fails"
+    verify_fix.changed_diff = False
+    verify_fix.review_verify_head_sha = "head-1"
+    store.update(verify_fix)
+    worktree_path = config.worktree_path / verify_fix.slug
+    worktree_path.mkdir(parents=True)
+    before_artifact_count = len(store.list_artifacts(impl.id, kind="verify_gate_result"))
+
+    lifecycle_git = MagicMock()
+    lifecycle_git.can_merge.return_value = True
+    lifecycle_git.is_merged.return_value = False
+    lifecycle_git.branch_exists.return_value = True
+    lifecycle_git.ref_exists.return_value = False
+    lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
+    lifecycle_git.is_ancestor.return_value = False
+    lifecycle_git.count_commits_behind_checked.return_value = 0
+    lifecycle_git.count_commits_ahead_checked.return_value = 1
+    lifecycle_git.get_diff_name_status.return_value = ""
+    lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=lifecycle_git,
+    )
+    worktree_git = MagicMock()
+    worktree_git.repo_dir = worktree_path
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "HEAD": "head-1",
+        "main": "base-1",
+        impl.branch: "head-1",
+    }.get(ref)
+    worktree_git.status_porcelain.return_value = set()
+    rerun_result = _make_review_verify_result(
+        "./bin/tests",
+        status=rerun_status,
+        exit_status="0" if rerun_status == "passed" else "timed out",
+        captured_at=datetime(2026, 8, 17, 10, 20, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory=str(worktree_path),
+        failure=None if rerun_status == "passed" else "verify_command timed out after 120s",
+    )
+    with (
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch(
+            "gza.runner._run_lifecycle_verify",
+            return_value=SimpleNamespace(markdown="verify", aggregate_result=rerun_result, project_results=()),
+        ),
+        patch(
+            "gza.runner.persist_verify_gate_artifact_with_verify_fix_outcome",
+            side_effect=RuntimeError("simulated atomic verify persistence failure"),
+        ),
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "rerun_completed_verify_fix",
+                "verify_fix_task": verify_fix,
+                "verify_owner_task": impl,
+                "verify_epoch": verify_epoch,
+                "verify_base_sha": "base-1",
+            },
+            context=context,
+        )
+
+    assert result.status == "skip"
+    assert result.attention_type == "needs_discussion"
+    assert result.attention_reason == "verify-fix-proof-unavailable"
+    assert "simulated atomic verify persistence failure" in result.message
+    assert len(store.list_artifacts(impl.id, kind="verify_gate_result")) == before_artifact_count
+    refreshed_fix = store.get(verify_fix.id)
+    assert refreshed_fix is not None
+    outcome = effective_verify_fix_completion_outcome(refreshed_fix)
+    assert outcome is not None
+    assert outcome.no_source_changes is True
+    assert outcome.completion_head_sha == "head-1"
+    assert outcome.recovery_rerun_attempted is False
+
+    next_action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
+    assert next_action["type"] == "rerun_completed_verify_fix"
+    assert next_action.get("needs_attention_reason") != "verify-fix-failed"
+
+
+def test_completed_legacy_timeout_verify_fix_executor_branch_proof_failure_is_proof_unavailable(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.worktree_path.mkdir(parents=True, exist_ok=True)
+    impl = store.add("Implement timeout verify fix", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/legacy-branch-proof"
+    store.update(impl)
+    verify_fix = store.add("Legacy verify fix", task_type="verify_fix", based_on=impl.id, same_branch=True)
+    assert verify_fix.id is not None
+    verify_fix.status = "completed"
+    verify_fix.branch = impl.branch
+    verify_fix.slug = "20260817-legacy-branch-proof"
+    store.update(verify_fix)
+    (config.worktree_path / verify_fix.slug).mkdir(parents=True)
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=MagicMock(),
+    )
+    worktree_git = MagicMock()
+    worktree_git.rev_parse_if_exists.side_effect = GitError("branch ref probe failed")
+
+    with patch("gza.cli.advance_executor.Git", return_value=worktree_git):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "rerun_completed_verify_fix",
+                "verify_fix_task": verify_fix,
+                "verify_owner_task": impl,
+                "verify_epoch": VerifyEpoch(
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="head-1",
+                    verify_command="./bin/tests",
+                    verify_timeout_seconds=120,
+                    verify_timeout_grace_seconds=5.0,
+                ),
+                "legacy_completion_proof": SimpleNamespace(
+                    branch_name=impl.branch,
+                    expected_head_sha="head-1",
+                ),
+            },
+            context=context,
+        )
+
+    assert result.status == "skip"
+    assert result.attention_reason == "verify-fix-proof-unavailable"
+    assert "branch ref probe failed" in result.message
+    assert result.attention_reason != "verify-fix-failed"
+
+
+def test_completed_legacy_timeout_verify_fix_executor_refuses_dirty_managed_worktree(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.worktree_path.mkdir(parents=True, exist_ok=True)
+    impl = store.add("Implement timeout verify fix", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/legacy-managed-dirty"
+    store.update(impl)
+    verify_fix = store.add("Legacy verify fix", task_type="verify_fix", based_on=impl.id, same_branch=True)
+    assert verify_fix.id is not None
+    verify_fix.status = "completed"
+    verify_fix.branch = impl.branch
+    verify_fix.slug = "20260817-legacy-managed-dirty"
+    store.update(verify_fix)
+    worktree_path = config.worktree_path / verify_fix.slug
+    worktree_path.mkdir(parents=True)
+    canonical_git = MagicMock()
+    canonical_git.status_porcelain.return_value = set()
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=canonical_git,
+    )
+    worktree_git = MagicMock()
+    worktree_git.rev_parse_if_exists.return_value = "head-1"
+    worktree_git.status_porcelain.return_value = {("M", "src/dirty.py")}
+
+    with (
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch("gza.cli.advance_executor.persist_verify_fix_completion_outcome") as persist_outcome,
+        patch("gza.runner._run_lifecycle_verify") as run_verify,
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "rerun_completed_verify_fix",
+                "verify_fix_task": verify_fix,
+                "verify_owner_task": impl,
+                "verify_epoch": VerifyEpoch(
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="head-1",
+                    verify_command="./bin/tests",
+                    verify_timeout_seconds=120,
+                    verify_timeout_grace_seconds=5.0,
+                ),
+                "legacy_completion_proof": SimpleNamespace(
+                    branch_name=impl.branch,
+                    expected_head_sha="head-1",
+                ),
+            },
+            context=context,
+        )
+
+    assert result.status == "skip"
+    assert result.attention_reason == "verify-fix-proof-unavailable"
+    assert "clean managed worktree" in result.message
+    persist_outcome.assert_not_called()
+    run_verify.assert_not_called()
+    refreshed_fix = store.get(verify_fix.id)
+    assert refreshed_fix is not None
+    assert refreshed_fix.verify_fix_completion_outcome_json is None
+    canonical_git.status_porcelain.assert_not_called()
+
+
+def test_completed_legacy_timeout_verify_fix_upgrade_persistence_failure_is_proof_unavailable(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.worktree_path.mkdir(parents=True, exist_ok=True)
+    impl = store.add("Implement timeout verify fix", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/legacy-upgrade-persistence-fails"
+    store.update(impl)
+    verify_fix = store.add("Legacy verify fix", task_type="verify_fix", based_on=impl.id, same_branch=True)
+    assert verify_fix.id is not None
+    verify_fix.status = "completed"
+    verify_fix.branch = impl.branch
+    verify_fix.slug = "20260817-legacy-upgrade-persistence-fails"
+    verify_fix.has_commits = False
+    store.update(verify_fix)
+    worktree_path = config.worktree_path / verify_fix.slug
+    worktree_path.mkdir(parents=True)
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=MagicMock(),
+    )
+    worktree_git = MagicMock()
+    worktree_git.rev_parse_if_exists.return_value = "head-1"
+    worktree_git.status_porcelain.return_value = set()
+    original_update = store.update
+
+    def fail_verify_fix_update(task: DbTask) -> None:
+        if task.id == verify_fix.id and task.verify_fix_completion_outcome_json is not None:
+            raise RuntimeError("simulated legacy upgrade write failure")
+        original_update(task)
+
+    with (
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch.object(store, "update", side_effect=fail_verify_fix_update),
+        patch("gza.runner._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")),
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "rerun_completed_verify_fix",
+                "verify_fix_task": verify_fix,
+                "verify_owner_task": impl,
+                "verify_epoch": VerifyEpoch(
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="head-1",
+                    verify_command="./bin/tests",
+                    verify_timeout_seconds=120,
+                    verify_timeout_grace_seconds=5.0,
+                ),
+                "legacy_completion_proof": SimpleNamespace(
+                    branch_name=impl.branch,
+                    expected_head_sha="head-1",
+                ),
+            },
+            context=context,
+        )
+
+    assert result.status == "skip"
+    assert result.attention_type == "needs_discussion"
+    assert result.attention_reason == "verify-fix-proof-unavailable"
+    assert "simulated legacy upgrade write failure" in result.message
+    refreshed_fix = store.get(verify_fix.id)
+    assert refreshed_fix is not None
+    assert refreshed_fix.changed_diff is None
+    assert refreshed_fix.review_verify_head_sha is None
+    assert refreshed_fix.verify_fix_completion_outcome_json is None
+    assert result.created_task is not None
+    assert result.created_task.verify_fix_completion_outcome_json is None
+
+
+@pytest.mark.parametrize("refusal", ["dirty", "missing_head", "missing_worktree", "rerun_failed", "rerun_timeout"])
+def test_completed_no_source_timeout_verify_fix_rerun_refusals_do_not_clear_gate(
+    tmp_path: Path,
+    refusal: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.worktree_path.mkdir(parents=True, exist_ok=True)
+
+    impl = store.add("Implement timeout verify fix", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/completed-timeout-refusal")
+    impl.has_commits = True
+    store.update(impl)
+    source = store.add("Verify timeout source", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert source.id is not None
+    _mark_completed(source)
+    source.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(source)
+    timeout_result = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="timed out",
+        captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+        failure="verify_command timed out after 120s",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=source,
+        result=timeout_result,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    verify_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, verify_epoch),
+        task_type="verify_fix",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.status = "completed"
+    verify_fix.branch = impl.branch
+    verify_fix.slug = f"20260817-completed-timeout-{refusal}"
+    verify_fix.changed_diff = False
+    verify_fix.review_verify_head_sha = None if refusal == "missing_head" else "head-1"
+    store.update(verify_fix)
+    worktree_path = config.worktree_path / verify_fix.slug
+    if refusal != "missing_worktree":
+        worktree_path.mkdir(parents=True)
+
+    lifecycle_git = MagicMock()
+    lifecycle_git.can_merge.return_value = True
+    lifecycle_git.is_merged.return_value = False
+    lifecycle_git.branch_exists.return_value = True
+    lifecycle_git.ref_exists.return_value = False
+    lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {"main": "base-1", impl.branch: "head-1"}.get(ref)
+    lifecycle_git.is_ancestor.return_value = False
+    lifecycle_git.count_commits_behind_checked.return_value = 0
+    lifecycle_git.count_commits_ahead_checked.return_value = 1
+    lifecycle_git.get_diff_name_status.return_value = ""
+    lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+    lifecycle_git.status_porcelain.return_value = set()
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=lifecycle_git,
+    )
+    worktree_git = MagicMock()
+    worktree_git.repo_dir = worktree_path
+    worktree_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "HEAD": "head-1",
+        "main": "base-1",
+        impl.branch: "head-1",
+    }.get(ref)
+    worktree_git.status_porcelain.return_value = {("M", "src/dirty.py")} if refusal == "dirty" else set()
+    rerun_result = _make_review_verify_result(
+        "./bin/tests",
+        status="failed" if refusal in {"rerun_failed", "rerun_timeout"} else "passed",
+        exit_status="timed out" if refusal == "rerun_timeout" else ("7" if refusal == "rerun_failed" else "0"),
+        captured_at=datetime(2026, 8, 17, 10, 20, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory=str(worktree_path),
+        failure=(
+            "verify_command timed out after 120s"
+            if refusal == "rerun_timeout"
+            else ("pytest failed" if refusal == "rerun_failed" else None)
+        ),
+    )
+
+    with (
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git) as git_ctor,
+        patch(
+            "gza.runner._run_lifecycle_verify",
+            return_value=SimpleNamespace(markdown="verify", aggregate_result=rerun_result, project_results=()),
+        ) as run_verify,
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "rerun_completed_verify_fix",
+                "verify_fix_task": verify_fix,
+                "verify_owner_task": impl,
+                "verify_epoch": verify_epoch,
+                "verify_base_sha": "base-1",
+            },
+            context=context,
+        )
+
+    assert result.status == "skip"
+    lookup = latest_verify_result_for_epoch(store, impl, current_epoch=verify_epoch)
+    assert lookup.is_current
+    assert lookup.result is not None
+    assert lookup.result.status == "failed"
+    if refusal in {"missing_head", "missing_worktree", "dirty"}:
+        assert lookup.result.source_task_id == source.id
+    if refusal == "missing_head":
+        git_ctor.assert_not_called()
+        run_verify.assert_not_called()
+    elif refusal in {"missing_worktree", "dirty"}:
+        run_verify.assert_not_called()
+    else:
+        run_verify.assert_called_once()
+    if refusal == "rerun_timeout":
+        next_action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
+        assert next_action["type"] == "needs_discussion"
+        assert next_action["needs_attention_reason"] == "verify-fix-failed"
+        assert "already consumed its exact-head recovery rerun" in next_action["description"]
 
 
 def test_create_verify_fix_action_creates_and_spawns_worker(tmp_path: Path) -> None:
