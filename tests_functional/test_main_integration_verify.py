@@ -45,9 +45,10 @@ def test_configured_main_integration_verify_launch_failure_keeps_main_green_and_
     assert check.state.gate_enabled is True
     assert check.state.verify_status == "unavailable"
     assert check.state.alert_message == (
-        f"main verify misconfigured at `{head_sha[:12]}` - could not launch verify tooling "
-        "(launcher missing); fix the environment, not the code"
+        "main verify misconfigured - could not launch verify tooling (launcher missing); "
+        "fix the environment, not the code"
     )
+    assert head_sha[:12] not in check.state.alert_message
     assert check.merges_halted is False
     assert check.needs_attention is True
 
@@ -201,7 +202,7 @@ def test_changed_main_head_reruns_verify_and_persists_red_alert(tmp_path) -> Non
     assert refreshed_check.state.head_sha == new_head
     assert refreshed_check.state.tree_fingerprint is not None
     assert refreshed_check.state.verify_status == "failed"
-    assert refreshed_check.state.alert_message == f"main verify RED at `{new_head[:12]}` - merges halted"
+    assert refreshed_check.state.alert_message == "main verify RED - merges halted"
 
     persisted_red = load_main_integration_verify_state(store)
     assert persisted_red is not None
@@ -211,7 +212,7 @@ def test_changed_main_head_reruns_verify_and_persists_red_alert(tmp_path) -> Non
     assert persisted_red.verify_status == "failed"
     assert persisted_red.alert_message == refreshed_check.state.alert_message
 
-    assert refreshed_check.state.alert_message.startswith(f"main verify RED at `{new_head[:12]}`")
+    assert f"`{new_head[:12]}`" not in (refreshed_check.state.alert_message or "")
 
 
 def test_same_tree_red_checkpoint_reruns_when_verify_command_changes_and_recovers(tmp_path) -> None:
@@ -249,7 +250,8 @@ def test_same_tree_red_checkpoint_reruns_when_verify_command_changes_and_recover
     assert red_check.state.gate_enabled is True
     assert red_check.state.verify_command == "./bin/broken-verify"
     assert red_check.state.verify_status == "failed"
-    assert red_check.state.alert_message == f"main verify RED at `{head_sha[:12]}` - merges halted"
+    assert red_check.state.alert_message == "main verify RED - merges halted"
+    assert f"`{head_sha[:12]}`" not in (red_check.state.alert_message or "")
     original_fingerprint = red_check.state.tree_fingerprint
 
     config.verify_command = "./bin/tests"

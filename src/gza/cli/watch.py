@@ -74,6 +74,8 @@ from ..lineage_query import (
 )
 from ..lineage_view import LineageView
 from ..main_integration_verify import (
+    MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+    MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_REASON,
     MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
     MAIN_INTEGRATION_VERIFY_TAG,
@@ -3087,41 +3089,257 @@ def format_red_duration(red_since: datetime, now: datetime) -> str:
     return f"{total_minutes}m"
 
 
+def _format_main_verify_red_attention_message(state: Any) -> str:
+    short_sha = (getattr(state, "head_sha", None) or "unknown")[:12]
+    failing_phase = getattr(state, "failing_phase", None)
+    if isinstance(failing_phase, str) and failing_phase:
+        return f"main verify RED at `{short_sha}` - merges halted; phase `{failing_phase}` failing"
+    verify_status = getattr(state, "verify_status", None)
+    if isinstance(verify_status, str) and verify_status and verify_status != "failed":
+        return f"main verify RED at `{short_sha}` - merges halted; verify status `{verify_status}`"
+    return f"main verify RED at `{short_sha}` - merges halted"
+
+
+def _main_verify_state_is_freshness_unavailable(state: Any) -> bool:
+    return getattr(state, "verify_exit_status", None) == MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
+
+
+def _main_verify_state_is_red_verdict(state: Any) -> bool:
+    message = getattr(state, "alert_message", None)
+    if isinstance(message, str) and _MAIN_VERIFY_REMEDIATION_EXHAUSTED_ATTENTION_RE.search(message) is not None:
+        return False
+    if isinstance(message, str) and message.startswith("main verify RED"):
+        return True
+    verify_status = getattr(state, "verify_status", None)
+    verify_exit_status = getattr(state, "verify_exit_status", None)
+    if verify_exit_status in {
+        MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+        MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+    }:
+        return False
+    return isinstance(verify_status, str) and verify_status not in {"passed", "unavailable"}
+
+
+def _main_verify_state_needs_non_red_attention(state: Any) -> bool:
+    message = getattr(state, "alert_message", None)
+    if not isinstance(message, str) or not message:
+        return False
+    return getattr(state, "verify_exit_status", None) == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+
+
+def _main_verify_current_head_sha(git: Git | None, *, target_branch: str | None = None) -> str | None:
+    if git is None:
+        return None
+    ref = f"refs/heads/{target_branch}" if target_branch else "HEAD"
+    try:
+        current_head = git.rev_parse_if_exists(ref)
+    except (AssertionError, GitError):
+        return None
+    if current_head is None and target_branch:
+        try:
+            current_branch = git.current_branch()
+        except (AssertionError, GitError):
+            current_branch = None
+        if current_branch == target_branch:
+            try:
+                current_head = git.rev_parse_if_exists("HEAD")
+            except (AssertionError, GitError):
+                return None
+    return current_head if isinstance(current_head, str) and current_head else None
+
+
+def _main_verify_red_attention_head_status(
+    state: Any,
+    *,
+    git: Git | None,
+    target_branch: str | None = None,
+) -> Literal["current", "stale", "unproven"]:
+    recorded_head = getattr(state, "head_sha", None)
+    if not isinstance(recorded_head, str) or not recorded_head:
+        return "unproven"
+    current_head = _main_verify_current_head_sha(git, target_branch=target_branch)
+    if current_head is None:
+        return "unproven"
+    if current_head != recorded_head:
+        return "stale"
+    return "current"
+
+
+def _format_main_verify_unproven_current_head_message(state: Any) -> str:
+    recorded_head = getattr(state, "head_sha", None)
+    if not isinstance(recorded_head, str) or not recorded_head:
+        return "main verify red evidence unproven at current HEAD; recorded target SHA unavailable"
+    return "main verify red evidence unproven at current HEAD; current HEAD identity unavailable"
+
+
+def _format_main_verify_freshness_unavailable_attention_message(state: Any) -> str:
+    short_sha = (getattr(state, "head_sha", None) or "unknown")[:12]
+    return f"main verify freshness unproven at `{short_sha}` - merges halted; exact tree fingerprint unavailable"
+
+
+def _format_main_verify_freshness_unavailable_unproven_message(state: Any) -> str:
+    recorded_head = getattr(state, "head_sha", None)
+    if not isinstance(recorded_head, str) or not recorded_head:
+        return "main verify freshness unproven at current HEAD; recorded target SHA unavailable"
+    return "main verify freshness unproven at current HEAD; exact tree fingerprint unavailable"
+
+
 def _format_main_verify_attention_message(state: Any, *, now: datetime) -> str:
     message = state.alert_message or "main verify is red; merges halted"
     red_since = getattr(state, "red_since", None)
     exhausted_match = _MAIN_VERIFY_REMEDIATION_EXHAUSTED_ATTENTION_RE.search(message)
-    if exhausted_match is not None and red_since is not None:
+    if exhausted_match is not None:
         signature = _main_verify_state_failure_signature(state) or "unknown"
         message = (
             f"main verify remediation exhausted for {signature} after "
             f"{exhausted_match.group('attempts')} attempts; human intervention required"
         )
+    elif _main_verify_state_is_red_verdict(state):
+        message = _format_main_verify_red_attention_message(state)
+    elif _main_verify_state_is_freshness_unavailable(state):
+        message = _format_main_verify_freshness_unavailable_attention_message(state)
     if red_since is None:
         return message
     return f"{message} (red for {format_red_duration(red_since, now)})"
 
 
-def _main_verify_attention_key(state: Any) -> str | None:
+def _main_verify_ordinary_attention_key(state: Any) -> str | None:
     task = getattr(state, "task", None)
     task_id = getattr(task, "id", None)
-    if task_id is None:
+    if not isinstance(task_id, str) or not task_id:
         return None
+    return f"main-integration-verify:{task_id}:{MAIN_INTEGRATION_VERIFY_REASON}"
+
+
+def _main_verify_exhausted_attention_key(state: Any) -> str | None:
     message = getattr(state, "alert_message", None) or ""
     if "automatic remediation exhausted after" in message:
         signature = _main_verify_state_failure_signature(state)
         if signature:
             return f"main-verify-remediation-exhausted:{signature}"
-    return f"main-integration-verify:{task_id}:{MAIN_INTEGRATION_VERIFY_REASON}"
+    return None
 
 
-def _emit_main_verify_attention(*, log: "_WatchLog", state: Any, now: datetime) -> None:
+def _main_verify_attention_key(state: Any) -> str | None:
+    return _main_verify_exhausted_attention_key(state) or _main_verify_ordinary_attention_key(state)
+
+
+def _clear_main_verify_counterpart_attention(*, log: "_WatchLog", state: Any, attention_key: str) -> None:
+    ordinary_key = _main_verify_ordinary_attention_key(state)
+    exhausted_key = _main_verify_exhausted_attention_key(state)
+    if ordinary_key is not None and ordinary_key != attention_key:
+        log.clear_attention(ordinary_key)
+    if exhausted_key is not None and exhausted_key != attention_key:
+        log.clear_attention(exhausted_key)
+    if exhausted_key is None:
+        log.clear_attention_prefix("main-verify-remediation-exhausted:")
+
+
+def _emit_main_verify_attention(
+    *,
+    log: "_WatchLog",
+    state: Any,
+    now: datetime,
+    git: Git | None = None,
+    target_branch: str | None = None,
+) -> None:
     task = getattr(state, "task", None)
     task_id = getattr(task, "id", None)
     if task_id is None:
         return
     attention_key = _main_verify_attention_key(state)
     if attention_key is None:
+        return
+    _clear_main_verify_counterpart_attention(log=log, state=state, attention_key=attention_key)
+    if _main_verify_state_is_freshness_unavailable(state):
+        head_status = _main_verify_red_attention_head_status(state, git=git, target_branch=target_branch)
+        if head_status != "current":
+            log.emit_attention(
+                attention_key=attention_key,
+                message=_format_main_verify_freshness_unavailable_unproven_message(state),
+            )
+            return
+    if _main_verify_state_is_red_verdict(state):
+        head_status = _main_verify_red_attention_head_status(state, git=git, target_branch=target_branch)
+        if head_status == "stale":
+            log.clear_attention(attention_key)
+            return
+        if head_status == "unproven":
+            log.emit_attention(
+                attention_key=attention_key,
+                message=_format_main_verify_unproven_current_head_message(state),
+            )
+            return
+    log.emit_attention(
+        attention_key=attention_key,
+        message=_format_main_verify_attention_message(state, now=now),
+    )
+
+
+def _clear_main_verify_attention(*, log: "_WatchLog", state: Any | None) -> None:
+    if state is None:
+        log.clear_attention_prefix("main-verify-remediation-exhausted:")
+        return
+    for attention_key in (
+        _main_verify_ordinary_attention_key(state),
+        _main_verify_exhausted_attention_key(state),
+    ):
+        if attention_key is not None:
+            log.clear_attention(attention_key)
+    log.clear_attention_prefix("main-verify-remediation-exhausted:")
+
+
+def _finalize_main_verify_attention(
+    *,
+    log: "_WatchLog",
+    state: Any | None,
+    now: datetime,
+    git: Git | None,
+    target_branch: str | None = None,
+) -> None:
+    if state is None:
+        return
+    attention_key = _main_verify_attention_key(state)
+    if attention_key is None:
+        return
+    _clear_main_verify_counterpart_attention(log=log, state=state, attention_key=attention_key)
+    if _main_verify_exhausted_attention_key(state) is not None:
+        log.emit_attention(
+            attention_key=attention_key,
+            message=_format_main_verify_attention_message(state, now=now),
+        )
+        return
+    if _main_verify_state_is_freshness_unavailable(state):
+        head_status = _main_verify_red_attention_head_status(state, git=git, target_branch=target_branch)
+        if head_status != "current":
+            log.emit_attention(
+                attention_key=attention_key,
+                message=_format_main_verify_freshness_unavailable_unproven_message(state),
+            )
+            return
+        log.emit_attention(
+            attention_key=attention_key,
+            message=_format_main_verify_attention_message(state, now=now),
+        )
+        return
+    if _main_verify_state_needs_non_red_attention(state):
+        log.emit_attention(
+            attention_key=attention_key,
+            message=_format_main_verify_attention_message(state, now=now),
+        )
+        return
+    if not _main_verify_state_is_red_verdict(state):
+        _clear_main_verify_attention(log=log, state=state)
+        return
+    head_status = _main_verify_red_attention_head_status(state, git=git, target_branch=target_branch)
+    if head_status == "stale":
+        log.clear_attention(attention_key)
+        return
+    if head_status == "unproven":
+        log.emit_attention(
+            attention_key=attention_key,
+            message=_format_main_verify_unproven_current_head_message(state),
+        )
         return
     log.emit_attention(
         attention_key=attention_key,
@@ -3684,6 +3902,18 @@ class _WatchLog:
         if self._sticky_attention_prev_cycle.get(attention_key) == message:
             return
         self.emit("ATTENTION", message)
+
+    def clear_attention(self, attention_key: str) -> None:
+        self._visible_attention_this_cycle.pop(attention_key, None)
+        self._sticky_attention_this_cycle.pop(attention_key, None)
+
+    def clear_attention_prefix(self, attention_key_prefix: str) -> None:
+        for attention_key in tuple(self._visible_attention_this_cycle):
+            if attention_key.startswith(attention_key_prefix):
+                self._visible_attention_this_cycle.pop(attention_key, None)
+        for attention_key in tuple(self._sticky_attention_this_cycle):
+            if attention_key.startswith(attention_key_prefix):
+                self._sticky_attention_this_cycle.pop(attention_key, None)
 
     def visible_attention_messages(self) -> tuple[str, ...]:
         return tuple(self._visible_attention_this_cycle.values())
@@ -6541,6 +6771,8 @@ def _run_cycle(
     merge_halted_for_cycle = False
     active_main_verify_remediation: MainIntegrationVerifyRemediation | None = None
     merge_verify_git: Git | None = None
+    latest_main_verify_state: Any | None = None
+    latest_main_verify_git: Git | None = None
     if isolation_enabled:
         merge_verify_git = merge_git
     elif current_branch == target_branch:
@@ -6573,14 +6805,30 @@ def _run_cycle(
             check=main_verify,
         )
         main_verify_state = refreshed_main_verify_state or getattr(main_verify, "state", None)
+        latest_main_verify_state = main_verify_state
+        latest_main_verify_git = git
         if main_verify.merges_halted and main_verify_state is not None:
             merge_halted_for_cycle = True
-            _emit_main_verify_attention(log=log, state=main_verify_state, now=datetime.now(UTC))
+            _emit_main_verify_attention(
+                log=log,
+                state=main_verify_state,
+                now=datetime.now(UTC),
+                git=git,
+                target_branch=target_branch,
+            )
             remediation = getattr(main_verify, "remediation", None)
             if remediation is not None and remediation.kind == "fix":
                 active_main_verify_remediation = remediation
         elif getattr(main_verify, "needs_attention", False) and main_verify_state is not None:
-            _emit_main_verify_attention(log=log, state=main_verify_state, now=datetime.now(UTC))
+            _emit_main_verify_attention(
+                log=log,
+                state=main_verify_state,
+                now=datetime.now(UTC),
+                git=git,
+                target_branch=target_branch,
+            )
+        else:
+            _clear_main_verify_attention(log=log, state=main_verify_state)
 
     if lifecycle_rows:
         action_plan = list(analysis.action_plan)
@@ -6912,9 +7160,17 @@ def _run_cycle(
                         check=main_verify,
                     )
                     main_verify_state = refreshed_main_verify_state or getattr(main_verify, "state", None)
+                    latest_main_verify_state = main_verify_state
+                    latest_main_verify_git = git
                     if main_verify.merges_halted and main_verify_state is not None:
                         merge_halted_for_cycle = True
-                        _emit_main_verify_attention(log=log, state=main_verify_state, now=datetime.now(UTC))
+                        _emit_main_verify_attention(
+                            log=log,
+                            state=main_verify_state,
+                            now=datetime.now(UTC),
+                            git=git,
+                            target_branch=target_branch,
+                        )
                         remediation = getattr(main_verify, "remediation", None)
                         if remediation is not None and remediation.kind == "fix":
                             active_main_verify_remediation = remediation
@@ -6924,7 +7180,15 @@ def _run_cycle(
                         merge_halted_for_cycle = False
                         active_main_verify_remediation = None
                         if getattr(main_verify, "needs_attention", False) and main_verify_state is not None:
-                            _emit_main_verify_attention(log=log, state=main_verify_state, now=datetime.now(UTC))
+                            _emit_main_verify_attention(
+                                log=log,
+                                state=main_verify_state,
+                                now=datetime.now(UTC),
+                                git=git,
+                                target_branch=target_branch,
+                            )
+                        else:
+                            _clear_main_verify_attention(log=log, state=main_verify_state)
                 for followup_task in merge_result.created_followups:
                     log.emit(
                         "FOLLOW",
@@ -8650,6 +8914,13 @@ def _run_cycle(
         else 0
     )
     _check_canonical_checkout_boundary("watch-pass-end")
+    _finalize_main_verify_attention(
+        log=log,
+        state=latest_main_verify_state,
+        now=datetime.now(UTC),
+        git=latest_main_verify_git,
+        target_branch=target_branch,
+    )
     _emit_cycle_attention_summary(log)
     if end_cycle:
         log.end_cycle()

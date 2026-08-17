@@ -511,12 +511,12 @@ def _build_red_alert_message(
     verify_status: str | None,
     failing_phase: str | None,
 ) -> str:
-    short_sha = (head_sha or "unknown")[:12]
+    del head_sha
     if failing_phase:
-        return f"main verify RED at `{short_sha}` - merges halted; phase `{failing_phase}` failing"
+        return f"main verify RED - merges halted; phase `{failing_phase}` failing"
     if verify_status and verify_status != "failed":
-        return f"main verify RED at `{short_sha}` - merges halted; verify status `{verify_status}`"
-    return f"main verify RED at `{short_sha}` - merges halted"
+        return f"main verify RED - merges halted; verify status `{verify_status}`"
+    return "main verify RED - merges halted"
 
 
 def _normalize_verify_tool_name(raw: str | None) -> str | None:
@@ -631,19 +631,19 @@ def _build_launch_issue_failure(issue: VerifyLaunchIssue) -> str:
 
 
 def _build_launch_issue_alert_message(*, head_sha: str | None, issue: VerifyLaunchIssue) -> str:
-    short_sha = (head_sha or "unknown")[:12]
+    del head_sha
     if issue.tool_name and issue.phase_name:
         return (
-            f"main verify misconfigured at `{short_sha}` - could not launch `{issue.tool_name}` "
+            f"main verify misconfigured - could not launch `{issue.tool_name}` "
             f"for phase `{issue.phase_name}` ({issue.detail}); fix the environment, not the code"
         )
     if issue.tool_name:
         return (
-            f"main verify misconfigured at `{short_sha}` - could not launch `{issue.tool_name}` "
+            f"main verify misconfigured - could not launch `{issue.tool_name}` "
             f"({issue.detail}); fix the environment, not the code"
         )
     return (
-        f"main verify misconfigured at `{short_sha}` - could not launch verify tooling "
+        f"main verify misconfigured - could not launch verify tooling "
         f"({issue.detail}); fix the environment, not the code"
     )
 
@@ -653,8 +653,8 @@ def _build_freshness_unavailable_failure() -> str:
 
 
 def _build_freshness_unavailable_alert_message(*, head_sha: str | None) -> str:
-    short_sha = (head_sha or "unknown")[:12]
-    return f"main verify freshness unproven at `{short_sha}` - merges halted; exact tree fingerprint unavailable"
+    del head_sha
+    return "main verify freshness unproven; exact tree fingerprint unavailable"
 
 
 def _verify_result_halts_merges(

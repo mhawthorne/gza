@@ -1480,6 +1480,7 @@ def test_check_main_integration_verify_classifies_tool_launch_failure_as_attenti
     assert check.state.alert_message is not None
     assert "could not launch `ruff`" in check.state.alert_message
     assert "fix the environment, not the code" in check.state.alert_message
+    assert "abc123" not in check.state.alert_message
 
     alert_git = MagicMock()
     alert_git.default_branch.return_value = "main"
@@ -1496,7 +1497,7 @@ def test_check_main_integration_verify_green_does_not_resolve_launch_failure_sig
         verify_status="unavailable",
         verify_exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
         failure="verify tool launch failed",
-        alert_message="main verify misconfigured at `abc123` - could not launch `ruff` (missing); fix the environment, not the code",
+        alert_message="main verify misconfigured - could not launch `ruff` (missing); fix the environment, not the code",
         failing_phase="ruff",
     )
 
@@ -1614,6 +1615,7 @@ def test_check_main_integration_verify_extracts_tool_name_from_top_level_launch_
     assert check.state.alert_message is not None
     assert "could not launch `ruff`" in check.state.alert_message
     assert "fix the environment, not the code" in check.state.alert_message
+    assert "abc123" not in check.state.alert_message
 
 
 def test_check_main_integration_verify_classifies_shell_not_found_phase_failure_as_attention(
@@ -1681,6 +1683,7 @@ def test_check_main_integration_verify_classifies_shell_not_found_phase_failure_
     assert check.state.alert_message is not None
     assert "could not launch `ruff`" in check.state.alert_message
     assert "fix the environment, not the code" in check.state.alert_message
+    assert "abc123" not in check.state.alert_message
 
 
 def test_check_main_integration_verify_reruns_and_halts_when_current_fingerprint_is_unavailable(tmp_path) -> None:
@@ -1745,9 +1748,8 @@ def test_check_main_integration_verify_reruns_and_halts_when_current_fingerprint
     assert check.state.failure == (
         "could not prove exact local target tree freshness because the tree fingerprint is unavailable"
     )
-    assert check.state.alert_message == (
-        "main verify freshness unproven at `abc123` - merges halted; exact tree fingerprint unavailable"
-    )
+    assert check.state.alert_message == "main verify freshness unproven; exact tree fingerprint unavailable"
+    assert "abc123" not in check.state.alert_message
 
 
 def test_current_main_integration_verify_alert_surfaces_unproven_freshness_when_default_branch_probe_fails(
@@ -1780,9 +1782,8 @@ def test_current_main_integration_verify_alert_surfaces_unproven_freshness_when_
     assert alert is not None
     assert alert.verify_status == "unavailable"
     assert alert.verify_exit_status == MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
-    assert alert.alert_message == (
-        "main verify freshness unproven at `abc123` - merges halted; exact tree fingerprint unavailable"
-    )
+    assert alert.alert_message == "main verify freshness unproven; exact tree fingerprint unavailable"
+    assert "abc123" not in alert.alert_message
 
 
 def test_current_main_integration_verify_alert_omits_red_checkpoint_missing_environment_identity(tmp_path) -> None:
