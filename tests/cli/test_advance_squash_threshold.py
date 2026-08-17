@@ -165,7 +165,7 @@ def test_advance_squash_threshold_cli_override(tmp_path: Path, capsys) -> None:
 
 def test_advance_dry_run_shows_squash_annotation(tmp_path: Path, capsys) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: codex\n"
         "model: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
@@ -194,7 +194,7 @@ def test_default_merge_squash_threshold_is_zero(tmp_path: Path) -> None:
 
 def test_yaml_merge_squash_threshold_parsed(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: codex\n"
         "model: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
@@ -206,7 +206,7 @@ def test_yaml_merge_squash_threshold_parsed(tmp_path: Path) -> None:
 
 def test_invalid_type_raises_config_error(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: codex\n"
         "model: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
@@ -218,7 +218,7 @@ def test_invalid_type_raises_config_error(tmp_path: Path) -> None:
 
 def test_negative_value_raises_config_error(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: codex\n"
         "model: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
@@ -230,7 +230,7 @@ def test_negative_value_raises_config_error(tmp_path: Path) -> None:
 
 def test_validate_rejects_negative_max_resume_attempts(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: codex\n"
         "model: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
@@ -243,7 +243,7 @@ def test_validate_rejects_negative_max_resume_attempts(tmp_path: Path) -> None:
 
 def test_validate_rejects_non_integer_max_resume_attempts(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: codex\n"
         "model: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
@@ -256,7 +256,7 @@ def test_validate_rejects_non_integer_max_resume_attempts(tmp_path: Path) -> Non
 
 def test_validate_rejects_non_positive_max_review_cycles(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: codex\n"
         "model: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
@@ -269,7 +269,7 @@ def test_validate_rejects_non_positive_max_review_cycles(tmp_path: Path) -> None
 
 def test_load_rejects_non_integer_max_resume_attempts(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: codex\n"
         "model: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
@@ -281,7 +281,7 @@ def test_load_rejects_non_integer_max_resume_attempts(tmp_path: Path) -> None:
 
 def test_load_rejects_negative_max_resume_attempts(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: codex\n"
         "model: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
@@ -293,7 +293,7 @@ def test_load_rejects_negative_max_resume_attempts(tmp_path: Path) -> None:
 
 def test_load_rejects_non_integer_max_review_cycles(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: codex\n"
         "model: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
@@ -305,7 +305,7 @@ def test_load_rejects_non_integer_max_review_cycles(tmp_path: Path) -> None:
 
 def test_load_rejects_non_positive_max_review_cycles(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: codex\n"
         "model: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
@@ -331,7 +331,7 @@ def test_load_and_validate_reject_bool_and_quoted_numeric_values(
     expected_error: str,
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
-        f"project_name: test-project\n"
+        f"project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         f"provider: codex\n"
         f"model: gpt-5.5\n"
         f"db_path: .gza/gza.db\n"

@@ -461,7 +461,7 @@ class TestProjectPrefixValidation:
     def test_project_prefix_valid_accepted(self, tmp_path: Path):
         """Valid project_prefix is accepted without error."""
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: myproject\nproject_prefix: myproj\n")
+        config_path.write_text("project_name: myproject\nprovider: codex\nmodel: gpt-5.5\nproject_prefix: myproj\n")
         result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 0
 
@@ -470,14 +470,14 @@ class TestProjectPrefixValidation:
         from gza.config import Config
 
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: myproject\n")
+        config_path.write_text("project_name: myproject\nprovider: codex\nmodel: gpt-5.5\n")
         config = Config.load(tmp_path)
         assert config.project_prefix == "myproject"
 
     def test_project_prefix_too_long_rejected(self, tmp_path: Path):
         """project_prefix longer than 12 characters raises a config error."""
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: myproject\nproject_prefix: toolongprefix\n")
+        config_path.write_text("project_name: myproject\nprovider: codex\nmodel: gpt-5.5\nproject_prefix: toolongprefix\n")
         result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "project_prefix" in result.stdout
@@ -485,7 +485,7 @@ class TestProjectPrefixValidation:
     def test_project_prefix_invalid_chars_rejected(self, tmp_path: Path):
         """project_prefix with uppercase letters raises a config error."""
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: myproject\nproject_prefix: MyProj\n")
+        config_path.write_text("project_name: myproject\nprovider: codex\nmodel: gpt-5.5\nproject_prefix: MyProj\n")
         result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "project_prefix" in result.stdout
@@ -493,7 +493,7 @@ class TestProjectPrefixValidation:
     def test_project_prefix_hyphen_start_rejected(self, tmp_path: Path):
         """project_prefix starting with a hyphen raises a config error."""
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: myproject\nproject_prefix: -myproj\n")
+        config_path.write_text("project_name: myproject\nprovider: codex\nmodel: gpt-5.5\nproject_prefix: -myproj\n")
         result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "project_prefix" in result.stdout
@@ -501,7 +501,7 @@ class TestProjectPrefixValidation:
     def test_project_prefix_non_string_rejected(self, tmp_path: Path):
         """project_prefix that is not a string raises a config error."""
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: myproject\nproject_prefix: 123\n")
+        config_path.write_text("project_name: myproject\nprovider: codex\nmodel: gpt-5.5\nproject_prefix: 123\n")
         result = invoke_gza("validate", "--project", str(tmp_path))
         # YAML parses 123 as an integer, triggering type validation
         assert result.returncode == 1
@@ -510,7 +510,7 @@ class TestProjectPrefixValidation:
     def test_project_prefix_trailing_hyphen_rejected(self, tmp_path: Path):
         """project_prefix with a trailing hyphen is rejected (M3)."""
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: myproject\nproject_prefix: myproj-\n")
+        config_path.write_text("project_name: myproject\nprovider: codex\nmodel: gpt-5.5\nproject_prefix: myproj-\n")
         result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "project_prefix" in result.stdout
@@ -520,7 +520,7 @@ class TestProjectPrefixValidation:
         from gza.config import Config
 
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: MyLargeProjectName\n")
+        config_path.write_text("project_name: MyLargeProjectName\nprovider: codex\nmodel: gpt-5.5\n")
         config = Config.load(tmp_path)
         # Sanitized prefix must be lowercase, alphanumeric+hyphens, no leading/trailing hyphens,
         # max 12 chars, and non-empty
@@ -768,7 +768,7 @@ class TestLocalConfigOverrides:
         from gza.config import Config, ConfigError
 
         (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
-        (tmp_path / "gza.local.yaml").write_text("project_name: hacked\n")
+        (tmp_path / "gza.local.yaml").write_text("project_name: hacked\nprovider: codex\nmodel: gpt-5.5\n")
 
         with pytest.raises(ConfigError, match="Invalid local override key 'project_name'"):
             Config.load(tmp_path)
@@ -776,7 +776,7 @@ class TestLocalConfigOverrides:
     def test_validate_fails_for_invalid_local_override_key(self, tmp_path: Path):
         """gza validate should fail when local override contains disallowed keys."""
         (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
-        (tmp_path / "gza.local.yaml").write_text("project_name: hacked\n")
+        (tmp_path / "gza.local.yaml").write_text("project_name: hacked\nprovider: codex\nmodel: gpt-5.5\n")
 
         result = invoke_gza("validate", "--project", str(tmp_path))
 
@@ -1450,7 +1450,7 @@ class TestLocalConfigOverrides:
     @pytest.mark.parametrize(
         "key,content",
         [
-            ("project_name", "project_name: nope\n"),
+            ("project_name", "project_name: nope\nprovider: codex\nmodel: gpt-5.5\n"),
             ("project_id", "project_id: nope\n"),
             ("project_prefix", "project_prefix: nope\n"),
             ("tasks_file", "tasks_file: nope\n"),
@@ -2399,14 +2399,14 @@ class TestCleanCommand:
 
         # Create config with custom cleanup_days
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test-project\ncleanup_days: 7\n")
+        config_path.write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ncleanup_days: 7\n")
 
         config = Config.load(tmp_path)
         assert config.cleanup_days == 7
 
     def test_clean_archive_uses_config_cleanup_days(self, tmp_path: Path) -> None:
         setup_config(tmp_path)
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\ncleanup_days: 7\n", encoding="utf-8")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ncleanup_days: 7\n", encoding="utf-8")
 
         logs_dir = tmp_path / ".gza" / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)

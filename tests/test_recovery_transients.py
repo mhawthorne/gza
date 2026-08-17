@@ -30,7 +30,7 @@ def _task(**overrides: object) -> SimpleNamespace:
 
 
 def test_compute_transient_recovery_backoff_seconds_follows_bounded_schedule(tmp_path: Path) -> None:
-    (tmp_path / "gza.yaml").write_text("project_name: demo\n", encoding="utf-8")
+    (tmp_path / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n", encoding="utf-8")
     config = Config.load(tmp_path)
 
     assert compute_transient_recovery_backoff_seconds(config, 0) == 0
@@ -45,7 +45,7 @@ def test_compute_transient_recovery_backoff_seconds_follows_bounded_schedule(tmp
 
 def test_compute_transient_recovery_backoff_seconds_scales_from_initial_and_caps_at_max(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "watch:\n"
         "  failure_backoff_initial: 30\n"
         "  transient_recovery_backoff_max: 500\n",

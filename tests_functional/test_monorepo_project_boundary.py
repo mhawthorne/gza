@@ -65,7 +65,7 @@ def _setup_monorepo(tmp_path: Path, *, enforce_project_scope: bool = True) -> tu
         'source = { directory = "../../libs/shared" }\n'
     )
     (project_dir / "gza.yaml").write_text(
-        "project_name: foo\n"
+        "project_name: foo\nprovider: codex\nmodel: gpt-5.5\n"
         "project_prefix: foo\n"
         "provider: codex\n"
         "use_docker: false\n"
@@ -73,7 +73,7 @@ def _setup_monorepo(tmp_path: Path, *, enforce_project_scope: bool = True) -> tu
         "worktree_dir: .gza-test-worktrees\n"
         "db_path: .gza/gza.db\n"
     )
-    (sibling_dir / "gza.yaml").write_text("project_name: bar\nproject_prefix: bar\n")
+    (sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nproject_prefix: bar\n")
 
     git = Git(repo_root)
     git._run("add", ".")

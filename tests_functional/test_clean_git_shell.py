@@ -103,7 +103,7 @@ def test_clean_lineage_aware_preserves_recent(tmp_path) -> None:
     git = _init_git_repo(tmp_path)
     wt_base = tmp_path / "worktrees"
     (tmp_path / "gza.yaml").write_text(
-        f"project_name: test-project\n"
+        f"project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "project_id: default\n"
         "db_path: .gza/gza.db\n"
         f"worktree_dir: {wt_base}\n"
@@ -131,7 +131,7 @@ def test_clean_lineage_aware_removes_old(tmp_path) -> None:
     git = _init_git_repo(tmp_path)
     wt_base = tmp_path / "worktrees"
     (tmp_path / "gza.yaml").write_text(
-        f"project_name: test-project\n"
+        f"project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "project_id: default\n"
         "db_path: .gza/gza.db\n"
         f"worktree_dir: {wt_base}\n"
@@ -159,7 +159,7 @@ def test_clean_lineage_aware_removes_old(tmp_path) -> None:
 def test_clean_force_skips_prompt(tmp_path) -> None:
     _init_git_repo(tmp_path)
     wt_base = tmp_path / "worktrees"
-    (tmp_path / "gza.yaml").write_text(f"project_name: test-project\nworktree_dir: {wt_base}\n")
+    (tmp_path / "gza.yaml").write_text(f"project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nworktree_dir: {wt_base}\n")
     config = Config.load(tmp_path)
 
     orphan = config.worktree_path / "orphaned-dir"
@@ -176,7 +176,7 @@ def test_clean_force_skips_prompt(tmp_path) -> None:
 def test_clean_no_force_denies_removal(tmp_path) -> None:
     _init_git_repo(tmp_path)
     wt_base = tmp_path / "worktrees"
-    (tmp_path / "gza.yaml").write_text(f"project_name: test-project\nworktree_dir: {wt_base}\n")
+    (tmp_path / "gza.yaml").write_text(f"project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nworktree_dir: {wt_base}\n")
     config = Config.load(tmp_path)
 
     orphan = config.worktree_path / "orphaned-dir"

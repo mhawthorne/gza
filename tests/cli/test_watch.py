@@ -19840,7 +19840,7 @@ def test_watch_cycle_isolated_main_verify_summary_uses_real_target_ref(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: codex\n"
         "model: gpt-5.5\n"
         "db_path: .gza/gza.db\n"

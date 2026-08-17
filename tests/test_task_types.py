@@ -16,7 +16,7 @@ from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
 
 def _write_config(project_dir: Path) -> None:
     (project_dir / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "verify_command: './bin/tests'\n"
         "autonomous_verify_timeout_seconds: 300\n"
         "review_verify_timeout_grace_seconds: 5.0\n",

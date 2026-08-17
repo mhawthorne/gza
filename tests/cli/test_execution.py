@@ -5851,8 +5851,7 @@ class TestReconciliation:
 
         setup_config(tmp_path)
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
-            "provider: codex\n"
+            "project_name: test-project\nprovider: codex\n"
             "model: gpt-5.5\n"
             "watch:\n"
             "  no_activity_timeout: 120\n"
@@ -24803,7 +24802,7 @@ class TestMaxTurnsFlag:
         import argparse
 
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\nmax_steps: 50\n")
+        config_path.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nmax_steps: 50\n")
 
         config = Config.load(tmp_path)
         assert config.max_turns == 50

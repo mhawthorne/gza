@@ -631,7 +631,7 @@ class TestSpawnBackgroundWorkerTmux:
     def _make_config(self, tmp_path: Path, tmux_enabled: bool = True):
         from gza.config import Config
 
-        config_content = f"project_name: test\ntmux:\n  enabled: {'true' if tmux_enabled else 'false'}\n"
+        config_content = f"project_name: test\nprovider: codex\nmodel: gpt-5.5\ntmux:\n  enabled: {'true' if tmux_enabled else 'false'}\n"
         (tmp_path / "gza.yaml").write_text(config_content)
         (tmp_path / ".gza").mkdir(parents=True, exist_ok=True)
         return Config.load(tmp_path)
@@ -807,7 +807,7 @@ class TestClaudeProviderTmuxMode:
     def _make_config(self, tmp_path: Path, tmux_session: str | None = None):
         from gza.config import Config
 
-        config_content = "project_name: test\n"
+        config_content = "project_name: test\nprovider: claude\nmodel: claude-sonnet-4-5\n"
         (tmp_path / "gza.yaml").write_text(config_content)
         (tmp_path / ".gza").mkdir(parents=True, exist_ok=True)
         config = Config.load(tmp_path)
@@ -1006,7 +1006,9 @@ class TestClaudeProviderTmuxMode:
     def test_spawn_background_worker_disables_tmux_proxy_for_claude(self, tmp_path: Path):
         """Claude workers should default to pipe-mode background execution (no tmux proxy)."""
 
-        config_content = "project_name: test\ntmux:\n  enabled: true\n"
+        config_content = (
+            "project_name: test\nprovider: claude\nmodel: claude-sonnet-4-5\ntmux:\n  enabled: true\n"
+        )
         (tmp_path / "gza.yaml").write_text(config_content)
         (tmp_path / ".gza").mkdir(parents=True, exist_ok=True)
         from gza.config import Config
@@ -1044,7 +1046,7 @@ class TestClaudeProviderTmuxMode:
         """_run_as_worker propagates args.tmux_session to config.tmux.session_name (M3)."""
         from gza.config import Config
 
-        config_content = "project_name: test\n"
+        config_content = "project_name: test\nprovider: claude\nmodel: claude-sonnet-4-5\n"
         (tmp_path / "gza.yaml").write_text(config_content)
         (tmp_path / ".gza").mkdir(parents=True, exist_ok=True)
         config = Config.load(tmp_path)

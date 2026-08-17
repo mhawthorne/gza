@@ -664,7 +664,7 @@ class TestNoModuleLevelConfigRead:
 
         # Write a gza.yaml with theme: blue in tmp_path
         gza_yaml = tmp_path / "gza.yaml"
-        gza_yaml.write_text("project_name: test\ntheme: blue\n")
+        gza_yaml.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\ntheme: blue\n")
 
         orig_dir = os.getcwd()
         try:
@@ -698,7 +698,7 @@ class TestConfigThemeIntegration:
         from gza.config import Config
 
         cfg_file = tmp_path / "gza.yaml"
-        cfg_file.write_text("project_name: test\n")
+        cfg_file.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
         Config.load(tmp_path)
         # minimal theme sets task_id to blue_bright via base
         from gza.colors import blue_bright
@@ -710,7 +710,7 @@ class TestConfigThemeIntegration:
         from gza.config import Config
 
         cfg_file = tmp_path / "gza.yaml"
-        cfg_file.write_text("project_name: test\ntheme: blue\n")
+        cfg_file.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\ntheme: blue\n")
         Config.load(tmp_path)
         assert c.TASK_COLORS.task_id == blue_bright
 
@@ -718,7 +718,7 @@ class TestConfigThemeIntegration:
         from gza.config import Config, ConfigError
 
         cfg_file = tmp_path / "gza.yaml"
-        cfg_file.write_text("project_name: test\ntheme: not_a_real_theme\n")
+        cfg_file.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\ntheme: not_a_real_theme\n")
         with pytest.raises(ConfigError, match="theme"):
             Config.load(tmp_path)
 
@@ -727,7 +727,7 @@ class TestConfigThemeIntegration:
         from gza.config import Config
 
         cfg_file = tmp_path / "gza.yaml"
-        cfg_file.write_text("project_name: test\ncolors:\n  task_id: '#ff0000'\n  prompt: '#00ff00'\n")
+        cfg_file.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\ncolors:\n  task_id: '#ff0000'\n  prompt: '#00ff00'\n")
         Config.load(tmp_path)
         assert c.TASK_COLORS.task_id == "#ff0000"
         assert c.TASK_COLORS.prompt == "#00ff00"
@@ -736,7 +736,7 @@ class TestConfigThemeIntegration:
         from gza.config import Config
 
         cfg_file = tmp_path / "gza.yaml"
-        cfg_file.write_text("project_name: test\ntheme: blue\n")
+        cfg_file.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\ntheme: blue\n")
         cfg = Config.load(tmp_path)
         assert cfg.theme == "blue"
 
@@ -744,7 +744,7 @@ class TestConfigThemeIntegration:
         from gza.config import Config
 
         cfg_file = tmp_path / "gza.yaml"
-        cfg_file.write_text("project_name: test\ncolors:\n  task_id: '#aabbcc'\n")
+        cfg_file.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\ncolors:\n  task_id: '#aabbcc'\n")
         cfg = Config.load(tmp_path)
         assert cfg.colors == {"task_id": "#aabbcc"}
 
@@ -756,7 +756,7 @@ class TestConfigThemeIntegration:
         cfg_file = tmp_path / "gza.yaml"
         # blue theme sets task_id to blue_bright; the colors override wins
         cfg_file.write_text(
-            "project_name: test\ntheme: blue\ncolors:\n  task_id: '#deadbe'\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\ntheme: blue\ncolors:\n  task_id: '#deadbe'\n"
         )
         Config.load(tmp_path)
         assert c.TASK_COLORS.task_id == "#deadbe"
@@ -765,7 +765,7 @@ class TestConfigThemeIntegration:
         from gza.config import Config
 
         cfg_file = tmp_path / "gza.yaml"
-        cfg_file.write_text("project_name: test\nno_color: true\n")
+        cfg_file.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nno_color: true\n")
         cfg = Config.load(tmp_path)
         assert cfg.no_color is True
 
@@ -773,6 +773,6 @@ class TestConfigThemeIntegration:
         from gza.config import Config, ConfigError
 
         cfg_file = tmp_path / "gza.yaml"
-        cfg_file.write_text("project_name: test\nno_color: nope\n")
+        cfg_file.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nno_color: nope\n")
         with pytest.raises(ConfigError, match="no_color"):
             Config.load(tmp_path)

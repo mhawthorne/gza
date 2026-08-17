@@ -313,7 +313,7 @@ def test_generate_pr_content_refuses_at_capacity_without_creating_internal_task(
 ):
     """Capacity refusal must fall back before persisting an internal PR task row."""
     config_path = tmp_path / "gza.yaml"
-    config_path.write_text("project_name: test\nproject_prefix: test\nmax_concurrent: 1\n")
+    config_path.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nproject_prefix: test\nmax_concurrent: 1\n")
     config = Config.load(tmp_path)
     store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
 
@@ -350,7 +350,7 @@ def test_generate_pr_content_refuses_at_capacity_without_creating_internal_task(
 def test_generate_pr_content_allows_same_pid_reentry_at_max_concurrent_one(tmp_path):
     """Nested PR generation should reuse the current worker slot instead of falling back."""
     config_path = tmp_path / "gza.yaml"
-    config_path.write_text("project_name: test\nproject_prefix: test\nmax_concurrent: 1\n")
+    config_path.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nproject_prefix: test\nmax_concurrent: 1\n")
     config = Config.load(tmp_path)
     store = SqliteTaskStore(tmp_path / ".gza" / "gza.db")
 

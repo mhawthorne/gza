@@ -15,7 +15,7 @@ from gza.recovery_engine import decide_failed_task_recovery
 
 def _setup_task_with_log(project_dir: Path, *, task_type: str = "implement") -> tuple[str, Path]:
     (project_dir / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: codex\n"
         "model: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
@@ -637,7 +637,7 @@ def test_attach_wrapper_calls_load_dotenv_before_interactive_claude(tmp_path: Pa
 
 def _setup_docker_task(project_dir: Path) -> tuple[str, Path]:
     (project_dir / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "provider: claude\n"
         "model: claude-sonnet-4-5\n"
         "db_path: .gza/gza.db\n"

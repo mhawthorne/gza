@@ -194,7 +194,7 @@ def test_v24_to_v27_chains_via_gza_migrate(tmp_path: Path) -> None:
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     (tmp_path / "gza.yaml").write_text(
-        "project_name: gza\n"
+        "project_name: gza\nprovider: codex\nmodel: gpt-5.5\n"
         f"db_path: {db_path}\n",
         encoding="utf-8",
     )

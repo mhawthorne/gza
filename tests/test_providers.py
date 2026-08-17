@@ -5667,7 +5667,7 @@ class TestClaudeConfigIntegration:
         """Config.load should parse claude section."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "claude:\n"
             "  fetch_auth_token_from_keychain: true\n"
             "  args:\n"
@@ -5681,7 +5681,7 @@ class TestClaudeConfigIntegration:
         """Top-level claude_args should still work with deprecation warning."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "claude_args:\n"
             "  - --verbose\n"
         )
@@ -5696,7 +5696,7 @@ class TestClaudeConfigIntegration:
         """claude.args should take precedence over top-level claude_args."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "claude_args:\n"
             "  - --old\n"
             "claude:\n"
@@ -5714,7 +5714,7 @@ class TestClaudeConfigIntegration:
         """Validate should accept valid claude section."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "claude:\n"
             "  fetch_auth_token_from_keychain: true\n"
             "  args:\n"
@@ -5728,7 +5728,7 @@ class TestClaudeConfigIntegration:
         """Validate should reject non-dict claude section."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "claude: not-a-dict\n"
         )
         is_valid, errors, warnings = Config.validate(tmp_path)
@@ -5739,7 +5739,7 @@ class TestClaudeConfigIntegration:
         """Validate should warn about deprecated claude_args."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "claude_args:\n"
             "  - --verbose\n"
         )
@@ -5751,8 +5751,7 @@ class TestClaudeConfigIntegration:
         """Validate should reject obvious cross-provider model mismatches."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: codex\n"
+            "project_name: test\nprovider: codex\n"
             "model: claude-3-5-haiku-latest\n"
         )
         is_valid, errors, _warnings = Config.validate(tmp_path)
@@ -5763,8 +5762,7 @@ class TestClaudeConfigIntegration:
         """Validate should reject incompatible task_types.<type>.model overrides."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: codex\n"
+            "project_name: test\nprovider: codex\n"
             "task_types:\n"
             "  review:\n"
             "    model: claude-3-5-haiku-latest\n"
@@ -5777,8 +5775,7 @@ class TestClaudeConfigIntegration:
         """Load should fail fast on incompatible provider/task-type model config."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: codex\n"
+            "project_name: test\nprovider: codex\n"
             "task_types:\n"
             "  review:\n"
             "    model: claude-3-5-haiku-latest\n"
@@ -5795,8 +5792,7 @@ class TestProviderScopedConfig:
         """Config.load should parse providers section into provider-scoped config."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: claude\n"
+            "project_name: test\nprovider: claude\n"
             "providers:\n"
             "  claude:\n"
             "    model: claude-sonnet-4-5\n"
@@ -5825,8 +5821,7 @@ class TestProviderScopedConfig:
         """Config.load should parse task_providers routing map."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: codex\n"
+            "project_name: test\nprovider: codex\n"
             "model: gpt-5.5\n"
             "task_providers:\n"
             "  review: claude\n"
@@ -5842,7 +5837,7 @@ class TestProviderScopedConfig:
         """Validate should reject non-dict and unknown provider names in task_providers."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "task_providers:\n"
             "  review: unknown\n"
         )
@@ -5855,8 +5850,7 @@ class TestProviderScopedConfig:
         """task_types.<type>.model compatibility should validate against routed provider."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: codex\n"
+            "project_name: test\nprovider: codex\n"
             "model: gpt-5.5\n"
             "task_providers:\n"
             "  review: claude\n"
@@ -5873,8 +5867,7 @@ class TestProviderScopedConfig:
         """Validate should accept well-formed providers schema."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: codex\n"
+            "project_name: test\nprovider: codex\n"
             "providers:\n"
             "  codex:\n"
             "    model: o4-mini\n"
@@ -5893,7 +5886,7 @@ class TestProviderScopedConfig:
         """Validate should reject unknown providers and invalid providers schema types."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "providers:\n"
             "  unknown:\n"
             "    model: x\n"
@@ -5908,7 +5901,7 @@ class TestProviderScopedConfig:
         """Validate should reject non-string scoped fields and non-positive max_turns in providers.task_types."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "providers:\n"
             "  claude:\n"
             "    reasoning_effort: 123\n"
@@ -5929,8 +5922,7 @@ class TestProviderScopedConfig:
         """Validate should reject providers.<provider>.model mismatched with provider family."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: codex\n"
+            "project_name: test\nprovider: codex\n"
             "providers:\n"
             "  codex:\n"
             "    model: claude-3-5-haiku-latest\n"
@@ -5944,8 +5936,7 @@ class TestProviderScopedConfig:
         """Load should reject providers.<provider>.task_types.<type>.model mismatches."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: codex\n"
+            "project_name: test\nprovider: codex\n"
             "providers:\n"
             "  codex:\n"
             "    task_types:\n"
@@ -5960,8 +5951,7 @@ class TestProviderScopedConfig:
         """Validate should warn when scoped and legacy fields overlap on the same semantic target."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: claude\n"
+            "project_name: test\nprovider: claude\n"
             "model: legacy-model\n"
             "task_types:\n"
             "  review:\n"
@@ -5986,8 +5976,7 @@ class TestProviderScopedConfig:
         """Provider-scoped getters should prefer scoped values then legacy fallbacks."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: claude\n"
+            "project_name: test\nprovider: claude\n"
             "max_steps: 60\n"
             "max_turns: 50\n"
             "model: legacy-model\n"
@@ -6029,8 +6018,7 @@ class TestProviderScopedConfig:
         """Timeout getter should prefer provider/task-type override, then task-type, then global."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: codex\n"
+            "project_name: test\nprovider: codex\n"
             "model: gpt-5.5\n"
             "timeout_minutes: 10\n"
             "task_types:\n"
@@ -6060,8 +6048,7 @@ class TestProviderScopedConfig:
         """Config.load should fail closed for invalid task_types.<type>.timeout_minutes."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: codex\n"
+            "project_name: test\nprovider: codex\n"
             "model: gpt-5.5\n"
             "timeout_minutes: 10\n"
             "task_types:\n"
@@ -6076,7 +6063,7 @@ class TestProviderScopedConfig:
         """Validate should reject non-string reasoning_effort values across config scopes."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "reasoning_effort: 1\n"
             "defaults:\n"
             "  reasoning_effort: 2\n"
@@ -6094,8 +6081,7 @@ class TestProviderScopedConfig:
         """Legacy max_turns should still resolve max steps and emit a deprecation warning."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: codex\n"
+            "project_name: test\nprovider: codex\n"
             "model: gpt-5.5\n"
             "max_turns: 77\n"
         )
@@ -6109,8 +6095,7 @@ class TestProviderScopedConfig:
         """task_types.<type>.max_steps should win over task_types.<type>.max_turns and global values."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
-            "provider: codex\n"
+            "project_name: test\nprovider: codex\n"
             "model: gpt-5.5\n"
             "max_steps: 50\n"
             "max_turns: 40\n"

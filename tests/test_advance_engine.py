@@ -246,7 +246,7 @@ class _FakeGit:
 
 
 def _make_store(tmp_path: Path) -> SqliteTaskStore:
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nprovider: codex\nmodel: gpt-5.5\n")
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n")
     config = Config.load(tmp_path)
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7326,7 +7326,7 @@ def test_default_cross_project_allows_out_of_scope_change_to_advance(tmp_path: P
     config.default_cross_project = True
     sibling_project_dir = tmp_path / "dre" / "web"
     sibling_project_dir.mkdir(parents=True, exist_ok=True)
-    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nverify_command: ./bin/web-verify\n")
+    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/web-verify\n")
 
     impl = _make_completed_unmerged_impl(
         store,

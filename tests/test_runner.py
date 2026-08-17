@@ -2091,11 +2091,11 @@ class TestReviewContextFromChain:
         worktree_project_dir = worktree_path / "server"
         project_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
-        (repo_root / "gza.yaml").write_text("project_name: gza\nverify_command: ./bin/root-verify\n")
-        (project_dir / "gza.yaml").write_text("project_name: server\nverify_command: ./bin/server-verify\n")
-        (worktree_path / "gza.yaml").write_text("project_name: gza\nverify_command: ./bin/root-verify\n")
+        (repo_root / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n")
+        (project_dir / "gza.yaml").write_text("project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n")
+        (worktree_path / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n")
         (worktree_project_dir / "gza.yaml").write_text(
-            "project_name: server\nverify_command: ./bin/server-verify\n"
+            "project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n"
         )
 
         config = Config(
@@ -2158,10 +2158,10 @@ class TestReviewContextFromChain:
         worktree_project_dir = worktree_path / "server"
         project_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
-        (repo_root / "gza.yaml").write_text("project_name: gza\n")
-        (project_dir / "gza.yaml").write_text("project_name: server\nverify_command: ./bin/server-verify\n")
-        (worktree_path / "gza.yaml").write_text("project_name: gza\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: server\nverify_command: ./bin/server-verify\n")
+        (repo_root / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\n")
+        (project_dir / "gza.yaml").write_text("project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n")
+        (worktree_path / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n")
 
         config = Config(
             project_dir=project_dir,
@@ -6768,7 +6768,7 @@ class TestFailureReasonGroundTruth:
     def test_run_uses_loaded_legacy_task_type_timeout_for_provider_handoff(self, tmp_path: Path):
         """A valid task_types.<type>.timeout_minutes should reach provider.run unchanged."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "provider: claude\n"
             "model: claude-sonnet-4-5\n"
             "timeout_minutes: 10\n"
@@ -19376,7 +19376,7 @@ class TestExtractedRunInnerHelpers:
         (tmp_path / "gza.yaml").write_text(
             "provider: codex\n"
             "model: gpt-5\n"
-            "project_name: runner-rebase-progress\n"
+            "project_name: runner-rebase-progress\nprovider: codex\nmodel: gpt-5.5\n"
             "use_docker: false\n"
         )
         config = Config.load(tmp_path)
@@ -24793,14 +24793,14 @@ def test_publication_recovery_cross_project_diff_scope_comes_from_worktree_head(
 ) -> None:
     (tmp_path / "services" / "foo").mkdir(parents=True)
     (tmp_path / "libs" / "bar").mkdir(parents=True)
-    (tmp_path / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-    (tmp_path / "libs" / "bar" / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+    (tmp_path / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+    (tmp_path / "libs" / "bar" / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
     store, config, impl, verify_fix, verify_epoch = _timeout_verify_fix_fixture(tmp_path, cross_project=True)
     worktree_path = config.worktree_path / verify_fix.slug
     (worktree_path / "services" / "foo").mkdir(parents=True, exist_ok=True)
     (worktree_path / "libs" / "bar").mkdir(parents=True, exist_ok=True)
-    (worktree_path / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-    (worktree_path / "libs" / "bar" / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+    (worktree_path / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+    (worktree_path / "libs" / "bar" / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
 
     canonical_git = Mock(spec=Git)
     canonical_git.default_branch.return_value = "main"

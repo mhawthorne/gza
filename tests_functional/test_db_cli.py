@@ -13,7 +13,7 @@ class TestSharedDbImportCli:
     def test_local_default_with_legacy_local_db_does_not_require_import(self, tmp_path: Path) -> None:
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
-        (project_dir / "gza.yaml").write_text("project_name: gated\n", encoding="utf-8")
+        (project_dir / "gza.yaml").write_text("project_name: gated\nprovider: codex\nmodel: gpt-5.5\n", encoding="utf-8")
 
         local_db = project_dir / ".gza" / "gza.db"
         local_db.parent.mkdir(parents=True, exist_ok=True)
@@ -30,7 +30,7 @@ class TestSharedDbImportCli:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: gated\n"
+            "project_name: gated\nprovider: codex\nmodel: gpt-5.5\n"
             f"db_path: {shared_db}\n",
             encoding="utf-8",
         )
@@ -61,7 +61,7 @@ class TestSharedDbImportCli:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: gated\n"
+            "project_name: gated\nprovider: codex\nmodel: gpt-5.5\n"
             f"db_path: {shared_db}\n",
             encoding="utf-8",
         )
@@ -121,7 +121,7 @@ class TestSharedDbImportCli:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: gated\n"
+            "project_name: gated\nprovider: codex\nmodel: gpt-5.5\n"
             f"db_path: {shared_db}\n",
             encoding="utf-8",
         )
@@ -165,7 +165,7 @@ class TestSharedDbImportCli:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoimportstep01\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -228,7 +228,7 @@ class TestSharedDbImportCli:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoimportsubstep01\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -298,7 +298,7 @@ class TestSharedDbImportCli:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoimportmarker01\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -340,7 +340,7 @@ class TestSharedDbImportCli:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared-missing" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoimportdryrun01\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -373,7 +373,7 @@ class TestSharedDbImportCli:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoimportdryrun02\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -433,7 +433,7 @@ class TestSharedDbImportCli:
         shared_db.parent.mkdir(parents=True, exist_ok=True)
         shared_db.touch()
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoimportdryrun03\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -467,7 +467,7 @@ class TestSharedDbImportCli:
         shared_db = tmp_path / "shared" / "gza.db"
         config_path = project_dir / "gza.yaml"
         config_path.write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
             encoding="utf-8",
@@ -516,7 +516,7 @@ class TestSharedDbImportCli:
         shared_db = tmp_path / "shared" / "gza.db"
         config_path = project_dir / "gza.yaml"
         original_config = (
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n"
         )
@@ -546,7 +546,7 @@ class TestSharedDbImportCli:
         shared_db = tmp_path / "shared" / "gza.db"
         config_path = project_dir / "gza.yaml"
         config_path.write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
             encoding="utf-8",
@@ -586,7 +586,7 @@ class TestSharedDbImportCli:
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "db_path: .gza/gza.db\n",
             encoding="utf-8",
         )
@@ -610,7 +610,7 @@ class TestSharedDbImportCli:
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "db_path: .gza/gza.db\n",
             encoding="utf-8",
         )

@@ -6569,7 +6569,7 @@ class TestConvenienceFunctions:
     def _write_config(self, tmp_path: Path) -> None:
         db_path = tmp_path / ".gza" / "gza.db"
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             f"db_path: {db_path}\n",
             encoding="utf-8",
@@ -9111,7 +9111,7 @@ class TestSharedDbIsolationAndImportGating:
         config_path = tmp_path / "gza.yaml"
         shared_db = tmp_path / "shared" / "gza.db"
         original = (
-            "project_name: readonly-project\n"
+            "project_name: readonly-project\nprovider: codex\nmodel: gpt-5.5\n"
             f"db_path: {shared_db}\n"
         )
         config_path.write_text(original, encoding="utf-8")
