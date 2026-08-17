@@ -1,0 +1,40 @@
+[project]
+name = "gza-server"
+version = "0.1.0.dev0"
+description = "Local HTTP API and web UI for gza (see specs/features/server.md)"
+requires-python = ">=3.11"
+authors = [
+    { name = "Matthew Hawthorne", email = "mh@supremeinformatics.com" }
+]
+dependencies = [
+    "gza-agent",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "jinja2>=3.1",
+    "markdown-it-py>=3.0",
+]
+
+[project.scripts]
+gza-server = "gza_server.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[tool.uv.sources]
+gza-agent = { path = "..", editable = true }
+
+[tool.uv]
+exclude-newer = "7 days"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gza_server"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
