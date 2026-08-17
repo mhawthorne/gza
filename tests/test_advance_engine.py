@@ -7315,10 +7315,39 @@ def test_cross_project_tag_allows_out_of_scope_change_to_advance(tmp_path: Path)
     assert action["verify_gate_phase"] == "pre_review"
 
 
+def test_default_cross_project_allows_out_of_scope_change_to_advance(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    _set_subdir_project_boundary(config, tmp_path)
+    config.default_cross_project = True
+    sibling_project_dir = tmp_path / "dre" / "web"
+    sibling_project_dir.mkdir(parents=True, exist_ok=True)
+    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nverify_command: ./bin/web-verify\n")
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/default-cross-project-scope",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={
+            "main...feat/default-cross-project-scope": "M\tservices/foo/app.py\nM\tdre/web/src/app.tsx\n",
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
+
+
 def test_cross_project_tag_still_parks_unknown_paths_outside_discovered_roots(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     _set_subdir_project_boundary(config, tmp_path)
+    (tmp_path / "gza.yaml").unlink()
     sibling_project_dir = tmp_path / "dre" / "web"
     sibling_project_dir.mkdir(parents=True, exist_ok=True)
     (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nverify_command: ./bin/web-verify\n")
@@ -7384,6 +7413,7 @@ def test_cross_project_tag_rename_declared_project_root_still_parks_for_unknown_
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     _set_subdir_project_boundary(config, tmp_path)
+    (tmp_path / "gza.yaml").unlink()
 
     impl = _make_completed_unmerged_impl(
         store,
@@ -7455,6 +7485,7 @@ def test_cross_project_tag_deleted_project_root_still_parks_without_declared_roo
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     _set_subdir_project_boundary(config, tmp_path)
+    (tmp_path / "gza.yaml").unlink()
 
     impl = _make_completed_unmerged_impl(
         store,
@@ -7486,6 +7517,7 @@ def test_cross_project_tag_branch_local_path_without_declared_root_still_parks(t
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     _set_subdir_project_boundary(config, tmp_path)
+    (tmp_path / "gza.yaml").unlink()
 
     impl = _make_completed_unmerged_impl(
         store,
@@ -7571,6 +7603,39 @@ def test_strict_scope_uninspectable_git_diff_parks_for_human(tmp_path: Path) -> 
     assert action["type"] not in {"create_review", "improve", "needs_rebase", "merge", "merge_with_followups"}
     assert "strict project scope could not be verified" in action["description"]
     assert "fatal: bad revision" in action["description"]
+
+
+def test_strict_scope_uninspectable_git_diff_for_default_cross_project_repairs_diff_only(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.default_cross_project = True
+    _set_subdir_project_boundary(config, tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/implicit-cross-project-uninspectable-diff",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        name_status_error_by_range={
+            "main...feat/implicit-cross-project-uninspectable-diff": GitError(
+                "git diff --name-status main...feat/implicit-cross-project-uninspectable-diff failed:\n"
+                "fatal: bad revision"
+            ),
+        },
+    )
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert classify_advance_action(action) == "needs_attention"
+    assert action["needs_attention_reason"] == "project-scope-unverified"
+    assert "strict project scope could not be verified" in action["description"]
+    assert "diff/ref problem is fixed" in action["description"]
+    assert "fatal: bad revision" in action["description"]
+    assert "tagged `cross-project`" not in action["description"]
 
 
 def test_one_noop_improve_permits_another_improve_with_warning_description(tmp_path: Path, monkeypatch) -> None:

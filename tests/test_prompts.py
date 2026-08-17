@@ -1779,6 +1779,47 @@ class TestVerifyCommandInjection:
         assert "Project `libs/bar` final verify: `./bin/bar-verify`" in result
         assert "Project `apps/baz` has no `verify_command`" in result
 
+    def test_default_cross_project_prompt_matches_explicit_cross_project_policy(self, tmp_path: Path):
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        explicit_task = store.add(prompt="Implement shared change", task_type="implement")
+        explicit_task.tags = ("cross-project",)
+        store.update(explicit_task)
+        implicit_task = store.add(prompt="Implement shared change", task_type="implement")
+
+        project_dir = tmp_path / "services" / "foo"
+        sibling_dir = tmp_path / "libs" / "bar"
+        project_dir.mkdir(parents=True)
+        sibling_dir.mkdir(parents=True)
+        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+
+        explicit_config = Config(
+            project_dir=project_dir,
+            project_name="foo",
+            verify_command="./bin/foo-verify",
+        )
+        implicit_config = Config(
+            project_dir=project_dir,
+            project_name="foo",
+            verify_command="./bin/foo-verify",
+            default_cross_project=True,
+        )
+        boundary = type(
+            "Boundary",
+            (),
+            {"repo_root": tmp_path, "scope_root": Path("services/foo"), "local_dependencies": ()},
+        )()
+        explicit_config._project_boundary_cache = boundary
+        implicit_config._project_boundary_cache = boundary
+
+        explicit_result = PromptBuilder().build(explicit_task, explicit_config, store)
+        implicit_result = PromptBuilder().build(implicit_task, implicit_config, store)
+
+        explicit_policy = explicit_result.split("Cross-project verification policy:", 1)[1]
+        implicit_policy = implicit_result.split("Cross-project verification policy:", 1)[1]
+        assert implicit_policy == explicit_policy
+
     def test_verify_command_not_injected_when_empty(self, tmp_path: Path):
         """Test that no verification instruction is added when verify_command is empty."""
         db_path = tmp_path / "test.db"

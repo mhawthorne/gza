@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from gza.config import Config
+from gza.db import Task
 from gza.project_discovery import (
     infer_declared_repo_project_roots,
     parse_name_status_project_paths,
@@ -183,6 +184,46 @@ def test_find_out_of_scope_paths_is_noop_for_root_scope(tmp_path: Path) -> None:
     assert violations == []
 
 
+def test_default_cross_project_allows_discovered_project_paths_only(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    project_dir = repo_root / "services" / "foo"
+    sibling_dir = repo_root / "libs" / "bar"
+    project_dir.mkdir(parents=True)
+    sibling_dir.mkdir(parents=True)
+    (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+
+    config = Config(project_dir=project_dir, project_name="foo")
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        ),
+    )
+    task = Task(id="gza-1", prompt="Implement", status="pending", task_type="implement")
+
+    default_violations = _find_out_of_scope_paths(
+        config,
+        {"services/foo/app.py", "libs/bar/lib.py"},
+        task=task,
+        strict_scope=True,
+    )
+
+    config.default_cross_project = True
+    implicit_cross_project_violations = _find_out_of_scope_paths(
+        config,
+        {"services/foo/app.py", "libs/bar/lib.py", "misc/tool.py"},
+        task=task,
+        strict_scope=True,
+    )
+
+    assert default_violations == ["libs/bar/lib.py"]
+    assert implicit_cross_project_violations == ["misc/tool.py"]
+
+
 def test_build_runtime_docker_volumes_adds_readonly_out_of_repo_mounts(tmp_path: Path) -> None:
     project_dir = tmp_path / "repo" / "services" / "foo"
     out_of_repo_dep = tmp_path / "vendor" / "external"
@@ -248,6 +289,72 @@ def test_resolve_affected_repo_projects_matches_known_roots_and_reports_unknown_
 
     assert [project.scope_root.as_posix() for project in affected.projects] == ["services/foo", "libs/bar"]
     assert affected.unknown_paths == ("misc/script.py",)
+
+
+def test_resolve_affected_repo_projects_attributes_parent_owned_paths_for_nested_project(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    project_dir = repo_root / "server"
+    project_dir.mkdir(parents=True)
+    (repo_root / "gza.yaml").write_text("project_name: gza\nverify_command: ./bin/root-verify\n")
+    (project_dir / "gza.yaml").write_text("project_name: server\nverify_command: ./bin/server-verify\n")
+
+    config = Config(project_dir=project_dir, project_name="server")
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("server"),
+            local_dependencies=(),
+        ),
+    )
+
+    affected = resolve_affected_repo_projects(
+        config,
+        {
+            "server/src/server.py",
+            "src/gza/db.py",
+            "src/gza/task_query.py",
+        },
+    )
+
+    assert [project.scope_root.as_posix() for project in affected.projects] == ["server", "."]
+    assert affected.unknown_paths == ()
+
+
+def test_resolve_affected_repo_projects_keeps_no_verify_parent_for_nested_project(
+    tmp_path: Path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    project_dir = repo_root / "server"
+    project_dir.mkdir(parents=True)
+    (repo_root / "gza.yaml").write_text("project_name: gza\n")
+    (project_dir / "gza.yaml").write_text("project_name: server\nverify_command: ./bin/server-verify\n")
+
+    config = Config(project_dir=project_dir, project_name="server")
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("server"),
+            local_dependencies=(),
+        ),
+    )
+
+    affected = resolve_affected_repo_projects(
+        config,
+        {
+            "server/src/server.py",
+            "src/gza/db.py",
+        },
+    )
+
+    assert [project.scope_root.as_posix() for project in affected.projects] == ["server", "."]
+    assert [project.verify_command for project in affected.projects] == ["./bin/server-verify", ""]
+    assert affected.unknown_paths == ()
 
 
 def test_resolve_affected_repo_projects_can_discover_branch_local_project_configs(tmp_path: Path) -> None:

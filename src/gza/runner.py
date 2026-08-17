@@ -52,6 +52,10 @@ from .console import (
     task_footer,
     task_header,
 )
+from .cross_project import (
+    CROSS_PROJECT_TAG as CROSS_PROJECT_TAG,  # re-exported for compatibility
+    task_is_cross_project as _task_is_cross_project,
+)
 from .db import (
     DB_UNSET,
     TASK_COMMENT_KIND_FEEDBACK,
@@ -198,7 +202,6 @@ BRANCH_UNPUSHABLE_FAILURE_REASON = "BRANCH_UNPUSHABLE"
 PROJECT_SCOPE_VIOLATION_FAILURE_REASON = "PROJECT_SCOPE_VIOLATION"
 VERIFIED_EMPTY_NOOP_COMPLETION_REASON = "VERIFIED_EMPTY_NOOP"
 REBASE_CONFLICT_FAILURE_REASON = "REBASE_CONFLICT"
-CROSS_PROJECT_TAG = "cross-project"
 DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE = 3
 _GZA_OWNED_DIR_NAMES = (".gza", ".claude")
 
@@ -421,11 +424,6 @@ def _fail_if_workspace_not_populated(
         prelude_written=prelude_written,
     )
     return True
-
-
-def _task_is_cross_project(task: Task) -> bool:
-    """Return whether a task carries the reserved cross-project scope tag."""
-    return CROSS_PROJECT_TAG in task.tags
 
 
 def _normalize_repo_relative_path(path: str) -> str:
@@ -829,7 +827,7 @@ def _find_out_of_scope_paths(
     declared_project_roots: tuple[Path, ...] = (),
 ) -> list[str]:
     """Return sorted repo-relative paths that violate the current project scope."""
-    if task is not None and _task_is_cross_project(task):
+    if task is not None and _task_is_cross_project(task, config):
         return list(
             resolve_affected_repo_projects(
                 config,
@@ -855,7 +853,7 @@ def _find_out_of_scope_paths(
 
 def _reviewable_diff_scope_paths(task: Task, config: Config) -> tuple[str, ...]:
     """Return repo-relative path roots that define the reviewable diff scope."""
-    if _task_is_cross_project(task):
+    if _task_is_cross_project(task, config):
         return ()
 
     allowed_roots = _project_boundary(config).project_rooted_paths
@@ -4813,7 +4811,7 @@ def _run_verify_commands_for_projects(
     reviewed_base_sha: str | None = None,
 ) -> CrossProjectVerificationResult | None:
     """Run lifecycle verification from each affected project root."""
-    if not _task_is_cross_project(task):
+    if not _task_is_cross_project(task, config):
         return None
 
     default_branch = worktree_git.default_branch()
@@ -4956,7 +4954,7 @@ def _run_lifecycle_verify(
     reviewed_base_sha: str | None = None,
 ) -> LifecycleVerifyExecution | None:
     """Run the reusable lifecycle verify path for the current evaluated head."""
-    if _task_is_cross_project(task):
+    if _task_is_cross_project(task, config):
         execution = _run_review_verify_commands_for_projects(
             config=config,
             task=task,

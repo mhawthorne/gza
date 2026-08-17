@@ -232,6 +232,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         True,
         "Enforce repo-subtree write boundaries at commit time; `cross-project` tagged tasks are exempt.",
     ),
+    ConfigKeySpec(
+        "default_cross_project",
+        "bool",
+        False,
+        "Treat every task in this project as if tagged `cross-project`: scope gates allow discovered project roots and lifecycle verify fans out across affected projects. This is not the same as `enforce_project_scope: false`, which disables scope parking without enabling cross-project verification fan-out.",
+    ),
     ConfigKeySpec("verify_command", "str", "", "Project verification command used before completion and during autonomous review cycles."),
     ConfigKeySpec("watch.batch", "int", 2, "Default concurrent worker target for `gza watch`."),
     ConfigKeySpec("watch.failure_backoff_initial", "int", 60, "Initial cooldown after a non-auto-resumable watch failure."),

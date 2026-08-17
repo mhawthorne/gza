@@ -168,8 +168,8 @@ This matches the project's "errors over silent fallbacks" stance.
 
 ### Escape hatch: cross-project tasks (a reserved tag)
 
-A reserved tag `cross-project` exempts a task from the gate (and widens the
-agent's working directory back to the repo root). Using a tag — rather than a
+A reserved tag `cross-project` exempts a task from the gate and enables
+per-affected-project verification fan-out. Using a tag — rather than a
 new `Task` column and a new `--cross-project` flag — is deliberate and follows
 the existing system:
 
@@ -189,6 +189,12 @@ The failure→fix→resume loop therefore uses existing commands unchanged:
 
 `cross-project` is a *semantic* tag read by the gate, not an execution-trigger
 tag, so it does not by itself cause `gza watch` to spawn work.
+
+Projects may set `default_cross_project: true` when essentially every task
+should carry those same semantics, for example a nested Gza project whose normal
+work touches parent-repo files. This is an implicit tag, not a scope-disable
+switch: it still rejects paths outside discovered or branch-declared project
+roots, and it still runs verify fan-out for each affected project.
 
 ### Global switch: opt the whole behavior in/out
 

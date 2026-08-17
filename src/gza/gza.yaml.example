@@ -512,6 +512,13 @@ project_name: my-project
 
 # --- Other ---
 
+# Treat every task in this project as if tagged `cross-project`: scope gates allow discovered
+# project roots and lifecycle verify fans out across affected projects. This is not the same as
+# `enforce_project_scope: false`, which disables scope parking without enabling cross-project
+# verification fan-out.
+# Default: false
+# default_cross_project: false
+
 # Hard global ceiling on concurrently running task-executing processes across all commands.
 # Explicit `max_concurrent` wins; when it is unset, `gza watch` derives its runtime cap from the
 # effective watch batch (including `--batch`), while other commands keep the loaded fallback

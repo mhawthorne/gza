@@ -15,6 +15,7 @@ from gza.artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from gza.branch_resolution import resolve_rebase_target_task
 from gza.config import DEFAULT_ADVANCE_OFF_TOPIC_VERIFY_UNBLOCK, DEFAULT_MAX_NOOP_IMPROVE_CYCLES
 from gza.console import prompt_available_width, shorten_prompt
+from gza.cross_project import CROSS_PROJECT_TAG, task_is_cross_project
 from gza.db import (
     TASK_COMMENT_KIND_FEEDBACK,
     SqliteTaskStore,
@@ -112,7 +113,6 @@ from gza.review_verdict import (
 )
 from gza.review_verify_state import VerifyGateDecision, resolve_verify_gate_decision, verify_result_is_timeout_origin
 from gza.runner import (
-    CROSS_PROJECT_TAG,
     PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
     REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
     ReviewVerifyResult,
@@ -122,7 +122,6 @@ from gza.runner import (
     _make_review_verify_result,
     _project_boundary,
     _task_has_current_passing_review_verify_evidence,
-    _task_is_cross_project,
 )
 from gza.source_followup import (
     collect_non_dropped_implement_source_ids,
@@ -2804,7 +2803,7 @@ def _strict_scope_violation_action(ctx: AdvanceContext) -> dict[str, Any]:
     description = (
         "SKIP: cross-project branch includes paths outside all discovered project roots: "
         f"{paths}. Fix the branch or add project configs so the affected roots are discoverable."
-        if _task_is_cross_project(ctx.task)
+        if task_is_cross_project(ctx.task, getattr(ctx, "config", None))
         else (
             "SKIP: branch includes out-of-scope paths outside the strict project scope: "
             f"{paths}. Tag `{CROSS_PROJECT_TAG}` and re-advance if intended, or fix the branch."
@@ -2825,13 +2824,21 @@ def _strict_scope_violation_action(ctx: AdvanceContext) -> dict[str, Any]:
 def _strict_scope_unverified_action(ctx: AdvanceContext) -> dict[str, Any]:
     detail = getattr(ctx, "strict_scope_inspection_error", None) or "unknown diff inspection failure"
     merge_source_ref = getattr(ctx, "merge_source_ref", None) or ctx.task.branch or "unknown"
+    task_is_already_cross_project = task_is_cross_project(ctx.task, getattr(ctx, "config", None))
+    recovery_guidance = (
+        "No automation will proceed until the diff/ref problem is fixed. "
+        if task_is_already_cross_project
+        else (
+            "No automation will proceed until the diff/ref problem is fixed "
+            f"or the task is tagged `{CROSS_PROJECT_TAG}` if the wider scope is intended. "
+        )
+    )
     return with_needs_attention(
         {
             "type": "needs_discussion",
             "description": (
                 "SKIP: strict project scope could not be verified for branch diff "
-                f"`{merge_source_ref}`. No automation will proceed until the diff/ref problem is fixed "
-                f"or the task is tagged `{CROSS_PROJECT_TAG}` if the wider scope is intended. "
+                f"`{merge_source_ref}`. {recovery_guidance}"
                 f"Inspection error: {detail}"
             ),
             "strict_scope_inspection_error": detail,

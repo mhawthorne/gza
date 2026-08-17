@@ -139,14 +139,6 @@ def _discovery_repo_root(config: Config, repo_root: Path | None) -> Path:
     return resolve_repo_root(config.project_dir)
 
 
-def _discovery_current_project_dir(config: Config, repo_root: Path) -> Path:
-    boundary = getattr(config, "_project_boundary_cache", None)
-    scope_root = getattr(boundary, "scope_root", None)
-    if isinstance(scope_root, Path):
-        return (repo_root / scope_root).resolve()
-    return config.project_dir.resolve()
-
-
 def discover_repo_project_configs(
     config: Config,
     *,
@@ -161,7 +153,6 @@ def discover_repo_project_configs(
         if isinstance(cached, tuple):
             return cached
 
-    current_project_dir = _discovery_current_project_dir(config, discovery_root)
     discovered: list[RepoProjectConfig] = []
     seen: set[Path] = set()
     for config_path in sorted(discovery_root.rglob(CONFIG_FILENAME)):
@@ -171,12 +162,6 @@ def discover_repo_project_configs(
         project_dir = config_path.parent.resolve()
         if project_dir in seen:
             continue
-        if project_dir != current_project_dir:
-            try:
-                current_project_dir.relative_to(project_dir)
-                continue
-            except ValueError:
-                pass
         seen.add(project_dir)
         try:
             project_config = Config.load(project_dir)
@@ -187,10 +172,11 @@ def discover_repo_project_configs(
             scope_root = project_dir.relative_to(discovery_root)
         except ValueError:
             continue
+        normalized_scope_root = scope_root if str(scope_root) else Path(".")
         discovered.append(
             RepoProjectConfig(
                 project_dir=project_dir,
-                scope_root=scope_root if str(scope_root) else Path("."),
+                scope_root=normalized_scope_root,
                 verify_command=project_config.verify_command.strip(),
                 unit_verify_command=project_config.unit_verify_command.strip(),
                 inner_verify_command=project_config.inner_verify_command.strip(),
@@ -217,7 +203,12 @@ def match_repo_project(
     path_str: str,
     projects: tuple[RepoProjectConfig, ...],
 ) -> RepoProjectConfig | None:
-    """Return the most specific discovered project that contains ``path_str``."""
+    """Return the most specific discovered project that contains ``path_str``.
+
+    Ancestor project configs are discoverable so nested projects can touch
+    parent-owned files. Sorting keeps attribution most-specific, so ancestor
+    projects are not selected merely because a descendant project's files changed.
+    """
     path = Path(_normalize_repo_relative_path(path_str))
     for project in projects:
         if _path_within(project.scope_root, path):

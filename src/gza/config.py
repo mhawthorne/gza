@@ -55,6 +55,7 @@ DEFAULT_INNER_VERIFY_COMMAND = ""
 DEFAULT_USE_DOCKER = True
 DEFAULT_DOCKER_STARTUP_TIMEOUT = 60
 DEFAULT_ENFORCE_PROJECT_SCOPE = True
+DEFAULT_DEFAULT_CROSS_PROJECT = False
 DEFAULT_BRANCH_MODE = "multi"  # "single" or "multi"
 DEFAULT_MAX_STEPS = 50
 DEFAULT_MAX_TURNS = 50
@@ -140,7 +141,7 @@ DEFAULT_SPEC_COHERENCE_PATHS = ("specs/behavior/**",)
 VALID_CONFIG_FIELDS = {
     "project_name", "project_id", "project_prefix", "tasks_file", "log_dir", "db_path", "use_docker",
     "docker_startup_timeout",
-    "enforce_project_scope",
+    "enforce_project_scope", "default_cross_project",
     "docker_image", "docker_volumes", "docker_setup_command", "timeout_minutes", "branch_mode", "max_steps",
     "max_turns", "claude_args", "claude", "worktree_dir", "work_count", "provider", "task_providers", "model",
     "reasoning_effort", "defaults", "task_types", "providers", "branch_strategy", "chat_text_display_length",
@@ -167,6 +168,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "use_docker": None,
     "docker_startup_timeout": None,
     "enforce_project_scope": None,
+    "default_cross_project": None,
     "docker_image": None,
     "docker_volumes": None,
     "docker_setup_command": None,
@@ -304,6 +306,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "use_docker": None,
     "docker_startup_timeout": None,
     "enforce_project_scope": None,
+    "default_cross_project": None,
     "docker_image": None,
     "docker_volumes": None,
     "docker_setup_command": None,
@@ -1130,6 +1133,7 @@ class Config:
     use_docker: bool = DEFAULT_USE_DOCKER
     docker_startup_timeout: int = DEFAULT_DOCKER_STARTUP_TIMEOUT
     enforce_project_scope: bool = DEFAULT_ENFORCE_PROJECT_SCOPE
+    default_cross_project: bool = DEFAULT_DEFAULT_CROSS_PROJECT
     docker_image: str = ""
     docker_volumes: list[str] = field(default_factory=list)
     timeout_minutes: int = DEFAULT_TIMEOUT_MINUTES
@@ -1737,6 +1741,9 @@ class Config:
         enforce_project_scope = data.get("enforce_project_scope", DEFAULT_ENFORCE_PROJECT_SCOPE)
         if not isinstance(enforce_project_scope, bool):
             raise ConfigError("'enforce_project_scope' must be a boolean (true/false)")
+        default_cross_project = data.get("default_cross_project", DEFAULT_DEFAULT_CROSS_PROJECT)
+        if not isinstance(default_cross_project, bool):
+            raise ConfigError("'default_cross_project' must be a boolean (true/false)")
 
         # Expand tilde in volume paths
         expanded_volumes = []
@@ -2632,6 +2639,7 @@ class Config:
             use_docker=use_docker,
             docker_startup_timeout=docker_startup_timeout,
             enforce_project_scope=enforce_project_scope,
+            default_cross_project=default_cross_project,
             docker_image=data.get("docker_image", ""),
             docker_volumes=docker_volumes,
             docker_setup_command=data.get("docker_setup_command", ""),
@@ -2857,6 +2865,8 @@ class Config:
 
         if "enforce_project_scope" in data and not isinstance(data["enforce_project_scope"], bool):
             errors.append("'enforce_project_scope' must be a boolean (true/false)")
+        if "default_cross_project" in data and not isinstance(data["default_cross_project"], bool):
+            errors.append("'default_cross_project' must be a boolean (true/false)")
 
         if "docker_image" in data and not isinstance(data["docker_image"], str):
             errors.append("'docker_image' must be a string")

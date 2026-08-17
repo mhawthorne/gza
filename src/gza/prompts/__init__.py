@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from gza.cross_project import task_is_cross_project
 from gza.plan_review_verdict import SLICE_COMPLEXITIES
 from gza.project_discovery import discover_repo_project_configs
 from gza.review_verify_state import normalized_verify_command
@@ -42,8 +43,7 @@ def _get_optional_verify_command(config: Config, field_name: str) -> str:
 
 def _cross_project_verify_instructions(task: Task, config: Config) -> str:
     """Build additional verification guidance for cross-project code tasks."""
-    tags = tuple(getattr(task, "tags", ()) or ())
-    if "cross-project" not in tags:
+    if not task_is_cross_project(task, config):
         return ""
 
     lines = [

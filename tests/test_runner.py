@@ -2083,6 +2083,131 @@ class TestReviewContextFromChain:
         assert verify_calls[0].kwargs["reviewed_head_sha"] == "deadbeef"
         assert verify_calls[0].kwargs["reviewed_base_sha"] == "cafebabe"
 
+    def test_default_cross_project_runs_verify_for_current_and_parent_projects(self, tmp_path: Path):
+        repo_root = tmp_path / "repo"
+        worktree_path = tmp_path / "worktree"
+        project_dir = repo_root / "server"
+        worktree_project_dir = worktree_path / "server"
+        project_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        (repo_root / "gza.yaml").write_text("project_name: gza\nverify_command: ./bin/root-verify\n")
+        (project_dir / "gza.yaml").write_text("project_name: server\nverify_command: ./bin/server-verify\n")
+        (worktree_path / "gza.yaml").write_text("project_name: gza\nverify_command: ./bin/root-verify\n")
+        (worktree_project_dir / "gza.yaml").write_text(
+            "project_name: server\nverify_command: ./bin/server-verify\n"
+        )
+
+        config = Config(
+            project_dir=project_dir,
+            project_name="server",
+            verify_command="./bin/server-verify",
+            default_cross_project=True,
+        )
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("server"),
+            local_dependencies=(),
+        )
+        task = Task(id="gza-1", prompt="Review implicit cross-project", status="pending", task_type="review")
+
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tserver/app.py\nM\tsrc/gza/db.py\n"
+
+        with patch(
+            "gza.runner._run_review_verify_command",
+            side_effect=[
+                ReviewVerifyResult(
+                    command="./bin/server-verify",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ),
+                ReviewVerifyResult(
+                    command="./bin/root-verify",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+                ),
+            ],
+        ) as mock_verify:
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=120,
+                timeout_grace_seconds=5.0,
+            )
+
+        assert outcome is not None
+        assert "### server" in outcome.markdown
+        assert "### ." in outcome.markdown
+        verify_calls = mock_verify.call_args_list
+        assert len(verify_calls) == 2
+        assert verify_calls[0].args[0] == "./bin/server-verify"
+        assert verify_calls[0].kwargs["cwd"] == worktree_path / "server"
+        assert verify_calls[1].args[0] == "./bin/root-verify"
+        assert verify_calls[1].kwargs["cwd"] == worktree_path
+
+    def test_default_cross_project_reports_no_verify_parent_as_skipped(self, tmp_path: Path):
+        repo_root = tmp_path / "repo"
+        worktree_path = tmp_path / "worktree"
+        project_dir = repo_root / "server"
+        worktree_project_dir = worktree_path / "server"
+        project_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        (repo_root / "gza.yaml").write_text("project_name: gza\n")
+        (project_dir / "gza.yaml").write_text("project_name: server\nverify_command: ./bin/server-verify\n")
+        (worktree_path / "gza.yaml").write_text("project_name: gza\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: server\nverify_command: ./bin/server-verify\n")
+
+        config = Config(
+            project_dir=project_dir,
+            project_name="server",
+            verify_command="./bin/server-verify",
+            default_cross_project=True,
+        )
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("server"),
+            local_dependencies=(),
+        )
+        task = Task(id="gza-1", prompt="Review implicit cross-project", status="pending", task_type="review")
+
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tserver/app.py\nM\tsrc/gza/db.py\n"
+
+        with patch(
+            "gza.runner._run_review_verify_command",
+            return_value=ReviewVerifyResult(
+                command="./bin/server-verify",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            ),
+        ) as mock_verify:
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=120,
+                timeout_grace_seconds=5.0,
+            )
+
+        assert outcome is not None
+        assert "### server" in outcome.markdown
+        assert "### ." in outcome.markdown
+        assert "no verify_command configured for this affected project" in outcome.markdown
+        assert "unknown paths" not in outcome.markdown
+        assert outcome.aggregate_result.exit_status == "1 passed, 0 failed, 0 unavailable, 1 skipped"
+        verify_calls = mock_verify.call_args_list
+        assert len(verify_calls) == 1
+        assert verify_calls[0].args[0] == "./bin/server-verify"
+        assert verify_calls[0].kwargs["cwd"] == worktree_path / "server"
+
     def test_run_review_verify_commands_for_cross_project_prioritizes_failed_over_unavailable(
         self, tmp_path: Path
     ):

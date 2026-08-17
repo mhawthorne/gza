@@ -163,9 +163,27 @@ and default to **off**.
 Before queuing rebase, review, improve, or merge for a code-changing branch, the engine
 MUST verify the branch diff stays within the work unit's declared project scope.
 
-- If the diff touches any path outside scope and the unit is not tagged `cross-project`,
+- If the diff touches any path outside scope and the unit is not explicitly or implicitly
+  cross-project,
   the engine MUST `needs_discussion` (ScopeParked): list the offending paths; instruct to
   tag `cross-project` and re-advance, or fix the branch.
+- A unit is implicitly cross-project when its project config sets
+  `default_cross_project: true`. This MUST behave like the reserved `cross-project` tag
+  for both strict-scope exemption and per-affected-project verify fan-out. It MUST NOT
+  behave like `enforce_project_scope: false`, which disables scope parking without
+  enabling cross-project verification fan-out.
+- Cross-project scope exemption MUST still fail closed if any changed path falls outside
+  all discovered project roots and branch-declared project roots. When the current
+  project is nested under another project config, ancestor configs MUST be available for
+  path attribution so parent-owned paths can resolve cleanly. Most-specific attribution
+  MUST prevent an ancestor project from being selected only because a descendant-owned
+  path changed.
+- If the diff cannot be inspected reliably, the engine MUST fail closed with
+  `project-scope-unverified`. For a unit that is not explicitly or implicitly
+  cross-project, the guidance MAY tell the operator to tag `cross-project` when wider
+  scope is intended. For a unit that is already explicitly or implicitly cross-project,
+  the guidance MUST direct the operator to repair the diff/ref inspection failure
+  without asking for a redundant tag.
 - If the diff cannot be inspected reliably, the engine MUST `needs_discussion` and stop
   all automation for the unit until the ref/diff problem is fixed (fail closed; see
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4).

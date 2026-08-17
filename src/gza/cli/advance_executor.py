@@ -28,6 +28,7 @@ from ..concurrency import (
     release_task_launch_permit,
     reserve_task_launch_permit,
 )
+from ..cross_project import task_is_cross_project
 from ..db import DuplicateActiveChildError, SqliteTaskStore, Task as DbTask
 from ..flaky_investigations import create_or_reuse_flaky_investigations
 from ..git import Git, GitError
@@ -58,7 +59,6 @@ from ..runner import (
     _run_lifecycle_verify,
     _run_review_verify_command,
     _run_review_verify_commands_for_projects,
-    _task_is_cross_project,
     _verify_fix_completion_worktree_path,
     _worktree_execution_dir,
 )
@@ -1615,7 +1615,7 @@ def _execute_recover_verify_only_noop_review(
                     working_directory=str(provider_cwd),
                     failure="unable to resolve detached review-verify HEAD",
                 )
-            elif _task_is_cross_project(noop_improve_task):
+            elif task_is_cross_project(noop_improve_task, context.config):
                 cross_project_verify = _run_review_verify_commands_for_projects(
                     config=context.config,
                     task=noop_improve_task,
