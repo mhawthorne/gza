@@ -12,3 +12,5 @@ branch_strategy: date_slug
 advance_mode: iterate
 
 provider: codex
+
+learnings_interval: 20
