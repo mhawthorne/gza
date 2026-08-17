@@ -1,7 +1,7 @@
 # Gza Configuration — server subproject (write boundary: server/)
 
 project_name: gza-server
-project_id: gza-server
+project_id: gzaserver
 
 verify_command: './bin/tests'
 autonomous_verify_timeout_seconds: 300
