@@ -24011,6 +24011,126 @@ def test_watch_cycle_selected_create_review_skip_reasons_do_not_reset_no_progres
     assert "watch selected the same create review action without durable progress for 2 cycles" in text
 
 
+def test_watch_cycle_verify_gate_followup_progress_does_not_trigger_no_progress_backstop(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(
+        tmp_path,
+        "branch_mode: single\n"
+        "verify_command: ./bin/tests\n"
+        "autonomous_verify_timeout_seconds: 120\n"
+        "review_verify_timeout_grace_seconds: 5.0\n"
+        "watch:\n"
+        "  no_progress_cycles: 2\n",
+    )
+    store = make_store(tmp_path)
+    shared_branch = "gza/gza-work"
+
+    original = store.add("Original implementation", task_type="implement")
+    assert original.id is not None
+    original.status = "completed"
+    original.completed_at = datetime.now(UTC)
+    original.branch = shared_branch
+    store.update(original)
+    store.set_merge_status(original.id, "merged")
+
+    review = store.add("Review original", task_type="review", depends_on=original.id, based_on=original.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    followup = store.add("Review follow-up implementation", task_type="implement", based_on=review.id)
+    assert followup.id is not None
+    followup.status = "completed"
+    followup.completed_at = datetime.now(UTC)
+    followup.branch = shared_branch
+    store.update(followup)
+    store.set_merge_status(followup.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    heads = {
+        "HEAD": "main-head",
+        "main": "main-head",
+        "origin/main": "main-head",
+        shared_branch: "followup-head-1",
+    }
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: heads.get(ref)
+    )
+    git.worktree_add_existing = MagicMock()  # type: ignore[method-assign]
+    git.worktree_remove = MagicMock()  # type: ignore[method-assign]
+    worktree_git = _make_watch_git()
+    worktree_git.repo_dir = tmp_path / "tmp-worktree"
+    worktree_git.default_branch = MagicMock(return_value="main")  # type: ignore[method-assign]
+    worktree_git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: {
+            "HEAD": "main-head",
+            "main": "main-head",
+            "origin/main": "main-head",
+        }.get(ref)
+    )
+    captures = [
+        datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+        datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+    ]
+
+    def lifecycle_verify_result(**_kwargs: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            markdown="verify markdown",
+            aggregate_result=_make_review_verify_result(
+                "./bin/tests",
+                status="passed",
+                exit_status="0",
+                captured_at=captures.pop(0),
+                reviewed_branch=shared_branch,
+                reviewed_head_sha=heads[shared_branch],
+                reviewed_base_sha="main-head",
+                working_directory=str(tmp_path),
+            ),
+            project_results=(),
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=lifecycle_verify_result),
+        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("second cycle should not need review creation")),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+        heads[shared_branch] = "followup-head-2"
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=make_store(tmp_path),
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+    final_store = make_store(tmp_path)
+    refreshed_followup = final_store.get(followup.id)
+    assert refreshed_followup is not None
+    observations = final_store.list_all_watch_progress_observations(parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON)
+    assert observations == []
+    assert refreshed_followup.review_verify_status == "passed"
+    assert refreshed_followup.review_verify_branch == shared_branch
+    assert refreshed_followup.review_verify_head_sha == "followup-head-2"
+    assert captures == []
+    assert "watch-no-progress-backstop" not in log_path.read_text()
+
+
 def test_watch_cycle_create_review_quick_terminal_iterate_releases_slots_for_same_cycle_pending_pickup(
     tmp_path: Path,
 ) -> None:

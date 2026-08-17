@@ -36,6 +36,7 @@ from gza.cli.advance_executor import (
     BranchDivergenceReconcileResult,
     _prepare_resolution_review_action,
     _prepare_spec_coherence_review_action,
+    _resolve_canonical_verify_gate_owner,
     build_improve_needs_attention_result,
     execute_advance_action,
     resolve_execution_needs_attention,
@@ -3385,6 +3386,388 @@ def test_verify_gate_execution_persists_current_passing_owner_artifact(tmp_path:
     assert lookup.is_current is True
     assert lookup.result is not None
     assert lookup.result.status == "passed"
+
+
+def test_verify_gate_owner_for_review_followup_implement_stops_at_same_branch_owner(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    shared_branch = "gza/gza-work"
+
+    original = store.add("Original implementation", task_type="implement")
+    assert original.id is not None
+    _mark_completed(original, branch=shared_branch)
+    store.update(original)
+
+    review = store.add(
+        "Review original implementation",
+        task_type="review",
+        depends_on=original.id,
+        based_on=original.id,
+    )
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    followup = store.add(
+        "Review follow-up implementation",
+        task_type="implement",
+        based_on=review.id,
+    )
+    assert followup.id is not None
+    _mark_completed(followup, branch=shared_branch)
+    store.update(followup)
+
+    owner = _resolve_canonical_verify_gate_owner(store, followup)
+
+    assert owner.id == followup.id
+
+
+def test_verify_gate_review_followup_same_branch_runs_live_head_and_persists_to_followup(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    shared_branch = "gza/gza-work"
+
+    original = store.add("Original implementation", task_type="implement")
+    assert original.id is not None
+    _mark_completed(original, branch=shared_branch)
+    store.update(original)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=original,
+        source_task=original,
+        result=_make_review_verify_result(
+            "./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+            reviewed_branch=original.branch,
+            reviewed_head_sha="original-head",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+
+    review = store.add("Review original", task_type="review", depends_on=original.id, based_on=original.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    followup = store.add("Follow-up from review", task_type="implement", based_on=review.id)
+    assert followup.id is not None
+    _mark_completed(followup, branch=shared_branch)
+    store.update(followup)
+
+    heads = {
+        shared_branch: "followup-head",
+        "main": "base-1",
+        "origin/main": "base-1",
+    }
+    added_refs: list[str] = []
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda ref: heads.get(ref),
+        worktree_add_existing=lambda _path, ref, detach=True: added_refs.append(ref),
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    worktree_git = SimpleNamespace(
+        repo_dir=tmp_path / "tmp-worktree",
+        default_branch=lambda: "main",
+        rev_parse_if_exists=lambda ref: heads.get(ref),
+    )
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+        reviewed_branch=followup.branch,
+        reviewed_head_sha="followup-head",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch(
+            "gza.cli.advance_executor._run_lifecycle_verify",
+            return_value=SimpleNamespace(markdown="verify markdown", aggregate_result=verify_result, project_results=()),
+        ) as run_verify,
+    ):
+        result = execute_advance_action(
+            task=followup,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_owner_task": followup,
+            },
+            context=context,
+        )
+
+    refreshed_followup = store.get(followup.id)
+    assert refreshed_followup is not None
+    assert result.status == "success"
+    assert result.work_done is True
+    run_verify.assert_called_once()
+    assert added_refs == ["followup-head"]
+    assert len(store.list_artifacts(original.id, kind=VERIFY_GATE_ARTIFACT_KIND)) == 1
+    assert store.list_artifacts(followup.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_followup,
+        current_epoch=owner_task_verify_epoch(refreshed_followup, config, git),
+    )
+    assert lookup.is_current is True
+    assert lookup.result is not None
+    assert lookup.result.reviewed_branch == followup.branch
+    assert lookup.result.reviewed_head_sha == "followup-head"
+    assert refreshed_followup.review_verify_status == "passed"
+    assert refreshed_followup.review_verify_branch == followup.branch
+    assert refreshed_followup.review_verify_head_sha == "followup-head"
+
+
+def test_verify_gate_same_branch_ancestor_cached_pass_does_not_short_circuit_followup(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    shared_branch = "gza/gza-work"
+
+    original = store.add("Original implementation", task_type="implement")
+    assert original.id is not None
+    _mark_completed(original, branch=shared_branch)
+    store.update(original)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=original,
+        source_task=original,
+        result=_make_review_verify_result(
+            "./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+            reviewed_branch=shared_branch,
+            reviewed_head_sha="ancestor-head",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+
+    review = store.add("Review original", task_type="review", depends_on=original.id, based_on=original.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    followup = store.add("Follow-up from review", task_type="implement", based_on=review.id)
+    assert followup.id is not None
+    _mark_completed(followup, branch=shared_branch)
+    store.update(followup)
+
+    heads = {
+        shared_branch: "followup-head",
+        "main": "base-1",
+        "origin/main": "base-1",
+    }
+    added_refs: list[str] = []
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda ref: heads.get(ref),
+        worktree_add_existing=lambda _path, ref, detach=True: added_refs.append(ref),
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    worktree_git = SimpleNamespace(
+        repo_dir=tmp_path / "tmp-worktree",
+        default_branch=lambda: "main",
+        rev_parse_if_exists=lambda ref: heads.get(ref),
+    )
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+        reviewed_branch=shared_branch,
+        reviewed_head_sha="followup-head",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch(
+            "gza.cli.advance_executor._run_lifecycle_verify",
+            return_value=SimpleNamespace(markdown="verify markdown", aggregate_result=verify_result, project_results=()),
+        ) as run_verify,
+    ):
+        result = execute_advance_action(
+            task=followup,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_owner_task": followup,
+            },
+            context=context,
+        )
+
+    refreshed_followup = store.get(followup.id)
+    assert refreshed_followup is not None
+    assert result.status == "success"
+    assert result.work_done is True
+    run_verify.assert_called_once()
+    assert added_refs == ["followup-head"]
+    assert refreshed_followup.review_verify_status == "passed"
+    assert refreshed_followup.review_verify_head_sha == "followup-head"
+
+
+def test_verify_gate_cached_pass_with_mismatched_subject_head_runs_verify(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    followup = store.add("Follow-up implementation", task_type="implement")
+    assert followup.id is not None
+    _mark_completed(followup, branch="feature/cached-pass-mismatch")
+    store.update(followup)
+
+    heads = {
+        followup.branch: "subject-head",
+        "main": "base-1",
+        "origin/main": "base-1",
+    }
+    added_refs: list[str] = []
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda ref: heads.get(ref),
+        worktree_add_existing=lambda _path, ref, detach=True: added_refs.append(ref),
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    worktree_git = SimpleNamespace(
+        repo_dir=tmp_path / "tmp-worktree",
+        default_branch=lambda: "main",
+        rev_parse_if_exists=lambda ref: heads.get(ref),
+    )
+    stale_pass = SimpleNamespace(
+        reviewed_branch="feature/other-branch",
+        reviewed_head_sha="other-head",
+    )
+    mismatched_decision = SimpleNamespace(
+        state="passed",
+        current_epoch=VerifyEpoch(
+            reviewed_branch="feature/other-branch",
+            reviewed_head_sha="other-head",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+        ),
+        lookup=SimpleNamespace(result=stale_pass),
+    )
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 8, 17, 10, 10, tzinfo=UTC),
+        reviewed_branch=followup.branch,
+        reviewed_head_sha="subject-head",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch("gza.cli.advance_executor.resolve_verify_gate_decision", return_value=mismatched_decision),
+        patch(
+            "gza.cli.advance_executor._run_lifecycle_verify",
+            return_value=SimpleNamespace(markdown="verify markdown", aggregate_result=verify_result, project_results=()),
+        ) as run_verify,
+    ):
+        result = execute_advance_action(
+            task=followup,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_owner_task": followup,
+            },
+            context=context,
+        )
+
+    assert result.status == "success"
+    assert result.work_done is True
+    run_verify.assert_called_once()
+    assert added_refs == ["subject-head"]
+    assert store.list_artifacts(followup.id, kind=VERIFY_GATE_ARTIFACT_KIND)
 
 
 def test_verify_gate_explicit_refresh_reruns_even_when_current_decision_already_passed(tmp_path: Path) -> None:

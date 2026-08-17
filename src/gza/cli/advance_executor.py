@@ -44,7 +44,7 @@ from ..review_tasks import (
     create_spec_coherence_review_task,
     persist_review_clearance_artifact,
 )
-from ..review_verify_state import VerifyEpoch, resolve_verify_gate_decision
+from ..review_verify_state import VerifyEpoch, VerifyGateDecision, owner_task_verify_epoch, resolve_verify_gate_decision
 from ..runner import (
     LifecycleVerifyExecution,
     ProjectReviewVerifyResult,
@@ -53,6 +53,7 @@ from ..runner import (
     _format_review_verify_result,
     _make_review_verify_result,
     _persist_lifecycle_verify_execution,
+    _persist_review_verify_result,
     _project_boundary,
     _resolve_review_verify_base_sha,
     _resolve_review_verify_timeout_settings,
@@ -587,6 +588,21 @@ def _release_reserved_launch_if_left(task: DbTask | None) -> None:
         release_task_launch_permit(str(task.id))
 
 
+def _verify_gate_branch_hint(store: SqliteTaskStore, task: DbTask | None) -> str | None:
+    if task is None:
+        return None
+    if task.branch:
+        return task.branch
+    if task.task_type == "review":
+        for related_id in (task.depends_on, task.based_on):
+            if not related_id:
+                continue
+            related = store.get(related_id)
+            if related is not None and related.branch:
+                return related.branch
+    return None
+
+
 def _resolve_canonical_verify_gate_owner(store: SqliteTaskStore, task: DbTask) -> DbTask:
     owner_task = task
     current_owner: DbTask | None = task
@@ -597,8 +613,47 @@ def _resolve_canonical_verify_gate_owner(store: SqliteTaskStore, task: DbTask) -
             owner_task = current_owner
         if not current_owner.based_on:
             break
-        current_owner = store.get(current_owner.based_on)
+        parent = store.get(current_owner.based_on)
+        if current_owner.task_type == "implement" and parent is not None and parent.task_type == "review":
+            break
+        if (
+            current_owner.task_type == "implement"
+            and current_owner.branch
+            and _verify_gate_branch_hint(store, parent) != current_owner.branch
+        ):
+            break
+        current_owner = parent
     return owner_task
+
+
+def _resolve_verify_gate_subject_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    current_task: DbTask | None = task
+    visited_task_ids: set[str] = set()
+    while current_task is not None and current_task.id is not None and current_task.id not in visited_task_ids:
+        visited_task_ids.add(current_task.id)
+        if current_task.task_type == "implement" and current_task.branch:
+            return current_task
+        if not current_task.based_on:
+            break
+        current_task = store.get(current_task.based_on)
+    return _resolve_canonical_verify_gate_owner(store, task)
+
+
+def _passed_verify_gate_matches_subject(
+    *,
+    decision: VerifyGateDecision,
+    subject_epoch: VerifyEpoch | None,
+) -> bool:
+    result = decision.lookup.result
+    current_epoch = decision.current_epoch
+    if result is None or current_epoch is None or subject_epoch is None:
+        return False
+    return (
+        result.reviewed_branch == subject_epoch.reviewed_branch
+        and result.reviewed_head_sha == subject_epoch.reviewed_head_sha
+        and current_epoch.reviewed_branch == subject_epoch.reviewed_branch
+        and current_epoch.reviewed_head_sha == subject_epoch.reviewed_head_sha
+    )
 
 
 def _skip_duplicate_rebase_creation(
@@ -893,6 +948,7 @@ def _execute_verify_gate(
         owner_task = task
     owner_task = _resolve_canonical_verify_gate_owner(context.store, owner_task)
     expected_owner_task = _resolve_canonical_verify_gate_owner(context.store, task)
+    subject_task = _resolve_verify_gate_subject_task(context.store, task)
     if owner_task.id is None or context.config is None or context.git is None:
         return AdvanceActionExecutionResult(
             action_type=action_type,
@@ -931,8 +987,13 @@ def _execute_verify_gate(
         config=context.config,
         git=context.git,
     )
+    subject_epoch = owner_task_verify_epoch(subject_task, context.config, context.git)
     explicit_refresh = action.get("verify_gate_explicit_refresh") is True
-    if decision.state == "passed" and not explicit_refresh:
+    passed_decision_matches_subject = _passed_verify_gate_matches_subject(
+        decision=decision,
+        subject_epoch=subject_epoch,
+    )
+    if decision.state == "passed" and not explicit_refresh and passed_decision_matches_subject:
         return AdvanceActionExecutionResult(
             action_type=action_type,
             status="success",
@@ -949,7 +1010,7 @@ def _execute_verify_gate(
             attention_reason="verify-gate-blocked",
             handled_task_id=owner_task.id,
         )
-    current_epoch = decision.current_epoch
+    current_epoch = subject_epoch if decision.state == "passed" and not passed_decision_matches_subject else decision.current_epoch
     if current_epoch is None or not current_epoch.reviewed_head_sha or not current_epoch.reviewed_branch:
         return AdvanceActionExecutionResult(
             action_type=action_type,
@@ -1030,6 +1091,13 @@ def _execute_verify_gate(
             timeout_grace_seconds=timeout_grace_seconds,
             artifact_task=owner_task,
         )
+        _persist_review_verify_result(
+            owner_task,
+            persisted_result,
+            markdown=execution.markdown,
+            artifact_file=_artifact_path,
+        )
+        context.store.update(owner_task)
         live_head_after = context.git.rev_parse_if_exists(current_epoch.reviewed_branch)
         if live_head_after != current_epoch.reviewed_head_sha:
             return AdvanceActionExecutionResult(

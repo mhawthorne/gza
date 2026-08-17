@@ -159,6 +159,32 @@ def _latest_review_resolution_progress_marker(
     }
 
 
+def _verify_gate_progress_marker(task: DbTask | None) -> dict[str, object | None] | None:
+    if task is None:
+        return None
+    if (
+        task.review_verify_command is None
+        and task.review_verify_status is None
+        and task.review_verify_exit_status is None
+        and task.review_verify_head_sha is None
+        and task.review_verify_branch is None
+        and task.review_verify_captured_at is None
+    ):
+        return None
+    return {
+        "review_verify_command": task.review_verify_command,
+        "review_verify_status": task.review_verify_status,
+        "review_verify_exit_status": task.review_verify_exit_status,
+        "review_verify_branch": task.review_verify_branch,
+        "review_verify_head_sha": task.review_verify_head_sha,
+        "review_verify_captured_at": (
+            _normalize_time(task.review_verify_captured_at).isoformat()
+            if task.review_verify_captured_at is not None
+            else None
+        ),
+    }
+
+
 def build_watch_progress_candidate(
     store: SqliteTaskStore,
     *,
@@ -206,6 +232,10 @@ def build_watch_progress_candidate(
     )
     if review_resolution_marker is not None:
         evidence["review_resolution_marker"] = review_resolution_marker
+    if action_type == "verify_gate":
+        verify_gate_marker = _verify_gate_progress_marker(action_task or subject_task)
+        if verify_gate_marker is not None:
+            evidence["verify_gate_marker"] = verify_gate_marker
     return WatchProgressCandidate(
         subject_kind=subject_kind,
         subject_id=subject_id,
