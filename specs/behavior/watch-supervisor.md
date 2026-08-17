@@ -93,6 +93,28 @@ Each watch cycle MUST execute these phases in order:
    also includes the resolved automation timeout settings. For configured gates, an older
    checkpoint that lacks the required environment identity MUST be treated as stale rather
    than reused optimistically.
+   Watch MUST keep local-target verify progress truthful and concise. It MAY first emit a
+   checkpoint-status line that says the verify will run if the checkpoint is stale or if a
+   red result needs bounded confirmation, but that line MUST NOT describe an active suite
+   execution. When a configured-gate checkpoint is stale or a current red checkpoint needs
+   bounded confirmation and watch is about to execute the suite, watch MUST emit a
+   distinct actual-run start line immediately before attempt 1 starts; that line MUST
+   include attempt numbering as `1/<bounded-total>`, the target branch and resolved target
+   SHA when available, and a note that the suite may take a while. If the target SHA
+   cannot be resolved because of an expected Git lookup failure, watch MUST emit a concise
+   `WARN` explaining why the SHA is unavailable before displaying `unknown`; programming
+   errors in target lookup MUST surface instead of being rendered as `unknown`. Bounded
+   merge-halting reruns MUST use the same total-attempt count and concise rerun lines,
+   and those rerun lines MUST describe the preceding evidence truthfully: `red` only for
+   an actual failed gate verdict, `unavailable` for unavailable freshness or environment
+   evidence, and `unknown` for malformed evidence. Completion
+   output MUST include the verdict, the target/SHA, elapsed time, and the performed
+   attempt count when a suite ran;
+   red completions MUST also name the failing phase when structured phase evidence exists.
+   Cached checkpoint completions MUST be visibly marked as cached and MUST NOT include the
+   actual-run start line. Under `--quiet` and `--yes`, raw verify command stdout MUST be
+   suppressed; under `--yes`, watch MUST still keep structured checkpoint, start, rerun,
+   warning, completion, and attention stdout visible.
    Independently of tree change, a configured-gate checkpoint that is not `passed` MUST
    expire after a bounded configured TTL and be rerun on that cadence so red/unavailable
    results cannot persist indefinitely on an unchanged target tree. If the current

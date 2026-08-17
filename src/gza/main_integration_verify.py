@@ -37,6 +37,7 @@ VERIFY_COMMAND_OUTPUT_ARTIFACT_KIND = "verify_command_output"
 MAIN_VERIFY_REMEDIATION_ARTIFACT_MAX_BYTES = 32 * 1024
 MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_LINES = 24
 MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_CHARS = 2000
+_HEAD_SHA_UNSET = object()
 _VERIFY_PHASE_LAUNCH_FAILURE_RE = re.compile(
     r"verify_phase: failed to launch command (?P<command>\[.+?\]): (?P<detail>.+)"
 )
@@ -1067,12 +1068,15 @@ def run_main_integration_verify(
     *,
     reason: str,
     runner_class: Literal["host", "container"] = "host",
+    resolved_head_sha: str | None | object = _HEAD_SHA_UNSET,
 ) -> MainIntegrationVerifyState:
     """Run the configured verify gate against the current local target checkout."""
     task = ensure_main_integration_verify_task(store)
     prior_state = load_main_integration_verify_state(store)
     captured_at = datetime.now(UTC)
-    head_sha = _coerce_optional_str(git.rev_parse_if_exists("HEAD"))
+    if resolved_head_sha is _HEAD_SHA_UNSET:
+        resolved_head_sha = git.rev_parse_if_exists("HEAD")
+    head_sha = _coerce_optional_str(resolved_head_sha)
     gate = _current_gate_identity(config, runner_class=runner_class)
     verify_command = gate.verify_command or ""
     gate_enabled = gate.gate_enabled
@@ -1120,7 +1124,7 @@ def run_main_integration_verify(
             failure=_build_launch_issue_failure(launch_issue),
             output=result.output,
         )
-    tree_fingerprint = _verify_tree_fingerprint(result.output) or _compute_tree_fingerprint(git)
+    tree_fingerprint = _verify_tree_fingerprint(result.output) or _compute_tree_fingerprint(git, head_sha=head_sha)
     capture_metadata: dict[str, Any] = {
         "reason": reason,
         "timeout_seconds": gate.verify_timeout_seconds,
@@ -1217,6 +1221,8 @@ def _run_integration_verify_with_red_reruns(
     reason: str,
     red_reruns: int,
     prior_red_state: IntegrationVerifyEvidence | None = None,
+    on_initial_run_start: Callable[[int, int], None] | None = None,
+    on_red_rerun_start: Callable[[int, int, IntegrationVerifyEvidence], None] | None = None,
 ) -> tuple[
     IntegrationVerifyEvidence,
     MainIntegrationVerifyRemediation | None,
@@ -1224,8 +1230,11 @@ def _run_integration_verify_with_red_reruns(
     int,
 ]:
     """Run verify, optionally rerunning red verdicts to classify flakes vs deterministic reds."""
+    total_attempts = red_reruns + 1
+    if on_initial_run_start is not None:
+        on_initial_run_start(1, total_attempts)
     state = run_once(reason)
-    verify_runs = 1
+    verify_runs = 1 if getattr(state, "gate_enabled", True) else 0
     if red_reruns <= 0:
         return state, None, None, verify_runs
 
@@ -1260,6 +1269,8 @@ def _run_integration_verify_with_red_reruns(
 
     confirmed_red_state = state
     for attempt in range(1, red_reruns + 1):
+        if on_red_rerun_start is not None:
+            on_red_rerun_start(attempt + 1, total_attempts, state)
         rerun_state = run_once(f"{reason}-rerun-{attempt}")
         verify_runs += 1
         if not _verify_result_halts_merges(
@@ -1293,7 +1304,12 @@ def _run_main_integration_verify_with_red_reruns(
     red_reruns: int,
     runner_class: Literal["host", "container"] = "host",
     prior_red_state: MainIntegrationVerifyState | None = None,
+    resolved_head_sha: str | None | object = _HEAD_SHA_UNSET,
+    on_initial_run_start: Callable[[int, int], None] | None = None,
+    on_red_rerun_start: Callable[[int, int, IntegrationVerifyEvidence], None] | None = None,
 ) -> tuple[MainIntegrationVerifyState, MainIntegrationVerifyRemediation | None, int]:
+    current_gate = _current_gate_identity(config, runner_class=runner_class)
+    gated_initial_run_start = on_initial_run_start if current_gate.gate_enabled else None
     state, remediation, remediation_source_state, verify_runs = _run_integration_verify_with_red_reruns(
         lambda run_reason: run_main_integration_verify(
             config,
@@ -1301,10 +1317,13 @@ def _run_main_integration_verify_with_red_reruns(
             git,
             reason=run_reason,
             runner_class=runner_class,
+            resolved_head_sha=resolved_head_sha,
         ),
         reason=reason,
         red_reruns=red_reruns,
         prior_red_state=prior_red_state,
+        on_initial_run_start=gated_initial_run_start,
+        on_red_rerun_start=on_red_rerun_start,
     )
     main_state = cast(MainIntegrationVerifyState, state)
     if remediation is not None:
@@ -1335,10 +1354,15 @@ def check_main_integration_verify(
     force: bool = False,
     red_reruns: int = 0,
     runner_class: Literal["host", "container"] = "host",
+    resolved_head_sha: str | None | object = _HEAD_SHA_UNSET,
+    on_initial_run_start: Callable[[int, int], None] | None = None,
+    on_red_rerun_start: Callable[[int, int, IntegrationVerifyEvidence], None] | None = None,
 ) -> MainIntegrationVerifyCheck:
     """Reuse or refresh local-main verify state for the current tree and gate identity."""
-    current_tree_fingerprint = _compute_tree_fingerprint(git)
-    current_head_sha = _coerce_optional_str(git.rev_parse_if_exists("HEAD"))
+    if resolved_head_sha is _HEAD_SHA_UNSET:
+        resolved_head_sha = git.rev_parse_if_exists("HEAD")
+    current_head_sha = _coerce_optional_str(resolved_head_sha)
+    current_tree_fingerprint = _compute_tree_fingerprint(git, head_sha=current_head_sha)
     current_gate = _current_gate_identity(config, runner_class=runner_class)
     state = load_main_integration_verify_state(store)
     prior_red_signature = (
@@ -1410,6 +1434,9 @@ def check_main_integration_verify(
         red_reruns=red_reruns,
         runner_class=runner_class,
         prior_red_state=state if checkpoint_is_current else None,
+        resolved_head_sha=current_head_sha,
+        on_initial_run_start=on_initial_run_start,
+        on_red_rerun_start=on_red_rerun_start,
     )
     resolved_signature = None
     if not _verify_result_halts_merges(
@@ -1550,6 +1577,7 @@ def check_candidate_integration_verify(
     reason: str,
     red_reruns: int = 0,
     runner_class: Literal["host", "container"] = "host",
+    on_red_rerun_start: Callable[[int, int, IntegrationVerifyEvidence], None] | None = None,
 ) -> CandidateIntegrationVerifyCheck:
     """Run candidate integration verify for an exact checkout without touching main state."""
     evidence, remediation, _remediation_source_state, verify_runs = _run_integration_verify_with_red_reruns(
@@ -1561,6 +1589,7 @@ def check_candidate_integration_verify(
         ),
         reason=reason,
         red_reruns=red_reruns,
+        on_red_rerun_start=on_red_rerun_start,
     )
     evidence = cast(CandidateIntegrationVerifyEvidence, evidence)
     classification = _classify_candidate_integration_verify(evidence, remediation)

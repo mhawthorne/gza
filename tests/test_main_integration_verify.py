@@ -4,6 +4,7 @@ import json
 import platform
 import sys
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Literal
 from unittest.mock import MagicMock, patch
 
@@ -23,7 +24,7 @@ from gza.main_integration_verify import (
     persist_main_integration_verify_alert_message,
     run_main_integration_verify,
 )
-from gza.runner import _make_review_verify_result
+from gza.runner import _compute_tree_fingerprint, _make_review_verify_result
 from tests.cli.conftest import make_store, setup_config
 
 
@@ -724,6 +725,262 @@ def test_check_main_integration_verify_treats_environment_identity_mismatch_as_s
     run_verify.assert_called_once()
     assert check.performed_verify is True
     assert check.state.environment_identity == _current_host_identity()
+
+
+def test_check_main_integration_verify_emits_initial_start_before_stale_verify_body(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    events: list[tuple[str, int | None, int | None]] = []
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 23, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+
+    def run_verify_body(*_args, **_kwargs):
+        events.append(("body", None, None))
+        return verify_result
+
+    def capture_verify_result(_config, _store, task, result, **_kwargs) -> None:
+        task.review_verify_command = result.command
+        task.review_verify_status = result.status
+        task.review_verify_exit_status = result.exit_status
+        task.review_verify_failure = result.failure
+        task.review_verify_head_sha = result.reviewed_head_sha
+        task.review_verify_branch = result.reviewed_branch
+        task.review_verify_captured_at = result.captured_at
+        store.update(task)
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", side_effect=["fp-live", "fp-live"]),
+        patch("gza.main_integration_verify._run_review_verify_command", side_effect=run_verify_body),
+        patch("gza.main_integration_verify._capture_review_verify_result", side_effect=capture_verify_result),
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="watch-main-verify",
+            red_reruns=2,
+            on_initial_run_start=lambda attempt, total: events.append(("start", attempt, total)),
+        )
+
+    assert check.performed_verify is True
+    assert events == [("start", 1, 3), ("body", None, None)]
+
+
+def test_check_main_integration_verify_does_not_emit_initial_start_for_disabled_gate(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    starts: list[tuple[int, int]] = []
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-live"),
+        patch("gza.main_integration_verify._run_review_verify_command") as run_verify,
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="watch-main-verify",
+            red_reruns=2,
+            on_initial_run_start=lambda attempt, total: starts.append((attempt, total)),
+        )
+
+    run_verify.assert_not_called()
+    assert check.performed_verify is True
+    assert check.verify_runs == 0
+    assert check.state.gate_enabled is False
+    assert check.state.verify_status == "unavailable"
+    assert starts == []
+
+
+def test_check_main_integration_verify_does_not_emit_initial_start_for_cached_checkpoint(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _seed_main_verify_task(
+        store,
+        verify_status="passed",
+        verify_exit_status="0",
+        failure="",
+        alert_message="",
+    )
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    starts: list[tuple[int, int]] = []
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-verified"),
+        patch("gza.main_integration_verify._run_review_verify_command") as run_verify,
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="watch-main-verify",
+            red_reruns=2,
+            on_initial_run_start=lambda attempt, total: starts.append((attempt, total)),
+        )
+
+    run_verify.assert_not_called()
+    assert check.performed_verify is False
+    assert starts == []
+
+
+def test_compute_tree_fingerprint_explicit_missing_head_is_not_reusable_for_clean_target(tmp_path) -> None:
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git._run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    assert _compute_tree_fingerprint(git, head_sha=None) is None
+    git._run.assert_not_called()
+
+    concrete = _compute_tree_fingerprint(git, head_sha="abc123")
+
+    assert isinstance(concrete, str)
+    assert len(concrete) == 64
+
+
+def test_check_main_integration_verify_unknown_head_does_not_cache_green_across_clean_targets(tmp_path) -> None:
+    setup_config(tmp_path)
+    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "verify_command: ./bin/tests\n")
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = None
+    git._run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    first_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 23, 12, 0, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha=None,
+        working_directory=str(tmp_path),
+        output="first clean target passed",
+    )
+    second_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 23, 12, 5, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha=None,
+        working_directory=str(tmp_path),
+        output="second clean target passed",
+    )
+
+    with patch(
+        "gza.main_integration_verify._run_review_verify_command",
+        side_effect=[first_result, second_result],
+    ) as run_verify:
+        first = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="unknown-head-first-clean-target",
+            resolved_head_sha=None,
+        )
+        second = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="unknown-head-second-clean-target",
+            resolved_head_sha=None,
+        )
+
+    assert run_verify.call_count == 2
+    assert first.performed_verify is True
+    assert first.current_tree_fingerprint is None
+    assert first.state.tree_fingerprint is None
+    assert first.state.verify_status == "unavailable"
+    assert first.state.verify_exit_status == MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
+    assert first.merges_halted is True
+    assert second.performed_verify is True
+    assert second.current_tree_fingerprint is None
+    assert second.state.tree_fingerprint is None
+    assert second.state.verify_status == "unavailable"
+    assert second.state.verify_exit_status == MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
+    assert second.merges_halted is True
+
+
+def test_check_main_integration_verify_structured_fingerprint_establishes_freshness_when_head_unknown(
+    tmp_path,
+) -> None:
+    setup_config(tmp_path)
+    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "verify_command: ./bin/tests\n")
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = None
+    git._run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    fingerprint = "a" * 64
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 23, 12, 0, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha=None,
+        working_directory=str(tmp_path),
+        output=f"gza-verify phase=passed name=unit duration_seconds=1.0 tree_fingerprint={fingerprint}",
+    )
+
+    with patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result) as run_verify:
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="unknown-head-structured-fingerprint",
+            resolved_head_sha=None,
+        )
+
+    run_verify.assert_called_once()
+    assert check.performed_verify is True
+    assert check.current_tree_fingerprint is None
+    assert check.state.tree_fingerprint == fingerprint
+    assert check.state.verify_status == "passed"
+    assert check.merges_halted is False
 
 
 def test_check_main_integration_verify_reuses_checkpoint_when_only_python_path_differs(tmp_path) -> None:

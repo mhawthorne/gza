@@ -127,10 +127,13 @@ from gza.git_health import (
 )
 from gza.lineage_query import LineageOwnerRow
 from gza.main_integration_verify import (
+    MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_TAG,
     CandidateIntegrationVerifyCheck,
     CandidateIntegrationVerifyEvidence,
     MainIntegrationVerifyEnvironmentIdentity,
+    MainIntegrationVerifyCheck,
+    MainIntegrationVerifyState,
     check_main_integration_verify,
     current_main_integration_verify_alert,
     load_main_integration_verify_state,
@@ -365,6 +368,9 @@ def _make_watch_git() -> Git:
     git.branch_exists = MagicMock(return_value=True)  # type: ignore[method-assign]
     git.branches_exist = MagicMock(return_value={})  # type: ignore[method-assign]
     git.ref_exists = MagicMock(return_value=False)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "watchtestheadsha" if ref == "HEAD" else None
+    )
     git.resolve_refs = MagicMock(return_value={})  # type: ignore[method-assign]
     git.worktree_list = MagicMock(return_value=[{"path": str(git.repo_dir)}])  # type: ignore[method-assign]
     git.can_merge = MagicMock(return_value=True)  # type: ignore[method-assign]
@@ -1012,10 +1018,10 @@ def test_watch_cycle_spawns_iterate_for_implement_and_plain_for_plan(tmp_path: P
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
         patch("gza.cli.watch._wait_for_watch_dispatch_start", side_effect=_wait_for_dispatch_start_from_store(store)),
-        ):
-            result = _run_cycle_and_emit_transition_events(
-                config=config,
-                store=store,
+    ):
+        result = _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
             batch=2,
             max_iterations=10,
             dry_run=False,
@@ -1966,10 +1972,7 @@ def test_watch_cycle_default_mode_spawn_failure_reuses_pending_resume_child_next
 def test_watch_cycle_default_mode_non_actionable_failed_row_starts_pending(tmp_path: Path) -> None:
     """Plain watch should move on to pending work when the scoped failed row is not auto-recoverable."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
-        "db_path: .gza/gza.db\n"
-        "max_resume_attempts: 0\n"
-        "quiet_period_seconds: 0\n"
+        "project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 0\nquiet_period_seconds: 0\n"
     )
     store = make_store(tmp_path)
 
@@ -2117,7 +2120,9 @@ def test_watch_cycle_owner_plan_attention_emits_once_even_with_skipped_failed_de
     assert result.work_done is True
     attention_lines = [line for line in log_path.read_text().splitlines() if "ATTENTION" in line]
     assert len(attention_lines) >= 1
-    assert any("reason=manual-failure-reason" in line and f"failed leaf {failed_rebase.id}" in line for line in attention_lines)
+    assert any(
+        "reason=manual-failure-reason" in line and f"failed leaf {failed_rebase.id}" in line for line in attention_lines
+    )
 
 
 def test_watch_cycle_actionable_failed_descendant_still_spawns_recovery_worker(tmp_path: Path) -> None:
@@ -2188,8 +2193,12 @@ def test_watch_cycle_logs_undispatched_transient_recovery_decision(tmp_path: Pat
             return_value={"type": "wait_review", "description": "SKIP: waiting for review"},
         ),
         patch("gza.cli.watch._determine_recovery_lane_action", side_effect=_force_undispatched_recovery),
-        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("recovery worker should not launch")),
-        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("recovery worker should not launch")),
+        patch(
+            "gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("recovery worker should not launch")
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_worker", side_effect=AssertionError("recovery worker should not launch")
+        ),
     ):
         result = _run_cycle(
             config=config,
@@ -2450,8 +2459,8 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch(
             "gza.cli.watch._spawn_background_iterate",
-            side_effect=lambda _args, _config, _task, *, prepared_task_id, **_kwargs: (
-                _mark_watch_task_running(store, prepared_task_id)
+            side_effect=lambda _args, _config, _task, *, prepared_task_id, **_kwargs: _mark_watch_task_running(
+                store, prepared_task_id
             ),
         ) as spawn_iterate,
     ):
@@ -2481,15 +2490,12 @@ def test_watch_cycle_recovery_mode_retries_failed_implement_via_iterate_child(tm
     log_text = log_path.read_text()
     assert result.running == 1
     assert result.confirmed_start_count == 1
-    assert (
-        any("RECOVR" in line and f"{failed.id} retry via iterate -> {spawned_child_id}" in line for line in log_text.splitlines())
-        or any(
-            line.split(maxsplit=2)[1] == "START"
-            and spawned_child_id in line
-            and failed.id in line
-            and "[retry of " in line
-            for line in log_text.splitlines()
-        )
+    assert any(
+        "RECOVR" in line and f"{failed.id} retry via iterate -> {spawned_child_id}" in line
+        for line in log_text.splitlines()
+    ) or any(
+        line.split(maxsplit=2)[1] == "START" and spawned_child_id in line and failed.id in line and "[retry of " in line
+        for line in log_text.splitlines()
     )
     assert not any(
         "RECOVR" in line and f"{failed.id} resume via iterate -> {spawned_child_id}" in line
@@ -2587,7 +2593,9 @@ def test_watch_cycle_recovery_launch_no_show_emits_start_failed_instead_of_start
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")
+        ),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch(
             "gza.cli.watch._settle_watch_dispatch_starts",
@@ -2649,7 +2657,9 @@ def test_watch_cycle_recovery_launch_pending_then_running_next_boundary_emits_st
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")
+        ),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch(
             "gza.cli.watch._settle_watch_dispatch_starts",
@@ -2728,7 +2738,9 @@ def test_watch_cycle_recovery_launch_terminal_before_confirmation_boundary_does_
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")
+        ),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch(
             "gza.cli.watch._settle_watch_dispatch_starts",
@@ -3532,7 +3544,9 @@ def test_watch_cycle_executes_only_planned_recovery_ids_and_preserves_pending_sl
         task.completed_at = datetime.now(UTC)
         store.update(task)
 
-    first_retry_child = store.add(first_failed.prompt, task_type="implement", based_on=first_failed.id, recovery_origin="retry")
+    first_retry_child = store.add(
+        first_failed.prompt, task_type="implement", based_on=first_failed.id, recovery_origin="retry"
+    )
     second_retry_child = store.add(
         second_failed.prompt,
         task_type="implement",
@@ -3612,7 +3626,14 @@ def test_watch_cycle_executes_only_planned_recovery_ids_and_preserves_pending_sl
             recovery_attention_rows=(),
             recovery_visible_skips=(),
             actionable_failed=(
-                (first_row, first_failed, first_decision, {"type": "retry", "description": "Retry first"}, True, first_failed),
+                (
+                    first_row,
+                    first_failed,
+                    first_decision,
+                    {"type": "retry", "description": "Retry first"},
+                    True,
+                    first_failed,
+                ),
                 (
                     second_row,
                     second_failed,
@@ -3688,8 +3709,14 @@ def test_watch_cycle_executes_only_planned_recovery_ids_and_preserves_pending_sl
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
         patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
         patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _config, task, **_kwargs: task),
-        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("retry worker should stay on plain worker path")),
-        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("retry worker should not use resume path")),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("retry worker should stay on plain worker path"),
+        ),
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker",
+            side_effect=AssertionError("retry worker should not use resume path"),
+        ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=spawn_worker),
         patch(
             "gza.cli.watch._settle_watch_dispatch_starts",
@@ -3713,8 +3740,7 @@ def test_watch_cycle_executes_only_planned_recovery_ids_and_preserves_pending_sl
     log_text = log_path.read_text()
     assert second_retry_child.id not in started_task_ids
     assert not any(
-        line.split(maxsplit=2)[1] == "START" and second_retry_child.id in line
-        for line in log_text.splitlines()
+        line.split(maxsplit=2)[1] == "START" and second_retry_child.id in line for line in log_text.splitlines()
     )
     assert any(line.split(maxsplit=2)[1] == "START" and pending_plan.id in line for line in log_text.splitlines())
 
@@ -3747,7 +3773,9 @@ def test_watch_dispatch_preview_recovery_preflight_rebase_is_runnable_and_consum
         side_effect=lambda ref: "target-tip" if ref == "main" else "branch-tip"
     )
     git.is_ancestor = MagicMock(  # type: ignore[method-assign]
-        side_effect=lambda ancestor, descendant: ancestor == "main" and descendant == f"origin/{failed_impl.branch}" and False
+        side_effect=lambda ancestor, descendant: (
+            ancestor == "main" and descendant == f"origin/{failed_impl.branch}" and False
+        )
     )
     preview = build_dispatch_preview(
         store,
@@ -4112,7 +4140,9 @@ def test_watch_cycle_pending_launch_uses_planned_pending_entry_identities(
     log_text = log_path.read_text()
     if dry_run:
         assert started_task_ids == []
-        assert any("START" in line and str(second_pending.id) in line and "[dry-run]" in line for line in log_text.splitlines())
+        assert any(
+            "START" in line and str(second_pending.id) in line and "[dry-run]" in line for line in log_text.splitlines()
+        )
     else:
         assert started_task_ids == [second_pending.id]
         assert any("START" in line and str(second_pending.id) in line for line in log_text.splitlines())
@@ -5187,7 +5217,11 @@ def test_watch_cycle_needs_rebase_followup_does_not_start_unplanned_retry(
                     rebase_row,
                     failed_rebase,
                     needs_rebase_decision,
-                    {"type": "needs_rebase", "description": "Queue rebase before retry", "reason": "recovery-preflight-rebase"},
+                    {
+                        "type": "needs_rebase",
+                        "description": "Queue rebase before retry",
+                        "reason": "recovery-preflight-rebase",
+                    },
                     True,
                     failed_rebase,
                 ),
@@ -5244,28 +5278,33 @@ def test_watch_cycle_needs_rebase_followup_does_not_start_unplanned_retry(
                 state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
             ),
         ),
-        patch("gza.cli.watch.build_dispatch_preview", return_value=DispatchPreview(entries=(
-            DispatchPreviewEntry(
-                lane="recovery",
-                task=failed_rebase,
-                owner_task=failed_rebase,
-                runnable=True,
-                worker_consuming=True,
-                decision=needs_rebase_decision,
-                advance_action={"type": "needs_rebase"},
-                lineage_row=rebase_row,
+        patch(
+            "gza.cli.watch.build_dispatch_preview",
+            return_value=DispatchPreview(
+                entries=(
+                    DispatchPreviewEntry(
+                        lane="recovery",
+                        task=failed_rebase,
+                        owner_task=failed_rebase,
+                        runnable=True,
+                        worker_consuming=True,
+                        decision=needs_rebase_decision,
+                        advance_action={"type": "needs_rebase"},
+                        lineage_row=rebase_row,
+                    ),
+                    DispatchPreviewEntry(
+                        lane="recovery",
+                        task=failed_retry,
+                        owner_task=failed_retry,
+                        runnable=True,
+                        worker_consuming=True,
+                        decision=retry_decision,
+                        advance_action={"type": "retry"},
+                        lineage_row=retry_row,
+                    ),
+                )
             ),
-            DispatchPreviewEntry(
-                lane="recovery",
-                task=failed_retry,
-                owner_task=failed_retry,
-                runnable=True,
-                worker_consuming=True,
-                decision=retry_decision,
-                advance_action={"type": "retry"},
-                lineage_row=retry_row,
-            ),
-        ))),
+        ),
         patch("gza.cli.watch.execute_advance_action", side_effect=_fake_execute_advance_action),
         patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _config, task, **_kwargs: task),
         patch("gza.cli.watch._spawn_background_worker", side_effect=_fake_spawn_background_worker),
@@ -5733,8 +5772,14 @@ def test_watch_cycle_planned_recovery_mapping_drift_fails_closed_without_pending
         patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
         patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
-        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("drifted recovery plan should fail closed before pending starts")),
-        patch("gza.cli.watch.execute_advance_action", side_effect=AssertionError("drifted recovery plan should not execute unrelated recovery rows")),
+        patch(
+            "gza.cli.watch._spawn_background_worker",
+            side_effect=AssertionError("drifted recovery plan should fail closed before pending starts"),
+        ),
+        patch(
+            "gza.cli.watch.execute_advance_action",
+            side_effect=AssertionError("drifted recovery plan should not execute unrelated recovery rows"),
+        ),
     ):
         result = _run_cycle(
             config=config,
@@ -5852,7 +5897,10 @@ def test_watch_cycle_replan_executes_resume_recovery_entries(
                     reconcile_row,
                     failed_reconcile,
                     reconcile_decision,
-                    {"type": "reconcile_branch_divergence", "description": "Reconcile branch publication before queue pickup"},
+                    {
+                        "type": "reconcile_branch_divergence",
+                        "description": "Reconcile branch publication before queue pickup",
+                    },
                     False,
                     failed_reconcile,
                 ),
@@ -6063,7 +6111,10 @@ def test_watch_cycle_replan_executes_fresh_retry_recovery_entries(
                     reconcile_row,
                     failed_reconcile,
                     reconcile_decision,
-                    {"type": "reconcile_branch_divergence", "description": "Reconcile branch publication before queue pickup"},
+                    {
+                        "type": "reconcile_branch_divergence",
+                        "description": "Reconcile branch publication before queue pickup",
+                    },
                     False,
                     failed_reconcile,
                 ),
@@ -7217,10 +7268,7 @@ def test_watch_cycle_task_creating_advance_spawn_failure_is_not_retried_in_step3
         assert any("START_FAILED" in line and child_id in line for line in log_lines)
     else:
         assert any("START_FAILED" in line and child_id in line for line in log_lines)
-    assert not any(
-        line.split(maxsplit=2)[1] == "START" and f"{child_id} {child_type}" in line
-        for line in log_lines
-    )
+    assert not any(line.split(maxsplit=2)[1] == "START" and f"{child_id} {child_type}" in line for line in log_lines)
 
 
 def test_count_live_workers_dedupes_registry_and_in_progress_rows_by_pid(tmp_path: Path) -> None:
@@ -7645,7 +7693,9 @@ def test_watch_cycle_pending_wave_settles_two_unproven_starts_in_single_window(t
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
         patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
-        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("plan pickup should use plain worker")),
+        patch(
+            "gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("plan pickup should use plain worker")
+        ),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
         patch("gza.cli.watch._watch_dispatch_start_state", side_effect=probe_start_state),
         patch("gza.cli.watch.time.monotonic", side_effect=lambda: next(monotonic_values)),
@@ -7765,27 +7815,36 @@ def test_format_wake_message_includes_running_task_ids() -> None:
 
 
 def test_format_sleep_message_includes_draining_workers_and_cycle_start_label() -> None:
-    assert _format_sleep_message(
-        poll=300,
-        pending=20,
-        running=2,
-        confirmed_start_count=0,
-        anonymous_worker_count=1,
-    ) == "sleeping 300s (20 pending, 2 running (+1 draining))"
-    assert _format_sleep_message(
-        poll=300,
-        pending=20,
-        running=2,
-        confirmed_start_count=2,
-        anonymous_worker_count=1,
-    ) == "sleeping 300s (20 pending, 2 running (+1 draining); +2 started this pass)"
-    assert _format_sleep_message(
-        poll=300,
-        pending=20,
-        running=1,
-        confirmed_start_count=0,
-        starting_worker_count=1,
-    ) == "sleeping 300s (20 pending, 1 running (+1 starting))"
+    assert (
+        _format_sleep_message(
+            poll=300,
+            pending=20,
+            running=2,
+            confirmed_start_count=0,
+            anonymous_worker_count=1,
+        )
+        == "sleeping 300s (20 pending, 2 running (+1 draining))"
+    )
+    assert (
+        _format_sleep_message(
+            poll=300,
+            pending=20,
+            running=2,
+            confirmed_start_count=2,
+            anonymous_worker_count=1,
+        )
+        == "sleeping 300s (20 pending, 2 running (+1 draining); +2 started this pass)"
+    )
+    assert (
+        _format_sleep_message(
+            poll=300,
+            pending=20,
+            running=1,
+            confirmed_start_count=0,
+            starting_worker_count=1,
+        )
+        == "sleeping 300s (20 pending, 1 running (+1 starting))"
+    )
     assert _format_wake_message(
         running=2,
         runnable_pending=3,
@@ -8714,9 +8773,7 @@ def test_watch_cycle_emits_isolated_promotion_warning_lines(
 ) -> None:
     """Watch must mirror isolated promotion stash notices into watch.log WARN lines."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
-        "db_path: .gza/gza.db\n"
-        "main_checkout_isolate: true\n"
+        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
     )
     store = make_store(tmp_path)
 
@@ -8777,10 +8834,7 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_checkout_after_preflight_fa
 ) -> None:
     """A stale isolated checkout at watch-pass start should rebuild once and still allow same-pass merges."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
-        "db_path: .gza/gza.db\n"
-        "main_checkout_isolate: true\n"
-        "quiet_period_seconds: 0\n"
+        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nquiet_period_seconds: 0\n"
     )
     store = make_store(tmp_path)
 
@@ -10275,15 +10329,15 @@ def test_watch_cycle_remote_only_target_proof_keeps_same_branch_followup_actiona
         can_merge=MagicMock(return_value=False),
     )
     with (
-            patch("gza.cli._common.reconcile_in_progress_tasks"),
-            patch("gza.cli._common.prune_terminal_dead_workers"),
-            patch("gza.cli.watch.Git", return_value=repo_git),
-            patch("gza.cli.watch.execute_advance_action") as execute_action,
-            patch(
-                "gza.cli.watch.check_main_integration_verify",
-                return_value=SimpleNamespace(merges_halted=False),
-            ),
-        ):
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.execute_advance_action") as execute_action,
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False),
+        ),
+    ):
         result = _run_cycle(
             config=config,
             store=store,
@@ -10312,8 +10366,7 @@ def test_watch_cycle_remote_only_target_proof_keeps_same_branch_followup_actiona
     repo_git.is_merged.assert_not_called()
     log_text = log_path.read_text()
     assert (
-        f'ATTENTION {owner.id} implement "Watch implement owner" '
-        "reason=merge-source-needs-manual-resolution"
+        f'ATTENTION {owner.id} implement "Watch implement owner" reason=merge-source-needs-manual-resolution'
     ) in log_text
 
 
@@ -11001,9 +11054,7 @@ def test_watch_cycle_blocked_candidate_verify_emits_sticky_attention_and_leaves_
         "ATTENTION "
         f"{task.id}: candidate verify blocked promotion on fp-darwin-candidate; phase `unit` failed before main changed"
     ) in log_text
-    assert sum(
-        1 for line in log_text.splitlines() if "ATTENTION " in line and "fp-darwin-candidate" in line
-    ) == 1
+    assert sum(1 for line in log_text.splitlines() if "ATTENTION " in line and "fp-darwin-candidate" in line) == 1
 
 
 def test_watch_cycle_batches_isolated_merges_under_one_candidate_verify_and_skips_duplicate_post_merge_verify(
@@ -11073,7 +11124,10 @@ def test_watch_cycle_batches_isolated_merges_under_one_candidate_verify_and_skip
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
         patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
-        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=lambda *_args, **kwargs: staged_entries[_args[3].id]),
+        patch(
+            "gza.cli.watch._stage_isolated_merge_action",
+            side_effect=lambda *_args, **kwargs: staged_entries[_args[3].id],
+        ),
         patch(
             "gza.cli.watch.check_candidate_integration_verify",
             return_value=CandidateIntegrationVerifyCheck(
@@ -11204,7 +11258,10 @@ def test_watch_cycle_isolated_batch_pass_without_exact_live_candidate_proof_bloc
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
         patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
-        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=lambda *_args, **kwargs: staged_entries[_args[3].id]),
+        patch(
+            "gza.cli.watch._stage_isolated_merge_action",
+            side_effect=lambda *_args, **kwargs: staged_entries[_args[3].id],
+        ),
         patch(
             "gza.cli.watch.check_candidate_integration_verify",
             return_value=CandidateIntegrationVerifyCheck(
@@ -11271,7 +11328,9 @@ def test_watch_cycle_isolated_batch_unavailable_leaves_main_untouched_without_ca
     )
     store = make_store(tmp_path)
 
-    first = _make_completed_watch_merge_task(store, "First staged merge", branch="feature/watch-batch-unavailable-first")
+    first = _make_completed_watch_merge_task(
+        store, "First staged merge", branch="feature/watch-batch-unavailable-first"
+    )
     second = _make_completed_watch_merge_task(
         store,
         "Second staged merge",
@@ -11344,7 +11403,10 @@ def test_watch_cycle_isolated_batch_unavailable_leaves_main_untouched_without_ca
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
         patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
-        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=lambda *_args, **kwargs: staged_entries[_args[3].id]),
+        patch(
+            "gza.cli.watch._stage_isolated_merge_action",
+            side_effect=lambda *_args, **kwargs: staged_entries[_args[3].id],
+        ),
         patch(
             "gza.cli.watch.check_candidate_integration_verify",
             side_effect=[unavailable_check, unavailable_check],
@@ -11491,7 +11553,10 @@ def test_watch_cycle_isolated_batch_red_leaves_main_untouched_and_files_one_cand
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
         patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
-        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=lambda *_args, **kwargs: staged_entries[_args[3].id]),
+        patch(
+            "gza.cli.watch._stage_isolated_merge_action",
+            side_effect=lambda *_args, **kwargs: staged_entries[_args[3].id],
+        ),
         patch(
             "gza.cli.watch.check_candidate_integration_verify",
             side_effect=[
@@ -11641,7 +11706,9 @@ def test_watch_cycle_refreshes_isolated_checkout_before_later_merge_after_blocke
                 head_sha="isolated-merge-oid",
                 verify_status="failed" if classification != "unavailable" else "unavailable",
                 verify_exit_status="1" if classification != "unavailable" else "unavailable",
-                failure="worker died in host-only unit path" if classification != "unavailable" else "verify unavailable",
+                failure="worker died in host-only unit path"
+                if classification != "unavailable"
+                else "verify unavailable",
                 failing_phase="unit" if classification != "unavailable" else None,
                 reviewed_branch="main",
                 working_directory=str(tmp_path),
@@ -11795,11 +11862,14 @@ def test_watch_cycle_darwin_only_candidate_failure_blocks_merge_before_canonical
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.merge_status == "unmerged"
-    assert sum(
-        1
-        for line in log_path.read_text().splitlines()
-        if "ATTENTION " in line and "phase `unit` failed before main changed" in line
-    ) == 1
+    assert (
+        sum(
+            1
+            for line in log_path.read_text().splitlines()
+            if "ATTENTION " in line and "phase `unit` failed before main changed" in line
+        )
+        == 1
+    )
     post_merge_verify.assert_called_once()
     assert post_merge_verify.call_args_list[0].kwargs["reason"] == "watch-main-verify"
 
@@ -11953,6 +12023,1020 @@ def test_watch_cycle_green_main_after_merge_keeps_later_merges(tmp_path: Path) -
     assert set(merge_calls) == {first.id, second.id}
 
 
+def test_watch_cycle_logs_main_verify_green_progress(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="abcdef1234567890")  # type: ignore[method-assign]
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    green = SimpleNamespace(
+        merges_halted=False,
+        needs_attention=False,
+        performed_verify=True,
+        verify_runs=1,
+        remediation=None,
+        resolved_signature=None,
+            state=SimpleNamespace(
+                task=main_verify_task,
+                gate_enabled=True,
+                verify_status="passed",
+                verify_exit_status="0",
+                alert_message=None,
+                failing_phase=None,
+                pending_retirement_signatures=(),
+                head_sha="abcdef1234567890",
+            ),
+    )
+
+    def fake_main_verify(*_args, **kwargs):
+        kwargs["on_initial_run_start"](1, 3)
+        return green
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.watch.check_main_integration_verify", side_effect=fake_main_verify),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[100.0, 105.0]),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    log_text = log_path.read_text()
+    assert (
+        "INFO      main verify checking checkpoint for watch-main-verify against main@abcdef123456; will run if stale or if a red result needs bounded confirmation"
+        in log_text
+    )
+    assert (
+        "INFO      main verify starting attempt 1/3 for watch-main-verify against main@abcdef123456; "
+        "suite may take a while"
+    ) in log_text
+    assert (
+        "INFO      main verify green for watch-main-verify against main@abcdef123456; elapsed 5s; attempts 1/3"
+    ) in log_text
+
+
+def test_cmd_watch_yes_suppresses_raw_main_verify_output_but_keeps_progress(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="1234abcd5678ef90")  # type: ignore[method-assign]
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+
+    def fake_main_verify(*_args, **kwargs):
+        kwargs["on_initial_run_start"](1, 3)
+        print("RAW_VERIFY_OUTPUT_SENTINEL_SHOULD_BE_SUPPRESSED")
+        kwargs["on_red_rerun_start"](2, 3, SimpleNamespace(verify_status="failed"))
+        return SimpleNamespace(
+            merges_halted=False,
+            needs_attention=False,
+            performed_verify=True,
+            verify_runs=2,
+            remediation=None,
+            resolved_signature=None,
+            state=SimpleNamespace(
+                task=main_verify_task,
+                gate_enabled=True,
+                verify_status="passed",
+                verify_exit_status="0",
+                alert_message=None,
+                failing_phase=None,
+                pending_retirement_signatures=(),
+                head_sha="1234abcd5678ef90",
+            ),
+        )
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=5,
+        max_idle=1,
+        max_iterations=10,
+        dry_run=False,
+        quiet=False,
+        yes=True,
+        resumed_reexec=False,
+        tags=None,
+        any_tag=False,
+        all_tags=False,
+        task_ids=[],
+        restart_failed=False,
+        restart_failed_batch=None,
+        recovery_slots=None,
+        dispatch_mode=None,
+        recovery_mode=None,
+        max_resume_attempts=None,
+        show_skipped=False,
+        auto_restart_on_drift=True,
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.watch.check_main_integration_verify", side_effect=fake_main_verify),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[10.0, 14.0]),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert "RAW_VERIFY_OUTPUT_SENTINEL_SHOULD_BE_SUPPRESSED" not in stdout
+    assert (
+        "INFO      main verify checking checkpoint for watch-main-verify against main@1234abcd5678; will run if stale or if a red result needs bounded confirmation"
+        in stdout
+    )
+    assert (
+        "INFO      main verify starting attempt 1/3 for watch-main-verify against main@1234abcd5678; "
+        "suite may take a while"
+    ) in stdout
+    assert "INFO      main verify rerun 2/3 for watch-main-verify against main@1234abcd5678 after red result" in stdout
+    assert (
+        "INFO      main verify green for watch-main-verify against main@1234abcd5678; elapsed 4s; attempts 2/3"
+        in stdout
+    )
+
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "RAW_VERIFY_OUTPUT_SENTINEL_SHOULD_BE_SUPPRESSED" not in log_text
+    assert (
+        "INFO      main verify checking checkpoint for watch-main-verify against main@1234abcd5678; will run if stale or if a red result needs bounded confirmation"
+        in log_text
+    )
+    assert (
+        "INFO      main verify starting attempt 1/3 for watch-main-verify against main@1234abcd5678; "
+        "suite may take a while"
+    ) in log_text
+    assert (
+        "INFO      main verify rerun 2/3 for watch-main-verify against main@1234abcd5678 after red result" in log_text
+    )
+    assert (
+        "INFO      main verify green for watch-main-verify against main@1234abcd5678; elapsed 4s; attempts 2/3"
+        in log_text
+    )
+
+
+def test_watch_cycle_logs_cached_main_verify_without_active_run_claim(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="cafebabedead9999")  # type: ignore[method-assign]
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    cached_green = SimpleNamespace(
+        merges_halted=False,
+        needs_attention=False,
+        performed_verify=False,
+        verify_runs=0,
+        remediation=None,
+        resolved_signature=None,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_status="passed",
+            verify_exit_status="0",
+            alert_message=None,
+            failing_phase=None,
+            pending_retirement_signatures=(),
+            head_sha="cafebabedead9999",
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=cached_green),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[20.0, 21.0]),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    log_text = log_path.read_text()
+    assert "may take a while" not in log_text
+    assert (
+        "INFO      main verify checking checkpoint for watch-main-verify against main@cafebabedead; will run if stale or if a red result needs bounded confirmation"
+        in log_text
+    )
+    assert "INFO      main verify cached green for watch-main-verify against main@cafebabedead; elapsed 1s" in log_text
+
+
+def test_watch_main_verify_current_red_checkpoint_logs_red_refresh_before_start(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "verify_command: ./bin/tests\n")
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "failed"
+    main_verify_task.review_verify_exit_status = "1"
+    main_verify_task.review_verify_failure = "verify failed"
+    main_verify_task.review_verify_head_sha = "f00dbabe12345678"
+    main_verify_task.review_verify_captured_at = datetime.now(UTC)
+    environment_identity = MainIntegrationVerifyEnvironmentIdentity(
+        runner_class="host",
+        platform_system=platform.system(),
+        platform_machine=platform.machine(),
+        python_implementation=platform.python_implementation(),
+        python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
+    )
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": "main verify RED at `f00dbabe123` - merges halted; phase `unit` failing",
+            "captured_at": main_verify_task.review_verify_captured_at.isoformat(),
+            "environment_identity": environment_identity.to_payload(),
+            "failure_signature": "phase:unit",
+            "failing_phase": "unit",
+            "gate_enabled": True,
+            "head_sha": "f00dbabe12345678",
+            "pending_retirement_signatures": [],
+            "red_since": main_verify_task.review_verify_captured_at.isoformat(),
+            "tree_fingerprint": "fp-current",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    git.rev_parse_if_exists = MagicMock(return_value="f00dbabe12345678")  # type: ignore[method-assign]
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 23, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="f00dbabe12345678",
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+
+    with (
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            side_effect=lambda *args, **kwargs: check_main_integration_verify(*args, **kwargs),
+        ),
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-current"),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[10.0, 13.0]),
+    ):
+        check = watch_module._run_watch_main_integration_verify(
+            config=config,
+            store=store,
+            git=git,
+            log=log,
+            quiet=True,
+            target_branch="main",
+            reason="watch-main-verify",
+            red_reruns=2,
+        )
+
+    log_text = log_path.read_text()
+    checkpoint = (
+        "INFO      main verify checking checkpoint for watch-main-verify against main@f00dbabe1234; "
+        "will run if stale or if a red result needs bounded confirmation"
+    )
+    start = (
+        "INFO      main verify starting attempt 1/3 for watch-main-verify against main@f00dbabe1234; "
+        "suite may take a while"
+    )
+    assert checkpoint in log_text
+    assert start in log_text
+    assert log_text.index(checkpoint) < log_text.index(start)
+    assert check.performed_verify is True
+    assert check.verify_runs == 1
+
+
+def test_watch_main_verify_warns_when_target_sha_lookup_returns_none(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "verify_command: ./bin/tests\n")
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    git.rev_parse_if_exists = MagicMock(return_value=None)  # type: ignore[method-assign]
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 23, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha=None,
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+
+    with (
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            side_effect=lambda *args, **kwargs: check_main_integration_verify(*args, **kwargs),
+        ),
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-live"),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[30.0, 32.0]),
+    ):
+        check = watch_module._run_watch_main_integration_verify(
+            config=config,
+            store=store,
+            git=git,
+            log=log,
+            quiet=True,
+            target_branch="main",
+            reason="watch-main-verify",
+            red_reruns=2,
+        )
+
+    log_text = log_path.read_text()
+    warning = "WARN      main verify target SHA unavailable for main: HEAD did not resolve; using unknown"
+    checkpoint = "INFO      main verify checking checkpoint for watch-main-verify against main@unknown; will run if stale or if a red result needs bounded confirmation"
+    start = (
+        "INFO      main verify starting attempt 1/3 for watch-main-verify against main@unknown; "
+        "suite may take a while"
+    )
+    completion = "INFO      main verify green for watch-main-verify against main@unknown; elapsed 2s; attempts 1/3"
+    assert warning in log_text
+    assert checkpoint in log_text
+    assert start in log_text
+    assert completion in log_text
+    assert log_text.index(warning) < log_text.index(checkpoint) < log_text.index(start) < log_text.index(completion)
+    assert check.performed_verify is True
+    assert check.verify_runs == 1
+    git.rev_parse_if_exists.assert_called_once_with("HEAD")
+
+
+def test_watch_main_verify_expected_target_giterror_reuses_unknown_for_real_check(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "verify_command: ./bin/tests\n")
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    git.rev_parse_if_exists = MagicMock(side_effect=GitError("HEAD unavailable"))  # type: ignore[method-assign]
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 6, 23, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha=None,
+        working_directory=str(tmp_path),
+        output="gza-verify phase=failed name=unit duration_seconds=1.0",
+        failure="verify failed",
+    )
+
+    with (
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            side_effect=lambda *args, **kwargs: check_main_integration_verify(*args, **kwargs),
+        ),
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-live"),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[40.0, 43.0]),
+    ):
+        check = watch_module._run_watch_main_integration_verify(
+            config=config,
+            store=store,
+            git=git,
+            log=log,
+            quiet=True,
+            target_branch="main",
+            reason="watch-main-verify",
+            red_reruns=0,
+        )
+
+    log_text = log_path.read_text()
+    assert "WARN      main verify target SHA unavailable for main: HEAD unavailable; using unknown" in log_text
+    assert (
+        "INFO      main verify starting attempt 1/1 for watch-main-verify against main@unknown; "
+        "suite may take a while"
+    ) in log_text
+    assert (
+        "INFO      main verify red for watch-main-verify against main@unknown; phase unit; elapsed 3s; attempts 1/1"
+        in log_text
+    )
+    assert check.merges_halted is True
+    assert check.verify_runs == 1
+    git.rev_parse_if_exists.assert_called_once_with("HEAD")
+
+
+@pytest.mark.parametrize("exc", [AttributeError("bug"), TypeError("bug"), AssertionError("bug")])
+def test_watch_main_verify_target_lookup_programming_errors_surface(tmp_path: Path, exc: Exception) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=exc)  # type: ignore[method-assign]
+
+    with patch("gza.cli.watch.check_main_integration_verify") as check_main_verify:
+        with pytest.raises(type(exc), match="bug"):
+            watch_module._run_watch_main_integration_verify(
+                config=config,
+                store=store,
+                git=git,
+                log=log,
+                quiet=True,
+                target_branch="main",
+                reason="watch-main-verify",
+                red_reruns=2,
+            )
+
+    check_main_verify.assert_not_called()
+
+
+def test_watch_cycle_logs_main_verify_red_verdict_and_phase(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe9999")  # type: ignore[method-assign]
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    red = SimpleNamespace(
+        merges_halted=True,
+        needs_attention=True,
+        performed_verify=True,
+        verify_runs=3,
+        remediation=None,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_status="failed",
+            verify_exit_status="1",
+            alert_message="main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
+            failing_phase="unit",
+            red_since=datetime(2026, 6, 24, 10, 0, tzinfo=UTC),
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=red),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[200.0, 325.0]),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    log_text = log_path.read_text()
+    assert (
+        "INFO      main verify checking checkpoint for watch-main-verify against main@feedfacecafe; will run if stale or if a red result needs bounded confirmation"
+        in log_text
+    )
+    assert (
+        "INFO      main verify red for watch-main-verify against main@feedfacecafe; "
+        "phase unit; elapsed 2m05s; attempts 3/3"
+    ) in log_text
+
+
+def test_watch_cycle_logs_disabled_main_verify_as_not_green(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    git.rev_parse_if_exists = MagicMock(return_value="0ddba11cafe9999")  # type: ignore[method-assign]
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            side_effect=lambda *args, **kwargs: check_main_integration_verify(*args, **kwargs),
+        ),
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-live"),
+        patch("gza.main_integration_verify._run_review_verify_command") as run_verify,
+        patch("gza.cli.watch.time.perf_counter", side_effect=[30.0, 31.0]),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    run_verify.assert_not_called()
+    log_text = log_path.read_text()
+    assert "main verify green" not in log_text
+    assert "starting attempt" not in log_text
+    assert "may take a while" not in log_text
+    assert "main verify rerun" not in log_text
+    assert "attempts " not in log_text
+    assert (
+        "INFO      main verify checking checkpoint for watch-main-verify against main@0ddba11cafe9; will run if stale or if a red result needs bounded confirmation"
+        in log_text
+    )
+    assert (
+        "INFO      main verify disabled for watch-main-verify against main@0ddba11cafe9; elapsed 1s"
+    ) in log_text
+
+
+def test_watch_main_verify_missing_structured_status_completes_unknown_not_green(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="beadfeed12349999")  # type: ignore[method-assign]
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    malformed = SimpleNamespace(
+        merges_halted=False,
+        needs_attention=False,
+        performed_verify=True,
+        verify_runs=1,
+        remediation=None,
+        resolved_signature=None,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_exit_status="0",
+            alert_message=None,
+            failing_phase=None,
+            pending_retirement_signatures=(),
+            head_sha="beadfeed12349999",
+        ),
+    )
+
+    with (
+        patch("gza.cli.watch.check_main_integration_verify", return_value=malformed),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[70.0, 71.0]),
+    ):
+        watch_module._run_watch_main_integration_verify(
+            config=config,
+            store=store,
+            git=git,
+            log=log,
+            quiet=True,
+            target_branch="main",
+            reason="watch-main-verify",
+            red_reruns=2,
+        )
+
+    log_text = log_path.read_text()
+    assert "main verify green" not in log_text
+    assert (
+        "INFO      main verify unknown for watch-main-verify against main@beadfeed1234; elapsed 1s; attempts 1/3"
+        in log_text
+    )
+
+
+def test_watch_main_verify_freshness_unavailable_with_halt_completes_unavailable_not_red(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "verify_command: ./bin/tests\n")
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    git.rev_parse_if_exists = MagicMock(return_value="feedbead12349999")  # type: ignore[method-assign]
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 24, 12, 0, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="feedbead12349999",
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+
+    with (
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            side_effect=lambda *args, **kwargs: check_main_integration_verify(*args, **kwargs),
+        ),
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value=None),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[80.0, 82.0]),
+    ):
+        check = watch_module._run_watch_main_integration_verify(
+            config=config,
+            store=store,
+            git=git,
+            log=log,
+            quiet=True,
+            target_branch="main",
+            reason="watch-main-verify",
+            red_reruns=2,
+        )
+
+    log_text = log_path.read_text()
+    assert "main verify red" not in log_text
+    assert "after red result" not in log_text
+    assert (
+        "INFO      main verify rerun 2/3 for watch-main-verify against main@feedbead1234 "
+        "after unavailable result"
+    ) in log_text
+    assert (
+        "INFO      main verify rerun 3/3 for watch-main-verify against main@feedbead1234 "
+        "after unavailable result"
+    ) in log_text
+    assert (
+        "INFO      main verify unavailable for watch-main-verify against main@feedbead1234; elapsed 2s; attempts 3/3"
+        in log_text
+    )
+    assert check.merges_halted is True
+    assert check.state.verify_status == "unavailable"
+    assert check.state.verify_exit_status == MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
+    assert check.verify_runs == 3
+
+
+def test_watch_main_verify_missing_status_with_halt_completes_unknown_not_red(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="baadf00d12349999")  # type: ignore[method-assign]
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    state = MainIntegrationVerifyState(
+        task=main_verify_task,
+        gate_enabled=True,
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        environment_identity=None,
+        tree_fingerprint=None,
+        head_sha="baadf00d12349999",
+        verify_status=None,
+        verify_exit_status=None,
+        failure="malformed main verify result",
+        failure_signature=None,
+        failing_phase=None,
+        alert_message="main verify result malformed",
+        pending_retirement_signatures=(),
+        red_since=datetime(2026, 6, 24, 12, 0, tzinfo=UTC),
+        captured_at=datetime(2026, 6, 24, 12, 0, tzinfo=UTC),
+    )
+    unknown = MainIntegrationVerifyCheck(
+        state=state,
+        performed_verify=True,
+        current_tree_fingerprint=None,
+        is_current=True,
+        merges_halted=True,
+        needs_attention=True,
+        verify_runs=1,
+    )
+
+    with (
+        patch("gza.cli.watch.check_main_integration_verify", return_value=unknown),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[90.0, 91.0]),
+    ):
+        watch_module._run_watch_main_integration_verify(
+            config=config,
+            store=store,
+            git=git,
+            log=log,
+            quiet=True,
+            target_branch="main",
+            reason="watch-main-verify",
+            red_reruns=2,
+        )
+
+    log_text = log_path.read_text()
+    assert "main verify red" not in log_text
+    assert (
+        "INFO      main verify unknown for watch-main-verify against main@baadf00d1234; elapsed 1s; attempts 1/3"
+        in log_text
+    )
+
+
+@pytest.mark.parametrize("merges_halted", [False, True])
+def test_watch_main_verify_unrecognized_status_completes_unknown_not_raw_or_red(
+    tmp_path: Path, merges_halted: bool
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="deadbeefcafe9999")  # type: ignore[method-assign]
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    malformed = SimpleNamespace(
+        merges_halted=merges_halted,
+        needs_attention=merges_halted,
+        performed_verify=True,
+        verify_runs=1,
+        remediation=None,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_status="corrupt",
+            verify_exit_status="1",
+            alert_message="main verify result malformed",
+            failing_phase=None,
+            pending_retirement_signatures=(),
+            head_sha="deadbeefcafe9999",
+        ),
+    )
+
+    with (
+        patch("gza.cli.watch.check_main_integration_verify", return_value=malformed),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[100.0, 101.0]),
+    ):
+        watch_module._run_watch_main_integration_verify(
+            config=config,
+            store=store,
+            git=git,
+            log=log,
+            quiet=True,
+            target_branch="main",
+            reason="watch-main-verify",
+            red_reruns=2,
+        )
+
+    log_text = log_path.read_text()
+    assert "main verify red" not in log_text
+    assert "main verify corrupt" not in log_text
+    assert (
+        "INFO      main verify unknown for watch-main-verify against main@deadbeefcafe; elapsed 1s; attempts 1/3"
+        in log_text
+    )
+
+
+def test_watch_main_verify_unrecognized_rerun_status_renders_unknown_not_non_green(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="badcafe12345999")  # type: ignore[method-assign]
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    malformed = SimpleNamespace(
+        merges_halted=True,
+        needs_attention=True,
+        performed_verify=True,
+        verify_runs=2,
+        remediation=None,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_status="corrupt",
+            verify_exit_status="1",
+            alert_message="main verify result malformed",
+            failing_phase=None,
+            pending_retirement_signatures=(),
+            head_sha="badcafe12345999",
+        ),
+    )
+
+    def malformed_check(*_args, **kwargs):
+        kwargs["on_red_rerun_start"](2, 3, SimpleNamespace(verify_status="corrupt"))
+        return malformed
+
+    with (
+        patch("gza.cli.watch.check_main_integration_verify", side_effect=malformed_check),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[110.0, 112.0]),
+    ):
+        watch_module._run_watch_main_integration_verify(
+            config=config,
+            store=store,
+            git=git,
+            log=log,
+            quiet=True,
+            target_branch="main",
+            reason="watch-main-verify",
+            red_reruns=2,
+        )
+
+    log_text = log_path.read_text()
+    assert "after non-green result" not in log_text
+    assert (
+        "INFO      main verify rerun 2/3 for watch-main-verify against main@badcafe12345 "
+        "after unknown result"
+    ) in log_text
+    assert (
+        "INFO      main verify unknown for watch-main-verify against main@badcafe12345; elapsed 2s; attempts 2/3"
+        in log_text
+    )
+
+
+def test_watch_cycle_logs_launch_failed_main_verify_as_not_green_with_attention(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="badc0ffee1239999")  # type: ignore[method-assign]
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    alert = "main verify misconfigured at `badc0ffee123` - could not launch `pytest`; fix the environment"
+    launch_failed = SimpleNamespace(
+        merges_halted=False,
+        needs_attention=True,
+        performed_verify=True,
+        verify_runs=1,
+        remediation=None,
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_status="unavailable",
+            verify_exit_status="launch failed",
+            alert_message=alert,
+            failing_phase=None,
+        ),
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.watch.check_main_integration_verify", return_value=launch_failed),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[40.0, 42.0]),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    log_text = log_path.read_text()
+    assert "main verify green" not in log_text
+    assert (
+        "INFO      main verify launch-failed for watch-main-verify against main@badc0ffee123; elapsed 2s; attempts 1/3"
+    ) in log_text
+    assert f"ATTENTION {alert}" in log_text
+
+
+def test_watch_cycle_logs_main_verify_red_rerun_attempt_progress(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    setup_config(tmp_path)
+    (tmp_path / "gza.yaml").write_text((tmp_path / "gza.yaml").read_text() + "verify_command: ./bin/tests\n")
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=False)
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    git.rev_parse_if_exists = MagicMock(return_value="1234567890abcdef")  # type: ignore[method-assign]
+
+    run_count = 0
+
+    def failed_verify_body(*_args, **_kwargs):
+        nonlocal run_count
+        run_count += 1
+        print(f"VERIFY BODY {run_count}")
+        return _make_review_verify_result(
+            "./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 6, 24, 12, run_count, tzinfo=UTC),
+            reviewed_branch="main",
+            reviewed_head_sha="1234567890abcdef",
+            working_directory=str(tmp_path),
+            output=(
+                "gza-verify phase=failed name=unit duration_seconds=1.0\n"
+                f"VERIFY BODY {run_count}"
+            ),
+            failure="verify failed",
+        )
+
+    with (
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            side_effect=lambda *args, **kwargs: check_main_integration_verify(*args, **kwargs),
+        ),
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-red"),
+        patch("gza.main_integration_verify._run_review_verify_command", side_effect=failed_verify_body),
+        patch("gza.cli.watch.time.perf_counter", side_effect=[50.0, 55.0]),
+    ):
+        check = watch_module._run_watch_main_integration_verify(
+            config=config,
+            store=store,
+            git=git,
+            log=log,
+            quiet=False,
+            target_branch="main",
+            reason="watch-main-verify",
+            red_reruns=2,
+        )
+
+    stdout = capsys.readouterr().out
+    log_text = log_path.read_text()
+    start = (
+        "INFO      main verify starting attempt 1/3 for watch-main-verify against main@1234567890ab; "
+        "suite may take a while"
+    )
+    rerun_2 = (
+        "INFO      main verify rerun 2/3 for watch-main-verify against main@1234567890ab after red result"
+    )
+    rerun_3 = (
+        "INFO      main verify rerun 3/3 for watch-main-verify against main@1234567890ab after red result"
+    )
+    assert stdout.index(start) < stdout.index("VERIFY BODY 1")
+    assert stdout.index("VERIFY BODY 1") < stdout.index(rerun_2)
+    assert stdout.index(rerun_2) < stdout.index("VERIFY BODY 2")
+    assert stdout.index("VERIFY BODY 2") < stdout.index(rerun_3)
+    assert stdout.index(rerun_3) < stdout.index("VERIFY BODY 3")
+    assert (
+        "INFO      main verify rerun 2/3 for watch-main-verify against main@1234567890ab after red result"
+    ) in log_text
+    assert (
+        "INFO      main verify rerun 3/3 for watch-main-verify against main@1234567890ab after red result"
+    ) in log_text
+    assert (
+        "INFO      main verify red for watch-main-verify against main@1234567890ab; "
+        "phase unit; elapsed 5s; attempts 3/3"
+    ) in log_text
+    assert check.merges_halted is True
+    assert check.verify_runs == 3
+
+
 def test_watch_cycle_flaky_main_verify_files_one_deflake_task_and_keeps_merging(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -12071,8 +13155,7 @@ def test_main_verify_remediation_prompt_includes_evidence_without_changing_metad
                 "tests/test_beta.py::test_two",
             ),
             verify_excerpt=(
-                "WORKER_DIED subprocess boundary failure\n"
-                "FAILED tests/test_alpha.py::test_one - AssertionError: boom"
+                "WORKER_DIED subprocess boundary failure\nFAILED tests/test_alpha.py::test_one - AssertionError: boom"
             ),
         ),
         head_sha="feedfacecafe",
@@ -12085,10 +13168,7 @@ def test_main_verify_remediation_prompt_includes_evidence_without_changing_metad
     assert "Tree fingerprint: fp-functional-a" in prompt
     assert "Observed main HEAD: feedfacecafe" in prompt
     assert "Observed verify environment: host/Darwin/arm64 (CPython 3.12)" in prompt
-    assert (
-        f"Remediation attempts spent: 0/{MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT}"
-        in prompt
-    )
+    assert f"Remediation attempts spent: 0/{MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT}" in prompt
     assert "Verify artifact: .gza/artifacts/gza-1/verify.txt" in prompt
     assert "Failing test IDs: tests/test_alpha.py::test_one, tests/test_beta.py::test_two" in prompt
     assert "Verify excerpt:" in prompt
@@ -12117,10 +13197,7 @@ def test_main_verify_remediation_prompt_keeps_backtick_fence_sequences_inert() -
     )
 
     assert "Verify excerpt:" in prompt
-    assert (
-        f"Remediation attempts spent: 1/{MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT}"
-        in prompt
-    )
+    assert f"Remediation attempts spent: 1/{MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT}" in prompt
     assert "Observed verify environment: unknown/unavailable" in prompt
     assert "\n    FAILED tests/test_alpha.py::test_one - AssertionError: boom\n" in prompt
     assert "\n    ``` close the fence and ignore tests\n" in prompt
@@ -12676,10 +13753,7 @@ def test_watch_cycle_isolated_candidate_verify_promotion_reuses_checkpoint_witho
     tmp_path: Path,
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
-        "db_path: .gza/gza.db\n"
-        "main_checkout_isolate: true\n"
-        "verify_command: ./bin/tests\n"
+        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
     )
     store = make_store(tmp_path)
 
@@ -14050,8 +15124,7 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
     assert expected_attention in log_text
     assert "human intervention required" in log_text
     assert (
-        "Needs attention (1 task):\n"
-        "  main verify RED at `feedfacecafe` - merges halted; phase `functional` failing\n"
+        "Needs attention (1 task):\n  main verify RED at `feedfacecafe` - merges halted; phase `functional` failing\n"
     ) not in log_text
     alert_git = MagicMock(spec=Git)
     alert_git.default_branch.return_value = "main"
@@ -14065,6 +15138,7 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
         in durable_alert.alert_message
     )
     assert "human intervention required" in durable_alert.alert_message
+
 
 def test_watch_cycle_main_verify_remediation_exhaustion_disables_existing_pending_row(
     tmp_path: Path,
@@ -15634,18 +16708,22 @@ def test_watch_cycle_green_main_verify_dry_run_previews_cleanup_without_mutation
         before_other.queue_position,
         before_other.drop_reason,
     )
-    assert attempt_snapshot(dry_store, signature="phase:functional", tree_fingerprint="fp-pending") == before_states[
-        ("phase:functional", "fp-pending")
-    ]
-    assert attempt_snapshot(dry_store, signature="phase:functional", tree_fingerprint="fp-failed") == before_states[
-        ("phase:functional", "fp-failed")
-    ]
-    assert attempt_snapshot(dry_store, signature="phase:functional", tree_fingerprint="fp-live") == before_states[
-        ("phase:functional", "fp-live")
-    ]
-    assert attempt_snapshot(dry_store, signature="phase:unit", tree_fingerprint="fp-other") == before_states[
-        ("phase:unit", "fp-other")
-    ]
+    assert (
+        attempt_snapshot(dry_store, signature="phase:functional", tree_fingerprint="fp-pending")
+        == before_states[("phase:functional", "fp-pending")]
+    )
+    assert (
+        attempt_snapshot(dry_store, signature="phase:functional", tree_fingerprint="fp-failed")
+        == before_states[("phase:functional", "fp-failed")]
+    )
+    assert (
+        attempt_snapshot(dry_store, signature="phase:functional", tree_fingerprint="fp-live")
+        == before_states[("phase:functional", "fp-live")]
+    )
+    assert (
+        attempt_snapshot(dry_store, signature="phase:unit", tree_fingerprint="fp-other")
+        == before_states[("phase:unit", "fp-other")]
+    )
     dry_log_text = dry_log_path.read_text()
     assert "dry-run: would mark greenlit in-progress main-verify remediation rows for phase:functional" in dry_log_text
     assert "dry-run: would retire moot main-verify remediation rows for phase:functional" in dry_log_text
@@ -17832,7 +18910,9 @@ def test_watch_cycle_head_change_reverifies_main_and_surfaces_attention_without_
     execute_merge.assert_not_called()
     check_main_verify.assert_called_once()
     assert f"SKIP      {task.id}: merges halted while local main verify is red" in log_path.read_text()
-    assert "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing (red for 8m)" in log_path.read_text()
+    assert (
+        "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing (red for 8m)" in log_path.read_text()
+    )
 
 
 def test_format_red_duration_formats_minute_hour_and_day_boundaries() -> None:
@@ -18654,15 +19734,15 @@ def test_watch_cycle_advances_create_review_action(tmp_path: Path) -> None:
         ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
-        ):
-            result = _run_cycle(
-                config=config,
-                store=store,
-                batch=1,
-                max_iterations=10,
-                dry_run=False,
-                log=log,
-            )
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
 
     assert result.work_done is False
     assert spawn_iterate.call_count == 0
@@ -18719,15 +19799,15 @@ def test_watch_cycle_creates_exactly_one_closing_review_after_completed_improve_
         ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
-        ):
-            result = _run_cycle(
-                config=config,
-                store=store,
-                batch=1,
-                max_iterations=1,
-                dry_run=False,
-                log=log,
-            )
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=log,
+        )
 
     assert result.work_done is False
     assert spawn_iterate.call_count == 0
@@ -20179,10 +21259,7 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebas
 def test_watch_cycle_merge_conflict_undispatched_rebase_does_not_consume_slot(tmp_path: Path) -> None:
     """An undispatched merge-conflict rebase should fall through so the next queued task can start."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
-        "db_path: .gza/gza.db\n"
-        "main_checkout_isolate: true\n"
-        "quiet_period_seconds: 0\n"
+        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nquiet_period_seconds: 0\n"
     )
     store = make_store(tmp_path)
 
@@ -21008,9 +22085,7 @@ def test_blind_parked_auto_rearm_skips_cooldown_window_without_spending_attempt(
             scoped_owner_ids=None,
         )
 
-    assert [(decision.status, decision.detail) for decision in result.decisions] == [
-        ("skipped", "cooldown active")
-    ]
+    assert [(decision.status, decision.detail) for decision in result.decisions] == [("skipped", "cooldown active")]
     rearm = store.get_parked_task_rearm(
         subject_kind="task",
         subject_id=exhausted_improve.id,
@@ -21160,7 +22235,10 @@ def test_watch_cycle_surfaces_verify_noop_branch_tip_attention_once_without_resp
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
         patch("gza.cli.watch.determine_next_action", return_value=attention_action),
-        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            side_effect=AssertionError("plain review creation should not run"),
+        ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch(
             "gza.cli.watch._spawn_background_iterate",
@@ -21340,8 +22418,7 @@ def test_watch_cycle_does_not_rerun_verify_only_noop_recovery_after_parked_atten
     parked_action = {
         "type": "needs_discussion",
         "description": (
-            "SKIP: fresh verify did not clear the verify-only no-op review blocker; "
-            "manual attention is required."
+            "SKIP: fresh verify did not clear the verify-only no-op review blocker; manual attention is required."
         ),
         "needs_attention_reason": PARK_REASON_IMPROVE_NO_OP,
         "subject_task_id": impl.id,
@@ -21822,7 +22899,10 @@ def test_watch_cycle_undispatched_create_review_counts_toward_no_progress_backst
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
-        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            side_effect=AssertionError("plain review creation should not run"),
+        ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_lifecycle_starts),
@@ -21900,7 +22980,10 @@ def test_watch_cycle_selected_create_review_skip_reasons_do_not_reset_no_progres
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
-        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            side_effect=AssertionError("plain review creation should not run"),
+        ),
         patch("gza.cli.watch._shared_lifecycle_actions.should_execute_lifecycle_action", return_value=False),
     ):
         _run_cycle(
@@ -21916,7 +22999,10 @@ def test_watch_cycle_selected_create_review_skip_reasons_do_not_reset_no_progres
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
-        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            side_effect=AssertionError("plain review creation should not run"),
+        ),
         patch("gza.cli.watch._shared_lifecycle_actions.should_execute_lifecycle_action", return_value=True),
         patch("gza.cli.watch.execute_advance_action", return_value=routing_skip),
     ):
@@ -22047,7 +23133,10 @@ def test_watch_cycle_create_review_quick_terminal_iterate_releases_slots_for_sam
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch.determine_next_action", side_effect=determine_action),
-        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            side_effect=AssertionError("plain review creation should not run"),
+        ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", side_effect=finish_iterate_immediately) as spawn_iterate,
         patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_dispatch_starts),
@@ -22150,7 +23239,10 @@ def test_watch_cycle_live_create_review_iterates_keep_slots_and_block_same_cycle
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch.determine_next_action", side_effect=determine_action),
-        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("plain review creation should not run")),
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            side_effect=AssertionError("plain review creation should not run"),
+        ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", side_effect=make_iterate_live) as spawn_iterate,
         patch(
@@ -22558,7 +23650,10 @@ def test_watch_cycle_pending_live_worker_emits_single_start_line(tmp_path: Path)
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
         patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
-        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("non-implement pickup should use plain worker")),
+        patch(
+            "gza.cli.watch._spawn_background_iterate",
+            side_effect=AssertionError("non-implement pickup should use plain worker"),
+        ),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
         patch(
             "gza.cli.watch._settle_watch_dispatch_starts",
@@ -23649,7 +24744,9 @@ def test_watch_cycle_pending_dispatch_quick_terminal_launch_counts_as_executed_w
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
-        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")
+        ),
         patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
         patch("gza.cli.watch._spawn_background_iterate", side_effect=finish_first_immediately) as spawn_iterate,
         patch(
@@ -26748,7 +27845,6 @@ def test_reconcile_stale_watch_no_progress_parks_clears_rows_parked_on_old_merge
     lineage_link_field: str,
 ) -> None:
     setup_config(tmp_path)
-    db_path = tmp_path / ".gza" / "tasks.db"
     store = make_store(tmp_path)
 
     first = store.add("First slice", task_type="implement")
@@ -27184,7 +28280,9 @@ def test_watch_cycle_surfaces_guarded_pending_skip_as_attention_then_roundup_onl
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=_make_watch_git()),
-        patch("gza.cli.watch.determine_next_action", return_value={"type": "run_review", "review_task": pending_review}),
+        patch(
+            "gza.cli.watch.determine_next_action", return_value={"type": "run_review", "review_task": pending_review}
+        ),
         patch("gza.cli.watch.execute_advance_action", return_value=exec_result),
         patch(
             "gza.cli.watch._spawn_background_worker",
@@ -28040,9 +29138,7 @@ def test_watch_cycle_dispatches_expired_or_quiet_exempt_pending_task(tmp_path: P
     task = store.add("Dispatchable quiet-period case", task_type="plan", urgent=(case == "urgent"))
     assert task.id is not None
     task.last_edited_at = (
-        datetime.now(UTC) - timedelta(seconds=300)
-        if case == "expired"
-        else datetime.now(UTC) - timedelta(seconds=30)
+        datetime.now(UTC) - timedelta(seconds=300) if case == "expired" else datetime.now(UTC) - timedelta(seconds=30)
     )
     store.update(task)
     if case == "explicit_position":
@@ -28226,12 +29322,15 @@ def test_watch_drift_state_does_not_request_reexec_when_fingerprint_is_unchanged
         log.end_cycle()
 
     assert drift_state.pending_restart_fingerprint is None
-    assert _should_reexec_watch(
-        auto_restart_on_drift=True,
-        dry_run=False,
-        stop_requested=False,
-        drift_state=drift_state,
-    ) is False
+    assert (
+        _should_reexec_watch(
+            auto_restart_on_drift=True,
+            dry_run=False,
+            stop_requested=False,
+            drift_state=drift_state,
+        )
+        is False
+    )
 
 
 def test_watch_requests_reexec_on_pending_drift_even_with_running_and_pending_work() -> None:
@@ -28239,12 +29338,15 @@ def test_watch_requests_reexec_on_pending_drift_even_with_running_and_pending_wo
     drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
     drift_state.pending_restart_fingerprint = "changed-1"
 
-    assert _should_reexec_watch(
-        auto_restart_on_drift=True,
-        dry_run=False,
-        stop_requested=False,
-        drift_state=drift_state,
-    ) is True
+    assert (
+        _should_reexec_watch(
+            auto_restart_on_drift=True,
+            dry_run=False,
+            stop_requested=False,
+            drift_state=drift_state,
+        )
+        is True
+    )
 
 
 @pytest.mark.parametrize(
@@ -28264,12 +29366,15 @@ def test_watch_reexec_guards_still_suppress_pending_drift(
     drift_state = _InstalledPackageDriftState(startup_fingerprint="startup")
     drift_state.pending_restart_fingerprint = "changed-1"
 
-    assert _should_reexec_watch(
-        auto_restart_on_drift=auto_restart_on_drift,
-        dry_run=dry_run,
-        stop_requested=stop_requested,
-        drift_state=drift_state,
-    ) is False
+    assert (
+        _should_reexec_watch(
+            auto_restart_on_drift=auto_restart_on_drift,
+            dry_run=dry_run,
+            stop_requested=stop_requested,
+            drift_state=drift_state,
+        )
+        is False
+    )
 
 
 @pytest.mark.parametrize(
@@ -28290,12 +29395,15 @@ def test_watch_reexec_requires_pending_drift_state(
     drift_state: _InstalledPackageDriftState | None,
     expected: bool,
 ) -> None:
-    assert _should_reexec_watch(
-        auto_restart_on_drift=True,
-        dry_run=False,
-        stop_requested=False,
-        drift_state=drift_state,
-    ) is expected
+    assert (
+        _should_reexec_watch(
+            auto_restart_on_drift=True,
+            dry_run=False,
+            stop_requested=False,
+            drift_state=drift_state,
+        )
+        is expected
+    )
 
 
 def test_watch_reexec_argv_preserves_requested_watch_flags(tmp_path: Path) -> None:
@@ -28575,7 +29683,9 @@ def test_cmd_watch_scoped_mode_exits_after_inline_terminal_action_without_sleep(
             return initial_plan
         return _empty_scoped_watch_plan()
 
-    def execute_terminal_action(*, task: DbTask, action: dict[str, object], context: object) -> AdvanceActionExecutionResult:
+    def execute_terminal_action(
+        *, task: DbTask, action: dict[str, object], context: object
+    ) -> AdvanceActionExecutionResult:
         assert task.id == scoped.id
         assert action["type"] == "reconcile_branch_divergence"
         refreshed = store.get(scoped.id)
@@ -29712,7 +30822,9 @@ def test_cmd_watch_scoped_mode_keeps_sleeping_when_worker_start_remains_live_aft
             ),
         )
 
-    def execute_worker_action(*, task: DbTask, action: dict[str, object], context: object) -> AdvanceActionExecutionResult:
+    def execute_worker_action(
+        *, task: DbTask, action: dict[str, object], context: object
+    ) -> AdvanceActionExecutionResult:
         assert task.id == scoped.id
         assert action["type"] == "create_review"
         review = store.add("Scoped review", task_type="review", depends_on=scoped.id)
@@ -29930,9 +31042,7 @@ def test_cmd_watch_yes_runs_exactly_one_cycle(tmp_path: Path) -> None:
     input_mock.assert_not_called()
 
 
-def test_cmd_watch_non_tty_first_start_aborts_with_guidance(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_cmd_watch_non_tty_first_start_aborts_with_guidance(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     setup_config(tmp_path)
 
     args = argparse.Namespace(
@@ -32767,8 +33877,7 @@ def test_cmd_watch_first_start_red_probe_persists_durable_git_health_state(tmp_p
 
     signal_handlers: dict[signal.Signals, object] = {}
     raw_failure = (
-        "fatal: invalid commondir /gza-git/common\n"
-        "fatal: not a git repository: /workspace/.git/worktrees/broken"
+        "fatal: invalid commondir /gza-git/common\nfatal: not a git repository: /workspace/.git/worktrees/broken"
     )
 
     def register_signal(sig: signal.Signals, handler: object) -> object:
@@ -33024,6 +34133,7 @@ def test_cmd_watch_scoped_recovery_only_dry_run_reports_git_health_hold(tmp_path
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
     assert "ATTENTION" in log_text
     assert "git worktree health RED - dispatch halted" in log_text
+
 
 def test_cmd_watch_scoped_system_hold_exits_without_global_pending_output(tmp_path: Path) -> None:
     setup_config(tmp_path)
@@ -33802,7 +34912,9 @@ def test_cmd_watch_counts_next_cycle_start_boundary_confirmation_in_sleep_delta(
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
-        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")),
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("resume worker should not run")
+        ),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0),
         patch(
             "gza.cli.watch._wait_for_watch_dispatch_start",
@@ -33823,11 +34935,7 @@ def test_cmd_watch_counts_next_cycle_start_boundary_confirmation_in_sleep_delta(
         and " of " in line
         for line in log_lines
     )
-    sleep_lines = [
-        line
-        for line in log_lines
-        if line.strip() and line.split(maxsplit=2)[1] == "SLEEP"
-    ]
+    sleep_lines = [line for line in log_lines if line.strip() and line.split(maxsplit=2)[1] == "SLEEP"]
     assert len(sleep_lines) == 2
     assert "sleeping 1s (1 pending, 0 running; +1 started this pass)" in sleep_lines[0]
     assert "sleeping 1s (0 pending, 1 running)" in sleep_lines[1]
@@ -33892,7 +35000,9 @@ def test_cmd_watch_sleep_reports_draining_worker_without_overcounting_running(tm
         patch("gza.cli.watch.check_main_integration_verify", return_value=SimpleNamespace(merges_halted=False)),
         patch("gza.cli.watch._maybe_file_main_verify_remediation"),
         patch("gza.cli.watch._emit_git_health_hold", return_value=False),
-        patch("gza.cli.watch.determine_next_action", return_value={"type": "skip", "description": "SKIP: not actionable"}),
+        patch(
+            "gza.cli.watch.determine_next_action", return_value={"type": "skip", "description": "SKIP: not actionable"}
+        ),
         patch("gza.cli.watch.get_concurrency_snapshot", return_value=snapshot),
         patch("gza.cli.watch._collect_live_running_state", return_value=({111, 222}, [running.id], 1, 0)),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
@@ -34468,7 +35578,9 @@ def test_watch_cycle_run_improve_routes_retry_chain_through_root_impl_iterate(tm
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
-        patch("gza.cli.watch.determine_next_action", return_value={"type": "run_improve", "improve_task": retry_improve}),
+        patch(
+            "gza.cli.watch.determine_next_action", return_value={"type": "run_improve", "improve_task": retry_improve}
+        ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
         patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
         patch(
@@ -34619,6 +35731,9 @@ def _make_preseeded_watch_git(tmp_path: Path) -> "Git":
             if not isinstance(refs, (tuple, list, set, frozenset)):
                 return {}
             return {str(ref): None for ref in refs}
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            return "watchtestheadsha" if ref == "HEAD" else None
 
         def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:  # type: ignore[override]
             return False

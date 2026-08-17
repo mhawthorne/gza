@@ -391,10 +391,7 @@ def _main_verify_remediation_prompt(
     observed_environment = _describe_main_verify_environment_identity(
         getattr(remediation, "observed_environment_identity", None)
     )
-    body.append(
-        "Observed verify environment: "
-        f"{observed_environment or 'unknown/unavailable'}"
-    )
+    body.append(f"Observed verify environment: {observed_environment or 'unknown/unavailable'}")
     failure = getattr(remediation, "failure", None)
     artifact_path = getattr(remediation, "artifact_path", None)
     failing_test_ids = tuple(getattr(remediation, "failing_test_ids", ()))
@@ -506,7 +503,9 @@ def _main_verify_remediation_attempts_from_prompt(
 
 
 def _main_verify_remediation_attempt_limit(config: Config) -> int:
-    configured_limit = getattr(config.watch, "main_verify_remediation_max_attempts", MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT)
+    configured_limit = getattr(
+        config.watch, "main_verify_remediation_max_attempts", MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT
+    )
     return max(1, configured_limit)
 
 
@@ -652,9 +651,7 @@ def _retire_duplicate_main_verify_remediation_tasks(
         fresh.completed_at = datetime.now(UTC)
         fresh.failure_reason = None
         fresh.completion_reason = None
-        fresh.drop_reason = (
-            f"{MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON}:{identity.signature}:{canonical.id}"
-        )
+        fresh.drop_reason = f"{MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON}:{identity.signature}:{canonical.id}"
         fresh.urgent = False
         fresh.queue_position = None
         store.update(fresh)
@@ -733,10 +730,7 @@ def _retire_greenlit_main_verify_remediation_active_tasks(
     retired: list[str] = []
     cleared: list[str] = []
     for attempt_state in store.list_main_verify_remediation_attempt_states():
-        if (
-            attempt_state.active_task_id is None
-            or attempt_state.greenlit_while_in_progress_task_id is None
-        ):
+        if attempt_state.active_task_id is None or attempt_state.greenlit_while_in_progress_task_id is None:
             continue
         task = store.get(attempt_state.active_task_id)
         should_clear_active = False
@@ -789,10 +783,7 @@ def _preview_greenlit_main_verify_remediation_active_tasks(
     retired: list[str] = []
     cleared: list[str] = []
     for attempt_state in store.list_main_verify_remediation_attempt_states():
-        if (
-            attempt_state.active_task_id is None
-            or attempt_state.greenlit_while_in_progress_task_id is None
-        ):
+        if attempt_state.active_task_id is None or attempt_state.greenlit_while_in_progress_task_id is None:
             continue
         task = store.get(attempt_state.active_task_id)
         if task is None:
@@ -1105,9 +1096,7 @@ def _mark_main_verify_remediation_task_exhausted(
         has_commits=bool(task.has_commits),
         explicit_reason=MAIN_VERIFY_REMEDIATION_EXHAUSTED_FAILURE_REASON,
     )
-    task.completion_reason = (
-        f"main verify remediation exhausted after {attempt_limit}/{attempt_limit} attempts"
-    )
+    task.completion_reason = f"main verify remediation exhausted after {attempt_limit}/{attempt_limit} attempts"
     store.update(task)
     store.mark_main_verify_remediation_exhausted(
         signature=remediation.signature,
@@ -1250,7 +1239,7 @@ def _ensure_main_verify_remediation_task(
             task_id=task.id,
             last_observed_head_sha=state.head_sha,
             last_observed_failure=remediation.failure,
-    )
+        )
     return _MainVerifyRemediationEnsureResult(task=task, outcome="created")
 
 
@@ -1749,10 +1738,14 @@ def _resolve_watch_attention_display_task(store: SqliteTaskStore, row: LineageOw
     """Resolve the declared attention subject, falling back to incomplete-owner behavior."""
     action = row.next_action or {}
     fallback_task = (
-        _resolve_watch_iterate_impl_for_task(store, row.lifecycle_action_task)
-        if row.lifecycle_action_task is not None
-        else None
-    ) or row.owner_task or _resolve_incomplete_owner_task(store, cast(Any, row))
+        (
+            _resolve_watch_iterate_impl_for_task(store, row.lifecycle_action_task)
+            if row.lifecycle_action_task is not None
+            else None
+        )
+        or row.owner_task
+        or _resolve_incomplete_owner_task(store, cast(Any, row))
+    )
     return resolve_subject_task(
         store,
         action,
@@ -1938,6 +1931,8 @@ def _resolve_watch_scope_owner_ids(
         seen.add(owner_task.id)
         owner_ids.append(owner_task.id)
     return tuple(owner_ids)
+
+
 def _watch_iterate_result(
     *,
     action_type: str,
@@ -3217,22 +3212,12 @@ def _candidate_rework_prompt(
     fingerprint = evidence.tree_fingerprint or "unavailable"
     batch_context_lines: list[str] = []
     if batch_context is not None:
-        batch_context_lines.append(
-            f"Batch position: {batch_context.failing_position} of {batch_context.batch_size}"
-        )
+        batch_context_lines.append(f"Batch position: {batch_context.failing_position} of {batch_context.batch_size}")
         if batch_context.green_prefix:
             green_prefix_summary = ", ".join(
-                (
-                    f"{owner_id} ({branch})"
-                    if branch
-                    else owner_id
-                )
-                for owner_id, branch in batch_context.green_prefix
+                (f"{owner_id} ({branch})" if branch else owner_id) for owner_id, branch in batch_context.green_prefix
             )
-            batch_context_lines.append(
-                "Verified green prefix before this failure: "
-                f"{green_prefix_summary}"
-            )
+            batch_context_lines.append(f"Verified green prefix before this failure: {green_prefix_summary}")
     batch_context_block = ""
     if batch_context_lines:
         batch_context_block = "Batch context:\n" + "\n".join(batch_context_lines) + "\n\n"
@@ -3349,9 +3334,8 @@ def _run_isolated_merge_batch(
                 target_branch=target_branch,
             )
             if merge_event is not None:
-                merge_status_before = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
-                    "merge_status"
-                )
+                merge_status_before = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get("merge_status")
+
         def _stage_current_merge() -> _StagedIsolatedMergeAction | _MergeActionResult:
             return _stage_isolated_merge_action(
                 config,
@@ -3463,13 +3447,28 @@ def _run_isolated_merge_batch(
                 quiet_mechanics=True,
             )
             for followup_task in finalized.created_followups:
-                log.emit("FOLLOW", _format_follow_line(str(followup_task.id), str(staged_entry.display_task.id), reused=False))
+                log.emit(
+                    "FOLLOW",
+                    _format_follow_line(str(followup_task.id), str(staged_entry.display_task.id), reused=False),
+                )
             for followup_task in finalized.reused_followups:
-                log.emit("FOLLOW", _format_follow_line(str(followup_task.id), str(staged_entry.display_task.id), reused=True))
+                log.emit(
+                    "FOLLOW", _format_follow_line(str(followup_task.id), str(staged_entry.display_task.id), reused=True)
+                )
             for investigation_task_id in finalized.created_investigation_task_ids:
-                log.emit("FOLLOW", _format_follow_line(str(investigation_task_id), str(staged_entry.display_task.id), reused=False, investigation=True))
+                log.emit(
+                    "FOLLOW",
+                    _format_follow_line(
+                        str(investigation_task_id), str(staged_entry.display_task.id), reused=False, investigation=True
+                    ),
+                )
             for investigation_task_id in finalized.reused_investigation_task_ids:
-                log.emit("FOLLOW", _format_follow_line(str(investigation_task_id), str(staged_entry.display_task.id), reused=True, investigation=True))
+                log.emit(
+                    "FOLLOW",
+                    _format_follow_line(
+                        str(investigation_task_id), str(staged_entry.display_task.id), reused=True, investigation=True
+                    ),
+                )
             if staged_entry.merge_event is not None:
                 merge_status_after = (_task_snapshot(store).get(staged_entry.merge_event.display_task_id) or {}).get(
                     "merge_status"
@@ -3479,7 +3478,10 @@ def _run_isolated_merge_batch(
                     and merge_status_after == "merged"
                     and not log.was_merge_logged(staged_entry.merge_event.merge_key)
                 ):
-                    log.emit("MERGE", f"{staged_entry.merge_event.display_task_id} -> {staged_entry.merge_event.target_branch}")
+                    log.emit(
+                        "MERGE",
+                        f"{staged_entry.merge_event.display_task_id} -> {staged_entry.merge_event.target_branch}",
+                    )
                     log.note_merge_logged(staged_entry.merge_event.merge_key)
         return True, False, None
 
@@ -3491,6 +3493,7 @@ def _run_isolated_merge_batch(
     first_red_check: CandidateIntegrationVerifyCheck | None = None
     green_prefix: list[tuple[str, str | None]] = []
     for staged_entry in staged_batch:
+
         def _replay_staged_merge() -> _StagedIsolatedMergeAction | _MergeActionResult:
             return _stage_isolated_merge_action(
                 config,
@@ -3917,8 +3920,7 @@ def _pending_runnable_tasks(
     return [
         task
         for task in pending_tasks
-        if task.id is not None
-        and (_resolve_failure_owner_task_id(store, str(task.id)) not in excluded_owner_ids)
+        if task.id is not None and (_resolve_failure_owner_task_id(store, str(task.id)) not in excluded_owner_ids)
     ]
 
 
@@ -3973,6 +3975,152 @@ def _spawn_worker_with_failure_log(
     if rc != 0:
         log.emit("START_FAILED", failure_message, dedupe_key=dedupe_key)
     return rc
+
+
+def _format_watch_duration(seconds: float) -> str:
+    elapsed = max(0, int(seconds))
+    mins = elapsed // 60
+    secs = elapsed % 60
+    if mins > 0:
+        return f"{mins}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _resolve_main_verify_target_head(git: Git, target_branch: str, log: "_WatchLog") -> str | None:
+    head_sha: str | None = None
+    try:
+        head_sha = git.rev_parse_if_exists("HEAD")
+    except GitError as exc:
+        log.emit(
+            "WARN",
+            f"main verify target SHA unavailable for {target_branch}: {exc}; using unknown",
+        )
+        return None
+    if head_sha is None:
+        log.emit(
+            "WARN",
+            f"main verify target SHA unavailable for {target_branch}: HEAD did not resolve; using unknown",
+        )
+    return head_sha
+
+
+def _format_main_verify_target(target_branch: str, head_sha: str | None) -> str:
+    short_sha = head_sha[:12] if head_sha else "unknown"
+    return f"{target_branch}@{short_sha}"
+
+
+def _main_verify_completion_verdict(check: MainIntegrationVerifyCheck) -> str:
+    state = getattr(check, "state", None)
+    status = getattr(state, "verify_status", None)
+    exit_status = getattr(state, "verify_exit_status", None)
+    gate_enabled = getattr(state, "gate_enabled", True)
+    if gate_enabled is False:
+        return "disabled"
+    if status == "passed":
+        return "green"
+    if status == "failed":
+        return "red"
+    if status == "unavailable" and exit_status == "launch failed":
+        return "launch-failed"
+    if status == "unavailable":
+        return "unavailable"
+    return "unknown"
+
+
+def _main_verify_rerun_result_description(state: object | None) -> str:
+    status = getattr(state, "verify_status", None)
+    if status == "failed":
+        return "red"
+    if status == "unavailable":
+        return "unavailable"
+    return "unknown"
+
+
+def _run_watch_main_integration_verify(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    log: "_WatchLog",
+    quiet: bool,
+    target_branch: str,
+    reason: str,
+    red_reruns: int,
+    suppress_verify_stdout: bool = False,
+) -> MainIntegrationVerifyCheck:
+    head_sha = _resolve_main_verify_target_head(git, target_branch, log)
+    target = _format_main_verify_target(target_branch, head_sha)
+    total_attempts = red_reruns + 1
+    log.emit(
+        "INFO",
+        (
+            f"main verify checking checkpoint for {reason} against {target}; "
+            "will run if stale or if a red result needs bounded confirmation"
+        ),
+    )
+    started = time.perf_counter()
+    visible_stdout = sys.stdout
+
+    def log_initial_run(attempt: int, total: int) -> None:
+        message = (
+            f"main verify starting attempt {attempt}/{total} for {reason} against {target}; "
+            "suite may take a while"
+        )
+        if suppress_verify_stdout and not quiet:
+            with contextlib.redirect_stdout(visible_stdout):
+                log.emit("INFO", message)
+            return
+        log.emit("INFO", message)
+
+    def log_red_rerun(attempt: int, total: int, prior_state: object | None = None) -> None:
+        result_description = _main_verify_rerun_result_description(prior_state)
+        message = (
+            f"main verify rerun {attempt}/{total} for {reason} against {target} "
+            f"after {result_description} result"
+        )
+        if suppress_verify_stdout and not quiet:
+            with contextlib.redirect_stdout(visible_stdout):
+                log.emit("INFO", message)
+            return
+        log.emit("INFO", message)
+
+    check = _run_with_optional_stdout_suppressed(
+        quiet or suppress_verify_stdout,
+        lambda: check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason=reason,
+            red_reruns=red_reruns,
+            resolved_head_sha=head_sha,
+            on_initial_run_start=log_initial_run,
+            on_red_rerun_start=log_red_rerun,
+        ),
+    )
+    elapsed = _format_watch_duration(time.perf_counter() - started)
+    state = getattr(check, "state", None)
+    phase = getattr(state, "failing_phase", None)
+    remediation = getattr(check, "remediation", None)
+    if not phase and remediation is not None:
+        phase = getattr(remediation, "failing_phase", None)
+    gate_enabled = getattr(state, "gate_enabled", True)
+    verdict = _main_verify_completion_verdict(check)
+    cached_prefix = "cached " if not getattr(check, "performed_verify", True) else ""
+    phase_suffix = ""
+    if verdict == "red":
+        phase_suffix = f"; phase {phase or 'unknown'}"
+    runs = getattr(check, "verify_runs", None)
+    suite_ran = getattr(check, "performed_verify", True) and gate_enabled is not False
+    runs_suffix = f"; attempts {runs}/{total_attempts}" if suite_ran and isinstance(runs, int) and runs > 0 else ""
+    message = (
+        f"main verify {cached_prefix}{verdict} for {reason} against {target}{phase_suffix}; "
+        f"elapsed {elapsed}{runs_suffix}"
+    )
+    log.emit(
+        "INFO",
+        message,
+    )
+    return check
 
 
 def _watch_task_has_live_registered_worker(config: Config, task_id: str) -> bool:
@@ -4268,7 +4416,12 @@ def _wait_for_watch_dispatch_start(
 
 def _watch_execution_requires_dispatch_confirmation(result: AdvanceActionExecutionResult) -> bool:
     """Return whether a shared advance result represents a real worker launch attempt."""
-    return result.worker_consuming and result.attempted_spawn and result.worker_started and result.handled_task_id is not None
+    return (
+        result.worker_consuming
+        and result.attempted_spawn
+        and result.worker_started
+        and result.handled_task_id is not None
+    )
 
 
 def _confirm_watch_dispatch_start(
@@ -4335,10 +4488,7 @@ def _emit_deferred_watch_dispatch_outcome(
     if settle_result.status is _DispatchSettleStatus.TERMINAL_BEFORE_RUNNING:
         log.emit(
             "START_NOSLOT",
-            (
-                f"{deferred.settle.start_label}: dispatch exited before occupying a live slot "
-                f"({settle_result.reason})"
-            ),
+            (f"{deferred.settle.start_label}: dispatch exited before occupying a live slot ({settle_result.reason})"),
             dedupe_key=deferred.settle.dedupe_key,
         )
         return False, None
@@ -4393,17 +4543,14 @@ def _format_start_line(
         suffix += " [dry-run]"
     prompt = _format_prompt_for_width(
         task.prompt,
-        prefix=16 + len(f"{task.id} {task_type} \""),
+        prefix=16 + len(f'{task.id} {task_type} "'),
         suffix=len(f'"{suffix}'),
     )
     return f'{task.id} {task_type} "{prompt}"{suffix}'
 
 
 def _format_expected_start_failed_line(task_id: str, expected_start: "_ExpectedStart") -> str:
-    return (
-        f"{task_id} {_format_expected_start_annotation(expected_start)}: "
-        "spawned worker never reached in_progress"
-    )
+    return f"{task_id} {_format_expected_start_annotation(expected_start)}: spawned worker never reached in_progress"
 
 
 def _format_follow_line(
@@ -4603,9 +4750,7 @@ def _filter_watch_dispatch_preview_entries(
 def _map_planned_recovery_entries_to_actionable_failed(
     planned_entries: Sequence[DispatchPreviewEntry],
     *,
-    actionable_failed: Sequence[
-        tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]
-    ],
+    actionable_failed: Sequence[tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]],
     known_non_actionable_failed_ids: frozenset[str] = frozenset(),
 ) -> tuple[
     tuple[tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask], ...],
@@ -5015,9 +5160,7 @@ def _emit_recovery_dry_run_report(
         else f"{resume} resume, {retry} retry, {reconcile} reconcile"
     )
     hidden_breakdown = (
-        f"{rebase} needs_rebase, {resume} resume, {retry} retry"
-        if rebase > 0
-        else f"{resume} resume, {retry} retry"
+        f"{rebase} needs_rebase, {resume} resume, {retry} retry" if rebase > 0 else f"{resume} resume, {retry} retry"
     )
     if show_skipped:
         print(
@@ -5123,11 +5266,12 @@ def _determine_recovery_lane_action(
         if isinstance(decision.recovery_task_id, str) and decision.recovery_task_id
         else None
     )
-    has_active_recovery_child = active_recovery_task is not None and active_recovery_task.status in {"pending", "in_progress"}
+    has_active_recovery_child = active_recovery_task is not None and active_recovery_task.status in {
+        "pending",
+        "in_progress",
+    }
     active_recovery_mode = (
-        resolve_pending_recovery_execution_mode(active_recovery_task)
-        if active_recovery_task is not None
-        else None
+        resolve_pending_recovery_execution_mode(active_recovery_task) if active_recovery_task is not None else None
     )
 
     shared_action = _shared_determine_next_action(
@@ -5229,10 +5373,7 @@ def _record_failure_backoff_updates(
                 f"(streak {streak}; latest: {failure.task_id}={failure.reason}; "
                 "other units remain dispatchable)"
             ),
-            dedupe_key=(
-                f"owner-backoff:{failure.owner_task_id}:{streak}:"
-                f"{backoff_until.astimezone(UTC).isoformat()}"
-            ),
+            dedupe_key=(f"owner-backoff:{failure.owner_task_id}:{streak}:{backoff_until.astimezone(UTC).isoformat()}"),
         )
     halt_after = config.watch.failure_halt_after
     if halt_after is None:
@@ -5457,10 +5598,10 @@ def _analyze_watch_cycle(
                     recovery_attention_rows.append((row.owner_task, decision, parked_attention))
                     active_recovery_subject_ids.add(str(failed.id))
                     continue
-                if (
-                    str(recovery_action.get("reason", "")).startswith("recovery_already_")
-                    or decision.reason_code in {"recovery_already_pending", "recovery_already_running"}
-                ):
+                if str(recovery_action.get("reason", "")).startswith("recovery_already_") or decision.reason_code in {
+                    "recovery_already_pending",
+                    "recovery_already_running",
+                }:
                     active_recovery_subject_ids.add(str(failed.id))
                 recovery_visible_skips.append((row.owner_task, failed, decision, recovery_action))
                 continue
@@ -5564,15 +5705,11 @@ def _evaluate_blind_parked_auto_rearm(
 
         if policy.require_target_advanced:
             if not target_sha:
-                decisions.append(
-                    _BlindParkedAutoRearmDecision(candidate, "skipped", "target SHA unavailable")
-                )
+                decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "target SHA unavailable"))
                 continue
             last_target_sha = rearm_state.last_auto_attempt_target_sha if rearm_state is not None else None
             if last_target_sha == target_sha:
-                decisions.append(
-                    _BlindParkedAutoRearmDecision(candidate, "skipped", "target SHA unchanged")
-                )
+                decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "target SHA unchanged"))
                 continue
 
         clear_parked_candidate_state(
@@ -5590,6 +5727,7 @@ def _evaluate_blind_parked_auto_rearm(
         decisions.append(_BlindParkedAutoRearmDecision(candidate, "rearmed", "blind auto-rearm"))
 
     return _BlindParkedAutoRearmResult(decisions=tuple(decisions))
+
 
 def _scoped_member_task_ids(owner_rows: list[LineageOwnerRow], owner_task_ids: tuple[str, ...]) -> set[str]:
     member_ids = set(owner_task_ids)
@@ -5818,6 +5956,7 @@ def _dispatch_scoped_watch_once(
     tags: tuple[str, ...] | None = None,
     any_tag: bool = False,
     quiet: bool = False,
+    suppress_main_verify_stdout: bool = False,
     recovery_slots: int = 1,
     recovery_mode: DispatchSelectionMode | None = None,
     max_recovery_attempts: int = 1,
@@ -5846,6 +5985,7 @@ def _dispatch_scoped_watch_once(
         tags=tags,
         any_tag=any_tag,
         quiet=quiet,
+        suppress_main_verify_stdout=suppress_main_verify_stdout,
         recovery_slots=recovery_slots,
         recovery_mode=recovery_mode,
         max_recovery_attempts=max_recovery_attempts,
@@ -5876,6 +6016,7 @@ def _run_cycle(
     tags: tuple[str, ...] | None = None,
     any_tag: bool = False,
     quiet: bool = False,
+    suppress_main_verify_stdout: bool = False,
     recovery_slots: int = 1,
     recovery_mode: DispatchSelectionMode | None = None,
     restart_failed: bool = False,
@@ -5956,11 +6097,7 @@ def _run_cycle(
     deferred_recovery_starts: list[_DeferredWatchDispatchStart] = []
     step1_handled_child_task_ids: set[str] = set()
     reserved_recovery_slots = 0
-    remaining_new_worker_starts = (
-        max(0, new_worker_start_cap)
-        if new_worker_start_cap is not None
-        else None
-    )
+    remaining_new_worker_starts = max(0, new_worker_start_cap) if new_worker_start_cap is not None else None
 
     def _check_canonical_checkout_boundary(action: str) -> None:
         if dry_run:
@@ -6409,15 +6546,16 @@ def _run_cycle(
     elif current_branch == target_branch:
         merge_verify_git = git
     if merge_verify_git is not None:
-        main_verify = _run_with_optional_stdout_suppressed(
-            quiet,
-            lambda: check_main_integration_verify(
-                config,
-                store,
-                merge_verify_git,
-                reason="watch-main-verify",
-                red_reruns=2,
-            ),
+        main_verify = _run_watch_main_integration_verify(
+            config=config,
+            store=store,
+            git=merge_verify_git,
+            log=log,
+            quiet=quiet,
+            suppress_verify_stdout=suppress_main_verify_stdout,
+            target_branch=target_branch,
+            reason="watch-main-verify",
+            red_reruns=2,
         )
         _retire_cleared_main_verify_remediations(
             store=store,
@@ -6653,7 +6791,9 @@ def _run_cycle(
                         display_task = task
                 merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
                 effective_merge_state = (
-                    effective_no_work_merge_state(task, merge_unit.state) if merge_unit is not None else task.merge_status
+                    effective_no_work_merge_state(task, merge_unit.state)
+                    if merge_unit is not None
+                    else task.merge_status
                 )
                 if task.status != "completed" or effective_merge_state in {"merged", "empty", "redundant"}:
                     log.emit(
@@ -6737,15 +6877,16 @@ def _run_cycle(
                         log.emit("MERGE", f"{merge_event.display_task_id} -> {merge_event.target_branch}")
                         log.note_merge_logged(merge_event.merge_key)
                 if rc == 0 and merge_execution_git is not None:
-                    main_verify = _run_with_optional_stdout_suppressed(
-                        quiet,
-                        lambda: check_main_integration_verify(
-                            config,
-                            store,
-                            merge_execution_git,
-                            reason="watch-post-merge",
-                            red_reruns=2,
-                        ),
+                    main_verify = _run_watch_main_integration_verify(
+                        config=config,
+                        store=store,
+                        git=merge_execution_git,
+                        log=log,
+                        quiet=quiet,
+                        suppress_verify_stdout=suppress_main_verify_stdout,
+                        target_branch=target_branch,
+                        reason="watch-post-merge",
+                        red_reruns=2,
                     )
                     _retire_cleared_main_verify_remediations(
                         store=store,
@@ -7016,9 +7157,8 @@ def _run_cycle(
             guarded_pending_task_id = exec_result.guarded_pending_task_id
 
             if exec_result.status == "skip":
-                if (
-                    display_task.id is not None
-                    and exec_result.message.startswith("SKIP: no watch worker slots available for ")
+                if display_task.id is not None and exec_result.message.startswith(
+                    "SKIP: no watch worker slots available for "
                 ):
                     _observe_dispatch(display_task.id, "capacity_blocked", str(action_type))
                 if guarded_pending_task_id is not None:
@@ -7267,10 +7407,7 @@ def _run_cycle(
             if auto_rearm_decision.status == "rearmed" and owner_id is not None:
                 log.emit(
                     "REARM",
-                    (
-                        f"{owner_id}: blind auto-rearm cleared "
-                        f"{auto_rearm_decision.candidate.attention_reason}"
-                    ),
+                    (f"{owner_id}: blind auto-rearm cleared {auto_rearm_decision.candidate.attention_reason}"),
                     dedupe_key=f"blind-auto-rearm:{owner_id}:{auto_rearm_decision.candidate.attention_reason}",
                 )
                 work_done = True
@@ -7288,7 +7425,6 @@ def _run_cycle(
                 scoped_owner_ids=scoped_owner_ids,
                 excluded_owner_ids=excluded_owner_ids,
             )
-
 
     # 2) Recovery queue for failed tasks.
     pending_recovery_task_ids = set(analysis.pending_recovery_task_ids)
@@ -7419,7 +7555,9 @@ def _run_cycle(
     pending_tasks = (
         []
         if scoped_owner_ids is not None
-        else [entry.task for entry in dispatch_launchable_entries if entry.lane == "pending" and entry.task.id is not None]
+        else [
+            entry.task for entry in dispatch_launchable_entries if entry.lane == "pending" and entry.task.id is not None
+        ]
     )
     dispatch_plan = plan_watch_dispatch_entries(
         dispatch_launchable_entries,
@@ -7440,10 +7578,12 @@ def _run_cycle(
         )
         if failed.id is not None
     )
-    planned_recovery_actionable_failed, unmapped_planned_recovery_entries = _map_planned_recovery_entries_to_actionable_failed(
-        planned_dispatch_entries,
-        actionable_failed=actionable_failed,
-        known_non_actionable_failed_ids=known_non_actionable_recovery_subject_ids,
+    planned_recovery_actionable_failed, unmapped_planned_recovery_entries = (
+        _map_planned_recovery_entries_to_actionable_failed(
+            planned_dispatch_entries,
+            actionable_failed=actionable_failed,
+            known_non_actionable_failed_ids=known_non_actionable_recovery_subject_ids,
+        )
     )
     launchable_recovery_subject_ids = {
         str(failed.id)
@@ -7467,6 +7607,7 @@ def _run_cycle(
                 subject_task=failed,
                 action=recovery_action,
             )
+
     def _fail_closed_for_planned_recovery_entry(
         entry: DispatchPreviewEntry,
         *,
@@ -7474,7 +7615,9 @@ def _run_cycle(
         reason: str,
     ) -> None:
         task_id = str(entry.task.id) if entry.task.id is not None else "unknown"
-        owner_id = entry.owner_task.id if entry.owner_task is not None and entry.owner_task.id is not None else "unknown"
+        owner_id = (
+            entry.owner_task.id if entry.owner_task is not None and entry.owner_task.id is not None else "unknown"
+        )
         log.emit_attention(
             attention_key=f"planned-recovery-dispatch-invariant:{stage}:{task_id}:{reason}",
             message=(
@@ -7484,9 +7627,7 @@ def _run_cycle(
         )
 
     def _dispatch_planned_recovery_entries(
-        planned_rows: Sequence[
-            tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]
-        ],
+        planned_rows: Sequence[tuple[LineageOwnerRow, DbTask, FailedRecoveryDecision, dict[str, Any], bool, DbTask]],
         *,
         pending_slots_for_replan: int,
         allow_replan: bool,
@@ -7701,8 +7842,17 @@ def _run_cycle(
                         dedupe_key=f"recovery-needs-rebase-error:{failed.id}:{exec_result.message}",
                     )
                     continue
-                if exec_result.status != "success" or exec_result.created_task is None or exec_result.created_task.id is None:
-                    if allow_replan and exec_result.status == "success" and pending_slots_for_replan <= 0 and not exec_result.worker_consuming:
+                if (
+                    exec_result.status != "success"
+                    or exec_result.created_task is None
+                    or exec_result.created_task.id is None
+                ):
+                    if (
+                        allow_replan
+                        and exec_result.status == "success"
+                        and pending_slots_for_replan <= 0
+                        and not exec_result.worker_consuming
+                    ):
                         local_replan_requested = True
                     continue
                 recovered_task_id = str(exec_result.created_task.id)
@@ -8024,6 +8174,7 @@ def _run_cycle(
             count_recovery_start=True,
         )
         return local_fail_closed, local_replan_requested
+
     for row, failed, decision, recovery_action, _worker_consuming_recovery, action_task in actionable_failed:
         if failed.id is None:
             continue
@@ -8094,10 +8245,12 @@ def _run_cycle(
             include_pending=scoped_owner_ids is None,
         )
         replanned_dispatch_entries = tuple(getattr(replanned_dispatch_plan, "entries", remaining_dispatch_entries))
-        replanned_actionable_failed, unmapped_replanned_recovery_entries = _map_planned_recovery_entries_to_actionable_failed(
-            replanned_dispatch_entries,
-            actionable_failed=actionable_failed,
-            known_non_actionable_failed_ids=known_non_actionable_recovery_subject_ids,
+        replanned_actionable_failed, unmapped_replanned_recovery_entries = (
+            _map_planned_recovery_entries_to_actionable_failed(
+                replanned_dispatch_entries,
+                actionable_failed=actionable_failed,
+                known_non_actionable_failed_ids=known_non_actionable_recovery_subject_ids,
+            )
         )
         if unmapped_replanned_recovery_entries:
             invariant_violating_entries = tuple(
@@ -8500,8 +8653,8 @@ def _run_cycle(
     _emit_cycle_attention_summary(log)
     if end_cycle:
         log.end_cycle()
-    _live_pids, end_running_task_ids, end_anonymous_worker_count, end_starting_worker_count = _collect_live_running_state(
-        config, store
+    _live_pids, end_running_task_ids, end_anonymous_worker_count, end_starting_worker_count = (
+        _collect_live_running_state(config, store)
     )
     return _CycleResult(
         work_done=work_done,
@@ -8630,8 +8783,7 @@ def _emit_git_health_hold(
         )
     log.emit_attention(
         attention_key=f"git-health:{GIT_HEALTH_REASON}",
-        message=git_health_check.state.alert_message
-        or "git worktree health RED - dispatch halted",
+        message=git_health_check.state.alert_message or "git worktree health RED - dispatch halted",
     )
     return True
 
@@ -8797,6 +8949,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
         resumed_reexec = bool(getattr(args, "resumed_reexec", False))
         skip_confirm = dry_run or bool(getattr(args, "yes", False)) or resumed_reexec
+        suppress_main_verify_stdout = quiet or bool(getattr(args, "yes", False))
         needs_initial_preview = not skip_confirm
         pending_first_cycle_plan: _WatchCyclePlan | None = None
         preview_cycle_open = False
@@ -9020,6 +9173,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     max_iterations=max_iterations,
                     dry_run=dry_run,
                     quiet=quiet,
+                    suppress_main_verify_stdout=suppress_main_verify_stdout,
                     log=log,
                     tags=tag_filters,
                     any_tag=any_tag,
@@ -9046,6 +9200,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     max_iterations=max_iterations,
                     dry_run=dry_run,
                     quiet=quiet,
+                    suppress_main_verify_stdout=suppress_main_verify_stdout,
                     log=log,
                     tags=tag_filters,
                     any_tag=any_tag,
@@ -9499,17 +9654,11 @@ def cmd_queue(args: argparse.Namespace) -> int:
     display_limit = None if show_all else max(1, int(limit_arg))
     runnable_preview_entries = tuple(dispatch_preview.runnable_entries if dispatch_preview is not None else ())
     visible_runnable_entries = (
-        runnable_preview_entries
-        if display_limit is None
-        else runnable_preview_entries[:display_limit]
+        runnable_preview_entries if display_limit is None else runnable_preview_entries[:display_limit]
     )
     visible_recovery_entries = [entry for entry in visible_runnable_entries if entry.lane == "recovery"]
     visible_pending_entries = [entry for entry in visible_runnable_entries if entry.lane == "pending"]
-    visible_pending_task_ids = {
-        entry.task.id
-        for entry in visible_pending_entries
-        if entry.task.id is not None
-    }
+    visible_pending_task_ids = {entry.task.id for entry in visible_pending_entries if entry.task.id is not None}
     visible_runnable_recovery = [
         adapted
         for adapted in (
@@ -9523,9 +9672,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
         )
         if adapted is not None
     ]
-    visible_runnable_pending_rows = [
-        row for row in _runnable_rows if row.task.id in visible_pending_task_ids
-    ]
+    visible_runnable_pending_rows = [row for row in _runnable_rows if row.task.id in visible_pending_task_ids]
     visible_quiet_rows = list(quiet_rows)
 
     if not show_pending:
@@ -9677,9 +9824,7 @@ def cmd_queue(args: argparse.Namespace) -> int:
     if quiet_rendered_rows:
         console.print()
         console.print(
-            build_queue_summary(
-                "Quiet lane: `gza queue` shows held tasks without giving them runnable positions."
-            )
+            build_queue_summary("Quiet lane: `gza queue` shows held tasks without giving them runnable positions.")
         )
         print_queue_rows(console, quiet_rendered_rows, widths=widths)
 

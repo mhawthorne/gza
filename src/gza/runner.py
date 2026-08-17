@@ -5910,11 +5910,39 @@ def _checked_git_probe_output(git: Git, *args: str) -> str:
     return result.stdout if isinstance(result.stdout, str) else ""
 
 
-def _compute_tree_fingerprint(git: Git) -> str | None:
+_TREE_FINGERPRINT_HEAD_UNSET = object()
+
+
+def _compute_tree_fingerprint(
+    git: Git,
+    *,
+    head_sha: str | None | object = _TREE_FINGERPRINT_HEAD_UNSET,
+) -> str | None:
     """Compute a conservative tree fingerprint for checkpoint reuse decisions."""
-    head_sha = git.rev_parse_if_exists("HEAD")
+    head_sha_was_unset = head_sha is _TREE_FINGERPRINT_HEAD_UNSET
+    if head_sha is _TREE_FINGERPRINT_HEAD_UNSET:
+        head_sha = git.rev_parse_if_exists("HEAD")
     if not isinstance(head_sha, str) or not head_sha:
-        head_sha = "missing-head"
+        if head_sha_was_unset:
+            try:
+                _checked_git_probe_output(
+                    git,
+                    "diff",
+                    "--cached",
+                    "--binary",
+                    "--no-ext-diff",
+                    "--submodule=diff",
+                )
+            except GitError as exc:
+                logger.warning(
+                    "Warning: failed to compute exact tree fingerprint for timeout resume checkpoints: %s",
+                    exc,
+                )
+                return None
+            logger.warning(
+                "Warning: failed to compute exact tree fingerprint for timeout resume checkpoints: HEAD unavailable"
+            )
+        return None
 
     try:
         staged_diff = _checked_git_probe_output(
