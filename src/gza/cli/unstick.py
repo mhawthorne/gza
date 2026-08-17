@@ -20,12 +20,23 @@ from .watch import _build_watch_cycle_plan, _dispatch_scoped_watch_once, _WatchL
 
 
 @dataclass(frozen=True)
+class _UnstickDirectOutcome:
+    action_type: str
+    status: Literal["success", "blocked", "error"]
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
 class _UnstickRunSummary:
     started_owner_ids: frozenset[str]
     capacity_blocked_owner_ids: frozenset[str]
+    direct_owner_outcomes: dict[str, _UnstickDirectOutcome]
 
 
-def _seed_zero_slot_capacity_blocked(plan, observed: dict[str, Literal["started", "direct", "capacity_blocked"]]) -> None:
+_ObservedRunOutcome = Literal["started", "direct", "direct_blocked", "direct_error", "capacity_blocked"]
+
+
+def _seed_zero_slot_capacity_blocked(plan, observed: dict[str, tuple[_ObservedRunOutcome, str, str | None]]) -> None:
     """Pre-classify runnable worker recovery owners when scoped watch has no slots at all."""
     slots = getattr(plan, "slots", None)
     analysis = getattr(plan, "analysis", None)
@@ -34,7 +45,7 @@ def _seed_zero_slot_capacity_blocked(plan, observed: dict[str, Literal["started"
     for row, failed, _decision, _action, worker_consuming, _action_task in getattr(analysis, "actionable_failed", ()):
         if not worker_consuming or row.owner_task.id is None or failed.id is None:
             continue
-        observed[str(row.owner_task.id)] = "capacity_blocked"
+        observed[str(row.owner_task.id)] = ("capacity_blocked", str(_action.get("type", "recovery")), None)
 
 
 def _dispatch_rearmed_owners(
@@ -45,17 +56,26 @@ def _dispatch_rearmed_owners(
     limit: int,
 ) -> _UnstickRunSummary:
     if not owner_ids:
-        return _UnstickRunSummary(started_owner_ids=frozenset(), capacity_blocked_owner_ids=frozenset())
+        return _UnstickRunSummary(
+            started_owner_ids=frozenset(),
+            capacity_blocked_owner_ids=frozenset(),
+            direct_owner_outcomes={},
+        )
 
     snapshot = get_concurrency_snapshot(config, store, cleanup_stale=False)
     scoped_batch = min(snapshot.limit, snapshot.running + limit)
-    observed: dict[str, Literal["started", "direct", "capacity_blocked"]] = {}
-    priority = {"direct": 0, "capacity_blocked": 1, "started": 2}
+    observed: dict[str, tuple[_ObservedRunOutcome, str, str | None]] = {}
+    priority = {"direct": 0, "direct_blocked": 1, "direct_error": 1, "capacity_blocked": 2, "started": 3}
 
-    def _observe(owner_task_id: str, outcome: Literal["started", "direct", "capacity_blocked"], _action_type: str) -> None:
+    def _observe(
+        owner_task_id: str,
+        outcome: _ObservedRunOutcome,
+        action_type: str,
+        detail: str | None = None,
+    ) -> None:
         previous = observed.get(owner_task_id)
-        if previous is None or priority[outcome] >= priority[previous]:
-            observed[owner_task_id] = outcome
+        if previous is None or priority[outcome] >= priority[previous[0]]:
+            observed[owner_task_id] = (outcome, action_type, detail)
 
     log = _WatchLog(config.project_dir / ".gza" / "unstick-run.log", quiet=True)
     plan = _build_watch_cycle_plan(
@@ -90,10 +110,25 @@ def _dispatch_rearmed_owners(
         new_worker_start_cap=limit,
     )
     return _UnstickRunSummary(
-        started_owner_ids=frozenset(owner_id for owner_id, outcome in observed.items() if outcome == "started"),
+        started_owner_ids=frozenset(owner_id for owner_id, (outcome, _action_type, _detail) in observed.items() if outcome == "started"),
         capacity_blocked_owner_ids=frozenset(
-            owner_id for owner_id, outcome in observed.items() if outcome == "capacity_blocked"
+            owner_id for owner_id, (outcome, _action_type, _detail) in observed.items() if outcome == "capacity_blocked"
         ),
+        direct_owner_outcomes={
+            owner_id: _UnstickDirectOutcome(
+                action_type=action_type,
+                status=(
+                    "success"
+                    if outcome == "direct"
+                    else "blocked"
+                    if outcome == "direct_blocked"
+                    else "error"
+                ),
+                detail=detail,
+            )
+            for owner_id, (outcome, action_type, detail) in observed.items()
+            if outcome in {"direct", "direct_blocked", "direct_error"}
+        },
     )
 
 
@@ -108,6 +143,21 @@ def _print_outcome_group(title: str, outcomes: list[UnstickOutcome]) -> None:
             print(f"  {outcome.owner_task.id} {outcome.detail}: {prompt}")
         else:
             print(f"  {outcome.owner_task.id} [{reason}] {prompt}")
+
+
+def _print_direct_outcome_group(
+    title: str,
+    outcomes: list[tuple[UnstickOutcome, _UnstickDirectOutcome]],
+) -> None:
+    if not outcomes:
+        return
+    print(title)
+    for outcome, direct in outcomes:
+        prompt = truncate(outcome.owner_task.prompt, 80)
+        reason = outcome.reason_class or "unknown"
+        direct_detail = getattr(direct, "detail", None)
+        detail = f" - {direct_detail.removeprefix('SKIP: ')}" if direct_detail else ""
+        print(f"  {outcome.owner_task.id} [{reason}] {direct.action_type} {direct.status}: {prompt}{detail}")
 
 
 def cmd_unstick(args: argparse.Namespace) -> int:
@@ -153,6 +203,8 @@ def cmd_unstick(args: argparse.Namespace) -> int:
     skipped = [outcome for outcome in result.outcomes if outcome.status == "skipped"]
     started: list[UnstickOutcome] = []
     capacity_blocked: list[UnstickOutcome] = []
+    direct: list[tuple[UnstickOutcome, _UnstickDirectOutcome]] = []
+    direct_blocked: list[tuple[UnstickOutcome, _UnstickDirectOutcome]] = []
     cleared_only: list[UnstickOutcome] = rearmed
 
     if run_cleared and rearmed:
@@ -176,23 +228,42 @@ def cmd_unstick(args: argparse.Namespace) -> int:
             for outcome in rearmed
             if outcome.owner_task.id is not None and str(outcome.owner_task.id) in run_summary.capacity_blocked_owner_ids
         ]
+        direct = [
+            (outcome, run_summary.direct_owner_outcomes[str(outcome.owner_task.id)])
+            for outcome in rearmed
+            if outcome.owner_task.id is not None
+            and str(outcome.owner_task.id) in run_summary.direct_owner_outcomes
+            and run_summary.direct_owner_outcomes[str(outcome.owner_task.id)].status == "success"
+        ]
+        direct_blocked = [
+            (outcome, run_summary.direct_owner_outcomes[str(outcome.owner_task.id)])
+            for outcome in rearmed
+            if outcome.owner_task.id is not None
+            and str(outcome.owner_task.id) in run_summary.direct_owner_outcomes
+            and run_summary.direct_owner_outcomes[str(outcome.owner_task.id)].status != "success"
+        ]
+        direct_owner_ids = frozenset(run_summary.direct_owner_outcomes)
         cleared_only = [
             outcome
             for outcome in rearmed
             if outcome.owner_task.id is None
-            or str(outcome.owner_task.id) not in run_summary.started_owner_ids | run_summary.capacity_blocked_owner_ids
+            or str(outcome.owner_task.id)
+            not in run_summary.started_owner_ids | run_summary.capacity_blocked_owner_ids | direct_owner_ids
         ]
         print(
             "Run summary: "
-            f"{len(started)} started, {len(cleared_only)} cleared-only, {len(capacity_blocked)} capacity-blocked"
+            f"{len(started)} started, {len(direct)} direct, {len(direct_blocked)} direct-blocked, "
+            f"{len(cleared_only)} cleared-only, {len(capacity_blocked)} capacity-blocked"
         )
         if limit_arg is not None:
             print(f"Dispatch limit: {limit}")
     elif run_cleared:
-        print("Run summary: 0 started, 0 cleared-only, 0 capacity-blocked")
+        print("Run summary: 0 started, 0 direct, 0 direct-blocked, 0 cleared-only, 0 capacity-blocked")
 
     if run_cleared:
         _print_outcome_group("Started:", started)
+        _print_direct_outcome_group("Direct:", direct)
+        _print_direct_outcome_group("Direct Blocked:", direct_blocked)
         _print_outcome_group("Cleared Only:", cleared_only)
         _print_outcome_group("Capacity Blocked:", capacity_blocked)
     else:

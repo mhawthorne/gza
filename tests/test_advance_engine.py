@@ -19333,6 +19333,93 @@ def test_new_failed_verify_at_current_head_keeps_completed_verify_fix_gate_red(t
     assert "verify gate is still red after completed verify_fix" in action["description"]
 
 
+def test_pre_review_verify_fix_failed_manual_rearm_describes_fresh_verify(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-rearmed-verify-fix",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="verify-head",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    artifact = store_command_output_artifact(
+        store,
+        impl,
+        config,
+        kind="verify_command_output",
+        producer="test",
+        label="verify_command_output",
+        output="pytest failed",
+        command=epoch.verify_command,
+        status="failed",
+        exit_status="1",
+        head_sha=epoch.reviewed_head_sha,
+        created_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+            artifact_path=artifact.path,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        output_artifact_id=artifact.id,
+        output_artifact_task_id=impl.id,
+        output_artifact_path=artifact.path,
+        producer="test",
+    )
+    verify_fix, created = create_or_reuse_verify_fix_task(
+        store,
+        config,
+        impl_task=impl,
+        based_on_task=impl,
+        verify_epoch=epoch,
+        trigger_source="test",
+    )
+    assert created is True
+    verify_fix.status = "completed"
+    verify_fix.completed_at = datetime(2026, 7, 6, 12, 10, tzinfo=UTC)
+    store.update(verify_fix)
+    store.record_parked_task_manual_rearm(
+        subject_kind="task",
+        subject_id=impl.id,
+        attention_reason="verify-fix-failed",
+        subject_task_id=impl.id,
+    )
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "verify_gate"
+    assert action["verify_gate_phase"] == "pre_review"
+    assert action["verify_gate_state"] == "failed"
+    assert action["verify_gate_explicit_refresh"] is True
+    assert action["description"] == "Run verify gate before review"
+    assert "SKIP: current verify gate is red; review is blocked" not in action["description"]
+
+
 def test_post_improve_failed_verify_routes_to_verify_fix_before_another_improve(
     tmp_path: Path,
     monkeypatch,

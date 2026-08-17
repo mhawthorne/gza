@@ -4771,6 +4771,30 @@ def _prove_legacy_verify_fix_completion_repair(
     return LegacyVerifyFixCompletionProof(branch_name=branch_name, expected_head_sha=expected_head)
 
 
+def _verify_fix_failed_manual_rearm_requires_fresh_verify(
+    ctx: AdvanceContext,
+    *,
+    owner_task: DbTask,
+) -> bool:
+    decision = getattr(ctx, "verify_gate_decision", None)
+    if (
+        decision is None
+        or decision.state != "failed"
+        or decision.lookup.result is None
+        or owner_task.id is None
+        or not ctx.store.supports_parked_task_rearms()
+    ):
+        return False
+    rearm = ctx.store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=owner_task.id,
+        attention_reason=PARK_REASON_VERIFY_FIX_FAILED,
+    )
+    if rearm is None or rearm.manual_rearm_epoch <= 0 or rearm.manual_rearmed_at is None:
+        return False
+    return decision.lookup.result.captured_at < rearm.manual_rearmed_at
+
+
 def _pre_review_verify_fix_action(ctx: AdvanceContext) -> dict[str, Any]:
     decision = getattr(ctx, "verify_gate_decision", None)
     owner_task = _verify_gate_owner_task(ctx)
@@ -4860,6 +4884,8 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext) -> dict[str, Any]:
                         reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
                         subject_task_id=owner_task.id,
                     )
+                if _verify_fix_failed_manual_rearm_requires_fresh_verify(ctx, owner_task=owner_task):
+                    return _verify_gate_action(ctx, phase="pre_review", explicit_refresh=True)
                 outcome = effective_verify_fix_completion_outcome(existing)
                 legacy_completion_proof: LegacyVerifyFixCompletionProof | None = None
                 if outcome is None:
@@ -4942,6 +4968,8 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext) -> dict[str, Any]:
                         "verify_epoch": current_epoch,
                         "legacy_completion_proof": legacy_completion_proof,
                     }
+            if _verify_fix_failed_manual_rearm_requires_fresh_verify(ctx, owner_task=owner_task):
+                return _verify_gate_action(ctx, phase="pre_review", explicit_refresh=True)
             reason = (
                 PARK_REASON_VERIFY_FIX_FAILED
                 if decision.state == "failed"
@@ -5023,7 +5051,7 @@ def _verify_gate_blocks_merge(ctx: AdvanceContext) -> bool:
     return decision is not None and decision.state != "passed"
 
 
-def _verify_gate_action(ctx: AdvanceContext, *, phase: str) -> dict[str, Any]:
+def _verify_gate_action(ctx: AdvanceContext, *, phase: str, explicit_refresh: bool = False) -> dict[str, Any]:
     decision = getattr(ctx, "verify_gate_decision", None)
     if decision is None:
         return {
@@ -5034,7 +5062,7 @@ def _verify_gate_action(ctx: AdvanceContext, *, phase: str) -> dict[str, Any]:
         return _pre_review_verify_fix_action(ctx)
     owner_task = _verify_gate_owner_task(ctx)
     description_suffix = "review" if phase == "pre_review" else "merge"
-    if decision.state in {"missing", "stale"}:
+    if explicit_refresh or decision.state in {"missing", "stale"}:
         description = f"Run verify gate before {description_suffix}"
     elif decision.state == "failed":
         description = f"SKIP: current verify gate is red; {description_suffix} is blocked"
@@ -5045,6 +5073,7 @@ def _verify_gate_action(ctx: AdvanceContext, *, phase: str) -> dict[str, Any]:
         "description": description,
         "verify_gate_phase": phase,
         "verify_gate_state": decision.state,
+        "verify_gate_explicit_refresh": explicit_refresh,
         "verify_owner_task": owner_task,
     }
 

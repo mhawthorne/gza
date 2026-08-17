@@ -10,16 +10,22 @@ import tempfile
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
 from ..advance_engine import (
+    ADVANCE_RULES,
+    PARK_REASON_VERIFY_FIX_FAILED,
+    AdvanceContext,
+    _pre_review_verify_fix_action,
     _resolve_and_persist_post_merge_rebase_state,
     _resolve_current_merge_source,
     _resolve_latest_plan_source,
     count_completed_review_cycles,
+    require_needs_attention_subject,
+    resolve_advance_context,
 )
 from ..concurrency import (
     LaunchPermit,
@@ -94,7 +100,12 @@ from ..review_tasks import (
     resolve_latest_failed_verify_epoch,
 )
 from ..review_verdict import get_review_report
-from ..review_verify_state import VerifyEpoch, owner_task_verify_epoch
+from ..review_verify_state import (
+    VerifyEpoch,
+    owner_task_verify_epoch,
+    resolve_verify_gate_decision,
+    resolve_verify_owner_task,
+)
 from ..runner import (
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
     RunInvocationContext,
@@ -3991,6 +4002,7 @@ def _spawn_background_iterate(
     prepared_resume: bool = False,
     prepared_phase: str | None = None,
     prepared_action_type: str | None = None,
+    prepared_verify_owner_task_id: str | None = None,
     prepared_review_task_id: str | None = None,
     startup_quiet: bool = False,
 ) -> int:
@@ -4013,6 +4025,7 @@ def _spawn_background_iterate(
         prepared_resume=prepared_resume,
         prepared_phase=prepared_phase,
         prepared_action_type=prepared_action_type,
+        prepared_verify_owner_task_id=prepared_verify_owner_task_id,
         prepared_review_task_id=prepared_review_task_id,
         startup_quiet=startup_quiet,
     )
@@ -4073,6 +4086,256 @@ def _determine_selected_iterate_action(
     )
 
 
+def _resolve_verify_fix_failed_owner_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    """Return the implementation root whose verify-fix-failed park owns the gate."""
+    owner = resolve_verify_owner_task(store, task)
+    current: DbTask | None = owner
+    visited: set[str] = set()
+    while current is not None and current.id is not None and current.id not in visited:
+        visited.add(current.id)
+        if current.task_type == "implement":
+            owner = current
+        if not current.based_on:
+            break
+        current = store.get(current.based_on)
+    return owner
+
+
+def _force_verify_fix_failed_action(
+    action: dict[str, Any],
+    *,
+    task: DbTask,
+    store: SqliteTaskStore,
+) -> dict[str, Any]:
+    """Convert the verify-fix-failed park into a fresh verify gate for manual force."""
+    if action.get("type") != "needs_discussion":
+        return action
+    if action.get("needs_attention_reason") != PARK_REASON_VERIFY_FIX_FAILED:
+        return action
+    verify_owner_task = _resolve_verify_fix_failed_owner_task(store, task)
+    subject_task_id = action.get("subject_task_id")
+    if isinstance(subject_task_id, str) and subject_task_id:
+        subject_task = store.get(subject_task_id)
+        if subject_task is not None:
+            verify_owner_task = _resolve_verify_fix_failed_owner_task(store, subject_task)
+    return {
+        "type": "verify_gate",
+        "description": "Run verify gate before review",
+        "verify_gate_phase": "pre_review",
+        "verify_gate_state": "failed",
+        "verify_gate_explicit_refresh": True,
+        "verify_owner_task": verify_owner_task,
+    }
+
+
+def _determine_recovered_post_green_iterate_action(
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    task: DbTask,
+    target_branch: str,
+    *,
+    max_resume_attempts: int,
+) -> dict[str, Any]:
+    """Evaluate shared lifecycle policy after a recovered verify-fix park is cleared."""
+
+    def _evaluate(*, selected_for_merge: bool) -> dict[str, Any]:
+        context = resolve_advance_context(
+            config,
+            store,
+            git,
+            task,
+            target_branch,
+            max_resume_attempts=max_resume_attempts,
+            selected_for_merge=selected_for_merge,
+        )
+        context = replace(
+            context,
+            failed_recovery_decision=None,
+            failed_recovery_attention_reason=None,
+        )
+        for rule in ADVANCE_RULES:
+            if rule.matches(context):
+                shared_action = rule.action(context)
+                if shared_action.get("type") == "verify_gate":
+                    maybe_verify_owner = shared_action.get("verify_owner_task")
+                    verify_owner = maybe_verify_owner if isinstance(maybe_verify_owner, DbTask) else task
+                    verify_owner = _resolve_verify_fix_failed_owner_task(store, verify_owner)
+                    verify_decision = resolve_verify_gate_decision(store, verify_owner, config=config, git=git)
+                    if verify_decision.state == "passed":
+                        continue
+                require_needs_attention_subject(shared_action)
+                return shared_action
+        return {"type": "skip", "description": "SKIP: no matching rule (unexpected)"}
+
+    return dict(
+        reproject_selected_merge_action(
+            _evaluate(selected_for_merge=False),
+            selected=True,
+            reproject_action=lambda: _evaluate(selected_for_merge=True),
+        )
+    )
+
+
+def _current_verify_fix_owner_verify_action(
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    owner_task: DbTask,
+    target_branch: str,
+    *,
+    max_resume_attempts: int,
+) -> dict[str, Any] | None:
+    """Return the canonical owner's current verify-fix policy action."""
+    decision = resolve_verify_gate_decision(store, owner_task, config=config, git=git)
+    owner_action = _pre_review_verify_fix_action(
+        AdvanceContext(
+            store=store,
+            git=git,
+            config=config,
+            task=owner_task,
+            task_type=owner_task.task_type,
+            has_branch=bool(owner_task.branch),
+            target_branch=target_branch,
+            requires_review=True,
+            create_reviews=True,
+            max_review_cycles=getattr(config, "max_review_cycles", 1),
+            advance_create_plan_reviews=getattr(config, "advance_create_plan_reviews", True),
+            require_plan_review_before_implement=getattr(config, "require_plan_review_before_implement", True),
+            max_plan_review_cycles=getattr(config, "max_plan_review_cycles", 2),
+            max_failed_plan_review_retries=getattr(config, "max_failed_plan_review_retries", 3),
+            max_plan_slices=getattr(config, "max_plan_slices", None),
+            plan_slice_target_timeout_minutes=getattr(config, "plan_slice_target_timeout_minutes", 30),
+            max_noop_improve_cycles=getattr(config, "max_noop_improve_cycles", 1),
+            max_resume_attempts=max_resume_attempts,
+            can_merge=True,
+            closing_review_action={"type": "create_review"},
+            verify_gate_decision=decision,
+            review_root_task=owner_task,
+        )
+    )
+    if owner_action.get("type") in {"needs_discussion", "verify_gate"}:
+        return owner_action
+    return None
+
+
+def _force_recovered_verify_fix_failed_gate_action(
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    action: dict[str, Any],
+    target_branch: str,
+    *,
+    task: DbTask,
+    max_resume_attempts: int,
+) -> dict[str, Any]:
+    """Force a current-head verify when a recovered descendant masks the root park."""
+    action_owner_task = action.get("verify_owner_task")
+    if action.get("type") == "verify_gate" and action.get("verify_gate_state") == "passed" and isinstance(
+        action_owner_task, DbTask
+    ):
+        owner_task = action_owner_task
+    else:
+        owner_task = _resolve_verify_fix_failed_owner_task(store, task)
+    if owner_task.id is None or owner_task.id == task.id:
+        return action
+    decision = resolve_verify_gate_decision(store, owner_task, config=config, git=git)
+    current_epoch = decision.current_epoch
+    if decision.state == "passed":
+        return _determine_recovered_post_green_iterate_action(
+            config,
+            store,
+            git,
+            task,
+            target_branch,
+            max_resume_attempts=max_resume_attempts,
+        )
+    owner_verify_action = _current_verify_fix_owner_verify_action(
+        config,
+        store,
+        git,
+        owner_task,
+        target_branch,
+        max_resume_attempts=max_resume_attempts,
+    )
+    if owner_verify_action is None:
+        return action
+    if owner_verify_action.get("needs_attention_reason") != PARK_REASON_VERIFY_FIX_FAILED:
+        return owner_verify_action
+    if action.get("verify_gate_explicit_refresh") is True:
+        return action
+    if decision.state != "failed" or current_epoch is None:
+        return action
+    return {
+        "type": "verify_gate",
+        "description": "Run verify gate before review",
+        "verify_gate_phase": "pre_review",
+        "verify_gate_state": "failed",
+        "verify_gate_explicit_refresh": True,
+        "verify_owner_task": owner_task,
+    }
+
+
+def _determine_selected_iterate_action_for_args(
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    task: DbTask,
+    target_branch: str,
+    *,
+    max_resume_attempts: int,
+    force: bool,
+) -> dict[str, Any]:
+    action = _determine_selected_iterate_action(
+        config,
+        store,
+        git,
+        task,
+        target_branch,
+        max_resume_attempts=max_resume_attempts,
+    )
+    if force:
+        if (
+            action.get("type") == "needs_discussion"
+            and action.get("needs_attention_reason") == PARK_REASON_VERIFY_FIX_FAILED
+        ):
+            owner_task = _resolve_verify_fix_failed_owner_task(store, task)
+            if owner_task.id is not None and owner_task.id != task.id:
+                decision = resolve_verify_gate_decision(store, owner_task, config=config, git=git)
+                owner_verify_action = _current_verify_fix_owner_verify_action(
+                    config,
+                    store,
+                    git,
+                    owner_task,
+                    target_branch,
+                    max_resume_attempts=max_resume_attempts,
+                )
+                if (
+                    decision.state == "passed"
+                    and owner_verify_action is not None
+                    and owner_verify_action.get("needs_attention_reason") == PARK_REASON_VERIFY_FIX_FAILED
+                ):
+                    return _determine_recovered_post_green_iterate_action(
+                        config,
+                        store,
+                        git,
+                        task,
+                        target_branch,
+                        max_resume_attempts=max_resume_attempts,
+                    )
+        forced = _force_verify_fix_failed_action(action, task=task, store=store)
+        return _force_recovered_verify_fix_failed_gate_action(
+            config,
+            store,
+            git,
+            forced,
+            target_branch,
+            task=task,
+            max_resume_attempts=max_resume_attempts,
+        )
+    return action
+
+
 def _iterate_action_description(action: dict[str, Any]) -> str:
     """Return a user-facing description for an iterate action."""
     description = action.get("description")
@@ -4087,6 +4350,7 @@ class _PreparedIterateStart:
     initial_resume: bool
     phase: str
     action_type: str | None = None
+    verify_owner_task_id: str | None = None
     review_task_id: str | None = None
 
 
@@ -4205,6 +4469,7 @@ def _cmd_iterate_impl(
     use_resume: bool = getattr(args, 'resume', False)
     use_retry: bool = getattr(args, 'retry', False)
     background: bool = getattr(args, 'background', False)
+    force: bool = bool(getattr(args, "force", False))
 
     # cmd_iterate intentionally only accepts implement task IDs (not improve/review);
     # it manages the full review/improve iteration lifecycle and requires the root impl task.
@@ -4532,13 +4797,14 @@ def _cmd_iterate_impl(
             return None
         if iterate_task.status != "completed" or preflight_context is None:
             return None
-        initial_action = _determine_selected_iterate_action(
+        initial_action = _determine_selected_iterate_action_for_args(
             engine_config,
             store,
             preflight_context.git_runtime,
             iterate_task,
             preflight_context.target_branch,
             max_resume_attempts=effective_max_resume_attempts,
+            force=force,
         )
         if initial_action.get("type") != "improve":
             return initial_action
@@ -4633,13 +4899,14 @@ def _cmd_iterate_impl(
         assert preflight_context is not None
         if initial_action is None:
             try:
-                initial_action = _determine_selected_iterate_action(
+                initial_action = _determine_selected_iterate_action_for_args(
                     engine_config,
                     store,
                     preflight_context.git_runtime,
                     iterate_task,
                     preflight_context.target_branch,
                     max_resume_attempts=effective_max_resume_attempts,
+                    force=force,
                 )
             except Exception as exc:
                 task_label = iterate_task.id or "<unknown>"
@@ -4671,6 +4938,9 @@ def _cmd_iterate_impl(
                 print(f"Iterate blocked: {attention_result.message.removeprefix('SKIP: ')}")
             return 3
         if action_type in WORKER_CONSUMING_ACTIONS:
+            return None
+
+        if action_type == "verify_gate" and initial_action.get("verify_gate_explicit_refresh") is True:
             return None
 
         if action_type == "merge_with_followups":
@@ -4749,17 +5019,56 @@ def _cmd_iterate_impl(
             return None, None
         assert prepared_phase is not None
         prepared_action_type = getattr(args, "prepared_action_type", None)
+        prepared_verify_owner_task_id = getattr(args, "prepared_verify_owner_task_id", None)
         prepared_review_task_id = getattr(args, "prepared_review_task_id", None)
-        return (
-            _PreparedIterateStart(
-                task=prepared_task,
-                initial_resume=bool(getattr(args, "prepared_resume", False)),
-                phase=prepared_phase,
-                action_type=prepared_action_type if isinstance(prepared_action_type, str) else None,
-                review_task_id=prepared_review_task_id if isinstance(prepared_review_task_id, str) else None,
+        prepared_start = _PreparedIterateStart(
+            task=prepared_task,
+            initial_resume=bool(getattr(args, "prepared_resume", False)),
+            phase=prepared_phase,
+            action_type=prepared_action_type if isinstance(prepared_action_type, str) else None,
+            verify_owner_task_id=(
+                prepared_verify_owner_task_id if isinstance(prepared_verify_owner_task_id, str) else None
             ),
-            None,
+            review_task_id=prepared_review_task_id if isinstance(prepared_review_task_id, str) else None,
         )
+        if prepared_start.phase == "iteration" and prepared_start.action_type == "verify_gate":
+            if not force:
+                print("Error: prepared verify_gate iterate startup requires --force.")
+                return None, 1
+            if impl_task is None:
+                print("Error: prepared verify_gate iterate startup requires a resolved implementation task.")
+                return None, 1
+            canonical_owner = _resolve_verify_fix_failed_owner_task(store, impl_task)
+            if canonical_owner.id is None:
+                print(f"Error: cannot resolve canonical verify owner for implementation {impl_task.id}.")
+                return None, 1
+            if not prepared_start.verify_owner_task_id:
+                print(
+                    "Error: prepared verify_gate iterate startup is missing the canonical "
+                    f"verify owner {canonical_owner.id}."
+                )
+                return None, 1
+            prepared_owner = store.get(prepared_start.verify_owner_task_id)
+            if prepared_owner is None:
+                print(f"Error: prepared verify owner task {prepared_start.verify_owner_task_id} not found.")
+                return None, 1
+            if prepared_owner.id != canonical_owner.id:
+                print(
+                    "Error: prepared verify owner "
+                    f"{prepared_owner.id} is not the canonical verify owner {canonical_owner.id} "
+                    f"for implementation {impl_task.id}."
+                )
+                return None, 1
+            resolved_prepared_owner = _resolve_verify_fix_failed_owner_task(store, prepared_owner)
+            if resolved_prepared_owner.id != canonical_owner.id:
+                print(
+                    "Error: prepared verify owner "
+                    f"{prepared_owner.id} resolves to {resolved_prepared_owner.id}, expected "
+                    f"canonical verify owner {canonical_owner.id} for implementation {impl_task.id}."
+                )
+                return None, 1
+            prepared_start = replace(prepared_start, verify_owner_task_id=canonical_owner.id)
+        return prepared_start, None
 
     def _reserve_iterate_launch(*, emit_error: bool = True) -> LaunchPermit | Literal[False] | None:
         if not isinstance(getattr(config, "max_concurrent", None), int):
@@ -4852,13 +5161,14 @@ def _cmd_iterate_impl(
                 return None, 1
 
             try:
-                initial_action = _determine_selected_iterate_action(
+                initial_action = _determine_selected_iterate_action_for_args(
                     config,
                     store,
                     preflight_context.git_runtime,
                     iterate_task,
                     preflight_context.target_branch,
                     max_resume_attempts=effective_max_resume_attempts,
+                    force=force,
                 )
             except Exception as exc:
                 task_label = iterate_task.id or "<unknown>"
@@ -4868,6 +5178,23 @@ def _cmd_iterate_impl(
                 )
                 return None, 1
             action_type = initial_action["type"]
+
+            if action_type == "verify_gate" and initial_action.get("verify_gate_explicit_refresh") is True:
+                verify_owner_task = initial_action.get("verify_owner_task")
+                return (
+                    _PreparedIterateStart(
+                        task=iterate_task,
+                        initial_resume=False,
+                        phase="iteration",
+                        action_type="verify_gate",
+                        verify_owner_task_id=(
+                            verify_owner_task.id
+                            if isinstance(verify_owner_task, DbTask) and verify_owner_task.id is not None
+                            else None
+                        ),
+                    ),
+                    None,
+                )
 
             if action_type == "create_review":
                 rollback_on_failure = True
@@ -5277,6 +5604,9 @@ def _cmd_iterate_impl(
             prepared_action_type=(
                 prepared_background_start.action_type if prepared_background_start is not None else None
             ),
+            prepared_verify_owner_task_id=(
+                prepared_background_start.verify_owner_task_id if prepared_background_start is not None else None
+            ),
             prepared_review_task_id=(
                 prepared_background_start.review_task_id if prepared_background_start is not None else None
             ),
@@ -5506,6 +5836,18 @@ def _cmd_iterate_impl(
     )
     if prepared_iteration_start is not None:
         initial_action = {"type": prepared_iteration_start.action_type or "iteration"}
+        if initial_action["type"] == "verify_gate":
+            parked_action: dict[str, Any] = {
+                "type": "needs_discussion",
+                "needs_attention_reason": PARK_REASON_VERIFY_FIX_FAILED,
+            }
+            if prepared_iteration_start.verify_owner_task_id is not None:
+                parked_action["subject_task_id"] = prepared_iteration_start.verify_owner_task_id
+            initial_action = _force_verify_fix_failed_action(
+                parked_action,
+                task=impl_task,
+                store=store,
+            )
     else:
         initial_action = determine_next_action(
             engine_config,
@@ -5515,6 +5857,17 @@ def _cmd_iterate_impl(
             target_branch,
             max_resume_attempts=max_resume_attempts,
         )
+        if force:
+            initial_action = _force_verify_fix_failed_action(dict(initial_action), task=impl_task, store=store)
+            initial_action = _force_recovered_verify_fix_failed_gate_action(
+                engine_config,
+                store,
+                git_runtime,
+                initial_action,
+                target_branch,
+                task=impl_task,
+                max_resume_attempts=max_resume_attempts,
+            )
     initial_action_type = initial_action["type"]
     initial_action_description = initial_action.get("description")
     if not isinstance(initial_action_description, str) or not initial_action_description:
@@ -5666,6 +6019,8 @@ def _cmd_iterate_impl(
         )
 
     def _resolve_forced_closing_review_action() -> dict[str, Any] | None:
+        if not engine_config.require_review_before_merge:
+            return None
         current_impl_task = _current_impl_task()
         return resolve_closing_review_action(
             task=current_impl_task,
@@ -5842,15 +6197,28 @@ def _cmd_iterate_impl(
                 "_prepared_initial_resume": prepared_iteration_start.initial_resume,
                 "_prepared_review_task_id": prepared_iteration_start.review_task_id,
             }
+            if action["type"] == "verify_gate":
+                prepared_parked_action: dict[str, Any] = {
+                    "type": "needs_discussion",
+                    "needs_attention_reason": PARK_REASON_VERIFY_FIX_FAILED,
+                }
+                if prepared_iteration_start.verify_owner_task_id is not None:
+                    prepared_parked_action["subject_task_id"] = prepared_iteration_start.verify_owner_task_id
+                action = _force_verify_fix_failed_action(
+                    prepared_parked_action,
+                    task=impl_task,
+                    store=store,
+                )
             prepared_iteration_start = None
         else:
-            action = _determine_selected_iterate_action(
+            action = _determine_selected_iterate_action_for_args(
                 engine_config,
                 store,
                 git_runtime,
                 impl_task,
                 target_branch,
                 max_resume_attempts=max_resume_attempts,
+                force=force,
             )
         action_type = action["type"]
         assert isinstance(action_type, str)

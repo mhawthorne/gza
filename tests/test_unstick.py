@@ -174,6 +174,34 @@ def _make_retry_limit_owner(store, *, prompt: str, branch: str):
     return impl, retry, owner_row
 
 
+def _make_verify_fix_failed_owner(store, *, prompt: str, branch: str, tags: tuple[str, ...] = ()):
+    impl = store.add(prompt, task_type="implement", tags=tags)
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = branch
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    owner_row = LineageOwnerRow(
+        owner_task=impl,
+        members=(impl,),
+        tree=None,
+        lineage_status="needs_attention",
+        next_action={
+            "type": "needs_discussion",
+            "description": "verify gate is still red after completed verify_fix",
+            "needs_attention_reason": "verify-fix-failed",
+            "subject_task_id": impl.id,
+        },
+        next_action_reason="needs_attention",
+        unresolved_tasks=(impl,),
+        unresolved_leaf_summary=(),
+    )
+    return impl, owner_row
+
+
 def test_discover_parked_tasks_includes_owner_row_reconcile_and_watch_backstop(tmp_path: Path) -> None:
     config, store = _config_and_store(tmp_path)
     git = _GitDouble()
@@ -358,6 +386,30 @@ def test_discover_parked_tasks_selector_scope_keeps_leaf_candidates_but_collapse
     assert len(owner_candidates) == 1
     assert owner_candidates[0].owner_task.id == impl.id
     assert owner_candidates[0].reason_class == "retry-limit"
+
+
+def test_discover_parked_tasks_includes_verify_fix_failed_owner_row(tmp_path: Path) -> None:
+    config, store = _config_and_store(tmp_path)
+    git = _GitDouble()
+    impl, owner_row = _make_verify_fix_failed_owner(
+        store,
+        prompt="Verify fix failed owner",
+        branch="feature/verify-fix-failed",
+    )
+
+    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((owner_row,), object())):
+        candidates, stale_cleared = discover_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert stale_cleared == 0
+    assert len(candidates) == 1
+    assert candidates[0].owner_task.id == impl.id
+    assert candidates[0].subject_task.id == impl.id
+    assert candidates[0].reason_class == "verify-fix-failed"
 
 
 def test_discover_parked_tasks_maps_retryable_provider_error_to_retry_limit_rearm(tmp_path: Path) -> None:
@@ -650,6 +702,91 @@ def test_select_and_clear_parked_tasks_records_retry_limit_manual_rearm_and_is_i
         )
 
     assert [(outcome.status, outcome.detail) for outcome in second.outcomes] == [("skipped", "not currently parked")]
+
+
+def test_select_and_clear_parked_tasks_rearms_verify_fix_failed_by_owner_id(tmp_path: Path) -> None:
+    config, store = _config_and_store(tmp_path)
+    git = _GitDouble()
+    impl, owner_row = _make_verify_fix_failed_owner(
+        store,
+        prompt="Verify fix failed clear",
+        branch="feature/verify-fix-failed-clear",
+    )
+    assert impl.id is not None
+
+    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((owner_row,), object())):
+        result = select_and_clear_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+            task_ids=(impl.id,),
+            reason_classes=("verify-fix-failed",),
+        )
+
+    assert [(outcome.status, outcome.reason_class, outcome.detail) for outcome in result.outcomes] == [
+        ("rearmed", "verify-fix-failed", "cleared verify-fix-failed"),
+    ]
+    rearm = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=impl.id,
+        attention_reason="verify-fix-failed",
+    )
+    assert rearm is not None
+    assert rearm.manual_rearm_epoch == 1
+
+
+def test_select_and_clear_parked_tasks_rearms_verify_fix_failed_by_tag_scope(tmp_path: Path) -> None:
+    config, store = _config_and_store(tmp_path)
+    git = _GitDouble()
+    matching, matching_row = _make_verify_fix_failed_owner(
+        store,
+        prompt="Tagged verify fix failed clear",
+        branch="feature/tagged-verify-fix-failed-clear",
+        tags=("ops", "verify"),
+    )
+    other, other_row = _make_verify_fix_failed_owner(
+        store,
+        prompt="Untagged verify fix failed clear",
+        branch="feature/untagged-verify-fix-failed-clear",
+        tags=("other",),
+    )
+    assert matching.id is not None
+    assert other.id is not None
+
+    with patch(
+        "gza.unstick.query_lineage_owner_rows_in_read_session",
+        return_value=((matching_row, other_row), object()),
+    ):
+        result = select_and_clear_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+            tags=("ops",),
+            reason_classes=("verify-fix-failed",),
+        )
+
+    assert [outcome.owner_task.id for outcome in result.outcomes] == [matching.id]
+    assert [(outcome.status, outcome.reason_class, outcome.detail) for outcome in result.outcomes] == [
+        ("rearmed", "verify-fix-failed", "cleared verify-fix-failed"),
+    ]
+    assert (
+        store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id=matching.id,
+            attention_reason="verify-fix-failed",
+        )
+        is not None
+    )
+    assert (
+        store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id=other.id,
+            attention_reason="verify-fix-failed",
+        )
+        is None
+    )
 
 
 def test_select_and_clear_parked_tasks_applies_landed_and_missing_branch_guards(tmp_path: Path) -> None:

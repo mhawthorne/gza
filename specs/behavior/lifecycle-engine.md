@@ -393,7 +393,12 @@ epoch.
   gate remains red for that epoch, lifecycle MUST park with reason `verify-fix-failed`
   instead of spawning another `verify_fix`. Deterministic test failures and unknown
   structured failure origins are not timeout-origin and MUST remain blocking unless a
-  later source-changing fix or valid same-head green verify result replaces them.
+  later source-changing fix or valid same-head green verify result replaces them. A
+  manual `iterate --force` or `unstick --reason verify-fix-failed` rearm MAY bypass only
+  this park and MUST first run a fresh verify gate for the current head; if that fresh
+  verify is still red, cannot be executed, or cannot be persisted, lifecycle MUST remain
+  blocked and surface an actionable direct diagnostic rather than continuing to review or
+  merge.
 - If the current pre-review verify gate is unavailable and lifecycle cannot safely route
   through `verify_fix`, it MUST park with `verify-unavailable`. If that same unavailable
   state persists after one completed same-epoch `verify_fix`, it MUST park with
@@ -794,14 +799,18 @@ retry or re-implement instead of creating a fix task.
 
 Manual operator semantics for `uv run gza unstick` are intentionally narrow. The
 command may target parked owners with reason class `backstop`
-(`watch-no-progress-backstop`), `retry-limit` (`retry-limit-reached`), or `reconcile`
-(`reconcile-needs-manual-resolution`).
+(`watch-no-progress-backstop`), `retry-limit` (`retry-limit-reached`), `reconcile`
+(`reconcile-needs-manual-resolution`), or `verify-fix-failed`
+(`verify-fix-failed`).
 
 - For `backstop` and `reconcile`, it MUST clear only the watch-owned exclusion state that
   kept the owner out of normal watch/advance pickup.
 - For `retry-limit`, it MUST record one durable manual-rearm epoch for the parked subject
   and reason so the next shared recovery evaluation measures retry budget from that epoch
   instead of lifetime history.
+- For `verify-fix-failed`, it MUST record one durable manual-rearm epoch for the owner so
+  the next shared lifecycle evaluation reruns the verify gate at the current head before
+  considering the completed same-epoch `verify_fix` terminal again.
 - Plain `uv run gza unstick` MUST remain clear-only and MUST NOT start workers itself.
 - `uv run gza unstick --run` MAY immediately dispatch only the owners it just cleared, but
   it MUST do so by reusing the shared scoped watch dispatch path, shared slot ceiling,

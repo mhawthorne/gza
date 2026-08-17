@@ -136,6 +136,7 @@ from ..task_query import (
     task_matches_tag_filters,
 )
 from ..unstick import (
+    VERIFY_FIX_FAILED_REASON,
     ParkedTaskCandidate,
     clear_parked_candidate_state,
     discover_parked_tasks,
@@ -4841,7 +4842,15 @@ class _CycleResult:
     active_recovery_subject_ids: frozenset[str] = frozenset()
 
 
-_DispatchObserver = Callable[[str, Literal["started", "direct", "capacity_blocked"], str], None]
+_DispatchObserver = Callable[
+    [
+        str,
+        Literal["started", "direct", "direct_blocked", "direct_error", "capacity_blocked"],
+        str,
+        str | None,
+    ],
+    None,
+]
 
 
 @dataclass(frozen=True)
@@ -6113,6 +6122,8 @@ def _evaluate_blind_parked_auto_rearm(
             any_tag=any_tag,
         ):
             continue
+        if candidate.attention_reason == VERIFY_FIX_FAILED_REASON:
+            continue
 
         guard_task = owner_task
         scoped_leaf_has_live_work = False
@@ -6960,12 +6971,13 @@ def _run_cycle(
 
     def _observe_dispatch(
         owner_task_id: str | None,
-        outcome: Literal["started", "direct", "capacity_blocked"],
+        outcome: Literal["started", "direct", "direct_blocked", "direct_error", "capacity_blocked"],
         action_type: str,
+        detail: str | None = None,
     ) -> None:
         if dispatch_observer is None or owner_task_id is None:
             return
-        dispatch_observer(str(owner_task_id), outcome, action_type)
+        dispatch_observer(str(owner_task_id), outcome, action_type, detail)
 
     def _emit_settle_no_progress_attention(
         *,
@@ -7951,6 +7963,8 @@ def _run_cycle(
                     "SKIP: no watch worker slots available for "
                 ):
                     _observe_dispatch(display_task.id, "capacity_blocked", str(action_type))
+                elif display_task.id is not None and not getattr(exec_result, "worker_consuming", False):
+                    _observe_dispatch(display_task.id, "direct_blocked", str(action_type), exec_result.message)
                 if guarded_pending_task_id is not None:
                     step1_handled_child_task_ids.add(str(guarded_pending_task_id))
                 message = exec_result.message
@@ -8007,6 +8021,8 @@ def _run_cycle(
             if exec_result.status == "error":
                 if guarded_pending_task_id is not None:
                     step1_handled_child_task_ids.add(str(guarded_pending_task_id))
+                if display_task.id is not None and not getattr(exec_result, "worker_consuming", False):
+                    _observe_dispatch(display_task.id, "direct_error", str(action_type), exec_result.message)
                 if not exec_result.attempted_spawn and display_task.id is not None:
                     event = "REPAIR" if action_type == "reconcile_branch_divergence" else "ERROR"
                     log.emit(
@@ -8504,6 +8520,8 @@ def _run_cycle(
                 if exec_result.status == "skip":
                     if exec_result.message.startswith("SKIP: no watch worker slots available for "):
                         _observe_dispatch(row.owner_task.id, "capacity_blocked", recovery_action_type)
+                    elif not getattr(exec_result, "worker_consuming", False):
+                        _observe_dispatch(row.owner_task.id, "direct_blocked", recovery_action_type, exec_result.message)
                     attention = resolve_execution_needs_attention(failed, exec_result)
                     if attention is not None:
                         log.emit_attention(
@@ -8532,6 +8550,8 @@ def _run_cycle(
                         )
                     continue
                 if exec_result.status == "error":
+                    if not getattr(exec_result, "worker_consuming", False):
+                        _observe_dispatch(row.owner_task.id, "direct_error", recovery_action_type, exec_result.message)
                     log.emit(
                         "REPAIR",
                         f"{failed.id}: {exec_result.message}",

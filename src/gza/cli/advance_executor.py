@@ -587,6 +587,20 @@ def _release_reserved_launch_if_left(task: DbTask | None) -> None:
         release_task_launch_permit(str(task.id))
 
 
+def _resolve_canonical_verify_gate_owner(store: SqliteTaskStore, task: DbTask) -> DbTask:
+    owner_task = task
+    current_owner: DbTask | None = task
+    visited_owner_ids: set[str] = set()
+    while current_owner is not None and current_owner.id is not None and current_owner.id not in visited_owner_ids:
+        visited_owner_ids.add(current_owner.id)
+        if current_owner.task_type == "implement":
+            owner_task = current_owner
+        if not current_owner.based_on:
+            break
+        current_owner = store.get(current_owner.based_on)
+    return owner_task
+
+
 def _skip_duplicate_rebase_creation(
     *,
     action_type: str,
@@ -877,11 +891,28 @@ def _execute_verify_gate(
     owner_task = action.get("verify_owner_task")
     if not isinstance(owner_task, DbTask):
         owner_task = task
+    owner_task = _resolve_canonical_verify_gate_owner(context.store, owner_task)
+    expected_owner_task = _resolve_canonical_verify_gate_owner(context.store, task)
     if owner_task.id is None or context.config is None or context.git is None:
         return AdvanceActionExecutionResult(
             action_type=action_type,
             status="skip",
             message="missing verify gate inputs",
+        )
+    if expected_owner_task.id is None or owner_task.id != expected_owner_task.id:
+        task_label = task.id or "<unknown>"
+        expected_label = expected_owner_task.id or "<unknown>"
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=(
+                "SKIP: verify gate owner "
+                f"{owner_task.id} is not the canonical verify owner {expected_label} "
+                f"for implementation {task_label}."
+            ),
+            attention_type="needs_discussion",
+            attention_reason="verify-gate-blocked",
+            handled_task_id=expected_owner_task.id,
         )
     if context.dry_run:
         return AdvanceActionExecutionResult(
@@ -900,14 +931,15 @@ def _execute_verify_gate(
         config=context.config,
         git=context.git,
     )
-    if decision.state == "passed":
+    explicit_refresh = action.get("verify_gate_explicit_refresh") is True
+    if decision.state == "passed" and not explicit_refresh:
         return AdvanceActionExecutionResult(
             action_type=action_type,
             status="success",
             success_message=f"Verify gate already passed for the current tip before {phase_label}.",
             handled_task_id=owner_task.id,
         )
-    if decision.state in {"failed", "unavailable"}:
+    if decision.state in {"failed", "unavailable"} and not explicit_refresh:
         status_word = "red" if decision.state == "failed" else "unavailable"
         return AdvanceActionExecutionResult(
             action_type=action_type,
@@ -961,7 +993,7 @@ def _execute_verify_gate(
         reviewed_base_sha = _resolve_review_verify_base_sha(worktree_git, worktree_git.default_branch())
         execution = _run_lifecycle_verify(
             config=context.config,
-            task=owner_task,
+            task=task,
             worktree_git=worktree_git,
             worktree_path=worktree_git.repo_dir,
             cwd=provider_cwd,
@@ -1029,6 +1061,28 @@ def _execute_verify_gate(
             message=(
                 f"SKIP: verify gate remained {persisted_result.status}; {phase_label} is blocked."
             ),
+            attention_type="needs_discussion",
+            attention_reason="verify-gate-blocked",
+            handled_task_id=owner_task.id,
+        )
+    except Exception as exc:
+        cleanup_failure = _cleanup_verify_only_noop_worktree(
+            context=context,
+            worktree_path=worktree_path,
+            added_worktree=added_worktree,
+        )
+        worktree_path = None
+        added_worktree = False
+        detail = (
+            f"SKIP: could not run or persist the verify gate for owner {owner_task.id}; "
+            f"{phase_label} is blocked. Failure: {type(exc).__name__}: {exc}"
+        )
+        if cleanup_failure:
+            detail = f"{detail}. Cleanup failure: {cleanup_failure}"
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=detail,
             attention_type="needs_discussion",
             attention_reason="verify-gate-blocked",
             handled_task_id=owner_task.id,

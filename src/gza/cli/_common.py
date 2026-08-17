@@ -2613,6 +2613,7 @@ def _spawn_background_iterate_worker(
     prepared_resume: bool = False,
     prepared_phase: str | None = None,
     prepared_action_type: str | None = None,
+    prepared_verify_owner_task_id: str | None = None,
     prepared_review_task_id: str | None = None,
     startup_quiet: bool = False,
 ) -> int:
@@ -2649,6 +2650,8 @@ def _spawn_background_iterate_worker(
         inner_cmd.extend(["--prepared-phase", prepared_phase])
     if prepared_action_type:
         inner_cmd.extend(["--prepared-action-type", prepared_action_type])
+    if prepared_verify_owner_task_id:
+        inner_cmd.extend(["--prepared-verify-owner-task-id", prepared_verify_owner_task_id])
     if prepared_review_task_id:
         inner_cmd.extend(["--prepared-review-task-id", prepared_review_task_id])
 

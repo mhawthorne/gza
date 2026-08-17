@@ -21,11 +21,17 @@ from .watch_progress import (
     reconcile_stale_watch_no_progress_parks,
 )
 
-ParkReasonClass = Literal["backstop", "retry-limit", "reconcile"]
+ParkReasonClass = Literal["backstop", "retry-limit", "reconcile", "verify-fix-failed"]
 ParkedDiscoveryScopeKind = Literal["canonical_owner", "effective_leaf"]
 
 RECONCILE_NEEDS_MANUAL_RESOLUTION_REASON = "reconcile-needs-manual-resolution"
-SUPPORTED_PARK_REASON_CLASSES: tuple[ParkReasonClass, ...] = ("backstop", "retry-limit", "reconcile")
+VERIFY_FIX_FAILED_REASON = "verify-fix-failed"
+SUPPORTED_PARK_REASON_CLASSES: tuple[ParkReasonClass, ...] = (
+    "backstop",
+    "retry-limit",
+    "reconcile",
+    "verify-fix-failed",
+)
 _UNSTICK_DISCOVERY_STATUSES: tuple[str, ...] = ("failed", "completed", "unmerged", "dropped")
 _REASON_CLASS_BY_ATTENTION_REASON = cast(
     "Mapping[str, ParkReasonClass]",
@@ -34,6 +40,7 @@ _REASON_CLASS_BY_ATTENTION_REASON = cast(
         RETRY_LIMIT_REACHED_ATTENTION_REASON: "retry-limit",
         "retryable-provider-error": "retry-limit",
         RECONCILE_NEEDS_MANUAL_RESOLUTION_REASON: "reconcile",
+        VERIFY_FIX_FAILED_REASON: "verify-fix-failed",
     },
 )
 
@@ -86,7 +93,7 @@ def discover_parked_tasks(
     task_ids: Sequence[str] = (),
     selector_kinds: Sequence[ParkedDiscoveryScopeKind] | None = None,
 ) -> tuple[tuple[ParkedTaskCandidate, ...], int]:
-    """Return the currently parked backstop/reconcile owner candidates."""
+    """Return the currently parked owners eligible for manual unstick."""
     scoped_task_ids = tuple(task_ids)
     scoped_task_id_set = frozenset(scoped_task_ids)
     selector_kind_by_task_id: dict[str, ParkedDiscoveryScopeKind] = {}
@@ -450,7 +457,7 @@ def clear_parked_candidate_state(
     clear_watch_progress_subject(store, subject_task=candidate.subject_task)
     if (
         record_manual_retry_limit_rearm
-        and candidate.reason_class == "retry-limit"
+        and candidate.reason_class in {"retry-limit", "verify-fix-failed"}
         and candidate.subject_task.id is not None
     ):
         store.record_parked_task_manual_rearm(

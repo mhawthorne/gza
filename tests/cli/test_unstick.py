@@ -13,9 +13,10 @@ import gza.cli.watch as watch_module
 from gza.cli.advance_executor import AdvanceActionExecutionResult
 from gza.concurrency import ConcurrencySnapshot
 from gza.config import Config
+from gza.dispatch_preview import DispatchPreview, DispatchPreviewEntry
 from gza.git import Git
 from gza.lineage_query import LineageOwnerRow, RecoveryReadContext
-from gza.recovery_engine import _MergeContext, decide_failed_task_recovery
+from gza.recovery_engine import FailedRecoveryDecision, _MergeContext, decide_failed_task_recovery
 from gza.unstick import UnstickOutcome
 from tests.cli.conftest import invoke_gza, make_store, setup_config
 
@@ -145,7 +146,7 @@ def test_unstick_help_mentions_reason_and_all_tags(tmp_path):
     result = invoke_gza("unstick", "--help", "--project", str(tmp_path))
 
     assert result.returncode == 0
-    assert "--reason {backstop,retry-limit,reconcile}" in result.stdout
+    assert "--reason {backstop,retry-limit,reconcile,verify-fix-failed}" in result.stdout
     assert "--all-tags" in result.stdout
     assert "--all" in result.stdout
     assert "--run" in result.stdout
@@ -180,6 +181,9 @@ def test_unstick_run_reports_started_cleared_only_and_capacity_blocked(tmp_path,
             return_value=SimpleNamespace(
                 started_owner_ids=frozenset({str(first.id)}),
                 capacity_blocked_owner_ids=frozenset({str(third.id)}),
+                direct_owner_outcomes={
+                    str(second.id): SimpleNamespace(action_type="reconcile_branch_divergence", status="success")
+                },
             ),
         ),
     ):
@@ -192,11 +196,12 @@ def test_unstick_run_reports_started_cleared_only_and_capacity_blocked(tmp_path,
         )
 
     assert result.returncode == 0
-    assert "Run summary: 1 started, 1 cleared-only, 1 capacity-blocked" in result.stdout
+    assert "Run summary: 1 started, 1 direct, 0 direct-blocked, 0 cleared-only, 1 capacity-blocked" in result.stdout
     assert "Started:" in result.stdout
     assert f"{first.id} [retry-limit] Started owner" in result.stdout
-    assert "Cleared Only:" in result.stdout
-    assert f"{second.id} [reconcile] Direct owner" in result.stdout
+    assert "Direct:" in result.stdout
+    assert f"{second.id} [reconcile] reconcile_branch_divergence success: Direct owner" in result.stdout
+    assert "Cleared Only:" not in result.stdout
     assert "Capacity Blocked:" in result.stdout
     assert f"{third.id} [backstop] Blocked owner" in result.stdout
 
@@ -258,6 +263,7 @@ def test_dispatch_rearmed_owners_collects_started_and_capacity_blocked(tmp_path)
 
     assert summary.started_owner_ids == frozenset({"gza-1"})
     assert summary.capacity_blocked_owner_ids == frozenset({"gza-2"})
+    assert summary.direct_owner_outcomes == {}
 
 
 def test_dispatch_rearmed_owners_allows_limit_starts_when_live_workers_leave_capacity(tmp_path):
@@ -618,9 +624,217 @@ def test_unstick_run_reports_zero_slot_retry_owner_as_capacity_blocked(tmp_path,
         )
 
     assert result.returncode == 0
-    assert "Run summary: 0 started, 0 cleared-only, 1 capacity-blocked" in result.stdout
+    assert "Run summary: 0 started, 0 direct, 0 direct-blocked, 0 cleared-only, 1 capacity-blocked" in result.stdout
     assert "Capacity Blocked:" in result.stdout
     assert f"{owner.id} [retry-limit] Blocked retry owner" in result.stdout
+    assert "Cleared Only:" not in result.stdout
+
+
+def _invoke_unstick_run_for_reconcile_recovery(
+    tmp_path,
+    *,
+    exec_result: AdvanceActionExecutionResult,
+):
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    owner = store.add("Reconcile recovery owner", task_type="implement")
+    failed = store.add("Failed publication recovery", task_type="implement")
+    assert owner.id is not None
+    assert failed.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = "feature/reconcile-owner"
+    owner.has_commits = True
+    store.update(owner)
+    failed.status = "failed"
+    failed.branch = owner.branch
+    failed.depends_on = owner.id
+    store.update(failed)
+
+    owner_row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, failed),
+        tree=None,
+        lineage_status="failed",
+        next_action={"type": "skip", "description": "failed recovery"},
+        next_action_reason="recovery",
+        unresolved_tasks=(failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=owner,
+        recovery_action_task=failed,
+        recovery_leaf_task=failed,
+    )
+    recovery_action = {
+        "type": "reconcile_branch_divergence",
+        "description": "Reconcile branch publication",
+    }
+    decision = FailedRecoveryDecision(
+        task_id=str(failed.id),
+        action="reconcile",
+        reason_code="branch_unpushable",
+        reason_text="branch publication needs reconciliation",
+        launch_mode="none",
+        attempt_index=1,
+        attempt_limit=1,
+    )
+    preview_entry = DispatchPreviewEntry(
+        lane="recovery",
+        task=failed,
+        owner_task=owner,
+        runnable=True,
+        worker_consuming=False,
+        decision=decision,
+        advance_action=recovery_action,
+        lineage_row=owner_row,
+    )
+    plan = SimpleNamespace(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        slots=1,
+        analysis=SimpleNamespace(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(owner_row,),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(),
+            recovery_rows=(),
+            recovery_lane_entry_by_failed_id={str(failed.id): preview_entry},
+            action_plan=(),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            recovery_undispatched_rows=(),
+            active_recovery_subject_ids=frozenset(),
+            actionable_failed=((owner_row, failed, decision, recovery_action, False, failed),),
+            pending_recovery_task_ids=frozenset(),
+        ),
+    )
+    outcomes = (
+        UnstickOutcome(owner_task=owner, reason_class="reconcile", status="rearmed", detail="cleared reconcile"),
+    )
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("gza.cli.unstick.Git", return_value=_UnstickGitDouble()))
+        stack.enter_context(
+            patch(
+                "gza.cli.unstick.select_and_clear_parked_tasks",
+                return_value=SimpleNamespace(selected=(object(),), outcomes=outcomes, stale_backstop_cleared=0),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "gza.cli.unstick.get_concurrency_snapshot",
+                return_value=ConcurrencySnapshot(
+                    limit=1,
+                    running=0,
+                    available=1,
+                    live_pids=frozenset(),
+                    running_task_ids=(),
+                    anonymous_worker_count=0,
+                    current_pid_counted=False,
+                ),
+            )
+        )
+        stack.enter_context(patch("gza.cli.unstick._build_watch_cycle_plan", return_value=plan))
+        stack.enter_context(patch("gza.cli.watch.Git", return_value=_UnstickGitDouble()))
+        stack.enter_context(patch("gza.cli._common.reconcile_in_progress_tasks"))
+        stack.enter_context(patch("gza.cli._common.prune_terminal_dead_workers"))
+        stack.enter_context(patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"))
+        stack.enter_context(patch("gza.cli.watch.reconcile_stale_watch_no_progress_parks"))
+        stack.enter_context(patch("gza.cli.watch._warn_if_installed_gza_changed"))
+        stack.enter_context(
+            patch(
+                "gza.cli.watch.check_canonical_checkout_invariant",
+                return_value=SimpleNamespace(
+                    restored=False,
+                    needs_attention=False,
+                    dirty_tracked_paths=[],
+                    current_branch="main",
+                    expected_branch="main",
+                ),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "gza.cli.watch.check_main_integration_verify",
+                return_value=SimpleNamespace(
+                    merges_halted=False,
+                    state=SimpleNamespace(task=SimpleNamespace(id=None), alert_message=None),
+                ),
+            )
+        )
+        stack.enter_context(patch("gza.cli.watch._maybe_file_main_verify_remediation"))
+        stack.enter_context(
+            patch(
+                "gza.cli.watch.build_dispatch_preview",
+                return_value=DispatchPreview(
+                    entries=(preview_entry,),
+                    owner_rows=(owner_row,),
+                    read_context=RecoveryReadContext(),
+                ),
+            )
+        )
+        execute_action = stack.enter_context(patch("gza.cli.watch.execute_advance_action", return_value=exec_result))
+        stack.enter_context(patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False))
+        stack.enter_context(patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None))
+        stack.enter_context(
+            patch("gza.cli.watch._watch_no_progress_result_deferred_for_transient_backoff", return_value=False)
+        )
+        stack.enter_context(patch("gza.cli.watch._observe_selected_watch_no_progress_without_dispatch", return_value=None))
+        stack.enter_context(patch("gza.cli.watch._finalize_watch_no_progress_after_execution", return_value=None))
+        stack.enter_context(patch("gza.cli.watch._emit_cycle_attention_summary"))
+        stack.enter_context(patch("gza.cli.watch._count_live_workers", return_value=0))
+        stack.enter_context(patch("gza.cli.watch._scoped_watch_active_count", return_value=0))
+        result = invoke_gza(
+            "unstick",
+            str(owner.id),
+            "--reason",
+            "reconcile",
+            "--run",
+            "--project",
+            str(tmp_path),
+        )
+
+    return result, owner, execute_action
+
+
+def test_unstick_run_reports_reconcile_direct_skip_as_direct_blocked(tmp_path):
+    result, owner, execute_action = _invoke_unstick_run_for_reconcile_recovery(
+        tmp_path,
+        exec_result=AdvanceActionExecutionResult(
+            action_type="reconcile_branch_divergence",
+            status="skip",
+            message="SKIP: reconcile needs manual resolution",
+            worker_consuming=False,
+        ),
+    )
+
+    assert result.returncode == 0
+    assert execute_action.call_count == 1
+    assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 cleared-only, 0 capacity-blocked" in result.stdout
+    assert "Direct Blocked:" in result.stdout
+    assert f"{owner.id} [reconcile] reconcile_branch_divergence blocked: Reconcile recovery owner" in result.stdout
+    assert "Cleared Only:" not in result.stdout
+
+
+def test_unstick_run_reports_reconcile_direct_error_as_direct_blocked_error(tmp_path):
+    result, owner, execute_action = _invoke_unstick_run_for_reconcile_recovery(
+        tmp_path,
+        exec_result=AdvanceActionExecutionResult(
+            action_type="reconcile_branch_divergence",
+            status="error",
+            message="publication reconcile failed",
+            worker_consuming=False,
+        ),
+    )
+
+    assert result.returncode == 0
+    assert execute_action.call_count == 1
+    assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 cleared-only, 0 capacity-blocked" in result.stdout
+    assert "Direct Blocked:" in result.stdout
+    assert f"{owner.id} [reconcile] reconcile_branch_divergence error: Reconcile recovery owner" in result.stdout
     assert "Cleared Only:" not in result.stdout
 
 
@@ -723,7 +937,7 @@ def test_unstick_run_reports_zero_slot_lifecycle_owner_as_capacity_blocked(tmp_p
         )
 
     assert result.returncode == 0
-    assert "Run summary: 0 started, 0 cleared-only, 1 capacity-blocked" in result.stdout
+    assert "Run summary: 0 started, 0 direct, 0 direct-blocked, 0 cleared-only, 1 capacity-blocked" in result.stdout
     assert "Capacity Blocked:" in result.stdout
     assert f"{owner.id} [backstop] Blocked lifecycle owner" in result.stdout
     assert "Cleared Only:" not in result.stdout

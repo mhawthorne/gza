@@ -3387,6 +3387,116 @@ def test_verify_gate_execution_persists_current_passing_owner_artifact(tmp_path:
     assert lookup.result.status == "passed"
 
 
+def test_verify_gate_explicit_refresh_reruns_even_when_current_decision_already_passed(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement explicit verify refresh", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/explicit-verify-refresh")
+    store.update(impl)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=_make_review_verify_result(
+            "./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 6, 29, 11, 0, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda _ref: "head-1",
+        worktree_add_existing=lambda *_args, **_kwargs: None,
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    worktree_git = SimpleNamespace(
+        repo_dir=tmp_path / "tmp-worktree",
+        default_branch=lambda: "main",
+        rev_parse_if_exists=lambda ref: "base-1" if ref in {"main", "origin/main"} else "head-1",
+    )
+    refreshed_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with (
+        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch(
+            "gza.cli.advance_executor._run_lifecycle_verify",
+            return_value=SimpleNamespace(
+                markdown="fresh verify markdown",
+                aggregate_result=refreshed_result,
+                project_results=(),
+            ),
+        ) as run_verify,
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_gate_explicit_refresh": True,
+                "verify_owner_task": impl,
+            },
+            context=context,
+        )
+
+    refreshed_impl = store.get(impl.id)
+    assert refreshed_impl is not None
+    artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_impl,
+        current_epoch=owner_task_verify_epoch(refreshed_impl, config, git),
+    )
+    assert result.status == "success"
+    run_verify.assert_called_once()
+    assert len(artifacts) == 2
+    assert lookup.result is not None
+    assert lookup.result.captured_at == datetime(2026, 6, 29, 12, 0, tzinfo=UTC)
+
+
 def test_verify_gate_execution_blocks_current_red_evidence_without_rerun(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

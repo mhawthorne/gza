@@ -203,9 +203,11 @@ Each watch cycle MUST execute these phases in order:
    parked-owner auto-rearm pass before any worker dispatch. This phase MUST stay
    supervisor-owned and MUST reuse the shared parked clear service; it MUST NOT create a
    judge task, inspect per-merge relevance, or fork a second lifecycle policy. For each
-   currently parked subject/reason candidate, watch MUST apply these gates in order:
-   feature enabled, budget remaining, cooldown elapsed, and target branch advanced when
-   `watch.parked_auto_rearm.require_target_advanced` is true. A failed gate MUST leave the
+   currently parked subject/reason candidate, watch MUST first exclude
+   `verify-fix-failed`, which remains a manual-only fresh-verify escape hatch, and then
+   apply these gates in order: feature enabled, budget remaining, cooldown elapsed, and
+   target branch advanced when `watch.parked_auto_rearm.require_target_advanced` is true.
+   An excluded reason or failed gate MUST leave the
    parked row untouched and MUST NOT spend an attempt. In particular, an unchanged target
    SHA under `require_target_advanced` spends no attempt and performs no clear. A
    successful blind auto-rearm MUST clear only the shared parked exclusion state, persist
@@ -530,7 +532,7 @@ When the installed `gza` package fingerprint changes while watch is running:
   already one of those parked human-needed states.
 - `uv run gza unstick` is the manual operator escape hatch for parked owner states such as
   `watch-no-progress-backstop`, `retry-limit-reached`, and
-  `reconcile-needs-manual-resolution`.
+  `reconcile-needs-manual-resolution`, and `verify-fix-failed`.
 - Plain `uv run gza unstick` MUST clear only the watch-owned exclusion state for the
   selected owner/subject and MUST NOT itself start work.
 - `uv run gza unstick --run` MAY immediately dispatch only the owners it just cleared, but

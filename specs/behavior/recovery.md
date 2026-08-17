@@ -246,6 +246,9 @@ its stored action.
   [watch-supervisor.md](watch-supervisor.md). It MUST additionally persist its own attempt
   count plus last-attempt target SHA/timestamp so unchanged-target and cooldown skips do
   not spend more recovery budget.
+- Blind watch-owned parked auto-rearm MUST NOT clear `verify-fix-failed` parks, spend
+  auto-attempt budget for them, or report them rearmed. That reason is manual-only unless
+  watch also implements the same durable fresh-verify epoch semantics as manual unstick.
 - Shared recovery policy MUST evaluate bounded retry/resume budget relative to the latest
   applicable retry-limit rearm epoch for that recovery chain, whether that epoch came from
   a manual unstick or a bounded watch-owned blind auto-rearm, not relative to lifetime
@@ -264,6 +267,10 @@ its stored action.
   shared scoped watch dispatcher, but it MUST still spend recovery capacity only through
   the same shared slot and permit rules that `watch` uses, and direct recovery actions
   such as reconcile MUST NOT consume worker slots.
+- `uv run gza unstick --run` MUST preserve and render direct action outcomes from that
+  scoped dispatch. A successful direct action MUST be reported as direct work, and an
+  attempted direct action that remains blocked or errors MUST remain visibly blocked
+  instead of being folded into a clear-only bucket.
 
 ## Policy knobs
 

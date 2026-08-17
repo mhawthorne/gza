@@ -27,6 +27,7 @@ from gza.advance_engine import (
     classify_advance_action,
     failed_recovery_decision_to_action,
 )
+from gza.artifacts import store_command_output_artifact
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.canonical_checkout import CanonicalCheckoutStatus
 from gza.cli._common import reconcile_in_progress_tasks, set_task_queue_position_scoped
@@ -161,6 +162,7 @@ from gza.recovery_read_context import RecoveryReadContext
 from gza.review_verdict import ParsedReviewReport
 from gza.review_verify_state import persist_verify_gate_artifact
 from gza.runner import _make_review_verify_result
+from gza.unstick import VERIFY_FIX_FAILED_REASON, select_and_clear_parked_tasks
 from gza.watch_progress import (
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
     WatchProgressCandidate,
@@ -499,6 +501,87 @@ def _setup_retry_limit_parked_lineage(tmp_path: Path) -> tuple[object, Config, D
 
     config = Config.load(tmp_path)
     return store, config, impl, exhausted_improve
+
+
+def _setup_verify_fix_failed_parked_owner(tmp_path: Path) -> tuple[object, Config, DbTask, str]:
+    from gza.review_tasks import create_or_reuse_verify_fix_task
+    from gza.review_verify_state import VerifyEpoch
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement verify fix failed park", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/parked-verify-fix-failed"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    head_sha = "verify-fix-failed-head"
+    output_artifact = store_command_output_artifact(
+        store,
+        impl,
+        config,
+        kind="verify_command_output",
+        producer="test",
+        label="verify_command_output",
+        output="pytest failed",
+        command="./bin/tests",
+        status="failed",
+        exit_status="1",
+        head_sha=head_sha,
+        created_at=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=_make_review_verify_result(
+            "./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha=head_sha,
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        output_artifact_id=output_artifact.id,
+        output_artifact_task_id=impl.id,
+        output_artifact_path=output_artifact.path,
+        producer="test",
+    )
+    epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha=head_sha,
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    verify_fix, _created = create_or_reuse_verify_fix_task(
+        store,
+        config,
+        impl_task=impl,
+        based_on_task=impl,
+        verify_epoch=epoch,
+        trigger_source="test",
+    )
+    verify_fix.status = "completed"
+    verify_fix.completed_at = datetime(2026, 7, 6, 12, 5, tzinfo=UTC)
+    verify_fix.branch = impl.branch
+    verify_fix.has_commits = True
+    store.update(verify_fix)
+    return store, config, impl, head_sha
 
 
 def test_behavior_monitor_internal_task_does_not_consume_watch_slots(tmp_path: Path) -> None:
@@ -22920,6 +23003,120 @@ def test_watch_cycle_blind_auto_rearm_returns_retry_limit_owner_to_same_cycle_wa
     )
     assert rearm is not None
     assert rearm.auto_attempt_count == 1
+
+
+def test_blind_parked_auto_rearm_ignores_verify_fix_failed_without_mutating_manual_park(
+    tmp_path: Path,
+) -> None:
+    from gza.cli.advance_engine import determine_next_action
+    from gza.watch_progress import observe_watch_progress_and_maybe_park
+
+    store, config, impl, head_sha = _setup_verify_fix_failed_parked_owner(tmp_path)
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.budget = 2
+    config.watch.parked_auto_rearm.cooldown_hours = 0
+    config.watch.parked_auto_rearm.require_target_advanced = False
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: head_sha if ref in {impl.branch, "HEAD"} else "main-sha"
+    )
+
+    action = determine_next_action(
+        config,
+        store,
+        git,
+        impl,
+        "main",
+        max_resume_attempts=config.max_resume_attempts,
+    )
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == VERIFY_FIX_FAILED_REASON
+
+    watch_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+    )
+    observe_watch_progress_and_maybe_park(
+        store,
+        candidate=watch_candidate,
+        no_progress_cycles=1,
+    )
+    assert store.list_all_watch_progress_observations(parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON)
+
+    candidate = watch_module.ParkedTaskCandidate(
+        owner_task=impl,
+        subject_task=impl,
+        reason_class="verify-fix-failed",
+        attention_reason=VERIFY_FIX_FAILED_REASON,
+        source="owner_row",
+    )
+
+    with patch("gza.cli.watch.discover_parked_tasks", return_value=((candidate,), 0)):
+        result = _evaluate_blind_parked_auto_rearm(
+            config=config,
+            store=store,
+            git=git,
+            target_branch="main",
+            target_sha="main-sha",
+            tags=None,
+            any_tag=False,
+            scoped_owner_ids=None,
+        )
+
+    assert result.decisions == ()
+    assert result.rearmed_owner_ids == ()
+    assert store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=impl.id,
+        attention_reason=VERIFY_FIX_FAILED_REASON,
+    ) is None
+    assert store.list_all_watch_progress_observations(parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON)
+    after_auto_action = determine_next_action(
+        config,
+        store,
+        git,
+        impl,
+        "main",
+        max_resume_attempts=config.max_resume_attempts,
+    )
+    assert after_auto_action["type"] == "needs_discussion"
+    assert after_auto_action["needs_attention_reason"] == VERIFY_FIX_FAILED_REASON
+
+    owner_row = LineageOwnerRow(
+        owner_task=impl,
+        members=(impl,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=action,
+        next_action_reason="test",
+        unresolved_tasks=(impl,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=impl,
+    )
+    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((owner_row,), object())):
+        manual_result = select_and_clear_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+            task_ids=(impl.id,),
+            reason_classes=("verify-fix-failed",),
+        )
+
+    assert [(outcome.status, outcome.reason_class, outcome.detail) for outcome in manual_result.outcomes] == [
+        ("rearmed", "verify-fix-failed", "cleared verify-fix-failed")
+    ]
+    rearm = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=impl.id,
+        attention_reason=VERIFY_FIX_FAILED_REASON,
+    )
+    assert rearm is not None
+    assert rearm.manual_rearm_epoch == 1
+    assert rearm.auto_attempt_count == 0
 
 
 @pytest.mark.parametrize(

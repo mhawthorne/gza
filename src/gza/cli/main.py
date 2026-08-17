@@ -568,9 +568,9 @@ def main() -> int:
     # unstick command
     unstick_parser = subparsers.add_parser(
         "unstick",
-        help="Manually clear eligible parked backstop/retry-limit/reconcile owner state, optionally dispatching it through scoped watch",
+        help="Manually clear eligible parked owner state, optionally dispatching it through scoped watch",
         description=(
-            "Manually clear eligible parked backstop/retry-limit/reconcile owner state. "
+            "Manually clear eligible parked backstop/retry-limit/reconcile/verify-fix-failed owner state. "
             "With --run, dispatch cleared owners through the shared scoped watch path. "
             "Requires at least one explicit selector."
         ),
@@ -598,8 +598,8 @@ def main() -> int:
         "--reason",
         action="append",
         dest="reasons",
-        choices=["backstop", "retry-limit", "reconcile"],
-        metavar="{backstop,retry-limit,reconcile}",
+        choices=["backstop", "retry-limit", "reconcile", "verify-fix-failed"],
+        metavar="{backstop,retry-limit,reconcile,verify-fix-failed}",
         help="Only select the named parked reason class (repeatable)",
     )
     unstick_parser.add_argument(
@@ -956,7 +956,7 @@ def main() -> int:
     advance_parser.add_argument(
         "--force",
         action="store_true",
-        help="Bypass numeric retry/review caps only; dependency-blocked tasks still will not run",
+        help="Bypass numeric retry/review caps; dependency-blocked tasks still will not run",
     )
     advance_parser.add_argument(
         "--unimplemented",
@@ -2553,6 +2553,10 @@ def main() -> int:
             help=argparse.SUPPRESS,
         )
         iterate_parser.add_argument(
+            "--prepared-verify-owner-task-id",
+            help=argparse.SUPPRESS,
+        )
+        iterate_parser.add_argument(
             "--prepared-review-task-id",
             help=argparse.SUPPRESS,
         )
@@ -2564,7 +2568,7 @@ def main() -> int:
         iterate_parser.add_argument(
             "--force",
             action="store_true",
-            help="Bypass numeric retry/review caps only; dependency-blocked tasks still will not run",
+            help="Bypass numeric retry/review caps and verify-fix-failed parks; dependency-blocked tasks still will not run",
         )
         add_common_args(iterate_parser)
 

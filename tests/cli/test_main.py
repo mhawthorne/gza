@@ -547,6 +547,8 @@ class TestHelpOutput:
         assert "--tag TAG" in help_result.stdout
         assert "--any-tag" in help_result.stdout
         assert "Skip auto-resume of resumable failed tasks" not in help_text
+        assert "Bypass numeric retry/review caps and verify-fix-failed parks" not in help_text
+        assert "Bypass numeric retry/review caps; dependency-blocked tasks still will not run" in help_text
 
         config_keys = invoke_gza("config", "keys", "--json", "--project", str(tmp_path))
         assert config_keys.returncode == 0
@@ -573,6 +575,7 @@ class TestHelpOutput:
             in normalized_output
         )
         assert "new attempt with a fresh conversation" in normalized_output
+        assert "Bypass numeric retry/review caps and verify-fix-failed parks" in normalized_output
         assert "implement retries may fork fresh" in normalized_output
         assert "same-branch follow-ups stay on the shared branch" in normalized_output
         assert "starts fresh" not in normalized_output
