@@ -16,6 +16,7 @@ from .artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from .config import Config
 from .db import SqliteTaskStore, Task
 from .git import Git
+from .main_verify_target import current_local_target_head_sha
 from .off_topic_verify import extract_pytest_failing_nodeids
 from .runner import (
     _capture_review_verify_result,
@@ -1624,7 +1625,7 @@ def current_main_integration_verify_alert(
     if not _gate_identity_matches(state, _current_gate_identity(config, runner_class=runner_class)):
         return None
     default_branch = git.default_branch()
-    current_head_sha = _coerce_optional_str(git.rev_parse_if_exists(default_branch))
+    current_head_sha = current_local_target_head_sha(git, target_branch=default_branch)
     if git.current_branch() == default_branch:
         current_tree_fingerprint = _compute_tree_fingerprint(git)
         if current_tree_fingerprint and state.tree_fingerprint:

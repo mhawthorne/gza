@@ -16,6 +16,7 @@ from .lifecycle_completion import (
     task_is_complete_for_lifecycle,
 )
 from .main_integration_verify import MAIN_INTEGRATION_VERIFY_REASON, current_main_integration_verify_alert
+from .main_verify_format import format_main_verify_status_message, resolve_main_verify_target_proof
 from .merge_state import classify_branch_merge_state_for_target
 from .metrics import instrument_module_functions
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
@@ -1805,9 +1806,15 @@ def _query_lineage_owner_rows_with_context(
         if git is not None and config is not None and _main_integration_alert_matches_query(query):
             main_alert = current_main_integration_verify_alert(store, git, config)
             if main_alert is not None and main_alert.task.id is not None:
+                target_proof = resolve_main_verify_target_proof(
+                    main_alert,
+                    git=git,
+                    target_branch=git.default_branch(),
+                )
+                description = format_main_verify_status_message(main_alert, target_proof=target_proof)
                 action = {
                     "type": "needs_discussion",
-                    "description": f"SKIP: {main_alert.alert_message or 'main verify is red; merges halted'}",
+                    "description": f"SKIP: {description}",
                     "needs_attention_reason": MAIN_INTEGRATION_VERIFY_REASON,
                     "subject_task_id": main_alert.task.id,
                 }

@@ -108,6 +108,7 @@ from gza.cli.watch import (
     _WatchCyclePlan,
     _WatchLog,
     allocate_watch_slots,
+    cmd_main_verify,
     cmd_watch,
     format_red_duration,
 )
@@ -148,6 +149,11 @@ from gza.main_integration_verify import (
     check_main_integration_verify,
     current_main_integration_verify_alert,
     load_main_integration_verify_state,
+)
+from gza.main_verify_format import (
+    format_main_verify_status_message,
+    main_verify_state_is_red_verdict,
+    main_verify_state_is_remediation_exhausted,
 )
 from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
@@ -12268,6 +12274,149 @@ def test_cmd_watch_yes_suppresses_raw_main_verify_output_but_keeps_progress(
     )
 
 
+@pytest.mark.parametrize(
+    ("verify_status", "verify_exit_status", "failing_phase", "expected"),
+    [
+        (
+            "failed",
+            "1",
+            "unit",
+            "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
+        ),
+        (
+            "unavailable",
+            MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+            None,
+            "main verify freshness unproven at `feedfacecafe` - merges halted; exact tree fingerprint unavailable",
+        ),
+    ],
+)
+def test_cmd_main_verify_renders_current_target_sha_from_live_proof(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    verify_status: str,
+    verify_exit_status: str,
+    failing_phase: str | None,
+    expected: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "feedfacecafe9999" if ref == "refs/heads/main" else None
+    )
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha="feedfacecafe9999",
+        verify_status=verify_status,
+        verify_exit_status=verify_exit_status,
+        failing_phase=failing_phase,
+        alert_message=(
+            "main verify RED - merges halted; phase `unit` failing"
+            if verify_status == "failed"
+            else "main verify freshness unproven; exact tree fingerprint unavailable"
+        ),
+    )
+
+    with (
+        patch("gza.cli.watch.get_store", return_value=store),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=True, performed_verify=True, state=state),
+        ),
+    ):
+        rc = cmd_main_verify(argparse.Namespace(project_dir=tmp_path, force=False))
+
+    assert rc == 1
+    assert capsys.readouterr().out.strip() == expected
+
+
+@pytest.mark.parametrize(
+    ("current_head", "short_ref_head", "verify_status", "verify_exit_status", "alert_message", "expected"),
+    [
+        (
+            "cafebabecafe9999",
+            None,
+            "failed",
+            "1",
+            "main verify RED - merges halted; phase `unit` failing",
+            "main verify red evidence stale at current HEAD; recorded target SHA no longer current",
+        ),
+        (
+            None,
+            None,
+            "failed",
+            "1",
+            "main verify RED - merges halted; phase `unit` failing",
+            "main verify red evidence unproven at current HEAD; current HEAD identity unavailable",
+        ),
+        (
+            None,
+            "feedfacecafe9999",
+            "failed",
+            "1",
+            "main verify RED - merges halted; phase `unit` failing",
+            "main verify red evidence unproven at current HEAD; current HEAD identity unavailable",
+        ),
+        (
+            None,
+            "feedfacecafe9999",
+            "unavailable",
+            MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+            "main verify freshness unproven; exact tree fingerprint unavailable",
+            "main verify freshness unproven at current HEAD; exact tree fingerprint unavailable",
+        ),
+    ],
+)
+def test_cmd_main_verify_never_asserts_unproven_target_sha_or_halt(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    current_head: str | None,
+    short_ref_head: str | None,
+    verify_status: str,
+    verify_exit_status: str,
+    alert_message: str,
+    expected: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    git = _make_watch_git()
+    git.current_branch = MagicMock(return_value="topic")  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: current_head
+        if ref == "refs/heads/main"
+        else short_ref_head
+        if ref == "main"
+        else None
+    )
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha="feedfacecafe9999",
+        verify_status=verify_status,
+        verify_exit_status=verify_exit_status,
+        failing_phase="unit" if verify_status == "failed" else None,
+        alert_message=alert_message,
+    )
+
+    with (
+        patch("gza.cli.watch.get_store", return_value=store),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=True, performed_verify=True, state=state),
+        ),
+    ):
+        rc = cmd_main_verify(argparse.Namespace(project_dir=tmp_path, force=False))
+
+    stdout = capsys.readouterr().out.strip()
+    assert rc == 1
+    assert stdout == expected
+    assert "feedfacecafe" not in stdout
+    assert "merges halted" not in stdout
+    assert call("main") not in git.rev_parse_if_exists.call_args_list
+
+
 def test_watch_cycle_logs_cached_main_verify_without_active_run_claim(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -15204,7 +15353,9 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
     alert_git.default_branch.return_value = "main"
     alert_git.branch_exists.return_value = True
     alert_git.current_branch.return_value = "topic"
-    alert_git.rev_parse_if_exists.side_effect = lambda ref: "feedfacecafe" if ref == "main" else "topic-sha"
+    alert_git.rev_parse_if_exists.side_effect = (
+        lambda ref: "feedfacecafe" if ref == "refs/heads/main" else "topic-sha"
+    )
     durable_alert = current_main_integration_verify_alert(store, alert_git, config)
     assert durable_alert is not None
     assert (
@@ -29862,6 +30013,71 @@ def test_main_verify_attention_summary_uses_real_target_ref_for_isolated_checkou
 
 
 @pytest.mark.parametrize(
+    ("verify_status", "verify_exit_status", "alert_message", "expected"),
+    [
+        (
+            "failed",
+            "1",
+            "main verify RED - merges halted; phase `unit` failing",
+            "main verify red evidence unproven at current HEAD; current HEAD identity unavailable",
+        ),
+        (
+            "unavailable",
+            MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+            "main verify freshness unproven; exact tree fingerprint unavailable",
+            "main verify freshness unproven at current HEAD; exact tree fingerprint unavailable",
+        ),
+    ],
+)
+def test_main_verify_attention_summary_ignores_ambiguous_short_target_ref(
+    tmp_path: Path,
+    verify_status: str,
+    verify_exit_status: str,
+    alert_message: str,
+    expected: str,
+) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.current_branch = MagicMock(return_value="topic")  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "feedfacecafe" if ref == "main" else None
+    )
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha="feedfacecafe",
+        failing_phase="unit" if verify_status == "failed" else None,
+        verify_status=verify_status,
+        verify_exit_status=verify_exit_status,
+        alert_message=alert_message,
+        red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
+    )
+
+    log.begin_cycle()
+    _emit_main_verify_attention(
+        log=log,
+        state=state,
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+        git=git,
+        target_branch="main",
+    )
+    _finalize_main_verify_attention(
+        log=log,
+        state=state,
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+        git=git,
+        target_branch="main",
+    )
+    _emit_cycle_attention_summary(log)
+
+    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
+    assert expected in summary_text
+    assert "feedfacecafe" not in summary_text
+    assert "merges halted" not in summary_text
+    assert call("main") not in git.rev_parse_if_exists.call_args_list
+
+
+@pytest.mark.parametrize(
     ("head_side_effect", "head_sha", "expected"),
     [
         (None, "feedfacecafe", "current HEAD identity unavailable"),
@@ -29979,6 +30195,103 @@ def test_main_verify_attention_summary_keeps_freshness_halt_when_head_matches(tm
     summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
     assert "main verify freshness unproven at `feedfacecafe` - merges halted" in summary_text
     assert "exact tree fingerprint unavailable" in summary_text
+
+
+@pytest.mark.parametrize(
+    "target_head",
+    ["cafebabecafe", None, "feedfacecafe"],
+)
+def test_main_verify_missing_alert_exhaustion_finalizes_as_proof_free_human_attention(
+    tmp_path: Path,
+    target_head: str | None,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = _make_main_verify_internal_task(store, head_sha="feedfacecafe")
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "failed"
+    main_verify_task.review_verify_exit_status = "1"
+    main_verify_task.review_verify_failure = "verify_command failed"
+    store.update(main_verify_task)
+    store.mark_main_verify_remediation_exhausted(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        consumed_attempt_count=config.watch.main_verify_remediation_max_attempts,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure="verify_command failed",
+    )
+
+    check = _main_verify_red_check(main_verify_task, tree_fingerprint="fp-functional-a", head_sha="feedfacecafe")
+    check.state.alert_message = None
+    persisted_state = _maybe_file_main_verify_remediation(
+        dry_run=False,
+        config=config,
+        store=store,
+        tags=None,
+        any_tag=False,
+        log=_WatchLog(tmp_path / ".gza" / "remediation.log", quiet=True),
+        check=check,
+    )
+    assert persisted_state is not None
+    assert persisted_state.alert_message is not None
+    assert persisted_state.alert_message.startswith("main verify is red; merges halted; automatic remediation")
+    assert main_verify_state_is_remediation_exhausted(persisted_state)
+    assert not main_verify_state_is_red_verdict(persisted_state)
+
+    log_path = tmp_path / ".gza" / f"watch-{target_head or 'unavailable'}.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    git.current_branch = MagicMock(return_value="topic")  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: target_head if ref == "refs/heads/main" else None
+    )
+
+    log.begin_cycle()
+    _finalize_main_verify_attention(
+        log=log,
+        state=persisted_state,
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+        git=git,
+        target_branch="main",
+    )
+    _emit_cycle_attention_summary(log)
+
+    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
+    assert (
+        "main verify remediation exhausted for phase:functional after 2/2 attempts; "
+        "human intervention required"
+    ) in summary_text
+    assert "feedfacecafe" not in summary_text
+    assert "merges halted" not in summary_text
+    assert git.rev_parse_if_exists.call_args_list == [call("refs/heads/main")]
+
+
+def test_main_verify_legacy_exhaustion_message_uses_shared_classifier_and_renderer() -> None:
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        head_sha="feedfacecafe",
+        failing_phase=None,
+        verify_status="failed",
+        verify_exit_status="7",
+        failure_signature=None,
+        alert_message=(
+            "legacy main verify red; automatic remediation exhausted after 3/3 attempts "
+            "for status:failed:exit:7 on fp-legacy"
+        ),
+        red_since=None,
+    )
+
+    assert _main_verify_attention_key(state) == "main-verify-remediation-exhausted:status:failed:exit:7"
+    assert main_verify_state_is_remediation_exhausted(state)
+    assert not main_verify_state_is_red_verdict(state)
+    assert (
+        format_main_verify_status_message(state, target_proof="stale")
+        == "main verify remediation exhausted for status:failed:exit:7 after 3/3 attempts; "
+        "human intervention required"
+    )
 
 
 def test_main_verify_attention_summary_clears_exhausted_key_after_green_resolution(tmp_path: Path) -> None:

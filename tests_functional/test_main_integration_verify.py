@@ -388,7 +388,7 @@ def test_current_main_integration_verify_alert_suppresses_same_head_red_checkpoi
     live_git = MagicMock()
     live_git.default_branch.return_value = "main"
     live_git.current_branch.return_value = "topic"
-    live_git.rev_parse_if_exists.side_effect = lambda ref: head_sha if ref == "main" else "topic-sha"
+    live_git.rev_parse_if_exists.side_effect = lambda ref: head_sha if ref == "refs/heads/main" else "topic-sha"
 
     assert current_main_integration_verify_alert(store, live_git, config) is not None
 
@@ -432,7 +432,7 @@ def test_current_main_integration_verify_alert_suppresses_same_head_red_checkpoi
     live_git = MagicMock()
     live_git.default_branch.return_value = "main"
     live_git.current_branch.return_value = "topic"
-    live_git.rev_parse_if_exists.side_effect = lambda ref: head_sha if ref == "main" else "topic-sha"
+    live_git.rev_parse_if_exists.side_effect = lambda ref: head_sha if ref == "refs/heads/main" else "topic-sha"
 
     assert current_main_integration_verify_alert(store, live_git, config) is not None
 

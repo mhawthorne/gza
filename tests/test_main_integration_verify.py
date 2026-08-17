@@ -6,7 +6,7 @@ import sys
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Literal
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from gza.artifacts import store_command_output_artifact
 from gza.cli.watch import _main_verify_remediation_prompt
@@ -1485,7 +1485,7 @@ def test_check_main_integration_verify_classifies_tool_launch_failure_as_attenti
     alert_git = MagicMock()
     alert_git.default_branch.return_value = "main"
     alert_git.current_branch.return_value = "topic"
-    alert_git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "main" else "topic-sha"
+    alert_git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
     assert current_main_integration_verify_alert(store, alert_git, config) is None
 
 
@@ -1786,6 +1786,34 @@ def test_current_main_integration_verify_alert_surfaces_unproven_freshness_when_
     assert "abc123" not in alert.alert_message
 
 
+def test_current_main_integration_verify_alert_ignores_ambiguous_short_target_ref(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _seed_main_verify_task(
+        store,
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="verify_command failed",
+        alert_message="main verify RED at `abc123` - merges halted; phase `unit` failing",
+    )
+
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "main" else None
+
+    alert = current_main_integration_verify_alert(store, git, config)
+
+    assert alert is None
+    assert git.rev_parse_if_exists.call_args_list == [call("refs/heads/main")]
+
+
 def test_current_main_integration_verify_alert_omits_red_checkpoint_missing_environment_identity(tmp_path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -1807,7 +1835,7 @@ def test_current_main_integration_verify_alert_omits_red_checkpoint_missing_envi
     git = MagicMock()
     git.default_branch.return_value = "main"
     git.current_branch.return_value = "topic"
-    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "main" else "topic-sha"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
 
     alert = current_main_integration_verify_alert(store, git, config)
 
@@ -1837,7 +1865,7 @@ def test_current_main_integration_verify_alert_omits_red_checkpoint_with_mismatc
     git = MagicMock()
     git.default_branch.return_value = "main"
     git.current_branch.return_value = "topic"
-    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "main" else "topic-sha"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
 
     alert = current_main_integration_verify_alert(store, git, config)
 

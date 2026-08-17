@@ -10,12 +10,14 @@ from types import SimpleNamespace
 
 import pytest
 
+import gza.lineage_query as lineage_query_module
 import gza.recovery_engine as recovery_engine
 import gza.task_query as task_query
 from gza.cli._queue_render import partition_queue_rows
 from gza.cli.advance_engine import determine_next_action
 from gza.config import Config
 from gza.git import GitError
+from gza.main_integration_verify import MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
 from gza.review_verify_state import persist_verify_gate_artifact
 from gza.db import SqliteTaskStore
 from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows, query_lineage_owner_rows_in_read_session
@@ -1371,6 +1373,116 @@ def test_collect_scoped_tag_scope_gaps_reuses_supplied_owner_rows_and_read_conte
 
     assert len(gaps) == 1
     assert gaps[0].owner_id == plan.id
+
+
+@pytest.mark.parametrize(
+    ("verify_status", "verify_exit_status", "failing_phase", "expected"),
+    [
+        (
+            "failed",
+            "1",
+            "unit",
+            "SKIP: main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
+        ),
+        (
+            "unavailable",
+            MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+            None,
+            "SKIP: main verify freshness unproven at `feedfacecafe` - merges halted; exact tree fingerprint unavailable",
+        ),
+    ],
+)
+def test_lineage_query_main_verify_attention_renders_current_target_sha_from_live_proof(
+    tmp_path: Path,
+    verify_status: str,
+    verify_exit_status: str,
+    failing_phase: str | None,
+    expected: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.cli.conftest import setup_config
+
+    setup_config(tmp_path)
+    store = _store(tmp_path)
+    config = Config.load(tmp_path)
+    task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert task.id is not None
+    state = SimpleNamespace(
+        task=task,
+        head_sha="feedfacecafe9999",
+        verify_status=verify_status,
+        verify_exit_status=verify_exit_status,
+        failing_phase=failing_phase,
+        failure=None,
+        alert_message=(
+            "main verify RED - merges halted; phase `unit` failing"
+            if verify_status == "failed"
+            else "main verify freshness unproven; exact tree fingerprint unavailable"
+        ),
+    )
+    git = SimpleNamespace(
+        default_branch=lambda: "main",
+        rev_parse_if_exists=lambda ref: "feedfacecafe9999" if ref == "refs/heads/main" else None,
+        current_branch=lambda: "feature/local",
+    )
+    monkeypatch.setattr(lineage_query_module, "current_main_integration_verify_alert", lambda *_args, **_kwargs: state)
+
+    rows = query_lineage_owner_rows(store, LineageOwnerQuery(limit=None), config=config, git=git)
+
+    assert rows[0].next_action_reason == expected
+
+
+@pytest.mark.parametrize(
+    ("current_head", "expected", "forbidden"),
+    [
+        (
+            "cafebabecafe9999",
+            "SKIP: main verify red evidence stale at current HEAD; recorded target SHA no longer current",
+            ("feedfacecafe", "merges halted"),
+        ),
+        (
+            None,
+            "SKIP: main verify red evidence unproven at current HEAD; current HEAD identity unavailable",
+            ("feedfacecafe", "merges halted"),
+        ),
+    ],
+)
+def test_lineage_query_main_verify_attention_never_asserts_unproven_target_sha_or_halt(
+    tmp_path: Path,
+    current_head: str | None,
+    expected: str,
+    forbidden: tuple[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.cli.conftest import setup_config
+
+    setup_config(tmp_path)
+    store = _store(tmp_path)
+    config = Config.load(tmp_path)
+    task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    assert task.id is not None
+    state = SimpleNamespace(
+        task=task,
+        head_sha="feedfacecafe9999",
+        verify_status="failed",
+        verify_exit_status="1",
+        failing_phase="unit",
+        failure=None,
+        alert_message="main verify RED - merges halted; phase `unit` failing",
+    )
+    git = SimpleNamespace(
+        default_branch=lambda: "main",
+        rev_parse_if_exists=lambda ref: current_head if ref == "refs/heads/main" else None,
+        current_branch=lambda: "feature/local",
+    )
+    monkeypatch.setattr(lineage_query_module, "current_main_integration_verify_alert", lambda *_args, **_kwargs: state)
+
+    rows = query_lineage_owner_rows(store, LineageOwnerQuery(limit=None), config=config, git=git)
+
+    rendered = rows[0].next_action_reason
+    assert rendered == expected
+    assert forbidden[0] not in rendered
+    assert forbidden[1] not in rendered
 
 
 def test_collect_scoped_tag_scope_gaps_any_tag_suggests_single_matching_tag(tmp_path: Path) -> None:

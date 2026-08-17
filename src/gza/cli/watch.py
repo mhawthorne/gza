@@ -74,8 +74,6 @@ from ..lineage_query import (
 )
 from ..lineage_view import LineageView
 from ..main_integration_verify import (
-    MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
-    MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_REASON,
     MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
     MAIN_INTEGRATION_VERIFY_TAG,
@@ -90,6 +88,16 @@ from ..main_integration_verify import (
     persist_main_integration_verify_pending_retire_signatures,
     promote_candidate_integration_verify_evidence,
     verify_gate_enabled,
+)
+from ..main_verify_format import (
+    format_main_verify_status_message,
+    format_red_duration as _shared_format_red_duration,
+    main_verify_state_failure_signature,
+    main_verify_state_is_freshness_unavailable,
+    main_verify_state_is_red_verdict,
+    main_verify_state_is_remediation_exhausted,
+    main_verify_state_needs_non_red_attention,
+    resolve_main_verify_target_proof,
 )
 from ..merge_state import (
     effective_no_work_merge_state,
@@ -353,10 +361,6 @@ MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT = DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MA
 MAIN_VERIFY_REMEDIATION_EXHAUSTED_REASON = MAIN_VERIFY_REMEDIATION_EXHAUSTED_FAILURE_REASON
 MAIN_VERIFY_REMEDIATION_MOOT_GREEN_REASON = "main verify turned green for cleared signature"
 _MAIN_VERIFY_REMEDIATION_ATTEMPTS_PREFIX = "Remediation attempts spent: "
-_MAIN_VERIFY_REMEDIATION_EXHAUSTED_ATTENTION_RE = re.compile(
-    r"automatic remediation exhausted after (?P<attempts>\d+/\d+) attempts"
-    r"(?: for (?P<signature>.+?) on (?P<fingerprint>.+?))?(?:;|$)",
-)
 
 
 def _main_verify_remediation_prompt(
@@ -1293,27 +1297,6 @@ def _collect_main_verify_pending_retirement_signatures(state: Any) -> tuple[str,
     if not isinstance(raw, tuple):
         return ()
     return tuple(signature for signature in raw if isinstance(signature, str) and signature)
-
-
-def _main_verify_state_failure_signature(state: Any) -> str | None:
-    signature = getattr(state, "failure_signature", None)
-    if isinstance(signature, str) and signature:
-        return signature
-    message = getattr(state, "alert_message", None) or ""
-    exhausted_match = _MAIN_VERIFY_REMEDIATION_EXHAUSTED_ATTENTION_RE.search(message)
-    if exhausted_match is not None:
-        parsed_signature = exhausted_match.group("signature")
-        if parsed_signature:
-            return parsed_signature
-    failing_phase = getattr(state, "failing_phase", None)
-    if isinstance(failing_phase, str) and failing_phase:
-        return f"phase:{failing_phase}"
-    verify_status = getattr(state, "verify_status", None)
-    if not isinstance(verify_status, str) or not verify_status:
-        return None
-    verify_exit_status = getattr(state, "verify_exit_status", None)
-    exit_status = verify_exit_status if isinstance(verify_exit_status, str) and verify_exit_status else "unknown"
-    return f"status:{verify_status}:exit:{exit_status}"
 
 
 def _apply_main_verify_green_cleanup(
@@ -3226,129 +3209,7 @@ def _format_elapsed(started_at: str | None, completed_at: str | None) -> str | N
 
 
 def format_red_duration(red_since: datetime, now: datetime) -> str:
-    elapsed = max(0, int((now - red_since).total_seconds()))
-    total_minutes = elapsed // 60
-    total_hours = elapsed // 3600
-    total_days = elapsed // 86400
-    if total_days > 0:
-        return f"{total_days}d{(total_hours % 24)}h"
-    if total_hours > 0:
-        return f"{total_hours}h{(total_minutes % 60)}m"
-    return f"{total_minutes}m"
-
-
-def _format_main_verify_red_attention_message(state: Any) -> str:
-    short_sha = (getattr(state, "head_sha", None) or "unknown")[:12]
-    failing_phase = getattr(state, "failing_phase", None)
-    if isinstance(failing_phase, str) and failing_phase:
-        return f"main verify RED at `{short_sha}` - merges halted; phase `{failing_phase}` failing"
-    verify_status = getattr(state, "verify_status", None)
-    if isinstance(verify_status, str) and verify_status and verify_status != "failed":
-        return f"main verify RED at `{short_sha}` - merges halted; verify status `{verify_status}`"
-    return f"main verify RED at `{short_sha}` - merges halted"
-
-
-def _main_verify_state_is_freshness_unavailable(state: Any) -> bool:
-    return getattr(state, "verify_exit_status", None) == MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
-
-
-def _main_verify_state_is_red_verdict(state: Any) -> bool:
-    message = getattr(state, "alert_message", None)
-    if isinstance(message, str) and _MAIN_VERIFY_REMEDIATION_EXHAUSTED_ATTENTION_RE.search(message) is not None:
-        return False
-    if isinstance(message, str) and message.startswith("main verify RED"):
-        return True
-    verify_status = getattr(state, "verify_status", None)
-    verify_exit_status = getattr(state, "verify_exit_status", None)
-    if verify_exit_status in {
-        MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
-        MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
-    }:
-        return False
-    return isinstance(verify_status, str) and verify_status not in {"passed", "unavailable"}
-
-
-def _main_verify_state_needs_non_red_attention(state: Any) -> bool:
-    message = getattr(state, "alert_message", None)
-    if not isinstance(message, str) or not message:
-        return False
-    return getattr(state, "verify_exit_status", None) == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
-
-
-def _main_verify_current_head_sha(git: Git | None, *, target_branch: str | None = None) -> str | None:
-    if git is None:
-        return None
-    ref = f"refs/heads/{target_branch}" if target_branch else "HEAD"
-    try:
-        current_head = git.rev_parse_if_exists(ref)
-    except (AssertionError, GitError):
-        return None
-    if current_head is None and target_branch:
-        try:
-            current_branch = git.current_branch()
-        except (AssertionError, GitError):
-            current_branch = None
-        if current_branch == target_branch:
-            try:
-                current_head = git.rev_parse_if_exists("HEAD")
-            except (AssertionError, GitError):
-                return None
-    return current_head if isinstance(current_head, str) and current_head else None
-
-
-def _main_verify_red_attention_head_status(
-    state: Any,
-    *,
-    git: Git | None,
-    target_branch: str | None = None,
-) -> Literal["current", "stale", "unproven"]:
-    recorded_head = getattr(state, "head_sha", None)
-    if not isinstance(recorded_head, str) or not recorded_head:
-        return "unproven"
-    current_head = _main_verify_current_head_sha(git, target_branch=target_branch)
-    if current_head is None:
-        return "unproven"
-    if current_head != recorded_head:
-        return "stale"
-    return "current"
-
-
-def _format_main_verify_unproven_current_head_message(state: Any) -> str:
-    recorded_head = getattr(state, "head_sha", None)
-    if not isinstance(recorded_head, str) or not recorded_head:
-        return "main verify red evidence unproven at current HEAD; recorded target SHA unavailable"
-    return "main verify red evidence unproven at current HEAD; current HEAD identity unavailable"
-
-
-def _format_main_verify_freshness_unavailable_attention_message(state: Any) -> str:
-    short_sha = (getattr(state, "head_sha", None) or "unknown")[:12]
-    return f"main verify freshness unproven at `{short_sha}` - merges halted; exact tree fingerprint unavailable"
-
-
-def _format_main_verify_freshness_unavailable_unproven_message(state: Any) -> str:
-    recorded_head = getattr(state, "head_sha", None)
-    if not isinstance(recorded_head, str) or not recorded_head:
-        return "main verify freshness unproven at current HEAD; recorded target SHA unavailable"
-    return "main verify freshness unproven at current HEAD; exact tree fingerprint unavailable"
-
-
-def _format_main_verify_attention_message(state: Any, *, now: datetime) -> str:
-    message = state.alert_message or "main verify is red; merges halted"
-    red_since = getattr(state, "red_since", None)
-    exhausted_match = _MAIN_VERIFY_REMEDIATION_EXHAUSTED_ATTENTION_RE.search(message)
-    if exhausted_match is not None:
-        signature = _main_verify_state_failure_signature(state) or "unknown"
-        message = (
-            f"main verify remediation exhausted for {signature} after "
-            f"{exhausted_match.group('attempts')} attempts; human intervention required"
-        )
-    elif _main_verify_state_is_red_verdict(state):
-        message = _format_main_verify_red_attention_message(state)
-    elif _main_verify_state_is_freshness_unavailable(state):
-        message = _format_main_verify_freshness_unavailable_attention_message(state)
-    if red_since is None:
-        return message
-    return f"{message} (red for {format_red_duration(red_since, now)})"
+    return _shared_format_red_duration(red_since, now)
 
 
 def _main_verify_ordinary_attention_key(state: Any) -> str | None:
@@ -3360,9 +3221,8 @@ def _main_verify_ordinary_attention_key(state: Any) -> str | None:
 
 
 def _main_verify_exhausted_attention_key(state: Any) -> str | None:
-    message = getattr(state, "alert_message", None) or ""
-    if "automatic remediation exhausted after" in message:
-        signature = _main_verify_state_failure_signature(state)
+    if main_verify_state_is_remediation_exhausted(state):
+        signature = main_verify_state_failure_signature(state)
         if signature:
             return f"main-verify-remediation-exhausted:{signature}"
     return None
@@ -3399,28 +3259,28 @@ def _emit_main_verify_attention(
     if attention_key is None:
         return
     _clear_main_verify_counterpart_attention(log=log, state=state, attention_key=attention_key)
-    if _main_verify_state_is_freshness_unavailable(state):
-        head_status = _main_verify_red_attention_head_status(state, git=git, target_branch=target_branch)
+    if main_verify_state_is_freshness_unavailable(state):
+        head_status = resolve_main_verify_target_proof(state, git=git, target_branch=target_branch)
         if head_status != "current":
             log.emit_attention(
                 attention_key=attention_key,
-                message=_format_main_verify_freshness_unavailable_unproven_message(state),
+                message=format_main_verify_status_message(state, target_proof=head_status),
             )
             return
-    if _main_verify_state_is_red_verdict(state):
-        head_status = _main_verify_red_attention_head_status(state, git=git, target_branch=target_branch)
+    if main_verify_state_is_red_verdict(state):
+        head_status = resolve_main_verify_target_proof(state, git=git, target_branch=target_branch)
         if head_status == "stale":
             log.clear_attention(attention_key)
             return
         if head_status == "unproven":
             log.emit_attention(
                 attention_key=attention_key,
-                message=_format_main_verify_unproven_current_head_message(state),
+                message=format_main_verify_status_message(state, target_proof=head_status),
             )
             return
     log.emit_attention(
         attention_key=attention_key,
-        message=_format_main_verify_attention_message(state, now=now),
+        message=format_main_verify_status_message(state, target_proof="current", now=now),
     )
 
 
@@ -3451,47 +3311,48 @@ def _finalize_main_verify_attention(
     if attention_key is None:
         return
     _clear_main_verify_counterpart_attention(log=log, state=state, attention_key=attention_key)
-    if _main_verify_exhausted_attention_key(state) is not None:
+    if main_verify_state_is_remediation_exhausted(state):
+        head_status = resolve_main_verify_target_proof(state, git=git, target_branch=target_branch)
         log.emit_attention(
             attention_key=attention_key,
-            message=_format_main_verify_attention_message(state, now=now),
+            message=format_main_verify_status_message(state, target_proof=head_status, now=now),
         )
         return
-    if _main_verify_state_is_freshness_unavailable(state):
-        head_status = _main_verify_red_attention_head_status(state, git=git, target_branch=target_branch)
+    if main_verify_state_is_freshness_unavailable(state):
+        head_status = resolve_main_verify_target_proof(state, git=git, target_branch=target_branch)
         if head_status != "current":
             log.emit_attention(
                 attention_key=attention_key,
-                message=_format_main_verify_freshness_unavailable_unproven_message(state),
+                message=format_main_verify_status_message(state, target_proof=head_status),
             )
             return
         log.emit_attention(
             attention_key=attention_key,
-            message=_format_main_verify_attention_message(state, now=now),
+            message=format_main_verify_status_message(state, target_proof=head_status, now=now),
         )
         return
-    if _main_verify_state_needs_non_red_attention(state):
+    if main_verify_state_needs_non_red_attention(state):
         log.emit_attention(
             attention_key=attention_key,
-            message=_format_main_verify_attention_message(state, now=now),
+            message=format_main_verify_status_message(state, target_proof="current", now=now),
         )
         return
-    if not _main_verify_state_is_red_verdict(state):
+    if not main_verify_state_is_red_verdict(state):
         _clear_main_verify_attention(log=log, state=state)
         return
-    head_status = _main_verify_red_attention_head_status(state, git=git, target_branch=target_branch)
+    head_status = resolve_main_verify_target_proof(state, git=git, target_branch=target_branch)
     if head_status == "stale":
         log.clear_attention(attention_key)
         return
     if head_status == "unproven":
         log.emit_attention(
             attention_key=attention_key,
-            message=_format_main_verify_unproven_current_head_message(state),
+            message=format_main_verify_status_message(state, target_proof=head_status),
         )
         return
     log.emit_attention(
         attention_key=attention_key,
-        message=_format_main_verify_attention_message(state, now=now),
+        message=format_main_verify_status_message(state, target_proof=head_status, now=now),
     )
 
 
@@ -10336,8 +10197,8 @@ def cmd_main_verify(args: argparse.Namespace) -> int:
     store = get_store(config)
     git = Git(config.project_dir)
     verify_git = git
+    target_branch = git.default_branch()
     if config.main_checkout_isolate:
-        target_branch = git.default_branch()
         verify_git = ensure_watch_main_checkout(config, git, target_branch)
 
     check = check_main_integration_verify(
@@ -10351,10 +10212,18 @@ def cmd_main_verify(args: argparse.Namespace) -> int:
     status = check.state.verify_status or "unknown"
     phase = f" phase={check.state.failing_phase}" if check.state.failing_phase else ""
     if check.merges_halted:
-        print(check.state.alert_message or f"main verify {status}{phase}; merges halted")
+        target_proof = resolve_main_verify_target_proof(check.state, git=git, target_branch=target_branch)
+        print(
+            format_main_verify_status_message(
+                check.state,
+                target_proof=target_proof,
+                fallback=f"main verify {status}{phase}; merges halted",
+            )
+        )
         return 1
     if check.state.alert_message:
-        print(check.state.alert_message)
+        target_proof = resolve_main_verify_target_proof(check.state, git=git, target_branch=target_branch)
+        print(format_main_verify_status_message(check.state, target_proof=target_proof))
         return 0
     print(
         f"main verify {status}{phase}; merges allowed"
