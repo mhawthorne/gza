@@ -19,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import IO
+from typing import BinaryIO
 from urllib.error import URLError
 from urllib.request import urlopen
 import webbrowser
@@ -33,6 +33,7 @@ STOP_TIMEOUT_SECONDS = 5.0
 STARTUP_TIMEOUT_SECONDS = 10.0
 HEALTH_REQUEST_TIMEOUT_SECONDS = 0.25
 STARTUP_POLL_INTERVAL_SECONDS = 0.05
+STARTUP_DIAGNOSTIC_MAX_BYTES = 2000
 
 
 class LifecycleError(RuntimeError):
@@ -298,16 +299,18 @@ def _cleanup_child(process: subprocess.Popen[object]) -> None:
     process.wait()
 
 
-def _startup_diagnostic(stream: IO[str]) -> str:
+def _startup_diagnostic(stream: BinaryIO) -> str:
     try:
         stream.flush()
-        stream.seek(0)
-        output = stream.read().strip()
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(max(0, size - STARTUP_DIAGNOSTIC_MAX_BYTES))
+        output = stream.read().decode("utf-8", errors="replace").strip()
     except (OSError, ValueError):
         return ""
     if not output:
         return ""
-    return f"; startup output: {output[-2000:]}"
+    return f"; startup output: {output}"
 
 
 def _exception_diagnostic(exc: BaseException) -> str:
@@ -342,13 +345,14 @@ def start_server(path: Path) -> str:
         instance_id = secrets.token_urlsafe(32)
         environment = os.environ.copy()
         environment["GZA_SERVER_INSTANCE_ID"] = instance_id
-        with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as startup_output:
+        with tempfile.TemporaryFile(mode="w+b") as startup_output:
             process = subprocess.Popen(
                 [
                     sys.executable,
                     "-m",
                     "uvicorn",
                     "gza_server.app:create_app",
+                    "--no-access-log",
                     "--factory",
                     "--host",
                     HOST,
@@ -515,7 +519,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser(
         "start",
-        help="start the server, wait until ready, open it, and print its URL",
+        help=(
+            "start the server without routine access logging, wait until ready, "
+            "open it, and print its URL"
+        ),
     )
     subparsers.add_parser("stop", help="stop the running server")
     subparsers.add_parser(
