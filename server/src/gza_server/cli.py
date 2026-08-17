@@ -248,13 +248,19 @@ def _wait_for_owned_process_exit(
     state: ServerState,
     expected_start_id: str | None,
 ) -> IdentityStatus:
+    """Wait for death, tolerating lost health after a markerless SIGTERM."""
     deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
     while True:
         identity = _owned_process_status(state, expected_start_id)
-        if identity is not IdentityStatus.MATCH:
+        if identity in (IdentityStatus.DEAD, IdentityStatus.MISMATCH):
+            return identity
+        if (
+            identity is IdentityStatus.UNVERIFIABLE
+            and expected_start_id is not None
+        ):
             return identity
         if time.monotonic() >= deadline:
-            return IdentityStatus.MATCH
+            return identity
         time.sleep(0.05)
 
 

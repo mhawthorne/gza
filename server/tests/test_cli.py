@@ -189,6 +189,60 @@ def test_stop_terminates_live_process_and_removes_state(tmp_path):
     assert not path.exists()
 
 
+def test_stop_without_start_marker_waits_for_graceful_exit(tmp_path):
+    path = tmp_path / "gza-server.json"
+    _write_state(path)
+    with (
+        patch(
+            "gza_server.cli.process_is_alive",
+            side_effect=[True, True, True, False],
+        ),
+        patch(
+            "gza_server.cli.urlopen",
+            side_effect=[
+                _health_response(),
+                _health_response(),
+                URLError("server stopped serving health"),
+            ],
+        ),
+        patch("gza_server.cli.time.sleep"),
+        patch("gza_server.cli.os.kill") as kill,
+    ):
+        result = stop_server(path)
+
+    assert result == "stopped"
+    kill.assert_called_once_with(1234, signal.SIGTERM)
+    assert not path.exists()
+
+
+def test_stop_without_start_marker_preserves_unverifiable_live_pid_at_timeout(
+    tmp_path,
+):
+    path = tmp_path / "gza-server.json"
+    _write_state(path)
+    with (
+        patch("gza_server.cli.process_is_alive", return_value=True),
+        patch(
+            "gza_server.cli.urlopen",
+            side_effect=[
+                _health_response(),
+                _health_response(),
+                URLError("server stopped serving health"),
+                URLError("server still not serving health"),
+            ],
+        ),
+        patch("gza_server.cli.time.monotonic", side_effect=[0.0, 1.0, 5.0]),
+        patch("gza_server.cli.time.sleep") as sleep,
+        patch("gza_server.cli.os.kill") as kill,
+    ):
+        with pytest.raises(LifecycleError, match="cannot stop.*state was preserved"):
+            stop_server(path)
+
+    kill.assert_called_once_with(1234, signal.SIGTERM)
+    sleep.assert_called_once_with(0.05)
+    assert path.exists()
+
+
 def test_stop_removes_stale_state_without_signalling(tmp_path):
     path = tmp_path / "gza-server.json"
     _write_state(path)
