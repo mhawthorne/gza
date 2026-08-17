@@ -1753,10 +1753,12 @@ class TestVerifyCommandInjection:
         sibling_dir.mkdir(parents=True)
         skipped_dir.mkdir(parents=True)
         (project_dir / "gza.yaml").write_text(
-            "project_name: foo\nverify_command: ./bin/foo-verify\nunit_verify_command: ./bin/foo-unit\ninner_verify_command: ./bin/foo-quick\n"
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\nunit_verify_command: ./bin/foo-unit\ninner_verify_command: ./bin/foo-quick\n"
         )
-        (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
-        (skipped_dir / "gza.yaml").write_text("project_name: baz\n")
+        (sibling_dir / "gza.yaml").write_text(
+            "project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n"
+        )
+        (skipped_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\n")
 
         config = Config(
             project_dir=project_dir,
@@ -1949,6 +1951,8 @@ class TestVerifyCommandInjection:
 
         (tmp_path / "gza.yaml").write_text(
             "project_name: testproject\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "verify_command: './bin/tests'\n"
             "unit_verify_command: './bin/test-unit --summary -- tests/ -n 2 --dist loadscope'\n"
         )

@@ -6770,6 +6770,7 @@ class TestFailureReasonGroundTruth:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test\n"
             "provider: claude\n"
+            "model: claude-sonnet-4-5\n"
             "timeout_minutes: 10\n"
             "task_types:\n"
             "  implement:\n"

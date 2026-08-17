@@ -22,7 +22,10 @@ from gza.plan_review_verdict import validate_plan_review_report
 
 
 def _make_store(tmp_path: Path) -> SqliteTaskStore:
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n",
+        encoding="utf-8",
+    )
     config = Config.load(tmp_path)
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)

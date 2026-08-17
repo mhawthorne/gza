@@ -310,8 +310,7 @@ class TestPreflightTargetResolution:
 class TestPreflightCommand:
     def test_cmd_preflight_reporting_and_exit_code(self, tmp_path: Path, monkeypatch, capsys) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
-            "provider: claude\n"
+            "project_name: test\nprovider: claude\nmodel: claude-sonnet-4-5\n"
             "task_providers:\n"
             "  review: codex\n"
             "providers:\n"
@@ -350,7 +349,7 @@ class TestPreflightCommand:
         output = capsys.readouterr().out
 
         assert result == 1
-        assert "Checking claude / (default) ..." in output
+        assert "Checking claude / claude-sonnet-4-5 ..." in output
         assert "Checking codex / gpt-5.4-codex ..." in output
         assert "Provider/model preflight (docker)" in output
         assert "PASS" in output
@@ -359,7 +358,10 @@ class TestPreflightCommand:
         assert "1 passed, 1 failed" in output
 
     def test_cmd_preflight_returns_zero_when_all_targets_pass(self, tmp_path: Path, monkeypatch, capsys) -> None:
-        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nprovider: claude\n", encoding="utf-8")
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\nprovider: claude\nmodel: claude-sonnet-4-5\n",
+            encoding="utf-8",
+        )
 
         class FakeProvider:
             credential_setup_hint = "set credentials"

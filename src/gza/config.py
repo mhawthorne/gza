@@ -1593,6 +1593,7 @@ class Config:
         *,
         discover: bool = False,
         allow_derived_shared_project_id: bool = False,
+        require_project_model_provider: bool = True,
     ) -> "Config":
         """Load config from gza.yaml in project root.
 
@@ -1618,6 +1619,7 @@ class Config:
             local_override_path=local_override_path,
             local_overrides_active=local_overrides_active,
             allow_derived_shared_project_id=allow_derived_shared_project_id,
+            require_project_model_provider=require_project_model_provider,
         )
 
     @classmethod
@@ -1632,6 +1634,7 @@ class Config:
         local_override_path: Path | None,
         local_overrides_active: bool,
         allow_derived_shared_project_id: bool = False,
+        require_project_model_provider: bool = True,
     ) -> "Config":
         """Build a Config from already-merged config data."""
         config_path = cls.config_path(project_dir)
@@ -1771,11 +1774,14 @@ class Config:
         work_count = data.get("work_count", DEFAULT_WORK_COUNT)
         chat_text_display_length = data.get("chat_text_display_length", DEFAULT_CHAT_TEXT_DISPLAY_LENGTH)
         if "provider" not in data or data["provider"] in (None, ""):
-            raise ConfigError(_missing_project_config_key_error(config_path, "provider"))
-        provider = data["provider"]
+            if require_project_model_provider:
+                raise ConfigError(_missing_project_config_key_error(config_path, "provider"))
+            provider = DEFAULT_PROVIDER
+        else:
+            provider = data["provider"]
         if not isinstance(provider, str):
             raise ConfigError("'provider' must be a string")
-        if provider not in KNOWN_PROVIDERS:
+        if provider and provider not in KNOWN_PROVIDERS:
             raise ConfigError(f"'provider' must be one of: {', '.join(KNOWN_PROVIDERS)}")
 
         # task_providers routing
@@ -1946,7 +1952,7 @@ class Config:
                     task_types=provider_task_types,
                 )
 
-        if not _merged_data_has_model_for_provider(data, provider):
+        if require_project_model_provider and not _merged_data_has_model_for_provider(data, provider):
             raise ConfigError(_missing_model_error(config_path, provider))
 
         # Warn when provider-scoped and broader fallback fields are both set for the same semantic target.
@@ -2041,11 +2047,11 @@ class Config:
 
         # Validate provider/model compatibility with effective loaded settings.
         model_compat_errors: list[str] = []
-        if not _is_model_compatible_with_provider(provider, model):
+        if provider and not _is_model_compatible_with_provider(provider, model):
             model_compat_errors.append(_provider_model_mismatch_error("model", provider, model))
         for task_type, task_cfg in task_types.items():
             task_provider = task_providers.get(task_type, provider)
-            if task_cfg.model and not _is_model_compatible_with_provider(task_provider, task_cfg.model):
+            if task_provider and task_cfg.model and not _is_model_compatible_with_provider(task_provider, task_cfg.model):
                 model_compat_errors.append(
                     _provider_model_mismatch_error(f"task_types.{task_type}.model", task_provider, task_cfg.model)
                 )
@@ -2069,6 +2075,8 @@ class Config:
                     )
         if model_compat_errors:
             raise ConfigError("Invalid provider/model configuration:\n- " + "\n- ".join(model_compat_errors))
+        if require_project_model_provider and not _merged_data_has_model_for_provider(data, provider):
+            raise ConfigError(_missing_model_error(config_path, provider))
 
         # Parse branch_strategy configuration
         branch_strategy = None
@@ -2825,6 +2833,7 @@ class Config:
                 user_config_active=user_active,
                 local_override_path=None,
                 local_overrides_active=False,
+                require_project_model_provider=False,
             )
         except ConfigError as exc:
             raise ConfigError(

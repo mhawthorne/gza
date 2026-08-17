@@ -5827,6 +5827,7 @@ class TestProviderScopedConfig:
         config_path.write_text(
             "project_name: test\n"
             "provider: codex\n"
+            "model: gpt-5.5\n"
             "task_providers:\n"
             "  review: claude\n"
             "  plan: gemini\n"
@@ -5856,6 +5857,7 @@ class TestProviderScopedConfig:
         config_path.write_text(
             "project_name: test\n"
             "provider: codex\n"
+            "model: gpt-5.5\n"
             "task_providers:\n"
             "  review: claude\n"
             "task_types:\n"
@@ -5959,6 +5961,7 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: claude\n"
             "model: legacy-model\n"
             "task_types:\n"
             "  review:\n"
@@ -5984,6 +5987,7 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: claude\n"
             "max_steps: 60\n"
             "max_turns: 50\n"
             "model: legacy-model\n"
@@ -6026,6 +6030,8 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "timeout_minutes: 10\n"
             "task_types:\n"
             "  review:\n"
@@ -6055,6 +6061,8 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "timeout_minutes: 10\n"
             "task_types:\n"
             "  implement:\n"
@@ -6087,6 +6095,8 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "max_turns: 77\n"
         )
         with pytest.warns(DeprecationWarning, match="max_turns"):
@@ -6100,6 +6110,8 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "max_steps: 50\n"
             "max_turns: 40\n"
             "task_types:\n"

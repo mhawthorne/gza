@@ -5526,6 +5526,11 @@ class TestBackgroundWorkerCommand:
             "provider: claude\n"
             "task_providers:\n"
             "  fix: codex\n"
+            "providers:\n"
+            "  claude:\n"
+            "    model: claude-sonnet-4-5\n"
+            "  codex:\n"
+            "    model: gpt-5.5\n"
         )
         store = make_store(tmp_path)
         fix_task = store.add("Fix stuck workflow", task_type="fix")
@@ -5847,6 +5852,8 @@ class TestReconciliation:
         setup_config(tmp_path)
         (tmp_path / "gza.yaml").write_text(
             "project_name: test-project\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "watch:\n"
             "  no_activity_timeout: 120\n"
         )
