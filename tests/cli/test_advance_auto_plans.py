@@ -379,7 +379,7 @@ def test_advance_does_not_create_implement_for_held_plan(tmp_path: Path, capsys)
 
 def test_advance_type_plan_filters_to_plans_only(tmp_path: Path, capsys) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
         "require_review_before_merge: false\n"
     )
@@ -399,7 +399,7 @@ def test_advance_type_plan_filters_to_plans_only(tmp_path: Path, capsys) -> None
 
 def test_advance_type_implement_filters_to_implements_only(tmp_path: Path, capsys) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
         "require_review_before_merge: false\n"
     )

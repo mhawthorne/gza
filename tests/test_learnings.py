@@ -385,7 +385,7 @@ def test_run_learnings_task_refuses_at_capacity_without_creating_internal_task(t
     """Capacity refusal must happen before persisting the internal learnings task row."""
     store = _new_store(tmp_path)
     config_path = tmp_path / "gza.yaml"
-    config_path.write_text("project_name: test\nmax_concurrent: 1\n")
+    config_path.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nmax_concurrent: 1\n")
     config = Config.load(tmp_path)
 
     completed = store.add("Completed task", task_type="implement")
@@ -417,7 +417,7 @@ def test_run_learnings_task_allows_same_pid_reentry_at_max_concurrent_one(tmp_pa
     """Nested learnings generation should reuse the current worker slot."""
     store = _new_store(tmp_path)
     config_path = tmp_path / "gza.yaml"
-    config_path.write_text("project_name: test\nmax_concurrent: 1\n")
+    config_path.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nmax_concurrent: 1\n")
     config = Config.load(tmp_path)
 
     completed = store.add("Completed task", task_type="implement")
@@ -627,7 +627,7 @@ def test_learnings_config_fields_no_unknown_warning(tmp_path: Path, capsys):
     """learnings_window, learnings_interval, and learnings_max_items must not produce unknown-field warnings."""
     config_file = tmp_path / "gza.yaml"
     config_file.write_text(
-        "project_name: test\nlearnings_window: 30\nlearnings_interval: 10\nlearnings_max_items: 40\n"
+        "project_name: test\nprovider: codex\nmodel: gpt-5.5\nlearnings_window: 30\nlearnings_interval: 10\nlearnings_max_items: 40\n"
     )
     config = Config.load(tmp_path)
     captured = capsys.readouterr()

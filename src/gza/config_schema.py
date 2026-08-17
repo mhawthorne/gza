@@ -165,7 +165,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("max_turns", "int", 50, "Deprecated global alias for `max_steps`."),
     ConfigKeySpec("main_checkout_isolate", "bool", False, "Stage watch-time merges in a detached integration checkout before advancing the real default branch on success."),
     ConfigKeySpec("merge_squash_threshold", "int", 0, "Auto-squash threshold for merge operations."),
-    ConfigKeySpec("model", "str", "", "Legacy global model fallback."),
+    ConfigKeySpec("model", "str", None, "Legacy global model fallback.", required=True, example_value="gpt-5.5"),
     ConfigKeySpec(
         "no_color",
         "bool",
@@ -181,7 +181,7 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ),
     ConfigKeySpec("project_name", "str", None, "Project identifier used for naming and defaults.", required=True),
     ConfigKeySpec("project_prefix", "str", "derived from project_name", "Task-ID prefix (1-12 lowercase alphanumeric chars)."),
-    ConfigKeySpec("provider", "str", "claude", "Default provider when task-specific routing is absent."),
+    ConfigKeySpec("provider", "str", None, "Default provider when task-specific routing is absent.", required=True, example_value="codex"),
     ConfigKeySpec("providers.*.model", "str", None, "Provider-scoped default model."),
     ConfigKeySpec("providers.*.reasoning_effort", "str", None, "Provider-scoped default reasoning effort (Codex)."),
     ConfigKeySpec("providers.*.task_types.*.max_steps", "int", None, "Provider/task-type step budget override."),

@@ -17,6 +17,8 @@ def setup_config(tmp_path: Path) -> None:
     config_path.write_text(
         "project_name: test-project\n"
         "db_path: .gza/gza.db\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
     )
 
 
@@ -29,6 +31,8 @@ def setup_shared_db_config(tmp_path: Path) -> Path:
         "project_id: testproject\n"
         "project_prefix: testproject\n"
         f"db_path: {shared_db}\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
     )
     return shared_db
 

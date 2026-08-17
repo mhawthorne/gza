@@ -22,7 +22,7 @@ divergence is hidden behind the `Provider` interface.
 ## Provider selection
 
 - Config field: `provider` (top-level in `gza.yaml`)
-  - Default: `"claude"` (`DEFAULT_PROVIDER` at `src/gza/config.py:55`)
+  - Required: no implicit provider default is applied
   - Allowed: `claude`, `codex`, `gemini`
 - Per-task-type override: `task_providers.*` — looked up via
   `config.get_provider_for_task(task.task_type)` at `src/gza/runner.py:1060`

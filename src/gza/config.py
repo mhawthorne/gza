@@ -61,7 +61,7 @@ DEFAULT_MAX_STEPS = 50
 DEFAULT_MAX_TURNS = 50
 DEFAULT_WORKTREE_DIR = f"/tmp/{APP_NAME}-worktrees"
 DEFAULT_WORK_COUNT = 1  # Number of tasks to run in a work session
-DEFAULT_PROVIDER = "claude"  # "claude", "codex", or "gemini"
+DEFAULT_PROVIDER = ""  # No implicit provider; projects must configure one explicitly.
 KNOWN_PROVIDERS = ("claude", "codex", "gemini")
 DEFAULT_CHAT_TEXT_DISPLAY_LENGTH = 0  # 0 means unlimited (show all)
 DEFAULT_BRANCH_STRATEGY = "monorepo"  # Default branch naming strategy
@@ -527,6 +527,78 @@ def _provider_model_mismatch_error(path: str, provider: str, model: str) -> str:
         f"'{path}' model '{model}' appears incompatible with provider '{provider}'. "
         f"Use a model for '{provider}' or change provider."
     )
+
+
+def _missing_project_config_key_error(config_path: Path, key: str, *, detail: str | None = None) -> str:
+    message = (
+        f"'{key}' is required in {config_path}.\n"
+        f"Set '{key}' in {config_path} so this project does not depend on an implicit provider default."
+    )
+    if detail:
+        message += f"\n{detail}"
+    return message
+
+
+def _model_config_paths(provider: str, task_type: str | None = None) -> tuple[str, ...]:
+    paths = [
+        "model",
+        "defaults.model",
+        f"providers.{provider}.model",
+    ]
+    if task_type is not None:
+        paths.extend(
+            [
+                f"providers.{provider}.task_types.{task_type}.model",
+                f"task_types.{task_type}.model",
+            ]
+        )
+    else:
+        paths.extend(
+            [
+                f"providers.{provider}.task_types.<task_type>.model",
+                "task_types.<task_type>.model",
+            ]
+        )
+    return tuple(paths)
+
+
+def _missing_model_error(config_path: Path, provider: str, task_type: str | None = None) -> str:
+    scope = f" for task type '{task_type}'" if task_type else ""
+    detail = (
+        f"No effective model resolves for provider '{provider}'{scope}. "
+        "Set one of: " + ", ".join(_model_config_paths(provider, task_type)) + "."
+    )
+    return _missing_project_config_key_error(config_path, "model", detail=detail)
+
+
+def _merged_data_has_model_for_provider(data: dict, provider: str) -> bool:
+    model_value, _ = _resolve_compat_value(data, {}, ["defaults.model", "model"])
+    if isinstance(model_value, str) and model_value.strip():
+        return True
+
+    providers_data = data.get("providers")
+    if isinstance(providers_data, dict):
+        provider_data = providers_data.get(provider)
+        if isinstance(provider_data, dict):
+            provider_model = provider_data.get("model")
+            if isinstance(provider_model, str) and provider_model.strip():
+                return True
+            task_types_data = provider_data.get("task_types")
+            if isinstance(task_types_data, dict):
+                for task_type_data in task_types_data.values():
+                    if isinstance(task_type_data, dict):
+                        task_model = task_type_data.get("model")
+                        if isinstance(task_model, str) and task_model.strip():
+                            return True
+
+    task_types_data = data.get("task_types")
+    if isinstance(task_types_data, dict):
+        for task_type_data in task_types_data.values():
+            if isinstance(task_type_data, dict):
+                task_model = task_type_data.get("model")
+                if isinstance(task_model, str) and task_model.strip():
+                    return True
+    return False
 
 
 def is_model_compatible_with_provider(provider: str, model: str | None) -> bool:
@@ -1143,7 +1215,7 @@ class Config:
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
     worktree_dir: str = DEFAULT_WORKTREE_DIR
     work_count: int = DEFAULT_WORK_COUNT
-    provider: str = DEFAULT_PROVIDER  # "claude", "codex", or "gemini"
+    provider: str = DEFAULT_PROVIDER  # Required in project config: "claude", "codex", or "gemini"
     task_providers: dict[str, str] = field(default_factory=dict)  # Per-task-type provider routing
     model: str = ""  # Provider-specific model name (optional)
     reasoning_effort: str = ""  # Provider-specific reasoning effort override (optional; Codex only)
@@ -1246,7 +1318,7 @@ class Config:
         2. providers.<provider>.model
         3. task_types.<task_type>.model (legacy)
         4. model (legacy)
-        5. None (provider runtime default)
+        5. None (invalid for task creation; provider runtime defaults are not used)
         """
         provider_config = self.providers.get(provider)
         if provider_config:
@@ -1261,6 +1333,14 @@ class Config:
             return legacy_task_type.model
 
         return self.model or None
+
+    def require_model_for_task(self, task_type: str, provider: str | None = None) -> str:
+        """Return the resolved model or raise a config error before task creation."""
+        resolved_provider = provider or self.get_provider_for_task(task_type)
+        model = self.get_model_for_task(task_type, resolved_provider)
+        if not model:
+            raise ConfigError(_missing_model_error(self.config_path(self.project_dir), resolved_provider, task_type))
+        return model
 
     def get_provider_for_task(self, task_type: str) -> str:
         """Get effective provider for a task type.
@@ -1690,7 +1770,13 @@ class Config:
         worktree_dir = data.get("worktree_dir", DEFAULT_WORKTREE_DIR)
         work_count = data.get("work_count", DEFAULT_WORK_COUNT)
         chat_text_display_length = data.get("chat_text_display_length", DEFAULT_CHAT_TEXT_DISPLAY_LENGTH)
-        provider = data.get("provider", DEFAULT_PROVIDER)
+        if "provider" not in data or data["provider"] in (None, ""):
+            raise ConfigError(_missing_project_config_key_error(config_path, "provider"))
+        provider = data["provider"]
+        if not isinstance(provider, str):
+            raise ConfigError("'provider' must be a string")
+        if provider not in KNOWN_PROVIDERS:
+            raise ConfigError(f"'provider' must be one of: {', '.join(KNOWN_PROVIDERS)}")
 
         # task_providers routing
         task_providers: dict[str, str] = {}
@@ -1859,6 +1945,9 @@ class Config:
                     reasoning_effort=provider_reasoning_effort,
                     task_types=provider_task_types,
                 )
+
+        if not _merged_data_has_model_for_provider(data, provider):
+            raise ConfigError(_missing_model_error(config_path, provider))
 
         # Warn when provider-scoped and broader fallback fields are both set for the same semantic target.
         legacy_model_set = "model" in data or ("defaults" in data and isinstance(defaults, dict) and "model" in defaults)
@@ -3102,12 +3191,13 @@ class Config:
             elif data["work_count"] <= 0:
                 errors.append("'work_count' must be positive")
 
-        if "provider" in data:
-            if not isinstance(data["provider"], str):
-                errors.append("'provider' must be a string")
-            elif data["provider"] not in KNOWN_PROVIDERS:
-                provider_list = ", ".join("'" + p + "'" for p in KNOWN_PROVIDERS)
-                errors.append(f"'provider' must be one of: {provider_list}")
+        if "provider" not in data or data["provider"] in (None, ""):
+            errors.append(_missing_project_config_key_error(config_path, "provider"))
+        elif not isinstance(data["provider"], str):
+            errors.append("'provider' must be a string")
+        elif data["provider"] not in KNOWN_PROVIDERS:
+            provider_list = ", ".join("'" + p + "'" for p in KNOWN_PROVIDERS)
+            errors.append(f"'provider' must be one of: {provider_list}")
 
         if "task_providers" in data:
             if not isinstance(data["task_providers"], dict):
@@ -3333,11 +3423,13 @@ class Config:
                                 warnings.append(f"Unknown field in 'task_types.{task_type}': '{key}'")
 
         # Validate provider/model compatibility to fail early on mixed-provider configs.
-        provider_for_models = data.get("provider", DEFAULT_PROVIDER)
+        provider_for_models = data.get("provider")
         task_providers_for_models = data.get("task_providers", {})
         if not isinstance(task_providers_for_models, dict):
             task_providers_for_models = {}
         if isinstance(provider_for_models, str) and provider_for_models in ("claude", "codex", "gemini"):
+            if not _merged_data_has_model_for_provider(data, provider_for_models):
+                errors.append(_missing_model_error(config_path, provider_for_models))
             top_model = data.get("model")
             if isinstance(top_model, str) and top_model and not _is_model_compatible_with_provider(provider_for_models, top_model):
                 errors.append(_provider_model_mismatch_error("model", provider_for_models, top_model))

@@ -300,12 +300,19 @@ def _render_node(
         )
     if full_path == "branch_strategy":
         return _render_branch_strategy(node, indent, options.branch_strategy)
-    return _render_generic_node(key, node, full_path, indent)
+    return _render_generic_node(key, node, full_path, indent, options)
 
 
-def _render_generic_node(key: str, node: _Node, full_path: str, indent: int) -> list[str]:
+def _render_generic_node(
+    key: str,
+    node: _Node,
+    full_path: str,
+    indent: int,
+    options: ConfigExampleRenderOptions,
+) -> list[str]:
     if node.spec and not node.children:
-        return _render_simple_setting(node.spec, key, indent, enabled=False, value=_example_value(node.spec))
+        enabled = bool(node.spec.required and options.flavor != "local")
+        return _render_simple_setting(node.spec, key, indent, enabled=enabled, value=_example_value(node.spec))
 
     lines: list[str] = []
     if node.spec:
@@ -317,7 +324,7 @@ def _render_generic_node(key: str, node: _Node, full_path: str, indent: int) -> 
     for child_key in child_keys:
         child = node.children[child_key]
         child_path = f"{full_path}.{child_key}"
-        lines.extend(_render_node(_display_segment(child_key, child_path), child, child_path, indent + 2, ConfigExampleRenderOptions()))
+        lines.extend(_render_node(_display_segment(child_key, child_path), child, child_path, indent + 2, options))
     return lines
 
 

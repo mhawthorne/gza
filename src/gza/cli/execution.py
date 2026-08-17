@@ -39,6 +39,7 @@ from ..config import (
     DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES,
     DEFAULT_MAX_RESUME_ATTEMPTS,
     Config,
+    ConfigError,
     is_model_compatible_with_provider,
     provider_model_mismatch_error,
 )
@@ -2324,7 +2325,6 @@ def cmd_extract(args: argparse.Namespace) -> int:
 def cmd_add(args: argparse.Namespace) -> int:
     """Add a new task."""
     config = Config.load(args.project_dir)
-    store = get_store(config)
 
     # Determine task type
     if args.type:
@@ -2342,6 +2342,14 @@ def cmd_add(args: argparse.Namespace) -> int:
     if task_type not in valid_types:
         print(f"Error: Invalid task type '{task_type}'. Must be one of: {', '.join(valid_types)}")
         return 1
+
+    try:
+        config.require_model_for_task(task_type, provider=args.provider if hasattr(args, "provider") else None)
+    except ConfigError as exc:
+        print(f"Error: {exc}")
+        return 1
+
+    store = get_store(config)
 
     # Get optional parameters
     try:

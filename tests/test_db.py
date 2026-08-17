@@ -9070,7 +9070,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: tarantino-ui\n"
+            "project_name: tarantino-ui\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: existinghash123\n"
             f"db_path: {shared_db}\n",
             encoding="utf-8",
@@ -9087,7 +9087,7 @@ class TestSharedDbIsolationAndImportGating:
         shared_db = tmp_path / "shared" / "gza.db"
         project_a = tmp_path / "project-a"
         project_a.mkdir(parents=True, exist_ok=True)
-        (project_a / "gza.yaml").write_text(f"project_name: demo\ndb_path: {shared_db}\n", encoding="utf-8")
+        (project_a / "gza.yaml").write_text(f"project_name: demo\nprovider: codex\nmodel: gpt-5.5\ndb_path: {shared_db}\n", encoding="utf-8")
 
         expected_legacy_id = _legacy_project_id(project_a, "demo")
         with pytest.raises(ConfigError) as exc_info:
@@ -9168,7 +9168,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demomarker01\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -9200,7 +9200,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demomarker02\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -9235,7 +9235,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demomarkerctime01\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -9273,7 +9273,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demomarker03\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -9319,7 +9319,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoimportdryrun04\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -9353,7 +9353,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoimportdryrun05\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -9383,7 +9383,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoimport03\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -9415,7 +9415,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoimport04\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -9444,7 +9444,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoproject01\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -9472,7 +9472,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoproject02\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -9513,7 +9513,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoimport01\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -9561,7 +9561,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoimport02\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -9607,7 +9607,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: demoimporttimestamps01\n"
             "project_prefix: demo\n"
             f"db_path: {shared_db}\n",
@@ -9735,7 +9735,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             f"db_path: {shared_db}\n",
             encoding="utf-8",
         )
@@ -9754,7 +9754,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
-        (project_dir / "gza.yaml").write_text("project_name: demo\n", encoding="utf-8")
+        (project_dir / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n", encoding="utf-8")
         (project_dir / "gza.local.yaml").write_text(
             f"db_path: {shared_db}\n",
             encoding="utf-8",
@@ -9776,7 +9776,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir.mkdir(parents=True, exist_ok=True)
         shared_db = tmp_path / "shared" / "gza.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             f"db_path: {shared_db}\n",
             encoding="utf-8",
@@ -9795,7 +9795,7 @@ class TestSharedDbIsolationAndImportGating:
         project_dir = tmp_path / "project"
         project_dir.mkdir(parents=True, exist_ok=True)
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n",
             encoding="utf-8",

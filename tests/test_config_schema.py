@@ -85,7 +85,7 @@ def test_code_task_diff_timeout_cap_registry_description_matches_hard_cap_docs()
 def test_config_load_parses_pr_integration_false(tmp_path) -> None:
     """Explicit project opt-out should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "pr_integration: false\n"
     )
 
@@ -97,7 +97,7 @@ def test_config_load_parses_pr_integration_false(tmp_path) -> None:
 def test_config_load_parses_plan_review_lifecycle_keys(tmp_path) -> None:
     """Plan-review lifecycle controls should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "advance_create_plan_reviews: false\n"
         "require_plan_review_before_implement: false\n"
         "max_plan_review_cycles: 4\n"
@@ -120,7 +120,7 @@ def test_config_load_parses_plan_review_lifecycle_keys(tmp_path) -> None:
 def test_config_load_parses_advance_off_topic_verify_unblock(tmp_path) -> None:
     """The off-topic verify unblock policy knob should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "advance_off_topic_verify_unblock: true\n"
     )
 
@@ -132,7 +132,7 @@ def test_config_load_parses_advance_off_topic_verify_unblock(tmp_path) -> None:
 def test_plan_slice_target_timeout_defaults_from_code_task_timeout_cap(tmp_path) -> None:
     """Unset plan slice timeout should derive from the code-task timeout cap."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "code_task_diff_timeout_cap_minutes: 62\n"
     )
 
@@ -145,7 +145,7 @@ def test_plan_slice_target_timeout_defaults_from_code_task_timeout_cap(tmp_path)
 def test_config_load_parses_docker_startup_timeout(tmp_path) -> None:
     """docker_startup_timeout should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "docker_startup_timeout: 60\n"
     )
 
@@ -156,7 +156,7 @@ def test_config_load_parses_docker_startup_timeout(tmp_path) -> None:
 
 def test_config_load_defaults_watch_slot_settle_seconds(tmp_path) -> None:
     """watch.slot_settle_seconds should default when omitted."""
-    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+    (tmp_path / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n")
 
     config = Config.load(tmp_path)
 
@@ -165,7 +165,7 @@ def test_config_load_defaults_watch_slot_settle_seconds(tmp_path) -> None:
 
 def test_config_load_defaults_watch_main_verify_remediation_max_attempts(tmp_path) -> None:
     """watch.main_verify_remediation_max_attempts should default when omitted."""
-    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+    (tmp_path / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n")
 
     config = Config.load(tmp_path)
 
@@ -178,7 +178,7 @@ def test_config_load_defaults_watch_main_verify_remediation_max_attempts(tmp_pat
 def test_config_load_parses_watch_main_verify_remediation_max_attempts(tmp_path) -> None:
     """watch.main_verify_remediation_max_attempts should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "watch:\n"
         "  main_verify_remediation_max_attempts: 4\n"
     )
@@ -191,7 +191,7 @@ def test_config_load_parses_watch_main_verify_remediation_max_attempts(tmp_path)
 def test_config_load_parses_watch_slot_settle_seconds(tmp_path) -> None:
     """watch.slot_settle_seconds should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "watch:\n"
         "  slot_settle_seconds: 7\n"
     )
@@ -203,7 +203,7 @@ def test_config_load_parses_watch_slot_settle_seconds(tmp_path) -> None:
 
 def test_config_load_defaults_watch_parked_auto_rearm(tmp_path) -> None:
     """watch.parked_auto_rearm should default to the conservative blind-policy settings."""
-    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+    (tmp_path / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n")
 
     config = Config.load(tmp_path)
 
@@ -216,7 +216,7 @@ def test_config_load_defaults_watch_parked_auto_rearm(tmp_path) -> None:
 def test_config_load_parses_watch_parked_auto_rearm(tmp_path) -> None:
     """watch.parked_auto_rearm should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "watch:\n"
         "  parked_auto_rearm:\n"
         "    enabled: true\n"
@@ -235,7 +235,7 @@ def test_config_load_parses_watch_parked_auto_rearm(tmp_path) -> None:
 
 def test_config_load_defaults_quiet_period_seconds(tmp_path) -> None:
     """quiet_period_seconds should default when omitted."""
-    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+    (tmp_path / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n")
 
     config = Config.load(tmp_path)
 
@@ -245,7 +245,7 @@ def test_config_load_defaults_quiet_period_seconds(tmp_path) -> None:
 def test_config_load_accepts_zero_quiet_period_seconds(tmp_path) -> None:
     """quiet_period_seconds should accept zero as the disable sentinel."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "quiet_period_seconds: 0\n"
     )
 
@@ -275,7 +275,7 @@ def test_config_validation_rejects_invalid_quiet_period_seconds(
 ) -> None:
     """Load and validate should reject invalid quiet_period_seconds values."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         f"quiet_period_seconds: {value}\n"
     )
 
@@ -293,7 +293,7 @@ def test_config_validation_rejects_invalid_quiet_period_seconds(
 def test_config_load_rejects_invalid_docker_startup_timeout(tmp_path, value: str) -> None:
     """Load should reject non-positive and non-integer docker_startup_timeout values."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         f"docker_startup_timeout: {value}\n"
     )
 
@@ -315,7 +315,7 @@ def test_config_load_rejects_invalid_docker_startup_timeout(tmp_path, value: str
 def test_config_validate_rejects_invalid_docker_startup_timeout(tmp_path, value: str, expected: str) -> None:
     """Validate should report shared positive-int wording for docker_startup_timeout."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         f"docker_startup_timeout: {value}\n"
     )
 
@@ -338,7 +338,7 @@ def test_config_validate_rejects_invalid_docker_startup_timeout(tmp_path, value:
 def test_config_watch_slot_settle_seconds_validation(tmp_path, value: str, expected: str) -> None:
     """Load and validate should reject invalid watch.slot_settle_seconds values."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "watch:\n"
         f"  slot_settle_seconds: {value}\n"
     )
@@ -357,7 +357,7 @@ def test_config_watch_slot_settle_seconds_validation(tmp_path, value: str, expec
 def test_config_watch_slot_settle_seconds_accepts_bounded_values(tmp_path, value: str) -> None:
     """The settle window should accept in-range strict integers only."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "watch:\n"
         f"  slot_settle_seconds: {value}\n"
     )
@@ -374,7 +374,7 @@ def test_config_watch_slot_settle_seconds_accepts_bounded_values(tmp_path, value
 def test_config_load_rejects_legacy_watch_dispatch_start_timeout_key(tmp_path) -> None:
     """The legacy watch.dispatch_start_timeout key should fail as unknown."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "watch:\n"
         "  dispatch_start_timeout: 7\n"
     )

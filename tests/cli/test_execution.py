@@ -27700,6 +27700,80 @@ class TestAddCommandWithChaining:
 class TestAddCommandWithModelAndProvider:
     """Tests for 'gza add' command with --model and --provider flags."""
 
+    def test_add_rejects_config_missing_provider_before_task_row(self, tmp_path: Path):
+        """Missing project provider must fail before the task store is opened."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "model: gpt-5.5\n"
+            "quiet_period_seconds: 0\n",
+            encoding="utf-8",
+        )
+
+        result = invoke_gza("add", "Task without provider config", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        output = result.stdout + result.stderr
+        assert "'provider' is required" in output
+        assert str(config_path) in output
+        assert not (tmp_path / ".gza" / "gza.db").exists()
+
+    def test_add_rejects_config_missing_resolvable_model_before_task_row(self, tmp_path: Path):
+        """Missing project model must fail before any task row can be written."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "provider: codex\n"
+            "quiet_period_seconds: 0\n",
+            encoding="utf-8",
+        )
+
+        result = invoke_gza("add", "Task without model config", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        output = result.stdout + result.stderr
+        assert "'model' is required" in output
+        assert "provider 'codex'" in output
+        assert str(config_path) in output
+        assert not (tmp_path / ".gza" / "gza.db").exists()
+
+    def test_add_rejects_task_type_without_resolved_model_before_task_row(self, tmp_path: Path):
+        """Task-type-only model config must still resolve for the task being created."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test-project\n"
+            "db_path: .gza/gza.db\n"
+            "provider: codex\n"
+            "task_types:\n"
+            "  review:\n"
+            "    model: gpt-5.5\n"
+            "quiet_period_seconds: 0\n",
+            encoding="utf-8",
+        )
+
+        result = invoke_gza("add", "--type", "implement", "Implement without model", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        output = result.stdout + result.stderr
+        assert "'model' is required" in output
+        assert "task type 'implement'" in output
+        assert "task_types.implement.model" in output
+        assert not (tmp_path / ".gza" / "gza.db").exists()
+
+    def test_config_with_explicit_provider_and_model_resolves_exact_values(self, tmp_path: Path):
+        setup_config(tmp_path)
+
+        from gza.config import Config
+
+        config = Config.load(tmp_path)
+
+        assert config.provider == "codex"
+        assert config.model == "gpt-5.5"
+        assert config.get_provider_for_task("implement") == "codex"
+        assert config.require_model_for_task("implement") == "gpt-5.5"
+
     def test_add_with_model_flag(self, tmp_path: Path):
         """Add command with --model flag stores model override."""
 

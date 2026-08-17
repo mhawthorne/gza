@@ -59,7 +59,7 @@ class TestConfigRequirements:
     def test_unknown_keys_warning(self, tmp_path: Path):
         """Unknown keys in config produce warnings but don't fail."""
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\nunknown_key: value\n")
+        config_path.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nunknown_key: value\n")
 
         with (
             patch("gza.cli.query.Git") as mock_git_cls,
@@ -109,7 +109,7 @@ class TestValidateCommand:
     def test_validate_unknown_keys_warning(self, tmp_path: Path):
         """Validate command shows warnings for unknown keys."""
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\nunknown_field: value\n")
+        config_path.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nunknown_field: value\n")
 
         result = invoke_gza("validate", "--project", str(tmp_path))
 
@@ -120,7 +120,7 @@ class TestValidateCommand:
     def test_validate_docker_volumes_must_be_list(self, tmp_path: Path):
         """Validate rejects docker_volumes that isn't a list."""
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\ndocker_volumes: /path:/mount\n")
+        config_path.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\ndocker_volumes: /path:/mount\n")
         result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "docker_volumes" in result.stdout
@@ -129,7 +129,7 @@ class TestValidateCommand:
     def test_validate_docker_volumes_entries_must_be_strings(self, tmp_path: Path):
         """Validate rejects non-string docker_volumes entries."""
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\ndocker_volumes:\n  - 123\n")
+        config_path.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\ndocker_volumes:\n  - 123\n")
         result = invoke_gza("validate", "--project", str(tmp_path))
         assert result.returncode == 1
         assert "docker_volumes[0]" in result.stdout
@@ -139,7 +139,7 @@ class TestValidateCommand:
         """Validate accepts valid docker_volumes configuration."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "docker_volumes:\n"
             "  - /host/data:/data:ro\n"
             "  - /host/models:/models\n"
@@ -152,7 +152,7 @@ class TestValidateCommand:
         """Validate warns about docker_volumes entries without colons."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "docker_volumes:\n"
             "  - /just/a/path\n"
         )
@@ -165,7 +165,7 @@ class TestValidateCommand:
         """Validate warns about unknown docker_volumes modes."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "docker_volumes:\n"
             "  - /host:/container:xyz\n"
         )
@@ -178,7 +178,7 @@ class TestValidateCommand:
         """Validate accepts inner verify and timeout override fields across scopes."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "verify_command: ./bin/tests\n"
             "unit_verify_command: ./bin/tests --unit\n"
             "inner_verify_command: ./bin/tests --quick\n"
@@ -201,7 +201,7 @@ class TestValidateCommand:
         """Validate rejects large diff thresholds below the medium threshold."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "code_task_diff_timeout_medium_threshold: 800\n"
             "code_task_diff_timeout_large_threshold: 500\n"
         )
@@ -215,27 +215,27 @@ class TestValidateCommand:
         ("config_body", "expected_error"),
         [
             (
-                "project_name: test\ncode_task_diff_timeout_large_threshold: 300\n",
+                "project_name: test\nprovider: codex\nmodel: gpt-5.5\ncode_task_diff_timeout_large_threshold: 300\n",
                 "'code_task_diff_timeout_large_threshold' must be greater than or equal to "
                 "'code_task_diff_timeout_medium_threshold'",
             ),
             (
-                "project_name: test\ncode_task_diff_timeout_medium_threshold: 1500\n",
+                "project_name: test\nprovider: codex\nmodel: gpt-5.5\ncode_task_diff_timeout_medium_threshold: 1500\n",
                 "'code_task_diff_timeout_large_threshold' must be greater than or equal to "
                 "'code_task_diff_timeout_medium_threshold'",
             ),
             (
-                "project_name: test\ncode_task_diff_timeout_large_minutes: 20\n",
+                "project_name: test\nprovider: codex\nmodel: gpt-5.5\ncode_task_diff_timeout_large_minutes: 20\n",
                 "'code_task_diff_timeout_large_minutes' must be greater than or equal to "
                 "'code_task_diff_timeout_medium_minutes'",
             ),
             (
-                "project_name: test\ncode_task_diff_timeout_medium_minutes: 60\n",
+                "project_name: test\nprovider: codex\nmodel: gpt-5.5\ncode_task_diff_timeout_medium_minutes: 60\n",
                 "'code_task_diff_timeout_large_minutes' must be greater than or equal to "
                 "'code_task_diff_timeout_medium_minutes'",
             ),
             (
-                "project_name: test\ncode_task_diff_timeout_medium_threshold: true\n",
+                "project_name: test\nprovider: codex\nmodel: gpt-5.5\ncode_task_diff_timeout_medium_threshold: true\n",
                 "'code_task_diff_timeout_medium_threshold' must be an integer",
             ),
         ],
@@ -310,7 +310,7 @@ class TestPreflightTargetResolution:
 class TestPreflightCommand:
     def test_cmd_preflight_reporting_and_exit_code(self, tmp_path: Path, monkeypatch, capsys) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "provider: claude\n"
             "task_providers:\n"
             "  review: codex\n"
@@ -359,7 +359,7 @@ class TestPreflightCommand:
         assert "1 passed, 1 failed" in output
 
     def test_cmd_preflight_returns_zero_when_all_targets_pass(self, tmp_path: Path, monkeypatch, capsys) -> None:
-        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: claude\n", encoding="utf-8")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nprovider: claude\n", encoding="utf-8")
 
         class FakeProvider:
             credential_setup_hint = "set credentials"
@@ -545,7 +545,7 @@ class TestConfigEnvVars:
 
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "docker_volumes:\n"
             "  - ~/data:/container/data\n"
             "  - ~/models:/models:ro\n"
@@ -565,7 +565,7 @@ class TestConfigEnvVars:
 
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "docker_setup_command: 'uv sync --project /workspace'\n"
         )
 
@@ -577,7 +577,7 @@ class TestConfigEnvVars:
         from gza.config import Config
 
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\n")
+        config_path.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
 
         config = Config.load(tmp_path)
         assert config.docker_setup_command == ""
@@ -589,7 +589,7 @@ class TestDockerSetupCommandValidation:
     def test_validate_docker_setup_command_must_be_string(self, tmp_path: Path):
         """Validate rejects docker_setup_command that isn't a string."""
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\ndocker_setup_command: 123\n")
+        config_path.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\ndocker_setup_command: 123\n")
 
         result = invoke_gza("validate", "--project", str(tmp_path))
 
@@ -600,7 +600,7 @@ class TestDockerSetupCommandValidation:
         """Validate accepts a valid docker_setup_command string."""
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "docker_setup_command: 'uv sync --project /workspace'\n"
         )
 
@@ -617,7 +617,7 @@ class TestLocalConfigOverrides:
         from gza.config import Config
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "providers:\n"
             "  claude:\n"
             "    task_types:\n"
@@ -669,7 +669,7 @@ class TestLocalConfigOverrides:
         from gza.config import Config
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "watch:\n"
             "  batch: 2\n"
             "  no_activity_timeout: 120\n"
@@ -693,7 +693,7 @@ class TestLocalConfigOverrides:
         from gza.config import Config
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "watch:\n"
             "  max_idle: 30\n"
         )
@@ -712,7 +712,7 @@ class TestLocalConfigOverrides:
         from gza.config import Config
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "watch:\n"
             "  batch: 2\n"
             "  poll: 60\n"
@@ -738,7 +738,7 @@ class TestLocalConfigOverrides:
         from gza.config import Config
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "tmux:\n"
             "  enabled: true\n"
             "  auto_accept_timeout: 20\n"
@@ -765,7 +765,7 @@ class TestLocalConfigOverrides:
         """Local overrides should reject disallowed keys like project_name."""
         from gza.config import Config, ConfigError
 
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
         (tmp_path / "gza.local.yaml").write_text("project_name: hacked\n")
 
         with pytest.raises(ConfigError, match="Invalid local override key 'project_name'"):
@@ -773,7 +773,7 @@ class TestLocalConfigOverrides:
 
     def test_validate_fails_for_invalid_local_override_key(self, tmp_path: Path):
         """gza validate should fail when local override contains disallowed keys."""
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
         (tmp_path / "gza.local.yaml").write_text("project_name: hacked\n")
 
         result = invoke_gza("validate", "--project", str(tmp_path))
@@ -783,7 +783,7 @@ class TestLocalConfigOverrides:
 
     def test_local_override_applies_to_loaded_config(self, tmp_path: Path):
         """Local overrides should be reflected in the loaded config."""
-        (tmp_path / "gza.yaml").write_text("project_name: test\nuse_docker: true\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nuse_docker: true\n")
         (tmp_path / "gza.local.yaml").write_text("use_docker: false\n")
 
         from gza.config import Config
@@ -796,7 +796,7 @@ class TestLocalConfigOverrides:
         from gza.config import Config
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "advance_create_reviews: true\n"
             "advance_off_topic_verify_unblock: false\n"
             "require_review_before_merge: true\n"
@@ -821,7 +821,7 @@ class TestLocalConfigOverrides:
         """Local overrides should still run the strict boolean validator for renamed review gating."""
         from gza.config import Config, ConfigError
 
-        (tmp_path / "gza.yaml").write_text("project_name: test\nrequire_review_before_merge: true\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nrequire_review_before_merge: true\n")
         (tmp_path / "gza.local.yaml").write_text(f"require_review_before_merge: {value}\n")
 
         is_valid, errors, _warnings = Config.validate(tmp_path)
@@ -835,7 +835,7 @@ class TestLocalConfigOverrides:
         """Local overrides should surface the rename hint for the removed review gate key."""
         from gza.config import Config, ConfigError
 
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
         (tmp_path / "gza.local.yaml").write_text("advance_requires_review: false\n")
 
         expected = (
@@ -852,7 +852,7 @@ class TestLocalConfigOverrides:
     def test_enforce_project_scope_loads_from_config(self, tmp_path: Path):
         """Project-scope enforcement should be configurable."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "enforce_project_scope: false\n"
         )
 
@@ -864,7 +864,7 @@ class TestLocalConfigOverrides:
     def test_validate_rejects_non_boolean_enforce_project_scope(self, tmp_path: Path):
         """Config validation should reject invalid enforce_project_scope values."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "enforce_project_scope: nope\n"
         )
 
@@ -877,7 +877,7 @@ class TestLocalConfigOverrides:
         """gza config --json should include effective values and source attribution."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "timeout_minutes: 10\n"
             "use_docker: true\n"
         )
@@ -900,7 +900,7 @@ class TestLocalConfigOverrides:
         """gza config --json should expose advance_off_topic_verify_unblock with source attribution."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "advance_off_topic_verify_unblock: false\n"
         )
         (tmp_path / "gza.local.yaml").write_text(
@@ -918,7 +918,7 @@ class TestLocalConfigOverrides:
         """`gza config --json` should expose inner/final verify commands and timeout scaling fields."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "verify_command: ./bin/tests\n"
             "unit_verify_command: ./bin/tests --unit\n"
             "inner_verify_command: ./bin/tests --quick\n"
@@ -941,7 +941,7 @@ class TestLocalConfigOverrides:
         """`gza config --json` should expose off-topic verify unblock policy and source."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "advance_off_topic_verify_unblock: true\n"
         )
 
@@ -956,7 +956,7 @@ class TestLocalConfigOverrides:
         """gza config should attribute normalized branch_strategy fields to configured source."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "branch_strategy: conventional\n"
         )
 
@@ -973,7 +973,7 @@ class TestLocalConfigOverrides:
         """gza config --json should project task_providers values and source attribution."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "provider: codex\n"
             "task_providers:\n"
             "  review: claude\n"
@@ -990,7 +990,7 @@ class TestLocalConfigOverrides:
         """gza config --json should expose reasoning_effort at all config scopes."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "provider: codex\n"
             "defaults:\n"
             "  reasoning_effort: low\n"
@@ -1022,7 +1022,7 @@ class TestLocalConfigOverrides:
         """gza config --json should show db_path and attribute env override source."""
         shared_db = tmp_path / "shared" / "gza.db"
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: test\n"
             "db_path: .gza/gza.db\n"
         )
@@ -1047,7 +1047,7 @@ class TestLocalConfigOverrides:
         """gza config --json should expose main_checkout_isolate with source attribution."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "main_checkout_isolate: true\n"
         )
 
@@ -1067,7 +1067,7 @@ class TestLocalConfigOverrides:
         """gza config --json should expose watch.no_activity_timeout with source attribution."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "watch:\n"
             "  no_activity_timeout: 120\n"
         )
@@ -1091,7 +1091,7 @@ class TestLocalConfigOverrides:
         """gza config --json should expose watch.transient_recovery_backoff_max with source attribution."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "watch:\n"
             "  transient_recovery_backoff_max: 240\n"
         )
@@ -1115,7 +1115,7 @@ class TestLocalConfigOverrides:
         """gza config --json should expose watch remediation/settle/no-progress settings with sources."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "watch:\n"
             "  no_progress_cycles: 4\n"
             "  main_verify_remediation_max_attempts: 5\n"
@@ -1145,7 +1145,7 @@ class TestLocalConfigOverrides:
         """gza config --json should expose quiet_period_seconds with source attribution."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "quiet_period_seconds: 0\n"
         )
 
@@ -1165,7 +1165,7 @@ class TestLocalConfigOverrides:
         """gza config should render main_checkout_isolate rows with false values and sources."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "main_checkout_isolate: true\n"
         )
         (tmp_path / "gza.local.yaml").write_text("main_checkout_isolate: false\n")
@@ -1190,7 +1190,7 @@ class TestLocalConfigOverrides:
         """Text output should render watch.transient_recovery_backoff_max with its source marker."""
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "watch:\n"
             "  transient_recovery_backoff_max: 240\n"
         )
@@ -1215,7 +1215,7 @@ class TestLocalConfigOverrides:
         home_dir = Path(os.environ["HOME"])
         shared_db = home_dir / ".gza" / "shared.db"
         write_user_config(home_dir, f"db_path: {shared_db}\nuse_docker: false\n")
-        (tmp_path / "gza.yaml").write_text("project_name: test\nproject_id: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nproject_id: test\n")
 
         config = Config.load(tmp_path)
 
@@ -1232,7 +1232,7 @@ class TestLocalConfigOverrides:
         home_dir = Path(os.environ["HOME"])
         shared_db = home_dir / ".gza" / "shared.db"
         write_user_config(home_dir, f"db_path: {shared_db}\n")
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
 
         with pytest.raises(ConfigError, match="'project_id' is required when shared DB mode is active"):
             Config.load(tmp_path)
@@ -1245,7 +1245,7 @@ class TestLocalConfigOverrides:
         shared_db = home_dir / ".gza" / "shared.db"
         write_user_config(home_dir, f"db_path: {shared_db}\ntimeout_minutes: 30\n")
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: test\n"
             "db_path: .gza/project.db\n"
             "timeout_minutes: 10\n"
@@ -1265,7 +1265,7 @@ class TestLocalConfigOverrides:
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, "use_docker: false\nwatch:\n  poll: 15\n")
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "use_docker: true\n"
             "watch:\n"
             "  poll: 30\n"
@@ -1289,7 +1289,7 @@ class TestLocalConfigOverrides:
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, f"db_path: {home_dir / '.gza' / 'user.db'}\n")
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: test\n"
             "db_path: .gza/project.db\n"
         )
@@ -1312,7 +1312,7 @@ class TestLocalConfigOverrides:
         """gza config --json should expose user-source attribution and metadata."""
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, "use_docker: false\n")
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
 
         result = invoke_gza("config", "--json", "--project", str(tmp_path))
 
@@ -1335,7 +1335,7 @@ class TestLocalConfigOverrides:
             "  reasoning_effort: high\n",
         )
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "provider: codex\n"
             "max_steps: 5\n"
             "model: gpt-5.2-codex\n"
@@ -1360,7 +1360,7 @@ class TestLocalConfigOverrides:
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, "defaults:\n  max_turns: 10\n")
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "max_turns: 5\n"
         )
 
@@ -1378,7 +1378,7 @@ class TestLocalConfigOverrides:
         """gza config text output should render user config status and [user] rows."""
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, "use_docker: false\n")
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
 
         result = invoke_gza("config", "--project", str(tmp_path))
 
@@ -1391,7 +1391,7 @@ class TestLocalConfigOverrides:
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, "defaults:\n  max_steps: 10\n")
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "max_steps: 5\n"
         )
 
@@ -1405,7 +1405,7 @@ class TestLocalConfigOverrides:
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, "")
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "provider: codex\n"
             "defaults:\n"
             "  max_steps: 10\n"
@@ -1434,7 +1434,7 @@ class TestLocalConfigOverrides:
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, "")
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test\n"
+            "project_name: test\nprovider: codex\nmodel: gpt-5.5\n"
             "defaults:\n"
             "  max_steps: 10\n"
         )
@@ -1464,7 +1464,7 @@ class TestLocalConfigOverrides:
 
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, content)
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
 
         with pytest.raises(
             ConfigError,
@@ -1483,7 +1483,7 @@ class TestLocalConfigOverrides:
             "unit_verify_command: ./bin/tests --unit\n"
             "inner_verify_command: ./bin/tests --quick\n",
         )
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
 
         config = Config.load(tmp_path)
 
@@ -1495,7 +1495,7 @@ class TestLocalConfigOverrides:
         """gza validate should fail when the user config contains disallowed keys."""
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, "project_id: nope\n")
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
 
         result = invoke_gza("validate", "--project", str(tmp_path))
 
@@ -1508,7 +1508,7 @@ class TestLocalConfigOverrides:
 
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, "branch_mode: single\n")
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
 
         is_valid, errors, warnings = Config.validate(tmp_path)
 
@@ -1528,7 +1528,7 @@ class TestLocalConfigOverrides:
             "advance_create_reviews: false\n"
             "require_review_before_merge: false\n",
         )
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
 
         cfg = Config.load(tmp_path)
 
@@ -1556,7 +1556,7 @@ class TestLocalConfigOverrides:
 
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, f"{key}: {value}\n")
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
 
         is_valid, errors, _warnings = Config.validate(tmp_path)
         assert is_valid is False
@@ -1571,7 +1571,7 @@ class TestLocalConfigOverrides:
 
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, "max_failed_closing_review_retries: 5\n")
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
 
         cfg = Config.load(tmp_path)
 
@@ -1602,7 +1602,7 @@ class TestLocalConfigOverrides:
 
         home_dir = Path(os.environ["HOME"])
         write_user_config(home_dir, "advance_requires_review: false\n")
-        (tmp_path / "gza.yaml").write_text("project_name: test\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
 
         expected = (
             "Invalid configuration key 'advance_requires_review' in ~/.gza/config.yaml: "
@@ -4402,7 +4402,7 @@ class TestTmuxConfigValidation:
 
     def _write_config(self, tmp_path: Path, extra: str) -> None:
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text(f"project_name: test\n{extra}")
+        config_path.write_text(f"project_name: test\nprovider: codex\nmodel: gpt-5.5\n{extra}")
 
     def test_config_tmux_invalid_auto_accept_timeout_raises(self, tmp_path: Path):
         """Config.load raises ConfigError for a non-numeric auto_accept_timeout."""
@@ -4500,7 +4500,7 @@ class TestWatchConfigValidation:
     """Tests for watch config section parsing and validation."""
 
     def _write_config(self, tmp_path: Path, extra: str) -> None:
-        (tmp_path / "gza.yaml").write_text(f"project_name: test\n{extra}")
+        (tmp_path / "gza.yaml").write_text(f"project_name: test\nprovider: codex\nmodel: gpt-5.5\n{extra}")
 
     @pytest.mark.parametrize(
         ("field", "value"),
@@ -5022,7 +5022,7 @@ class TestIterateMaxIterationsConfigValidation:
     """Tests for iterate_max_iterations config parsing and validation."""
 
     def _write_config(self, tmp_path: Path, extra: str) -> None:
-        (tmp_path / "gza.yaml").write_text(f"project_name: test\n{extra}")
+        (tmp_path / "gza.yaml").write_text(f"project_name: test\nprovider: codex\nmodel: gpt-5.5\n{extra}")
 
     def test_config_iterate_max_iterations_default_is_three(self, tmp_path: Path) -> None:
         """Config.load defaults iterate_max_iterations to 3 when omitted."""

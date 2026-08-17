@@ -14,3 +14,4 @@ advance_mode: iterate
 provider: codex
 
 learnings_interval: 20
+model: gpt-5.5

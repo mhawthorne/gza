@@ -2274,7 +2274,7 @@ def test_watch_cycle_default_mode_spawn_failure_reuses_pending_resume_child_next
 def test_watch_cycle_default_mode_non_actionable_failed_row_starts_pending(tmp_path: Path) -> None:
     """Plain watch should move on to pending work when the scoped failed row is not auto-recoverable."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 0\nquiet_period_seconds: 0\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmax_resume_attempts: 0\nquiet_period_seconds: 0\n"
     )
     store = make_store(tmp_path)
 
@@ -9012,7 +9012,7 @@ def test_watch_cycle_does_not_reproject_selected_merge_when_merge_lane_unavailab
 def test_watch_cycle_with_isolation_enabled_preflights_and_merges_in_isolated_checkout(tmp_path: Path) -> None:
     """Isolation mode should preflight checkout and route merge execution through that checkout."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
     )
     store = make_store(tmp_path)
 
@@ -9075,7 +9075,7 @@ def test_watch_cycle_emits_isolated_promotion_warning_lines(
 ) -> None:
     """Watch must mirror isolated promotion stash notices into watch.log WARN lines."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
     )
     store = make_store(tmp_path)
 
@@ -9136,7 +9136,7 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_checkout_after_preflight_fa
 ) -> None:
     """A stale isolated checkout at watch-pass start should rebuild once and still allow same-pass merges."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nquiet_period_seconds: 0\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nquiet_period_seconds: 0\n"
     )
     store = make_store(tmp_path)
 
@@ -9206,7 +9206,7 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_checkout_after_preflight_fa
 def test_watch_cycle_with_isolation_enabled_dry_run_does_not_mutate_checkout(tmp_path: Path) -> None:
     """Isolation dry-run should preview merges without reconciling isolated checkout."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
     )
     store = make_store(tmp_path)
 
@@ -10151,7 +10151,7 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_c
 ) -> None:
     """Cleanup failures in isolated mode should rebuild checkout and continue later merges in the same pass."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
     )
     store = make_store(tmp_path)
 
@@ -10242,7 +10242,7 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_preparation_failure_r
 ) -> None:
     """Isolated conflict rebases must prepare in the watch parent and roll back on failure."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
     )
     store = make_store(tmp_path)
 
@@ -10310,7 +10310,7 @@ def test_watch_cycle_with_isolation_enabled_duplicate_rebase_skips_without_error
     tmp_path: Path,
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nmax_concurrent: 1\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nmax_concurrent: 1\n"
     )
     store = make_store(tmp_path)
 
@@ -10389,7 +10389,7 @@ def test_watch_cycle_with_isolation_enabled_rebuild_failure_skips_later_merges_b
 ) -> None:
     """When rebuild fails, later merge actions should skip while non-merge actions still proceed."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
     )
     store = make_store(tmp_path)
 
@@ -10468,7 +10468,7 @@ def test_watch_cycle_with_isolation_enabled_missing_branch_failure_does_not_rout
 ) -> None:
     """Missing task branches must not be misclassified as isolated merge conflicts."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
     )
     store = make_store(tmp_path)
 
@@ -10531,7 +10531,7 @@ def test_watch_cycle_with_isolation_enabled_already_merged_failure_does_not_rout
 ) -> None:
     """Already-merged branches should repair canonical merge state instead of creating rebase work."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
     )
     store = make_store(tmp_path)
 
@@ -10937,7 +10937,7 @@ def test_watch_cycle_without_isolation_preserves_default_branch_merge_guard(tmp_
 
 def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Path) -> None:
     """Watch merge execution should honor merge_squash_threshold auto-squash."""
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmerge_squash_threshold: 2\n")
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmerge_squash_threshold: 2\n")
     store = make_store(tmp_path)
 
     task = store.add("Completed task", task_type="implement")
@@ -11370,7 +11370,7 @@ def test_watch_cycle_batches_isolated_merges_under_one_candidate_verify_and_skip
     tmp_path: Path,
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
     )
     store = make_store(tmp_path)
 
@@ -11514,7 +11514,7 @@ def test_watch_cycle_isolated_batch_pass_without_exact_live_candidate_proof_bloc
     expected_message: str,
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
     )
     store = make_store(tmp_path)
 
@@ -11633,7 +11633,7 @@ def test_watch_cycle_isolated_batch_unavailable_leaves_main_untouched_without_ca
     tmp_path: Path,
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
     )
     store = make_store(tmp_path)
 
@@ -11759,7 +11759,7 @@ def test_watch_cycle_isolated_batch_red_leaves_main_untouched_and_files_one_cand
     tmp_path: Path,
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
     )
     store = make_store(tmp_path)
 
@@ -11960,7 +11960,7 @@ def test_watch_cycle_refreshes_isolated_checkout_before_later_merge_after_blocke
     expected_fragment: str,
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
     )
     store = make_store(tmp_path)
 
@@ -14210,7 +14210,7 @@ def test_watch_cycle_isolated_candidate_verify_promotion_reuses_checkpoint_witho
     tmp_path: Path,
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
     )
     store = make_store(tmp_path)
 
@@ -22194,7 +22194,7 @@ def test_watch_cycle_next_pass_skips_iterate_after_child_reconciles_merged_state
 def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebase_task(tmp_path: Path) -> None:
     """Isolated conflict rebases should pass the prepared child into the worker spawn helper."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
     )
     store = make_store(tmp_path)
 
@@ -22273,7 +22273,7 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebas
 def test_watch_cycle_merge_conflict_undispatched_rebase_does_not_consume_slot(tmp_path: Path) -> None:
     """An undispatched merge-conflict rebase should fall through so the next queued task can start."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nquiet_period_seconds: 0\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nquiet_period_seconds: 0\n"
     )
     store = make_store(tmp_path)
 
@@ -22368,7 +22368,7 @@ def test_watch_cycle_merge_conflict_undispatched_rebase_does_not_consume_slot(tm
 
 def test_watch_cycle_merge_conflict_skips_rebase_at_max_concurrent_without_creating_task(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
     )
     store = make_store(tmp_path)
 
@@ -36633,7 +36633,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_descendant_visible_under_
 ) -> None:
     """A completed non-recovery ancestor must not hide a failed descendant in watch recovery output."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 
@@ -36696,7 +36696,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_pendi
 ) -> None:
     """A pending manual based_on follow-up must not supersede the failed parent."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 
@@ -36749,7 +36749,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_faile
 ) -> None:
     """A failed manual based_on follow-up must not supersede the failed parent."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 
@@ -36803,7 +36803,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_compl
 ) -> None:
     """A completed same-payload manual follow-up on a different session/branch must not resolve the failed parent."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 
@@ -36870,7 +36870,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_compl
 ) -> None:
     """A legacy same-payload manual follow-up on a different session/branch must not resolve the failed parent."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 
@@ -36936,7 +36936,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_root_visible_across_non_r
 ) -> None:
     """A resolved recovery grandchild below a manual break must not hide the original failed root."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 
@@ -37006,7 +37006,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_fix_visible_under_complet
 ) -> None:
     """A cross-type completed ancestor must not hide an independent failed fix in watch recovery output."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
     )
     store = make_store(tmp_path)
 
@@ -37348,7 +37348,7 @@ def test_collect_unhandled_failures_default_mode_counts_resumable_failure_after_
     tmp_path: Path,
 ) -> None:
     """Default watch should count capped resumable failures toward backoff."""
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
     store = make_store(tmp_path)
 
     root = store.add("Failed root", task_type="implement")
@@ -37480,7 +37480,7 @@ def test_compute_failure_backoff_seconds_caps_at_max(tmp_path: Path) -> None:
     """Watch failure backoff should grow exponentially and clamp at the configured max."""
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
         f"worktree_dir: {worktree_dir}\n"
         "watch:\n"
@@ -37551,7 +37551,7 @@ def test_owner_failure_backoff_streaks_are_tracked_per_unit(tmp_path: Path) -> N
 def test_owner_failure_halt_requires_distinct_units(tmp_path: Path) -> None:
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
         f"worktree_dir: {worktree_dir}\n"
         "watch:\n"
@@ -37702,7 +37702,7 @@ def test_cmd_watch_holds_until_docker_returns_then_resumes(tmp_path: Path) -> No
     """Required-Docker watch should hold outside the normal pass and resume without backoff."""
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
         f"worktree_dir: {worktree_dir}\n"
         "use_docker: true\n"
@@ -37775,7 +37775,7 @@ def test_cmd_watch_no_docker_bypasses_system_probe(tmp_path: Path) -> None:
     """No-Docker watch should proceed without probing Docker readiness."""
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
-        f"project_name: test-project\ndb_path: .gza/gza.db\nworktree_dir: {worktree_dir}\nuse_docker: false\n"
+        f"project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nworktree_dir: {worktree_dir}\nuse_docker: false\n"
     )
     store = make_store(tmp_path)
     task = store.add("Pending plan", task_type="plan")
@@ -38422,7 +38422,7 @@ def test_cmd_watch_logs_owner_backoff_without_global_sleep(tmp_path: Path) -> No
     """watch should quarantine only the failing owner and keep the loop on poll cadence."""
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
         f"worktree_dir: {worktree_dir}\n"
         "watch:\n"
@@ -38505,7 +38505,7 @@ def test_cmd_watch_restart_failed_does_not_backoff_for_actionable_review_recover
     """Restart-failed should not back off for failures that the shared recovery policy will handle."""
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
         f"worktree_dir: {worktree_dir}\n"
         "watch:\n"
@@ -38571,7 +38571,7 @@ def test_cmd_watch_restart_failed_suppresses_merged_target_sidequest_failure(tmp
     """Restart-failed should fully suppress merged-target sidequest failure transitions."""
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
         f"worktree_dir: {worktree_dir}\n"
         "watch:\n"
@@ -38667,7 +38667,7 @@ def test_cmd_watch_restart_failed_backoffs_for_unmerged_target_sidequest_failure
     """Restart-failed should keep visible sidequest failures in backoff accounting when the target is unmerged."""
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
         f"worktree_dir: {worktree_dir}\n"
         "watch:\n"
@@ -38763,7 +38763,7 @@ def test_cmd_watch_max_resume_attempts_zero_disables_default_auto_resume(tmp_pat
     """--max-resume-attempts 0 should disable plain-watch auto-resume for that invocation."""
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
         f"worktree_dir: {worktree_dir}\n"
         "watch:\n"
@@ -38828,7 +38828,7 @@ def test_cmd_watch_halts_after_configured_failure_streak(tmp_path: Path) -> None
     """watch should stop and log when the configured failure streak threshold is reached."""
     worktree_dir = tmp_path / ".gza-test-worktrees"
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
         f"worktree_dir: {worktree_dir}\n"
         "watch:\n"

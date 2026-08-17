@@ -42,10 +42,10 @@ Gza reads configuration from three YAML layers:
 | `max_turns` | Integer | `50` | Legacy alias for `max_steps` |
 | `worktree_dir` | String | `/tmp/gza-worktrees` | Directory for git worktrees |
 | `work_count` | Integer | `1` | Number of tasks to run in a single work session |
-| `provider` | String | `claude` | AI provider: `claude` or `codex` |
+| `provider` | String | *(required)* | AI provider: `claude`, `codex`, or `gemini` |
 | `task_providers` | Dict | `{}` | Route task types to providers (e.g., `review: claude`) |
 | `providers` | Dict | `{}` | Provider-scoped model/task-type config (preferred) |
-| `model` | String | *(empty)* | Default model fallback (compatible) |
+| `model` | String | *(required)* | Default model fallback (must be compatible with the selected provider unless provider-scoped or task-type models cover every created task type) |
 | `reasoning_effort` | String | *(empty)* | Default reasoning effort fallback (Codex) |
 | `task_types` | Dict | `{}` | Task-type fallback configuration (compatible) |
 | `claude` | Dict | *(see below)* | Claude-specific configuration (see [Claude Configuration](#claude-configuration)) |
@@ -462,7 +462,8 @@ Model selection:
 3. `providers.<effective_provider>.model`
 4. `task_types.<task_type>.model` (legacy fallback)
 5. `model` / `defaults.model` (legacy fallback)
-6. Provider runtime default (if no model resolved)
+
+If no model resolves from config for the effective provider and task type, task creation fails before writing a task row. Gza never delegates model selection to a provider CLI runtime default.
 
 Reasoning effort selection:
 1. `providers.<effective_provider>.task_types.<task_type>.reasoning_effort`
@@ -526,7 +527,7 @@ Set your provider in `gza.yaml`:
 
 ```yaml
 provider: claude
-model: claude-sonnet-4-5  # optional: override the default model
+model: claude-sonnet-4-5
 reasoning_effort: medium  # optional: Codex reasoning effort override
 ```
 

@@ -197,12 +197,12 @@ project_name: my-project
 #   reasoning_effort: ""
 
 # Legacy global model fallback.
-# Default: ""
-# model: ""
+# Default: (required)
+model: gpt-5.5
 
 # Default provider when task-specific routing is absent.
-# Default: claude
-# provider: claude
+# Default: (required)
+provider: codex
 
 # providers:
 #   <provider>:

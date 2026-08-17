@@ -925,10 +925,10 @@ def test_complete_code_task_allows_out_of_scope_paths_for_cross_project_tag(tmp_
     config = Mock(spec=Config)
     config.project_dir = tmp_path / "services" / "foo"
     config.project_dir.mkdir(parents=True)
-    (config.project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (config.project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
     sibling_project_dir = tmp_path / "services" / "bar"
     sibling_project_dir.mkdir(parents=True)
-    (sibling_project_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+    (sibling_project_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
     config.log_path = config.project_dir / ".gza" / "logs"
     config.log_path.mkdir(parents=True, exist_ok=True)
     config.enforce_project_scope = True
@@ -987,10 +987,10 @@ def test_complete_code_task_cross_project_fails_on_unknown_project_path(tmp_path
     config = Mock(spec=Config)
     config.project_dir = tmp_path / "services" / "foo"
     config.project_dir.mkdir(parents=True)
-    (config.project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (config.project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
     sibling_project_dir = tmp_path / "services" / "bar"
     sibling_project_dir.mkdir(parents=True)
-    (sibling_project_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+    (sibling_project_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
     config.log_path = config.project_dir / ".gza" / "logs"
     config.log_path.mkdir(parents=True, exist_ok=True)
     config.enforce_project_scope = True
@@ -1055,11 +1055,11 @@ def test_complete_code_task_cross_project_allows_branch_local_new_project_config
     config = Mock(spec=Config)
     config.project_dir = repo_root / "services" / "foo"
     config.project_dir.mkdir(parents=True)
-    (config.project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (config.project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
     (worktree_root / "services" / "foo").mkdir(parents=True)
-    (worktree_root / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (worktree_root / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
     (worktree_root / "libs" / "new").mkdir(parents=True)
-    (worktree_root / "libs" / "new" / "gza.yaml").write_text("project_name: new\nverify_command: ./bin/new-verify\n")
+    (worktree_root / "libs" / "new" / "gza.yaml").write_text("project_name: new\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/new-verify\n")
     config.log_path = config.project_dir / ".gza" / "logs"
     config.log_path.mkdir(parents=True, exist_ok=True)
     config.enforce_project_scope = True

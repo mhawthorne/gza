@@ -20,6 +20,8 @@ def setup_config(tmp_path: Path, project_name: str = "test-project") -> None:
     (tmp_path / "gza.yaml").write_text(
         f"project_name: {project_name}\n"
         "db_path: .gza/gza.db\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
     )
 
 
