@@ -262,6 +262,87 @@ class TestVerifyFixTasks:
         assert created.based_on == improve.id
         assert resolve_verify_fix_task_identity(store, created) == (impl.id, epoch)
 
+    def test_create_or_reuse_verify_fix_task_reuses_same_identity_with_timeout_drift(
+        self, tmp_path: Path
+    ) -> None:
+        config, store = _make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=900,
+            verify_timeout_grace_seconds=None,
+        )
+        current_epoch = VerifyEpoch(
+            reviewed_branch=recorded_epoch.reviewed_branch,
+            reviewed_head_sha=recorded_epoch.reviewed_head_sha,
+            verify_command=recorded_epoch.verify_command,
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=improve,
+            epoch=recorded_epoch,
+        )
+
+        created, did_create = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=recorded_epoch,
+            trigger_source="advance",
+        )
+        reused, reused_create = create_or_reuse_verify_fix_task(
+            store,
+            config,
+            impl_task=impl,
+            based_on_task=improve,
+            verify_epoch=current_epoch,
+            trigger_source="advance",
+        )
+
+        assert did_create is True
+        assert reused_create is False
+        assert reused.id == created.id
+        assert find_existing_verify_fix_task(store, impl_task_id=impl.id, verify_epoch=current_epoch).id == created.id
+
+    def test_find_existing_verify_fix_task_matches_legacy_prompt_with_timeout_drift(
+        self, tmp_path: Path
+    ) -> None:
+        _config, store = _make_store(tmp_path)
+        impl = store.add("Implement feature", task_type="implement")
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=None,
+            verify_timeout_grace_seconds=None,
+        )
+        current_epoch = VerifyEpoch(
+            reviewed_branch=recorded_epoch.reviewed_branch,
+            reviewed_head_sha=recorded_epoch.reviewed_head_sha,
+            verify_command=recorded_epoch.verify_command,
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        legacy = store.add(
+            build_verify_fix_prompt(impl.id, recorded_epoch),
+            task_type="verify_fix",
+            based_on=impl.id,
+            same_branch=True,
+        )
+
+        matched = find_existing_verify_fix_task(store, impl_task_id=impl.id, verify_epoch=current_epoch)
+
+        assert matched is not None
+        assert matched.id == legacy.id
+
     def test_create_or_reuse_verify_fix_task_creates_new_lane_for_new_epoch(self, tmp_path: Path) -> None:
         config, store = _make_store(tmp_path)
         impl = store.add("Implement feature", task_type="implement")

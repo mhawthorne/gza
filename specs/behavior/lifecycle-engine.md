@@ -366,7 +366,11 @@ epoch.
   non-green result, including another timeout, lifecycle MUST record the rerun as consumed
   and the next decision MUST park rather than rerun indefinitely.
 - Latest same-head verify evidence wins inside a verify epoch: a newer persisted green
-  result for the exact epoch supersedes older same-epoch red evidence.
+  result for the same reviewed branch, reviewed head SHA, and normalized verify command
+  supersedes older same-head red evidence. Timeout settings are run-budget provenance,
+  not verify freshness identity; changing only `autonomous_verify_timeout_seconds` or
+  `review_verify_timeout_grace_seconds` MUST NOT be the supported way to clear or stale
+  a verify gate.
 - If one same-epoch `verify_fix` attempt already completed and the latest current verify
   gate remains red for that epoch, lifecycle MUST park with reason `verify-fix-failed`
   instead of spawning another `verify_fix`. Deterministic test failures and unknown

@@ -406,7 +406,7 @@ def resolve_latest_failed_verify_epoch(
     if not verify_epoch_matches(expected=current_epoch, candidate=evidence.epoch):
         raise VerifyFixContextError(
             f"verify_fix manual creation for {impl_task_id} requires failed verify evidence for the current "
-            "implementation branch/head/command/timeout identity, but the latest persisted failure is stale. "
+            "implementation branch/head/command identity, but the latest persisted failure is stale. "
             f"Current: branch={current_epoch.reviewed_branch} head={current_epoch.reviewed_head_sha} "
             f"command={current_epoch.verify_command!r}. "
             f"Latest failed evidence: branch={evidence.epoch.reviewed_branch} "
@@ -714,7 +714,10 @@ def find_existing_verify_fix_task(
         identity = resolve_verify_fix_task_identity(store, task)
         if identity is not None:
             candidate_impl_id, candidate_epoch = identity
-            if candidate_impl_id == impl_task_id and candidate_epoch == verify_epoch:
+            if candidate_impl_id == impl_task_id and verify_epoch_matches(
+                expected=verify_epoch,
+                candidate=candidate_epoch,
+            ):
                 matches.append(task)
                 continue
         if task.prompt == expected_prompt:

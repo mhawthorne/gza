@@ -24,7 +24,7 @@ INVALID_STRUCTURED_FAILURE_ORIGIN = "__invalid_structured_failure_origin__"
 
 @dataclass(frozen=True)
 class VerifyEpoch:
-    """Identity for one verify gate evaluation at a specific head."""
+    """Provenance for one verify gate evaluation at a specific head."""
 
     reviewed_branch: str | None
     reviewed_head_sha: str | None
@@ -128,7 +128,7 @@ def make_verify_epoch(
     verify_timeout_seconds: int | None,
     verify_timeout_grace_seconds: float | None,
 ) -> VerifyEpoch:
-    """Build the canonical verify epoch identity for one branch head."""
+    """Build canonical verify epoch metadata for one branch head."""
     return VerifyEpoch(
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
@@ -139,8 +139,16 @@ def make_verify_epoch(
 
 
 def verify_epoch_matches(*, expected: VerifyEpoch, candidate: VerifyEpoch) -> bool:
-    """Return whether two verify epoch identities are equivalent."""
-    return expected == candidate
+    """Return whether two verify epochs cover the same code and command.
+
+    Timeout settings are persisted as run provenance, but they are not freshness
+    identity: changing the budget does not make same-head evidence stale or current.
+    """
+    return (
+        expected.reviewed_branch == candidate.reviewed_branch
+        and expected.reviewed_head_sha == candidate.reviewed_head_sha
+        and expected.verify_command == candidate.verify_command
+    )
 
 
 def _task_verify_result(task: Task) -> VerifyGateResult | None:

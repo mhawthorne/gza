@@ -19,6 +19,7 @@ from gza.review_verify_state import (
     resolve_verify_read_model,
     review_task_verify_epoch,
     task_has_current_passing_verify_evidence,
+    verify_epoch_matches,
     verify_result_is_timeout_origin,
 )
 from gza.git import GitError
@@ -302,7 +303,7 @@ def test_latest_verify_result_for_epoch_falls_back_to_legacy_review_when_owner_a
     assert lookup.result.captured_at == captured_at
 
 
-def test_latest_verify_result_for_epoch_marks_legacy_review_stale_without_persisted_timeout_identity(
+def test_latest_verify_result_for_epoch_accepts_legacy_review_without_persisted_timeout_identity(
     tmp_path: Path,
 ) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
@@ -316,7 +317,7 @@ def test_latest_verify_result_for_epoch_marks_legacy_review_stale_without_persis
 
     assert lookup.source == "legacy_review"
     assert lookup.has_owner_artifact is False
-    assert lookup.is_current is False
+    assert lookup.is_current is True
     assert lookup.result is not None
     assert lookup.result.captured_at == captured_at
 
@@ -387,6 +388,11 @@ def test_review_task_verify_epoch_preserves_legacy_timeout_identity_as_none(tmp_
     store.update(review)
 
     legacy_epoch = review_task_verify_epoch(review, config)
+    owner_epoch = owner_task_verify_epoch(
+        SimpleNamespace(branch="feature/verify"),
+        config,
+        SimpleNamespace(rev_parse_if_exists=lambda _ref: "head-1"),
+    )
 
     assert legacy_epoch == make_verify_epoch(
         reviewed_branch="feature/verify",
@@ -395,11 +401,9 @@ def test_review_task_verify_epoch_preserves_legacy_timeout_identity_as_none(tmp_
         verify_timeout_seconds=None,
         verify_timeout_grace_seconds=None,
     )
-    assert legacy_epoch != owner_task_verify_epoch(
-        SimpleNamespace(branch="feature/verify"),
-        config,
-        SimpleNamespace(rev_parse_if_exists=lambda _ref: "head-1"),
-    )
+    assert owner_epoch is not None
+    assert legacy_epoch != owner_epoch
+    assert verify_epoch_matches(expected=owner_epoch, candidate=legacy_epoch) is True
 
 
 def test_review_task_verify_epoch_stays_stale_across_timeout_config_changes(tmp_path: Path) -> None:
@@ -424,6 +428,11 @@ def test_review_task_verify_epoch_stays_stale_across_timeout_config_changes(tmp_
 
     first_epoch = review_task_verify_epoch(review, first_config)
     changed_epoch = review_task_verify_epoch(review, changed_config)
+    changed_owner_epoch = owner_task_verify_epoch(
+        SimpleNamespace(branch="feature/verify"),
+        changed_config,
+        SimpleNamespace(rev_parse_if_exists=lambda _ref: "head-1"),
+    )
 
     assert first_epoch == changed_epoch
     assert changed_epoch == make_verify_epoch(
@@ -433,11 +442,9 @@ def test_review_task_verify_epoch_stays_stale_across_timeout_config_changes(tmp_
         verify_timeout_seconds=None,
         verify_timeout_grace_seconds=None,
     )
-    assert changed_epoch != owner_task_verify_epoch(
-        SimpleNamespace(branch="feature/verify"),
-        changed_config,
-        SimpleNamespace(rev_parse_if_exists=lambda _ref: "head-1"),
-    )
+    assert changed_owner_epoch is not None
+    assert changed_epoch != changed_owner_epoch
+    assert verify_epoch_matches(expected=changed_owner_epoch, candidate=changed_epoch) is True
 
 
 def test_resolve_verify_gate_decision_marks_current_failed_owner_artifact_red(tmp_path: Path) -> None:
@@ -531,6 +538,107 @@ def test_later_current_green_verify_evidence_supersedes_stale_red_at_same_head(t
     assert decision.state == "passed"
     assert decision.lookup.result is not None
     assert decision.lookup.result.status == "passed"
+
+
+def test_later_current_green_verify_evidence_supersedes_red_with_absent_timeout_provenance(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _config(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement verify gate decision", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/verify"
+    store.update(impl)
+    review = store.add("Review verify gate decision", task_type="review", based_on=impl.id, depends_on=impl.id)
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+            reviewed_branch="feature/verify",
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory="/tmp/worktree",
+            failure="verify_command timed out after 120s",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=_result(captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC)),
+        verify_timeout_seconds=None,
+        verify_timeout_grace_seconds=None,
+        producer="advance_verify_gate",
+    )
+
+    git = SimpleNamespace(rev_parse_if_exists=lambda _ref: "head-1")
+    decision = resolve_verify_gate_decision(store, impl, config=config, git=git)
+
+    assert decision.state == "passed"
+    assert decision.lookup.result is not None
+    assert decision.lookup.result.status == "passed"
+    assert task_has_current_passing_verify_evidence(store, impl, config=config, git=git) is True
+
+
+def test_later_current_red_verify_evidence_supersedes_older_green_at_same_head(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _config(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement verify gate decision", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/verify"
+    store.update(impl)
+    review = store.add("Review verify gate decision", task_type="review", based_on=impl.id, depends_on=impl.id)
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=_result(captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC)),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+    failed_result = _result(captured_at=datetime(2026, 6, 29, 12, 5, tzinfo=UTC))
+    failed_result.status = "failed"
+    failed_result.exit_status = "1"
+    failed_result.failure = "pytest failed"
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=failed_result,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="advance_verify_gate",
+    )
+
+    git = SimpleNamespace(rev_parse_if_exists=lambda _ref: "head-1")
+    decision = resolve_verify_gate_decision(store, impl, config=config, git=git)
+
+    assert decision.state == "failed"
+    assert decision.lookup.result is not None
+    assert decision.lookup.result.exit_status == "1"
 
 
 def test_verify_result_is_timeout_origin_uses_structured_exit_status_and_failure(tmp_path: Path) -> None:

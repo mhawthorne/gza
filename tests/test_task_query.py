@@ -926,7 +926,7 @@ def test_task_projection_keeps_latest_owner_verify_fields_when_branch_probe_rais
     assert row.values["verify_failure"] == "git probe unavailable"
 
 
-def test_task_projection_marks_legacy_verify_stale_without_persisted_timeout_identity(
+def test_task_projection_marks_legacy_verify_current_without_persisted_timeout_identity(
     tmp_path: Path,
 ) -> None:
     store = _store(tmp_path)
@@ -977,7 +977,7 @@ def test_task_projection_marks_legacy_verify_stale_without_persisted_timeout_ide
     assert isinstance(row, TaskRow)
     assert row.values["verify_status"] == "passed"
     assert row.values["verify_source"] == "legacy_review"
-    assert row.values["verify_current"] is False
+    assert row.values["verify_current"] is True
 
 
 def test_incomplete_projection_keeps_latest_owner_verify_fields_when_git_probe_unavailable(

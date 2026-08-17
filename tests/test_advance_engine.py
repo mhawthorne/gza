@@ -18737,7 +18737,7 @@ def test_pre_review_failed_verify_creates_verify_fix(tmp_path: Path) -> None:
     assert action["verify_epoch"].reviewed_head_sha == "verify-head"
 
 
-def test_pre_review_failed_verify_reuses_pending_verify_fix(tmp_path: Path) -> None:
+def test_pre_review_failed_verify_reuses_pending_verify_fix_with_timeout_drift(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     config.require_review_before_merge = False
@@ -18750,12 +18750,12 @@ def test_pre_review_failed_verify_reuses_pending_verify_fix(tmp_path: Path) -> N
         branch="feature/pre-review-pending-verify-fix",
         when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
     )
-    epoch = VerifyEpoch(
+    recorded_epoch = VerifyEpoch(
         reviewed_branch=impl.branch,
         reviewed_head_sha="verify-head",
         verify_command="./bin/tests",
-        verify_timeout_seconds=120,
-        verify_timeout_grace_seconds=5.0,
+        verify_timeout_seconds=90,
+        verify_timeout_grace_seconds=None,
     )
     artifact = store_command_output_artifact(
         store,
@@ -18765,10 +18765,10 @@ def test_pre_review_failed_verify_reuses_pending_verify_fix(tmp_path: Path) -> N
         producer="test",
         label="verify_command_output",
         output="pytest failed",
-        command=epoch.verify_command,
+        command=recorded_epoch.verify_command,
         status="failed",
         exit_status="1",
-        head_sha=epoch.reviewed_head_sha,
+        head_sha=recorded_epoch.reviewed_head_sha,
         created_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
     )
     persist_verify_gate_artifact(
@@ -18788,8 +18788,8 @@ def test_pre_review_failed_verify_reuses_pending_verify_fix(tmp_path: Path) -> N
             failure="pytest failed",
             artifact_path=artifact.path,
         ),
-        verify_timeout_seconds=120,
-        verify_timeout_grace_seconds=5.0,
+        verify_timeout_seconds=recorded_epoch.verify_timeout_seconds,
+        verify_timeout_grace_seconds=recorded_epoch.verify_timeout_grace_seconds,
         output_artifact_id=artifact.id,
         output_artifact_task_id=impl.id,
         output_artifact_path=artifact.path,
@@ -18800,7 +18800,7 @@ def test_pre_review_failed_verify_reuses_pending_verify_fix(tmp_path: Path) -> N
         config,
         impl_task=impl,
         based_on_task=impl,
-        verify_epoch=epoch,
+        verify_epoch=recorded_epoch,
         trigger_source="test",
     )
     assert created is True
@@ -18812,7 +18812,7 @@ def test_pre_review_failed_verify_reuses_pending_verify_fix(tmp_path: Path) -> N
     assert action["verify_fix_task"].id == verify_fix.id
 
 
-def test_pre_review_failed_verify_parks_after_completed_verify_fix(tmp_path: Path) -> None:
+def test_pre_review_failed_verify_waits_for_in_progress_verify_fix_with_timeout_drift(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     config.require_review_before_merge = False
@@ -18822,15 +18822,15 @@ def test_pre_review_failed_verify_parks_after_completed_verify_fix(tmp_path: Pat
 
     impl = _make_completed_unmerged_impl(
         store,
-        branch="feature/pre-review-completed-verify-fix",
+        branch="feature/pre-review-in-progress-verify-fix",
         when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
     )
-    epoch = VerifyEpoch(
+    recorded_epoch = VerifyEpoch(
         reviewed_branch=impl.branch,
         reviewed_head_sha="verify-head",
         verify_command="./bin/tests",
-        verify_timeout_seconds=120,
-        verify_timeout_grace_seconds=5.0,
+        verify_timeout_seconds=90,
+        verify_timeout_grace_seconds=None,
     )
     artifact = store_command_output_artifact(
         store,
@@ -18840,10 +18840,10 @@ def test_pre_review_failed_verify_parks_after_completed_verify_fix(tmp_path: Pat
         producer="test",
         label="verify_command_output",
         output="pytest failed",
-        command=epoch.verify_command,
+        command=recorded_epoch.verify_command,
         status="failed",
         exit_status="1",
-        head_sha=epoch.reviewed_head_sha,
+        head_sha=recorded_epoch.reviewed_head_sha,
         created_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
     )
     persist_verify_gate_artifact(
@@ -18862,6 +18862,163 @@ def test_pre_review_failed_verify_parks_after_completed_verify_fix(tmp_path: Pat
             working_directory=str(tmp_path),
             failure="pytest failed",
             artifact_path=artifact.path,
+        ),
+        verify_timeout_seconds=recorded_epoch.verify_timeout_seconds,
+        verify_timeout_grace_seconds=recorded_epoch.verify_timeout_grace_seconds,
+        output_artifact_id=artifact.id,
+        output_artifact_task_id=impl.id,
+        output_artifact_path=artifact.path,
+        producer="test",
+    )
+    verify_fix, created = create_or_reuse_verify_fix_task(
+        store,
+        config,
+        impl_task=impl,
+        based_on_task=impl,
+        verify_epoch=recorded_epoch,
+        trigger_source="test",
+    )
+    assert created is True
+    verify_fix.status = "in_progress"
+    store.update(verify_fix)
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "wait_verify_fix"
+    assert action["verify_fix_task"].id == verify_fix.id
+
+
+def test_pre_review_failed_verify_parks_after_completed_verify_fix_with_timeout_drift(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-completed-verify-fix",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    recorded_epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="verify-head",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=90,
+        verify_timeout_grace_seconds=None,
+    )
+    artifact = store_command_output_artifact(
+        store,
+        impl,
+        config,
+        kind="verify_command_output",
+        producer="test",
+        label="verify_command_output",
+        output="pytest failed",
+        command=recorded_epoch.verify_command,
+        status="failed",
+        exit_status="1",
+        head_sha=recorded_epoch.reviewed_head_sha,
+        created_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+            artifact_path=artifact.path,
+        ),
+        verify_timeout_seconds=recorded_epoch.verify_timeout_seconds,
+        verify_timeout_grace_seconds=recorded_epoch.verify_timeout_grace_seconds,
+        output_artifact_id=artifact.id,
+        output_artifact_task_id=impl.id,
+        output_artifact_path=artifact.path,
+        producer="test",
+    )
+    verify_fix, created = create_or_reuse_verify_fix_task(
+        store,
+        config,
+        impl_task=impl,
+        based_on_task=impl,
+        verify_epoch=recorded_epoch,
+        trigger_source="test",
+    )
+    assert created is True
+    verify_fix.status = "completed"
+    verify_fix.completed_at = datetime(2026, 7, 6, 12, 10, tzinfo=UTC)
+    store.update(verify_fix)
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "verify-fix-failed"
+    assert "verify gate is still red after completed verify_fix" in action["description"]
+
+
+def test_green_verify_at_current_head_clears_completed_verify_fix_red_gate(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/current-green-clears-red",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="verify-head",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    artifact = store_command_output_artifact(
+        store,
+        impl,
+        config,
+        kind="verify_command_output",
+        producer="test",
+        label="verify_command_output",
+        output="verify_command timed out after 120s",
+        command=epoch.verify_command,
+        status="failed",
+        exit_status="timed out",
+        head_sha=epoch.reviewed_head_sha,
+        created_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="verify_command timed out after 120s",
+            artifact_path=artifact.path,
+            failure_origin="timeout",
         ),
         verify_timeout_seconds=120,
         verify_timeout_grace_seconds=5.0,
@@ -18882,7 +19039,227 @@ def test_pre_review_failed_verify_parks_after_completed_verify_fix(tmp_path: Pat
     verify_fix.status = "completed"
     verify_fix.completed_at = datetime(2026, 7, 6, 12, 10, tzinfo=UTC)
     store.update(verify_fix)
-    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=verify_fix,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 7, 6, 12, 15, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="advance_verify_gate",
+    )
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "merge"
+    assert action.get("needs_attention_reason") != "verify-fix-failed"
+    assert "verify gate is still red" not in action["description"]
+
+
+def test_green_verify_clears_completed_verify_fix_red_gate_with_absent_timeout_provenance(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/current-green-absent-timeout",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="verify-head",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    artifact = store_command_output_artifact(
+        store,
+        impl,
+        config,
+        kind="verify_command_output",
+        producer="test",
+        label="verify_command_output",
+        output="verify_command timed out after 120s",
+        command=epoch.verify_command,
+        status="failed",
+        exit_status="timed out",
+        head_sha=epoch.reviewed_head_sha,
+        created_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="verify_command timed out after 120s",
+            artifact_path=artifact.path,
+            failure_origin="timeout",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        output_artifact_id=artifact.id,
+        output_artifact_task_id=impl.id,
+        output_artifact_path=artifact.path,
+        producer="test",
+    )
+    verify_fix, created = create_or_reuse_verify_fix_task(
+        store,
+        config,
+        impl_task=impl,
+        based_on_task=impl,
+        verify_epoch=epoch,
+        trigger_source="test",
+    )
+    assert created is True
+    verify_fix.status = "completed"
+    verify_fix.completed_at = datetime(2026, 7, 6, 12, 10, tzinfo=UTC)
+    store.update(verify_fix)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=verify_fix,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 7, 6, 12, 15, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure=None,
+        ),
+        verify_timeout_seconds=None,
+        verify_timeout_grace_seconds=None,
+        producer="advance_verify_gate",
+    )
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "merge"
+    assert action.get("needs_attention_reason") != "verify-fix-failed"
+
+
+def test_new_failed_verify_at_current_head_keeps_completed_verify_fix_gate_red(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/current-red-stays-red",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="verify-head",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    artifact = store_command_output_artifact(
+        store,
+        impl,
+        config,
+        kind="verify_command_output",
+        producer="test",
+        label="verify_command_output",
+        output="verify_command timed out after 120s",
+        command=epoch.verify_command,
+        status="failed",
+        exit_status="timed out",
+        head_sha=epoch.reviewed_head_sha,
+        created_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="verify_command timed out after 120s",
+            artifact_path=artifact.path,
+            failure_origin="timeout",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        output_artifact_id=artifact.id,
+        output_artifact_task_id=impl.id,
+        output_artifact_path=artifact.path,
+        producer="test",
+    )
+    verify_fix, created = create_or_reuse_verify_fix_task(
+        store,
+        config,
+        impl_task=impl,
+        based_on_task=impl,
+        verify_epoch=epoch,
+        trigger_source="test",
+    )
+    assert created is True
+    verify_fix.status = "completed"
+    verify_fix.completed_at = datetime(2026, 7, 6, 12, 10, tzinfo=UTC)
+    store.update(verify_fix)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=verify_fix,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="1",
+            captured_at=datetime(2026, 7, 6, 12, 15, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="pytest failed",
+            failure_origin="test_failure",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="advance_verify_gate",
+    )
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head", "main": "base-head"})
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
