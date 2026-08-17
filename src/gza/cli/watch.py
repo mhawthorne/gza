@@ -10,7 +10,7 @@ import re
 import signal
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -136,6 +136,7 @@ from ..unstick import (
 from ..watch_progress import (
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
     WatchProgressCandidate,
+    WatchProgressScope,
     build_watch_progress_candidate,
     finalize_background_watch_execution,
     finalize_watch_progress_after_execution,
@@ -1894,6 +1895,117 @@ def _query_owner_rows(
     return rows
 
 
+@dataclass(frozen=True)
+class _WatchScopeSelector:
+    raw_task_id: str | None
+    startup_owner_id: str
+    effective_owner_id: str
+
+    @property
+    def scope_kind(self) -> Literal["canonical_owner", "effective_leaf"]:
+        if self.effective_owner_id != self.startup_owner_id:
+            return "effective_leaf"
+        return "canonical_owner"
+
+
+def _merge_scoped_owner_rows(rows: Iterable[LineageOwnerRow]) -> list[LineageOwnerRow]:
+    merged: list[LineageOwnerRow] = []
+    seen: set[tuple[object, ...]] = set()
+    for row in rows:
+        recovery_leaf_id = row.recovery_leaf_task.id if row.recovery_leaf_task is not None else None
+        key: tuple[object, ...]
+        if recovery_leaf_id is not None:
+            key = ("recovery", row.owner_task.id, recovery_leaf_id, None, ())
+        else:
+            key = (
+                "lifecycle",
+                row.owner_task.id,
+                None,
+                row.lifecycle_action_task.id if row.lifecycle_action_task is not None else None,
+                tuple(task.id for task in row.unresolved_tasks),
+            )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+    return merged
+
+
+def _query_scoped_owner_rows_with_context(
+    *,
+    store: SqliteTaskStore,
+    config: Config,
+    git: Git,
+    target_branch: str,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    selectors: tuple[_WatchScopeSelector, ...] | None,
+    max_recovery_attempts: int,
+    include_skipped: bool,
+) -> tuple[list[LineageOwnerRow], RecoveryReadContext]:
+    if selectors is None:
+        return _query_owner_rows_with_context(
+            store=store,
+            config=config,
+            git=git,
+            target_branch=target_branch,
+            tags=tags,
+            any_tag=any_tag,
+            max_recovery_attempts=max_recovery_attempts,
+            include_skipped=include_skipped,
+        )
+
+    rows: list[LineageOwnerRow] = []
+    read_context: RecoveryReadContext | None = None
+    for selector in selectors:
+        selector_task_ids = (
+            None
+            if selector.raw_task_id is None or selector.raw_task_id == selector.startup_owner_id
+            else (selector.raw_task_id,)
+        )
+        selector_rows, selector_context = _query_owner_rows_with_context(
+            store=store,
+            config=config,
+            git=git,
+            target_branch=target_branch,
+            tags=tags,
+            any_tag=any_tag,
+            owner_task_ids=(selector.startup_owner_id,),
+            task_ids=selector_task_ids,
+            max_recovery_attempts=max_recovery_attempts,
+            include_skipped=include_skipped,
+        )
+        if read_context is None:
+            read_context = selector_context
+        rows.extend(selector_rows)
+        if selector_task_ids is None and selector.raw_task_id == selector.startup_owner_id:
+            failed_member_ids = tuple(
+                dict.fromkeys(
+                    str(task.id)
+                    for task in store.get_all()
+                    if task.id is not None
+                    and task.id != selector.startup_owner_id
+                    and task.status == "failed"
+                    and resolve_lineage_owner_task_id(store, task.id) == selector.startup_owner_id
+                )
+            )
+            for failed_member_id in failed_member_ids:
+                leaf_rows, _leaf_context = _query_owner_rows_with_context(
+                    store=store,
+                    config=config,
+                    git=git,
+                    target_branch=target_branch,
+                    tags=tags,
+                    any_tag=any_tag,
+                    owner_task_ids=(selector.startup_owner_id,),
+                    task_ids=(failed_member_id,),
+                    max_recovery_attempts=max_recovery_attempts,
+                    include_skipped=include_skipped,
+                )
+                rows.extend(leaf_rows)
+    return _merge_scoped_owner_rows(rows), read_context or RecoveryReadContext()
+
+
 def _resolve_watch_scope_owner_ids(
     store: SqliteTaskStore,
     task_ids: tuple[str, ...],
@@ -1903,9 +2015,8 @@ def _resolve_watch_scope_owner_ids(
     git: Git | None = None,
     target_branch: str | None = None,
 ) -> tuple[str, ...]:
-    """Resolve explicit watch task IDs to canonical owner IDs, preserving order."""
+    """Resolve explicit watch task IDs to canonical owner IDs, preserving selector order."""
     owner_ids: list[str] = []
-    seen: set[str] = set()
     for raw_task_id in task_ids:
         if not _TASK_ID_RE.match(raw_task_id):
             raise ValueError(f"invalid task ID: {raw_task_id}")
@@ -1928,11 +2039,48 @@ def _resolve_watch_scope_owner_ids(
             owner_task = resolve_lineage_owner_task(store, task)
         if owner_task.id is None:
             raise ValueError(f"unable to resolve owner for task ID: {raw_task_id}")
-        if owner_task.id in seen:
-            continue
-        seen.add(owner_task.id)
         owner_ids.append(owner_task.id)
     return tuple(owner_ids)
+
+
+def _build_watch_scope_selectors(
+    *,
+    scoped_owner_ids: tuple[str, ...] | None,
+    scoped_task_ids: tuple[str, ...] | None,
+    effective_scoped_owner_ids: tuple[str, ...] | None = None,
+) -> tuple[_WatchScopeSelector, ...] | None:
+    if scoped_owner_ids is None:
+        return None
+    raw_task_ids = scoped_task_ids or ()
+    effective_ids = effective_scoped_owner_ids or scoped_owner_ids
+    selectors: list[_WatchScopeSelector] = []
+    for index, startup_owner_id in enumerate(scoped_owner_ids):
+        raw_task_id = raw_task_ids[index] if index < len(raw_task_ids) else None
+        effective_owner_id = effective_ids[index] if index < len(effective_ids) else startup_owner_id
+        selectors.append(
+            _WatchScopeSelector(
+                raw_task_id=raw_task_id,
+                startup_owner_id=startup_owner_id,
+                effective_owner_id=effective_owner_id,
+            )
+        )
+    return tuple(selectors)
+
+
+def _watch_progress_scopes_from_selectors(
+    selectors: tuple[_WatchScopeSelector, ...] | None,
+) -> tuple[WatchProgressScope, ...] | None:
+    if selectors is None:
+        return None
+    return tuple((selector.scope_kind, selector.effective_owner_id) for selector in selectors)
+
+
+def _selector_kinds_from_selectors(
+    selectors: tuple[_WatchScopeSelector, ...] | None,
+) -> tuple[Literal["canonical_owner", "effective_leaf"], ...] | None:
+    if selectors is None:
+        return None
+    return tuple(selector.scope_kind for selector in selectors)
 
 
 def _watch_iterate_result(
@@ -4824,6 +4972,7 @@ class _CycleResult:
     pending: int
     scoped_done: bool | None = None
     scoped_active: int = 0
+    effective_scoped_owner_ids: tuple[str, ...] | None = None
     anonymous_worker_count: int = 0
     starting_worker_count: int = 0
     expected_starts: dict[str, "_ExpectedStart"] = field(default_factory=dict)
@@ -4890,6 +5039,8 @@ class _BlindParkedAutoRearmDecision:
     candidate: ParkedTaskCandidate
     status: Literal["rearmed", "skipped"]
     detail: str
+    render_task_id: str | None = None
+    render_scope_kind: Literal["canonical_owner", "effective_leaf"] | None = None
 
 
 @dataclass(frozen=True)
@@ -4904,6 +5055,12 @@ class _BlindParkedAutoRearmResult:
             if decision.status == "rearmed" and owner_id is not None:
                 owner_ids.append(owner_id)
         return tuple(owner_ids)
+
+
+@dataclass(frozen=True)
+class _ScopedWatchActivity:
+    active_count: int
+    effective_scoped_owner_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -4925,9 +5082,97 @@ class _WatchCycleAnalysis:
         ...,
     ] = ()
     pending_recovery_task_ids: frozenset[str] = frozenset()
+    effective_scoped_owner_ids: tuple[str, ...] | None = None
 
 
-SCOPED_WATCH_COMPLETE_MESSAGE = "scoped watch complete; all named owner units are terminal or parked"
+SCOPED_WATCH_COMPLETE_MESSAGE = "scoped watch complete; selected effective scope is terminal or parked"
+
+
+def _row_matches_excluded_failure_unit(row: LineageOwnerRow, excluded_owner_ids: frozenset[str]) -> bool:
+    if not excluded_owner_ids:
+        return False
+    if row.owner_task.id is not None and str(row.owner_task.id) in excluded_owner_ids:
+        return True
+    if (
+        row.recovery_leaf_task is not None
+        and row.recovery_leaf_task.id is not None
+        and str(row.recovery_leaf_task.id) in excluded_owner_ids
+    ):
+        return True
+    return False
+
+
+def _task_matches_excluded_failure_unit(task: DbTask, excluded_owner_ids: frozenset[str]) -> bool:
+    return task.id is not None and str(task.id) in excluded_owner_ids
+
+
+def _filter_precomputed_watch_cycle_plan(
+    plan: _WatchCyclePlan,
+    *,
+    excluded_owner_ids: frozenset[str],
+) -> _WatchCyclePlan:
+    if not excluded_owner_ids:
+        return plan
+    owner_rows = tuple(
+        row for row in plan.analysis.owner_rows if not _row_matches_excluded_failure_unit(row, excluded_owner_ids)
+    )
+    lifecycle_rows = tuple(
+        row for row in plan.analysis.lifecycle_rows if not _row_matches_excluded_failure_unit(row, excluded_owner_ids)
+    )
+    recovery_rows = tuple(
+        row for row in plan.analysis.recovery_rows if not _row_matches_excluded_failure_unit(row, excluded_owner_ids)
+    )
+    action_plan = tuple(
+        (row, task, action)
+        for row, task, action in plan.analysis.action_plan
+        if not _row_matches_excluded_failure_unit(row, excluded_owner_ids)
+        and not _task_matches_excluded_failure_unit(task, excluded_owner_ids)
+    )
+    recovery_attention_rows = tuple(
+        (owner_task, decision, action)
+        for owner_task, decision, action in plan.analysis.recovery_attention_rows
+        if not _task_matches_excluded_failure_unit(owner_task, excluded_owner_ids)
+        and decision.task_id not in excluded_owner_ids
+    )
+    recovery_visible_skips = tuple(
+        (owner_task, failed, decision, action)
+        for owner_task, failed, decision, action in plan.analysis.recovery_visible_skips
+        if not _task_matches_excluded_failure_unit(owner_task, excluded_owner_ids)
+        and not _task_matches_excluded_failure_unit(failed, excluded_owner_ids)
+        and decision.task_id not in excluded_owner_ids
+    )
+    recovery_undispatched_rows = tuple(
+        (owner_task, failed, decision, action)
+        for owner_task, failed, decision, action in plan.analysis.recovery_undispatched_rows
+        if not _task_matches_excluded_failure_unit(owner_task, excluded_owner_ids)
+        and not _task_matches_excluded_failure_unit(failed, excluded_owner_ids)
+        and decision.task_id not in excluded_owner_ids
+    )
+    actionable_failed = tuple(
+        (row, failed, decision, action, worker_consuming, action_task)
+        for row, failed, decision, action, worker_consuming, action_task in plan.analysis.actionable_failed
+        if not _row_matches_excluded_failure_unit(row, excluded_owner_ids)
+        and not _task_matches_excluded_failure_unit(failed, excluded_owner_ids)
+        and decision.task_id not in excluded_owner_ids
+    )
+    analysis = replace(
+        plan.analysis,
+        owner_rows=owner_rows,
+        lifecycle_rows=lifecycle_rows,
+        recovery_rows=recovery_rows,
+        action_plan=action_plan,
+        recovery_attention_rows=recovery_attention_rows,
+        recovery_visible_skips=recovery_visible_skips,
+        recovery_undispatched_rows=recovery_undispatched_rows,
+        actionable_failed=actionable_failed,
+        active_recovery_subject_ids=frozenset(
+            subject_id for subject_id in plan.analysis.active_recovery_subject_ids if subject_id not in excluded_owner_ids
+        ),
+        pending_recovery_task_ids=frozenset(
+            task_id for task_id in plan.analysis.pending_recovery_task_ids if task_id not in excluded_owner_ids
+        ),
+    )
+    return replace(plan, analysis=analysis)
 
 
 def _normalize_watch_dispatch_selection_mode(
@@ -4964,10 +5209,17 @@ def _filter_watch_dispatch_preview_entries(
         task_id = entry.task.id
         if task_id is None or str(task_id) in started_task_ids:
             continue
+        if str(task_id) in excluded_owner_ids:
+            continue
         owner_id = entry.owner_task.id if entry.owner_task is not None and entry.owner_task.id is not None else None
         if owner_id is None:
             owner_id = _resolve_failure_owner_task_id(store, str(task_id))
         if owner_id in excluded_owner_ids:
+            continue
+        lineage_row = getattr(entry, "lineage_row", None)
+        recovery_leaf = getattr(lineage_row, "recovery_leaf_task", None)
+        recovery_leaf_id = getattr(recovery_leaf, "id", None)
+        if recovery_leaf_id is not None and str(recovery_leaf_id) in excluded_owner_ids:
             continue
         if entry.lane == "pending" and (
             str(task_id) in pending_recovery_task_ids or str(task_id) in step1_handled_child_task_ids
@@ -5187,7 +5439,7 @@ def _collect_unhandled_failures(
         failures.append(
             _ObservedFailure(
                 task_id=task_id,
-                owner_task_id=_resolve_failure_owner_task_id(store, task_id),
+                owner_task_id=_resolve_failure_unit_task_id(store, task_id, scoped_owner_ids=scoped_owner_ids),
                 task_type=new_row.get("task_type") or "implement",
                 reason=reason,
             )
@@ -5551,16 +5803,56 @@ def _active_failure_backoff_owner_ids(
     )
 
 
+def _task_nearest_scope_identity(store: SqliteTaskStore, task_id: str, scoped_owner_ids: tuple[str, ...] | None) -> str | None:
+    if scoped_owner_ids is None:
+        return None
+    scope_id_set = set(scoped_owner_ids)
+    if task_id in scope_id_set:
+        return task_id
+    task = store.get(task_id)
+    if task is None:
+        return None
+    pending_ids = [task.based_on, task.depends_on]
+    seen: set[str] = set()
+    while pending_ids:
+        parent_id = pending_ids.pop()
+        if parent_id is None or parent_id in seen:
+            continue
+        if parent_id in scope_id_set:
+            return parent_id
+        seen.add(parent_id)
+        parent = store.get(parent_id)
+        if parent is not None:
+            pending_ids.extend([parent.based_on, parent.depends_on])
+    owner_id = resolve_lineage_owner_task_id(store, task_id)
+    if owner_id in scope_id_set:
+        return owner_id
+    return None
+
+
+def _resolve_failure_unit_task_id(
+    store: SqliteTaskStore,
+    task_id: str,
+    *,
+    scoped_owner_ids: tuple[str, ...] | None = None,
+) -> str:
+    scoped_identity = _task_nearest_scope_identity(store, task_id, scoped_owner_ids)
+    if scoped_identity is not None:
+        return scoped_identity
+    return _resolve_failure_owner_task_id(store, task_id)
+
+
 def _reset_failure_backoff_for_completed_owners(
     *,
     store: SqliteTaskStore,
     completed_ids: Sequence[str],
     failure_backoffs: dict[str, _OwnerFailureBackoffState],
     log: _WatchLog,
+    scoped_owner_ids: tuple[str, ...] | None = None,
 ) -> None:
     cleared: list[tuple[str, str]] = []
     for task_id in completed_ids:
-        owner_id = _resolve_failure_owner_task_id(store, task_id)
+        owner_id = _resolve_failure_unit_task_id(store, task_id, scoped_owner_ids=scoped_owner_ids)
         if owner_id not in failure_backoffs:
             continue
         failure_backoffs.pop(owner_id, None)
@@ -5637,6 +5929,8 @@ def _analyze_watch_cycle(
     recovery_mode: DispatchSelectionMode | None,
     max_recovery_attempts: int,
     scoped_owner_ids: tuple[str, ...] | None = None,
+    scoped_task_ids: tuple[str, ...] | None = None,
+    known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
     excluded_owner_ids: frozenset[str] = frozenset(),
 ) -> _WatchCycleAnalysis:
     del slots, recovery_slots, recovery_mode
@@ -5654,19 +5948,41 @@ def _analyze_watch_cycle(
             )
         )
         impl_based_on_ids = collect_non_dropped_implement_source_ids(store.get_all())
-        owner_rows, watch_read_context = _query_owner_rows_with_context(
+        scope_selectors = _build_watch_scope_selectors(
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            effective_scoped_owner_ids=known_effective_scoped_owner_ids,
+        )
+        owner_rows, watch_read_context = _query_scoped_owner_rows_with_context(
             store=store,
             config=config,
             git=git,
             target_branch=target_branch,
             tags=tags,
             any_tag=any_tag,
-            owner_task_ids=scoped_owner_ids,
+            selectors=scope_selectors,
             max_recovery_attempts=max_recovery_attempts,
             include_skipped=True,
         )
+        owner_rows = list(owner_rows)
         if excluded_owner_ids:
-            owner_rows = [row for row in owner_rows if row.owner_task.id not in excluded_owner_ids]
+            owner_rows = [
+                row
+                for row in owner_rows
+                if row.owner_task.id not in excluded_owner_ids
+                and (
+                    row.recovery_leaf_task is None
+                    or row.recovery_leaf_task.id is None
+                    or row.recovery_leaf_task.id not in excluded_owner_ids
+                )
+            ]
+        effective_scoped_owner_ids = _derive_effective_scoped_owner_ids(
+            store=store,
+            owner_rows=owner_rows,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
+        )
         lifecycle_rows = tuple(
             row
             for row in owner_rows
@@ -5863,6 +6179,7 @@ def _analyze_watch_cycle(
             active_recovery_subject_ids=frozenset(active_recovery_subject_ids),
             actionable_failed=tuple(actionable_failed),
             pending_recovery_task_ids=frozenset(pending_recovery_task_ids),
+            effective_scoped_owner_ids=effective_scoped_owner_ids,
         )
 
 
@@ -5876,20 +6193,34 @@ def _evaluate_blind_parked_auto_rearm(
     tags: tuple[str, ...] | None,
     any_tag: bool,
     scoped_owner_ids: tuple[str, ...] | None,
+    scoped_task_ids: tuple[str, ...] | None = None,
+    startup_scoped_owner_ids: tuple[str, ...] | None = None,
 ) -> _BlindParkedAutoRearmResult:
     """Blindly auto-rearm eligible parked subjects using the shared parked clear service."""
     policy = config.watch.parked_auto_rearm
     if not policy.enabled:
         return _BlindParkedAutoRearmResult(decisions=())
 
+    scope_selectors = _build_watch_scope_selectors(
+        scoped_owner_ids=startup_scoped_owner_ids or scoped_owner_ids,
+        scoped_task_ids=scoped_task_ids,
+        effective_scoped_owner_ids=scoped_owner_ids,
+    )
     cooldown = timedelta(hours=policy.cooldown_hours)
     candidates, _stale_cleared = discover_parked_tasks(
         store,
         config=config,
         git=git,
         target_branch=target_branch,
+        task_ids=scoped_owner_ids or (),
+        selector_kinds=_selector_kinds_from_selectors(scope_selectors),
     )
     scoped_owner_id_set = frozenset(scoped_owner_ids or ())
+    scope_kind_by_effective_id = (
+        {selector.effective_owner_id: selector.scope_kind for selector in scope_selectors}
+        if scope_selectors is not None
+        else {}
+    )
     now = datetime.now(UTC)
     decisions: list[_BlindParkedAutoRearmDecision] = []
 
@@ -5899,8 +6230,22 @@ def _evaluate_blind_parked_auto_rearm(
         subject_id = candidate.subject_task.id
         if owner_id is None or subject_id is None:
             continue
-        if scoped_owner_ids is not None and owner_id not in scoped_owner_id_set:
+        if scoped_owner_ids is not None and owner_id not in scoped_owner_id_set and subject_id not in scoped_owner_id_set:
             continue
+        render_task_id = owner_id
+        render_scope_kind: Literal["canonical_owner", "effective_leaf"] = "canonical_owner"
+        if scoped_owner_ids is not None:
+            subject_scope_kind = scope_kind_by_effective_id.get(subject_id)
+            owner_scope_kind = scope_kind_by_effective_id.get(owner_id)
+            if subject_scope_kind == "effective_leaf":
+                render_task_id = subject_id
+                render_scope_kind = "effective_leaf"
+            elif owner_scope_kind is not None:
+                render_task_id = owner_id
+                render_scope_kind = owner_scope_kind
+            elif subject_scope_kind is not None:
+                render_task_id = subject_id
+                render_scope_kind = subject_scope_kind
         if tags is not None and not task_matches_tag_filters(
             task_tags=owner_task.tags,
             tag_filters=tags,
@@ -5908,14 +6253,38 @@ def _evaluate_blind_parked_auto_rearm(
         ):
             continue
 
-        guard_reason = skip_reason_for_landed_or_moot(
+        guard_task = owner_task
+        scoped_leaf_has_live_work = False
+        if scoped_owner_ids is not None and subject_id in scoped_owner_id_set and subject_id != owner_id:
+            guard_task = replace(candidate.subject_task, merge_status=None, has_commits=True)
+            if guard_task.branch:
+                scoped_leaf_has_live_work = git.has_non_empty_source_diff_against_target(
+                    guard_task.branch,
+                    target_branch,
+                ) is True
+        elif scoped_owner_ids is not None and owner_id in scoped_owner_id_set and subject_id != owner_id:
+            guard_task = replace(candidate.subject_task, merge_status=None, has_commits=True)
+            if guard_task.branch:
+                scoped_leaf_has_live_work = git.has_non_empty_source_diff_against_target(
+                    guard_task.branch,
+                    target_branch,
+                ) is True
+        guard_reason = None if scoped_leaf_has_live_work else skip_reason_for_landed_or_moot(
             store,
             git=git,
             target_branch=target_branch,
-            task=owner_task,
+            task=guard_task,
         )
         if guard_reason is not None:
-            decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", guard_reason))
+            decisions.append(
+                _BlindParkedAutoRearmDecision(
+                    candidate,
+                    "skipped",
+                    guard_reason,
+                    render_task_id=render_task_id,
+                    render_scope_kind=render_scope_kind,
+                )
+            )
             continue
 
         rearm_state = store.get_parked_task_rearm(
@@ -5925,21 +6294,53 @@ def _evaluate_blind_parked_auto_rearm(
         )
         auto_attempt_count = rearm_state.auto_attempt_count if rearm_state is not None else 0
         if auto_attempt_count >= policy.budget:
-            decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "budget exhausted"))
+            decisions.append(
+                _BlindParkedAutoRearmDecision(
+                    candidate,
+                    "skipped",
+                    "budget exhausted",
+                    render_task_id=render_task_id,
+                    render_scope_kind=render_scope_kind,
+                )
+            )
             continue
 
         last_auto_attempt_at = rearm_state.last_auto_attempt_at if rearm_state is not None else None
         if last_auto_attempt_at is not None and now < last_auto_attempt_at + cooldown:
-            decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "cooldown active"))
+            decisions.append(
+                _BlindParkedAutoRearmDecision(
+                    candidate,
+                    "skipped",
+                    "cooldown active",
+                    render_task_id=render_task_id,
+                    render_scope_kind=render_scope_kind,
+                )
+            )
             continue
 
         if policy.require_target_advanced:
             if not target_sha:
-                decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "target SHA unavailable"))
+                decisions.append(
+                    _BlindParkedAutoRearmDecision(
+                        candidate,
+                        "skipped",
+                        "target SHA unavailable",
+                        render_task_id=render_task_id,
+                        render_scope_kind=render_scope_kind,
+                    )
+                )
                 continue
             last_target_sha = rearm_state.last_auto_attempt_target_sha if rearm_state is not None else None
             if last_target_sha == target_sha:
-                decisions.append(_BlindParkedAutoRearmDecision(candidate, "skipped", "target SHA unchanged"))
+                decisions.append(
+                    _BlindParkedAutoRearmDecision(
+                        candidate,
+                        "skipped",
+                        "target SHA unchanged",
+                        render_task_id=render_task_id,
+                        render_scope_kind=render_scope_kind,
+                    )
+                )
                 continue
 
         clear_parked_candidate_state(
@@ -5954,7 +6355,15 @@ def _evaluate_blind_parked_auto_rearm(
             subject_task_id=subject_id,
             target_sha=target_sha,
         )
-        decisions.append(_BlindParkedAutoRearmDecision(candidate, "rearmed", "blind auto-rearm"))
+        decisions.append(
+            _BlindParkedAutoRearmDecision(
+                candidate,
+                "rearmed",
+                "blind auto-rearm",
+                render_task_id=render_task_id,
+                render_scope_kind=render_scope_kind,
+            )
+        )
 
     return _BlindParkedAutoRearmResult(decisions=tuple(decisions))
 
@@ -5970,6 +6379,149 @@ def _scoped_member_task_ids(owner_rows: list[LineageOwnerRow], owner_task_ids: t
         if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None:
             member_ids.add(str(row.recovery_leaf_task.id))
     return member_ids
+
+
+def _derive_effective_scoped_owner_ids(
+    *,
+    store: SqliteTaskStore,
+    owner_rows: Sequence[LineageOwnerRow],
+    scoped_owner_ids: tuple[str, ...] | None,
+    scoped_task_ids: tuple[str, ...] | None = None,
+    known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
+) -> tuple[str, ...] | None:
+    if scoped_owner_ids is None:
+        return None
+
+    effective: list[str] = []
+    raw_task_ids = scoped_task_ids or ()
+    known_effective_ids = known_effective_scoped_owner_ids or ()
+    selector_pairs: tuple[tuple[str, str | None], ...] = (
+        tuple(zip(scoped_owner_ids, raw_task_ids, strict=False))
+        if raw_task_ids
+        else tuple((owner_id, None) for owner_id in scoped_owner_ids)
+    )
+    if len(selector_pairs) < len(scoped_owner_ids):
+        selector_pairs += tuple((owner_id, None) for owner_id in scoped_owner_ids[len(selector_pairs) :])
+
+    def _row_owner_has_terminal_merge_proof(row: LineageOwnerRow) -> bool:
+        row_owner_id = row.owner_task.id
+        if row_owner_id is None:
+            return False
+        merge_unit = store.resolve_merge_unit_for_task(row_owner_id)
+        if merge_unit is not None:
+            return merge_state_is_terminal_for_lifecycle(merge_unit.state)
+        for task in row.members:
+            if task.id != row_owner_id:
+                continue
+            return merge_state_is_terminal_for_lifecycle(task.merge_status)
+        return merge_state_is_terminal_for_lifecycle(row.owner_task.merge_status)
+
+    for selector_index, (scoped_owner_id, raw_task_id) in enumerate(selector_pairs):
+        matching_row_ids: list[str] = []
+        known_effective_id = (
+            known_effective_ids[selector_index] if selector_index < len(known_effective_ids) else None
+        )
+        has_proven_leaf_scope = (
+            raw_task_id is not None
+            and known_effective_id == raw_task_id
+            and scoped_owner_id != raw_task_id
+        )
+        if raw_task_id is not None and scoped_owner_id != raw_task_id:
+            for row in owner_rows:
+                row_owner_id = row.owner_task.id
+                if (
+                    row_owner_id == scoped_owner_id
+                    and row.recovery_leaf_task is not None
+                    and row.recovery_leaf_task.id == raw_task_id
+                    and (
+                        has_proven_leaf_scope
+                        or _row_owner_has_terminal_merge_proof(row)
+                    )
+                ):
+                    matching_row_ids = [str(row.recovery_leaf_task.id)]
+                    break
+        for row in owner_rows:
+            if matching_row_ids:
+                break
+            row_owner_id = row.owner_task.id
+            if row_owner_id is None:
+                continue
+            if (
+                raw_task_id is not None
+                and row_owner_id == scoped_owner_id
+                and row_owner_id != raw_task_id
+                and _row_owner_has_terminal_merge_proof(row)
+                and any(task.id == raw_task_id and task.status == "failed" for task in row.unresolved_tasks)
+            ):
+                matching_row_ids = [raw_task_id]
+                break
+            if row_owner_id == scoped_owner_id:
+                matching_row_ids = [row_owner_id]
+                break
+            row_member_ids = _scoped_member_task_ids([row], ())
+            if scoped_owner_id in row_member_ids or resolve_lineage_owner_task_id(store, row_owner_id) == scoped_owner_id:
+                matching_row_ids.append(row_owner_id)
+        if len(set(matching_row_ids)) == 1:
+            effective_id = matching_row_ids[0]
+        elif has_proven_leaf_scope:
+            effective_id = str(raw_task_id)
+        else:
+            effective_id = scoped_owner_id
+        effective.append(effective_id)
+    return tuple(effective)
+
+
+def _task_is_descendant_of(store: SqliteTaskStore, task_id: str, ancestor_id: str) -> bool:
+    pending_ids: list[str | None] = [task_id]
+    seen: set[str] = set()
+    while pending_ids:
+        current_id = pending_ids.pop()
+        if current_id is None or current_id in seen:
+            continue
+        if current_id == ancestor_id:
+            return True
+        seen.add(current_id)
+        task = store.get(current_id)
+        if task is not None:
+            pending_ids.extend((task.based_on, task.depends_on))
+    return False
+
+
+def _row_is_effective_leaf_scope(row: LineageOwnerRow, owner_id: str) -> bool:
+    return (
+        row.recovery_leaf_task is not None
+        and row.recovery_leaf_task.id == owner_id
+        and row.owner_task.id != owner_id
+    )
+
+
+def _effective_leaf_scope_is_active(
+    *,
+    store: SqliteTaskStore,
+    leaf_id: str,
+    row: LineageOwnerRow | None,
+    running_task_ids: set[str],
+    planned_active_owner_ids: frozenset[str],
+) -> bool:
+    if leaf_id in planned_active_owner_ids:
+        return True
+    if any(_task_is_descendant_of(store, running_id, leaf_id) for running_id in running_task_ids):
+        return True
+    leaf = store.get(leaf_id)
+    if leaf is not None and leaf.status in {"pending", "in_progress"}:
+        return True
+    for candidate in store.get_all():
+        if candidate.id is None or candidate.status not in {"pending", "in_progress"}:
+            continue
+        if _task_is_descendant_of(store, candidate.id, leaf_id):
+            return True
+    if row is not None:
+        for row_task in (row.recovery_action_task, row.lifecycle_action_task):
+            if row_task is None or row_task.id is None:
+                continue
+            if row_task.status in {"pending", "in_progress"} and _task_is_descendant_of(store, row_task.id, leaf_id):
+                return True
+    return False
 
 
 def _missing_scoped_owner_row_is_active(
@@ -6012,11 +6564,41 @@ def _scoped_owner_active_count(
     running_task_ids: set[str],
     planned_active_owner_ids: frozenset[str] = frozenset(),
 ) -> int:
-    rows_by_owner_id = {row.owner_task.id: row for row in owner_rows if row.owner_task.id is not None}
+    rows_by_owner_id: dict[str, list[LineageOwnerRow]] = {}
+    rows_by_leaf_id: dict[str, LineageOwnerRow] = {}
+    for row in owner_rows:
+        if row.owner_task.id is not None:
+            rows_by_owner_id.setdefault(row.owner_task.id, []).append(row)
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None:
+            rows_by_leaf_id[str(row.recovery_leaf_task.id)] = row
     active = 0
     for owner_id in scoped_owner_ids:
-        row = rows_by_owner_id.get(owner_id)
-        if row is None:
+        scoped_leaf_row = rows_by_leaf_id.get(owner_id)
+        if scoped_leaf_row is not None and _row_is_effective_leaf_scope(scoped_leaf_row, owner_id):
+            if _effective_leaf_scope_is_active(
+                store=store,
+                leaf_id=owner_id,
+                row=scoped_leaf_row,
+                running_task_ids=running_task_ids,
+                planned_active_owner_ids=planned_active_owner_ids,
+            ):
+                active += 1
+            continue
+
+        scoped_rows = rows_by_owner_id.get(owner_id, [])
+        if not scoped_rows:
+            if _effective_leaf_scope_is_active(
+                store=store,
+                leaf_id=owner_id,
+                row=None,
+                running_task_ids=running_task_ids,
+                planned_active_owner_ids=planned_active_owner_ids,
+            ):
+                active += 1
+                continue
+            task = store.get(owner_id)
+            if task is not None and task.status == "failed":
+                continue
             if _missing_scoped_owner_row_is_active(
                 store=store,
                 owner_id=owner_id,
@@ -6024,14 +6606,14 @@ def _scoped_owner_active_count(
             ):
                 active += 1
             continue
-        member_ids = _scoped_member_task_ids([row], (owner_id,))
+        member_ids = _scoped_member_task_ids(scoped_rows, (owner_id,))
         if member_ids.intersection(running_task_ids):
             active += 1
             continue
-        if any(member.status in {"pending", "in_progress"} for member in row.members):
+        if any(member.status in {"pending", "in_progress"} for row in scoped_rows for member in row.members):
             active += 1
             continue
-        if owner_id in planned_active_owner_ids:
+        if owner_id in planned_active_owner_ids or member_ids.intersection(planned_active_owner_ids):
             active += 1
             continue
     return active
@@ -6048,7 +6630,38 @@ def _scoped_watch_active_count(
     recovery_mode: DispatchSelectionMode | None,
     max_recovery_attempts: int,
     scoped_owner_ids: tuple[str, ...],
+    scoped_task_ids: tuple[str, ...] | None = None,
+    known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
 ) -> int:
+    return _scoped_watch_activity(
+        config=config,
+        store=store,
+        batch=batch,
+        tags=tags,
+        any_tag=any_tag,
+        recovery_slots=recovery_slots,
+        recovery_mode=recovery_mode,
+        max_recovery_attempts=max_recovery_attempts,
+        scoped_owner_ids=scoped_owner_ids,
+        scoped_task_ids=scoped_task_ids,
+        known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
+    ).active_count
+
+
+def _scoped_watch_activity(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    batch: int,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    recovery_slots: int,
+    recovery_mode: DispatchSelectionMode | None,
+    max_recovery_attempts: int,
+    scoped_owner_ids: tuple[str, ...],
+    scoped_task_ids: tuple[str, ...] | None = None,
+    known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
+) -> _ScopedWatchActivity:
     plan = _build_watch_cycle_plan(
         config=config,
         store=store,
@@ -6059,14 +6672,21 @@ def _scoped_watch_active_count(
         recovery_mode=recovery_mode,
         max_recovery_attempts=max_recovery_attempts,
         scoped_owner_ids=scoped_owner_ids,
+        scoped_task_ids=scoped_task_ids,
+        known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
     )
     planned_active_owner_ids = _collect_planned_active_owner_ids(plan.analysis)
-    return _scoped_owner_active_count(
+    effective_scoped_owner_ids = getattr(plan.analysis, "effective_scoped_owner_ids", None) or scoped_owner_ids
+    active_count = _scoped_owner_active_count(
         store=store,
         owner_rows=list(plan.analysis.owner_rows),
-        scoped_owner_ids=scoped_owner_ids,
+        scoped_owner_ids=effective_scoped_owner_ids,
         running_task_ids=set(plan.running_task_ids),
         planned_active_owner_ids=planned_active_owner_ids,
+    )
+    return _ScopedWatchActivity(
+        active_count=active_count,
+        effective_scoped_owner_ids=effective_scoped_owner_ids,
     )
 
 
@@ -6079,7 +6699,11 @@ def _collect_planned_active_owner_ids(analysis: _WatchCycleAnalysis) -> frozense
         if classify_advance_action(action) not in {"skip", "needs_attention"}:
             active_owner_ids.add(str(owner_id))
     for row, _failed, decision, _action, _worker_consuming, _action_task in analysis.actionable_failed:
-        owner_id = row.owner_task.id
+        owner_id = (
+            row.recovery_leaf_task.id
+            if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+            else row.owner_task.id
+        )
         if owner_id is None:
             continue
         if decision.action in {"resume", "retry", "reconcile"}:
@@ -6099,8 +6723,21 @@ def _transition_task_matches_scope(
     task = store.get(task_id)
     if task is None:
         return False
+    scope_id_set = set(scoped_owner_ids)
+    pending_ids = [task.based_on, task.depends_on]
+    seen: set[str] = set()
+    while pending_ids:
+        parent_id = pending_ids.pop()
+        if parent_id is None or parent_id in seen:
+            continue
+        if parent_id in scope_id_set:
+            return True
+        seen.add(parent_id)
+        parent = store.get(parent_id)
+        if parent is not None:
+            pending_ids.extend([parent.based_on, parent.depends_on])
     owner = resolve_lineage_owner_task(store, task)
-    return owner.id in set(scoped_owner_ids)
+    return owner.id in scope_id_set
 
 
 def _build_watch_cycle_plan(
@@ -6114,6 +6751,8 @@ def _build_watch_cycle_plan(
     recovery_mode: DispatchSelectionMode | None,
     max_recovery_attempts: int,
     scoped_owner_ids: tuple[str, ...] | None = None,
+    scoped_task_ids: tuple[str, ...] | None = None,
+    known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
     excluded_owner_ids: frozenset[str] = frozenset(),
 ) -> _WatchCyclePlan:
     snapshot = get_concurrency_snapshot(config, store, cleanup_stale=False)
@@ -6160,6 +6799,8 @@ def _build_watch_cycle_plan(
         recovery_mode=recovery_mode,
         max_recovery_attempts=max_recovery_attempts,
         scoped_owner_ids=scoped_owner_ids,
+        scoped_task_ids=scoped_task_ids,
+        known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
         excluded_owner_ids=excluded_owner_ids,
     )
     return _WatchCyclePlan(
@@ -6199,6 +6840,8 @@ def _dispatch_scoped_watch_once(
     emit_cycle_header: bool = True,
     emit_lifecycle_summary: bool = True,
     scoped_owner_ids: tuple[str, ...],
+    scoped_task_ids: tuple[str, ...] | None = None,
+    known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
     dispatch_observer: _DispatchObserver | None = None,
     new_worker_start_cap: int | None = None,
     excluded_owner_ids: frozenset[str] = frozenset(),
@@ -6228,6 +6871,8 @@ def _dispatch_scoped_watch_once(
         emit_cycle_header=emit_cycle_header,
         emit_lifecycle_summary=emit_lifecycle_summary,
         scoped_owner_ids=scoped_owner_ids,
+        scoped_task_ids=scoped_task_ids,
+        known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
         dispatch_observer=dispatch_observer,
         new_worker_start_cap=new_worker_start_cap,
         excluded_owner_ids=excluded_owner_ids,
@@ -6261,6 +6906,8 @@ def _run_cycle(
     emit_cycle_header: bool = True,
     emit_lifecycle_summary: bool = True,
     scoped_owner_ids: tuple[str, ...] | None = None,
+    scoped_task_ids: tuple[str, ...] | None = None,
+    known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
     dispatch_observer: _DispatchObserver | None = None,
     new_worker_start_cap: int | None = None,
     excluded_owner_ids: frozenset[str] = frozenset(),
@@ -6296,7 +6943,12 @@ def _run_cycle(
         reconcile_in_progress_tasks(config)
         prune_terminal_dead_workers(config)
         reconcile_dead_pending_recovery_tasks(config)
-        reconcile_stale_watch_no_progress_parks(store)
+
+    if precomputed_plan is not None and excluded_owner_ids:
+        precomputed_plan = _filter_precomputed_watch_cycle_plan(
+            precomputed_plan,
+            excluded_owner_ids=excluded_owner_ids,
+        )
 
     plan = precomputed_plan or _build_watch_cycle_plan(
         config=config,
@@ -6308,6 +6960,8 @@ def _run_cycle(
         recovery_mode=recovery_mode,
         max_recovery_attempts=max_recovery_attempts,
         scoped_owner_ids=scoped_owner_ids,
+        scoped_task_ids=scoped_task_ids,
+        known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
         excluded_owner_ids=excluded_owner_ids,
     )
     running_task_ids = list(plan.running_task_ids)
@@ -6318,6 +6972,17 @@ def _run_cycle(
     blocked_pending_count = plan.blocked_pending_count
     running = plan.running
     slots = plan.slots
+    effective_scoped_owner_ids = getattr(plan.analysis, "effective_scoped_owner_ids", None) or scoped_owner_ids
+    if not dry_run:
+        scope_selectors = _build_watch_scope_selectors(
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            effective_scoped_owner_ids=effective_scoped_owner_ids,
+        )
+        reconcile_stale_watch_no_progress_parks(
+            store,
+            scopes=_watch_progress_scopes_from_selectors(scope_selectors),
+        )
     work_done = False
     confirmed_start_count = 0
     recovery_started_this_cycle = False
@@ -6369,7 +7034,7 @@ def _run_cycle(
                 starting_worker_count=starting_worker_count,
             ),
         )
-        scope_message = _format_scope_message(tags, any_tag=any_tag, scoped_owner_ids=scoped_owner_ids)
+        scope_message = _format_scope_message(tags, any_tag=any_tag, scoped_owner_ids=effective_scoped_owner_ids)
         if scope_message is not None:
             log.emit("INFO", scope_message)
 
@@ -7664,15 +8329,20 @@ def _run_cycle(
             target_sha=target_sha,
             tags=tags,
             any_tag=any_tag,
-            scoped_owner_ids=scoped_owner_ids,
+            scoped_owner_ids=effective_scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            startup_scoped_owner_ids=scoped_owner_ids,
         )
         for auto_rearm_decision in auto_rearm_result.decisions:
-            owner_id = auto_rearm_decision.candidate.owner_task.id
-            if auto_rearm_decision.status == "rearmed" and owner_id is not None:
+            render_task_id = auto_rearm_decision.render_task_id
+            if auto_rearm_decision.status == "rearmed" and render_task_id is not None:
                 log.emit(
                     "REARM",
-                    (f"{owner_id}: blind auto-rearm cleared {auto_rearm_decision.candidate.attention_reason}"),
-                    dedupe_key=f"blind-auto-rearm:{owner_id}:{auto_rearm_decision.candidate.attention_reason}",
+                    (f"{render_task_id}: blind auto-rearm cleared {auto_rearm_decision.candidate.attention_reason}"),
+                    dedupe_key=(
+                        f"blind-auto-rearm:{auto_rearm_decision.render_scope_kind or 'canonical_owner'}:"
+                        f"{render_task_id}:{auto_rearm_decision.candidate.attention_reason}"
+                    ),
                 )
                 work_done = True
         if auto_rearm_result.rearmed_owner_ids:
@@ -7687,6 +8357,8 @@ def _run_cycle(
                 recovery_mode=recovery_mode,
                 max_recovery_attempts=max_recovery_attempts,
                 scoped_owner_ids=scoped_owner_ids,
+                scoped_task_ids=scoped_task_ids,
+                known_effective_scoped_owner_ids=effective_scoped_owner_ids,
                 excluded_owner_ids=excluded_owner_ids,
             )
 
@@ -8909,6 +9581,8 @@ def _run_cycle(
             recovery_mode=recovery_mode,
             max_recovery_attempts=max_recovery_attempts,
             scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            known_effective_scoped_owner_ids=effective_scoped_owner_ids,
         )
         if scoped_mode and scoped_owner_ids is not None
         else 0
@@ -8933,6 +9607,7 @@ def _run_cycle(
         pending=pending_count,
         scoped_done=(scoped_active == 0) if scoped_mode else None,
         scoped_active=scoped_active,
+        effective_scoped_owner_ids=effective_scoped_owner_ids,
         anonymous_worker_count=end_anonymous_worker_count,
         starting_worker_count=end_starting_worker_count,
         expected_starts=expected_starts,
@@ -8957,6 +9632,8 @@ def _preview_initial_watch_cycle(
     auto_restart_on_drift: bool,
     installed_package_drift: _InstalledPackageDriftState | None,
     scoped_owner_ids: tuple[str, ...] | None = None,
+    scoped_task_ids: tuple[str, ...] | None = None,
+    known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
     excluded_owner_ids: frozenset[str] = frozenset(),
 ) -> tuple[_CycleResult, _WatchCyclePlan]:
     plan = _build_watch_cycle_plan(
@@ -8969,6 +9646,8 @@ def _preview_initial_watch_cycle(
         recovery_mode=recovery_mode,
         max_recovery_attempts=max_recovery_attempts,
         scoped_owner_ids=scoped_owner_ids,
+        scoped_task_ids=scoped_task_ids,
+        known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
         excluded_owner_ids=excluded_owner_ids,
     )
     log.begin_cycle()
@@ -8993,6 +9672,8 @@ def _preview_initial_watch_cycle(
             begin_cycle=False,
             end_cycle=False,
             scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            known_effective_scoped_owner_ids=plan.analysis.effective_scoped_owner_ids,
             excluded_owner_ids=excluded_owner_ids,
         )
     else:
@@ -9016,6 +9697,8 @@ def _preview_initial_watch_cycle(
             begin_cycle=False,
             end_cycle=False,
             scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            known_effective_scoped_owner_ids=plan.analysis.effective_scoped_owner_ids,
             excluded_owner_ids=excluded_owner_ids,
         )
     return result, plan
@@ -9166,6 +9849,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             return 1
     else:
         scoped_owner_ids = None
+    effective_scoped_owner_ids = scoped_owner_ids
     stop_requested = False
     stop_signal: int | None = None
     sigint_count = 0
@@ -9234,6 +9918,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
         def _process_failure_boundary(
             old_snapshot: dict[str, dict[str, str | None]],
             new_snapshot: dict[str, dict[str, str | None]],
+            *,
+            boundary_scoped_owner_ids: tuple[str, ...] | None,
         ) -> bool:
             completed_ids = _collect_completed_transition_ids(
                 old_snapshot,
@@ -9241,13 +9927,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 store=store,
                 tags=tag_filters,
                 any_tag=any_tag,
-                scoped_owner_ids=scoped_owner_ids,
+                scoped_owner_ids=boundary_scoped_owner_ids,
             )
             _reset_failure_backoff_for_completed_owners(
                 store=store,
                 completed_ids=completed_ids,
                 failure_backoffs=failure_backoffs,
                 log=log,
+                scoped_owner_ids=boundary_scoped_owner_ids,
             )
             unhandled_failures = _collect_unhandled_failures(
                 old_snapshot,
@@ -9257,7 +9944,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 restart_failed_mode=dispatch_mode == "recovery_only",
                 tags=tag_filters,
                 any_tag=any_tag,
-                scoped_owner_ids=scoped_owner_ids,
+                scoped_owner_ids=boundary_scoped_owner_ids,
             )
             return _record_failure_backoff_updates(
                 config=config,
@@ -9269,7 +9956,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             )
 
         def _preview_initial_cycle_and_confirm() -> int | None:
-            nonlocal needs_initial_preview, pending_first_cycle_plan, preview_cycle_open
+            nonlocal needs_initial_preview, pending_first_cycle_plan, preview_cycle_open, effective_scoped_owner_ids
             preview_result, preview_plan = _preview_initial_watch_cycle(
                 config=config,
                 store=store,
@@ -9285,9 +9972,13 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 auto_restart_on_drift=auto_restart_on_drift,
                 installed_package_drift=installed_package_drift,
                 scoped_owner_ids=scoped_owner_ids,
+                scoped_task_ids=raw_task_ids if scoped_owner_ids is not None else None,
+                known_effective_scoped_owner_ids=effective_scoped_owner_ids,
                 excluded_owner_ids=_active_failure_owner_ids(),
             )
             needs_initial_preview = False
+            if preview_plan is not None:
+                effective_scoped_owner_ids = preview_plan.analysis.effective_scoped_owner_ids or scoped_owner_ids
             if preview_result.work_done:
                 if not sys.stdout.isatty():
                     log.end_cycle()
@@ -9315,6 +10006,27 @@ def cmd_watch(args: argparse.Namespace) -> int:
             log.end_cycle()
             return None
 
+        def _prime_effective_scope_for_boundary() -> None:
+            nonlocal effective_scoped_owner_ids, pending_first_cycle_plan
+            if scoped_owner_ids is None:
+                return
+            if pending_first_cycle_plan is None:
+                pending_first_cycle_plan = _build_watch_cycle_plan(
+                    config=config,
+                    store=store,
+                    batch=batch,
+                    tags=tag_filters,
+                    any_tag=any_tag,
+                    recovery_slots=recovery_slots,
+                    recovery_mode=dispatch_mode,
+                    max_recovery_attempts=max_recovery_attempts,
+                    scoped_owner_ids=scoped_owner_ids,
+                    scoped_task_ids=raw_task_ids,
+                    known_effective_scoped_owner_ids=effective_scoped_owner_ids,
+                    excluded_owner_ids=_active_failure_owner_ids(),
+                )
+            effective_scoped_owner_ids = pending_first_cycle_plan.analysis.effective_scoped_owner_ids or scoped_owner_ids
+
         if resumed_reexec:
             log.emit(
                 "INFO",
@@ -9333,7 +10045,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     preview_cycle_open = False
                     pending_first_cycle_plan = None
                 if scoped_owner_ids is not None:
-                    scoped_active = _scoped_watch_active_count(
+                    scoped_activity = _scoped_watch_activity(
                         config=config,
                         store=store,
                         batch=batch,
@@ -9343,15 +10055,26 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         recovery_mode=dispatch_mode,
                         max_recovery_attempts=max_recovery_attempts,
                         scoped_owner_ids=scoped_owner_ids,
+                        scoped_task_ids=raw_task_ids,
+                        known_effective_scoped_owner_ids=effective_scoped_owner_ids,
                     )
-                    if scoped_active == 0:
+                    effective_scoped_owner_ids = scoped_activity.effective_scoped_owner_ids
+                    scope_message = _format_scope_message(
+                        tag_filters,
+                        any_tag=any_tag,
+                        scoped_owner_ids=effective_scoped_owner_ids,
+                    )
+                    if scope_message is not None:
+                        log.emit("INFO", scope_message)
+                    if scoped_activity.active_count == 0:
                         log.emit("INFO", SCOPED_WATCH_COMPLETE_MESSAGE)
                         break
                     log.emit(
                         "HOLD",
                         (
                             "System unavailable: Docker daemon unreachable - "
-                            f"holding scoped watch ({scoped_active} active owner units), nothing started/failed"
+                            f"holding scoped watch ({scoped_activity.active_count} active owner units), "
+                            "nothing started/failed"
                         ),
                     )
                 else:
@@ -9411,6 +10134,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     return preview_abort_code
                 continue
 
+            _prime_effective_scope_for_boundary()
             pre_cycle_snapshot = _task_snapshot(store)
             pre_cycle_confirmed_start_ids = _emit_transition_events(
                 previous_snapshot,
@@ -9420,7 +10144,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 log=log,
                 restart_failed_mode=dispatch_mode == "recovery_only",
                 max_recovery_attempts=max_recovery_attempts,
-                scoped_owner_ids=scoped_owner_ids,
+                scoped_owner_ids=effective_scoped_owner_ids,
             )
             cycle_confirmed_start_count = _process_expected_start_boundary(
                 store=store,
@@ -9430,11 +10154,18 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 snapshot=pre_cycle_snapshot,
                 confirmed_start_ids=pre_cycle_confirmed_start_ids,
             )
-            if _process_failure_boundary(previous_snapshot, pre_cycle_snapshot):
+            excluded_owner_ids_before_boundary = _active_failure_owner_ids()
+            if _process_failure_boundary(
+                previous_snapshot,
+                pre_cycle_snapshot,
+                boundary_scoped_owner_ids=effective_scoped_owner_ids,
+            ):
                 previous_snapshot = pre_cycle_snapshot
                 break
             previous_snapshot = pre_cycle_snapshot
             excluded_owner_ids = _active_failure_owner_ids()
+            if excluded_owner_ids != excluded_owner_ids_before_boundary:
+                pending_first_cycle_plan = None
 
             if scoped_owner_ids is not None:
                 cycle_result = _dispatch_scoped_watch_once(
@@ -9460,6 +10191,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     emit_cycle_header=not preview_cycle_open,
                     emit_lifecycle_summary=not preview_cycle_open,
                     scoped_owner_ids=scoped_owner_ids,
+                    scoped_task_ids=raw_task_ids,
+                    known_effective_scoped_owner_ids=effective_scoped_owner_ids,
                     excluded_owner_ids=excluded_owner_ids,
                     seen_active_recovery_subject_ids=seen_active_recovery_subject_ids,
                 )
@@ -9487,11 +10220,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     emit_cycle_header=not preview_cycle_open,
                     emit_lifecycle_summary=not preview_cycle_open,
                     scoped_owner_ids=scoped_owner_ids,
+                    scoped_task_ids=raw_task_ids if scoped_owner_ids is not None else None,
+                    known_effective_scoped_owner_ids=effective_scoped_owner_ids,
                     excluded_owner_ids=excluded_owner_ids,
                     seen_active_recovery_subject_ids=seen_active_recovery_subject_ids,
                 )
             pending_first_cycle_plan = None
             preview_cycle_open = False
+            effective_scoped_owner_ids = cycle_result.effective_scoped_owner_ids or scoped_owner_ids
             cycle_result.confirmed_start_count += cycle_confirmed_start_count
             if cycle_result.expected_starts:
                 expected_starts.update(cycle_result.expected_starts)
@@ -9510,7 +10246,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 log=log,
                 restart_failed_mode=dispatch_mode == "recovery_only",
                 max_recovery_attempts=max_recovery_attempts,
-                scoped_owner_ids=scoped_owner_ids,
+                scoped_owner_ids=effective_scoped_owner_ids,
             )
             cycle_result.confirmed_start_count += _process_expected_start_boundary(
                 store=store,
@@ -9520,7 +10256,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 snapshot=current_snapshot,
                 confirmed_start_ids=post_cycle_confirmed_start_ids,
             )
-            if _process_failure_boundary(previous_snapshot, current_snapshot):
+            if _process_failure_boundary(
+                previous_snapshot,
+                current_snapshot,
+                boundary_scoped_owner_ids=effective_scoped_owner_ids,
+            ):
                 previous_snapshot = current_snapshot
                 break
             previous_snapshot = current_snapshot

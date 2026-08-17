@@ -767,6 +767,16 @@ class TestHelpOutput:
         assert result.returncode == 0
         text = " ".join(result.stdout.split())
         assert "default: watch.batch or 2" in text
+
+    def test_watch_help_describes_effective_selector_scope(self, tmp_path):
+        """watch --help should describe canonical-owner and effective-leaf selector semantics."""
+        setup_config(tmp_path)
+        result = invoke_gza("watch", "--help", "--project", str(tmp_path))
+        assert result.returncode == 0
+        text = " ".join(result.stdout.split())
+        assert "effective selector scope" in text
+        assert "canonical owner drives that whole owner" in text
+        assert "re-root to that leaf and exclude sibling work" in text
         assert "--recovery-slots" in text
         assert "--recovery-only" in text
         assert "--recovery-first" in text

@@ -90,8 +90,10 @@ from gza.cli.watch import (
     _OwnerFailureBackoffState,
     _query_owner_rows_with_context,
     _record_failure_backoff_updates,
+    _reset_failure_backoff_for_completed_owners,
     _resolve_watch_attention_display_task,
     _resolve_watch_iterate_impl_for_task,
+    _resolve_watch_scope_owner_ids,
     _retire_duplicate_main_verify_remediation_tasks,
     _run_cycle,
     _should_reexec_watch,
@@ -111,7 +113,14 @@ from gza.cli.watch import (
 )
 from gza.concurrency import MaxConcurrentTasksError, launch_permit
 from gza.config import Config
-from gza.db import DuplicateActiveChildError, Task, Task as DbTask, WatchProgressObservation, WatchRecoveryBackoff
+from gza.db import (
+    DuplicateActiveChildError,
+    SqliteTaskStore,
+    Task,
+    Task as DbTask,
+    WatchProgressObservation,
+    WatchRecoveryBackoff,
+)
 from gza.dispatch_preview import (
     DispatchPreview,
     DispatchPreviewEntry,
@@ -133,8 +142,8 @@ from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_TAG,
     CandidateIntegrationVerifyCheck,
     CandidateIntegrationVerifyEvidence,
-    MainIntegrationVerifyEnvironmentIdentity,
     MainIntegrationVerifyCheck,
+    MainIntegrationVerifyEnvironmentIdentity,
     MainIntegrationVerifyState,
     check_main_integration_verify,
     current_main_integration_verify_alert,
@@ -342,6 +351,36 @@ def _empty_scoped_watch_plan(
     )
 
 
+def _empty_scoped_watch_plan_with_effective_scope(
+    effective_scoped_owner_ids: tuple[str, ...],
+) -> _WatchCyclePlan:
+    analysis = _WatchCycleAnalysis(
+        target_branch="main",
+        scope_gaps=(),
+        owner_rows=(),
+        watch_read_context=RecoveryReadContext(),
+        lifecycle_rows=(),
+        recovery_rows=(),
+        recovery_lane_entry_by_failed_id={},
+        action_plan=(),
+        recovery_attention_rows=(),
+        recovery_visible_skips=(),
+        actionable_failed=(),
+        pending_recovery_task_ids=frozenset(),
+        effective_scoped_owner_ids=effective_scoped_owner_ids,
+    )
+    return _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=analysis,
+    )
+
+
 def _make_watch_git() -> Git:
     class _UnitWatchGit(Git):
         def __init__(self) -> None:
@@ -521,6 +560,33 @@ def _make_watch_startup_git() -> Git:
 def _append_watch_config(tmp_path: Path, extra: str) -> None:
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(config_path.read_text() + extra)
+
+
+def _watch_args(tmp_path: Path, task_ids: list[str], **overrides: object) -> argparse.Namespace:
+    defaults: dict[str, object] = {
+        "project_dir": tmp_path,
+        "task_ids": task_ids,
+        "batch": 1,
+        "poll": 1,
+        "max_idle": None,
+        "max_iterations": 10,
+        "restart_failed": False,
+        "restart_failed_batch": None,
+        "max_resume_attempts": None,
+        "dry_run": False,
+        "show_skipped": False,
+        "quiet": True,
+        "yes": True,
+        "resumed_reexec": False,
+        "tags": None,
+        "any_tag": False,
+        "all_tags": False,
+        "auto_restart_on_drift": True,
+        "dispatch_mode": None,
+        "recovery_slots": None,
+    }
+    defaults.update(overrides)
+    return argparse.Namespace(**defaults)
 
 
 def _wait_for_dispatch_start_from_store(store):
@@ -15937,7 +16003,7 @@ def test_watch_cycle_keeps_unchanged_main_verify_launch_issue_sticky_across_cycl
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
-    merge_task = _make_completed_watch_merge_task(
+    _make_completed_watch_merge_task(
         store,
         "Completed normal merge task",
         branch="feature/normal-merge",
@@ -16021,7 +16087,7 @@ def test_watch_cycle_clears_main_verify_launch_issue_after_green_check(
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
-    merge_task = _make_completed_watch_merge_task(
+    _make_completed_watch_merge_task(
         store,
         "Completed normal merge task",
         branch="feature/normal-merge",
@@ -30483,7 +30549,7 @@ def test_cmd_watch_scoped_mode_exits_when_scope_is_done(tmp_path: Path) -> None:
     resolve_scope.assert_called_once()
     sleep.assert_not_called()
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
-    assert "scoped watch complete; all named owner units are terminal or parked" in log_text
+    assert SCOPED_WATCH_COMPLETE_MESSAGE in log_text
 
 
 def test_cmd_watch_scoped_mode_exits_after_inline_terminal_action_without_sleep(tmp_path: Path) -> None:
@@ -31179,6 +31245,2479 @@ def test_watch_cycle_scoped_pending_only_suppresses_recovery_with_zero_recovery_
     assert unrelated.id not in log_text
     assert "QUEUE" not in log_text
     assert "START" not in log_text
+
+
+def _setup_stale_failed_leaf_live_reroot_scope(tmp_path: Path) -> tuple[Config, SqliteTaskStore, Task, Task, Task]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Landed canonical owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = "feature/landed-owner"
+    owner.has_commits = True
+    owner.merge_status = None
+    store.update(owner)
+
+    selected = store.add("Selected stale failed leaf", task_type="implement", based_on=owner.id, same_branch=True)
+    sibling = store.add("Sibling stale failed leaf", task_type="implement", based_on=owner.id, same_branch=True)
+    assert selected.id is not None
+    assert sibling.id is not None
+    for task, branch in ((selected, "feature/selected-leaf"), (sibling, "feature/sibling-leaf")):
+        task.status = "failed"
+        task.failure_reason = "MAX_TURNS"
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        task.has_commits = False
+        task.merge_status = "merged"
+        task.session_id = f"session-{task.id}"
+        store.update(task)
+
+    unit = store.create_merge_unit(
+        source_branch=str(owner.branch),
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        merged_at=datetime.now(UTC),
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(selected.id, unit.id, "same_branch")
+    store.attach_task_to_merge_unit(sibling.id, unit.id, "same_branch")
+    return config, store, owner, selected, sibling
+
+
+def _add_landed_reroot_owner(
+    store: SqliteTaskStore,
+    *,
+    owner_prompt: str,
+    selected_prompt: str,
+    sibling_prompt: str,
+) -> tuple[Task, Task, Task]:
+    owner = store.add(owner_prompt, task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = f"feature/{owner.id}-landed-owner"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    store.update(owner)
+
+    selected = store.add(selected_prompt, task_type="implement", based_on=owner.id, same_branch=True)
+    sibling = store.add(sibling_prompt, task_type="implement", based_on=owner.id, same_branch=True)
+    assert selected.id is not None
+    assert sibling.id is not None
+    for task in (selected, sibling):
+        task.status = "failed"
+        task.failure_reason = "MAX_TURNS"
+        task.completed_at = datetime.now(UTC)
+        task.branch = f"feature/{task.id}-failed-leaf"
+        task.has_commits = False
+        task.merge_status = "merged"
+        task.session_id = f"session-{task.id}"
+        store.update(task)
+
+    unit = store.create_merge_unit(
+        source_branch=str(owner.branch),
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        merged_at=datetime.now(UTC),
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(selected.id, unit.id, "same_branch")
+    store.attach_task_to_merge_unit(sibling.id, unit.id, "same_branch")
+    return owner, selected, sibling
+
+
+def _park_task_watch_progress(store: SqliteTaskStore, task: Task, *, parked_reason: str = "retry-limit-reached") -> None:
+    assert task.id is not None
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind="task",
+            subject_id=task.id,
+            action_type="resume",
+            action_reason="resume",
+            subject_task_id=task.id,
+            action_task_id=task.id,
+            action_task_status=task.status,
+            failed_task_id=task.id,
+            recovery_task_id=task.id,
+            merge_unit_id=None,
+            merge_unit_state=None,
+            merge_unit_head_sha=None,
+            evidence_fingerprint=f"task-park:{task.id}",
+            streak=1,
+            parked_reason=parked_reason,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+
+def _park_stale_pending_action_watch_progress(store: SqliteTaskStore, task: Task) -> Task:
+    assert task.id is not None
+    pending_action = store.add(f"Pending stale action for {task.id}", task_type="implement", based_on=task.id)
+    assert pending_action.id is not None
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind="task",
+            subject_id=task.id,
+            action_type="resume",
+            action_reason="resume",
+            subject_task_id=task.id,
+            action_task_id=pending_action.id,
+            action_task_status="pending",
+            action_task_started_at=None,
+            action_task_running_pid=None,
+            failed_task_id=task.id,
+            recovery_task_id=pending_action.id,
+            merge_unit_id=None,
+            merge_unit_state=None,
+            merge_unit_head_sha=None,
+            evidence_fingerprint=f"stale-pending-action:{task.id}",
+            streak=3,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+    return pending_action
+
+
+def _add_exhausted_parked_leaf(
+    store: SqliteTaskStore,
+    *,
+    owner: Task,
+    unit_id: str,
+    prompt: str,
+    branch: str,
+    completed_at: datetime,
+) -> Task:
+    assert owner.id is not None
+    leaf = store.add(prompt, task_type="implement", based_on=owner.id, same_branch=True)
+    assert leaf.id is not None
+    leaf.status = "failed"
+    leaf.failure_reason = "MAX_TURNS"
+    leaf.completed_at = completed_at
+    leaf.branch = branch
+    leaf.has_commits = False
+    leaf.merge_status = "merged"
+    leaf.session_id = f"session-{leaf.id}"
+    store.update(leaf)
+    store.attach_task_to_merge_unit(leaf.id, unit_id, "same_branch")
+
+    exhausted = store.add(f"{prompt} exhausted retry", task_type="implement", based_on=leaf.id, same_branch=True)
+    assert exhausted.id is not None
+    exhausted.status = "failed"
+    exhausted.failure_reason = "MAX_TURNS"
+    exhausted.completed_at = completed_at + timedelta(minutes=1)
+    exhausted.branch = branch
+    exhausted.has_commits = False
+    exhausted.merge_status = "merged"
+    exhausted.session_id = leaf.session_id
+    store.update(exhausted)
+    store.attach_task_to_merge_unit(exhausted.id, unit_id, "same_branch")
+    return exhausted
+
+
+def test_watch_scoped_ordinary_descendant_selector_keeps_canonical_owner_scope(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Canonical owner with work", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = "feature/canonical-owner-work"
+    owner.has_commits = True
+    owner.merge_status = "unmerged"
+    store.update(owner)
+
+    selected = store.add("Ordinary completed review selector", task_type="review", depends_on=owner.id)
+    assert selected.id is not None
+    selected.status = "completed"
+    selected.completed_at = datetime.now(UTC)
+    selected.output_content = "**Verdict: APPROVED**"
+    store.update(selected)
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: {
+            "refs/heads/main": "main-sha",
+            "refs/heads/feature/canonical-owner-work": "owner-sha",
+            "HEAD": "main-sha",
+        }.get(ref)
+    )  # type: ignore[method-assign]
+
+    with (
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.advance_engine.determine_next_action", return_value={"type": "create_review"}),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+    ):
+        plan = watch_module._build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=config.max_resume_attempts,
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(selected.id,),
+        )
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(selected.id,),
+            precomputed_plan=plan,
+        )
+
+    assert plan.analysis.effective_scoped_owner_ids == (owner.id,)
+    assert any(
+        row.lifecycle_action_task is not None and row.lifecycle_action_task.id == owner.id
+        for row in plan.analysis.owner_rows
+    )
+    assert any(
+        row.owner_task.id == owner.id and task.id == owner.id
+        for row, task, _action in plan.analysis.action_plan
+    )
+    assert result.scoped_done is False
+    assert result.scoped_active == 1
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    scope_line = next(line for line in log_text.splitlines() if "scope: owners=" in line)
+    assert owner.id in scope_line
+    assert selected.id not in scope_line
+
+
+def test_watch_scoped_failed_descendant_under_nonterminal_owner_keeps_canonical_owner_scope(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Canonical owner still awaiting lifecycle work", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = "feature/nonterminal-owner-work"
+    owner.has_commits = True
+    owner.merge_status = "unmerged"
+    store.update(owner)
+
+    selected = store.add("Selected failed descendant", task_type="implement", based_on=owner.id)
+    assert selected.id is not None
+    selected.status = "failed"
+    selected.failure_reason = "MAX_TURNS"
+    selected.completed_at = datetime.now(UTC)
+    selected.session_id = f"session-{selected.id}"
+    store.update(selected)
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: {
+            "refs/heads/main": "main-sha",
+            "refs/heads/feature/nonterminal-owner-work": "owner-sha",
+            "HEAD": "main-sha",
+        }.get(ref)
+    )  # type: ignore[method-assign]
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    with (
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.advance_engine.determine_next_action", return_value={"type": "create_review"}),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+    ):
+        plan = watch_module._build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=config.max_resume_attempts,
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(selected.id,),
+        )
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(selected.id,),
+            precomputed_plan=plan,
+        )
+
+    assert plan.analysis.effective_scoped_owner_ids == (owner.id,)
+    assert any(
+        row.owner_task.id == owner.id and task.id == owner.id
+        for row, task, _action in plan.analysis.action_plan
+    )
+    assert result.effective_scoped_owner_ids == (owner.id,)
+    assert result.scoped_done is False
+    assert result.scoped_active == 1
+    scope_line = next(line for line in log_path.read_text().splitlines() if "scope: owners=" in line)
+    assert owner.id in scope_line
+    assert selected.id not in scope_line
+
+
+@pytest.mark.parametrize("active_unit_state", ["unmerged", "blocked", "stale"])
+def test_watch_scoped_failed_descendant_honors_nonterminal_active_unit_over_stale_owner_merge_status(
+    tmp_path: Path,
+    active_unit_state: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Canonical owner with stale row terminality", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = "feature/stale-row-terminality"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    store.update(owner)
+
+    selected = store.add("Selected failed descendant with live unique work", task_type="implement", based_on=owner.id)
+    sibling = store.add("Sibling failed descendant in whole-owner scope", task_type="implement", based_on=owner.id)
+    assert selected.id is not None
+    assert sibling.id is not None
+    for task, branch in (
+        (selected, "feature/selected-live-unique-work"),
+        (sibling, "feature/sibling-live-unique-work"),
+    ):
+        task.status = "failed"
+        task.failure_reason = "MAX_TURNS"
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        task.has_commits = False
+        task.session_id = f"session-{task.id}"
+        store.update(task)
+
+    unit = store.create_merge_unit(
+        source_branch=str(owner.branch),
+        target_branch="main",
+        owner_task_id=owner.id,
+        state=active_unit_state,
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(selected.id, unit.id, "same_branch")
+    store.attach_task_to_merge_unit(sibling.id, unit.id, "same_branch")
+
+    selected_recovery = store.add("Selected recovery transition", task_type="implement", based_on=selected.id)
+    sibling_recovery = store.add("Sibling recovery transition", task_type="implement", based_on=sibling.id)
+    assert selected_recovery.id is not None
+    assert sibling_recovery.id is not None
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: {
+            "refs/heads/main": "main-sha",
+            "refs/heads/feature/stale-row-terminality": "owner-sha",
+            "HEAD": "main-sha",
+        }.get(ref)
+    )  # type: ignore[method-assign]
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    with (
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
+        patch("gza.cli.advance_engine.determine_next_action", return_value={"type": "create_review"}),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+    ):
+        plan = watch_module._build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=config.max_resume_attempts,
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(selected.id,),
+        )
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(selected.id,),
+            precomputed_plan=plan,
+        )
+
+    assert plan.analysis.effective_scoped_owner_ids == (owner.id,)
+    assert any(
+        row.owner_task.id == owner.id and task.id == owner.id
+        for row, task, _action in plan.analysis.action_plan
+    )
+    assert result.effective_scoped_owner_ids == (owner.id,)
+    scope_line = next(line for line in log_path.read_text().splitlines() if "scope: owners=" in line)
+    assert owner.id in scope_line
+    assert selected.id not in scope_line
+
+    old = {
+        selected_recovery.id: {"status": "pending", "task_type": "implement", "failure_reason": None},
+        sibling_recovery.id: {"status": "pending", "task_type": "implement", "failure_reason": None},
+    }
+    new = {
+        selected_recovery.id: {"status": "in_progress", "task_type": "implement", "failure_reason": None},
+        sibling_recovery.id: {"status": "in_progress", "task_type": "implement", "failure_reason": None},
+    }
+    assert set(
+        _emit_transition_events(
+            old,
+            new,
+            store=store,
+            config=config,
+            log=_WatchLog(log_path, quiet=True),
+            scoped_owner_ids=(owner.id,),
+        )
+    ) == {selected_recovery.id, sibling_recovery.id}
+    assert _collect_completed_transition_ids(
+        {sibling_recovery.id: {"status": "in_progress", "task_type": "implement", "failure_reason": None}},
+        {sibling_recovery.id: {"status": "completed", "task_type": "implement", "failure_reason": None}},
+        store=store,
+        scoped_owner_ids=(owner.id,),
+    ) == [sibling_recovery.id]
+
+
+def test_watch_scoped_failed_descendant_honors_terminal_active_unit_over_stale_owner_merge_status(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Canonical owner with stale row nonterminality", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = "feature/stale-row-nonterminality"
+    owner.has_commits = True
+    owner.merge_status = "unmerged"
+    store.update(owner)
+
+    selected = store.add("Selected failed descendant", task_type="implement", based_on=owner.id)
+    sibling = store.add("Sibling failed descendant", task_type="implement", based_on=owner.id)
+    assert selected.id is not None
+    assert sibling.id is not None
+    for task in (selected, sibling):
+        task.status = "failed"
+        task.failure_reason = "MAX_TURNS"
+        task.completed_at = datetime.now(UTC)
+        task.session_id = f"session-{task.id}"
+        store.update(task)
+
+    unit = store.create_merge_unit(
+        source_branch=str(owner.branch),
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        merged_at=datetime.now(UTC),
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(selected.id, unit.id, "same_branch")
+    store.attach_task_to_merge_unit(sibling.id, unit.id, "same_branch")
+
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, selected, sibling),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="failed_recovery",
+        unresolved_tasks=(selected,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=selected,
+        recovery_leaf_task=selected,
+    )
+
+    assert watch_module._derive_effective_scoped_owner_ids(
+        store=store,
+        owner_rows=(row,),
+        scoped_owner_ids=(owner.id,),
+        scoped_task_ids=(selected.id,),
+    ) == (selected.id,)
+
+
+def test_watch_scoped_completed_descendant_without_owner_row_stays_canonical_owner_scope(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Terminal canonical owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = "feature/terminal-owner"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    store.update(owner)
+
+    selected = store.add("Completed descendant selector", task_type="review", depends_on=owner.id)
+    assert selected.id is not None
+    selected.status = "completed"
+    selected.completed_at = datetime.now(UTC)
+    selected.output_content = "**Verdict: APPROVED**"
+    store.update(selected)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(selected.id,),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.effective_scoped_owner_ids == (owner.id,)
+    assert result.scoped_done is True
+    scope_line = next(line for line in log_path.read_text().splitlines() if "scope: owners=" in line)
+    assert owner.id in scope_line
+    assert selected.id not in scope_line
+
+
+def test_watch_scoped_live_reroot_excludes_sibling_transition_boundaries(tmp_path: Path) -> None:
+    config, store, _owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    sibling_recovery = store.add("Sibling recovery", task_type="implement", based_on=sibling.id)
+    selected_recovery = store.add("Selected recovery", task_type="implement", based_on=selected.id)
+    assert sibling_recovery.id is not None
+    assert selected_recovery.id is not None
+
+    old = {
+        sibling_recovery.id: {"status": "pending", "task_type": "implement", "failure_reason": None},
+        selected_recovery.id: {"status": "pending", "task_type": "implement", "failure_reason": None},
+    }
+    new = {
+        sibling_recovery.id: {
+            "status": "failed",
+            "task_type": "implement",
+            "failure_reason": "SIBLING_BOOM",
+        },
+        selected_recovery.id: {"status": "in_progress", "task_type": "implement", "failure_reason": None},
+    }
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    confirmed_starts = _emit_transition_events(
+        old,
+        new,
+        store=store,
+        config=config,
+        log=_WatchLog(log_path, quiet=True),
+        scoped_owner_ids=(selected.id,),
+    )
+    completed_ids = _collect_completed_transition_ids(
+        {sibling_recovery.id: {"status": "in_progress", "task_type": "implement", "failure_reason": None}},
+        {sibling_recovery.id: {"status": "completed", "task_type": "implement", "failure_reason": None}},
+        store=store,
+        scoped_owner_ids=(selected.id,),
+    )
+    failures = _collect_unhandled_failures(old, new, store=store, config=config, scoped_owner_ids=(selected.id,))
+
+    assert confirmed_starts == (selected_recovery.id,)
+    assert completed_ids == []
+    assert failures == []
+    log_text = log_path.read_text() if log_path.exists() else ""
+    assert selected_recovery.id not in log_text
+    assert sibling_recovery.id not in log_text
+    assert "SIBLING_BOOM" not in log_text
+
+
+def test_watch_scoped_leaf_failure_backoff_boundaries_do_not_collapse_to_shared_owner(tmp_path: Path) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    config.watch.failure_halt_after = 2
+    selected_recovery = store.add("Selected recovery failure", task_type="implement", based_on=selected.id)
+    sibling_recovery = store.add("Sibling selected recovery", task_type="implement", based_on=sibling.id)
+    unselected = store.add("Unselected sibling failure", task_type="implement", based_on=owner.id, same_branch=True)
+    unselected_recovery = store.add("Unselected recovery failure", task_type="implement", based_on=unselected.id)
+    assert selected_recovery.id is not None
+    assert sibling_recovery.id is not None
+    assert unselected.id is not None
+    assert unselected_recovery.id is not None
+    unselected.status = "failed"
+    unselected.failure_reason = "MAX_TURNS"
+    unselected.completed_at = datetime.now(UTC)
+    unselected.branch = "feature/unselected-leaf"
+    unselected.merge_status = "merged"
+    store.update(unselected)
+
+    old = {
+        selected_recovery.id: {"status": "pending", "task_type": "implement", "failure_reason": None},
+        sibling_recovery.id: {"status": "pending", "task_type": "implement", "failure_reason": None},
+        unselected_recovery.id: {"status": "pending", "task_type": "implement", "failure_reason": None},
+    }
+    selected_failed = {
+        **old,
+        selected_recovery.id: {
+            "status": "failed",
+            "task_type": "implement",
+            "failure_reason": "SELECTED_BOOM",
+        },
+    }
+
+    failures = _collect_unhandled_failures(
+        old,
+        selected_failed,
+        store=store,
+        config=config,
+        scoped_owner_ids=(selected.id, sibling.id),
+    )
+    assert [(failure.task_id, failure.owner_task_id) for failure in failures] == [
+        (selected_recovery.id, selected.id)
+    ]
+
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    failure_backoffs: dict[str, _OwnerFailureBackoffState] = {}
+    assert (
+        _record_failure_backoff_updates(
+            config=config,
+            store=store,
+            failures=failures,
+            failure_backoffs=failure_backoffs,
+            log=log,
+            now=datetime(2026, 8, 17, 12, 0, tzinfo=UTC),
+        )
+        is False
+    )
+    assert set(failure_backoffs) == {selected.id}
+
+    rows = watch_module._query_owner_rows(
+        store=store,
+        config=config,
+        git=_make_watch_git(),
+        target_branch="main",
+        owner_task_ids=(owner.id, owner.id),
+        task_ids=(selected.id, sibling.id),
+        max_recovery_attempts=config.max_resume_attempts,
+        include_skipped=True,
+    )
+    filtered_rows = [
+        row
+        for row in rows
+        if row.owner_task.id not in {selected.id}
+        and (row.recovery_leaf_task is None or row.recovery_leaf_task.id not in {selected.id})
+    ]
+    filtered_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in filtered_rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert sibling.id in filtered_leaf_ids
+    assert selected.id not in filtered_leaf_ids
+
+    _reset_failure_backoff_for_completed_owners(
+        store=store,
+        completed_ids=(sibling_recovery.id,),
+        failure_backoffs=failure_backoffs,
+        log=log,
+        scoped_owner_ids=(selected.id, sibling.id),
+    )
+    assert set(failure_backoffs) == {selected.id}
+
+    unselected_failed = {
+        **old,
+        unselected_recovery.id: {
+            "status": "failed",
+            "task_type": "implement",
+            "failure_reason": "UNSELECTED_BOOM",
+        },
+    }
+    assert (
+        _collect_unhandled_failures(
+            old,
+            unselected_failed,
+            store=store,
+            config=config,
+            scoped_owner_ids=(selected.id, sibling.id),
+        )
+        == []
+    )
+
+    _reset_failure_backoff_for_completed_owners(
+        store=store,
+        completed_ids=(selected_recovery.id,),
+        failure_backoffs=failure_backoffs,
+        log=log,
+        scoped_owner_ids=(selected.id, sibling.id),
+    )
+    assert failure_backoffs == {}
+
+    assert (
+        _record_failure_backoff_updates(
+            config=config,
+            store=store,
+            failures=[
+                watch_module._ObservedFailure(
+                    task_id=selected_recovery.id,
+                    owner_task_id=selected.id,
+                    task_type="implement",
+                    reason="SELECTED_BOOM",
+                ),
+                watch_module._ObservedFailure(
+                    task_id=sibling_recovery.id,
+                    owner_task_id=sibling.id,
+                    task_type="implement",
+                    reason="SIBLING_BOOM",
+                ),
+            ],
+            failure_backoffs=failure_backoffs,
+            log=log,
+            now=datetime(2026, 8, 17, 12, 1, tzinfo=UTC),
+        )
+        is True
+    )
+
+
+def test_watch_scoped_live_reroot_keeps_selected_recovery_active_without_slots(tmp_path: Path) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    startup_scope = _resolve_watch_scope_owner_ids(
+        store,
+        (selected.id,),
+        max_recovery_attempts=config.max_resume_attempts,
+        config=config,
+    )
+    assert startup_scope == (owner.id,)
+
+    snapshot = watch_module.ConcurrencySnapshot(
+        limit=1,
+        running=1,
+        available=0,
+        live_pids=frozenset({111}),
+        running_task_ids=("gza-999999",),
+        anonymous_worker_count=0,
+        current_pid_counted=False,
+    )
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: {
+            "refs/heads/main": "main-sha",
+            "refs/heads/feature/selected-leaf": "selected-sha",
+            "refs/heads/feature/sibling-leaf": "sibling-sha",
+            "HEAD": "main-sha",
+        }.get(ref)
+    )  # type: ignore[method-assign]
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    with (
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.get_concurrency_snapshot", return_value=snapshot),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+        patch("gza.cli.watch._count_live_workers", return_value=1),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            scoped_owner_ids=startup_scope,
+            scoped_task_ids=(selected.id,),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.effective_scoped_owner_ids == (selected.id,)
+    assert result.scoped_done is False
+    assert result.scoped_active == 1
+    log_text = log_path.read_text()
+    assert f"scope: owners={selected.id} mode=explicit" in log_text
+    assert owner.id not in next(line for line in log_text.splitlines() if "scope: owners=" in line)
+    assert sibling.id not in log_text
+    assert SCOPED_WATCH_COMPLETE_MESSAGE not in log_text
+
+
+def test_watch_scoped_leaf_cycle_reconciles_stale_parks_only_inside_effective_leaf_scope(
+    tmp_path: Path,
+) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    _park_stale_pending_action_watch_progress(store, selected)
+    _park_stale_pending_action_watch_progress(store, sibling)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(selected.id,),
+            precomputed_plan=_empty_scoped_watch_plan_with_effective_scope((selected.id,)),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert store.list_watch_progress_observations(subject_kind="task", subject_id=selected.id) == []
+    assert store.list_watch_progress_observations(subject_kind="task", subject_id=sibling.id)
+
+
+def test_watch_stale_park_reconcile_scope_boundaries_cover_unscoped_owner_and_leaf(
+    tmp_path: Path,
+) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    _park_stale_pending_action_watch_progress(store, selected)
+    _park_stale_pending_action_watch_progress(store, sibling)
+
+    assert reconcile_stale_watch_no_progress_parks(
+        store,
+        scopes=(("effective_leaf", selected.id),),
+    ) == 1
+    assert store.list_watch_progress_observations(subject_kind="task", subject_id=selected.id) == []
+    assert store.list_watch_progress_observations(subject_kind="task", subject_id=sibling.id)
+
+    assert reconcile_stale_watch_no_progress_parks(
+        store,
+        scopes=(("canonical_owner", owner.id),),
+    ) == 1
+    assert store.list_watch_progress_observations(subject_kind="task", subject_id=sibling.id) == []
+
+    _park_stale_pending_action_watch_progress(store, selected)
+    _park_stale_pending_action_watch_progress(store, sibling)
+    assert reconcile_stale_watch_no_progress_parks(store) == 2
+    assert store.list_watch_progress_observations(subject_kind="task", subject_id=selected.id) == []
+    assert store.list_watch_progress_observations(subject_kind="task", subject_id=sibling.id) == []
+
+
+def test_watch_scoped_leaf_blind_auto_rearm_does_not_clear_stale_sibling_backstop(
+    tmp_path: Path,
+) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.budget = 2
+    config.watch.parked_auto_rearm.cooldown_hours = 0
+    config.watch.parked_auto_rearm.require_target_advanced = False
+    config.max_resume_attempts = 1
+    unit = store.list_merge_units_for_task(str(owner.id), active_only=True)[0]
+    selected_parked = _add_exhausted_parked_leaf(
+        store,
+        owner=owner,
+        unit_id=unit.id,
+        prompt="Selected parked retry-limit leaf for scoped backstop isolation",
+        branch="feature/selected-scoped-rearm-isolation",
+        completed_at=datetime.now(UTC),
+    )
+    assert selected_parked.id is not None
+    _park_stale_pending_action_watch_progress(store, sibling)
+
+    result = _evaluate_blind_parked_auto_rearm(
+        config=config,
+        store=store,
+        git=_make_watch_git(),
+        target_branch="main",
+        target_sha="main-sha-1",
+        tags=None,
+        any_tag=False,
+        scoped_owner_ids=(selected_parked.id,),
+        scoped_task_ids=(selected_parked.id,),
+        startup_scoped_owner_ids=(owner.id,),
+    )
+
+    assert any(decision.status == "rearmed" and decision.candidate.subject_task.id == selected_parked.id for decision in result.decisions)
+    assert store.list_watch_progress_observations(subject_kind="task", subject_id=sibling.id)
+
+
+def test_watch_scoped_canonical_owner_selector_keeps_failed_descendant_scope(tmp_path: Path) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    sibling.status = "completed"
+    sibling.failure_reason = None
+    sibling.completed_at = datetime.now(UTC)
+    store.update(sibling)
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        plan = watch_module._build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=config.max_resume_attempts,
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(owner.id,),
+        )
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(owner.id,),
+            precomputed_plan=plan,
+        )
+
+    recovery_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in plan.analysis.recovery_rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert selected.id in recovery_leaf_ids
+    assert plan.analysis.effective_scoped_owner_ids == (owner.id,)
+    assert (
+        watch_module._scoped_owner_active_count(
+            store=store,
+            owner_rows=list(plan.analysis.owner_rows),
+            scoped_owner_ids=(owner.id,),
+            running_task_ids=set(plan.running_task_ids),
+            planned_active_owner_ids=watch_module._collect_planned_active_owner_ids(plan.analysis),
+        )
+        == 1
+    )
+    assert result.work_done is True
+    assert SCOPED_WATCH_COMPLETE_MESSAGE not in (tmp_path / ".gza" / "watch.log").read_text()
+
+
+def test_watch_scoped_canonical_owner_counts_actionable_sibling_when_later_row_is_parked(
+    tmp_path: Path,
+) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    selected_row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, selected),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="failed_recovery",
+        unresolved_tasks=(selected,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=selected,
+        recovery_leaf_task=selected,
+    )
+    sibling_row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, sibling),
+        tree=None,
+        lineage_status="needs_attention",
+        next_action={"type": "skip", "needs_attention_reason": "retry-limit-reached"},
+        next_action_reason="needs_attention",
+        unresolved_tasks=(sibling,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=sibling,
+        recovery_leaf_task=sibling,
+    )
+    selected_decision = FailedRecoveryDecision(
+        task_id=selected.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry selected failed implementation",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=selected.id,
+        reuse_existing=True,
+    )
+    analysis = _WatchCycleAnalysis(
+        target_branch="main",
+        scope_gaps=(),
+        owner_rows=(selected_row, sibling_row),
+        watch_read_context=RecoveryReadContext(),
+        lifecycle_rows=(),
+        recovery_rows=(selected_row, sibling_row),
+        recovery_lane_entry_by_failed_id={},
+        action_plan=(),
+        recovery_attention_rows=(),
+        recovery_visible_skips=(),
+        actionable_failed=((selected_row, selected, selected_decision, {"type": "retry"}, True, selected),),
+        pending_recovery_task_ids=frozenset(),
+        effective_scoped_owner_ids=(owner.id,),
+    )
+    plan = _WatchCyclePlan(
+        running_task_ids=("gza-999999",),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=1,
+        effective_batch=1,
+        slots=0,
+        analysis=analysis,
+    )
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(owner.id,),
+            precomputed_plan=plan,
+        )
+
+    assert result.scoped_active == 1
+    assert result.scoped_done is False
+    assert SCOPED_WATCH_COMPLETE_MESSAGE not in log_path.read_text()
+
+
+def test_watch_scoped_canonical_owner_launches_each_failed_leaf_once_with_two_slots(tmp_path: Path) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    for task in (selected, sibling):
+        task.session_id = None
+        task.failure_reason = "INFRASTRUCTURE_ERROR"
+        store.update(task)
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        plan = watch_module._build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=2,
+            tags=None,
+            any_tag=False,
+            recovery_slots=2,
+            recovery_mode=None,
+            max_recovery_attempts=config.max_resume_attempts,
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(owner.id,),
+        )
+
+    owner_row_leaf_ids = [
+        row.recovery_leaf_task.id
+        for row in plan.analysis.owner_rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    ]
+    assert owner_row_leaf_ids.count(selected.id) == 1
+    assert owner_row_leaf_ids.count(sibling.id) == 1
+
+    actionable_failed_ids = [failed.id for _row, failed, *_rest in plan.analysis.actionable_failed]
+    assert actionable_failed_ids.count(selected.id) == 1
+    assert actionable_failed_ids.count(sibling.id) == 1
+
+    preview = build_dispatch_preview(
+        store,
+        config=config,
+        git=_make_watch_git(),
+        target_branch="main",
+        owner_rows=plan.analysis.owner_rows,
+        read_context=plan.analysis.watch_read_context,
+        tags=None,
+        any_tag=False,
+        max_recovery_attempts=config.max_resume_attempts,
+        selection_mode="default",
+        include_pending=False,
+    )
+    preview_leaf_ids = [entry.task.id for entry in preview.recovery_entries]
+    assert preview_leaf_ids.count(selected.id) == 1
+    assert preview_leaf_ids.count(sibling.id) == 1
+    dispatch_plan = plan_watch_dispatch_entries(
+        preview.runnable_entries,
+        slots=2,
+        recovery_slot_cap=2,
+        selection_mode="default",
+        include_pending=False,
+    )
+    planned_leaf_ids = [entry.task.id for entry in dispatch_plan.entries]
+    assert planned_leaf_ids.count(selected.id) == 1
+    assert planned_leaf_ids.count(sibling.id) == 1
+
+    launched_task_ids: list[str] = []
+
+    def fake_spawn_worker(_args: object, _config: Config, *, task_id: str, **_kwargs: object) -> int:
+        launched_task_ids.append(task_id)
+        return 0
+
+    def fake_spawn_iterate(_args: object, _config: Config, task: Task, **_kwargs: object) -> int:
+        assert task.id is not None
+        launched_task_ids.append(task.id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=fake_spawn_worker),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=fake_spawn_iterate),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(owner.id,),
+            precomputed_plan=plan,
+            max_recovery_attempts=config.max_resume_attempts,
+            recovery_slots=2,
+        )
+
+    launched_recovery_parents = [
+        store.get(task_id).based_on
+        for task_id in launched_task_ids
+        if store.get(task_id) is not None and store.get(task_id).based_on in {selected.id, sibling.id}
+    ]
+    assert launched_recovery_parents.count(selected.id) == 1
+    assert launched_recovery_parents.count(sibling.id) == 1
+    assert result.work_done is True
+
+
+def test_watch_scoped_mixed_owner_and_leaf_selectors_keep_distinct_query_semantics(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    owner_a, selected_a, sibling_a = _add_landed_reroot_owner(
+        store,
+        owner_prompt="Whole owner A",
+        selected_prompt="Selected A failed leaf",
+        sibling_prompt="Sibling A failed leaf",
+    )
+    owner_b, selected_b, sibling_b = _add_landed_reroot_owner(
+        store,
+        owner_prompt="Whole owner B",
+        selected_prompt="Selected B failed leaf",
+        sibling_prompt="Sibling B failed leaf",
+    )
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        plan = watch_module._build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=2,
+            tags=None,
+            any_tag=False,
+            recovery_slots=2,
+            recovery_mode=None,
+            max_recovery_attempts=config.max_resume_attempts,
+            scoped_owner_ids=(owner_a.id, owner_b.id),
+            scoped_task_ids=(owner_a.id, selected_b.id),
+        )
+
+    recovery_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in plan.analysis.recovery_rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert {selected_a.id, sibling_a.id, selected_b.id}.issubset(recovery_leaf_ids)
+    assert sibling_b.id not in recovery_leaf_ids
+
+
+def test_watch_scoped_leaf_counts_pending_recovery_descendant_only_inside_selected_closure(tmp_path: Path) -> None:
+    _config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    selected_recovery = store.add("Selected pending recovery", task_type="implement", based_on=selected.id)
+    sibling_recovery = store.add("Sibling pending recovery", task_type="implement", based_on=sibling.id)
+    assert selected_recovery.id is not None
+    assert sibling_recovery.id is not None
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, selected, sibling),
+        tree=None,
+        lineage_status="needs_attention",
+        next_action=None,
+        next_action_reason="failed_recovery",
+        unresolved_tasks=(selected,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=selected,
+        recovery_leaf_task=selected,
+    )
+
+    scoped_active = watch_module._scoped_owner_active_count(
+        store=store,
+        owner_rows=[row],
+        scoped_owner_ids=(selected.id,),
+        running_task_ids=set(),
+        planned_active_owner_ids=frozenset(),
+    )
+    assert scoped_active == 1
+
+    selected_recovery.status = "completed"
+    selected_recovery.completed_at = datetime.now(UTC)
+    store.update(selected_recovery)
+    scoped_active = watch_module._scoped_owner_active_count(
+        store=store,
+        owner_rows=[row],
+        scoped_owner_ids=(selected.id,),
+        running_task_ids=set(),
+        planned_active_owner_ids=frozenset(),
+    )
+    assert scoped_active == 0
+
+
+def test_watch_scoped_parked_leaf_ignores_unselected_pending_sibling_for_completion(tmp_path: Path) -> None:
+    _config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    sibling.status = "pending"
+    store.update(sibling)
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, selected, sibling),
+        tree=None,
+        lineage_status="needs_attention",
+        next_action=None,
+        next_action_reason="failed_recovery",
+        unresolved_tasks=(selected,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=selected,
+        recovery_leaf_task=selected,
+    )
+
+    scoped_active = watch_module._scoped_owner_active_count(
+        store=store,
+        owner_rows=[row],
+        scoped_owner_ids=(selected.id,),
+        running_task_ids=set(),
+        planned_active_owner_ids=frozenset(),
+    )
+
+    scoped_done = scoped_active == 0
+    assert scoped_active == 0
+    assert scoped_done is True
+
+
+def test_watch_scoped_parked_leaf_ignores_unselected_sibling_running_work(tmp_path: Path) -> None:
+    _config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    sibling_worker = store.add("Sibling-only running work", task_type="implement", based_on=sibling.id)
+    assert sibling_worker.id is not None
+    sibling_worker.status = "in_progress"
+    store.update(sibling_worker)
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, selected, sibling, sibling_worker),
+        tree=None,
+        lineage_status="needs_attention",
+        next_action=None,
+        next_action_reason="failed_recovery",
+        unresolved_tasks=(selected,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=selected,
+        recovery_leaf_task=selected,
+    )
+
+    scoped_active = watch_module._scoped_owner_active_count(
+        store=store,
+        owner_rows=[row],
+        scoped_owner_ids=(selected.id,),
+        running_task_ids={sibling_worker.id},
+        planned_active_owner_ids=frozenset(),
+    )
+
+    scoped_done = scoped_active == 0
+    assert scoped_active == 0
+    assert scoped_done is True
+
+
+def test_watch_scoped_two_parked_leaf_selectors_under_one_owner_complete(tmp_path: Path) -> None:
+    _config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    second_selected = store.add("Second selected parked leaf", task_type="implement", based_on=owner.id, same_branch=True)
+    assert second_selected.id is not None
+    second_selected.status = "failed"
+    second_selected.failure_reason = "MAX_TURNS"
+    second_selected.completed_at = datetime.now(UTC)
+    second_selected.branch = "feature/second-selected-parked-leaf"
+    second_selected.has_commits = False
+    second_selected.merge_status = "merged"
+    store.update(second_selected)
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, selected, second_selected, sibling),
+        tree=None,
+        lineage_status="needs_attention",
+        next_action=None,
+        next_action_reason="failed_recovery",
+        unresolved_tasks=(selected,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=selected,
+        recovery_leaf_task=selected,
+    )
+
+    scoped_active = watch_module._scoped_owner_active_count(
+        store=store,
+        owner_rows=[row],
+        scoped_owner_ids=(selected.id, second_selected.id),
+        running_task_ids=set(),
+        planned_active_owner_ids=frozenset(),
+    )
+
+    scoped_done = scoped_active == 0
+    assert scoped_active == 0
+    assert scoped_done is True
+
+
+def test_cmd_watch_scoped_live_reroot_primes_scope_before_first_transition_boundary(tmp_path: Path) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    started_sibling = store.add("Sibling recovery starting", task_type="implement", based_on=sibling.id)
+    done_sibling = store.add("Sibling recovery done", task_type="implement", based_on=sibling.id)
+    failed_sibling = store.add("Sibling recovery failed", task_type="implement", based_on=sibling.id)
+    assert started_sibling.id is not None
+    assert done_sibling.id is not None
+    assert failed_sibling.id is not None
+    for task in (started_sibling, failed_sibling):
+        task.status = "pending"
+        store.update(task)
+    done_sibling.status = "in_progress"
+    store.update(done_sibling)
+
+    args = _watch_args(tmp_path, [selected.id])
+    original_build_plan = watch_module._build_watch_cycle_plan
+
+    def build_plan_after_sibling_transitions(**kwargs: object) -> _WatchCyclePlan:
+        assert kwargs["scoped_owner_ids"] == (owner.id,)
+        assert kwargs["scoped_task_ids"] == (selected.id,)
+        started = store.get(started_sibling.id)
+        done = store.get(done_sibling.id)
+        failed = store.get(failed_sibling.id)
+        assert started is not None and done is not None and failed is not None
+        started.status = "in_progress"
+        done.status = "completed"
+        done.completed_at = datetime.now(UTC)
+        failed.status = "failed"
+        failed.failure_reason = "SIBLING_BOOM"
+        failed.completed_at = datetime.now(UTC)
+        for task in (started, done, failed):
+            store.update(task)
+        plan = original_build_plan(**kwargs)
+        assert plan.analysis.effective_scoped_owner_ids == (selected.id,)
+        return plan
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._build_watch_cycle_plan", side_effect=build_plan_after_sibling_transitions),
+        patch(
+            "gza.cli.watch._dispatch_scoped_watch_once",
+            return_value=_CycleResult(False, 0, 0, scoped_done=True, effective_scoped_owner_ids=(selected.id,)),
+        ),
+        patch("gza.cli.watch._sleep_interruptibly") as sleep,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    sleep.assert_not_called()
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "START" not in log_text
+    assert "DONE" not in log_text
+    assert "FAIL" not in log_text
+    assert "SIBLING_BOOM" not in log_text
+    assert store.list_watch_recovery_backoffs(subject_kind="lineage", subject_id=sibling.id) == []
+
+
+def _make_stale_selected_recovery_plan(
+    *,
+    selected: Task,
+    owner: Task,
+    slots: int = 1,
+) -> _WatchCyclePlan:
+    decision = FailedRecoveryDecision(
+        task_id=str(selected.id),
+        action="retry",
+        reason_code="retry_timeout",
+        reason_text="Retry selected failed implementation",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=None,
+        reuse_existing=False,
+    )
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, selected),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="failed_recovery",
+        unresolved_tasks=(selected,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=selected,
+        recovery_leaf_task=selected,
+    )
+    analysis = _WatchCycleAnalysis(
+        target_branch="main",
+        scope_gaps=(),
+        owner_rows=(row,),
+        watch_read_context=RecoveryReadContext(),
+        lifecycle_rows=(),
+        recovery_rows=(row,),
+        recovery_lane_entry_by_failed_id={},
+        action_plan=(),
+        recovery_attention_rows=(),
+        recovery_visible_skips=(),
+        recovery_undispatched_rows=(),
+        actionable_failed=((row, selected, decision, {"type": "retry", "description": "Retry selected"}, True, selected),),
+        pending_recovery_task_ids=frozenset(),
+        effective_scoped_owner_ids=(selected.id,),
+    )
+    return _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=slots,
+        slots=slots,
+        analysis=analysis,
+    )
+
+
+def test_cmd_watch_scoped_boundary_backoff_discards_primed_recovery_plan(tmp_path: Path) -> None:
+    config, store, owner, selected, _sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    recovery_child = store.add("Selected recovery child fails before first cycle", task_type="implement", based_on=selected.id)
+    assert recovery_child.id is not None
+    recovery_child.status = "pending"
+    store.update(recovery_child)
+    args = _watch_args(tmp_path, [selected.id])
+    stale_plan = _make_stale_selected_recovery_plan(selected=selected, owner=owner)
+    original_build_plan = watch_module._build_watch_cycle_plan
+
+    def build_then_fail_selected_recovery(**kwargs: object) -> _WatchCyclePlan:
+        if kwargs.get("scoped_owner_ids") == (owner.id,) and kwargs.get("scoped_task_ids") == (selected.id,):
+            plan = original_build_plan(**kwargs)
+            assert plan.analysis.effective_scoped_owner_ids == (selected.id,)
+            failed_child = store.get(recovery_child.id)
+            assert failed_child is not None
+            failed_child.status = "failed"
+            failed_child.failure_reason = "CONFIG_ERROR"
+            failed_child.completed_at = datetime.now(UTC)
+            store.update(failed_child)
+            return stale_plan
+        return original_build_plan(**kwargs)
+
+    seen_dispatch: list[dict[str, object]] = []
+
+    def fake_dispatch(**kwargs: object) -> _CycleResult:
+        seen_dispatch.append(dict(kwargs))
+        assert kwargs["precomputed_plan"] is None
+        assert kwargs["excluded_owner_ids"] == frozenset({selected.id})
+        return _CycleResult(False, 0, 0, scoped_done=True, effective_scoped_owner_ids=(selected.id,))
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._build_watch_cycle_plan", side_effect=build_then_fail_selected_recovery),
+        patch("gza.cli.watch._dispatch_scoped_watch_once", side_effect=fake_dispatch),
+        patch("gza.cli.watch._sleep_interruptibly") as sleep,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert len(seen_dispatch) == 1
+    sleep.assert_not_called()
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert f"{selected.id}: sleeping unit" in log_text
+    assert f"latest: {recovery_child.id}=CONFIG_ERROR" in log_text
+
+
+def test_cmd_watch_scoped_boundary_backoff_discards_confirmed_preview_plan(tmp_path: Path) -> None:
+    _config, store, owner, selected, _sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    recovery_child = store.add("Selected preview recovery child fails before first cycle", task_type="implement", based_on=selected.id)
+    assert recovery_child.id is not None
+    recovery_child.status = "pending"
+    store.update(recovery_child)
+    args = _watch_args(tmp_path, [selected.id], yes=False)
+    stale_plan = _make_stale_selected_recovery_plan(selected=selected, owner=owner)
+
+    def preview_then_fail_selected_recovery(**_kwargs: object) -> tuple[object, _WatchCyclePlan]:
+        failed_child = store.get(recovery_child.id)
+        assert failed_child is not None
+        failed_child.status = "failed"
+        failed_child.failure_reason = "CONFIG_ERROR"
+        failed_child.completed_at = datetime.now(UTC)
+        store.update(failed_child)
+        return SimpleNamespace(work_done=True), stale_plan
+
+    seen_dispatch: list[dict[str, object]] = []
+
+    def fake_dispatch(**kwargs: object) -> _CycleResult:
+        seen_dispatch.append(dict(kwargs))
+        assert kwargs["precomputed_plan"] is None
+        assert kwargs["excluded_owner_ids"] == frozenset({selected.id})
+        return _CycleResult(False, 0, 0, scoped_done=True, effective_scoped_owner_ids=(selected.id,))
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._preview_initial_watch_cycle", side_effect=preview_then_fail_selected_recovery),
+        patch("gza.cli.watch._dispatch_scoped_watch_once", side_effect=fake_dispatch),
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("builtins.input", return_value="y"),
+        patch("gza.cli.watch._sleep_interruptibly") as sleep,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert len(seen_dispatch) == 1
+    sleep.assert_not_called()
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert f"{selected.id}: sleeping unit" in log_text
+    assert f"latest: {recovery_child.id}=CONFIG_ERROR" in log_text
+
+
+def test_watch_cycle_refilters_stale_recovery_plan_until_boundary_backoff_expires(tmp_path: Path) -> None:
+    config, store, owner, selected, _sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    stale_plan = _make_stale_selected_recovery_plan(selected=selected, owner=owner)
+    log_path = tmp_path / ".gza" / "watch.log"
+    launched_task_ids: list[str] = []
+
+    def fake_spawn_worker(_args: object, _config: Config, *, task_id: str, **_kwargs: object) -> int:
+        launched_task_ids.append(task_id)
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=fake_spawn_worker),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+    ):
+        backed_off = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(selected.id,),
+            known_effective_scoped_owner_ids=(selected.id,),
+            precomputed_plan=stale_plan,
+            excluded_owner_ids=frozenset({selected.id}),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+        fresh = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(selected.id,),
+            known_effective_scoped_owner_ids=(selected.id,),
+            precomputed_plan=stale_plan,
+            excluded_owner_ids=frozenset(),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert backed_off.work_done is False
+    assert launched_task_ids
+    assert fresh.work_done is True
+    recovery_children = [
+        task for task in store.get_all() if task.based_on == selected.id and task.id in launched_task_ids
+    ]
+    assert len(recovery_children) == 1
+
+
+def test_watch_scoped_recovery_row_uses_selected_leaf_when_sibling_sorts_first(tmp_path: Path) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    older = datetime.now(UTC) - timedelta(days=1)
+    newer = datetime.now(UTC)
+    sibling.created_at = older
+    sibling.completed_at = older
+    selected.created_at = newer
+    selected.completed_at = newer
+    store.update(sibling)
+    store.update(selected)
+
+    rows = watch_module._query_owner_rows(
+        store=store,
+        config=config,
+        git=_make_watch_git(),
+        target_branch="main",
+        owner_task_ids=(owner.id,),
+        task_ids=(selected.id,),
+        max_recovery_attempts=config.max_resume_attempts,
+        include_skipped=True,
+    )
+
+    assert len(rows) == 1
+    assert rows[0].recovery_leaf_task is not None
+    assert rows[0].recovery_leaf_task.id == selected.id
+    assert rows[0].recovery_action_task is not None
+    assert rows[0].recovery_action_task.id == selected.id
+    assert sibling.id not in {task.id for task in rows[0].unresolved_tasks}
+
+
+@pytest.mark.parametrize("reverse_selector_order", [False, True])
+def test_watch_scoped_two_selected_leaves_under_one_owner_plan_later_retryable_when_first_needs_attention(
+    tmp_path: Path,
+    reverse_selector_order: bool,
+) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    attention_only = selected
+    attention_only.failure_reason = "REBASE_CONFLICT"
+    store.update(attention_only)
+    retryable = store.add(
+        "Retryable selected stale failed leaf",
+        task_type="implement",
+        based_on=owner.id,
+        same_branch=True,
+    )
+    assert retryable.id is not None
+    retryable.status = "failed"
+    retryable.failure_reason = "MAX_TURNS"
+    retryable.completed_at = datetime.now(UTC)
+    retryable.branch = "feature/retryable-selected-leaf"
+    retryable.has_commits = False
+    retryable.merge_status = "merged"
+    retryable.session_id = f"session-{retryable.id}"
+    store.update(retryable)
+
+    scoped_task_ids = (retryable.id, attention_only.id) if reverse_selector_order else (attention_only.id, retryable.id)
+    scoped_owner_ids = _resolve_watch_scope_owner_ids(
+        store,
+        scoped_task_ids,
+        max_recovery_attempts=1,
+        config=config,
+    )
+    assert scoped_owner_ids == (owner.id, owner.id)
+
+    rows = watch_module._query_owner_rows(
+        store=store,
+        config=config,
+        git=_make_watch_git(),
+        target_branch="main",
+        owner_task_ids=scoped_owner_ids,
+        task_ids=scoped_task_ids,
+        max_recovery_attempts=1,
+        include_skipped=True,
+    )
+
+    recovery_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert recovery_leaf_ids == {attention_only.id, retryable.id}
+    assert sibling.id not in recovery_leaf_ids
+
+    snapshot = watch_module.ConcurrencySnapshot(
+        limit=1,
+        running=1,
+        available=0,
+        live_pids=frozenset({111}),
+        running_task_ids=("gza-999999",),
+        anonymous_worker_count=0,
+        current_pid_counted=False,
+    )
+    log_path = tmp_path / ".gza" / "watch.log"
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.get_concurrency_snapshot", return_value=snapshot),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+        patch("gza.cli.watch._count_live_workers", return_value=1),
+    ):
+        plan = watch_module._build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+        )
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            precomputed_plan=plan,
+            max_recovery_attempts=1,
+        )
+
+    actionable_leaf_ids = {
+        failed.id
+        for _row, failed, decision, _action, _worker_consuming, _action_task in plan.analysis.actionable_failed
+        if decision.action in {"resume", "retry"}
+    }
+    assert retryable.id in actionable_leaf_ids
+    assert attention_only.id not in actionable_leaf_ids
+    assert sibling.id not in actionable_leaf_ids
+    assert result.effective_scoped_owner_ids == scoped_task_ids
+    assert result.scoped_done is False
+    assert result.scoped_active == 1
+    assert SCOPED_WATCH_COMPLETE_MESSAGE not in log_path.read_text()
+
+
+def test_watch_cycle_scoped_blind_auto_rearm_keeps_sibling_parked_and_replans_leaf_scope(
+    tmp_path: Path,
+) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.budget = 2
+    config.watch.parked_auto_rearm.cooldown_hours = 0
+    config.watch.parked_auto_rearm.require_target_advanced = False
+
+    selected_candidate = watch_module.ParkedTaskCandidate(
+        owner_task=owner,
+        subject_task=selected,
+        reason_class="retry-limit",
+        attention_reason="retry-limit-reached",
+        source="test",
+    )
+    sibling_candidate = watch_module.ParkedTaskCandidate(
+        owner_task=owner,
+        subject_task=sibling,
+        reason_class="retry-limit",
+        attention_reason="retry-limit-reached",
+        source="test",
+    )
+    _park_task_watch_progress(store, selected)
+    _park_task_watch_progress(store, sibling)
+    plan = _empty_scoped_watch_plan_with_effective_scope((selected.id,))
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: {
+            "refs/heads/main": "main-sha",
+            "refs/heads/feature/selected-leaf": "selected-sha",
+            "refs/heads/feature/sibling-leaf": "sibling-sha",
+            "HEAD": "main-sha",
+        }.get(ref)
+    )  # type: ignore[method-assign]
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.reconcile_stale_watch_no_progress_parks"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch.discover_parked_tasks",
+            return_value=((sibling_candidate, selected_candidate), 0),
+        ),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0) as spawn_iterate,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(selected.id,),
+            precomputed_plan=plan,
+        )
+
+    assert result.effective_scoped_owner_ids == (selected.id,)
+    assert spawn_iterate.called
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert f"[resume of {selected.id}]" in log_text
+    assert sibling.id not in log_text
+    assert store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=selected.id,
+        attention_reason="retry-limit-reached",
+    ) is not None
+    assert store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=sibling.id,
+        attention_reason="retry-limit-reached",
+    ) is None
+    assert store.list_watch_progress_observations(subject_kind="task", subject_id=sibling.id)
+
+
+def test_watch_cycle_scoped_blind_auto_rearm_uses_real_discovery_for_selected_leaf_when_sibling_wins_owner(
+    tmp_path: Path,
+) -> None:
+    config, store, owner, _selected, _sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    config.max_resume_attempts = 1
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.budget = 2
+    config.watch.parked_auto_rearm.cooldown_hours = 0
+    config.watch.parked_auto_rearm.require_target_advanced = False
+
+    unit = store.list_merge_units_for_task(str(owner.id), active_only=True)[0]
+    older = datetime.now(UTC) - timedelta(days=1)
+    unselected = _add_exhausted_parked_leaf(
+        store,
+        owner=owner,
+        unit_id=unit.id,
+        prompt="Earlier unselected parked leaf",
+        branch="feature/earlier-unselected-parked-leaf",
+        completed_at=older,
+    )
+    selected = _add_exhausted_parked_leaf(
+        store,
+        owner=owner,
+        unit_id=unit.id,
+        prompt="Selected parked leaf",
+        branch="feature/selected-parked-leaf",
+        completed_at=datetime.now(UTC),
+    )
+    assert selected.id is not None
+    assert unselected.id is not None
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="main-sha-1")  # type: ignore[method-assign]
+    snapshot = watch_module.ConcurrencySnapshot(
+        limit=1,
+        running=1,
+        available=0,
+        live_pids=frozenset({111}),
+        running_task_ids=("gza-999999",),
+        anonymous_worker_count=0,
+        current_pid_counted=False,
+    )
+    log_path = tmp_path / ".gza" / "watch.log"
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.get_concurrency_snapshot", return_value=snapshot),
+        patch("gza.cli.watch._count_live_workers", return_value=1),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(selected.id,),
+            precomputed_plan=_empty_scoped_watch_plan_with_effective_scope((selected.id,)),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.effective_scoped_owner_ids == (selected.id,)
+    assert result.scoped_done is False
+    assert result.scoped_active == 1
+    assert SCOPED_WATCH_COMPLETE_MESSAGE not in log_path.read_text()
+    assert store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=selected.id,
+        attention_reason="retry-limit-reached",
+    ) is not None
+    assert store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=unselected.id,
+        attention_reason="retry-limit-reached",
+    ) is None
+
+
+def test_blind_auto_rearm_real_discovery_keeps_two_selected_parked_leaves_distinct_under_one_owner(
+    tmp_path: Path,
+) -> None:
+    config, store, owner, _selected, _sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    config.max_resume_attempts = 1
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.budget = 2
+    config.watch.parked_auto_rearm.cooldown_hours = 0
+    config.watch.parked_auto_rearm.require_target_advanced = False
+
+    unit = store.list_merge_units_for_task(str(owner.id), active_only=True)[0]
+    selected_a = _add_exhausted_parked_leaf(
+        store,
+        owner=owner,
+        unit_id=unit.id,
+        prompt="Selected parked leaf A",
+        branch="feature/selected-parked-leaf-a",
+        completed_at=datetime.now(UTC) - timedelta(minutes=10),
+    )
+    selected_b = _add_exhausted_parked_leaf(
+        store,
+        owner=owner,
+        unit_id=unit.id,
+        prompt="Selected parked leaf B",
+        branch="feature/selected-parked-leaf-b",
+        completed_at=datetime.now(UTC),
+    )
+    assert selected_a.id is not None
+    assert selected_b.id is not None
+
+    result = _evaluate_blind_parked_auto_rearm(
+        config=config,
+        store=store,
+        git=_make_watch_git(),
+        target_branch="main",
+        target_sha="main-sha-1",
+        tags=None,
+        any_tag=False,
+        scoped_owner_ids=(selected_a.id, selected_b.id),
+    )
+
+    assert {
+        (decision.candidate.subject_task.id, decision.status, decision.detail)
+        for decision in result.decisions
+    } == {
+        (selected_a.id, "rearmed", "blind auto-rearm"),
+        (selected_b.id, "rearmed", "blind auto-rearm"),
+    }
+    for selected in (selected_a, selected_b):
+        rearm = store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id=str(selected.id),
+            attention_reason="retry-limit-reached",
+        )
+        assert rearm is not None
+        assert rearm.auto_attempt_count == 1
+
+
+def test_watch_cycle_scoped_blind_auto_rearm_logs_two_effective_leaf_records_under_one_owner(
+    tmp_path: Path,
+) -> None:
+    config, store, owner, _selected, _sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    config.max_resume_attempts = 1
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.budget = 2
+    config.watch.parked_auto_rearm.cooldown_hours = 0
+    config.watch.parked_auto_rearm.require_target_advanced = False
+
+    unit = store.list_merge_units_for_task(str(owner.id), active_only=True)[0]
+    selected_a = _add_exhausted_parked_leaf(
+        store,
+        owner=owner,
+        unit_id=unit.id,
+        prompt="Selected parked leaf A for logged rearm",
+        branch="feature/selected-parked-leaf-a-logged",
+        completed_at=datetime.now(UTC) - timedelta(minutes=10),
+    )
+    selected_b = _add_exhausted_parked_leaf(
+        store,
+        owner=owner,
+        unit_id=unit.id,
+        prompt="Selected parked leaf B for logged rearm",
+        branch="feature/selected-parked-leaf-b-logged",
+        completed_at=datetime.now(UTC),
+    )
+    assert selected_a.id is not None
+    assert selected_b.id is not None
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="main-sha-1")  # type: ignore[method-assign]
+    snapshot = watch_module.ConcurrencySnapshot(
+        limit=1,
+        running=1,
+        available=0,
+        live_pids=frozenset({111}),
+        running_task_ids=("gza-999999",),
+        anonymous_worker_count=0,
+        current_pid_counted=False,
+    )
+    log_path = tmp_path / ".gza" / "watch.log"
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.get_concurrency_snapshot", return_value=snapshot),
+        patch("gza.cli.watch._count_live_workers", return_value=1),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            scoped_owner_ids=(owner.id, owner.id),
+            scoped_task_ids=(selected_a.id, selected_b.id),
+            precomputed_plan=_empty_scoped_watch_plan_with_effective_scope((selected_a.id, selected_b.id)),
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.effective_scoped_owner_ids == (selected_a.id, selected_b.id)
+    rearm_lines = [line for line in log_path.read_text().splitlines() if "REARM" in line]
+    assert len(rearm_lines) == 2
+    assert any(f"{selected_a.id}: blind auto-rearm cleared retry-limit-reached" in line for line in rearm_lines)
+    assert any(f"{selected_b.id}: blind auto-rearm cleared retry-limit-reached" in line for line in rearm_lines)
+    assert all(owner.id not in line for line in rearm_lines)
+
+
+def test_blind_auto_rearm_real_discovery_expands_owner_scope_but_not_leaf_scope(
+    tmp_path: Path,
+) -> None:
+    config, store, owner, _selected, _sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    config.max_resume_attempts = 1
+    config.watch.parked_auto_rearm.enabled = True
+    config.watch.parked_auto_rearm.budget = 4
+    config.watch.parked_auto_rearm.cooldown_hours = 0
+    config.watch.parked_auto_rearm.require_target_advanced = False
+
+    unit = store.list_merge_units_for_task(str(owner.id), active_only=True)[0]
+    selected = _add_exhausted_parked_leaf(
+        store,
+        owner=owner,
+        unit_id=unit.id,
+        prompt="Owner-scope selected parked leaf",
+        branch="feature/owner-scope-selected-leaf",
+        completed_at=datetime.now(UTC) - timedelta(minutes=10),
+    )
+    sibling = _add_exhausted_parked_leaf(
+        store,
+        owner=owner,
+        unit_id=unit.id,
+        prompt="Owner-scope sibling parked leaf",
+        branch="feature/owner-scope-sibling-leaf",
+        completed_at=datetime.now(UTC),
+    )
+    assert selected.id is not None
+    assert sibling.id is not None
+
+    owner_result = _evaluate_blind_parked_auto_rearm(
+        config=config,
+        store=store,
+        git=_make_watch_git(),
+        target_branch="main",
+        target_sha="main-sha-1",
+        tags=None,
+        any_tag=False,
+        scoped_owner_ids=(owner.id,),
+        scoped_task_ids=(owner.id,),
+        startup_scoped_owner_ids=(owner.id,),
+    )
+
+    assert {
+        decision.candidate.subject_task.id
+        for decision in owner_result.decisions
+        if decision.status == "rearmed"
+    } == {selected.id, sibling.id}
+
+    with store._connect() as conn:  # noqa: SLF001 - reset temp rearm state between selector modes
+        conn.execute(
+            "DELETE FROM parked_task_rearms WHERE project_id = ? AND subject_id IN (?, ?)",
+            (store._project_id, selected.id, sibling.id),  # noqa: SLF001
+        )
+
+    leaf_result = _evaluate_blind_parked_auto_rearm(
+        config=config,
+        store=store,
+        git=_make_watch_git(),
+        target_branch="main",
+        target_sha="main-sha-2",
+        tags=None,
+        any_tag=False,
+        scoped_owner_ids=(selected.id,),
+        scoped_task_ids=(selected.id,),
+        startup_scoped_owner_ids=(owner.id,),
+    )
+
+    assert {
+        decision.candidate.subject_task.id
+        for decision in leaf_result.decisions
+        if decision.status == "rearmed"
+    } == {selected.id}
+    assert store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=sibling.id,
+        attention_reason="retry-limit-reached",
+    ) is None
+
+
+def test_cmd_watch_scoped_live_reroot_retains_two_selected_leaves_under_one_owner(tmp_path: Path) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    second_selected = store.add(
+        "Second selected stale failed leaf",
+        task_type="implement",
+        based_on=owner.id,
+        same_branch=True,
+    )
+    assert second_selected.id is not None
+    second_selected.status = "failed"
+    second_selected.failure_reason = "MAX_TURNS"
+    second_selected.completed_at = datetime.now(UTC)
+    second_selected.branch = "feature/second-selected-leaf"
+    second_selected.merge_status = "merged"
+    store.update(second_selected)
+    assert _resolve_watch_scope_owner_ids(
+        store,
+        (selected.id, second_selected.id),
+        max_recovery_attempts=config.max_resume_attempts,
+        config=config,
+    ) == (owner.id, owner.id)
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, selected, second_selected, sibling),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="failed_recovery",
+        unresolved_tasks=(selected, second_selected),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=selected,
+        recovery_leaf_task=selected,
+    )
+    assert watch_module._derive_effective_scoped_owner_ids(
+        store=store,
+        owner_rows=(row,),
+        scoped_owner_ids=(owner.id, owner.id),
+        scoped_task_ids=(selected.id, second_selected.id),
+    ) == (selected.id, second_selected.id)
+
+    args = _watch_args(tmp_path, [selected.id, second_selected.id], dry_run=True)
+    seen_transition_scopes: list[tuple[str, ...] | None] = []
+
+    def observe_transition_scope(*args: object, **kwargs: object) -> tuple[str, ...]:
+        seen_transition_scopes.append(kwargs["scoped_owner_ids"])
+        return ()
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch(
+            "gza.cli.watch._build_watch_cycle_plan",
+            return_value=_empty_scoped_watch_plan_with_effective_scope((selected.id, second_selected.id)),
+        ),
+        patch("gza.cli.watch._emit_transition_events", side_effect=observe_transition_scope),
+        patch(
+            "gza.cli.watch._dispatch_scoped_watch_once",
+            return_value=_CycleResult(
+                False,
+                0,
+                0,
+                scoped_done=True,
+                effective_scoped_owner_ids=(selected.id, second_selected.id),
+            ),
+        ),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert seen_transition_scopes
+    assert all(scope == (selected.id, second_selected.id) for scope in seen_transition_scopes)
+    assert sibling.id not in seen_transition_scopes[0]
+
+
+def test_watch_scoped_terminal_leaf_disappearance_completes_with_leaf_banner(tmp_path: Path) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    selected.status = "completed"
+    selected.failure_reason = None
+    selected.completed_at = datetime.now(UTC)
+    store.update(selected)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(selected.id,),
+            precomputed_plan=_empty_scoped_watch_plan_with_effective_scope((selected.id,)),
+        )
+
+    assert result.scoped_done is True
+    assert result.effective_scoped_owner_ids == (selected.id,)
+    log_text = log_path.read_text()
+    scope_line = next(line for line in log_text.splitlines() if "scope: owners=" in line)
+    assert selected.id in scope_line
+    assert owner.id not in scope_line
+    assert sibling.id not in scope_line
+
+
+def test_cmd_watch_scoped_terminal_leaf_completion_message_uses_effective_scope(
+    tmp_path: Path,
+) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    selected.status = "completed"
+    selected.failure_reason = None
+    selected.completed_at = datetime.now(UTC)
+    store.update(selected)
+    assert sibling.status == "failed"
+
+    args = _watch_args(tmp_path, [selected.id])
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch(
+            "gza.cli.watch._build_watch_cycle_plan",
+            return_value=_empty_scoped_watch_plan_with_effective_scope((selected.id,)),
+        ),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert store.get(sibling.id).status == "failed"
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert SCOPED_WATCH_COMPLETE_MESSAGE in log_text
+    assert "all named owner units" not in log_text
+
+
+def test_cmd_watch_scoped_system_hold_emits_effective_leaf_scope_before_hold_and_completion(
+    tmp_path: Path,
+) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    args = _watch_args(tmp_path, [selected.id], poll=1)
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._system_can_run_tasks", side_effect=(False, True)),
+        patch(
+            "gza.cli.watch._run_cycle",
+            return_value=_CycleResult(
+                False,
+                0,
+                0,
+                scoped_done=True,
+                effective_scoped_owner_ids=(selected.id,),
+            ),
+        ),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    log_lines = (tmp_path / ".gza" / "watch.log").read_text().splitlines()
+    scope_indexes = [index for index, line in enumerate(log_lines) if "scope: owners=" in line]
+    hold_index = next(index for index, line in enumerate(log_lines) if "HOLD" in line)
+    assert scope_indexes
+    for scope_index in scope_indexes:
+        scope_line = log_lines[scope_index]
+        assert selected.id in scope_line
+        assert owner.id not in scope_line
+        assert sibling.id not in scope_line
+    assert scope_indexes[0] < hold_index
+
+    terminal_tmp_path = tmp_path / "terminal"
+    terminal_tmp_path.mkdir()
+    _terminal_config, terminal_store, terminal_owner, terminal_selected, terminal_sibling = (
+        _setup_stale_failed_leaf_live_reroot_scope(terminal_tmp_path)
+    )
+    terminal_selected.status = "completed"
+    terminal_selected.failure_reason = None
+    terminal_selected.completed_at = datetime.now(UTC)
+    terminal_store.update(terminal_selected)
+    terminal_args = _watch_args(terminal_tmp_path, [terminal_selected.id])
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._system_can_run_tasks", return_value=False),
+        patch("gza.cli.watch._resolve_watch_scope_owner_ids", return_value=(terminal_owner.id,)),
+        patch(
+            "gza.cli.watch._build_watch_cycle_plan",
+            return_value=_empty_scoped_watch_plan_with_effective_scope((terminal_selected.id,)),
+        ),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        terminal_rc = cmd_watch(terminal_args)
+
+    assert terminal_rc == 0
+    terminal_log_lines = (terminal_tmp_path / ".gza" / "watch.log").read_text().splitlines()
+    terminal_scope_index = next(index for index, line in enumerate(terminal_log_lines) if "scope: owners=" in line)
+    terminal_complete_index = next(
+        index for index, line in enumerate(terminal_log_lines) if SCOPED_WATCH_COMPLETE_MESSAGE in line
+    )
+    terminal_scope_line = terminal_log_lines[terminal_scope_index]
+    assert terminal_selected.id in terminal_scope_line
+    assert terminal_owner.id not in terminal_scope_line
+    assert terminal_sibling.id not in terminal_scope_line
+    assert terminal_scope_index < terminal_complete_index
+
+
+def test_watch_scoped_proven_live_reroot_survives_row_disappearance_without_effective_fixture(
+    tmp_path: Path,
+) -> None:
+    config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    startup_scope = _resolve_watch_scope_owner_ids(
+        store,
+        (selected.id,),
+        max_recovery_attempts=config.max_resume_attempts,
+        config=config,
+    )
+    assert startup_scope == (owner.id,)
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        first_plan = watch_module._build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=config.max_resume_attempts,
+            scoped_owner_ids=startup_scope,
+            scoped_task_ids=(selected.id,),
+        )
+    assert first_plan.analysis.effective_scoped_owner_ids == (selected.id,)
+
+    selected.status = "completed"
+    selected.failure_reason = None
+    selected.completed_at = datetime.now(UTC)
+    store.update(selected)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(log_path, quiet=True),
+            scoped_owner_ids=startup_scope,
+            scoped_task_ids=(selected.id,),
+            known_effective_scoped_owner_ids=first_plan.analysis.effective_scoped_owner_ids,
+            max_recovery_attempts=config.max_resume_attempts,
+        )
+
+    assert result.scoped_done is True
+    assert result.effective_scoped_owner_ids == (selected.id,)
+    scope_line = next(line for line in log_path.read_text().splitlines() if "scope: owners=" in line)
+    assert selected.id in scope_line
+    assert owner.id not in scope_line
+    assert sibling.id not in scope_line
+
+
+def test_watch_scoped_positional_effective_scope_survives_duplicate_selector_row_disappearance(
+    tmp_path: Path,
+) -> None:
+    _config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
+    assert watch_module._derive_effective_scoped_owner_ids(
+        store=store,
+        owner_rows=(),
+        scoped_owner_ids=(owner.id, owner.id, owner.id),
+        scoped_task_ids=(selected.id, selected.id, sibling.id),
+    ) == (owner.id, owner.id, owner.id)
+
+    selected_row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, selected, sibling),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="failed_recovery",
+        unresolved_tasks=(selected,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=selected,
+        recovery_leaf_task=selected,
+    )
+    proven_effective = watch_module._derive_effective_scoped_owner_ids(
+        store=store,
+        owner_rows=(selected_row,),
+        scoped_owner_ids=(owner.id, owner.id, owner.id),
+        scoped_task_ids=(selected.id, selected.id, sibling.id),
+        known_effective_scoped_owner_ids=(owner.id, owner.id, owner.id),
+    )
+    assert proven_effective == (selected.id, selected.id, owner.id)
+
+    retained_effective = watch_module._derive_effective_scoped_owner_ids(
+        store=store,
+        owner_rows=(),
+        scoped_owner_ids=(owner.id, owner.id, owner.id),
+        scoped_task_ids=(selected.id, selected.id, sibling.id),
+        known_effective_scoped_owner_ids=proven_effective,
+    )
+    assert retained_effective == (selected.id, selected.id, owner.id)
+
+    scope_line = watch_module._format_scope_message(None, any_tag=False, scoped_owner_ids=retained_effective)
+    assert selected.id in scope_line
+    assert _collect_unhandled_failures(
+        {
+            sibling.id: {"status": "pending", "task_type": "implement", "failure_reason": None},
+        },
+        {
+            sibling.id: {"status": "failed", "task_type": "implement", "failure_reason": "SIBLING_BOOM"},
+        },
+        store=store,
+        config=_config,
+        scoped_owner_ids=(selected.id, selected.id),
+    ) == []
 
 
 def test_watch_cycle_scoped_mode_does_not_log_unrelated_quiet_pending_tasks(tmp_path: Path) -> None:
@@ -35080,7 +37619,7 @@ def test_cmd_watch_scoped_system_hold_exits_without_global_pending_output(tmp_pa
     assert "holding queue (" not in log_text
     assert "holding scoped watch" not in log_text
     assert "pending" not in log_text
-    assert "scoped watch complete; all named owner units are terminal or parked" in log_text
+    assert SCOPED_WATCH_COMPLETE_MESSAGE in log_text
 
 
 def test_task_snapshot_hides_synthetic_git_health_internal_task(tmp_path: Path) -> None:

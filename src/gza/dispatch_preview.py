@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -280,7 +281,7 @@ def _build_recovery_preview_entries(
     else:
         owner_rows = tuple(owner_rows)
         read_context = read_context or RecoveryReadContext()
-    failed_rows = [
+    failed_rows = _unique_recovery_preview_rows(
         row
         for row in owner_rows
         if (
@@ -288,7 +289,7 @@ def _build_recovery_preview_entries(
             and row.recovery_action_task is not None
             and row.recovery_action_task.id == row.recovery_leaf_task.id
         )
-    ]
+    )
     failed_rows.sort(key=_recovery_owner_row_sort_key)
 
     entries: list[DispatchPreviewEntry] = []
@@ -366,6 +367,21 @@ def _build_recovery_preview_entries(
         )
 
     return tuple(owner_rows), read_context, tuple(entries)
+
+
+def _unique_recovery_preview_rows(rows: Iterable[LineageOwnerRow]) -> list[LineageOwnerRow]:
+    unique: list[LineageOwnerRow] = []
+    seen: set[tuple[str | None, str]] = set()
+    for row in rows:
+        if row.recovery_leaf_task is None or row.recovery_leaf_task.id is None:
+            unique.append(row)
+            continue
+        key = (row.owner_task.id, str(row.recovery_leaf_task.id))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique
 
 
 def _build_pending_preview_entries(

@@ -2083,22 +2083,30 @@ When enabled, `watch.parked_auto_rearm.budget` caps blind auto-rearm attempts pe
 
 When a non-global scope is active, watch emits an explicit scope line to console and
 `.gza/watch.log`: `INFO      scope: tags=<comma-separated-tags> mode=any|all` for tag
-scope, or `INFO      scope: owners=<comma-separated-owner-ids> mode=explicit` for
-positional merge-unit scope.
+scope, or `INFO      scope: owners=<comma-separated-effective-selector-ids> mode=explicit`
+for positional selector scope.
 
 You can scope watch to explicit merge units with `gza watch <task_id> [<task_id> ...]`.
-Each supplied task ID is resolved once to its canonical lineage / merge-unit owner, so passing a
-review, improve, rebase, retry, or resume descendant drives the owning unit rather than only that
-leaf. In this mode watch still uses the normal lifecycle, merge, iterate routing, attention, dry-run,
-batch, and worker adoption behavior, but it does not pick up unrelated pending tasks and it does not
-inspect the global failed-task recovery lane. Failed members inside the named owner rows may still be
-resumed or retried by the shared recovery policy. Scoped watch exits once all named units are merged,
-otherwise terminal, or parked with no automatic next step; unrelated global queue work does not keep it
+Each supplied task ID is first paired with its canonical lineage / merge-unit owner, and watch keeps
+that raw selector paired with its current effective live owner or leaf. Naming the canonical owner
+itself still means intentional whole-owner scope. Naming a descendant normally plans through the owner,
+but if scoped analysis finds a selector-matching failed leaf under a landed or otherwise terminal owner,
+watch re-roots that selector to the leaf and excludes siblings under the same startup owner. This
+selector closure is established before transition/failure handling on the first analyzed cycle, survives
+initial preview and later reanalysis, and is retained when a selected leaf becomes terminal and its owner
+row disappears. Multiple positional IDs may share one startup owner; each selected leaf remains distinct
+and unselected siblings stay out of transition events, failure backoff/halt accounting, active counts,
+scope banners, recovery launch targets, and parked auto-rearm mutations. In this mode watch still uses
+the normal lifecycle, merge, iterate routing, attention, dry-run, batch, and worker adoption behavior,
+but it does not pick up unrelated pending tasks and it does not inspect the global failed-task recovery
+lane. Failed members inside the effective selector rows may still be resumed or retried by the shared
+recovery policy. Scoped watch exits once all selected effective units are merged, otherwise terminal, or
+parked with no automatic next step; unrelated global queue work and unselected siblings do not keep it
 alive. Positional task IDs are mutually exclusive with `--tag`, `--all-tags`, and `--restart-failed`.
 `--dry-run` previews one scoped pass and exits. Scoped sessions also preserve the positional IDs when
 watch auto-reexecs after installed-code drift. The scoped `WAKE` header stays scoped too: it reports
-only the named owners, emits the explicit owner-scope line, and does not include unrelated global
-blocked-pending counts.
+only the effective selected scope, emits the explicit owner/leaf-scope line, and does not include
+unrelated global blocked-pending counts.
 
 Manual-operator advance outcomes such as `needs_discussion`, `max_cycles_reached`, exhausted failed-task recovery, and improve-recovery stop reasons are surfaced as `ATTENTION` lines in watch output instead of one-shot deduped `SKIP` lines. Watch reuses the same formatted task line as `gza advance`, including the stable `reason=...` policy slug. Inline `ATTENTION` is emitted only when an attention row is newly visible for the current watch session or when that row's message changes from the previous watch pass; unchanged inline reminders are suppressed. Each watch pass still prints a counted `Needs attention (...)` roundup for the full current visible set, so unchanged rows stay operator-visible even when no new inline `ATTENTION` line appears. Attention row identity comes from the action's declared subject task, so held plans and similar follow-up gates render against the task the operator should inspect. Guarded pending routing skips use the same centralized attention path on the first observed guarded skip, then follow the same unchanged-inline suppression while remaining present in the roundup. Successful watch-managed merges now surface as exactly one structured `MERGE <owner-task-id> -> <target>` line per landed merge unit at the moment the merge lands; watch suppresses the shared cosmetic `Merging...`, `Successfully squash merged`, and `✓ Reconciled ...` success chatter, but still prints squash-reconcile warning/failure guidance when origin reconciliation diverges. The logged task ID is the merge-unit owner/leader only. Canonical merge credit for attached members persists on the shared merge unit (`state == merged`), while the compatibility task-row `merge_status` field remains owner-scoped during the migration window. For failed-recovery reasons such as `automatic-recovery-disabled`, `retry-limit-reached`, and `retryable-provider-error`, the shared CLI attention recommendation is category-aware: implementations that never completed tell the operator to retry or re-implement instead; completed implementations whose terminal failed task is retryable point at `gza unstick <owner-id> --reason retry-limit` (optionally `--run`); and `gza fix` stays reserved for review/content churn plus completed-implementation failed recovery whose terminal failure category is not retryable. For the review/improve-churn handoff reason `review-max-cycles-reached`, `gza advance` and `gza iterate` print `Recommended next step: gza fix <task-id>`. A `retry-limit-reached` owner stays parked until the operator runs `gza unstick --reason retry-limit` or otherwise changes lineage state; after that durable manual rearm, watch can select fresh shared recovery work again while the historical failed descendants remain in place for audit. When blind parked auto-rearm is enabled, watch may also spend the bounded `watch.parked_auto_rearm` budget to create a fresh effective retry-limit rearm epoch after cooldown and target-advance gating pass; inside one cooldown window, slot reuse stays with the normal watch dispatcher and the same subject/reason pair gets at most one blind attempt. Treat `manual-review-required` as a legacy alias rather than a current parked reason. Ordinary wait/skip states keep the existing `SKIP` dedupe behavior.
 

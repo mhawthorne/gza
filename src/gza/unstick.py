@@ -16,11 +16,13 @@ from .sync_ops import build_branch_cohorts_for_tasks, reconcile_branch_merge_tru
 from .task_query import normalize_tag_filters, task_matches_tag_filters
 from .watch_progress import (
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
+    WatchProgressScope,
     clear_watch_progress_subject,
     reconcile_stale_watch_no_progress_parks,
 )
 
 ParkReasonClass = Literal["backstop", "retry-limit", "reconcile"]
+ParkedDiscoveryScopeKind = Literal["canonical_owner", "effective_leaf"]
 
 RECONCILE_NEEDS_MANUAL_RESOLUTION_REASON = "reconcile-needs-manual-resolution"
 SUPPORTED_PARK_REASON_CLASSES: tuple[ParkReasonClass, ...] = ("backstop", "retry-limit", "reconcile")
@@ -81,9 +83,66 @@ def discover_parked_tasks(
     config: Config,
     git: Git,
     target_branch: str,
+    task_ids: Sequence[str] = (),
+    selector_kinds: Sequence[ParkedDiscoveryScopeKind] | None = None,
 ) -> tuple[tuple[ParkedTaskCandidate, ...], int]:
     """Return the currently parked backstop/reconcile owner candidates."""
-    stale_backstop_cleared = reconcile_stale_watch_no_progress_parks(store)
+    scoped_task_ids = tuple(task_ids)
+    scoped_task_id_set = frozenset(scoped_task_ids)
+    selector_kind_by_task_id: dict[str, ParkedDiscoveryScopeKind] = {}
+    if selector_kinds is not None:
+        for index, task_id in enumerate(scoped_task_ids):
+            kind = selector_kinds[index] if index < len(selector_kinds) else "effective_leaf"
+            selector_kind_by_task_id.setdefault(task_id, kind)
+    leaf_scoped_task_id_set = (
+        frozenset(task_id for task_id, kind in selector_kind_by_task_id.items() if kind == "effective_leaf")
+        if selector_kinds is not None
+        else scoped_task_id_set
+    )
+
+    def _task_is_descendant_of(task_id: str, ancestor_id: str) -> bool:
+        pending_ids: list[str | None] = [task_id]
+        seen: set[str] = set()
+        while pending_ids:
+            current_id = pending_ids.pop()
+            if current_id is None or current_id in seen:
+                continue
+            if current_id == ancestor_id:
+                return True
+            seen.add(current_id)
+            task = store.get(current_id)
+            if task is not None:
+                pending_ids.extend((task.based_on, task.depends_on))
+        return False
+
+    def _task_is_in_canonical_owner_scope(task_id: str, owner_id: str) -> bool:
+        if task_id == owner_id or _task_is_descendant_of(task_id, owner_id):
+            return True
+        merge_unit = store.resolve_merge_unit_for_task(task_id)
+        return merge_unit is not None and merge_unit.owner_task_id == owner_id
+
+    query_task_ids: tuple[str, ...] | None
+    if not scoped_task_ids:
+        query_task_ids = None
+    elif selector_kinds is None:
+        query_task_ids = scoped_task_ids
+    else:
+        expanded: list[str] = []
+        for task_id, kind in selector_kind_by_task_id.items():
+            if kind == "effective_leaf":
+                expanded.append(task_id)
+                continue
+            expanded.extend(
+                candidate.id
+                for candidate in store.get_all()
+                if candidate.id is not None and _task_is_in_canonical_owner_scope(candidate.id, task_id)
+            )
+        query_task_ids = tuple(dict.fromkeys(expanded))
+
+    reconcile_scopes: tuple[WatchProgressScope, ...] | None = None
+    if scoped_task_ids and selector_kinds is not None:
+        reconcile_scopes = tuple((selector_kind_by_task_id[task_id], task_id) for task_id in scoped_task_ids)
+    stale_backstop_cleared = reconcile_stale_watch_no_progress_parks(store, scopes=reconcile_scopes)
     owner_rows, _read_context = query_lineage_owner_rows_in_read_session(
         store,
         LineageOwnerQuery(
@@ -92,6 +151,7 @@ def discover_parked_tasks(
             include_skipped=True,
             exclude_dropped_from_planning=True,
             max_recovery_attempts=config.max_resume_attempts,
+            task_ids=query_task_ids,
         ),
         config=config,
         git=git,
@@ -108,14 +168,28 @@ def discover_parked_tasks(
                 member_owner_rows[member.id] = row
 
     candidates_by_key: dict[tuple[str, ParkReasonClass], ParkedTaskCandidate] = {}
+
+    def _candidate_key(candidate: ParkedTaskCandidate) -> tuple[str, ParkReasonClass] | None:
+        owner_id = candidate.owner_task.id
+        subject_id = candidate.subject_task.id
+        if owner_id is None or subject_id is None:
+            return None
+        if leaf_scoped_task_id_set and subject_id in leaf_scoped_task_id_set and subject_id != owner_id:
+            return (subject_id, candidate.reason_class)
+        if selector_kinds is not None and scoped_task_id_set and subject_id != owner_id:
+            for scoped_task_id, kind in selector_kind_by_task_id.items():
+                if kind == "canonical_owner" and _task_is_in_canonical_owner_scope(subject_id, scoped_task_id):
+                    return (subject_id, candidate.reason_class)
+        return (owner_id, candidate.reason_class)
+
     for row in owner_rows:
-        owner_id = row.owner_task.id
-        if owner_id is None:
-            continue
         parked = _row_to_parked_candidate(store, row=row)
         if parked is None:
             continue
-        candidates_by_key[(owner_id, parked.reason_class)] = parked
+        key = _candidate_key(parked)
+        if key is None:
+            continue
+        candidates_by_key[key] = parked
 
     if store.supports_watch_progress_observations():
         for observation in store.list_all_watch_progress_observations(parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON):
@@ -128,23 +202,34 @@ def discover_parked_tasks(
             owner_row = member_owner_rows.get(subject_task.id)
             owner_task = owner_row.owner_task if owner_row is not None else subject_task
             owner_id = owner_task.id
-            if owner_id is None:
+            if scoped_task_id_set and selector_kinds is not None:
+                in_leaf_scope = subject_task.id in leaf_scoped_task_id_set
+                in_owner_scope = any(
+                    kind == "canonical_owner" and _task_is_in_canonical_owner_scope(subject_task.id, scoped_task_id)
+                    for scoped_task_id, kind in selector_kind_by_task_id.items()
+                )
+                if not in_leaf_scope and not in_owner_scope:
+                    continue
+            elif scoped_task_id_set and subject_task.id not in scoped_task_id_set and owner_id not in scoped_task_id_set:
                 continue
-            candidates_by_key.setdefault(
-                (owner_id, "backstop"),
-                ParkedTaskCandidate(
-                    owner_task=owner_task,
-                    subject_task=subject_task,
-                    reason_class="backstop",
-                    attention_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
-                    source="watch_progress",
-                ),
+            elif owner_id is None:
+                continue
+            candidate = ParkedTaskCandidate(
+                owner_task=owner_task,
+                subject_task=subject_task,
+                reason_class="backstop",
+                attention_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+                source="watch_progress",
             )
+            key = _candidate_key(candidate)
+            if key is None:
+                continue
+            candidates_by_key.setdefault(key, candidate)
 
     ordered = tuple(
         sorted(
             candidates_by_key.values(),
-            key=lambda candidate: candidate.owner_task.id or "",
+            key=lambda candidate: (candidate.owner_task.id or "", candidate.subject_task.id or ""),
         )
     )
     return ordered, stale_backstop_cleared

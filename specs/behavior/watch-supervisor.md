@@ -565,9 +565,31 @@ When the installed `gza` package fingerprint changes while watch is running:
   scope.
 - Scope banners, wake summaries, and attention output SHOULD make the active scope
   explicit so operators can tell when watch is intentionally ignoring other work.
-- `watch <task-id>...` MUST normalize each supplied ID to the canonical lineage /
-  merge-unit owner before the loop starts, then use those owner IDs as the scope for all
-  cycle planning.
+- `watch <task-id>...` MUST keep one explicit selector record per supplied raw task ID.
+  Each selector records the raw ID, its startup canonical lineage / merge-unit owner, and
+  the current effective live owner/leaf established by scoped owner-row analysis.
+- Ordinary explicit owner scope still drives the whole owner when the operator names the
+  canonical owner itself. The exception is a raw descendant selector whose scoped
+  analysis re-roots to a selector-matching failed leaf under a landed or otherwise
+  terminal canonical owner; that selector's effective identity is the matching leaf, not
+  the canonical owner or any sibling.
+- Selector closure MUST be established before transition and failure-boundary processing
+  for the first analyzed cycle, including after an initial preview, and then carried into
+  subsequent preview, dispatch, reanalysis, and completion checks.
+- Recovery rows in explicit selector scope MUST come only from failed leaves matching one
+  of the raw selectors. An actionable sibling that sorts earlier MUST NOT become the
+  recovery row, recovery action, launch target, or no-progress/rearm subject for the
+  selected leaf.
+- Multiple raw selectors MAY share one startup canonical owner. Watch MUST retain one
+  effective identity per selector and exclude any unselected sibling under that same owner.
+- If an effective selector leaf becomes terminal and its owner row disappears while a
+  sibling remains unresolved, watch MUST retain the leaf-specific terminal state long
+  enough to complete that selector and render the leaf identity in the scope banner. It
+  MUST NOT broaden missing or ambiguous effective rows back to the canonical owner.
+- Active counting, transition filtering, failure halt/backoff boundaries, scope rendering,
+  scoped recovery, and state-mutating parked auto-rearm paths MUST consume the effective
+  selector identities. They MUST NOT count, report, clear, rearm, retry, resume, or launch
+  an unselected sibling merely because it shares the startup owner.
 - Explicit merge-unit scope is mutually exclusive with tag scope. The supervisor MUST
   fail closed rather than AND-combine named owners with `--tag` / `--all-tags`.
 - Explicit merge-unit scope MUST disable global pending pickup and the global failed-task

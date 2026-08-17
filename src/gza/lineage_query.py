@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -1421,6 +1421,14 @@ def _query_lineage_owner_rows_with_context(
                     include_tag_filters=False,
                     merge_unit=merge_unit,
                 )
+                if query.task_ids is not None and task.status != "failed":
+                    matches = _matches_task_filters(
+                        task,
+                        replace(query, task_ids=None),
+                        tag_matcher=task_matches_tag_filters,
+                        include_tag_filters=False,
+                        merge_unit=merge_unit,
+                    )
                 if task.task_type in IMPLEMENTATION_SOURCE_TASK_TYPES and task.status == "completed":
                     followup_state = _source_followup_state(indexes, task, source_followup_cache)
                     needs_followup = source_task_needs_implementation_followup(
@@ -1583,16 +1591,16 @@ def _query_lineage_owner_rows_with_context(
             recovery_action_task: DbTask | None = None
             recovery_leaf_task: DbTask | None = None
             max_recovery_attempts = query.max_recovery_attempts if query.max_recovery_attempts is not None else 1
-            failed_action_candidate: DbTask | None = None
-            failed_action_candidate_decision = None
+            failed_action_candidates: list[tuple[DbTask, Any, dict[str, Any] | None]] = []
             recovery_merge_context = None
             if reuse_recovery_merge_context:
                 from .recovery_engine import _MergeContext
 
                 if isinstance(read_context.merge_context, _MergeContext):
                     recovery_merge_context = read_context.merge_context
+            scoped_failed_leaves = matching_failed_leaves if query.task_ids is not None else failed_leaves
             for failed_task in sorted(
-                failed_leaves,
+                scoped_failed_leaves,
                 key=lambda task: (
                     visible_failed_order.get(task.id or "", len(visible_failed_order)),
                     _task_event_time(task),
@@ -1618,15 +1626,17 @@ def _query_lineage_owner_rows_with_context(
                 if failed_task.task_type == "improve" and lifecycle_action_task is not None:
                     continue
                 if decision.action != "skip" or attention_action is not None:
-                    failed_action_candidate = failed_task
-                    failed_action_candidate_decision = decision
-                    break
+                    failed_action_candidates.append((failed_task, decision, attention_action))
+                    if query.task_ids is None:
+                        break
+            failed_action_candidate = failed_action_candidates[0][0] if failed_action_candidates else None
+            failed_action_candidate_decision = failed_action_candidates[0][1] if failed_action_candidates else None
             if failed_action_candidate is not None:
                 recovery_action_task = failed_action_candidate
                 recovery_leaf_task = failed_action_candidate
-            elif lifecycle_action_task is None and failed_leaves:
+            elif lifecycle_action_task is None and scoped_failed_leaves:
                 recovery_leaf_task = max(
-                    failed_leaves,
+                    scoped_failed_leaves,
                     key=lambda task: (_task_event_time(task), task_id_numeric_key(task.id)),
                 )
                 recovery_action_task = recovery_leaf_task
@@ -1732,21 +1742,58 @@ def _query_lineage_owner_rows_with_context(
                 for task in displayed_unresolved_tasks
                 if task.id is not None
             )
-            rows.append(
-                LineageOwnerRow(
-                    owner_task=owner,
-                    members=rendered_members,
-                    tree=tree,
-                    lineage_status=lineage_status,
-                    next_action=action,
-                    next_action_reason=str(action.get("description", "")) if action is not None else "",
-                    unresolved_tasks=displayed_unresolved_tasks,
-                    unresolved_leaf_summary=summaries,
-                    lifecycle_action_task=lifecycle_action_task,
-                    recovery_action_task=recovery_action_task,
-                    recovery_leaf_task=recovery_leaf_task,
-                )
+            base_row = LineageOwnerRow(
+                owner_task=owner,
+                members=rendered_members,
+                tree=tree,
+                lineage_status=lineage_status,
+                next_action=action,
+                next_action_reason=str(action.get("description", "")) if action is not None else "",
+                unresolved_tasks=displayed_unresolved_tasks,
+                unresolved_leaf_summary=summaries,
+                lifecycle_action_task=lifecycle_action_task,
+                recovery_action_task=recovery_action_task,
+                recovery_leaf_task=recovery_leaf_task,
             )
+            selector_recovery_plans = (
+                tuple(failed_action_candidates)
+                if query.task_ids is not None and lifecycle_action_task is None and failed_action_candidates
+                else ()
+            )
+            if selector_recovery_plans:
+                for leaf, decision, attention_action in selector_recovery_plans:
+                    row_action = attention_action
+                    if row_action is None and decision.action in {"resume", "retry"}:
+                        recovery_action = {
+                            "type": decision.action,
+                            "description": decision.reason_text,
+                            "recovery_task_id": decision.recovery_task_id,
+                        }
+                        candidate = build_watch_progress_candidate(
+                            store,
+                            subject_task=leaf,
+                            action=recovery_action,
+                            action_task=leaf,
+                            failed_task=leaf,
+                        )
+                        row_action = get_active_watch_no_progress_attention(store, candidate=candidate)
+                    row_status = _classify_lineage_status(row_action) if row_action is not None else "actionable"
+                    rows.append(
+                        replace(
+                            base_row,
+                            lineage_status=row_status,
+                            next_action=row_action,
+                            next_action_reason=str(row_action.get("description", "")) if row_action is not None else "",
+                            unresolved_tasks=(leaf,),
+                            unresolved_leaf_summary=tuple(
+                                summary for summary in summaries if summary.task_id == leaf.id
+                            ),
+                            recovery_action_task=leaf,
+                            recovery_leaf_task=leaf,
+                        )
+                    )
+            else:
+                rows.append(base_row)
 
         rows.sort(
             key=lambda row: (

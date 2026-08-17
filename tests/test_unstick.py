@@ -304,6 +304,62 @@ def test_discover_parked_tasks_includes_retry_limit_owner_row(tmp_path: Path) ->
     assert candidates[0].reason_class == "retry-limit"
 
 
+def test_discover_parked_tasks_selector_scope_keeps_leaf_candidates_but_collapses_whole_owner(
+    tmp_path: Path,
+) -> None:
+    config, store = _config_and_store(tmp_path)
+    git = _GitDouble()
+    impl, retry, first_row = _make_retry_limit_owner(
+        store,
+        prompt="Retry limit owner with sibling leaves",
+        branch="feature/retry-limit-siblings",
+    )
+    sibling_retry = store.add("Sibling retry limit leaf", task_type="implement", based_on=impl.id)
+    assert sibling_retry.id is not None
+    sibling_retry.status = "failed"
+    sibling_retry.failure_reason = "INFRASTRUCTURE_ERROR"
+    sibling_retry.completed_at = datetime.now(UTC)
+    sibling_retry.branch = impl.branch
+    sibling_retry.has_commits = True
+    store.update(sibling_retry)
+    second_row = LineageOwnerRow(
+        owner_task=impl,
+        members=(impl, retry, sibling_retry),
+        tree=None,
+        lineage_status="needs_attention",
+        next_action={
+            "type": "skip",
+            "description": "automatic recovery stops here; retry limit reached",
+            "needs_attention_reason": RETRY_LIMIT_REACHED_ATTENTION_REASON,
+            "subject_task_id": sibling_retry.id,
+        },
+        next_action_reason="needs_attention",
+        unresolved_tasks=(sibling_retry,),
+        unresolved_leaf_summary=(),
+    )
+
+    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((first_row, second_row), object())):
+        leaf_candidates, _stale_cleared = discover_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+            task_ids=(retry.id, sibling_retry.id),
+        )
+        owner_candidates, _stale_cleared = discover_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+            task_ids=(impl.id,),
+        )
+
+    assert {candidate.subject_task.id for candidate in leaf_candidates} == {retry.id, sibling_retry.id}
+    assert len(owner_candidates) == 1
+    assert owner_candidates[0].owner_task.id == impl.id
+    assert owner_candidates[0].reason_class == "retry-limit"
+
+
 def test_discover_parked_tasks_maps_retryable_provider_error_to_retry_limit_rearm(tmp_path: Path) -> None:
     config, store = _config_and_store(tmp_path)
     git = _GitDouble()

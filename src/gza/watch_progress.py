@@ -7,13 +7,15 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from .db import SqliteTaskStore, Task as DbTask, WatchProgressObservation, task_id_numeric_key
 from .lineage import resolve_lineage_root
 from .runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
 
 WATCH_NO_PROGRESS_BACKSTOP_REASON = "watch-no-progress-backstop"
+WatchProgressScopeKind = Literal["canonical_owner", "effective_leaf"]
+WatchProgressScope = tuple[WatchProgressScopeKind, str]
 
 
 @dataclass(frozen=True)
@@ -307,13 +309,53 @@ def _watch_no_progress_park_is_stale(
     return subject_task.status in {"failed", "dropped"}
 
 
-def reconcile_stale_watch_no_progress_parks(store: SqliteTaskStore) -> int:
+def _task_is_in_watch_progress_scope(
+    store: SqliteTaskStore,
+    *,
+    task_id: str,
+    scopes: tuple[WatchProgressScope, ...],
+) -> bool:
+    for scope_kind, scope_task_id in scopes:
+        if task_id == scope_task_id:
+            return True
+        pending_ids: list[str | None] = [task_id]
+        seen: set[str] = set()
+        while pending_ids:
+            current_id = pending_ids.pop()
+            if current_id is None or current_id in seen:
+                continue
+            if current_id == scope_task_id:
+                return True
+            seen.add(current_id)
+            task = store.get(current_id)
+            if task is not None:
+                pending_ids.extend((task.based_on, task.depends_on))
+        if scope_kind == "canonical_owner":
+            merge_unit = store.resolve_merge_unit_for_task(task_id)
+            if merge_unit is not None and merge_unit.owner_task_id == scope_task_id:
+                return True
+    return False
+
+
+def reconcile_stale_watch_no_progress_parks(
+    store: SqliteTaskStore,
+    *,
+    scopes: tuple[WatchProgressScope, ...] | None = None,
+) -> int:
     """Delete persisted parked watch observations whose basis no longer holds."""
     cleared: set[tuple[str, str]] = set()
     for observation in store.list_all_watch_progress_observations(parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON):
         subject_key = (observation.subject_kind, observation.subject_id)
         if subject_key in cleared:
             continue
+        if scopes is not None:
+            scoped_task_id = observation.subject_task_id
+            if scoped_task_id is None or not _task_is_in_watch_progress_scope(
+                store,
+                task_id=scoped_task_id,
+                scopes=scopes,
+            ):
+                continue
         if not _watch_no_progress_park_is_stale(store, observation=observation):
             continue
         _clear_watch_subject_state(

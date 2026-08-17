@@ -1056,7 +1056,9 @@ def main() -> int:
         help="Continuously run recovery, lifecycle, and pending pickup to maintain a worker batch",
         description=(
             "Continuously run recovery, lifecycle, and pending pickup to maintain a worker batch. "
-            "Optionally pass task IDs to drive only those merge units."
+            "Optionally pass task IDs to drive only the effective selector scope: naming a "
+            "canonical owner drives that whole owner, while naming a live failed descendant may "
+            "re-root to that leaf and exclude sibling work."
         ),
     )
     add_common_args(watch_parser)
@@ -1064,7 +1066,7 @@ def main() -> int:
         "task_ids",
         nargs="*",
         type=str,
-        help="Specific task ID(s) whose merge units should be driven",
+        help="Task ID selector(s): canonical owners drive the whole owner; live failed descendants may drive only that effective leaf",
     )
     watch_parser.set_defaults(restart_failed=False)
     watch_parser.add_argument(
