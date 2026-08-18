@@ -74,7 +74,6 @@ from ..lineage_query import (
 )
 from ..lineage_view import LineageView
 from ..main_integration_verify import (
-    MAIN_INTEGRATION_VERIFY_REASON,
     MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
     MAIN_INTEGRATION_VERIFY_TAG,
     CandidateIntegrationVerifyCheck,
@@ -84,6 +83,7 @@ from ..main_integration_verify import (
     MainIntegrationVerifyState,
     check_candidate_integration_verify,
     check_main_integration_verify,
+    main_integration_verify_attention_reason,
     persist_main_integration_verify_alert_message,
     persist_main_integration_verify_pending_retire_signatures,
     promote_candidate_integration_verify_evidence,
@@ -3220,7 +3220,7 @@ def _main_verify_ordinary_attention_key(state: Any) -> str | None:
     task_id = getattr(task, "id", None)
     if not isinstance(task_id, str) or not task_id:
         return None
-    return f"main-integration-verify:{task_id}:{MAIN_INTEGRATION_VERIFY_REASON}"
+    return f"main-integration-verify:{task_id}:{main_integration_verify_attention_reason(state)}"
 
 
 def _main_verify_exhausted_attention_key(state: Any) -> str | None:

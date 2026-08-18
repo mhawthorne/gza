@@ -771,6 +771,7 @@ is a spec change. The accompanying human message is free text.
 | `review-verdict-needs-manual-attention` | needs_discussion | §6 verdict unclassifiable, or `APPROVED_WITH_FOLLOWUPS` with zero parsed follow-ups |
 | `review-needs-manual-creation` | needs_discussion | §8 implementation-owned lineage requires review, no review exists, `advance_create_reviews` off |
 | `main-integration-verify-red` | needs_discussion | §8 local target verify failed after target HEAD changed; halt further merges until it is green again |
+| `main-integration-verify-launch-failed` | needs_discussion | §8 local target verify tool could not launch because the environment is misconfigured; surface operator attention without marking main red, halting merges, or creating code remediation |
 | `automatic-recovery-disabled` | HumanParked | §7 recovery attempt budget = 0 |
 | `retry-limit-reached` | HumanParked | §7 recovery attempts exhausted or terminal manual-review recovery stop |
 | `retryable-provider-error` | HumanParked | §7 fresh retry consumed for a retryable provider failure; completed implementations with retryable terminal failures recommend `uv run gza unstick <owner-id> --reason retry-limit` (optionally `--run`) |

@@ -390,6 +390,38 @@ def test_format_main_integration_verify_attention_sanitizes_legacy_launch_failur
     assert "ruff" not in rendered
 
 
+def test_format_main_integration_verify_attention_parses_canonical_launch_failure() -> None:
+    state = SimpleNamespace(
+        head_sha="abc123deadbeef",
+        failing_phase=None,
+        failure=(
+            "verify_command environment error: could not launch `ruff` "
+            "for phase `ruff` (not on PATH)"
+        ),
+        verify_status="unavailable",
+        verify_exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+        alert_message=(
+            "main verify RED at `abc123deadbe` - merges halted; "
+            "could not launch verify tooling "
+            "(verify_command environment error: could not launch `ruff` for phase `ruff` (not on PATH))"
+        ),
+        red_since=None,
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof("current"),
+    )
+
+    assert rendered == (
+        "main verify misconfigured - could not launch `ruff` "
+        "for phase `ruff` (not on PATH); fix the environment, not the code"
+    )
+    assert "verify_command environment error" not in rendered
+    assert "main verify RED" not in rendered
+    assert "merges halted" not in rendered
+
+
 @pytest.mark.parametrize("target_status", ["stale", "unproven"])
 @pytest.mark.parametrize(
     ("state_kwargs", "expected_fragment"),
@@ -1979,7 +2011,19 @@ def test_check_main_integration_verify_classifies_tool_launch_failure_as_attenti
     alert_git.default_branch.return_value = "main"
     alert_git.current_branch.return_value = "topic"
     alert_git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
-    assert current_main_integration_verify_alert(store, alert_git, config) is None
+    alert = current_main_integration_verify_alert(store, alert_git, config)
+    assert alert is not None
+    assert alert.verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+    assert main_integration_verify_state_halts_merges(alert) is False
+    rendered = format_main_integration_verify_attention_message(
+        alert,
+        target_proof=MainIntegrationVerifyTargetProof("current"),
+    )
+    assert rendered == (
+        "main verify misconfigured - could not launch `ruff` "
+        "for phase `ruff` (not on PATH); fix the environment, not the code"
+    )
+    assert "verify_command environment error" not in rendered
 
 
 def test_check_main_integration_verify_green_does_not_resolve_launch_failure_signature(tmp_path) -> None:

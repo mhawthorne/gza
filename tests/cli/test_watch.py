@@ -142,6 +142,8 @@ from gza.lineage_query import LineageOwnerRow
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+    MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_REASON,
+    MAIN_INTEGRATION_VERIFY_REASON,
     MAIN_INTEGRATION_VERIFY_TAG,
     CandidateIntegrationVerifyCheck,
     CandidateIntegrationVerifyEvidence,
@@ -12738,6 +12740,54 @@ def test_cmd_main_verify_surfaces_launch_failure_without_alert_message(
     assert "red for" not in stdout
 
 
+def test_cmd_main_verify_renders_canonical_launch_failure_concisely(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(return_value="feedfacecafe9999")  # type: ignore[method-assign]
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main"),
+        gate_enabled=True,
+        head_sha="feedfacecafe9999",
+        verify_status="unavailable",
+        verify_exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+        failing_phase="ruff",
+        failure=(
+            "verify_command environment error: could not launch `ruff` "
+            "for phase `ruff` (not on PATH)"
+        ),
+        alert_message=(
+            "main verify misconfigured - could not launch `ruff` "
+            "for phase `ruff` (not on PATH); fix the environment, not the code"
+        ),
+        red_since=None,
+    )
+
+    with (
+        patch("gza.cli.watch.get_store", return_value=store),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, performed_verify=True, state=state),
+        ),
+    ):
+        rc = cmd_main_verify(argparse.Namespace(project_dir=tmp_path, force=False))
+
+    stdout = capsys.readouterr().out.strip()
+    assert rc == 0
+    assert stdout == (
+        "main verify misconfigured - could not launch `ruff` "
+        "for phase `ruff` (not on PATH); fix the environment, not the code"
+    )
+    assert stdout.count("could not launch `ruff`") == 1
+    assert "verify_command environment error" not in stdout
+    assert "main verify RED" not in stdout
+    assert "merges halted" not in stdout
+
+
 @pytest.mark.parametrize(
     ("live_main_sha", "expected"),
     [
@@ -16574,6 +16624,10 @@ def test_watch_cycle_emits_attention_for_main_verify_launch_issue_without_freezi
             verify_status="unavailable",
             verify_exit_status="launch failed",
             failing_phase="ruff",
+            failure=(
+                "verify_command environment error: could not launch `ruff` "
+                "for phase `ruff` (not on PATH)"
+            ),
         ),
     )
 
@@ -16612,6 +16666,7 @@ def test_watch_cycle_emits_attention_for_main_verify_launch_issue_without_freezi
     summary_tail = log_text.split("Needs attention (1 task):", maxsplit=1)[1]
     assert summary_tail.count("could not launch `ruff`") == 1
     assert "fix the environment, not the code" in summary_tail
+    assert "verify_command environment error" not in summary_tail
     assert "main verify RED" not in log_text
     assert "merges halted" not in log_text
 
@@ -31037,8 +31092,6 @@ def test_main_verify_attention_summary_suppresses_legacy_exhaustion_for_non_atte
         **state_kwargs,
     )
 
-    assert _main_verify_attention_key(state) == "main-integration-verify:gza-main:main-integration-verify-red"
-
     log.begin_cycle()
     _emit_main_verify_attention(log=log, state=state, now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC), git=git)
     _finalize_main_verify_attention(
@@ -31216,7 +31269,12 @@ def test_main_verify_attention_summary_prefers_structured_special_status_over_le
         red_since=None,
     )
 
-    assert _main_verify_attention_key(state) == "main-integration-verify:gza-main:main-integration-verify-red"
+    expected_reason = (
+        MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_REASON
+        if verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+        else MAIN_INTEGRATION_VERIFY_REASON
+    )
+    assert _main_verify_attention_key(state) == f"main-integration-verify:gza-main:{expected_reason}"
 
     log.begin_cycle()
     _emit_main_verify_attention(log=log, state=state, now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC), git=git)

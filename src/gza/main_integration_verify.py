@@ -29,6 +29,7 @@ from .runner import (
 
 MAIN_INTEGRATION_VERIFY_PROMPT = "System alert: local main integration verify"
 MAIN_INTEGRATION_VERIFY_REASON = "main-integration-verify-red"
+MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_REASON = "main-integration-verify-launch-failed"
 MAIN_INTEGRATION_VERIFY_TAG = "system-main-verify"
 MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS = "tree fingerprint unavailable"
 MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS = "launch failed"
@@ -52,6 +53,11 @@ _COMMAND_NOT_EXECUTABLE_RE = re.compile(
 _FAILED_TO_SPAWN_RE = re.compile(r"Failed to spawn:\s*`(?P<tool>[^`]+)`(?::\s*(?P<detail>.+))?")
 _OSERROR_TOOL_RE = re.compile(
     r"(?P<detail>No such file or directory|Permission denied|Exec format error):\s*['\"](?P<tool>[^'\"]+)['\"]"
+)
+_CANONICAL_LAUNCH_ISSUE_FAILURE_RE = re.compile(
+    r"^verify_command environment error: could not launch "
+    r"(?:(?:`(?P<tool>[^`]+)`)(?: for phase `(?P<phase>[^`]+)`)?|verify tooling) "
+    r"\((?P<detail>.*)\)$"
 )
 @dataclass(frozen=True)
 class MainIntegrationVerifyState:
@@ -582,6 +588,14 @@ def _extract_launch_issue_tool_from_command_repr(command_repr: str) -> str | Non
 
 
 def _extract_launch_issue_from_text(text: str) -> VerifyLaunchIssue | None:
+    canonical_match = _CANONICAL_LAUNCH_ISSUE_FAILURE_RE.match(text.strip())
+    if canonical_match is not None:
+        return VerifyLaunchIssue(
+            phase_name=canonical_match.group("phase"),
+            tool_name=_normalize_verify_tool_name(canonical_match.group("tool")),
+            detail=_summarize_launch_issue_detail(canonical_match.group("detail")),
+        )
+
     for pattern in (_COMMAND_NOT_FOUND_RE, _COMMAND_NOT_EXECUTABLE_RE):
         match = pattern.search(text)
         if match is not None:
@@ -632,13 +646,13 @@ def _detect_verify_launch_issue(
     if verify_exit_status in {"126", "127"}:
         issue = _extract_launch_issue_from_text(output)
         if issue is not None:
-            return replace(issue, phase_name=failing_phase)
+            return replace(issue, phase_name=failing_phase or issue.phase_name)
 
     if verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS and verify_failure:
         failure_detail = verify_failure.removeprefix("failed to launch verify_command: ").strip()
         issue = _extract_launch_issue_from_text(failure_detail)
         if issue is not None:
-            return replace(issue, phase_name=failing_phase)
+            return replace(issue, phase_name=failing_phase or issue.phase_name)
         return VerifyLaunchIssue(
             phase_name=failing_phase,
             tool_name=None,
@@ -707,6 +721,14 @@ def main_integration_verify_state_has_exhausted_remediation_attention(state: obj
     from .main_verify_format import main_verify_state_is_remediation_exhausted
 
     return main_verify_state_is_remediation_exhausted(state)
+
+
+def main_integration_verify_attention_reason(state: object) -> str:
+    from .main_verify_format import main_verify_state_needs_non_red_attention
+
+    if main_verify_state_needs_non_red_attention(state):
+        return MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_REASON
+    return MAIN_INTEGRATION_VERIFY_REASON
 
 
 def main_integration_verify_state_exhausted_remediation_attention(
@@ -1722,16 +1744,22 @@ def current_main_integration_verify_alert_with_target_proof(
     *,
     runner_class: Literal["host", "container"] = "host",
 ) -> CurrentMainIntegrationVerifyAlert | None:
-    """Return the red-main alert with proof for rendering live-target claims."""
-    from .main_verify_format import main_verify_state_halts_merges
+    """Return visible main-verify attention with proof for rendering live-target claims."""
+    from .main_verify_format import main_verify_state_halts_merges, main_verify_state_needs_non_red_attention
 
     state = load_main_integration_verify_state(store)
-    if state is None or not main_verify_state_halts_merges(state):
+    if state is None:
+        return None
+    halts_merges = main_verify_state_halts_merges(state)
+    needs_non_red_attention = main_verify_state_needs_non_red_attention(state)
+    if not halts_merges and not needs_non_red_attention:
         return None
     if not _gate_identity_matches(state, _current_gate_identity(config, runner_class=runner_class)):
         return None
     default_branch = git.default_branch()
     target_proof = resolve_main_integration_verify_target_proof(state, git, target_branch=default_branch)
+    if needs_non_red_attention:
+        return CurrentMainIntegrationVerifyAlert(state, target_proof)
     if git.current_branch() == default_branch:
         current_tree_fingerprint = _compute_tree_fingerprint(git)
         if current_tree_fingerprint and state.tree_fingerprint:

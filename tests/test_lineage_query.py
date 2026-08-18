@@ -30,7 +30,12 @@ from gza.lineage_query import (
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+    MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_REASON,
+    MAIN_INTEGRATION_VERIFY_REASON,
+    MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    load_main_integration_verify_state,
 )
+from gza.main_verify_format import main_verify_state_halts_merges
 from gza.operator_state import blocked_by_empty_prereq_label
 from gza.recovery_engine import list_failed_tasks_for_recovery
 from gza.recovery_read_context import RecoveryReadContext
@@ -4837,7 +4842,7 @@ def test_query_lineage_owner_rows_includes_current_main_verify_red_attention(tmp
     row = rows[0]
     assert row.owner_task.id == main_verify_task.id
     assert row.next_action is not None
-    assert row.next_action["needs_attention_reason"] == "main-integration-verify-red"
+    assert row.next_action["needs_attention_reason"] == MAIN_INTEGRATION_VERIFY_REASON
     assert "main verify RED at `abc123` - merges halted; phase `unit` failing" in row.next_action["description"]
 
 
@@ -5983,15 +5988,101 @@ def test_query_lineage_owner_rows_prefers_structured_special_status_over_legacy_
         target_branch="main",
     )
 
-    if verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS:
-        assert not any(row.owner_task.id == main_verify_task.id for row in rows)
-        return
     assert rows
     row = rows[0]
     assert row.owner_task.id == main_verify_task.id
     assert row.next_action is not None
+    expected_reason = (
+        MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_REASON
+        if verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+        else MAIN_INTEGRATION_VERIFY_REASON
+    )
+    assert row.next_action["needs_attention_reason"] == expected_reason
     assert expected in row.next_action["description"]
     assert "human intervention" not in row.next_action["description"]
+    if verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS:
+        assert row.next_action["needs_attention_reason"] != MAIN_INTEGRATION_VERIFY_REASON
+        assert "main verify RED" not in row.next_action["description"]
+        assert "merges halted" not in row.next_action["description"]
+
+
+def test_query_lineage_owner_rows_surfaces_canonical_launch_failure_concisely(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "unavailable"
+    main_verify_task.review_verify_exit_status = MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+    main_verify_task.review_verify_failure = (
+        "verify_command environment error: could not launch `ruff` "
+        "for phase `ruff` (not on PATH)"
+    )
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": (
+                "main verify misconfigured - could not launch `ruff` "
+                "for phase `ruff` (not on PATH); fix the environment, not the code"
+            ),
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failure_signature": None,
+            "failing_phase": "ruff",
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == main_verify_task.id
+    assert row.next_action is not None
+    assert row.next_action["needs_attention_reason"] == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_REASON
+    assert row.next_action["needs_attention_reason"] != MAIN_INTEGRATION_VERIFY_REASON
+    assert row.next_action["description"] == (
+        "SKIP: main verify misconfigured - could not launch `ruff` "
+        "for phase `ruff` (not on PATH); fix the environment, not the code"
+    )
+    assert row.next_action["description"].count("could not launch `ruff`") == 1
+    assert "verify_command environment error" not in row.next_action["description"]
+    assert "main verify RED" not in row.next_action["description"]
+    assert "merges halted" not in row.next_action["description"]
+    loaded_state = load_main_integration_verify_state(store)
+    assert loaded_state is not None
+    assert main_verify_state_halts_merges(loaded_state) is False
+    assert not any(
+        task.trigger_source == MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE
+        for task in store.get_all()
+    )
 
 
 @pytest.mark.parametrize("verify_status", ["mystery", ""])

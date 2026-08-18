@@ -16,8 +16,8 @@ from .lifecycle_completion import (
     task_is_complete_for_lifecycle,
 )
 from .main_integration_verify import (
-    MAIN_INTEGRATION_VERIFY_REASON,
     current_main_integration_verify_alert_with_target_proof as current_main_integration_verify_alert,
+    main_integration_verify_attention_reason,
 )
 from .main_verify_format import format_main_verify_status_message, resolve_main_verify_target_proof
 from .merge_state import classify_branch_merge_state_for_target
@@ -1809,7 +1809,7 @@ def _query_lineage_owner_rows_with_context(
                 action = {
                     "type": "needs_discussion",
                     "description": f"SKIP: {description}",
-                    "needs_attention_reason": MAIN_INTEGRATION_VERIFY_REASON,
+                    "needs_attention_reason": main_integration_verify_attention_reason(main_alert_state),
                     "subject_task_id": main_alert_state.task.id,
                 }
                 rows.insert(

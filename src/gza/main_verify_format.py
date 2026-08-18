@@ -241,8 +241,26 @@ def _format_unproven_freshness_unavailable_message(state: Any) -> str:
     return "main verify freshness unproven at current HEAD; exact tree fingerprint unavailable"
 
 
-def _format_launch_failed_message() -> str:
+def _format_generic_launch_failed_message() -> str:
     return "main verify misconfigured - verify command launch failed; fix the environment, not the code"
+
+
+def _format_launch_failed_message(state: Any) -> str:
+    message = getattr(state, "alert_message", None)
+    if isinstance(message, str) and message.startswith("main verify misconfigured - ") and " at `" not in message:
+        return message
+
+    from .main_integration_verify import _build_launch_issue_alert_message, _detect_verify_launch_issue
+
+    issue = _detect_verify_launch_issue(
+        verify_output=None,
+        verify_exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+        verify_failure=getattr(state, "failure", None),
+        failing_phase=getattr(state, "failing_phase", None),
+    )
+    if issue is not None and issue.tool_name:
+        return _build_launch_issue_alert_message(head_sha=getattr(state, "head_sha", None), issue=issue)
+    return _format_generic_launch_failed_message()
 
 
 def _format_unknown_evidence_message(state: Any, *, target_proof: MainVerifyTargetProof) -> str:
@@ -283,10 +301,7 @@ def format_main_verify_attention_message(
         else:
             message = _format_unproven_freshness_unavailable_message(state)
     elif main_verify_state_needs_non_red_attention(state):
-        if isinstance(message, str) and message.startswith("main verify misconfigured - ") and " at `" not in message:
-            pass
-        else:
-            message = _format_launch_failed_message()
+        message = _format_launch_failed_message(state)
     elif exhausted is not None:
         signature = main_verify_state_failure_signature(state) or "unknown"
         message = (
