@@ -167,7 +167,7 @@ from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.recovery_read_context import RecoveryReadContext
 from gza.review_verdict import ParsedReviewReport
-from gza.review_verify_state import persist_verify_gate_artifact
+from gza.review_verify_state import VERIFY_GATE_ARTIFACT_KIND, persist_verify_gate_artifact
 from gza.runner import _make_review_verify_result
 from gza.unstick import VERIFY_FIX_FAILED_REASON, select_and_clear_parked_tasks
 from gza.watch_progress import (
@@ -26088,6 +26088,145 @@ def test_watch_progress_candidate_treats_dispute_artifacts_as_progress(tmp_path:
     assert before.evidence_fingerprint != after.evidence_fingerprint
 
 
+@pytest.mark.parametrize("status,exit_status", [("passed", "0"), ("failed", "1")])
+def test_watch_progress_observation_treats_verify_evidence_recredit_as_durable_progress(
+    tmp_path: Path,
+    status: str,
+    exit_status: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    owner = store.add("Owner implementation", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = "feature/recredit-progress"
+    owner.has_commits = True
+    store.update(owner)
+    store.set_merge_status(owner.id, "unmerged")
+
+    contributor = store.add("Contributor implementation", task_type="implement")
+    assert contributor.id is not None
+    contributor.status = "completed"
+    contributor.completed_at = datetime.now(UTC)
+    contributor.branch = owner.branch
+    contributor.has_commits = True
+    store.update(contributor)
+
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(contributor.id, unit.id, "same_branch")
+
+    owner_result = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 8, 18, 10, 0, tzinfo=UTC),
+        reviewed_branch=owner.branch,
+        reviewed_head_sha="same-head",
+        reviewed_base_sha="base-head",
+        working_directory=str(tmp_path),
+        failure="older owner red",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=owner,
+        source_task=owner,
+        result=owner_result,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    owner.review_verify_command = owner_result.command
+    owner.review_verify_status = owner_result.status
+    owner.review_verify_exit_status = owner_result.exit_status
+    owner.review_verify_failure = owner_result.failure
+    owner.review_verify_captured_at = owner_result.captured_at
+    owner.review_verify_head_sha = owner_result.reviewed_head_sha
+    owner.review_verify_base_sha = owner_result.reviewed_base_sha
+    owner.review_verify_branch = owner_result.reviewed_branch
+    owner.review_verify_cwd = owner_result.working_directory
+    store.update(owner)
+
+    contributor_result = _make_review_verify_result(
+        "./bin/tests",
+        status=status,
+        exit_status=exit_status,
+        captured_at=datetime(2026, 8, 18, 10, 5, tzinfo=UTC),
+        reviewed_branch=owner.branch,
+        reviewed_head_sha="same-head",
+        reviewed_base_sha="base-head",
+        working_directory=str(tmp_path),
+        failure=None if status == "passed" else "newer contributor red",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=contributor,
+        source_task=contributor,
+        result=contributor_result,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    contributor.review_verify_command = contributor_result.command
+    contributor.review_verify_status = contributor_result.status
+    contributor.review_verify_exit_status = contributor_result.exit_status
+    contributor.review_verify_failure = contributor_result.failure
+    contributor.review_verify_captured_at = contributor_result.captured_at
+    contributor.review_verify_head_sha = contributor_result.reviewed_head_sha
+    contributor.review_verify_base_sha = contributor_result.reviewed_base_sha
+    contributor.review_verify_branch = contributor_result.reviewed_branch
+    contributor.review_verify_cwd = contributor_result.working_directory
+    store.update(contributor)
+
+    action = {"type": "reconcile_verify_gate_evidence", "verify_owner_task": owner}
+    before = build_watch_progress_candidate(store, subject_task=owner, action=action, action_task=owner)
+
+    refreshed_owner = store.get(owner.id)
+    refreshed_contributor = store.get(contributor.id)
+    assert refreshed_owner is not None
+    assert refreshed_contributor is not None
+    refreshed_owner.review_verify_command = refreshed_contributor.review_verify_command
+    refreshed_owner.review_verify_status = refreshed_contributor.review_verify_status
+    refreshed_owner.review_verify_exit_status = refreshed_contributor.review_verify_exit_status
+    refreshed_owner.review_verify_failure = refreshed_contributor.review_verify_failure
+    refreshed_owner.review_verify_captured_at = refreshed_contributor.review_verify_captured_at
+    refreshed_owner.review_verify_head_sha = refreshed_contributor.review_verify_head_sha
+    refreshed_owner.review_verify_base_sha = refreshed_contributor.review_verify_base_sha
+    refreshed_owner.review_verify_branch = refreshed_contributor.review_verify_branch
+    refreshed_owner.review_verify_cwd = refreshed_contributor.review_verify_cwd
+    refreshed_owner.review_verify_artifact_file = refreshed_contributor.review_verify_artifact_file
+    store.update(refreshed_owner)
+
+    after = build_watch_progress_candidate(store, subject_task=owner, action=action, action_task=refreshed_owner)
+
+    assert before.evidence_fingerprint != after.evidence_fingerprint
+    no_progress = _finalize_watch_no_progress_after_execution(
+        config=config,
+        store=store,
+        subject_task=owner,
+        action=action,
+        action_task_before=owner,
+        action_task_after=refreshed_owner,
+        failed_task=None,
+        no_progress_cycles=1,
+    )
+    assert no_progress is None
+    assert store.list_all_watch_progress_observations(parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON) == []
+
+
 def test_watch_cycle_pending_dispatch_failed_launch_does_not_park_without_execution(tmp_path: Path) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
@@ -35523,6 +35662,108 @@ def test_watch_cycle_scoped_mode_keeps_computed_lifecycle_action_active_without_
     assert result.scoped_done is False
     assert result.scoped_active == 1
     assert result.running == 0
+
+
+def test_watch_cycle_verify_gate_owner_mismatch_passes_planned_task_to_executor(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(
+        tmp_path,
+        "verify_command: ./bin/tests\n"
+        "autonomous_verify_timeout_seconds: 120\n"
+        "review_verify_timeout_grace_seconds: 5.0\n"
+        "watch:\n"
+        "  no_progress_cycles: 2\n",
+    )
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    planned = store.add("Planned owner", task_type="implement")
+    assert planned.id is not None
+    planned.status = "completed"
+    planned.completed_at = datetime.now(UTC)
+    planned.branch = "feature/planned-owner"
+    planned.has_commits = True
+    planned.merge_status = "unmerged"
+    store.update(planned)
+
+    unrelated = store.add("Unrelated owner", task_type="implement")
+    assert unrelated.id is not None
+    unrelated.status = "completed"
+    unrelated.completed_at = datetime.now(UTC)
+    unrelated.branch = "feature/unrelated-owner"
+    unrelated.has_commits = True
+    unrelated.merge_status = "unmerged"
+    store.update(unrelated)
+
+    row = LineageOwnerRow(
+        owner_task=planned,
+        members=(planned,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="verify",
+        unresolved_tasks=(planned,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=planned,
+        recovery_action_task=None,
+        recovery_leaf_task=None,
+    )
+    action = {
+        "type": "verify_gate",
+        "description": "Run verify gate",
+        "verify_owner_task": unrelated,
+    }
+    analysis = _WatchCycleAnalysis(
+        target_branch="main",
+        scope_gaps=(),
+        owner_rows=(row,),
+        watch_read_context=RecoveryReadContext(),
+        lifecycle_rows=(row,),
+        recovery_rows=(),
+        recovery_lane_entry_by_failed_id={},
+        action_plan=((row, planned, action),),
+        recovery_attention_rows=(),
+        recovery_visible_skips=(),
+        actionable_failed=(),
+        pending_recovery_task_ids=frozenset(),
+    )
+    plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=analysis,
+    )
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "head-1" if ref in {"feature/planned-owner", "main"} else None)
+
+    with (
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not run")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            precomputed_plan=plan,
+        )
+
+    refreshed_planned = store.get(planned.id)
+    refreshed_unrelated = store.get(unrelated.id)
+    assert refreshed_planned is not None
+    assert refreshed_unrelated is not None
+    assert result.work_done is False
+    assert refreshed_planned.review_verify_status is None
+    assert refreshed_unrelated.review_verify_status is None
+    assert store.list_artifacts(planned.id, kind=VERIFY_GATE_ARTIFACT_KIND) == []
+    assert store.list_artifacts(unrelated.id, kind=VERIFY_GATE_ARTIFACT_KIND) == []
+    assert "owner mismatch" in (tmp_path / ".gza" / "watch.log").read_text()
 
 
 def test_watch_cycle_scoped_dry_run_precomputed_plan_logs_owner_scope_without_global_blocked_pending(

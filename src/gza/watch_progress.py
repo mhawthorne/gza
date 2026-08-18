@@ -232,7 +232,7 @@ def build_watch_progress_candidate(
     )
     if review_resolution_marker is not None:
         evidence["review_resolution_marker"] = review_resolution_marker
-    if action_type == "verify_gate":
+    if action_type in {"verify_gate", "reconcile_verify_gate_evidence"}:
         verify_gate_marker = _verify_gate_progress_marker(action_task or subject_task)
         if verify_gate_marker is not None:
             evidence["verify_gate_marker"] = verify_gate_marker

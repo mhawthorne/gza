@@ -10151,7 +10151,10 @@ class TestReviewCommand:
         reviews = store.get_reviews_for_task(impl_task.id)
         assert len(reviews) == 2
 
-    def test_duplicate_review_uses_DuplicateReviewError_no_second_db_query(self, tmp_path: Path):
+    @pytest.mark.parametrize("review_status", ["pending", "in_progress"])
+    def test_duplicate_review_uses_DuplicateReviewError_no_second_db_query(
+        self, tmp_path: Path, review_status: str
+    ):
         """cmd_review shows the warning using DuplicateReviewError without a second DB query.
 
         After the refactor, cmd_review catches DuplicateReviewError (which carries
@@ -10173,7 +10176,8 @@ class TestReviewCommand:
 
         assert impl_task.id is not None
         existing_review = store.add("Review feature", task_type="review", depends_on=impl_task.id)
-        # Leave as pending so it counts as active
+        existing_review.status = review_status
+        store.update(existing_review)
 
         args = argparse.Namespace(
             task_id=impl_task.id,
@@ -10212,6 +10216,7 @@ class TestReviewCommand:
         printed = output.getvalue()
         assert "Warning: A review task already exists" in printed
         assert f"{existing_review.id}" in printed
+        assert review_status in printed
         # get_reviews_for_task must be called exactly once (inside _create_review_task),
         # NOT a second time in the cmd_review error handler.
         assert len(call_count) == 1, (
@@ -10360,6 +10365,18 @@ class TestIterateCommand:
         store.update(completed_descendant)
         return failed_root, completed_descendant
 
+    def _attach_recovered_lineage_merge_unit(self, store, root, head, *, target_branch: str = "main") -> None:
+        assert root.id is not None
+        assert head.id is not None
+        unit = store.create_merge_unit(
+            source_branch=head.branch,
+            target_branch=target_branch,
+            owner_task_id=root.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(root.id, unit.id, "owner")
+        store.attach_task_to_merge_unit(head.id, unit.id, "same_branch")
+
     def _make_review_task(
         self,
         store,
@@ -10453,6 +10470,458 @@ class TestIterateCommand:
             verify_timeout_grace_seconds=5.0,
             producer="test",
         )
+
+    def test_iterate_reconciles_merge_unit_verify_evidence_then_runs_review(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli import cmd_iterate
+        from gza.runner import ReviewVerifyResult
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        config = Config.load(tmp_path)
+        config.verify_command = "./bin/tests"
+        config.autonomous_verify_timeout_seconds = 120
+        config.review_verify_timeout_grace_seconds = 5.0
+
+        impl = self._make_completed_impl(store)
+        assert impl.id is not None
+        unit = store.create_merge_unit(
+            source_branch=impl.branch,
+            target_branch="main",
+            owner_task_id=impl.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(impl.id, unit.id, "owner")
+        contributor = store.add("Contributor with current evidence", task_type="implement")
+        assert contributor.id is not None
+        contributor.status = "completed"
+        contributor.branch = impl.branch
+        contributor.has_commits = True
+        contributor.completed_at = datetime.now(UTC)
+        store.update(contributor)
+        store.attach_task_to_merge_unit(contributor.id, unit.id, "same_branch")
+        output_artifact = store_command_output_artifact(
+            store,
+            contributor,
+            config,
+            kind="verify_command_output",
+            producer="test",
+            label="verify_command_output",
+            output="cross-project verify passed",
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            head_sha="same-head",
+            created_at=datetime(2026, 8, 18, 10, 1, tzinfo=UTC),
+        )
+
+        captured_at = datetime(2026, 8, 18, 10, 0, tzinfo=UTC)
+        for task, status, offset in ((impl, "failed", 0), (contributor, "passed", 1)):
+            output_artifact_id = output_artifact.id if task.id == contributor.id else None
+            output_artifact_task_id = contributor.id if task.id == contributor.id else None
+            output_artifact_path = output_artifact.path if task.id == contributor.id else None
+            provenance = (
+                {
+                    "command_identity": "./bin/tests",
+                    "reviewed_branch": impl.branch,
+                    "reviewed_head_sha": "same-head",
+                    "reviewed_base_sha": "base-head",
+                    "working_directory": str(tmp_path),
+                    "config_identity": {
+                        "verify_command": "./bin/tests",
+                        "verify_timeout_seconds": 120,
+                        "verify_timeout_grace_seconds": 5.0,
+                        "cross_project": True,
+                    },
+                }
+                if task.id == contributor.id
+                else None
+            )
+            aggregate_details = (
+                {
+                    "affected_scope_count": 2,
+                    "runnable_count": 2,
+                    "passed_count": 2,
+                    "failed_count": 0,
+                    "unavailable_count": 0,
+                    "skipped_count": 0,
+                    "scopes": [
+                        {
+                            "scope": ".",
+                            "working_directory": str(tmp_path),
+                            "status": "passed",
+                            "exit_status": "0",
+                            "command_identity": "./bin/tests",
+                            "reviewed_branch": impl.branch,
+                            "reviewed_head_sha": "same-head",
+                            "reviewed_base_sha": "base-head",
+                            "skip_reason": None,
+                        },
+                        {
+                            "scope": "packages/tool",
+                            "working_directory": str(tmp_path / "packages" / "tool"),
+                            "status": "passed",
+                            "exit_status": "0",
+                            "command_identity": "./bin/tool-tests",
+                            "reviewed_branch": impl.branch,
+                            "reviewed_head_sha": "same-head",
+                            "reviewed_base_sha": "base-head",
+                            "skip_reason": None,
+                        },
+                    ],
+                }
+                if task.id == contributor.id
+                else None
+            )
+            persist_verify_gate_artifact(
+                store,
+                config,
+                owner_task=task,
+                source_task=task,
+                result=ReviewVerifyResult(
+                    command="./bin/tests",
+                    status=status,
+                    exit_status="0" if status == "passed" else "1",
+                    captured_at=captured_at + timedelta(minutes=offset),
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="same-head",
+                    reviewed_base_sha="base-head",
+                    working_directory=str(tmp_path),
+                    failure=None if status == "passed" else "verify failed",
+                ),
+                verify_timeout_seconds=120,
+                verify_timeout_grace_seconds=5.0,
+                output_artifact_id=output_artifact_id,
+                output_artifact_task_id=output_artifact_task_id,
+                output_artifact_path=output_artifact_path,
+                producer="test",
+                provenance=provenance,
+                aggregate_details=aggregate_details,
+            )
+
+        review_runs: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task.task_type == "review"
+            review_runs.append(task.id)
+            task.status = "completed"
+            task.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        mock_config = self._make_iterate_mock_config(
+            tmp_path,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+            log_path=tmp_path / ".gza" / "logs",
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.ref_exists.return_value = False
+        mock_git.can_merge.return_value = True
+        mock_git.is_merged.return_value = False
+        mock_git.rev_parse_if_exists.side_effect = (
+            lambda ref: "same-head"
+            if ref == impl.branch
+            else "base-head"
+            if ref in {"main", "origin/main"}
+            else None
+        )
+        mock_git.count_commits_behind_checked.return_value = 0
+        mock_git.count_commits_ahead_checked.return_value = 1
+        mock_git.get_diff_name_status.return_value = ""
+        mock_git.resolve_fresh_merge_source.side_effect = lambda branch: branch
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+            patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")),
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        refreshed_impl = store.get(impl.id)
+        impl_artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+        assert refreshed_impl is not None
+        assert result == 0
+        assert review_runs
+        assert refreshed_impl.review_verify_status == "passed"
+        assert len(impl_artifacts) == 2
+        recredited = impl_artifacts[0].metadata
+        assert recredited["source_task_id"] == contributor.id
+        assert recredited["output_artifact_id"] == output_artifact.id
+        assert recredited["output_artifact_task_id"] == contributor.id
+        assert recredited["output_artifact_path"] == output_artifact.path
+        assert recredited["verify_epoch"]["verify_timeout_seconds"] == 120
+        assert recredited["verify_epoch"]["verify_timeout_grace_seconds"] == 5.0
+        assert recredited["provenance"]["config_identity"]["cross_project"] is True
+        assert recredited["aggregate_details"]["scopes"][1]["scope"] == "packages/tool"
+        assert recredited["reconciliation"]["evidence_holder_task_id"] == contributor.id
+        assert "Recredited current merge-unit verify gate evidence (passed)" in output
+        assert "unsupported_action:reconcile_verify_gate_evidence" not in output
+        assert "Iterate complete: APPROVED (approved)" in output
+
+    def test_iterate_background_reconciles_merge_unit_verify_evidence_without_blocking_or_rerun(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli import cmd_iterate
+        from gza.runner import ReviewVerifyResult
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        config = Config.load(tmp_path)
+        config.verify_command = "./bin/tests"
+        config.autonomous_verify_timeout_seconds = 120
+        config.review_verify_timeout_grace_seconds = 5.0
+
+        impl = self._make_completed_impl(store)
+        assert impl.id is not None
+        unit = store.create_merge_unit(
+            source_branch=impl.branch,
+            target_branch="main",
+            owner_task_id=impl.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(impl.id, unit.id, "owner")
+        contributor = store.add("Contributor with current evidence", task_type="implement")
+        assert contributor.id is not None
+        contributor.status = "completed"
+        contributor.branch = impl.branch
+        contributor.has_commits = True
+        contributor.completed_at = datetime.now(UTC)
+        store.update(contributor)
+        store.attach_task_to_merge_unit(contributor.id, unit.id, "same_branch")
+
+        captured_at = datetime(2026, 8, 18, 10, 0, tzinfo=UTC)
+        for task, status, offset in ((impl, "failed", 0), (contributor, "passed", 1)):
+            persist_verify_gate_artifact(
+                store,
+                config,
+                owner_task=task,
+                source_task=task,
+                result=ReviewVerifyResult(
+                    command="./bin/tests",
+                    status=status,
+                    exit_status="0" if status == "passed" else "1",
+                    captured_at=captured_at + timedelta(minutes=offset),
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="same-head",
+                    reviewed_base_sha="base-head",
+                    working_directory=str(tmp_path),
+                    failure=None if status == "passed" else "verify failed",
+                ),
+                verify_timeout_seconds=120,
+                verify_timeout_grace_seconds=5.0,
+                producer="test",
+            )
+
+        mock_config = self._make_iterate_mock_config(
+            tmp_path,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+            log_path=tmp_path / ".gza" / "logs",
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.ref_exists.return_value = False
+        mock_git.can_merge.return_value = True
+        mock_git.is_merged.return_value = False
+        mock_git.rev_parse_if_exists.side_effect = (
+            lambda ref: "same-head"
+            if ref == impl.branch
+            else "base-head"
+            if ref in {"main", "origin/main"}
+            else None
+        )
+        mock_git.count_commits_behind_checked.return_value = 0
+        mock_git.count_commits_ahead_checked.return_value = 1
+        mock_git.get_diff_name_status.return_value = ""
+        mock_git.resolve_fresh_merge_source.side_effect = lambda branch: branch
+        spawned: list[SimpleNamespace] = []
+
+        def fake_spawn(args, config, task, **kwargs):
+            spawned.append(SimpleNamespace(args=args, config=config, task=task, kwargs=kwargs))
+            return 0
+
+        parent_args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=2,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=True,
+            force=False,
+            worker_id=None,
+        )
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.cli.execution._spawn_background_iterate_worker", side_effect=fake_spawn),
+            patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")),
+        ):
+            parent_result = cmd_iterate(parent_args)
+        parent_output = capsys.readouterr().out
+
+        assert parent_result == 0
+        assert spawned
+        assert spawned[0].kwargs["prepared_action_type"] is None
+        assert "Iterate blocked" not in parent_output
+
+        review_runs: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task.task_type == "review"
+            review_runs.append(task.id)
+            task.status = "completed"
+            task.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        worker_args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+            patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")),
+        ):
+            worker_result = cmd_iterate(worker_args)
+        worker_output = capsys.readouterr().out
+
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        assert worker_result == 0
+        assert review_runs
+        assert refreshed_impl.review_verify_status == "passed"
+        assert "Recredited current merge-unit verify gate evidence (passed)" in worker_output
+        assert "Iteration 1/1: create_review" in worker_output
+        assert "Iterate blocked" not in worker_output
+
+    def test_iterate_verify_gate_owner_mismatch_passes_planned_task_to_executor(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        assert impl.id is not None
+
+        unrelated = store.add("Unrelated owner", task_type="implement")
+        assert unrelated.id is not None
+        unrelated.status = "completed"
+        unrelated.completed_at = datetime.now(UTC)
+        unrelated.branch = "test-project/unrelated-owner"
+        unrelated.has_commits = True
+        store.update(unrelated)
+
+        action = {
+            "type": "verify_gate",
+            "description": "Run verify gate",
+            "verify_owner_task": unrelated,
+        }
+        mock_config = self._make_iterate_mock_config(
+            tmp_path,
+            require_review_before_merge=True,
+            advance_create_reviews=True,
+            max_review_cycles=3,
+            max_resume_attempts=1,
+            log_path=tmp_path / ".gza" / "logs",
+        )
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.rev_parse_if_exists.side_effect = (
+            lambda ref: "impl-head"
+            if ref == impl.branch
+            else "base-head"
+            if ref in {"main", "origin/main"}
+            else None
+        )
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.execution.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.cli.execution.determine_next_action", return_value=action),
+            patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not run")),
+        ):
+            result = cmd_iterate(args)
+
+        output = capsys.readouterr().out
+        refreshed_impl = store.get(impl.id)
+        refreshed_unrelated = store.get(unrelated.id)
+        assert refreshed_impl is not None
+        assert refreshed_unrelated is not None
+        assert result != 0
+        assert "owner mismatch" in output
+        assert refreshed_impl.review_verify_status is None
+        assert refreshed_unrelated.review_verify_status is None
+        assert store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND) == []
+        assert store.list_artifacts(unrelated.id, kind=VERIFY_GATE_ARTIFACT_KIND) == []
 
     def _persist_current_failed_verify_with_completed_verify_fix(
         self,
@@ -13959,7 +14428,7 @@ class TestIterateCommand:
         decision = resolve_verify_gate_decision(store, impl, config=config, git=mock_git)
         assert decision.state == "passed"
 
-    def test_iterate_force_recovered_lineage_verifies_head_but_attaches_gate_to_root(
+    def test_iterate_force_recovered_merge_unit_verifies_and_attaches_gate_to_live_owner(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         from gza.cli import cmd_iterate
@@ -13971,10 +14440,11 @@ class TestIterateCommand:
             store,
             branch="feature/iterate-force-recovered-verify-fix-failed",
         )
+        self._attach_recovered_lineage_merge_unit(store, root, head)
         config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
             store,
             tmp_path,
-            root,
+            head,
             head_sha="recovered-force-head",
         )
 
@@ -14017,10 +14487,15 @@ class TestIterateCommand:
 
         root_decision = resolve_verify_gate_decision(store, root, config=config, git=mock_git)
         head_decision = resolve_verify_gate_decision(store, head, config=config, git=mock_git)
+        root_artifacts = store.list_artifacts(root.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+        head_artifacts = store.list_artifacts(head.id, kind=VERIFY_GATE_ARTIFACT_KIND)
         assert result == 0, output
         assert len(verify_calls) == 1
-        assert root_decision.state == "passed"
-        assert head_decision.state == "missing"
+        assert root_decision.state == "missing"
+        assert head_decision.state == "passed"
+        assert root_artifacts == []
+        assert head_artifacts
+        assert head_artifacts[0].metadata["source_task_id"] == head.id
         assert f"Iterating implementation {head.id}" in output
         assert "Iteration 1/2: create_review" in output
         assert "Iterate complete: APPROVED" in output
@@ -14058,10 +14533,11 @@ class TestIterateCommand:
             store,
             branch=f"feature/iterate-force-recovered-invalid-{proof_kind}",
         )
+        self._attach_recovered_lineage_merge_unit(store, root, head)
         config, _verify_fix = self._persist_timeout_verify_with_completed_verify_fix(
             store,
             tmp_path,
-            root,
+            head,
             head_sha=f"recovered-invalid-{proof_kind}-head",
             invalid_canonical_outcome=proof_value if proof_kind == "canonical" else None,
             invalid_legacy_scope=proof_value if proof_kind == "legacy" else None,
@@ -14114,6 +14590,7 @@ class TestIterateCommand:
             store,
             branch="feature/iterate-force-recovered-unavailable-after-fix",
         )
+        self._attach_recovered_lineage_merge_unit(store, root, head)
         config = Config.load(tmp_path)
         config.verify_command = "./bin/tests"
         config.autonomous_verify_timeout_seconds = 120
@@ -14121,14 +14598,14 @@ class TestIterateCommand:
         persist_verify_gate_artifact(
             store,
             config,
-            owner_task=root,
-            source_task=root,
+            owner_task=head,
+            source_task=head,
             result=SimpleNamespace(
                 command="./bin/tests",
                 status="unavailable",
                 exit_status="not configured",
                 captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
-                reviewed_branch=root.branch,
+                reviewed_branch=head.branch,
                 reviewed_head_sha="recovered-unavailable-head",
                 reviewed_base_sha="base-head",
                 working_directory=str(tmp_path),
@@ -14141,13 +14618,13 @@ class TestIterateCommand:
         verify_fix = store.add(
             "Verify fix completed after unavailable gate",
             task_type="verify_fix",
-            based_on=root.id,
+            based_on=head.id,
             same_branch=True,
         )
         assert verify_fix.id is not None
         verify_fix.status = "completed"
         verify_fix.completed_at = datetime(2026, 8, 17, 10, 5, tzinfo=UTC)
-        verify_fix.branch = root.branch
+        verify_fix.branch = head.branch
         store.update(verify_fix)
 
         args = argparse.Namespace(
@@ -14198,10 +14675,11 @@ class TestIterateCommand:
             store,
             branch="feature/iterate-force-recovered-no-review",
         )
+        self._attach_recovered_lineage_merge_unit(store, root, head)
         config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
             store,
             tmp_path,
-            root,
+            head,
             head_sha="recovered-no-review-head",
         )
         config.require_review_before_merge = False
@@ -14244,12 +14722,10 @@ class TestIterateCommand:
             result = cmd_iterate(args)
         output = capsys.readouterr().out
 
-        root_decision = resolve_verify_gate_decision(store, root, config=config, git=mock_git)
         head_decision = resolve_verify_gate_decision(store, head, config=config, git=mock_git)
         assert result == 0
         assert len(verify_calls) == 1
-        assert root_decision.state == "passed"
-        assert head_decision.state == "missing"
+        assert head_decision.state == "passed"
         assert f"Iterating implementation {head.id}" in output
         assert "Iteration 1/2: create_review" not in output
         assert "Iteration 1/2: run_review" not in output
@@ -14270,11 +14746,12 @@ class TestIterateCommand:
             store,
             branch="feature/iterate-force-recovered-approved-review",
         )
+        self._attach_recovered_lineage_merge_unit(store, root, head)
         review = self._make_review_task(store, head, status="completed", verdict="APPROVED")
         config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
             store,
             tmp_path,
-            root,
+            head,
             head_sha="recovered-approved-review-head",
         )
         config.advance_create_reviews = False
@@ -14317,10 +14794,10 @@ class TestIterateCommand:
             result = cmd_iterate(args)
         output = capsys.readouterr().out
 
-        root_decision = resolve_verify_gate_decision(store, root, config=config, git=mock_git)
+        head_decision = resolve_verify_gate_decision(store, head, config=config, git=mock_git)
         assert result == 0
         assert len(verify_calls) == 1
-        assert root_decision.state == "passed"
+        assert head_decision.state == "passed"
         assert "Next action: verify_gate" in output
         assert "Next action: merge" in output
         assert "review-needs-manual-creation" not in output
@@ -14345,11 +14822,12 @@ class TestIterateCommand:
             store,
             branch=f"feature/iterate-force-recovered-{review_status}-review",
         )
+        self._attach_recovered_lineage_merge_unit(store, root, head)
         review = self._make_review_task(store, head, status=review_status)
         config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
             store,
             tmp_path,
-            root,
+            head,
             head_sha=f"recovered-{review_status}-review-head",
         )
         config.advance_create_reviews = True
@@ -14406,12 +14884,13 @@ class TestIterateCommand:
             result = cmd_iterate(args)
         output = capsys.readouterr().out
 
-        root_decision = resolve_verify_gate_decision(store, root, config=config, git=mock_git)
+        head_decision = resolve_verify_gate_decision(store, head, config=config, git=mock_git)
         expected_result = 0 if expected_action == "run_review" else 3
         assert result == expected_result
-        assert len(verify_calls) == 1
-        assert root_decision.state == "passed"
-        assert "Next action: verify_gate" in output
+        assert len(verify_calls) == (1 if expected_action == "run_review" else 0)
+        assert head_decision.state == ("passed" if expected_action == "run_review" else "failed")
+        if expected_action == "run_review":
+            assert "Next action: verify_gate" in output
         if expected_action == "run_review":
             assert f"Iteration 1/1: {expected_action}" in output
             assert f"Running pending review {review.id}" in output
@@ -14445,11 +14924,12 @@ class TestIterateCommand:
             store,
             branch=f"feature/iterate-force-recovered-{verdict.lower().replace('_', '-')}",
         )
+        self._attach_recovered_lineage_merge_unit(store, root, head)
         review = self._make_review_task(store, head, status="completed", verdict=verdict)
         config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
             store,
             tmp_path,
-            root,
+            head,
             head_sha=f"recovered-{verdict.lower()}-head",
         )
         config.advance_create_reviews = True
@@ -14515,10 +14995,10 @@ class TestIterateCommand:
             result = cmd_iterate(args)
         output = capsys.readouterr().out
 
-        root_decision = resolve_verify_gate_decision(store, root, config=config, git=mock_git)
+        head_decision = resolve_verify_gate_decision(store, head, config=config, git=mock_git)
         assert result == 0
         assert len(verify_calls) == 1
-        assert root_decision.state == "passed"
+        assert head_decision.state == "passed"
         assert "Next action: verify_gate" in output
         if expected_action == "improve":
             assert "Iteration 1/1: improve" in output
@@ -14642,6 +15122,7 @@ class TestIterateCommand:
             store,
             branch="feature/iterate-force-recovered-wait-improve",
         )
+        self._attach_recovered_lineage_merge_unit(store, root, head)
         review = self._make_review_task(store, head, status="completed", verdict="CHANGES_REQUESTED")
         improve = store.add("Improve in progress", task_type="improve", based_on=head.id, depends_on=review.id)
         assert improve.id is not None
@@ -14650,7 +15131,7 @@ class TestIterateCommand:
         config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
             store,
             tmp_path,
-            root,
+            head,
             head_sha="recovered-wait-improve-head",
         )
 
@@ -14686,7 +15167,7 @@ class TestIterateCommand:
         output = capsys.readouterr().out
 
         assert result == 3
-        assert len(verify_calls) == 1
+        assert len(verify_calls) == 0
         assert "Next action: wait_improve" in output
         assert "Iterate waiting: improve_in_progress" in output
 
@@ -14701,11 +15182,12 @@ class TestIterateCommand:
             store,
             branch="feature/iterate-force-recovered-real-cap",
         )
+        self._attach_recovered_lineage_merge_unit(store, root, head)
         review = self._make_review_task(store, head, status="completed", verdict="CHANGES_REQUESTED")
         config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
             store,
             tmp_path,
-            root,
+            head,
             head_sha="recovered-real-cap-head",
         )
 
@@ -14909,10 +15391,11 @@ class TestIterateCommand:
             store,
             branch="feature/iterate-background-recovered-verify-fix-failed",
         )
+        self._attach_recovered_lineage_merge_unit(store, root, head)
         config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
             store,
             tmp_path,
-            root,
+            head,
             head_sha="background-recovered-head",
         )
 
@@ -14955,7 +15438,7 @@ class TestIterateCommand:
         assert spawned[0].kwargs["prepared_task_id"] == head.id
         assert spawned[0].kwargs["prepared_phase"] == "iteration"
         assert spawned[0].kwargs["prepared_action_type"] == "verify_gate"
-        assert spawned[0].kwargs["prepared_verify_owner_task_id"] == root.id
+        assert spawned[0].kwargs["prepared_verify_owner_task_id"] == head.id
         assert "NEEDS_ATTENTION" not in parent_output
 
         inner_args = argparse.Namespace(
@@ -14972,7 +15455,7 @@ class TestIterateCommand:
             prepared_resume=False,
             prepared_phase="iteration",
             prepared_action_type="verify_gate",
-            prepared_verify_owner_task_id=root.id,
+            prepared_verify_owner_task_id=head.id,
             prepared_review_task_id=None,
         )
 
@@ -14990,12 +15473,10 @@ class TestIterateCommand:
             result = cmd_iterate(inner_args)
         inner_output = capsys.readouterr().out
 
-        root_decision = resolve_verify_gate_decision(store, root, config=config, git=mock_git)
         head_decision = resolve_verify_gate_decision(store, head, config=config, git=mock_git)
         assert result == 3
         assert len(verify_calls) == 1
-        assert root_decision.state == "passed"
-        assert head_decision.state == "missing"
+        assert head_decision.state == "passed"
         assert "Next action: verify_gate" in inner_output
         assert "Verify gate passed for the current tip before review." in inner_output
 
@@ -15011,10 +15492,11 @@ class TestIterateCommand:
             store,
             branch="feature/iterate-background-recovered-no-review",
         )
+        self._attach_recovered_lineage_merge_unit(store, root, head)
         config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
             store,
             tmp_path,
-            root,
+            head,
             head_sha="background-recovered-no-review-head",
         )
         config.require_review_before_merge = False
@@ -15056,7 +15538,7 @@ class TestIterateCommand:
         assert spawned
         assert spawned[0].task.id == head.id
         assert spawned[0].kwargs["prepared_action_type"] == "verify_gate"
-        assert spawned[0].kwargs["prepared_verify_owner_task_id"] == root.id
+        assert spawned[0].kwargs["prepared_verify_owner_task_id"] == head.id
 
         inner_args = argparse.Namespace(
             impl_task_id=head.id,
@@ -15072,7 +15554,7 @@ class TestIterateCommand:
             prepared_resume=False,
             prepared_phase="iteration",
             prepared_action_type="verify_gate",
-            prepared_verify_owner_task_id=root.id,
+            prepared_verify_owner_task_id=head.id,
             prepared_review_task_id=None,
         )
 
@@ -15101,12 +15583,10 @@ class TestIterateCommand:
             result = cmd_iterate(inner_args)
         inner_output = capsys.readouterr().out
 
-        root_decision = resolve_verify_gate_decision(store, root, config=config, git=mock_git)
         head_decision = resolve_verify_gate_decision(store, head, config=config, git=mock_git)
         assert result == 0
         assert len(verify_calls) == 1
-        assert root_decision.state == "passed"
-        assert head_decision.state == "missing"
+        assert head_decision.state == "passed"
         assert "Next action: verify_gate" in inner_output
         assert "Next action: merge" in inner_output
         assert "create_review" not in inner_output
@@ -15518,6 +15998,7 @@ class TestIterateCommand:
         from gza.cli.unstick import cmd_unstick
         from gza.lineage_query import LineageOwnerRow
         from gza.review_verify_state import resolve_verify_gate_decision
+        from gza.unstick import SelectedParkedTask, UnstickOutcome, UnstickSelectionResult
 
         setup_config(tmp_path)
         store = make_store(tmp_path)
@@ -15525,6 +16006,7 @@ class TestIterateCommand:
             store,
             branch=f"feature/unstick-recovered-{selection_mode}-verify-fix-failed",
         )
+        self._attach_recovered_lineage_merge_unit(store, root, head)
         root.tags = ("verify-refresh",)
         head.tags = ("verify-refresh",)
         store.update(root)
@@ -15532,13 +16014,13 @@ class TestIterateCommand:
         config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
             store,
             tmp_path,
-            root,
+            head,
             head_sha=f"unstick-recovered-{selection_mode}-head",
             captured_at=datetime(2000, 1, 1, tzinfo=UTC),
         )
 
         args = argparse.Namespace(
-            task_ids=(root.id,) if selection_mode == "explicit-id" else (),
+            task_ids=(head.id,) if selection_mode == "explicit-id" else (),
             reasons=("verify-fix-failed",),
             all=False,
             run=True,
@@ -15549,20 +16031,43 @@ class TestIterateCommand:
         )
         mock_git = MagicMock()
         owner_row = LineageOwnerRow(
-            owner_task=root,
+            owner_task=head,
             members=(root, head),
             tree=None,
             lineage_status="needs_attention",
             next_action={
-                "type": "needs_discussion",
-                "description": "verify gate is still red after completed verify_fix",
-                "needs_attention_reason": "verify-fix-failed",
-                "subject_task_id": root.id,
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_gate_state": "failed",
+                "verify_gate_explicit_refresh": True,
+                "verify_owner_task": head,
             },
-            next_action_reason="needs_attention",
+            next_action_reason="verify_gate",
             unresolved_tasks=(head,),
             unresolved_leaf_summary=(),
         )
+
+        def fake_select_and_clear(*_args, **_kwargs):
+            store.record_parked_task_manual_rearm(
+                subject_kind="task",
+                subject_id=head.id,
+                attention_reason="verify-fix-failed",
+                subject_task_id=head.id,
+            )
+            return UnstickSelectionResult(
+                candidates=(),
+                selected=(SelectedParkedTask(owner_task=head, current_candidate=None),),
+                outcomes=(
+                    UnstickOutcome(
+                        owner_task=head,
+                        reason_class="verify-fix-failed",
+                        status="rearmed",
+                        detail="cleared verify-fix-failed",
+                    ),
+                ),
+            )
+
         with ExitStack() as stack:
             verify_calls = self._patch_fresh_verify_gate(
                 stack,
@@ -15582,8 +16087,41 @@ class TestIterateCommand:
             )
             stack.enter_context(
                 patch(
-                    "gza.unstick.query_lineage_owner_rows_in_read_session",
-                    return_value=((owner_row,), object()),
+                    "gza.cli.unstick.select_and_clear_parked_tasks",
+                    side_effect=fake_select_and_clear,
+                )
+            )
+            watch_plan = SimpleNamespace(
+                running_task_ids=(),
+                anonymous_worker_count=0,
+                starting_worker_count=0,
+                pending_count=0,
+                blocked_pending_count=0,
+                running=0,
+                effective_batch=1,
+                slots=1,
+                analysis=SimpleNamespace(
+                    target_branch="main",
+                    scope_gaps=(),
+                    owner_rows=(owner_row,),
+                    watch_read_context=SimpleNamespace(),
+                    lifecycle_rows=(owner_row,),
+                    recovery_rows=(),
+                    recovery_lane_entry_by_failed_id={},
+                    action_plan=((owner_row, head, owner_row.next_action),),
+                    recovery_attention_rows=(),
+                    recovery_visible_skips=(),
+                    recovery_undispatched_rows=(),
+                    active_recovery_subject_ids=frozenset(),
+                    actionable_failed=(),
+                    pending_recovery_task_ids=frozenset(),
+                    effective_scoped_owner_ids=(head.id,),
+                ),
+            )
+            stack.enter_context(
+                patch(
+                    "gza.cli.unstick._build_watch_cycle_plan",
+                    return_value=watch_plan,
                 )
             )
             stack.enter_context(
@@ -15595,7 +16133,7 @@ class TestIterateCommand:
                         "verify_gate_phase": "pre_review",
                         "verify_gate_state": "failed",
                         "verify_gate_explicit_refresh": True,
-                        "verify_owner_task": root,
+                        "verify_owner_task": head,
                     },
                 )
             )
@@ -15622,7 +16160,7 @@ class TestIterateCommand:
             output = capsys.readouterr().out
             root_rearm = store.get_parked_task_rearm(
                 subject_kind="task",
-                subject_id=root.id,
+                subject_id=head.id,
                 attention_reason="verify-fix-failed",
             )
             root_decision = resolve_verify_gate_decision(store, root, config=config, git=mock_git)
@@ -15637,18 +16175,21 @@ class TestIterateCommand:
         assert (
             store.get_parked_task_rearm(
                 subject_kind="task",
-                subject_id=head.id,
+                subject_id=root.id,
                 attention_reason="verify-fix-failed",
             )
             is None
         )
-        assert root_decision.state == "failed"
-        assert head_decision.state == "missing"
-        assert len(root_artifacts) == 2
-        assert len(head_artifacts) == 0
+        assert root_decision.state == "missing"
+        assert head_decision.state == "failed"
+        assert head_artifacts
+        assert root_artifacts == []
+        assert head_artifacts[0].status == "failed"
+        assert head_artifacts[0].metadata["source_task_id"] == head.id
+        assert head_artifacts[0].head_sha == f"unstick-recovered-{selection_mode}-head"
         assert "Selected 1 parked owner(s)" in output
         assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
-        assert f"{root.id} [verify-fix-failed] verify_gate blocked" in output
+        assert f"{head.id} [verify-fix-failed] verify_gate blocked" in output
         assert "Started:" not in output
         assert "Cleared Only:" not in output
 
@@ -15972,7 +16513,7 @@ class TestIterateCommand:
         assert result == 3
         assert len(verify_calls) == 1
         assert root_decision.state == "failed"
-        assert head_decision.state == "missing"
+        assert head_decision.state == "failed"
         assert "Iterate complete: BLOCKED (verify_gate_blocked)" in output
         assert "Iteration 1/1: create_review" not in output
         assert "merge_ready" not in output

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -20,6 +20,7 @@ from gza.advance_engine import (
     VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
     evaluate_advance_rules,
 )
+from gza.artifacts import store_command_output_artifact
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.cli._common import (
     PLAN_REVIEW_MATERIALIZATION_AUTO_REPAIR_DROP_REASON,
@@ -38,6 +39,7 @@ from gza.cli.advance_executor import (
     _prepare_resolution_review_action,
     _prepare_spec_coherence_review_action,
     _resolve_canonical_verify_gate_owner,
+    _resolve_verify_gate_subject_task,
     build_improve_needs_attention_result,
     execute_advance_action,
     resolve_execution_needs_attention,
@@ -61,12 +63,14 @@ from gza.plan_review_materialization import (
 )
 from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
-from gza.review_tasks import OffTopicVerifyPersistenceError, build_verify_fix_prompt
+from gza.review_tasks import OffTopicVerifyPersistenceError, build_verify_fix_prompt, create_or_reuse_verify_fix_task
 from gza.review_verify_state import (
     VerifyEpoch,
+    VerifyGateResult,
     VERIFY_GATE_ARTIFACT_KIND,
     latest_verify_result_for_epoch,
     owner_task_verify_epoch,
+    persist_recredited_verify_gate_artifact,
     persist_verify_gate_artifact,
 )
 from gza.review_verdict import ReviewFinding
@@ -3417,10 +3421,508 @@ def test_verify_gate_owner_for_review_followup_implement_stops_at_same_branch_ow
     assert followup.id is not None
     _mark_completed(followup, branch=shared_branch)
     store.update(followup)
+    assert store.get_or_create_merge_unit_for_task(followup) is not None
 
     owner = _resolve_canonical_verify_gate_owner(store, followup)
+    subject = _resolve_verify_gate_subject_task(store, followup)
 
     assert owner.id == followup.id
+    assert subject.id == followup.id
+
+
+def test_verify_gate_recredits_same_branch_failed_parent_pass_to_live_owner(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    shared_branch = "gza/resumed-work"
+
+    failed_parent = store.add("Failed first attempt", task_type="implement")
+    assert failed_parent.id is not None
+    failed_parent.status = "failed"
+    failed_parent.completed_at = datetime(2026, 8, 18, 5, 0, tzinfo=UTC)
+    failed_parent.failure_reason = "worker failed"
+    failed_parent.branch = shared_branch
+    store.update(failed_parent)
+
+    live_child = store.add("Completed resumed attempt", task_type="implement", based_on=failed_parent.id)
+    assert live_child.id is not None
+    live_child.status = "completed"
+    live_child.completed_at = datetime(2026, 8, 18, 5, 5, tzinfo=UTC)
+    live_child.branch = shared_branch
+    store.update(live_child)
+
+    unit = store.get_or_create_merge_unit_for_task(live_child)
+    assert unit is not None
+    assert store.resolve_merge_unit_owner_task(unit).id == live_child.id
+
+    contributor_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 8, 18, 5, 7, tzinfo=UTC),
+        reviewed_branch=shared_branch,
+        reviewed_head_sha="live-head",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=failed_parent,
+        source_task=live_child,
+        result=contributor_result,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda ref: {
+            shared_branch: "live-head",
+            "main": "base-1",
+            "origin/main": "base-1",
+        }.get(ref),
+        worktree_add_existing=lambda *_args, **_kwargs: pytest.fail("verify should not rerun"),
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with patch("gza.cli.advance_executor._run_lifecycle_verify") as run_verify:
+        result = execute_advance_action(
+            task=live_child,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_owner_task": live_child,
+            },
+            context=context,
+        )
+
+    refreshed_child = store.get(live_child.id)
+    assert refreshed_child is not None
+    assert result.status == "success"
+    assert result.handled_task_id == live_child.id
+    run_verify.assert_not_called()
+    assert store.list_artifacts(failed_parent.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    child_artifacts = store.list_artifacts(live_child.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    assert child_artifacts
+    assert child_artifacts[0].metadata is not None
+    assert child_artifacts[0].metadata["source_task_id"] == live_child.id
+    assert child_artifacts[0].metadata["source_task_type"] == live_child.task_type
+    assert child_artifacts[0].metadata["verify_epoch"]["verify_timeout_seconds"] == 120
+    assert child_artifacts[0].metadata["verify_epoch"]["verify_timeout_grace_seconds"] == 5.0
+    assert child_artifacts[0].metadata["reconciliation"] == {
+        "producer": "advance_verify_gate_recredit",
+        "credited_owner_task_id": live_child.id,
+        "evidence_holder_task_id": failed_parent.id,
+        "evidence_holder_task_type": failed_parent.task_type,
+    }
+    assert refreshed_child.review_verify_status == "passed"
+    assert refreshed_child.review_verify_branch == shared_branch
+    assert refreshed_child.review_verify_head_sha == "live-head"
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_child,
+        current_epoch=owner_task_verify_epoch(refreshed_child, config, git),
+    )
+    assert lookup.result is not None
+    assert lookup.result.source_task_id == live_child.id
+
+
+def test_verify_gate_recredits_failed_holder_evidence_without_rewriting_source_or_epoch(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    shared_branch = "gza/resumed-red-work"
+
+    failed_parent = store.add("Failed first attempt", task_type="implement")
+    assert failed_parent.id is not None
+    failed_parent.status = "failed"
+    failed_parent.completed_at = datetime(2026, 8, 18, 5, 0, tzinfo=UTC)
+    failed_parent.failure_reason = "worker failed"
+    failed_parent.branch = shared_branch
+    store.update(failed_parent)
+
+    live_child = store.add("Completed resumed attempt", task_type="implement", based_on=failed_parent.id)
+    assert live_child.id is not None
+    live_child.status = "completed"
+    live_child.completed_at = datetime(2026, 8, 18, 5, 5, tzinfo=UTC)
+    live_child.branch = shared_branch
+    live_child.has_commits = True
+    store.update(live_child)
+
+    unit = store.get_or_create_merge_unit_for_task(live_child)
+    assert unit is not None
+    assert store.resolve_merge_unit_owner_task(unit).id == live_child.id
+
+    output_artifact = store_command_output_artifact(
+        store,
+        failed_parent,
+        config,
+        kind="verify_command_output",
+        producer="test",
+        label="verify_command_output",
+        output="pytest failed\nAssertionError: still red\n",
+        command="./bin/tests",
+        status="failed",
+        exit_status="1",
+        head_sha="live-head",
+        created_at=datetime(2026, 8, 18, 5, 7, tzinfo=UTC),
+    )
+    provenance = {
+        "schema_version": 1,
+        "projects": [
+            {
+                "scope": "src",
+                "status": "failed",
+                "command": "./bin/tests",
+                "timeout_seconds": 120,
+                "timeout_grace_seconds": 5.0,
+            }
+        ],
+    }
+    aggregate_details = {
+        "schema_version": 1,
+        "failed_count": 1,
+        "passed_count": 0,
+        "scopes": [{"scope": "src", "status": "failed"}],
+    }
+    contributor_result = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 8, 18, 5, 8, tzinfo=UTC),
+        reviewed_branch=shared_branch,
+        reviewed_head_sha="live-head",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+        failure="pytest failed",
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=failed_parent,
+        source_task=live_child,
+        result=contributor_result,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        output_artifact_id=output_artifact.id,
+        output_artifact_task_id=failed_parent.id,
+        output_artifact_path=output_artifact.path,
+        producer="test",
+        provenance=provenance,
+        aggregate_details=aggregate_details,
+    )
+
+    config.autonomous_verify_timeout_seconds = 900
+    config.review_verify_timeout_grace_seconds = 30.0
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda ref: {
+            shared_branch: "live-head",
+            "main": "base-1",
+            "origin/main": "base-1",
+        }.get(ref),
+        worktree_add_existing=lambda *_args, **_kwargs: pytest.fail("verify should not rerun"),
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda task, _kind: 0,
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with patch("gza.cli.advance_executor._run_lifecycle_verify") as run_verify:
+        result = execute_advance_action(
+            task=live_child,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_owner_task": live_child,
+            },
+            context=context,
+        )
+
+    refreshed_child = store.get(live_child.id)
+    assert refreshed_child is not None
+    assert result.status == "skip"
+    assert result.attention_reason == "verify-gate-blocked"
+    run_verify.assert_not_called()
+    child_artifacts = store.list_artifacts(live_child.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    assert child_artifacts
+    assert child_artifacts[0].metadata is not None
+    child_metadata = child_artifacts[0].metadata
+    assert child_metadata["source_task_id"] == live_child.id
+    assert child_metadata["source_task_type"] == live_child.task_type
+    assert child_metadata["output_artifact_id"] == output_artifact.id
+    assert child_metadata["output_artifact_task_id"] == failed_parent.id
+    assert child_metadata["output_artifact_path"] == output_artifact.path
+    assert child_metadata["verify_epoch"]["verify_timeout_seconds"] == 120
+    assert child_metadata["verify_epoch"]["verify_timeout_grace_seconds"] == 5.0
+    assert child_metadata["provenance"] == provenance
+    assert child_metadata["aggregate_details"] == aggregate_details
+    assert child_metadata["reconciliation"] == {
+        "producer": "advance_verify_gate_recredit",
+        "credited_owner_task_id": live_child.id,
+        "evidence_holder_task_id": failed_parent.id,
+        "evidence_holder_task_type": failed_parent.task_type,
+    }
+
+    verify_epoch = owner_task_verify_epoch(refreshed_child, config, git)
+    assert verify_epoch is not None
+    lookup = latest_verify_result_for_epoch(store, refreshed_child, current_epoch=verify_epoch)
+    assert lookup.result is not None
+    assert lookup.result.source_task_id == live_child.id
+    assert lookup.result.output_artifact_path == output_artifact.path
+    assert lookup.result.status == "failed"
+
+    lifecycle_git = _build_merge_unit_lifecycle_git(refreshed_child, head_sha="live-head")
+    action = evaluate_advance_rules(config, store, lifecycle_git, refreshed_child, "main")
+    assert action["type"] == "create_verify_fix"
+    assert action["based_on_task"].id == live_child.id
+
+    created, did_create = create_or_reuse_verify_fix_task(
+        store,
+        config,
+        impl_task=action["impl_task"],
+        based_on_task=action["based_on_task"],
+        verify_epoch=action["verify_epoch"],
+        trigger_source="manual",
+    )
+    assert did_create is True
+    assert created.based_on == live_child.id
+
+
+def test_verify_gate_no_merge_unit_compat_copy_preserves_source_and_epoch(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement compat copy", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/no-merge-unit-compat")
+    store.update(impl)
+    review = store.add("Review compat copy", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+
+    provenance = {"schema_version": 1, "projects": [{"scope": ".", "status": "passed"}]}
+    aggregate_details = {"schema_version": 1, "passed_count": 1, "failed_count": 0}
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=_make_review_verify_result(
+            "./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 18, 6, 0, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+        provenance=provenance,
+        aggregate_details=aggregate_details,
+    )
+    config.autonomous_verify_timeout_seconds = 900
+    config.review_verify_timeout_grace_seconds = 30.0
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda ref: {
+            impl.branch: "head-1",
+            "main": "base-1",
+            "origin/main": "base-1",
+        }.get(ref),
+        worktree_add_existing=lambda *_args, **_kwargs: pytest.fail("verify should not rerun"),
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+    with patch("gza.cli.advance_executor._run_lifecycle_verify") as run_verify:
+        result = execute_advance_action(
+            task=review,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_owner_task": review,
+            },
+            context=context,
+        )
+
+    assert result.status == "success"
+    run_verify.assert_not_called()
+    review_artifacts = store.list_artifacts(review.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    assert review_artifacts
+    assert review_artifacts[0].metadata is not None
+    metadata = review_artifacts[0].metadata
+    assert metadata["source_task_id"] == impl.id
+    assert metadata["source_task_type"] == impl.task_type
+    assert metadata["verify_epoch"]["verify_timeout_seconds"] == 120
+    assert metadata["verify_epoch"]["verify_timeout_grace_seconds"] == 5.0
+    assert metadata["provenance"] == provenance
+    assert metadata["aggregate_details"] == aggregate_details
+    assert metadata["reconciliation"] == {
+        "producer": "advance_verify_gate_prepared_owner_compat",
+        "credited_owner_task_id": review.id,
+        "evidence_holder_task_id": impl.id,
+        "evidence_holder_task_type": impl.task_type,
+    }
+
+
+def test_verify_gate_no_merge_unit_rejects_unrelated_prepared_owner_without_writes(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    owner = store.add("Implement owner with green proof", task_type="implement")
+    assert owner.id is not None
+    _mark_completed(owner, branch="feature/no-merge-unit-owner")
+    store.update(owner)
+    unrelated = store.add("Unrelated prepared owner", task_type="implement")
+    assert unrelated.id is not None
+    _mark_completed(unrelated, branch="feature/unrelated-prepared-owner")
+    store.update(unrelated)
+
+    _persist_current_verify_gate_result(
+        store=store,
+        config=config,
+        task=owner,
+        status="passed",
+        captured_at=datetime(2026, 8, 18, 6, 0, tzinfo=UTC),
+    )
+    context = _build_verify_gate_merge_unit_context(tmp_path=tmp_path, store=store, config=config, owner=owner)
+
+    with patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")):
+        result = execute_advance_action(
+            task=owner,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_owner_task": unrelated,
+            },
+            context=context,
+        )
+
+    refreshed_unrelated = store.get(unrelated.id)
+    assert refreshed_unrelated is not None
+    assert result.status == "skip"
+    assert "owner mismatch" in result.message
+    assert store.list_artifacts(unrelated.id, kind=VERIFY_GATE_ARTIFACT_KIND) == []
+    assert refreshed_unrelated.review_verify_status is None
+    assert refreshed_unrelated.review_verify_artifact_file is None
+
+
+def test_verify_gate_owner_and_subject_match_same_branch_attempt_tip(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    shared_branch = "gza/multi-attempt"
+
+    first = store.add("Failed first attempt", task_type="implement")
+    assert first.id is not None
+    first.status = "failed"
+    first.completed_at = datetime(2026, 8, 18, 4, 0, tzinfo=UTC)
+    first.branch = shared_branch
+    store.update(first)
+
+    second = store.add("Dropped second attempt", task_type="implement", based_on=first.id)
+    assert second.id is not None
+    second.status = "dropped"
+    second.completed_at = datetime(2026, 8, 18, 4, 5, tzinfo=UTC)
+    second.branch = shared_branch
+    store.update(second)
+
+    third = store.add("Completed third attempt", task_type="implement", based_on=second.id)
+    assert third.id is not None
+    third.status = "completed"
+    third.completed_at = datetime(2026, 8, 18, 4, 10, tzinfo=UTC)
+    third.branch = shared_branch
+    store.update(third)
+
+    unit = store.get_or_create_merge_unit_for_task(third)
+    assert unit is not None
+    assert store.resolve_merge_unit_owner_task(unit).id == third.id
+
+    for task in (first, second, third):
+        owner = _resolve_canonical_verify_gate_owner(store, task)
+        subject = _resolve_verify_gate_subject_task(store, task)
+        assert owner.id == third.id
+        assert subject.id == third.id
 
 
 def test_verify_gate_review_followup_same_branch_runs_live_head_and_persists_to_followup(tmp_path: Path) -> None:
@@ -3465,6 +3967,7 @@ def test_verify_gate_review_followup_same_branch_runs_live_head_and_persists_to_
     assert followup.id is not None
     _mark_completed(followup, branch=shared_branch)
     store.update(followup)
+    assert store.get_or_create_merge_unit_for_task(followup) is not None
 
     heads = {
         shared_branch: "followup-head",
@@ -3596,6 +4099,7 @@ def test_verify_gate_same_branch_ancestor_cached_pass_does_not_short_circuit_fol
     assert followup.id is not None
     _mark_completed(followup, branch=shared_branch)
     store.update(followup)
+    assert store.get_or_create_merge_unit_for_task(followup) is not None
 
     heads = {
         shared_branch: "followup-head",
@@ -3955,6 +4459,962 @@ def test_verify_gate_execution_blocks_current_red_evidence_without_rerun(tmp_pat
     assert result.status == "skip"
     assert result.attention_reason == "verify-gate-blocked"
     assert "current verify gate is red" in result.message
+
+
+def _build_verify_gate_merge_unit_context(
+    *,
+    tmp_path: Path,
+    store: SqliteTaskStore,
+    config: Config,
+    owner: DbTask,
+    head_sha: str = "head-1",
+) -> AdvanceActionExecutionContext:
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda ref: {
+            owner.branch: head_sha,
+            "main": "base-1",
+            "origin/main": "base-1",
+        }.get(ref),
+        worktree_add_existing=lambda *_args, **_kwargs: pytest.fail("verify should not rerun"),
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+    return AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+    )
+
+
+def _build_merge_unit_lifecycle_git(owner: DbTask, *, head_sha: str = "head-1") -> MagicMock:
+    lifecycle_git = MagicMock()
+    lifecycle_git.can_merge.return_value = True
+    lifecycle_git.is_merged.return_value = False
+    lifecycle_git.branch_exists.return_value = True
+    lifecycle_git.ref_exists.return_value = False
+    lifecycle_git.rev_parse_if_exists.side_effect = lambda ref: {
+        "main": "base-1",
+        "origin/main": "base-1",
+        owner.branch: head_sha,
+    }.get(ref)
+    lifecycle_git.is_ancestor.return_value = False
+    lifecycle_git.count_commits_behind_checked.return_value = 0
+    lifecycle_git.count_commits_ahead_checked.return_value = 1
+    lifecycle_git.get_diff_name_status.return_value = ""
+    lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
+    return lifecycle_git
+
+
+def _add_completed_merge_unit_member(
+    store: SqliteTaskStore,
+    *,
+    prompt: str,
+    branch: str,
+    unit_id: str,
+) -> DbTask:
+    member = store.add(prompt, task_type="implement")
+    assert member.id is not None
+    _mark_completed(member, branch=branch)
+    store.update(member)
+    store.attach_task_to_merge_unit(member.id, unit_id, "same_branch")
+    return member
+
+
+def _persist_current_verify_gate_result(
+    *,
+    store: SqliteTaskStore,
+    config: Config,
+    task: DbTask,
+    status: str,
+    captured_at: datetime,
+    head_sha: str = "head-1",
+) -> None:
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=task,
+        source_task=task,
+        result=_make_review_verify_result(
+            "./bin/tests",
+            status=status,
+            exit_status="0" if status == "passed" else "1",
+            captured_at=captured_at,
+            reviewed_branch=task.branch,
+            reviewed_head_sha=head_sha,
+            reviewed_base_sha="base-1",
+            working_directory=str(config.project_dir),
+            failure=None if status == "passed" else f"verify {status}",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+
+
+def _persist_legacy_review_verify_result(
+    store: SqliteTaskStore,
+    *,
+    task: DbTask,
+    status: str,
+    captured_at: datetime,
+    head_sha: str = "head-1",
+) -> DbTask:
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.review_verify_command = "./bin/tests"
+    review.review_verify_status = status
+    review.review_verify_exit_status = "0" if status == "passed" else "1"
+    review.review_verify_failure = None if status == "passed" else f"verify {status}"
+    review.review_verify_captured_at = captured_at
+    review.review_verify_head_sha = head_sha
+    review.review_verify_base_sha = "base-1"
+    review.review_verify_branch = task.branch
+    review.review_verify_cwd = "/tmp/legacy-review-worktree"
+    store.update(review)
+    return review
+
+
+def test_verify_gate_recredits_newer_merge_unit_contributor_green_over_older_owner_red(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    owner = store.add("Implement owner", task_type="implement")
+    assert owner.id is not None
+    _mark_completed(owner, branch="feature/merge-unit-newer-green")
+    store.update(owner)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    contributor = _add_completed_merge_unit_member(
+        store,
+        prompt="Contributor current green",
+        branch=owner.branch,
+        unit_id=unit.id,
+    )
+    captured_at = datetime(2026, 8, 18, 10, 0, tzinfo=UTC)
+    _persist_current_verify_gate_result(
+        store=store,
+        config=config,
+        task=owner,
+        status="failed",
+        captured_at=captured_at,
+    )
+    _persist_current_verify_gate_result(
+        store=store,
+        config=config,
+        task=contributor,
+        status="passed",
+        captured_at=captured_at + timedelta(minutes=1),
+    )
+
+    context = _build_verify_gate_merge_unit_context(tmp_path=tmp_path, store=store, config=config, owner=owner)
+
+    with patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")):
+        result = execute_advance_action(
+            task=owner,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before merge",
+                "verify_gate_phase": "pre_merge",
+                "verify_owner_task": owner,
+            },
+            context=context,
+        )
+
+    refreshed_owner = store.get(owner.id)
+    assert refreshed_owner is not None
+    assert result.status == "success"
+    assert refreshed_owner.review_verify_status == "passed"
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_owner,
+        current_epoch=owner_task_verify_epoch(refreshed_owner, config, context.git),
+    )
+    assert lookup.result is not None
+    assert lookup.result.source_task_id == contributor.id
+
+
+def test_pre_review_planner_recredits_newer_merge_unit_green_before_verify_fix(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    owner = store.add("Implement owner", task_type="implement")
+    assert owner.id is not None
+    _mark_completed(owner, branch="feature/pre-review-merge-unit-newer-green")
+    owner.has_commits = True
+    store.update(owner)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    contributor = _add_completed_merge_unit_member(
+        store,
+        prompt="Contributor current green",
+        branch=owner.branch,
+        unit_id=unit.id,
+    )
+    captured_at = datetime(2026, 8, 18, 10, 0, tzinfo=UTC)
+    _persist_current_verify_gate_result(
+        store=store,
+        config=config,
+        task=owner,
+        status="failed",
+        captured_at=captured_at,
+    )
+    _persist_current_verify_gate_result(
+        store=store,
+        config=config,
+        task=contributor,
+        status="passed",
+        captured_at=captured_at + timedelta(minutes=1),
+    )
+
+    lifecycle_git = _build_merge_unit_lifecycle_git(owner)
+    action = evaluate_advance_rules(config, store, lifecycle_git, owner, "main")
+    assert action["type"] == "reconcile_verify_gate_evidence"
+
+    context = _build_verify_gate_merge_unit_context(tmp_path=tmp_path, store=store, config=config, owner=owner)
+    result = execute_advance_action(task=owner, action=action, context=context)
+
+    refreshed_owner = store.get(owner.id)
+    assert refreshed_owner is not None
+    assert result.status == "success"
+    assert refreshed_owner.review_verify_status == "passed"
+    assert [task for task in store.get_all() if task.task_type == "verify_fix"] == []
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_owner,
+        current_epoch=owner_task_verify_epoch(refreshed_owner, config, context.git),
+    )
+    assert lookup.result is not None
+    assert lookup.result.source_task_id == contributor.id
+
+    next_action = evaluate_advance_rules(config, store, lifecycle_git, refreshed_owner, "main")
+    assert next_action["type"] == "create_review"
+
+
+def test_reconcile_verify_gate_evidence_rejects_mismatched_action_owner_without_writes(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    owner = store.add("Implement canonical owner", task_type="implement")
+    assert owner.id is not None
+    _mark_completed(owner, branch="feature/reconcile-owner")
+    owner.has_commits = True
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+    owner_contributor = _add_completed_merge_unit_member(
+        store,
+        prompt="Owner unit contributor",
+        branch=owner.branch,
+        unit_id=owner_unit.id,
+    )
+
+    unrelated_owner = store.add("Unrelated canonical owner", task_type="implement")
+    assert unrelated_owner.id is not None
+    _mark_completed(unrelated_owner, branch="feature/unrelated-reconcile-owner")
+    unrelated_owner.has_commits = True
+    store.update(unrelated_owner)
+    unrelated_unit = store.create_merge_unit(
+        source_branch=unrelated_owner.branch,
+        target_branch="main",
+        owner_task_id=unrelated_owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(unrelated_owner.id, unrelated_unit.id, "owner")
+    unrelated_contributor = _add_completed_merge_unit_member(
+        store,
+        prompt="Unrelated unit contributor",
+        branch=unrelated_owner.branch,
+        unit_id=unrelated_unit.id,
+    )
+
+    captured_at = datetime(2026, 8, 18, 10, 0, tzinfo=UTC)
+    for task, status, offset in (
+        (owner, "failed", 0),
+        (owner_contributor, "passed", 1),
+        (unrelated_owner, "failed", 2),
+        (unrelated_contributor, "passed", 3),
+    ):
+        _persist_current_verify_gate_result(
+            store=store,
+            config=config,
+            task=task,
+            status=status,
+            captured_at=captured_at + timedelta(minutes=offset),
+        )
+    before_owner_artifacts = len(store.list_artifacts(owner.id, kind=VERIFY_GATE_ARTIFACT_KIND))
+    before_unrelated_artifacts = len(store.list_artifacts(unrelated_owner.id, kind=VERIFY_GATE_ARTIFACT_KIND))
+    context = _build_verify_gate_merge_unit_context(tmp_path=tmp_path, store=store, config=config, owner=owner)
+
+    with patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")):
+        result = execute_advance_action(
+            task=owner,
+            action={
+                "type": "reconcile_verify_gate_evidence",
+                "description": "Recredit unrelated stale action owner",
+                "verify_owner_task": unrelated_owner,
+            },
+            context=context,
+        )
+
+    refreshed_owner = store.get(owner.id)
+    refreshed_unrelated = store.get(unrelated_owner.id)
+    assert refreshed_owner is not None
+    assert refreshed_unrelated is not None
+    assert result.status == "skip"
+    assert "owner mismatch" in result.message
+    assert refreshed_owner.review_verify_status is None
+    assert refreshed_unrelated.review_verify_status is None
+    assert len(store.list_artifacts(owner.id, kind=VERIFY_GATE_ARTIFACT_KIND)) == before_owner_artifacts
+    assert len(store.list_artifacts(unrelated_owner.id, kind=VERIFY_GATE_ARTIFACT_KIND)) == before_unrelated_artifacts
+
+
+def test_verify_gate_recredits_legacy_contributor_review_without_rewriting_source(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    owner = store.add("Implement canonical owner", task_type="implement")
+    assert owner.id is not None
+    _mark_completed(owner, branch="feature/legacy-review-recredit")
+    owner.has_commits = True
+    store.update(owner)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    contributor = _add_completed_merge_unit_member(
+        store,
+        prompt="Contributor with legacy review evidence",
+        branch=owner.branch,
+        unit_id=unit.id,
+    )
+    review = _persist_legacy_review_verify_result(
+        store,
+        task=contributor,
+        status="passed",
+        captured_at=datetime(2026, 8, 18, 10, 5, tzinfo=UTC),
+    )
+
+    lifecycle_git = _build_merge_unit_lifecycle_git(owner)
+    action = evaluate_advance_rules(config, store, lifecycle_git, owner, "main")
+    assert action["type"] == "reconcile_verify_gate_evidence"
+    assert action["verify_source_task"].id == contributor.id
+
+    context = _build_verify_gate_merge_unit_context(tmp_path=tmp_path, store=store, config=config, owner=owner)
+    with patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")):
+        result = execute_advance_action(task=owner, action=action, context=context)
+
+    assert result.status == "success"
+    owner_artifacts = store.list_artifacts(owner.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    assert owner_artifacts
+    metadata = owner_artifacts[0].metadata
+    assert metadata is not None
+    assert metadata["source_task_id"] == review.id
+    assert metadata["source_task_type"] == "review"
+    assert metadata["reconciliation"] == {
+        "producer": "advance_verify_gate_recredit",
+        "credited_owner_task_id": owner.id,
+        "evidence_holder_task_id": contributor.id,
+        "evidence_holder_task_type": contributor.task_type,
+    }
+
+    refreshed_owner = store.get(owner.id)
+    assert refreshed_owner is not None
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_owner,
+        current_epoch=owner_task_verify_epoch(refreshed_owner, config, context.git),
+    )
+    assert lookup.result is not None
+    assert lookup.result.source_task_id == review.id
+    assert lookup.result.source_task_type == "review"
+
+
+def test_failed_legacy_merge_unit_evidence_preserves_review_source_for_verify_fix(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    owner = store.add("Implement canonical owner", task_type="implement")
+    assert owner.id is not None
+    _mark_completed(owner, branch="feature/legacy-review-red-recredit")
+    owner.has_commits = True
+    store.update(owner)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+        head_sha="head-1",
+        base_sha="base-1",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    contributor = _add_completed_merge_unit_member(
+        store,
+        prompt="Contributor with failed legacy review evidence",
+        branch=owner.branch,
+        unit_id=unit.id,
+    )
+    contributor.based_on = owner.id
+    store.update(contributor)
+    review = _persist_legacy_review_verify_result(
+        store,
+        task=contributor,
+        status="failed",
+        captured_at=datetime(2026, 8, 18, 10, 5, tzinfo=UTC),
+    )
+
+    lifecycle_git = _build_merge_unit_lifecycle_git(owner)
+    action = evaluate_advance_rules(config, store, lifecycle_git, owner, "main")
+    assert action["type"] == "reconcile_verify_gate_evidence"
+
+    context = _build_verify_gate_merge_unit_context(tmp_path=tmp_path, store=store, config=config, owner=owner)
+    with patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")):
+        result = execute_advance_action(task=owner, action=action, context=context)
+
+    assert result.status == "success"
+    refreshed_owner = store.get(owner.id)
+    assert refreshed_owner is not None
+    verify_epoch = owner_task_verify_epoch(refreshed_owner, config, context.git)
+    lookup = latest_verify_result_for_epoch(store, refreshed_owner, current_epoch=verify_epoch)
+    assert lookup.result is not None
+    assert lookup.result.status == "failed"
+    assert lookup.result.source_task_id == review.id
+    assert lookup.result.source_task_type == "review"
+
+    next_action = evaluate_advance_rules(config, store, lifecycle_git, refreshed_owner, "main")
+    assert next_action["type"] == "create_verify_fix"
+    assert next_action["based_on_task"].id == contributor.id
+
+
+def test_recredited_legacy_evidence_with_unresolvable_source_uses_holder_fallback(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    owner = store.add("Implement canonical owner", task_type="implement")
+    assert owner.id is not None
+    _mark_completed(owner, branch="feature/unresolvable-legacy-source")
+    store.update(owner)
+    holder = store.add("Evidence holder", task_type="implement")
+    assert holder.id is not None
+    _mark_completed(holder, branch=owner.branch)
+    store.update(holder)
+
+    result = VerifyGateResult(
+        command="./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 8, 18, 10, 10, tzinfo=UTC),
+        reviewed_branch=owner.branch,
+        reviewed_head_sha="head-1",
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+        source_task_id="gza-999999",
+        source_task_type="review",
+    )
+
+    persist_recredited_verify_gate_artifact(
+        store,
+        config,
+        owner_task=owner,
+        evidence_holder_task=holder,
+        result=result,
+        source_metadata=None,
+        producer="test_recredit",
+    )
+
+    artifacts = store.list_artifacts(owner.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    assert artifacts
+    metadata = artifacts[0].metadata
+    assert metadata is not None
+    assert metadata["source_task_id"] == holder.id
+    assert metadata["source_task_type"] == holder.task_type
+    assert metadata["reconciliation"] == {
+        "producer": "test_recredit",
+        "credited_owner_task_id": owner.id,
+        "evidence_holder_task_id": holder.id,
+        "evidence_holder_task_type": holder.task_type,
+        "source_provenance_fallback_reason": "unresolvable_source_provenance",
+    }
+
+
+def test_pre_merge_planner_recredits_newer_merge_unit_green_before_verify_fix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    owner = store.add("Implement owner", task_type="implement")
+    assert owner.id is not None
+    _mark_completed(owner, branch="feature/pre-merge-merge-unit-newer-green")
+    owner.has_commits = True
+    store.update(owner)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    contributor = _add_completed_merge_unit_member(
+        store,
+        prompt="Contributor current green",
+        branch=owner.branch,
+        unit_id=unit.id,
+    )
+    review = store.add("Review owner", task_type="review", depends_on=owner.id, based_on=owner.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_verify_head_sha = "head-1"
+    review.review_verify_branch = owner.branch
+    store.update(review)
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+    captured_at = datetime(2026, 8, 18, 10, 0, tzinfo=UTC)
+    _persist_current_verify_gate_result(
+        store=store,
+        config=config,
+        task=owner,
+        status="failed",
+        captured_at=captured_at,
+    )
+    _persist_current_verify_gate_result(
+        store=store,
+        config=config,
+        task=contributor,
+        status="passed",
+        captured_at=captured_at + timedelta(minutes=1),
+    )
+
+    lifecycle_git = _build_merge_unit_lifecycle_git(owner)
+    action = evaluate_advance_rules(config, store, lifecycle_git, owner, "main")
+    assert action["type"] == "reconcile_verify_gate_evidence"
+
+    context = _build_verify_gate_merge_unit_context(tmp_path=tmp_path, store=store, config=config, owner=owner)
+    result = execute_advance_action(task=owner, action=action, context=context)
+
+    refreshed_owner = store.get(owner.id)
+    assert refreshed_owner is not None
+    assert result.status == "success"
+    assert refreshed_owner.review_verify_status == "passed"
+    assert [task for task in store.get_all() if task.task_type == "verify_fix"] == []
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_owner,
+        current_epoch=owner_task_verify_epoch(refreshed_owner, config, context.git),
+    )
+    assert lookup.result is not None
+    assert lookup.result.source_task_id == contributor.id
+
+    next_action = evaluate_advance_rules(config, store, lifecycle_git, refreshed_owner, "main")
+    assert next_action["type"] == "merge"
+
+
+def _add_approved_review_for_merge(
+    store: SqliteTaskStore,
+    owner: DbTask,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    review = store.add("Review owner", task_type="review", depends_on=owner.id, based_on=owner.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_verify_head_sha = "head-1"
+    review.review_verify_branch = owner.branch
+    store.update(review)
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: SimpleNamespace(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+
+def _setup_owner_green_contributor_non_green_merge_unit(
+    tmp_path: Path,
+    newer_status: str,
+) -> tuple[SqliteTaskStore, Config, DbTask, DbTask]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    owner = store.add("Implement owner", task_type="implement")
+    assert owner.id is not None
+    _mark_completed(owner, branch=f"feature/merge-unit-owner-green-contributor-{newer_status}")
+    owner.has_commits = True
+    store.update(owner)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    contributor = _add_completed_merge_unit_member(
+        store,
+        prompt="Contributor newer non-green",
+        branch=owner.branch,
+        unit_id=unit.id,
+    )
+    contributor.based_on = owner.id
+    store.update(contributor)
+    captured_at = datetime(2026, 8, 18, 10, 0, tzinfo=UTC)
+    _persist_current_verify_gate_result(
+        store=store,
+        config=config,
+        task=owner,
+        status="passed",
+        captured_at=captured_at,
+    )
+    _persist_current_verify_gate_result(
+        store=store,
+        config=config,
+        task=contributor,
+        status=newer_status,
+        captured_at=captured_at + timedelta(minutes=1),
+    )
+    return store, config, owner, contributor
+
+
+@pytest.mark.parametrize("newer_status", ["failed", "unavailable"])
+def test_pre_review_planner_recredits_newer_merge_unit_non_green_over_older_owner_green(
+    tmp_path: Path,
+    newer_status: str,
+) -> None:
+    store, config, owner, contributor = _setup_owner_green_contributor_non_green_merge_unit(
+        tmp_path,
+        newer_status,
+    )
+    lifecycle_git = _build_merge_unit_lifecycle_git(owner)
+
+    action = evaluate_advance_rules(config, store, lifecycle_git, owner, "main")
+
+    assert action["type"] == "reconcile_verify_gate_evidence"
+    assert action["verify_owner_task"].id == owner.id
+    assert action["verify_source_task"].id == contributor.id
+
+    context = _build_verify_gate_merge_unit_context(tmp_path=tmp_path, store=store, config=config, owner=owner)
+    result = execute_advance_action(task=owner, action=action, context=context)
+    assert result.status == "success"
+
+    refreshed_owner = store.get(owner.id)
+    assert refreshed_owner is not None
+    next_action = evaluate_advance_rules(config, store, lifecycle_git, refreshed_owner, "main")
+    if newer_status == "failed":
+        assert next_action["type"] == "create_verify_fix"
+    else:
+        assert next_action["type"] == "needs_discussion"
+        assert next_action["needs_attention_reason"] == "verify-unavailable"
+    assert next_action["type"] != "create_review"
+
+
+@pytest.mark.parametrize("newer_status", ["failed", "unavailable"])
+def test_pre_merge_planner_recredits_newer_merge_unit_non_green_over_older_owner_green(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    newer_status: str,
+) -> None:
+    store, config, owner, contributor = _setup_owner_green_contributor_non_green_merge_unit(
+        tmp_path,
+        newer_status,
+    )
+    _add_approved_review_for_merge(store, owner, monkeypatch)
+    lifecycle_git = _build_merge_unit_lifecycle_git(owner)
+
+    action = evaluate_advance_rules(config, store, lifecycle_git, owner, "main")
+
+    assert action["type"] == "reconcile_verify_gate_evidence"
+    assert action["verify_owner_task"].id == owner.id
+    assert action["verify_source_task"].id == contributor.id
+
+    context = _build_verify_gate_merge_unit_context(tmp_path=tmp_path, store=store, config=config, owner=owner)
+    result = execute_advance_action(task=owner, action=action, context=context)
+    assert result.status == "success"
+
+    refreshed_owner = store.get(owner.id)
+    assert refreshed_owner is not None
+    next_action = evaluate_advance_rules(config, store, lifecycle_git, refreshed_owner, "main")
+    if newer_status == "failed":
+        assert next_action["type"] == "create_verify_fix"
+    else:
+        assert next_action["type"] == "verify_gate"
+        assert next_action["verify_gate_state"] == "unavailable"
+    assert next_action["type"] != "merge"
+
+
+def test_explicit_contributor_lifecycle_uses_canonical_merge_unit_verify_owner(
+    tmp_path: Path,
+) -> None:
+    store, config, owner, contributor = _setup_owner_green_contributor_non_green_merge_unit(
+        tmp_path,
+        "failed",
+    )
+    lifecycle_git = _build_merge_unit_lifecycle_git(owner)
+
+    action = evaluate_advance_rules(config, store, lifecycle_git, contributor, "main")
+
+    assert action["type"] == "reconcile_verify_gate_evidence"
+    assert action["verify_owner_task"].id == owner.id
+    assert action["verify_source_task"].id == contributor.id
+
+    context = _build_verify_gate_merge_unit_context(tmp_path=tmp_path, store=store, config=config, owner=owner)
+    result = execute_advance_action(task=contributor, action=action, context=context)
+
+    refreshed_owner = store.get(owner.id)
+    refreshed_contributor = store.get(contributor.id)
+    assert refreshed_owner is not None
+    assert refreshed_contributor is not None
+    assert result.status == "success"
+    assert refreshed_owner.review_verify_status == "failed"
+    assert refreshed_contributor.review_verify_status is None
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_owner,
+        current_epoch=owner_task_verify_epoch(refreshed_owner, config, context.git),
+    )
+    assert lookup.result is not None
+    assert lookup.result.source_task_id == contributor.id
+
+    next_action = evaluate_advance_rules(config, store, lifecycle_git, contributor, "main")
+    assert next_action["type"] == "create_verify_fix"
+    assert next_action["impl_task"].id == owner.id
+
+
+def test_verify_gate_preserves_newer_owner_red_over_older_merge_unit_contributor_green(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    owner = store.add("Implement owner", task_type="implement")
+    assert owner.id is not None
+    _mark_completed(owner, branch="feature/merge-unit-newer-owner-red")
+    store.update(owner)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    contributor = _add_completed_merge_unit_member(
+        store,
+        prompt="Contributor older green",
+        branch=owner.branch,
+        unit_id=unit.id,
+    )
+    captured_at = datetime(2026, 8, 18, 10, 0, tzinfo=UTC)
+    _persist_current_verify_gate_result(
+        store=store,
+        config=config,
+        task=contributor,
+        status="passed",
+        captured_at=captured_at,
+    )
+    _persist_current_verify_gate_result(
+        store=store,
+        config=config,
+        task=owner,
+        status="failed",
+        captured_at=captured_at + timedelta(minutes=1),
+    )
+
+    context = _build_verify_gate_merge_unit_context(tmp_path=tmp_path, store=store, config=config, owner=owner)
+
+    with patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")):
+        result = execute_advance_action(
+            task=owner,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before merge",
+                "verify_gate_phase": "pre_merge",
+                "verify_owner_task": owner,
+            },
+            context=context,
+        )
+
+    refreshed_owner = store.get(owner.id)
+    assert refreshed_owner is not None
+    assert result.status == "skip"
+    assert result.attention_reason == "verify-gate-blocked"
+    assert refreshed_owner.review_verify_status is None
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_owner,
+        current_epoch=owner_task_verify_epoch(refreshed_owner, config, context.git),
+    )
+    assert lookup.result is not None
+    assert lookup.result.status == "failed"
+    assert lookup.result.source_task_id == owner.id
+
+
+@pytest.mark.parametrize("newer_status", ["failed", "unavailable"])
+def test_verify_gate_recredits_newer_merge_unit_non_green_over_older_contributor_green(
+    tmp_path: Path,
+    newer_status: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    owner = store.add("Implement owner", task_type="implement")
+    assert owner.id is not None
+    _mark_completed(owner, branch=f"feature/merge-unit-newer-{newer_status}")
+    store.update(owner)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    green_contributor = _add_completed_merge_unit_member(
+        store,
+        prompt="Contributor older green",
+        branch=owner.branch,
+        unit_id=unit.id,
+    )
+    non_green_contributor = _add_completed_merge_unit_member(
+        store,
+        prompt="Contributor newer non-green",
+        branch=owner.branch,
+        unit_id=unit.id,
+    )
+    captured_at = datetime(2026, 8, 18, 10, 0, tzinfo=UTC)
+    _persist_current_verify_gate_result(
+        store=store,
+        config=config,
+        task=green_contributor,
+        status="passed",
+        captured_at=captured_at,
+    )
+    _persist_current_verify_gate_result(
+        store=store,
+        config=config,
+        task=non_green_contributor,
+        status=newer_status,
+        captured_at=captured_at + timedelta(minutes=1),
+    )
+
+    context = _build_verify_gate_merge_unit_context(tmp_path=tmp_path, store=store, config=config, owner=owner)
+
+    with patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")):
+        result = execute_advance_action(
+            task=owner,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before merge",
+                "verify_gate_phase": "pre_merge",
+                "verify_owner_task": owner,
+            },
+            context=context,
+        )
+
+    refreshed_owner = store.get(owner.id)
+    assert refreshed_owner is not None
+    assert result.status == "skip"
+    assert result.attention_reason == "verify-gate-blocked"
+    assert refreshed_owner.review_verify_status == newer_status
+    lookup = latest_verify_result_for_epoch(
+        store,
+        refreshed_owner,
+        current_epoch=owner_task_verify_epoch(refreshed_owner, config, context.git),
+    )
+    assert lookup.result is not None
+    assert lookup.result.status == newer_status
+    assert lookup.result.source_task_id == non_green_contributor.id
 
 
 def test_completed_no_source_timeout_verify_fix_rerun_persists_green_then_plans_merge(tmp_path: Path, monkeypatch) -> None:

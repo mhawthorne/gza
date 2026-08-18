@@ -598,6 +598,129 @@ def test_merge_single_task_runs_shared_verify_gate_before_merge(tmp_path: Path) 
     git.merge.assert_called_once_with("feature/gated-merge", squash=False, commit_message=None)
 
 
+@pytest.mark.parametrize(
+    "contributor_status,contributor_exit,expect_merged",
+    [("passed", "0", True), ("failed", "1", False)],
+)
+def test_merge_single_task_reconciles_contributor_verify_evidence_before_merge(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    contributor_status: str,
+    contributor_exit: str,
+    expect_merged: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    owner = store.add("Owner implementation", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = "feature/recredit-before-merge"
+    owner.has_commits = True
+    store.update(owner)
+    store.set_merge_status(owner.id, "unmerged")
+
+    contributor = store.add("Contributor implementation", task_type="implement")
+    assert contributor.id is not None
+    contributor.status = "completed"
+    contributor.completed_at = datetime.now(UTC)
+    contributor.branch = owner.branch
+    contributor.has_commits = True
+    store.update(contributor)
+
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+    store.attach_task_to_merge_unit(contributor.id, unit.id, "same_branch")
+
+    from gza.runner import _make_review_verify_result
+
+    for task, status, exit_status, captured_at in (
+        (owner, "failed", "1", datetime(2026, 8, 18, 10, 0, tzinfo=UTC)),
+        (contributor, contributor_status, contributor_exit, datetime(2026, 8, 18, 10, 5, tzinfo=UTC)),
+    ):
+        persist_verify_gate_artifact(
+            store,
+            config,
+            owner_task=task,
+            source_task=task,
+            result=_make_review_verify_result(
+                "./bin/tests",
+                status=status,
+                exit_status=exit_status,
+                captured_at=captured_at,
+                reviewed_branch=owner.branch,
+                reviewed_head_sha="same-head",
+                reviewed_base_sha="base-head",
+                working_directory=str(tmp_path),
+                failure=None if status == "passed" else "verify failed",
+            ),
+            verify_timeout_seconds=120,
+            verify_timeout_grace_seconds=5.0,
+            producer="test",
+        )
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        get_diff_name_status=MagicMock(return_value=""),
+        rev_parse_if_exists=MagicMock(
+            side_effect=lambda ref: "same-head"
+            if ref == owner.branch
+            else "base-head"
+            if ref in {"main", "origin/main"}
+            else None
+        ),
+        count_commits_behind_checked=MagicMock(return_value=0),
+        count_commits_ahead_checked=MagicMock(return_value=1),
+        resolve_fresh_merge_source=MagicMock(side_effect=lambda branch: branch),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+        force=False,
+        no_followups=True,
+    )
+
+    with patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")):
+        result = _merge_single_task(owner.id, config, store, git, args, "main")
+
+    output = capsys.readouterr().out
+    refreshed_owner = store.get(owner.id)
+    refreshed_unit = store.resolve_merge_unit_for_task(owner.id)
+    assert refreshed_owner is not None
+    assert refreshed_unit is not None
+    assert refreshed_owner.review_verify_status == contributor_status
+    assert f"Recredited current merge-unit verify gate evidence ({contributor_status})" in output
+    if expect_merged:
+        assert result.rc == 0
+        git.merge.assert_called_once()
+        assert refreshed_unit.state == "merged"
+    else:
+        assert result.rc == 1
+        git.merge.assert_not_called()
+        assert "verify_fix" in output
+
+
 def test_merge_single_task_default_keeps_merge_mechanics_output(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)

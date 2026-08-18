@@ -57,6 +57,7 @@ from gza.project_discovery import (
 from gza.query import (
     get_code_changing_descendants_for_root,
     get_implementation_review_evidence,
+    resolve_lineage_owner_task,
     resolve_lineage_root,
     resolve_same_branch_lineage_root,
 )
@@ -112,7 +113,13 @@ from gza.review_verdict import (
     is_verify_timeout_only_review,
     summarize_review_blockers,
 )
-from gza.review_verify_state import VerifyGateDecision, resolve_verify_gate_decision, verify_result_is_timeout_origin
+from gza.review_verify_state import (
+    MergeUnitVerifyEvidenceSelection,
+    VerifyGateDecision,
+    resolve_verify_gate_decision,
+    select_current_merge_unit_verify_evidence,
+    verify_result_is_timeout_origin,
+)
 from gza.runner import (
     PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
     REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
@@ -4683,7 +4690,7 @@ def has_current_passing_verify_for_merge(ctx: AdvanceContext) -> bool:
 def _verify_gate_owner_task(ctx: AdvanceContext) -> DbTask | None:
     if not _is_implementation_owned_lineage(ctx):
         return None
-    return getattr(ctx, "review_root_task", None) or ctx.task
+    return resolve_lineage_owner_task(ctx.store, getattr(ctx, "review_root_task", None) or ctx.task)
 
 
 @dataclass(frozen=True)
@@ -4702,6 +4709,13 @@ class LegacyVerifyFixProofUnavailable:
 
 
 def _verify_gate_blocks_closing_review(ctx: AdvanceContext) -> bool:
+    if not _verify_gate_in_closing_review_scope(ctx):
+        return False
+    decision = getattr(ctx, "verify_gate_decision", None)
+    return decision is not None and decision.state != "passed"
+
+
+def _verify_gate_in_closing_review_scope(ctx: AdvanceContext) -> bool:
     if not _is_implementation_owned_lineage(ctx):
         return False
     if not ctx.requires_review:
@@ -4713,10 +4727,7 @@ def _verify_gate_blocks_closing_review(ctx: AdvanceContext) -> bool:
         return False
     if action.get("type") not in {"create_review", "run_review"}:
         return False
-    if action.get("type") == "create_review" and not ctx.create_reviews:
-        return False
-    decision = getattr(ctx, "verify_gate_decision", None)
-    return decision is not None and decision.state != "passed"
+    return not (action.get("type") == "create_review" and not ctx.create_reviews)
 
 
 def _pre_review_verify_fix_required(ctx: AdvanceContext) -> bool:
@@ -4724,6 +4735,59 @@ def _pre_review_verify_fix_required(ctx: AdvanceContext) -> bool:
         return False
     decision = getattr(ctx, "verify_gate_decision", None)
     return decision is not None and decision.state in {"failed", "unavailable"}
+
+
+def _merge_unit_verify_evidence_reconciliation_candidate(
+    ctx: AdvanceContext,
+) -> MergeUnitVerifyEvidenceSelection | None:
+    owner_task = _verify_gate_owner_task(ctx)
+    decision = getattr(ctx, "verify_gate_decision", None)
+    current_epoch = getattr(decision, "current_epoch", None)
+    if owner_task is None or owner_task.id is None or decision is None or current_epoch is None:
+        return None
+    selection = select_current_merge_unit_verify_evidence(
+        ctx.store,
+        owner_task,
+        current_epoch=current_epoch,
+    )
+    if selection is None or selection.source_task.id == owner_task.id:
+        return None
+    return selection
+
+
+def _pre_review_verify_evidence_reconciliation_required(ctx: AdvanceContext) -> bool:
+    return (
+        _verify_gate_in_closing_review_scope(ctx)
+        and _merge_unit_verify_evidence_reconciliation_candidate(ctx) is not None
+    )
+
+
+def _pre_merge_verify_evidence_reconciliation_required(ctx: AdvanceContext) -> bool:
+    return _verify_gate_in_merge_scope(ctx) and _merge_unit_verify_evidence_reconciliation_candidate(ctx) is not None
+
+
+def _reconcile_verify_gate_evidence_action(ctx: AdvanceContext) -> dict[str, Any]:
+    selection = _merge_unit_verify_evidence_reconciliation_candidate(ctx)
+    decision = getattr(ctx, "verify_gate_decision", None)
+    if selection is None or decision is None:
+        return {
+            "type": "skip",
+            "description": "SKIP: merge-unit verify evidence reconciliation is unavailable",
+        }
+    owner_id = _task_id(selection.owner_task)
+    source_id = _task_id(selection.source_task)
+    result = selection.lookup.result
+    status = getattr(result, "status", "unknown")
+    return {
+        "type": "reconcile_verify_gate_evidence",
+        "description": (
+            f"Recredit newer current merge-unit verify evidence ({status}) "
+            f"from {source_id} to canonical owner {owner_id}"
+        ),
+        "verify_owner_task": selection.owner_task,
+        "verify_source_task": selection.source_task,
+        "verify_epoch": decision.current_epoch,
+    }
 
 
 def _prove_legacy_verify_fix_completion_repair(
@@ -5023,14 +5087,18 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext) -> dict[str, Any]:
 
 
 def _verify_gate_blocks_merge(ctx: AdvanceContext) -> bool:
-    if not _is_implementation_owned_lineage(ctx):
-        return False
-    if not execution_status_allows_merge(ctx):
-        return False
-    if not has_valid_review_for_merge(ctx):
+    if not _verify_gate_in_merge_scope(ctx):
         return False
     decision = getattr(ctx, "verify_gate_decision", None)
     return decision is not None and decision.state != "passed"
+
+
+def _verify_gate_in_merge_scope(ctx: AdvanceContext) -> bool:
+    return (
+        _is_implementation_owned_lineage(ctx)
+        and execution_status_allows_merge(ctx)
+        and has_valid_review_for_merge(ctx)
+    )
 
 
 def _verify_gate_action(ctx: AdvanceContext, *, phase: str, explicit_refresh: bool = False) -> dict[str, Any]:
@@ -6865,6 +6933,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
         action=_merge_source_unavailable_manual_resolution_action,
     ),
     AdvanceRule(
+        name="pre_review_reconcile_verify_gate_evidence",
+        matches=_pre_review_verify_evidence_reconciliation_required,
+        action=_reconcile_verify_gate_evidence_action,
+    ),
+    AdvanceRule(
         name="pre_review_verify_fix",
         matches=_pre_review_verify_fix_required,
         action=_pre_review_verify_fix_action,
@@ -7027,6 +7100,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
             ),
             "review_task": ctx.latest_completed_review,
         },
+    ),
+    AdvanceRule(
+        name="pre_merge_reconcile_verify_gate_evidence",
+        matches=_pre_merge_verify_evidence_reconciliation_required,
+        action=_reconcile_verify_gate_evidence_action,
     ),
     AdvanceRule(
         name="pre_merge_verify_gate",

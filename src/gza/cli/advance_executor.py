@@ -33,6 +33,7 @@ from ..db import DuplicateActiveChildError, SqliteTaskStore, Task as DbTask
 from ..flaky_investigations import create_or_reuse_flaky_investigations
 from ..git import Git, GitError
 from ..plan_review_verdict import PlanReviewManifest
+from ..query import resolve_lineage_owner_task
 from ..recovery_engine import FailedRecoveryDecision, get_failed_recovery_needs_attention_reason
 from ..review_tasks import (
     DuplicateReviewError,
@@ -44,7 +45,14 @@ from ..review_tasks import (
     create_spec_coherence_review_task,
     persist_review_clearance_artifact,
 )
-from ..review_verify_state import VerifyEpoch, VerifyGateDecision, owner_task_verify_epoch, resolve_verify_gate_decision
+from ..review_verify_state import (
+    VerifyEpoch,
+    VerifyGateDecision,
+    owner_task_verify_epoch,
+    persist_recredited_verify_gate_artifact,
+    resolve_verify_gate_decision,
+    select_current_merge_unit_verify_evidence,
+)
 from ..runner import (
     LifecycleVerifyExecution,
     ProjectReviewVerifyResult,
@@ -222,7 +230,12 @@ _WORKER_ACTIONS = frozenset(
 )
 
 _DIRECT_ACTIONS = frozenset(
-    {"release_approved_plan_review", "repair_plan_slice_materialization", "rerun_completed_verify_fix"}
+    {
+        "release_approved_plan_review",
+        "repair_plan_slice_materialization",
+        "reconcile_verify_gate_evidence",
+        "rerun_completed_verify_fix",
+    }
 )
 
 
@@ -594,55 +607,52 @@ def _release_reserved_launch_if_left(task: DbTask | None) -> None:
         release_task_launch_permit(str(task.id))
 
 
-def _verify_gate_branch_hint(store: SqliteTaskStore, task: DbTask | None) -> str | None:
-    if task is None:
-        return None
-    if task.branch:
-        return task.branch
-    if task.task_type == "review":
-        for related_id in (task.depends_on, task.based_on):
-            if not related_id:
-                continue
-            related = store.get(related_id)
-            if related is not None and related.branch:
-                return related.branch
-    return None
-
-
 def _resolve_canonical_verify_gate_owner(store: SqliteTaskStore, task: DbTask) -> DbTask:
-    owner_task = task
-    current_owner: DbTask | None = task
-    visited_owner_ids: set[str] = set()
-    while current_owner is not None and current_owner.id is not None and current_owner.id not in visited_owner_ids:
-        visited_owner_ids.add(current_owner.id)
-        if current_owner.task_type == "implement":
-            owner_task = current_owner
-        if not current_owner.based_on:
-            break
-        parent = store.get(current_owner.based_on)
-        if current_owner.task_type == "implement" and parent is not None and parent.task_type == "review":
-            break
-        if (
-            current_owner.task_type == "implement"
-            and current_owner.branch
-            and _verify_gate_branch_hint(store, parent) != current_owner.branch
-        ):
-            break
-        current_owner = parent
-    return owner_task
+    return resolve_lineage_owner_task(store, task)
 
 
 def _resolve_verify_gate_subject_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
-    current_task: DbTask | None = task
-    visited_task_ids: set[str] = set()
-    while current_task is not None and current_task.id is not None and current_task.id not in visited_task_ids:
-        visited_task_ids.add(current_task.id)
-        if current_task.task_type == "implement" and current_task.branch:
-            return current_task
-        if not current_task.based_on:
-            break
-        current_task = store.get(current_task.based_on)
     return _resolve_canonical_verify_gate_owner(store, task)
+
+
+def _resolve_verify_gate_action_owner(
+    *,
+    context: AdvanceActionExecutionContext,
+    task: DbTask,
+    action: dict[str, Any],
+    action_type: str,
+    purpose: str,
+) -> tuple[DbTask, DbTask] | AdvanceActionExecutionResult:
+    """Resolve task/action verify ownership and fail closed on stale action owners."""
+    action_owner_task = action.get("verify_owner_task")
+    prepared_owner_task = action_owner_task if isinstance(action_owner_task, DbTask) else task
+    resolved_action_owner = _resolve_canonical_verify_gate_owner(context.store, prepared_owner_task)
+    canonical_owner_task = _resolve_canonical_verify_gate_owner(context.store, task)
+
+    if canonical_owner_task.id is None:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=f"missing verify gate {purpose} owner",
+        )
+    if resolved_action_owner.id is None:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=f"missing verify gate {purpose} inputs",
+        )
+    if resolved_action_owner.id != canonical_owner_task.id:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message=(
+                f"SKIP: verify gate {purpose} owner mismatch; "
+                f"task {task.id} resolves to {canonical_owner_task.id} but action owner "
+                f"{prepared_owner_task.id} resolves to {resolved_action_owner.id}."
+            ),
+            handled_task_id=canonical_owner_task.id,
+        )
+    return canonical_owner_task, prepared_owner_task
 
 
 def _passed_verify_gate_matches_subject(
@@ -659,6 +669,188 @@ def _passed_verify_gate_matches_subject(
         and result.reviewed_head_sha == subject_epoch.reviewed_head_sha
         and current_epoch.reviewed_branch == subject_epoch.reviewed_branch
         and current_epoch.reviewed_head_sha == subject_epoch.reviewed_head_sha
+    )
+
+
+def _reconcile_current_merge_unit_verify_gate_evidence(
+    *,
+    context: AdvanceActionExecutionContext,
+    owner_task: DbTask,
+    current_epoch: VerifyEpoch,
+) -> VerifyGateDecision | None:
+    if owner_task.id is None or context.config is None:
+        return None
+    selection = select_current_merge_unit_verify_evidence(
+        context.store,
+        owner_task,
+        current_epoch=current_epoch,
+    )
+    if selection is None or selection.lookup.result is None:
+        return None
+
+    source_task = selection.source_task
+    result = selection.lookup.result
+    if source_task.id == owner_task.id:
+        return None
+    _credit_verify_gate_result_to_owner(
+        context=context,
+        owner_task=owner_task,
+        source_task=source_task,
+        result=result,
+        source_metadata=selection.lookup.artifact_metadata,
+        producer="advance_verify_gate_recredit",
+    )
+    return resolve_verify_gate_decision(
+        context.store,
+        owner_task,
+        config=context.config,
+        git=context.git,
+    )
+
+
+def _credit_verify_gate_result_to_owner(
+    *,
+    context: AdvanceActionExecutionContext,
+    owner_task: DbTask,
+    source_task: DbTask,
+    result: Any,
+    source_metadata: dict[str, Any] | None,
+    producer: str,
+) -> None:
+    if owner_task.id is None or context.config is None:
+        return
+    persist_recredited_verify_gate_artifact(
+        context.store,
+        context.config,
+        owner_task=owner_task,
+        evidence_holder_task=source_task,
+        result=result,
+        source_metadata=source_metadata,
+        producer=producer,
+    )
+    owner_task.review_verify_command = result.command
+    owner_task.review_verify_status = result.status
+    owner_task.review_verify_exit_status = result.exit_status
+    owner_task.review_verify_failure = result.failure
+    owner_task.review_verify_captured_at = result.captured_at
+    owner_task.review_verify_head_sha = result.reviewed_head_sha
+    owner_task.review_verify_base_sha = result.reviewed_base_sha
+    owner_task.review_verify_branch = result.reviewed_branch
+    owner_task.review_verify_markdown = None
+    owner_task.review_verify_cwd = result.working_directory
+    owner_task.review_verify_artifact_file = result.output_artifact_path
+    context.store.update(owner_task)
+
+
+def _execute_reconcile_verify_gate_evidence(
+    *,
+    task: DbTask,
+    action_type: str,
+    action: dict[str, Any],
+    context: AdvanceActionExecutionContext,
+) -> AdvanceActionExecutionResult:
+    owner_resolution = _resolve_verify_gate_action_owner(
+        context=context,
+        task=task,
+        action=action,
+        action_type=action_type,
+        purpose="reconciliation",
+    )
+    if isinstance(owner_resolution, AdvanceActionExecutionResult):
+        return owner_resolution
+    owner_task, _prepared_owner_task = owner_resolution
+    if owner_task.id is None or context.config is None or context.git is None:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message="missing verify gate reconciliation inputs",
+        )
+
+    decision = resolve_verify_gate_decision(
+        context.store,
+        owner_task,
+        config=context.config,
+        git=context.git,
+    )
+    current_epoch = decision.current_epoch
+    selection = select_current_merge_unit_verify_evidence(
+        context.store,
+        owner_task,
+        current_epoch=current_epoch,
+    )
+    if current_epoch is None or selection is None or selection.lookup.result is None:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="skip",
+            message="SKIP: no current merge-unit verify evidence is available to reconcile.",
+            handled_task_id=owner_task.id,
+        )
+    if selection.source_task.id == owner_task.id:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="success",
+            success_message="Verify gate evidence is already credited to the canonical owner.",
+            handled_task_id=owner_task.id,
+        )
+    if context.dry_run:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="dry_run",
+            message=action.get("description", "Recredit merge-unit verify gate evidence"),
+            work_done=True,
+            handled_task_id=owner_task.id,
+        )
+
+    _credit_verify_gate_result_to_owner(
+        context=context,
+        owner_task=owner_task,
+        source_task=selection.source_task,
+        result=selection.lookup.result,
+        source_metadata=selection.lookup.artifact_metadata,
+        producer="advance_verify_gate_recredit",
+    )
+    status = selection.lookup.result.status
+    return AdvanceActionExecutionResult(
+        action_type=action_type,
+        status="success",
+        success_message=(
+            f"Recredited current merge-unit verify gate evidence ({status}) "
+            f"from {selection.source_task.id} to canonical owner {owner_task.id}; "
+            "advance can continue to the next lifecycle action."
+        ),
+        work_done=True,
+        handled_task_id=owner_task.id,
+    )
+
+
+def _maybe_credit_no_merge_unit_prepared_owner(
+    *,
+    context: AdvanceActionExecutionContext,
+    prepared_owner_task: DbTask,
+    canonical_owner_task: DbTask,
+    decision: VerifyGateDecision,
+) -> None:
+    result = decision.lookup.result
+    current_epoch = decision.current_epoch
+    prepared_canonical_owner = _resolve_canonical_verify_gate_owner(context.store, prepared_owner_task)
+    if (
+        result is None
+        or current_epoch is None
+        or getattr(result, "status", None) != "passed"
+        or prepared_owner_task.id is None
+        or canonical_owner_task.id is None
+        or prepared_canonical_owner.id != canonical_owner_task.id
+        or prepared_owner_task.id == canonical_owner_task.id
+        or context.store.resolve_merge_unit_for_task(canonical_owner_task.id) is not None
+    ):
+        return
+    _credit_verify_gate_result_to_owner(
+        context=context,
+        owner_task=prepared_owner_task,
+        source_task=canonical_owner_task,
+        result=result,
+        source_metadata=decision.lookup.artifact_metadata,
+        producer="advance_verify_gate_prepared_owner_compat",
     )
 
 
@@ -955,32 +1147,22 @@ def _execute_verify_gate(
     action: dict[str, Any],
     context: AdvanceActionExecutionContext,
 ) -> AdvanceActionExecutionResult:
-    owner_task = action.get("verify_owner_task")
-    if not isinstance(owner_task, DbTask):
-        owner_task = task
-    owner_task = _resolve_canonical_verify_gate_owner(context.store, owner_task)
-    expected_owner_task = _resolve_canonical_verify_gate_owner(context.store, task)
-    subject_task = _resolve_verify_gate_subject_task(context.store, task)
+    owner_resolution = _resolve_verify_gate_action_owner(
+        context=context,
+        task=task,
+        action=action,
+        action_type=action_type,
+        purpose="execution",
+    )
+    if isinstance(owner_resolution, AdvanceActionExecutionResult):
+        return owner_resolution
+    owner_task, prepared_owner_task = owner_resolution
+    subject_task = _resolve_verify_gate_subject_task(context.store, owner_task)
     if owner_task.id is None or context.config is None or context.git is None:
         return AdvanceActionExecutionResult(
             action_type=action_type,
             status="skip",
             message="missing verify gate inputs",
-        )
-    if expected_owner_task.id is None or owner_task.id != expected_owner_task.id:
-        task_label = task.id or "<unknown>"
-        expected_label = expected_owner_task.id or "<unknown>"
-        return AdvanceActionExecutionResult(
-            action_type=action_type,
-            status="skip",
-            message=(
-                "SKIP: verify gate owner "
-                f"{owner_task.id} is not the canonical verify owner {expected_label} "
-                f"for implementation {task_label}."
-            ),
-            attention_type="needs_discussion",
-            attention_reason="verify-gate-blocked",
-            handled_task_id=expected_owner_task.id,
         )
     if context.dry_run:
         return AdvanceActionExecutionResult(
@@ -1005,7 +1187,25 @@ def _execute_verify_gate(
         decision=decision,
         subject_epoch=subject_epoch,
     )
+    if decision.current_epoch is not None:
+        reconciled_decision = _reconcile_current_merge_unit_verify_gate_evidence(
+            context=context,
+            owner_task=owner_task,
+            current_epoch=decision.current_epoch,
+        )
+        if reconciled_decision is not None:
+            decision = reconciled_decision
+            passed_decision_matches_subject = _passed_verify_gate_matches_subject(
+                decision=decision,
+                subject_epoch=subject_epoch,
+            )
     if decision.state == "passed" and not explicit_refresh and passed_decision_matches_subject:
+        _maybe_credit_no_merge_unit_prepared_owner(
+            context=context,
+            prepared_owner_task=prepared_owner_task,
+            canonical_owner_task=owner_task,
+            decision=decision,
+        )
         return AdvanceActionExecutionResult(
             action_type=action_type,
             status="success",
@@ -1066,7 +1266,7 @@ def _execute_verify_gate(
         reviewed_base_sha = _resolve_review_verify_base_sha(worktree_git, worktree_git.default_branch())
         execution = _run_lifecycle_verify(
             config=context.config,
-            task=task,
+            task=subject_task,
             worktree_git=worktree_git,
             worktree_path=worktree_git.repo_dir,
             cwd=provider_cwd,
@@ -1127,13 +1327,20 @@ def _execute_verify_gate(
             git=context.git,
         )
         if refreshed_decision.state == "passed":
+            refreshed_owner_task = context.store.get(owner_task.id) if owner_task.id is not None else None
+            _maybe_credit_no_merge_unit_prepared_owner(
+                context=context,
+                prepared_owner_task=prepared_owner_task,
+                canonical_owner_task=owner_task,
+                decision=refreshed_decision,
+            )
             return AdvanceActionExecutionResult(
                 action_type=action_type,
                 status="success",
                 success_message=f"Verify gate passed for the current tip before {phase_label}.",
                 work_done=True,
                 handled_task_id=owner_task.id,
-                created_task=context.store.get(owner_task.id) or owner_task,
+                created_task=refreshed_owner_task or owner_task,
             )
         return AdvanceActionExecutionResult(
             action_type=action_type,
@@ -1963,6 +2170,14 @@ def execute_advance_action(
 
     if action_type == "verify_gate":
         return _execute_verify_gate(
+            task=task,
+            action_type=action_type,
+            action=action,
+            context=context,
+        )
+
+    if action_type == "reconcile_verify_gate_evidence":
+        return _execute_reconcile_verify_gate_evidence(
             task=task,
             action_type=action_type,
             action=action,

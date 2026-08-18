@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -62,6 +63,7 @@ class VerifyGateLookup:
     source: Literal["owner_artifact", "legacy_review"] | None
     is_current: bool
     has_owner_artifact: bool
+    artifact_metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,15 @@ class VerifyGateDecision:
     current_epoch: VerifyEpoch | None
     lookup: VerifyGateLookup
     state: Literal["passed", "missing", "stale", "failed", "unavailable"]
+
+
+@dataclass(frozen=True)
+class MergeUnitVerifyEvidenceSelection:
+    """Newest current verify evidence selected across one merge unit."""
+
+    owner_task: Task
+    source_task: Task
+    lookup: VerifyGateLookup
 
 
 def verify_result_is_timeout_origin(result: VerifyGateResult | None) -> bool:
@@ -301,6 +312,7 @@ def latest_verify_result_for_epoch(
                     source="owner_artifact",
                     is_current=True,
                     has_owner_artifact=True,
+                    artifact_metadata=metadata,
                 )
         return VerifyGateLookup(
             result=latest_result,
@@ -447,6 +459,40 @@ def resolve_verify_gate_decision(
     )
 
 
+def select_current_merge_unit_verify_evidence(
+    store: SqliteTaskStore,
+    owner_task: Task,
+    *,
+    current_epoch: VerifyEpoch | None,
+) -> MergeUnitVerifyEvidenceSelection | None:
+    """Return the newest current same-epoch verify evidence across a merge unit."""
+    if owner_task.id is None or current_epoch is None:
+        return None
+    unit = store.resolve_merge_unit_for_task(owner_task.id)
+    if unit is None:
+        return None
+
+    candidates: list[tuple[datetime, Task, VerifyGateLookup]] = []
+    owner_lookup = latest_verify_result_for_epoch(store, owner_task, current_epoch=current_epoch)
+    if owner_lookup.is_current and owner_lookup.result is not None:
+        candidates.append((owner_lookup.result.captured_at, owner_task, owner_lookup))
+    for member in store.list_tasks_for_merge_unit(unit.id):
+        if member.id is None or member.id == owner_task.id:
+            continue
+        lookup = latest_verify_result_for_epoch(store, member, current_epoch=current_epoch)
+        if lookup.is_current and lookup.result is not None:
+            candidates.append((lookup.result.captured_at, member, lookup))
+    if not candidates:
+        return None
+
+    _captured_at, source_task, lookup = max(candidates, key=lambda candidate: candidate[0])
+    return MergeUnitVerifyEvidenceSelection(
+        owner_task=owner_task,
+        source_task=source_task,
+        lookup=lookup,
+    )
+
+
 def task_has_current_passing_verify_evidence(
     store: SqliteTaskStore,
     owner_task: Task,
@@ -586,6 +632,95 @@ def persist_verify_gate_artifact(
         created_at=getattr(result, "captured_at"),
         content_type="application/json",
     )
+
+
+def persist_recredited_verify_gate_artifact(
+    store: SqliteTaskStore,
+    config: Config,
+    *,
+    owner_task: Task,
+    evidence_holder_task: Task,
+    result: VerifyGateResult,
+    source_metadata: dict[str, Any] | None,
+    producer: str,
+) -> None:
+    """Copy selected verify evidence to a new owner without rewriting run provenance."""
+    if owner_task.id is None:
+        return
+    payload = deepcopy(source_metadata) if source_metadata is not None else None
+    fallback_reason: str | None = None
+    if not isinstance(payload, dict) or payload.get("schema_version") != VERIFY_GATE_ARTIFACT_SCHEMA_VERSION:
+        source_task, fallback_reason = _resolve_recredited_source_task(
+            store,
+            result=result,
+            payload_source_task_id=None,
+            evidence_holder_task=evidence_holder_task,
+        )
+        payload = build_verify_gate_artifact_payload(
+            result=result,
+            source_task=source_task,
+            verify_timeout_seconds=None,
+            verify_timeout_grace_seconds=None,
+            output_artifact_id=result.output_artifact_id,
+            output_artifact_task_id=result.output_artifact_task_id,
+            output_artifact_path=result.output_artifact_path,
+        )
+    else:
+        source_task, fallback_reason = _resolve_recredited_source_task(
+            store,
+            result=result,
+            payload_source_task_id=_coerce_optional_str(payload.get("source_task_id")),
+            evidence_holder_task=evidence_holder_task,
+        )
+        payload["source_task_id"] = source_task.id
+        payload["source_task_type"] = source_task.task_type
+
+    reconciliation = {
+        "producer": producer,
+        "credited_owner_task_id": owner_task.id,
+        "evidence_holder_task_id": evidence_holder_task.id,
+        "evidence_holder_task_type": evidence_holder_task.task_type,
+    }
+    if fallback_reason is not None:
+        reconciliation["source_provenance_fallback_reason"] = fallback_reason
+    payload["reconciliation"] = reconciliation
+
+    store_command_output_artifact(
+        store,
+        owner_task,
+        config,
+        kind=VERIFY_GATE_ARTIFACT_KIND,
+        producer=producer,
+        label=VERIFY_GATE_ARTIFACT_LABEL,
+        output=json.dumps(payload, sort_keys=True, indent=2) + "\n",
+        command=result.command,
+        status=result.status,
+        exit_status=result.exit_status,
+        head_sha=result.reviewed_head_sha,
+        metadata=payload,
+        created_at=result.captured_at,
+        content_type="application/json",
+    )
+
+
+def _resolve_recredited_source_task(
+    store: SqliteTaskStore,
+    *,
+    result: VerifyGateResult,
+    payload_source_task_id: str | None,
+    evidence_holder_task: Task,
+) -> tuple[Task, str | None]:
+    """Resolve original source provenance for a recredited verify artifact."""
+    for source_task_id in (payload_source_task_id, result.source_task_id):
+        if source_task_id is None:
+            continue
+        source_task = store.get(source_task_id)
+        if source_task is not None:
+            return source_task, None
+
+    if payload_source_task_id is not None or result.source_task_id is not None:
+        return evidence_holder_task, "unresolvable_source_provenance"
+    return evidence_holder_task, "missing_source_provenance"
 
 
 def build_verify_gate_artifact_payload(

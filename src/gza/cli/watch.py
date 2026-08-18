@@ -8052,15 +8052,17 @@ def _run_cycle(
                     action=action,
                 ):
                     continue
-                no_progress_attention = _maybe_park_watch_no_progress(
-                    config=config,
-                    store=store,
-                    subject_task=display_task,
-                    action=action,
-                    action_task=task,
-                    failed_task=None,
-                    no_progress_cycles=config.watch.no_progress_cycles,
-                )
+                no_progress_attention = None
+                if action_type != "reconcile_verify_gate_evidence":
+                    no_progress_attention = _maybe_park_watch_no_progress(
+                        config=config,
+                        store=store,
+                        subject_task=display_task,
+                        action=action,
+                        action_task=task,
+                        failed_task=None,
+                        no_progress_cycles=config.watch.no_progress_cycles,
+                    )
                 if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
                     _maybe_emit_active_watch_recovery_backoff(
                         store=store,

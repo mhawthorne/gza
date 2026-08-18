@@ -1580,6 +1580,7 @@ def _merge_single_task(
         print(f"✓ Marked task {merge_subject.id} as merged (branch '{merge_branch}' preserved)")
         return _MergeSingleTaskResult(rc=0)
 
+    direct_prerequisite_types = {"verify_gate", "reconcile_verify_gate_evidence"}
     planned_action = determine_next_action(
         config,
         store,
@@ -1588,8 +1589,10 @@ def _merge_single_task(
         target_branch,
         selected_for_merge=True,
     )
-    if planned_action.get("type") == "verify_gate":
-        verify_context = AdvanceActionExecutionContext(
+    for _prerequisite_attempt in range(len(direct_prerequisite_types) + 1):
+        if planned_action.get("type") not in direct_prerequisite_types:
+            break
+        prerequisite_context = AdvanceActionExecutionContext(
             store=store,
             trigger_source="manual",
             dry_run=False,
@@ -1607,15 +1610,15 @@ def _merge_single_task(
             config=config,
             git=git,
         )
-        verify_result = execute_advance_action(
+        prerequisite_result = execute_advance_action(
             task=execution_task,
             action=planned_action,
-            context=verify_context,
+            context=prerequisite_context,
         )
-        message = verify_result.success_message or verify_result.message or planned_action.get("description", "")
+        message = prerequisite_result.success_message or prerequisite_result.message or planned_action.get("description", "")
         if message:
             print(message)
-        if verify_result.status != "success":
+        if prerequisite_result.status != "success":
             return _MergeSingleTaskResult(rc=1)
         planned_action = determine_next_action(
             config,
@@ -1625,6 +1628,9 @@ def _merge_single_task(
             target_branch,
             selected_for_merge=True,
         )
+    else:
+        print("Error: merge prerequisite loop did not converge")
+        return _MergeSingleTaskResult(rc=1)
     effective_merge_source = merge_source
     if planned_action.get("type") not in {"merge", "merge_with_followups"}:
         if getattr(args, "force", False) and classify_advance_action(planned_action) == "needs_attention":

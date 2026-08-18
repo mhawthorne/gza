@@ -387,6 +387,17 @@ epoch.
   not verify freshness identity; changing only `verify_command`,
   `autonomous_verify_timeout_seconds`, or `review_verify_timeout_grace_seconds` MUST NOT
   be the supported way to clear or stale a verify gate.
+- When the newest current same-head verify evidence in a merge unit is credited to a
+  contributor instead of the canonical owner, writable lifecycle execution MUST recredit
+  that evidence to the canonical owner by copying the selected artifact's original
+  source task, verify epoch run settings, structured provenance, and aggregate details,
+  and MUST record the reconciliation itself as separate metadata. It MUST then
+  reevaluate before routing red, missing, or unavailable owner evidence to verify-gate
+  reruns, `verify_fix`, or park states. Legacy evidence without resolvable source
+  provenance MAY use an explicit safe fallback source, but valid source provenance MUST
+  NOT be rewritten to the artifact-holder row. Any no-merge-unit compatibility copy that
+  attaches canonical owner evidence to a prepared holder row MUST use the same
+  provenance-preserving copy semantics.
 - If one same-epoch `verify_fix` attempt already completed and the latest current verify
   gate remains red for that epoch, lifecycle MUST park with reason `verify-fix-failed`
   instead of spawning another `verify_fix`. Deterministic test failures and unknown

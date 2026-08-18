@@ -81,6 +81,7 @@ from ..prompts import PromptBuilder
 from ..query import (
     get_base_task_slug as _get_base_task_slug,
     get_code_changing_descendants_for_root,
+    resolve_lineage_owner_task,
 )
 from ..recovery_engine import (
     FailedRecoveryDecision,
@@ -104,7 +105,6 @@ from ..review_verify_state import (
     VerifyEpoch,
     owner_task_verify_epoch,
     resolve_verify_gate_decision,
-    resolve_verify_owner_task,
 )
 from ..runner import (
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
@@ -4087,18 +4087,8 @@ def _determine_selected_iterate_action(
 
 
 def _resolve_verify_fix_failed_owner_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
-    """Return the implementation root whose verify-fix-failed park owns the gate."""
-    owner = resolve_verify_owner_task(store, task)
-    current: DbTask | None = owner
-    visited: set[str] = set()
-    while current is not None and current.id is not None and current.id not in visited:
-        visited.add(current.id)
-        if current.task_type == "implement":
-            owner = current
-        if not current.based_on:
-            break
-        current = store.get(current.based_on)
-    return owner
+    """Return the canonical implementation whose verify-fix-failed park owns the gate."""
+    return resolve_lineage_owner_task(store, task)
 
 
 def _force_verify_fix_failed_action(
@@ -4941,6 +4931,8 @@ def _cmd_iterate_impl(
             return None
 
         if action_type == "verify_gate" and initial_action.get("verify_gate_explicit_refresh") is True:
+            return None
+        if action_type == "reconcile_verify_gate_evidence":
             return None
 
         if action_type == "merge_with_followups":
@@ -6342,7 +6334,7 @@ def _cmd_iterate_impl(
                 _append_summary_row(summary_rows, iteration_index=iteration, task_type="verify_fix", task=None, status="in_progress")
             break
 
-        if action_type == "verify_gate":
+        if action_type in {"verify_gate", "reconcile_verify_gate_evidence"}:
             exec_result = execute_advance_action(
                 task=impl_task,
                 action=action,
@@ -6355,25 +6347,25 @@ def _cmd_iterate_impl(
                     use_iterate_for_needs_rebase=False,
                     prepare_task_for_background_start=lambda task, _rollback: task,
                     prepare_create_review=lambda _task: (_ for _ in ()).throw(
-                        AssertionError("prepare_create_review should not run for verify_gate")
+                        AssertionError(f"prepare_create_review should not run for {action_type}")
                     ),
                     create_resume_task=lambda _task: (_ for _ in ()).throw(
-                        AssertionError("create_resume_task should not run for verify_gate")
+                        AssertionError(f"create_resume_task should not run for {action_type}")
                     ),
                     create_rebase_task=lambda _task: (_ for _ in ()).throw(
-                        AssertionError("create_rebase_task should not run for verify_gate")
+                        AssertionError(f"create_rebase_task should not run for {action_type}")
                     ),
                     create_implement_task=lambda _task: (_ for _ in ()).throw(
-                        AssertionError("create_implement_task should not run for verify_gate")
+                        AssertionError(f"create_implement_task should not run for {action_type}")
                     ),
                     spawn_worker=lambda _task, _kind: (_ for _ in ()).throw(
-                        AssertionError("spawn_worker should not run for verify_gate")
+                        AssertionError(f"spawn_worker should not run for {action_type}")
                     ),
                     spawn_resume_worker=lambda _task, _kind: (_ for _ in ()).throw(
-                        AssertionError("spawn_resume_worker should not run for verify_gate")
+                        AssertionError(f"spawn_resume_worker should not run for {action_type}")
                     ),
                     spawn_iterate_worker=lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                        AssertionError("spawn_iterate_worker should not run for verify_gate")
+                        AssertionError(f"spawn_iterate_worker should not run for {action_type}")
                     ),
                     config=config,
                     git=git_runtime,
@@ -6386,7 +6378,7 @@ def _cmd_iterate_impl(
             _append_summary_row(
                 summary_rows,
                 iteration_index=iteration,
-                task_type="verify_gate",
+                task_type=action_type,
                 task=None,
                 status="completed" if exec_result.status == "success" else "failed",
             )
@@ -6397,10 +6389,10 @@ def _cmd_iterate_impl(
                 else:
                     impl_task = store.get(impl_task.id) if impl_task.id is not None else None
                     if impl_task is None:
-                        raise ValueError("implementation task disappeared during verify gate execution")
+                        raise ValueError(f"implementation task disappeared during {action_type} execution")
                 continue
             final_status = "blocked"
-            final_stop_reason = "verify_gate_blocked"
+            final_stop_reason = "verify_gate_blocked" if action_type == "verify_gate" else action_type
             break
 
         if action_type == "recover_verify_only_noop_review":
