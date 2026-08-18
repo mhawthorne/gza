@@ -26,6 +26,16 @@
       .status-completed { background: color-mix(in srgb, #2a5 25%, transparent); }
       .muted, .empty { opacity: .65; }
       .empty { text-align: center; padding: 2rem; }
+      .metadata { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: .75rem; }
+      .metadata div { padding: .75rem; border: 1px solid color-mix(in srgb, currentColor 15%, transparent); border-radius: .4rem; }
+      .metadata dt { font-size: .8rem; font-weight: 650; opacity: .7; }
+      .metadata dd { margin: .3rem 0 0; overflow-wrap: anywhere; }
+      section { margin-top: 2rem; }
+      .lineage { padding-left: 1.25rem; }
+      .markdown { max-width: 52rem; padding: 1rem; border-left: .25rem solid color-mix(in srgb, currentColor 20%, transparent); overflow-wrap: anywhere; }
+      .markdown > :first-child { margin-top: 0; }
+      .markdown > :last-child { margin-bottom: 0; }
+      .markdown pre { overflow-x: auto; padding: .75rem; background: color-mix(in srgb, currentColor 8%, transparent); }
     </style>
   </head>
   <body>

@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Task not found · gza{% endblock %}
+{% block content %}
+  <h1>Task not found</h1>
+  <p>No task with id <code>{{ task_id }}</code> exists.</p>
+  <p><a href="/tasks">Return to tasks</a></p>
+{% endblock %}

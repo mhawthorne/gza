@@ -15,6 +15,7 @@ from gza.db import SqliteTaskStore
 from gza.task_query import normalize_tag_filters
 
 from . import __version__
+from .task_detail import query_task_detail
 from .task_list import (
     TASK_STATUSES,
     TASK_TYPES,
@@ -81,6 +82,7 @@ def create_app(
     resolve the database with gza's normal config and task-store APIs.
     """
     make_store = store_factory or (lambda: resolve_store(project_dir))
+    content_project_dir = project_dir or Path.cwd()
     server_instance_id = instance_id or os.environ.get("GZA_SERVER_INSTANCE_ID")
     app = FastAPI(title="gza-server", version=__version__)
 
@@ -136,5 +138,36 @@ def create_app(
         filters: Annotated[TaskListFilters, Depends(_task_list_filters)],
     ) -> list[dict[str, object]]:
         return query_task_list(cast(SqliteTaskStore, make_store()), filters).rows
+
+    @app.get("/tasks/{task_id}")
+    def task_detail_page(request: Request, task_id: str):
+        detail = query_task_detail(
+            cast(SqliteTaskStore, make_store()),
+            task_id,
+            project_dir=content_project_dir,
+        )
+        if detail is None:
+            return _TEMPLATES.TemplateResponse(
+                request=request,
+                name="404.html",
+                context={"task_id": task_id},
+                status_code=404,
+            )
+        return _TEMPLATES.TemplateResponse(
+            request=request,
+            name="task_detail.html",
+            context={"detail": detail, "task": detail.task},
+        )
+
+    @app.get("/api/tasks/{task_id}")
+    def task_detail_api(task_id: str) -> dict[str, object]:
+        detail = query_task_detail(
+            cast(SqliteTaskStore, make_store()),
+            task_id,
+            project_dir=content_project_dir,
+        )
+        if detail is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        return detail.json_record()
 
     return app
