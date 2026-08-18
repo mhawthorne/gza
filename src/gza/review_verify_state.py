@@ -113,7 +113,7 @@ def verify_result_is_timeout_origin(result: VerifyGateResult | None) -> bool:
 
 
 def normalized_verify_command(command: str | None) -> str | None:
-    """Return the stable verify command identity used for freshness matching."""
+    """Return normalized verify command provenance for persisted evidence."""
     if not isinstance(command, str):
         return None
     normalized = command.strip()
@@ -139,15 +139,15 @@ def make_verify_epoch(
 
 
 def verify_epoch_matches(*, expected: VerifyEpoch, candidate: VerifyEpoch) -> bool:
-    """Return whether two verify epochs cover the same code and command.
+    """Return whether two verify epochs cover the same reviewed branch head.
 
-    Timeout settings are persisted as run provenance, but they are not freshness
-    identity: changing the budget does not make same-head evidence stale or current.
+    The verify command and timeout settings are persisted as run provenance, but
+    they are not freshness identity: changing the command or budget does not
+    make same-head evidence stale or current.
     """
     return (
         expected.reviewed_branch == candidate.reviewed_branch
         and expected.reviewed_head_sha == candidate.reviewed_head_sha
-        and expected.verify_command == candidate.verify_command
     )
 
 

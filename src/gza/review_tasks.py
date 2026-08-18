@@ -406,11 +406,12 @@ def resolve_latest_failed_verify_epoch(
     if not verify_epoch_matches(expected=current_epoch, candidate=evidence.epoch):
         raise VerifyFixContextError(
             f"verify_fix manual creation for {impl_task_id} requires failed verify evidence for the current "
-            "implementation branch/head/command identity, but the latest persisted failure is stale. "
+            "implementation branch/head identity, but the latest persisted failure is stale. "
             f"Current: branch={current_epoch.reviewed_branch} head={current_epoch.reviewed_head_sha} "
-            f"command={current_epoch.verify_command!r}. "
+            f"command={current_epoch.verify_command!r} (provenance only). "
             f"Latest failed evidence: branch={evidence.epoch.reviewed_branch} "
-            f"head={evidence.epoch.reviewed_head_sha} command={evidence.epoch.verify_command!r}."
+            f"head={evidence.epoch.reviewed_head_sha} "
+            f"command={evidence.epoch.verify_command!r} (provenance only)."
         )
     return evidence.epoch
 

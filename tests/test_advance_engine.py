@@ -18802,6 +18802,48 @@ def test_pre_review_failed_verify_creates_verify_fix(tmp_path: Path) -> None:
     assert action["verify_epoch"].reviewed_head_sha == "verify-head"
 
 
+def test_pre_review_cross_project_placeholder_verify_pass_creates_closing_review(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = True
+    config.advance_create_reviews = True
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/cross-project-current-green",
+        when=datetime(2026, 7, 6, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="(per-project verify_command)",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 7, 6, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_review"
+    assert action["description"] == "Create closing review (latest implementation has no review yet)"
+
+
 def test_pre_review_failed_verify_reuses_pending_verify_fix_with_timeout_drift(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)

@@ -43,9 +43,9 @@ def _result(*, command: str = "./bin/tests", head_sha: str = "head-1", captured_
     )
 
 
-def _epoch(*, command: str = "./bin/tests", head_sha: str = "head-1"):
+def _epoch(*, command: str = "./bin/tests", branch: str = "feature/verify", head_sha: str = "head-1"):
     return make_verify_epoch(
-        reviewed_branch="feature/verify",
+        reviewed_branch=branch,
         reviewed_head_sha=head_sha,
         verify_command=command,
         verify_timeout_seconds=120,
@@ -272,6 +272,70 @@ def test_latest_verify_result_for_epoch_marks_canonical_owner_artifact_stale(tmp
     assert lookup.is_current is False
     assert lookup.result is not None
     assert lookup.result.reviewed_head_sha == "old-head"
+
+
+def test_latest_verify_result_for_epoch_marks_different_branch_stale(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    impl = store.add("Implement stale branch canonical verify", task_type="implement")
+    assert impl.id is not None
+    review = store.add("Review stale branch canonical verify", task_type="review", based_on=impl.id, depends_on=impl.id)
+
+    persist_verify_gate_artifact(
+        store,
+        _config(tmp_path),
+        owner_task=impl,
+        source_task=review,
+        result=_result(captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC)),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    lookup = latest_verify_result_for_epoch(store, impl, current_epoch=_epoch(branch="feature/other"))
+
+    assert lookup.source == "owner_artifact"
+    assert lookup.has_owner_artifact is True
+    assert lookup.is_current is False
+    assert lookup.result is not None
+    assert lookup.result.reviewed_branch == "feature/verify"
+
+
+def test_resolve_verify_gate_decision_accepts_same_head_per_project_command_placeholder(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _config(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement cross-project verify gate decision", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/verify"
+    store.update(impl)
+    review = store.add("Review cross-project verify gate decision", task_type="review", based_on=impl.id, depends_on=impl.id)
+
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=_result(
+            command="(per-project verify_command)",
+            captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="advance_verify_gate",
+    )
+
+    git = SimpleNamespace(rev_parse_if_exists=lambda _ref: "head-1")
+    decision = resolve_verify_gate_decision(store, impl, config=config, git=git)
+
+    assert decision.state == "passed"
+    assert decision.lookup.is_current is True
+    assert decision.lookup.result is not None
+    assert decision.lookup.result.command == "(per-project verify_command)"
 
 
 def test_latest_verify_result_for_epoch_falls_back_to_legacy_review_when_owner_artifact_absent(

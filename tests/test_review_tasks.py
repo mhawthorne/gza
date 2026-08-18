@@ -577,6 +577,36 @@ class TestVerifyFixTasks:
 
         assert resolve_latest_failed_verify_epoch(store, config, impl, git) == epoch
 
+    def test_resolve_latest_failed_verify_epoch_accepts_command_only_drift(self, tmp_path: Path) -> None:
+        config, store = _make_store(tmp_path)
+        config.verify_command = "./bin/tests --current"
+        config.autonomous_verify_timeout_seconds = 1800
+        config.review_verify_timeout_grace_seconds = 5.0
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/test"
+        store.update(impl)
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        recorded_epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests --recorded",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=improve,
+            epoch=recorded_epoch,
+        )
+
+        git = MagicMock()
+        git.rev_parse_if_exists.return_value = "deadbeef"
+
+        assert resolve_latest_failed_verify_epoch(store, config, impl, git) == recorded_epoch
+
     def test_resolve_latest_failed_verify_epoch_rejects_stale_owner_epoch(self, tmp_path: Path) -> None:
         config, store = _make_store(tmp_path)
         config.verify_command = "./bin/tests"
@@ -607,6 +637,42 @@ class TestVerifyFixTasks:
 
         with pytest.raises(VerifyFixContextError, match="latest persisted failure is stale"):
             resolve_latest_failed_verify_epoch(store, config, impl, git)
+
+    def test_resolve_latest_failed_verify_epoch_rejects_stale_branch(self, tmp_path: Path) -> None:
+        config, store = _make_store(tmp_path)
+        config.verify_command = "./bin/tests"
+        config.autonomous_verify_timeout_seconds = 1800
+        config.review_verify_timeout_grace_seconds = 5.0
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/current"
+        store.update(impl)
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        stale_epoch = VerifyEpoch(
+            reviewed_branch="feature/recorded",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=improve,
+            epoch=stale_epoch,
+        )
+
+        git = MagicMock()
+        git.rev_parse_if_exists.return_value = "deadbeef"
+
+        with pytest.raises(VerifyFixContextError) as exc_info:
+            resolve_latest_failed_verify_epoch(store, config, impl, git)
+
+        message = str(exc_info.value)
+        assert "implementation branch/head identity" in message
+        assert "branch/head/command identity" not in message
+        assert "provenance only" in message
 
     def test_create_or_reuse_verify_fix_task_rejects_based_on_task_from_other_lineage(self, tmp_path: Path) -> None:
         config, store = _make_store(tmp_path)
