@@ -17,6 +17,22 @@ TASK_TYPE_FIX: Final = "fix"
 TASK_TYPE_REBASE: Final = "rebase"
 TASK_TYPE_INTERNAL: Final = "internal"
 
+TASK_STATUS_PENDING: Final = "pending"
+TASK_STATUS_IN_PROGRESS: Final = "in_progress"
+TASK_STATUS_COMPLETED: Final = "completed"
+TASK_STATUS_FAILED: Final = "failed"
+TASK_STATUS_UNMERGED: Final = "unmerged"
+TASK_STATUS_DROPPED: Final = "dropped"
+
+ALL_TASK_STATUSES: Final[tuple[str, ...]] = (
+    TASK_STATUS_PENDING,
+    TASK_STATUS_IN_PROGRESS,
+    TASK_STATUS_COMPLETED,
+    TASK_STATUS_FAILED,
+    TASK_STATUS_UNMERGED,
+    TASK_STATUS_DROPPED,
+)
+
 ALL_TASK_TYPES: Final[tuple[str, ...]] = (
     TASK_TYPE_TASK,
     TASK_TYPE_EXPLORE,

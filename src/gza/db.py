@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 def _launch_editor(cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
     """Seam for tests: invoke the user's editor. Tests patch this, not ``subprocess.run``."""
     return subprocess.run(cmd)
+
 
 __all__ = [
     "BehaviorCheckFinding",
@@ -75,6 +76,7 @@ __all__ = [
     "import_legacy_local_db",
     "resolve_task_id",
     "task_id_numeric_key",
+    "task_updated_at",
     "task_owns_merge_status",
     "behavior_check_finding_fingerprint",
 ]
@@ -415,9 +417,7 @@ def task_owns_merge_status(task: "Task") -> bool:
 MERGE_UNIT_ACTIONABLE_STATES: frozenset[str] = frozenset({"unmerged", "blocked", "stale"})
 MERGE_UNIT_LANDED_OR_NO_WORK_STATES: frozenset[str] = frozenset({"merged", "empty", "redundant"})
 MERGE_UNIT_INACTIVE_TOMBSTONE_STATES: frozenset[str] = frozenset({"dropped", "superseded"})
-MERGE_UNIT_ACTIVE_STATES: frozenset[str] = (
-    MERGE_UNIT_ACTIONABLE_STATES | MERGE_UNIT_LANDED_OR_NO_WORK_STATES
-)
+MERGE_UNIT_ACTIVE_STATES: frozenset[str] = MERGE_UNIT_ACTIONABLE_STATES | MERGE_UNIT_LANDED_OR_NO_WORK_STATES
 BEHAVIOR_FINDING_TERMINAL_LINKED_TASK_STATUSES: frozenset[str] = frozenset({"dropped"})
 BEHAVIOR_FINDING_TERMINAL_LINKED_TASK_MERGE_STATUSES: frozenset[str] = frozenset({"merged"})
 
@@ -438,10 +438,7 @@ def merge_unit_is_active(unit: "MergeUnit | None") -> bool:
 
 def active_merge_unit_where_sql(alias: str) -> str:
     """Return the shared SQL predicate for active merge-unit reads."""
-    return (
-        f"{alias}.superseded_by_unit_id IS NULL "
-        f"AND {alias}.state NOT IN ('dropped', 'superseded')"
-    )
+    return f"{alias}.superseded_by_unit_id IS NULL AND {alias}.state NOT IN ('dropped', 'superseded')"
 
 
 def merge_unit_legacy_state(state: str | None) -> str | None:
@@ -608,10 +605,7 @@ class ManualMigrationRequired(Exception):
     def __init__(self, pending_versions: list[int]) -> None:
         self.pending_versions = pending_versions
         versions_str = ", ".join(f"v{v}" for v in pending_versions)
-        super().__init__(
-            f"Database requires manual migration(s): {versions_str}. "
-            "Run 'gza migrate' to upgrade."
-        )
+        super().__init__(f"Database requires manual migration(s): {versions_str}. Run 'gza migrate' to upgrade.")
 
 
 def _compute_percentiles(values: list[float]) -> dict | None:
@@ -656,6 +650,7 @@ def _compute_percentiles(values: list[float]) -> dict | None:
 @dataclass
 class Task:
     """A task in the database."""
+
     id: str | None  # None for unsaved tasks; project-prefixed decimal (e.g. "gza-1234")
     prompt: str
     status: str = "pending"  # pending, in_progress, completed, failed, unmerged, dropped
@@ -674,10 +669,11 @@ class Task:
     attach_count: int | None = None  # Number of interactive attach sessions
     attach_duration_seconds: float | None = None  # Total interactive attach wall time
     cost_usd: float | None = None
-    input_tokens: int | None = None   # Total input tokens (including cache tokens)
+    input_tokens: int | None = None  # Total input tokens (including cache tokens)
     output_tokens: int | None = None  # Total output tokens
     created_at: datetime | None = None
     last_edited_at: datetime | None = None  # Last meaningful prompt/type edit; NULL means use created_at
+    updated_at: datetime | None = None  # Authoritative last-mutation time; advances monotonically (v67)
     started_at: datetime | None = None
     running_pid: int | None = None
     completed_at: datetime | None = None
@@ -714,9 +710,11 @@ class Task:
     drop_reason: str | None = None
     skip_learnings: bool = False
     diff_files_changed: int | None = None  # Files changed vs. main (v13)
-    diff_lines_added: int | None = None    # Lines added vs. main (v13)
+    diff_lines_added: int | None = None  # Lines added vs. main (v13)
     diff_lines_removed: int | None = None  # Lines removed vs. main (v13)
-    changed_diff: bool | None = None  # Same-branch lifecycle diff-change signal for rebase/improve; NULL = legacy/unknown
+    changed_diff: bool | None = (
+        None  # Same-branch lifecycle diff-change signal for rebase/improve; NULL = legacy/unknown
+    )
     review_cleared_at: datetime | None = None  # When review state was cleared by an improve task (v14)
     review_score: int | None = None  # Derived deterministic score for completed review tasks (v33)
     review_verify_command: str | None = None  # Command used for review-time verify provenance
@@ -732,7 +730,9 @@ class Task:
     review_verify_artifact_file: str | None = None  # Full captured verify artifact for later audit/debugging
     verify_fix_completion_outcome_json: str | None = None  # Structured verify_fix no-source completion outcome
     log_schema_version: int = 1  # 1=legacy logs, 2=message-step logs
-    execution_mode: str | None = None  # worker_background, worker_foreground, foreground_inline, foreground_attach_resume, manual, skill_inline
+    execution_mode: str | None = (
+        None  # worker_background, worker_foreground, foreground_inline, foreground_attach_resume, manual, skill_inline
+    )
 
     def is_explore(self) -> bool:
         """Check if this is an exploration task."""
@@ -741,6 +741,35 @@ class Task:
     def is_blocked(self) -> bool:
         """Check if this task is blocked by a dependency."""
         return self.depends_on is not None
+
+
+def task_updated_at(task: Task) -> datetime | None:
+    """Return the authoritative last-update time for a task.
+
+    Rows written at schema v67 or later carry a persisted ``updated_at`` that the
+    store advances on every mutation, including status resets that clear
+    ``completed_at`` and tag-only edits that touch no task column. Legacy rows
+    predate that column, so they fall back to the best available approximation.
+    """
+    if task.updated_at is not None:
+        return _normalize_db_datetime(task.updated_at)
+    timestamps = (
+        task.created_at,
+        task.last_edited_at,
+        task.started_at,
+        task.completed_at,
+        task.merged_at,
+    )
+    available = [timestamp for timestamp in timestamps if timestamp is not None]
+    if not available:
+        return None
+
+    def normalized(timestamp: datetime) -> datetime:
+        if timestamp.tzinfo is None:
+            return timestamp.replace(tzinfo=UTC)
+        return timestamp.astimezone(UTC)
+
+    return max(available, key=normalized)
 
 
 @dataclass
@@ -802,13 +831,14 @@ def _task_is_successful_merge_unit_implement(task: "Task", unit: MergeUnit) -> b
 @dataclass
 class TaskStats:
     """Statistics from a task run."""
+
     duration_seconds: float | None = None
     num_steps_reported: int | None = None  # Step count reported by the provider
     num_steps_computed: int | None = None  # Step count computed internally
     num_turns_reported: int | None = None  # Turn count reported by the provider
     num_turns_computed: int | None = None  # Turn count computed internally
     cost_usd: float | None = None
-    input_tokens: int | None = None   # Total input tokens (including cache tokens)
+    input_tokens: int | None = None  # Total input tokens (including cache tokens)
     output_tokens: int | None = None  # Total output tokens
     tokens_estimated: bool = False
     cost_estimated: bool = False
@@ -1028,6 +1058,7 @@ _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
     "tasks": (
         "created_at",
         "last_edited_at",
+        "updated_at",
         "started_at",
         "completed_at",
         "pr_last_synced_at",
@@ -1550,8 +1581,23 @@ MIGRATION_V65_TO_V66 = """
 ALTER TABLE tasks ADD COLUMN verify_fix_completion_outcome_json TEXT;
 """
 
+# Migration from v66 to v67: authoritative monotonic task last-update timestamp.
+# Existing rows are backfilled with the best available approximation so ordering
+# stays stable across the upgrade; every later mutation advances the column.
+MIGRATION_V66_TO_V67 = """
+ALTER TABLE tasks ADD COLUMN updated_at TEXT;
+UPDATE tasks SET updated_at = MAX(
+    COALESCE(created_at, ''),
+    COALESCE(last_edited_at, ''),
+    COALESCE(started_at, ''),
+    COALESCE(completed_at, ''),
+    COALESCE(merged_at, '')
+) WHERE updated_at IS NULL;
+UPDATE tasks SET updated_at = NULL WHERE updated_at = '';
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 66
+SCHEMA_VERSION = 67
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -1596,9 +1642,7 @@ def _preserve_completed_rebase_provenance_scope(
         return candidate_scope
     persisted_scope = row["review_scope"]
     persisted_provenance = parse_rebase_diff_provenance(persisted_scope)
-    if rebase_diff_provenance_quality(candidate_provenance) < rebase_diff_provenance_quality(
-        persisted_provenance
-    ):
+    if rebase_diff_provenance_quality(candidate_provenance) < rebase_diff_provenance_quality(persisted_provenance):
         return persisted_scope
     return candidate_scope
 
@@ -1609,6 +1653,7 @@ def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool
         rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     except sqlite3.OperationalError:
         return False
+
     def _column_name(row: sqlite3.Row | tuple[Any, ...]) -> str:
         if isinstance(row, sqlite3.Row):
             return str(row["name"])
@@ -1858,6 +1903,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 cost_usd REAL,
                 created_at TEXT NOT NULL,
                 last_edited_at TEXT,
+                updated_at TEXT,
                 started_at TEXT,
                 running_pid INTEGER,
                 completed_at TEXT,
@@ -1997,19 +2043,83 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
         tasks_src_cols = _table_columns(conn, tasks_src)
         tasks_project_expr = "COALESCE(NULLIF(project_id, ''), ?)" if "project_id" in tasks_src_cols else "?"
         task_columns = (
-            "id", "prompt", "status", "task_type", "slug", "branch", "log_file", "report_file", "based_on", "has_commits",
-            "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns", "num_turns_reported", "num_turns_computed",
-            "attach_count", "attach_duration_seconds", "cost_usd", "created_at", "last_edited_at", "started_at", "running_pid", "completed_at",
-            "group", "depends_on", "spec", "review_scope", "create_review", "auto_implement", "create_pr", "same_branch", "task_type_hint", "output_content", "session_id", "pr_number",
-            "pr_state", "pr_last_synced_at", "sync_last_synced_at", "model", "provider", "provider_is_explicit", "model_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
-            "merge_status", "merged_at", "failure_reason", "completion_reason", "drop_reason", "skip_learnings", "diff_files_changed", "diff_lines_added", "diff_lines_removed",
+            "id",
+            "prompt",
+            "status",
+            "task_type",
+            "slug",
+            "branch",
+            "log_file",
+            "report_file",
+            "based_on",
+            "has_commits",
+            "duration_seconds",
+            "num_steps_reported",
+            "num_steps_computed",
+            "num_turns",
+            "num_turns_reported",
+            "num_turns_computed",
+            "attach_count",
+            "attach_duration_seconds",
+            "cost_usd",
+            "created_at",
+            "last_edited_at",
+            "updated_at",
+            "started_at",
+            "running_pid",
+            "completed_at",
+            "group",
+            "depends_on",
+            "spec",
+            "review_scope",
+            "create_review",
+            "auto_implement",
+            "create_pr",
+            "same_branch",
+            "task_type_hint",
+            "output_content",
+            "session_id",
+            "pr_number",
+            "pr_state",
+            "pr_last_synced_at",
+            "sync_last_synced_at",
+            "model",
+            "provider",
+            "provider_is_explicit",
+            "model_is_explicit",
+            "urgent",
+            "urgent_bumped_at",
+            "queue_position",
+            "input_tokens",
+            "output_tokens",
+            "merge_status",
+            "merged_at",
+            "failure_reason",
+            "completion_reason",
+            "drop_reason",
+            "skip_learnings",
+            "diff_files_changed",
+            "diff_lines_added",
+            "diff_lines_removed",
             "changed_diff",
-            "review_cleared_at", "review_score",
-            "review_verify_command", "review_verify_status", "review_verify_exit_status", "review_verify_failure",
-            "review_verify_captured_at", "review_verify_head_sha", "review_verify_base_sha", "review_verify_branch",
-            "review_verify_markdown", "review_verify_cwd", "review_verify_artifact_file",
+            "review_cleared_at",
+            "review_score",
+            "review_verify_command",
+            "review_verify_status",
+            "review_verify_exit_status",
+            "review_verify_failure",
+            "review_verify_captured_at",
+            "review_verify_head_sha",
+            "review_verify_base_sha",
+            "review_verify_branch",
+            "review_verify_markdown",
+            "review_verify_cwd",
+            "review_verify_artifact_file",
             "verify_fix_completion_outcome_json",
-            "log_schema_version", "execution_mode", "base_branch", "recovery_origin",
+            "log_schema_version",
+            "execution_mode",
+            "base_branch",
+            "recovery_origin",
             "trigger_source",
         )
         task_defaults: dict[str, str] = {
@@ -2048,7 +2158,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
                 INSERT INTO tasks (
                     project_id, id, prompt, status, task_type, slug, branch, log_file, report_file, based_on, has_commits,
                     duration_seconds, num_steps_reported, num_steps_computed, num_turns, num_turns_reported, num_turns_computed,
-                    attach_count, attach_duration_seconds, cost_usd, created_at, last_edited_at, started_at, running_pid, completed_at,
+                    attach_count, attach_duration_seconds, cost_usd, created_at, last_edited_at, updated_at, started_at, running_pid, completed_at,
                     "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, task_type_hint, output_content, session_id, pr_number,
                     pr_state, pr_last_synced_at, sync_last_synced_at, model, provider, provider_is_explicit, model_is_explicit, urgent, urgent_bumped_at, queue_position, input_tokens, output_tokens,
                     merge_status, merged_at, failure_reason, completion_reason, drop_reason, skip_learnings, diff_files_changed, diff_lines_added, diff_lines_removed,
@@ -2145,9 +2255,7 @@ def _run_v35_to_v36_migration(conn: sqlite3.Connection, project_id: str, project
             task_comments_project_expr = (
                 "COALESCE(NULLIF(project_id, ''), ?)" if "project_id" in task_comments_cols else "?"
             )
-            task_comments_kind_expr = (
-                "kind" if "kind" in task_comments_cols else f"'{TASK_COMMENT_KIND_FEEDBACK}'"
-            )
+            task_comments_kind_expr = "kind" if "kind" in task_comments_cols else f"'{TASK_COMMENT_KIND_FEEDBACK}'"
             conn.execute(
                 f"""
                 INSERT INTO task_comments (id, project_id, task_id, content, source, author, kind, created_at, resolved_at)
@@ -2199,9 +2307,7 @@ def _validate_v36_structural_schema(conn: sqlite3.Connection) -> None:
         if not _table_exists(conn, table):
             raise RuntimeError(f"Auto-migration to v36 incomplete: missing required table {table}")
         if _table_pk_columns(conn, table) != pk_columns:
-            raise RuntimeError(
-                f"Auto-migration to v36 incomplete: expected PRIMARY KEY{pk_columns} on {table}"
-            )
+            raise RuntimeError(f"Auto-migration to v36 incomplete: expected PRIMARY KEY{pk_columns} on {table}")
 
     run_steps_uniques = _table_unique_sets(conn, "run_steps")
     if ("project_id", "run_id", "step_index") not in run_steps_uniques:
@@ -2232,8 +2338,7 @@ def _validate_v36_structural_schema(conn: sqlite3.Connection) -> None:
     for table, to_table, from_cols in required_fks:
         if not _has_fk_columns(conn, table, to_table, from_cols):
             raise RuntimeError(
-                "Auto-migration to v36 incomplete: "
-                f"{table} must include FOREIGN KEY{from_cols} REFERENCES {to_table}"
+                f"Auto-migration to v36 incomplete: {table} must include FOREIGN KEY{from_cols} REFERENCES {to_table}"
             )
 
 
@@ -2407,6 +2512,7 @@ _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
         64,
         65,
         66,
+        67,
     }
 )
 
@@ -2571,9 +2677,7 @@ def _rebuild_task_artifacts_table(conn: sqlite3.Connection) -> None:
         "kind": "kind" if "kind" in existing_columns else "'unknown'",
         "label": "label" if "label" in existing_columns else "NULL",
         "path": "path" if "path" in existing_columns else "''",
-        "content_type": (
-            "content_type" if "content_type" in existing_columns else "'text/plain; charset=utf-8'"
-        ),
+        "content_type": ("content_type" if "content_type" in existing_columns else "'text/plain; charset=utf-8'"),
         "byte_size": "byte_size" if "byte_size" in existing_columns else "0",
         "sha256": "sha256" if "sha256" in existing_columns else "''",
         "created_at": "created_at" if "created_at" in existing_columns else f"'{now_text}'",
@@ -2647,21 +2751,16 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         missing_comment_columns = _missing_required_columns(conn, "task_comments", _TASK_COMMENTS_V32_REQUIRED_COLUMNS)
         if missing_comment_columns:
             raise RuntimeError(
-                "Auto-migration to v32 incomplete: missing required column "
-                f"task_comments.{missing_comment_columns[0]}"
+                f"Auto-migration to v32 incomplete: missing required column task_comments.{missing_comment_columns[0]}"
             )
     if target_version == 36:
         _validate_v36_structural_schema(conn)
     if target_version == 38:
         for column in ("pr_state", "pr_last_synced_at"):
             if not _table_has_column(conn, "tasks", column):
-                raise RuntimeError(
-                    f"Auto-migration to v38 incomplete: missing required column tasks.{column}"
-                )
+                raise RuntimeError(f"Auto-migration to v38 incomplete: missing required column tasks.{column}")
     if target_version == 39 and not _table_has_column(conn, "tasks", "sync_last_synced_at"):
-        raise RuntimeError(
-            "Auto-migration to v39 incomplete: missing required column tasks.sync_last_synced_at"
-        )
+        raise RuntimeError("Auto-migration to v39 incomplete: missing required column tasks.sync_last_synced_at")
 
     required_columns_by_version: dict[int, tuple[str, str]] = {
         30: ("tasks", "urgent_bumped_at"),
@@ -2682,6 +2781,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         54: ("task_comments", "kind"),
         56: ("watch_recovery_backoffs", "updated_at"),
         57: ("tasks", "last_edited_at"),
+        67: ("tasks", "updated_at"),
         58: ("parked_task_rearms", "manual_rearmed_at"),
         59: ("parked_task_rearms", "last_auto_attempt_target_sha"),
         63: ("main_verify_remediation_attempts", "updated_at"),
@@ -2698,93 +2798,65 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
     if target_version == 42:
         for table in ("merge_units", "merge_unit_tasks"):
             if not _table_exists(conn, table):
-                raise RuntimeError(
-                    f"Auto-migration to v42 incomplete: missing required table {table}"
-                )
+                raise RuntimeError(f"Auto-migration to v42 incomplete: missing required table {table}")
     if target_version >= 49 and not _index_exists(conn, "idx_merge_units_project_state_source"):
         raise RuntimeError(
-            "Auto-migration to v49 incomplete: missing required index "
-            "idx_merge_units_project_state_source"
+            "Auto-migration to v49 incomplete: missing required index idx_merge_units_project_state_source"
         )
     if target_version >= 50:
         for table in ("task_artifacts",):
             if not _table_exists(conn, table):
-                raise RuntimeError(
-                    f"Auto-migration to v50 incomplete: missing required table {table}"
-                )
+                raise RuntimeError(f"Auto-migration to v50 incomplete: missing required table {table}")
         for index_name in (
             "idx_task_artifacts_project_task_created",
             "idx_task_artifacts_project_task_kind_created",
         ):
             if not _index_exists(conn, index_name):
-                raise RuntimeError(
-                    "Auto-migration to v50 incomplete: missing required index "
-                    f"{index_name}"
-                )
+                raise RuntimeError(f"Auto-migration to v50 incomplete: missing required index {index_name}")
     if target_version >= 51:
         for table in ("watch_progress_observations",):
             if not _table_exists(conn, table):
-                raise RuntimeError(
-                    f"Auto-migration to v51 incomplete: missing required table {table}"
-                )
+                raise RuntimeError(f"Auto-migration to v51 incomplete: missing required table {table}")
         if not _index_exists(conn, "idx_watch_progress_subject"):
-            raise RuntimeError(
-                "Auto-migration to v51 incomplete: missing required index "
-                "idx_watch_progress_subject"
-            )
+            raise RuntimeError("Auto-migration to v51 incomplete: missing required index idx_watch_progress_subject")
     if target_version >= 53:
         for column in ("action_task_started_at", "action_task_running_pid"):
             if not _table_has_column(conn, "watch_progress_observations", column):
                 raise RuntimeError(
-                    "Auto-migration to v53 incomplete: missing required column "
-                    f"watch_progress_observations.{column}"
+                    f"Auto-migration to v53 incomplete: missing required column watch_progress_observations.{column}"
                 )
     if target_version >= 56:
         if not _table_exists(conn, "watch_recovery_backoffs"):
-            raise RuntimeError(
-                "Auto-migration to v56 incomplete: missing required table watch_recovery_backoffs"
-            )
+            raise RuntimeError("Auto-migration to v56 incomplete: missing required table watch_recovery_backoffs")
         if not _index_exists(conn, "idx_watch_recovery_backoffs_due"):
             raise RuntimeError(
-                "Auto-migration to v56 incomplete: missing required index "
-                "idx_watch_recovery_backoffs_due"
+                "Auto-migration to v56 incomplete: missing required index idx_watch_recovery_backoffs_due"
             )
     if target_version >= 58:
         if not _table_exists(conn, "parked_task_rearms"):
-            raise RuntimeError(
-                "Auto-migration to v58 incomplete: missing required table parked_task_rearms"
-            )
+            raise RuntimeError("Auto-migration to v58 incomplete: missing required table parked_task_rearms")
         if not _index_exists(conn, "idx_parked_task_rearms_task_reason"):
             raise RuntimeError(
-                "Auto-migration to v58 incomplete: missing required index "
-                "idx_parked_task_rearms_task_reason"
+                "Auto-migration to v58 incomplete: missing required index idx_parked_task_rearms_task_reason"
             )
     if target_version >= 59:
         for column in ("auto_attempt_count", "last_auto_attempt_at", "last_auto_attempt_target_sha"):
             if not _table_has_column(conn, "parked_task_rearms", column):
                 raise RuntimeError(
-                    "Auto-migration to v59 incomplete: missing required column "
-                    f"parked_task_rearms.{column}"
+                    f"Auto-migration to v59 incomplete: missing required column parked_task_rearms.{column}"
                 )
     if target_version >= 60:
         if not _table_has_column(conn, "tasks", "drop_reason"):
-            raise RuntimeError(
-                "Auto-migration to v60 incomplete: missing required column tasks.drop_reason"
-            )
+            raise RuntimeError("Auto-migration to v60 incomplete: missing required column tasks.drop_reason")
     if target_version >= 61:
         if not _table_exists(conn, "behavior_check_findings"):
-            raise RuntimeError(
-                "Auto-migration to v61 incomplete: missing required table behavior_check_findings"
-            )
+            raise RuntimeError("Auto-migration to v61 incomplete: missing required table behavior_check_findings")
         if not _index_exists(conn, "idx_behavior_check_findings_project_state"):
             raise RuntimeError(
-                "Auto-migration to v61 incomplete: missing required index "
-                "idx_behavior_check_findings_project_state"
+                "Auto-migration to v61 incomplete: missing required index idx_behavior_check_findings_project_state"
             )
     if target_version >= 62 and not _table_exists(conn, "project_leases"):
-        raise RuntimeError(
-            "Auto-migration to v62 incomplete: missing required table project_leases"
-        )
+        raise RuntimeError("Auto-migration to v62 incomplete: missing required table project_leases")
     if target_version >= 63:
         if not _table_exists(conn, "main_verify_remediation_attempts"):
             raise RuntimeError(
@@ -2805,15 +2877,11 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
             "idx_main_verify_remediation_attempts_updated_at",
         ):
             if not _index_exists(conn, index_name):
-                raise RuntimeError(
-                    "Auto-migration to v63 incomplete: missing required index "
-                    f"{index_name}"
-                )
+                raise RuntimeError(f"Auto-migration to v63 incomplete: missing required index {index_name}")
     if target_version >= 64:
         if not _table_exists(conn, "main_verify_remediation_consumed_task_ids"):
             raise RuntimeError(
-                "Auto-migration to v64 incomplete: missing required table "
-                "main_verify_remediation_consumed_task_ids"
+                "Auto-migration to v64 incomplete: missing required table main_verify_remediation_consumed_task_ids"
             )
         missing_columns = _missing_required_columns(
             conn,
@@ -2851,9 +2919,7 @@ def _ensure_required_auto_migration_artifacts(
         _TASK_COMMENTS_REQUIRED_COLUMNS if target_version >= 54 else _TASK_COMMENTS_V32_REQUIRED_COLUMNS
     )
     missing_comment_columns = (
-        _missing_required_columns(conn, "task_comments", required_comment_columns)
-        if target_version >= 32
-        else []
+        _missing_required_columns(conn, "task_comments", required_comment_columns) if target_version >= 32 else []
     )
     if target_version >= 32 and missing_comment_columns:
         missing_column = missing_comment_columns[0]
@@ -2944,6 +3010,7 @@ def _ensure_required_auto_migration_artifacts(
             "ALTER TABLE watch_progress_observations ADD COLUMN launch_evidence_fingerprint TEXT",
         ),
         (57, "tasks", "last_edited_at", "ALTER TABLE tasks ADD COLUMN last_edited_at TEXT"),
+        (67, "tasks", "updated_at", "ALTER TABLE tasks ADD COLUMN updated_at TEXT"),
         (
             65,
             "main_verify_remediation_attempts",
@@ -2985,8 +3052,7 @@ def _ensure_required_auto_migration_artifacts(
             conn.executescript(MIGRATION_V34_TO_V35)
         except sqlite3.OperationalError as exc:
             raise SchemaIntegrityError(
-                "Schema integrity check failed while repairing required table task_tags: "
-                "use a writable database."
+                "Schema integrity check failed while repairing required table task_tags: use a writable database."
             ) from exc
     if target_version >= 36 and not _table_exists(conn, "projects"):
         try:
@@ -3006,16 +3072,14 @@ def _ensure_required_auto_migration_artifacts(
             )
         except sqlite3.OperationalError as exc:
             raise SchemaIntegrityError(
-                "Schema integrity check failed while repairing required table projects: "
-                "use a writable database."
+                "Schema integrity check failed while repairing required table projects: use a writable database."
             ) from exc
     if target_version >= 42 and not _table_exists(conn, "merge_units"):
         try:
             conn.executescript(MIGRATION_V41_TO_V42)
         except sqlite3.OperationalError as exc:
             raise SchemaIntegrityError(
-                "Schema integrity check failed while repairing required table merge_units: "
-                "use a writable database."
+                "Schema integrity check failed while repairing required table merge_units: use a writable database."
             ) from exc
     if target_version >= 49 and _table_exists(conn, "merge_units"):
         if not _table_has_column(conn, "merge_units", "merge_source"):
@@ -3353,8 +3417,7 @@ def _ensure_required_auto_migration_artifacts(
                     "use a writable database to complete migration to v62, then retry."
                 ) from exc
             raise SchemaIntegrityError(
-                "Schema integrity check failed while repairing required table "
-                "project_leases: use a writable database."
+                "Schema integrity check failed while repairing required table project_leases: use a writable database."
             ) from exc
     if target_version >= 63:
         if not _table_exists(conn, "main_verify_remediation_attempts"):
@@ -3486,6 +3549,7 @@ def _ensure_required_auto_migration_artifacts(
                 f"{missing_columns[0]}. Use a writable database to repair the v64 schema."
             )
 
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
@@ -3531,6 +3595,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     cost_usd REAL,
     created_at TEXT NOT NULL,
     last_edited_at TEXT,
+    updated_at TEXT,
     started_at TEXT,
     running_pid INTEGER,
     completed_at TEXT,
@@ -4031,6 +4096,7 @@ def extract_failure_reason(log_file_path: Path) -> str:
 
     return last_reason if last_reason is not None else "UNKNOWN"
 
+
 _MIGRATIONS: list[tuple[int, str | None]] = [
     (2, MIGRATION_V1_TO_V2),
     (3, MIGRATION_V2_TO_V3),
@@ -4097,6 +4163,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (64, MIGRATION_V63_TO_V64),
     (65, MIGRATION_V64_TO_V65),
     (66, MIGRATION_V65_TO_V66),
+    (67, MIGRATION_V66_TO_V67),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -4163,11 +4230,7 @@ def _marker_matches_shared_db(project_dir: Path, local_db_path: Path, active_db_
     marker_size = marker.get("local_db_size")
     marker_mtime_ns = marker.get("local_db_mtime_ns")
     marker_ctime_ns = marker.get("local_db_ctime_ns")
-    if (
-        isinstance(marker_size, int)
-        and isinstance(marker_mtime_ns, int)
-        and isinstance(marker_ctime_ns, int)
-    ):
+    if isinstance(marker_size, int) and isinstance(marker_mtime_ns, int) and isinstance(marker_ctime_ns, int):
         try:
             local_size, local_mtime_ns, local_ctime_ns = _db_metadata(local_db_path)
         except OSError:
@@ -4297,9 +4360,7 @@ class SqliteTaskStore:
                     )
         config_path = getattr(config, "config_path", None)
         resolved_config_path = (
-            config_path(project_dir)
-            if callable(config_path) and isinstance(project_dir, Path)
-            else None
+            config_path(project_dir) if callable(config_path) and isinstance(project_dir, Path) else None
         )
         project_name = getattr(config, "project_name", None)
         if not isinstance(project_name, str):
@@ -4421,9 +4482,7 @@ class SqliteTaskStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             # Check if schema_version table exists
-            cur = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
-            )
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
             if cur.fetchone() is None:
                 # Fresh database - create full current schema directly
                 conn.executescript(SCHEMA)
@@ -4476,6 +4535,7 @@ class SqliteTaskStore:
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
 
             _backfill_task_tags_from_group(conn)
+
             def _safe_project_backfill(sql: str) -> None:
                 try:
                     conn.execute(sql, (self._project_id,))
@@ -4484,9 +4544,7 @@ class SqliteTaskStore:
                         raise
 
             if _table_has_column(conn, "tasks", "project_id"):
-                _safe_project_backfill(
-                    "UPDATE tasks SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
-                )
+                _safe_project_backfill("UPDATE tasks SET project_id = ? WHERE project_id IS NULL OR project_id = ''")
             if _table_has_column(conn, "run_steps", "project_id"):
                 _safe_project_backfill(
                     "UPDATE run_steps SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
@@ -4508,6 +4566,7 @@ class SqliteTaskStore:
             # or partial migrations removed them.
             _ensure_required_auto_migration_artifacts(conn, target_version=SCHEMA_VERSION)
 
+
     def _ensure_db_query_only(self) -> None:
         """Open a store for best-effort reads without any startup writes."""
         if not self.db_path.exists():
@@ -4515,9 +4574,7 @@ class SqliteTaskStore:
             return
 
         with self._connect() as conn:
-            cur = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
-            )
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
             if cur.fetchone() is None:
                 raise SchemaIntegrityError(
                     "Database is missing schema_version; query-only mode cannot initialize schema. "
@@ -4570,8 +4627,7 @@ class SqliteTaskStore:
         )
         self._query_only_table_exists = {table: _table_exists(conn, table) for table in tables}
         self._query_only_columns = {
-            table: (_table_columns(conn, table) if self._query_only_table_exists[table] else set())
-            for table in tables
+            table: (_table_columns(conn, table) if self._query_only_table_exists[table] else set()) for table in tables
         }
 
     def _collect_query_only_warnings(self) -> None:
@@ -4653,8 +4709,7 @@ class SqliteTaskStore:
             )
         if not self._query_only_supports_comments():
             self._startup_warnings.append(
-                "Query-only DB open detected incomplete task_comments schema; "
-                "task comments will be unavailable."
+                "Query-only DB open detected incomplete task_comments schema; task comments will be unavailable."
             )
         elif not self._query_only_has_column("task_comments", "source"):
             self._startup_warnings.append(
@@ -4693,9 +4748,7 @@ class SqliteTaskStore:
                 )
         if not self._query_only_supports_main_verify_remediation_attempts():
             attempts_exists = self._query_only_table_exists.get("main_verify_remediation_attempts", False)
-            consumed_ids_exists = self._query_only_table_exists.get(
-                "main_verify_remediation_consumed_task_ids", False
-            )
+            consumed_ids_exists = self._query_only_table_exists.get("main_verify_remediation_consumed_task_ids", False)
             if attempts_exists and consumed_ids_exists:
                 self._startup_warnings.append(
                     "Query-only DB open detected incomplete main_verify remediation attempt schema; "
@@ -4731,9 +4784,7 @@ class SqliteTaskStore:
                 "cannot safely read task data from this snapshot."
             )
         missing_columns = [
-            column
-            for column in _QUERY_ONLY_REQUIRED_TASK_COLUMNS
-            if not self._query_only_has_column("tasks", column)
+            column for column in _QUERY_ONLY_REQUIRED_TASK_COLUMNS if not self._query_only_has_column("tasks", column)
         ]
         if missing_columns:
             raise SchemaIntegrityError(
@@ -4752,8 +4803,7 @@ class SqliteTaskStore:
         if self._open_mode != "query_only":
             return True
         return self._query_only_table_exists.get("task_tags", False) and all(
-            self._query_only_has_column("task_tags", column)
-            for column in ("project_id", "task_id", "tag")
+            self._query_only_has_column("task_tags", column) for column in ("project_id", "task_id", "tag")
         )
 
     def _query_only_supports_comments(self) -> bool:
@@ -4761,8 +4811,7 @@ class SqliteTaskStore:
         if self._open_mode != "query_only":
             return True
         return self._query_only_table_exists.get("task_comments", False) and all(
-            self._query_only_has_column("task_comments", column)
-            for column in _QUERY_ONLY_REQUIRED_COMMENT_COLUMNS
+            self._query_only_has_column("task_comments", column) for column in _QUERY_ONLY_REQUIRED_COMMENT_COLUMNS
         )
 
     def _query_only_supports_watch_progress_observations(self) -> bool:
@@ -4814,8 +4863,7 @@ class SqliteTaskStore:
         if self._open_mode != "query_only":
             return True
         return self._query_only_table_exists.get("run_steps", False) and all(
-            self._query_only_has_column("run_steps", column)
-            for column in _QUERY_ONLY_REQUIRED_RUN_STEP_COUNT_COLUMNS
+            self._query_only_has_column("run_steps", column) for column in _QUERY_ONLY_REQUIRED_RUN_STEP_COUNT_COLUMNS
         )
 
     def _query_only_run_steps_warning(self) -> str | None:
@@ -4823,10 +4871,7 @@ class SqliteTaskStore:
         if self._open_mode != "query_only":
             return None
         if not self._query_only_table_exists.get("run_steps", False):
-            return (
-                "Query-only DB open detected missing required table run_steps; "
-                "step counts will be unavailable."
-            )
+            return "Query-only DB open detected missing required table run_steps; step counts will be unavailable."
         missing_columns = [
             column
             for column in _QUERY_ONLY_REQUIRED_RUN_STEP_COUNT_COLUMNS
@@ -4937,10 +4982,7 @@ class SqliteTaskStore:
         """Install one in-memory based_on index for the active read_session scope."""
         previous_children = self._read_session_based_on_children
         previous_children_by_type = self._read_session_based_on_children_by_type
-        normalized_children = {
-            task_id: tuple(children)
-            for task_id, children in based_on_children.items()
-        }
+        normalized_children = {task_id: tuple(children) for task_id, children in based_on_children.items()}
         normalized_children_by_type: dict[tuple[str, str], tuple[Task, ...]] = {}
         for task_id, children in normalized_children.items():
             grouped: dict[str, list[Task]] = {}
@@ -4960,9 +5002,7 @@ class SqliteTaskStore:
 
     def _open_connection(self, *, close_on_exit: bool) -> sqlite3.Connection:
         """Create a database connection with the store's standard pragmas and mode."""
-        factory: type[sqlite3.Connection] = (
-            _ClosingSqliteConnection if close_on_exit else _InstrumentedSqliteConnection
-        )
+        factory: type[sqlite3.Connection] = _ClosingSqliteConnection if close_on_exit else _InstrumentedSqliteConnection
         if self._query_only_empty_db:
             conn = _timed_sqlite_connect(
                 ":memory:",
@@ -5012,6 +5052,21 @@ class SqliteTaskStore:
             raise RuntimeError("write methods must not run inside an active read_session")
         return cast(sqlite3.Connection, self._connect())
 
+    @contextmanager
+    def _write_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Open one immediate transaction for a mutation and its bookkeeping."""
+        conn = self._require_write_connection()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.execute("COMMIT")
+        except Exception:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
     def _row_to_task(self, row: sqlite3.Row, *, tags: tuple[str, ...] = ()) -> Task:
         """Convert a database row to a Task."""
         keys = row.keys()
@@ -5024,7 +5079,9 @@ class SqliteTaskStore:
             slug_val = None
         return Task(
             id=row["id"],
-            prompt=row["prompt"].decode("utf-8", errors="replace") if isinstance(row["prompt"], bytes) else row["prompt"],
+            prompt=row["prompt"].decode("utf-8", errors="replace")
+            if isinstance(row["prompt"], bytes)
+            else row["prompt"],
             status=row["status"],
             task_type=row["task_type"],
             slug=slug_val,
@@ -5045,6 +5102,7 @@ class SqliteTaskStore:
             output_tokens=row["output_tokens"] if "output_tokens" in keys else None,
             created_at=_parse_db_timestamp(row["created_at"]),
             last_edited_at=_parse_db_timestamp(row["last_edited_at"]) if "last_edited_at" in keys else None,
+            updated_at=_parse_db_timestamp(row["updated_at"]) if "updated_at" in keys else None,
             started_at=_parse_db_timestamp(row["started_at"]),
             running_pid=row["running_pid"] if "running_pid" in keys else None,
             completed_at=_parse_db_timestamp(row["completed_at"]),
@@ -5054,7 +5112,9 @@ class SqliteTaskStore:
             spec=row["spec"],
             review_scope=row["review_scope"] if "review_scope" in keys else None,
             create_review=bool(row["create_review"]) if row["create_review"] is not None else False,
-            auto_implement=bool(row["auto_implement"]) if "auto_implement" in keys and row["auto_implement"] is not None else None,
+            auto_implement=bool(row["auto_implement"])
+            if "auto_implement" in keys and row["auto_implement"] is not None
+            else None,
             create_pr=bool(row["create_pr"]) if "create_pr" in keys and row["create_pr"] is not None else False,
             same_branch=bool(row["same_branch"]) if row["same_branch"] is not None else False,
             base_branch=row["base_branch"] if "base_branch" in keys else None,
@@ -5066,11 +5126,17 @@ class SqliteTaskStore:
             pr_number=row["pr_number"] if "pr_number" in keys else None,
             pr_state=row["pr_state"] if "pr_state" in keys else None,
             pr_last_synced_at=_parse_db_timestamp(row["pr_last_synced_at"]) if "pr_last_synced_at" in keys else None,
-            sync_last_synced_at=_parse_db_timestamp(row["sync_last_synced_at"]) if "sync_last_synced_at" in keys else None,
+            sync_last_synced_at=_parse_db_timestamp(row["sync_last_synced_at"])
+            if "sync_last_synced_at" in keys
+            else None,
             model=row["model"] if "model" in keys else None,
             provider=row["provider"] if "provider" in keys else None,
-            provider_is_explicit=bool(row["provider_is_explicit"]) if "provider_is_explicit" in keys and row["provider_is_explicit"] is not None else False,
-            model_is_explicit=bool(row["model_is_explicit"]) if "model_is_explicit" in keys and row["model_is_explicit"] is not None else False,
+            provider_is_explicit=bool(row["provider_is_explicit"])
+            if "provider_is_explicit" in keys and row["provider_is_explicit"] is not None
+            else False,
+            model_is_explicit=bool(row["model_is_explicit"])
+            if "model_is_explicit" in keys and row["model_is_explicit"] is not None
+            else False,
             urgent=bool(row["urgent"]) if "urgent" in keys and row["urgent"] is not None else False,
             queue_position=row["queue_position"] if "queue_position" in keys else None,
             merge_status=row["merge_status"] if "merge_status" in keys else None,
@@ -5078,11 +5144,15 @@ class SqliteTaskStore:
             failure_reason=row["failure_reason"] if "failure_reason" in keys else None,
             completion_reason=row["completion_reason"] if "completion_reason" in keys else None,
             drop_reason=row["drop_reason"] if "drop_reason" in keys else None,
-            skip_learnings=bool(row["skip_learnings"]) if "skip_learnings" in keys and row["skip_learnings"] is not None else False,
+            skip_learnings=bool(row["skip_learnings"])
+            if "skip_learnings" in keys and row["skip_learnings"] is not None
+            else False,
             diff_files_changed=row["diff_files_changed"] if "diff_files_changed" in keys else None,
             diff_lines_added=row["diff_lines_added"] if "diff_lines_added" in keys else None,
             diff_lines_removed=row["diff_lines_removed"] if "diff_lines_removed" in keys else None,
-            changed_diff=bool(row["changed_diff"]) if "changed_diff" in keys and row["changed_diff"] is not None else None,
+            changed_diff=bool(row["changed_diff"])
+            if "changed_diff" in keys and row["changed_diff"] is not None
+            else None,
             review_cleared_at=_parse_db_timestamp(row["review_cleared_at"]) if "review_cleared_at" in keys else None,
             review_score=row["review_score"] if "review_score" in keys else None,
             review_verify_command=row["review_verify_command"] if "review_verify_command" in keys else None,
@@ -5101,9 +5171,7 @@ class SqliteTaskStore:
                 row["review_verify_artifact_file"] if "review_verify_artifact_file" in keys else None
             ),
             verify_fix_completion_outcome_json=(
-                row["verify_fix_completion_outcome_json"]
-                if "verify_fix_completion_outcome_json" in keys
-                else None
+                row["verify_fix_completion_outcome_json"] if "verify_fix_completion_outcome_json" in keys else None
             ),
             log_schema_version=(
                 row["log_schema_version"]
@@ -5162,8 +5230,61 @@ class SqliteTaskStore:
             tasks.append(task)
         return tasks
 
-    def _replace_task_tags_conn(self, conn: sqlite3.Connection, task_id: str, tags: tuple[str, ...]) -> None:
-        """Replace all tags for a task inside an open transaction."""
+    def _touch_task_updated_at(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> datetime | None:
+        """Advance a task's authoritative last-update timestamp inside an open transaction.
+
+        Mutations that record no other timestamp -- tag edits, urgent bumps, queue
+        moves, cleared review state, and status resets that blank ``completed_at`` --
+        still have to move the task to the front of an update-ordered listing, so
+        every public mutator routes through here. The value never moves backwards,
+        which keeps ``sort=updated`` stable even when a caller backdates one of the
+        lifecycle timestamps.
+        """
+        row = conn.execute(
+            "SELECT updated_at FROM tasks WHERE project_id = ? AND id = ?",
+            (self._project_id, task_id),
+        ).fetchone()
+        if row is None:
+            return None
+        stamp = _next_monotonic_iso_timestamp(now or datetime.now(UTC), row["updated_at"])
+        conn.execute(
+            "UPDATE tasks SET updated_at = ? WHERE project_id = ? AND id = ?",
+            (stamp, self._project_id, task_id),
+        )
+        return _parse_db_timestamp(stamp)
+
+    def _touch_tasks_updated_at(
+        self,
+        conn: sqlite3.Connection,
+        task_ids: Iterable[str],
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        """Advance several task timestamps inside the transaction that mutated them."""
+        touched_at = now or datetime.now(UTC)
+        for task_id in dict.fromkeys(task_ids):
+            self._touch_task_updated_at(conn, task_id, now=touched_at)
+
+    def _replace_task_tags_conn(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        tags: tuple[str, ...],
+        *,
+        touch_updated_at: bool = True,
+    ) -> datetime | None:
+        """Replace all tags and touch an existing task inside an open transaction.
+
+        Fresh-task insertion opts out because the row is created with its initial
+        ``updated_at`` immediately before its tags are inserted. Existing-row callers
+        touch here so a future tag mutation cannot forget the authoritative timestamp.
+        """
         conn.execute(
             "DELETE FROM task_tags WHERE project_id = ? AND task_id = ?",
             (self._project_id, task_id),
@@ -5173,6 +5294,9 @@ class SqliteTaskStore:
                 "INSERT INTO task_tags(project_id, task_id, tag) VALUES (?, ?, ?)",
                 [(self._project_id, task_id, tag) for tag in tags],
             )
+        if touch_updated_at:
+            return self._touch_task_updated_at(conn, task_id)
+        return None
 
     def _fetch_existing_task_ids(self, conn: sqlite3.Connection, task_ids: Iterable[str]) -> set[str]:
         """Fetch the subset of task IDs that still exist for this project."""
@@ -5427,8 +5551,8 @@ class SqliteTaskStore:
         new_id = params.task_id or self._next_id(conn)
         conn.execute(
             """
-            INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, branch, base_branch, task_type_hint, model, provider, provider_is_explicit, model_is_explicit, recovery_origin, trigger_source, urgent, skip_learnings)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, updated_at, "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, branch, base_branch, task_type_hint, model, provider, provider_is_explicit, model_is_explicit, recovery_origin, trigger_source, urgent, skip_learnings)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 self._project_id,
@@ -5436,6 +5560,7 @@ class SqliteTaskStore:
                 params.prompt,
                 params.task_type,
                 params.based_on,
+                now,
                 now,
                 persisted_group,
                 params.depends_on,
@@ -5458,7 +5583,7 @@ class SqliteTaskStore:
                 1 if params.skip_learnings else 0,
             ),
         )
-        self._replace_task_tags_conn(conn, new_id, normalized_tags)
+        self._replace_task_tags_conn(conn, new_id, normalized_tags, touch_updated_at=False)
         row = conn.execute(
             "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
             (self._project_id, new_id),
@@ -5556,7 +5681,7 @@ class SqliteTaskStore:
         persisted_group = normalized_tags[0] if len(normalized_tags) == 1 else None
         task.tags = normalized_tags
         task.group = persisted_group
-        with self._connect() as conn:
+        with self._write_transaction() as conn:
             review_scope_to_persist = task.review_scope
             if task.id is not None and task.task_type == "rebase":
                 review_scope_to_persist = _preserve_completed_rebase_provenance_scope(
@@ -5723,7 +5848,7 @@ class SqliteTaskStore:
                 ),
             )
             if task.id is not None:
-                self._replace_task_tags_conn(conn, task.id, normalized_tags)
+                task.updated_at = self._replace_task_tags_conn(conn, task.id, normalized_tags)
 
     def delete(self, task_id: str) -> bool:
         """Delete a task by ID. Returns True if deleted."""
@@ -5837,7 +5962,7 @@ class SqliteTaskStore:
         """
         started_at = datetime.now(UTC)
         try:
-            with self._connect() as conn:
+            with self._write_transaction() as conn:
                 row = conn.execute(
                     "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
                     (self._project_id, task_id),
@@ -5872,9 +5997,14 @@ class SqliteTaskStore:
                 )
                 if cur.rowcount == 0:
                     return TaskClaimResult(task=None, refusal_reason="cas_lost")
-                claimed = self.get(task_id)
-                if claimed is None:
+                self._touch_task_updated_at(conn, task_id, now=started_at)
+                claimed_row = conn.execute(
+                    "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                    (self._project_id, task_id),
+                ).fetchone()
+                if claimed_row is None:
                     return TaskClaimResult(task=None, refusal_reason="missing")
+                claimed = self._rows_to_tasks(conn, [claimed_row])[0]
                 return TaskClaimResult(task=claimed)
         except sqlite3.OperationalError:
             # Database busy after timeout — treat as CAS loss.
@@ -5931,11 +6061,13 @@ class SqliteTaskStore:
         front of the urgent pickup lane.
         """
         bumped_at = _format_db_timestamp(datetime.now(UTC)) if urgent else None
-        with self._connect() as conn:
+        with self._write_transaction() as conn:
             cur = conn.execute(
                 "UPDATE tasks SET urgent = ?, urgent_bumped_at = ? WHERE project_id = ? AND id = ?",
                 (1 if urgent else 0, bumped_at, self._project_id, task_id),
             )
+            if cur.rowcount > 0:
+                self._touch_task_updated_at(conn, task_id)
             return cur.rowcount > 0
 
     def set_queue_position(
@@ -5958,7 +6090,7 @@ class SqliteTaskStore:
         if position < 1:
             raise ValueError("position must be >= 1")
 
-        with self._connect() as conn:
+        with self._write_transaction() as conn:
             row = conn.execute(
                 "SELECT id, queue_position FROM tasks WHERE project_id = ? AND id = ?",
                 (self._project_id, task_id),
@@ -5985,6 +6117,16 @@ class SqliteTaskStore:
                 ).fetchone()
                 max_position = int(max_position_row["max_position"] or 0)
                 desired_position = min(position, max_position + 1)
+                shifted_rows = conn.execute(
+                    f"""
+                    SELECT id
+                    FROM tasks
+                    WHERE {bucket_predicate}
+                      AND queue_position IS NOT NULL
+                      AND queue_position >= ?
+                    """,
+                    (*bucket_params, desired_position),
+                ).fetchall()
                 conn.execute(
                     f"""
                     UPDATE tasks
@@ -6007,6 +6149,18 @@ class SqliteTaskStore:
                 max_position = int(max_position_row["max_position"] or current_position)
                 desired_position = min(position, max_position)
                 if desired_position < current_position:
+                    shifted_rows = conn.execute(
+                        f"""
+                        SELECT id
+                        FROM tasks
+                        WHERE {bucket_predicate}
+                          AND queue_position IS NOT NULL
+                          AND queue_position >= ?
+                          AND queue_position < ?
+                          AND id != ?
+                        """,
+                        (*bucket_params, desired_position, current_position, task_id),
+                    ).fetchall()
                     conn.execute(
                         f"""
                         UPDATE tasks
@@ -6020,6 +6174,18 @@ class SqliteTaskStore:
                         (*bucket_params, desired_position, current_position, task_id),
                     )
                 elif desired_position > current_position:
+                    shifted_rows = conn.execute(
+                        f"""
+                        SELECT id
+                        FROM tasks
+                        WHERE {bucket_predicate}
+                          AND queue_position IS NOT NULL
+                          AND queue_position > ?
+                          AND queue_position <= ?
+                          AND id != ?
+                        """,
+                        (*bucket_params, current_position, desired_position, task_id),
+                    ).fetchall()
                     conn.execute(
                         f"""
                         UPDATE tasks
@@ -6032,11 +6198,18 @@ class SqliteTaskStore:
                         """,
                         (*bucket_params, current_position, desired_position, task_id),
                     )
+                else:
+                    shifted_rows = []
 
             cur = conn.execute(
                 "UPDATE tasks SET queue_position = ? WHERE project_id = ? AND id = ?",
                 (desired_position, self._project_id, task_id),
             )
+            if cur.rowcount > 0:
+                self._touch_tasks_updated_at(
+                    conn,
+                    (task_id, *(str(row["id"]) for row in shifted_rows)),
+                )
             return cur.rowcount > 0
 
     def clear_queue_position(
@@ -6047,7 +6220,7 @@ class SqliteTaskStore:
         any_tag: bool = False,
     ) -> bool:
         """Clear explicit queue ordering and close the bucket gap if needed."""
-        with self._connect() as conn:
+        with self._write_transaction() as conn:
             row = conn.execute(
                 "SELECT id, queue_position FROM tasks WHERE project_id = ? AND id = ?",
                 (self._project_id, task_id),
@@ -6063,6 +6236,16 @@ class SqliteTaskStore:
                 tags=tags,
                 any_tag=any_tag,
             )
+            shifted_rows = conn.execute(
+                f"""
+                SELECT id
+                FROM tasks
+                WHERE {bucket_predicate}
+                  AND queue_position IS NOT NULL
+                  AND queue_position > ?
+                """,
+                (*bucket_params, current_position),
+            ).fetchall()
             conn.execute(
                 "UPDATE tasks SET queue_position = NULL WHERE project_id = ? AND id = ?",
                 (self._project_id, task_id),
@@ -6076,6 +6259,10 @@ class SqliteTaskStore:
                   AND queue_position > ?
                 """,
                 (*bucket_params, current_position),
+            )
+            self._touch_tasks_updated_at(
+                conn,
+                (task_id, *(str(row["id"]) for row in shifted_rows)),
             )
             return True
 
@@ -6170,9 +6357,7 @@ class SqliteTaskStore:
             if status == "unmerged":
                 # Unmerged tasks: either merge_status='unmerged' (current) or
                 # legacy status='unmerged' (old data)
-                where_clauses.append(
-                    "(merge_status = 'unmerged' OR status = 'unmerged')"
-                )
+                where_clauses.append("(merge_status = 'unmerged' OR status = 'unmerged')")
             elif status:
                 where_clauses.append("status = ?")
                 params.append(status)
@@ -6188,17 +6373,13 @@ class SqliteTaskStore:
             if since is not None:
                 since_str = _format_db_timestamp(since)
                 assert since_str is not None
-                where_clauses.append(
-                    "(completed_at >= ? OR (completed_at IS NULL AND created_at >= ?))"
-                )
+                where_clauses.append("(completed_at >= ? OR (completed_at IS NULL AND created_at >= ?))")
                 params.extend([since_str, since_str])
 
             if until is not None:
                 until_str = _format_db_timestamp(until)
                 assert until_str is not None
-                where_clauses.append(
-                    "(completed_at <= ? OR (completed_at IS NULL AND created_at <= ?))"
-                )
+                where_clauses.append("(completed_at <= ? OR (completed_at IS NULL AND created_at <= ?))")
                 params.extend([until_str, until_str])
 
             where_clause = "WHERE " + " AND ".join(where_clauses)
@@ -6571,9 +6752,7 @@ class SqliteTaskStore:
             merged_at=_parse_db_timestamp(row["merged_at"]),
             merged_by_task_id=str(row["merged_by_task_id"]) if row["merged_by_task_id"] is not None else None,
             merge_source=(
-                str(row["merge_source"])
-                if "merge_source" in row.keys() and row["merge_source"] is not None
-                else None
+                str(row["merge_source"]) if "merge_source" in row.keys() and row["merge_source"] is not None else None
             ),
             pr_number=int(row["pr_number"]) if row["pr_number"] is not None else None,
             pr_state=str(row["pr_state"]) if row["pr_state"] is not None else None,
@@ -6582,7 +6761,9 @@ class SqliteTaskStore:
             diff_files_changed=int(row["diff_files_changed"]) if row["diff_files_changed"] is not None else None,
             diff_lines_added=int(row["diff_lines_added"]) if row["diff_lines_added"] is not None else None,
             diff_lines_removed=int(row["diff_lines_removed"]) if row["diff_lines_removed"] is not None else None,
-            superseded_by_unit_id=str(row["superseded_by_unit_id"]) if row["superseded_by_unit_id"] is not None else None,
+            superseded_by_unit_id=str(row["superseded_by_unit_id"])
+            if row["superseded_by_unit_id"] is not None
+            else None,
         )
 
     def _row_to_watch_progress_observation(self, row: sqlite3.Row | None) -> WatchProgressObservation | None:
@@ -6600,7 +6781,9 @@ class SqliteTaskStore:
             action_task_id=str(row["action_task_id"]) if row["action_task_id"] is not None else None,
             action_task_status=str(row["action_task_status"]) if row["action_task_status"] is not None else None,
             action_task_started_at=_parse_db_timestamp(action_task_started_at_raw),
-            action_task_running_pid=int(action_task_running_pid_raw) if action_task_running_pid_raw is not None else None,
+            action_task_running_pid=int(action_task_running_pid_raw)
+            if action_task_running_pid_raw is not None
+            else None,
             failed_task_id=str(row["failed_task_id"]) if row["failed_task_id"] is not None else None,
             recovery_task_id=str(row["recovery_task_id"]) if row["recovery_task_id"] is not None else None,
             merge_unit_id=str(row["merge_unit_id"]) if row["merge_unit_id"] is not None else None,
@@ -6629,9 +6812,7 @@ class SqliteTaskStore:
             last_failure_task_id=(
                 str(row["last_failure_task_id"]) if row["last_failure_task_id"] is not None else None
             ),
-            last_failure_reason=(
-                str(row["last_failure_reason"]) if row["last_failure_reason"] is not None else None
-            ),
+            last_failure_reason=(str(row["last_failure_reason"]) if row["last_failure_reason"] is not None else None),
             last_failure_fingerprint=str(row["last_failure_fingerprint"]),
             streak=int(row["streak"]) if row["streak"] is not None else 1,
             next_retry_at=_parse_db_timestamp(row["next_retry_at"]),
@@ -6686,9 +6867,7 @@ class SqliteTaskStore:
             auto_attempt_count=int(row["auto_attempt_count"]) if row["auto_attempt_count"] is not None else 0,
             last_auto_attempt_at=_parse_db_timestamp(row["last_auto_attempt_at"]),
             last_auto_attempt_target_sha=(
-                str(row["last_auto_attempt_target_sha"])
-                if row["last_auto_attempt_target_sha"] is not None
-                else None
+                str(row["last_auto_attempt_target_sha"]) if row["last_auto_attempt_target_sha"] is not None else None
             ),
         )
 
@@ -7521,11 +7700,7 @@ class SqliteTaskStore:
             raise
         finally:
             conn.close()
-        return [
-            finding
-            for row in resolved_rows
-            if (finding := self._row_to_behavior_check_finding(row)) is not None
-        ]
+        return [finding for row in resolved_rows if (finding := self._row_to_behavior_check_finding(row)) is not None]
 
     def try_acquire_project_lease(
         self,
@@ -7641,9 +7816,7 @@ class SqliteTaskStore:
                 (self._project_id, subject_kind, subject_id),
             ).fetchall()
         return [
-            observation
-            for row in rows
-            if (observation := self._row_to_watch_progress_observation(row)) is not None
+            observation for row in rows if (observation := self._row_to_watch_progress_observation(row)) is not None
         ]
 
     def list_all_watch_progress_observations(
@@ -7669,9 +7842,7 @@ class SqliteTaskStore:
         with self._connect() as conn:
             rows = conn.execute(query, tuple(params)).fetchall()
         return [
-            observation
-            for row in rows
-            if (observation := self._row_to_watch_progress_observation(row)) is not None
+            observation for row in rows if (observation := self._row_to_watch_progress_observation(row)) is not None
         ]
 
     def get_watch_progress_observation(
@@ -7869,9 +8040,7 @@ class SqliteTaskStore:
                 (self._project_id,),
             ).fetchall()
         return tuple(
-            state
-            for row in rows
-            if (state := self._row_to_main_verify_remediation_attempt_state(row)) is not None
+            state for row in rows if (state := self._row_to_main_verify_remediation_attempt_state(row)) is not None
         )
 
     def record_main_verify_remediation_active_task(
@@ -8075,9 +8244,13 @@ class SqliteTaskStore:
                 )
                 increment = 1 if inserted.rowcount > 0 else 0
             current_count = existing.consumed_attempt_count if existing is not None else 0
-            next_count = max(current_count, bounded_floor) + increment if increment > 0 else max(
-                current_count,
-                bounded_floor,
+            next_count = (
+                max(current_count, bounded_floor) + increment
+                if increment > 0
+                else max(
+                    current_count,
+                    bounded_floor,
+                )
             )
             next_active_task_id = existing.active_task_id if existing is not None else None
             if increment > 0 and (task_id is None or next_active_task_id == task_id):
@@ -8650,9 +8823,7 @@ class SqliteTaskStore:
         if merge_unit_state_is_inactive_tombstone(loser.state) or loser.superseded_by_unit_id is not None:
             if loser.state == requested_state and loser.superseded_by_unit_id == superseded_by_unit_id:
                 affected_task_ids = tuple(
-                    task.id
-                    for task in self.list_tasks_for_merge_unit(loser.id)
-                    if task.id is not None
+                    task.id for task in self.list_tasks_for_merge_unit(loser.id) if task.id is not None
                 )
                 return MergeUnitSupersedeResult(
                     unit_id=loser.id,
@@ -8664,11 +8835,7 @@ class SqliteTaskStore:
                 )
             raise ValueError(
                 f"Merge unit {loser.id} already resolved as {loser.state}"
-                + (
-                    f" by {loser.superseded_by_unit_id}"
-                    if loser.superseded_by_unit_id is not None
-                    else ""
-                )
+                + (f" by {loser.superseded_by_unit_id}" if loser.superseded_by_unit_id is not None else "")
             )
 
         if loser.state in MERGE_UNIT_LANDED_OR_NO_WORK_STATES:
@@ -8685,8 +8852,7 @@ class SqliteTaskStore:
                 raise ValueError(f"Winner merge unit {winner.id} is not active")
             if winner.target_branch != loser.target_branch:
                 raise ValueError(
-                    f"Winner merge unit {winner.id} targets {winner.target_branch!r}, "
-                    f"expected {loser.target_branch!r}"
+                    f"Winner merge unit {winner.id} targets {winner.target_branch!r}, expected {loser.target_branch!r}"
                 )
             if winner.superseded_by_unit_id == loser.id:
                 raise ValueError(f"Winner merge unit {winner.id} already points at loser {loser.id}")
@@ -8695,7 +8861,7 @@ class SqliteTaskStore:
         now = _format_db_timestamp(now_dt)
         assert now is not None
 
-        with self._connect() as conn:
+        with self._write_transaction() as conn:
             attached_rows = conn.execute(
                 """
                 SELECT t.*
@@ -8775,6 +8941,7 @@ class SqliteTaskStore:
                         task.id,
                     ),
                 )
+            self._touch_tasks_updated_at(conn, attached_task_ids, now=now_dt)
 
         return MergeUnitSupersedeResult(
             unit_id=loser.id,
@@ -8831,9 +8998,7 @@ class SqliteTaskStore:
         and failed.
         """
         tasks = self.list_tasks_for_merge_unit(unit.id)
-        actionable_members = [
-            task for task in tasks if _task_is_actionable_merge_unit_member(task, unit)
-        ]
+        actionable_members = [task for task in tasks if _task_is_actionable_merge_unit_member(task, unit)]
         if preferred_task_id is not None:
             preferred = next((task for task in actionable_members if task.id == preferred_task_id), None)
             if preferred is not None:
@@ -9170,7 +9335,9 @@ class SqliteTaskStore:
         related_branch_tasks = self._related_branch_tasks_for_merge_unit(task, same_branch_tasks)
         active_unit = self._resolve_related_merge_unit(related_branch_tasks)
         if active_unit is None:
-            owner_task = next((branch_task for branch_task in related_branch_tasks if task_owns_merge_status(branch_task)), task)
+            owner_task = next(
+                (branch_task for branch_task in related_branch_tasks if task_owns_merge_status(branch_task)), task
+            )
             active_unit = self.create_merge_unit(
                 source_branch=task.branch,
                 target_branch=target_branch,
@@ -9252,7 +9419,8 @@ class SqliteTaskStore:
             return
         owner = self._legacy_merge_status_owner_for_unit(unit)
         legacy_status = merge_unit_legacy_state(unit.state) if merge_unit_is_active(unit) else None
-        with self._connect() as conn:
+        with self._write_transaction() as conn:
+            affected_task_ids: list[str] = []
             for task in tasks:
                 if task.id is None:
                     continue
@@ -9291,6 +9459,8 @@ class SqliteTaskStore:
                         task.id,
                     ),
                 )
+                affected_task_ids.append(task.id)
+            self._touch_tasks_updated_at(conn, affected_task_ids)
 
     def set_merge_unit_state(
         self,
@@ -9315,9 +9485,7 @@ class SqliteTaskStore:
             raise ValueError(f"Merge unit {unit_id} not found")
         owner = self.resolve_merge_unit_owner_task(current_unit)
         owner_task_id = owner.id if owner is not None else current_unit.owner_task_id
-        typed_merged_by_task_id = (
-            cast("str | None", merged_by_task_id) if merged_by_task_id is not DB_UNSET else None
-        )
+        typed_merged_by_task_id = cast("str | None", merged_by_task_id) if merged_by_task_id is not DB_UNSET else None
         typed_merge_source = cast("str | None", merge_source) if merge_source is not DB_UNSET else None
         typed_merged_at_arg = cast("datetime | None", merged_at) if merged_at is not DB_UNSET else None
         if state != "merged":
@@ -9332,8 +9500,7 @@ class SqliteTaskStore:
         if merged_by_task_id is not DB_UNSET and typed_merged_by_task_id is not None:
             if owner_task_id is None or typed_merged_by_task_id != owner_task_id:
                 raise ValueError(
-                    f"merged_by_task_id must equal merge-unit owner {owner_task_id!r}; "
-                    f"got {typed_merged_by_task_id!r}"
+                    f"merged_by_task_id must equal merge-unit owner {owner_task_id!r}; got {typed_merged_by_task_id!r}"
                 )
         updates: list[str] = ["state = ?", "updated_at = ?"]
         params: list[object] = [state, _format_db_timestamp(now)]
@@ -9375,9 +9542,7 @@ class SqliteTaskStore:
         if sync_last_synced_at is not DB_UNSET:
             typed_sync_last_synced_at = cast("datetime | None", sync_last_synced_at)
             updates.append("sync_last_synced_at = ?")
-            params.append(
-                _format_db_timestamp(typed_sync_last_synced_at)
-            )
+            params.append(_format_db_timestamp(typed_sync_last_synced_at))
         if diff_stats is not None:
             updates.extend(
                 [
@@ -9388,7 +9553,7 @@ class SqliteTaskStore:
             )
             params.extend(diff_stats)
         params.extend([self._project_id, unit_id])
-        with self._connect() as conn:
+        with self._write_transaction() as conn:
             conn.execute(
                 f"UPDATE merge_units SET {', '.join(updates)} WHERE project_id = ? AND id = ?",
                 tuple(params),
@@ -9446,7 +9611,9 @@ class SqliteTaskStore:
             return 0
         repaired = 0
         for unit in self.list_active_merge_units(states=("unmerged",)):
-            implement_members = [task for task in self.list_tasks_for_merge_unit(unit.id) if task.task_type == "implement"]
+            implement_members = [
+                task for task in self.list_tasks_for_merge_unit(unit.id) if task.task_type == "implement"
+            ]
             if len(implement_members) < 2:
                 continue
             if not any(_task_is_successful_merge_unit_implement(task, unit) for task in implement_members):
@@ -9522,7 +9689,7 @@ class SqliteTaskStore:
                 f"""
                 SELECT *
                 FROM merge_units
-                WHERE {' AND '.join(where_parts)}
+                WHERE {" AND ".join(where_parts)}
                 ORDER BY merged_at DESC, id DESC
                 """,
                 tuple(params),
@@ -9531,9 +9698,7 @@ class SqliteTaskStore:
 
     def _get_unmerged_merge_units_with_legacy_fallback(self) -> list[MergeUnit]:
         """Return actionable merge units, lazily backfilling legacy rows when needed."""
-        units_by_id: dict[str, MergeUnit] = {
-            unit.id: unit for unit in self.get_unmerged_merge_units()
-        }
+        units_by_id: dict[str, MergeUnit] = {unit.id: unit for unit in self.get_unmerged_merge_units()}
         for task in self._legacy_unmerged_candidates():
             if task.id is None or not task.branch:
                 continue
@@ -9705,9 +9870,7 @@ class SqliteTaskStore:
                 if unit.state != "unmerged":
                     has_open_pr = unit.pr_number is not None and (unit.pr_state is None or unit.pr_state == "open")
                     needs_recent_sync = (
-                        activity_at is not None
-                        and activity_at >= recent_cutoff_dt
-                        and (unit.pr_number is not None)
+                        activity_at is not None and activity_at >= recent_cutoff_dt and (unit.pr_number is not None)
                     )
                     if not has_open_pr and not needs_recent_sync:
                         continue
@@ -9802,11 +9965,12 @@ class SqliteTaskStore:
                     )
                     return
         merged_at = _format_db_timestamp(datetime.now(UTC)) if merge_status == "merged" else None
-        with self._connect() as conn:
+        with self._write_transaction() as conn:
             conn.execute(
                 "UPDATE tasks SET merge_status = ?, merged_at = ? WHERE project_id = ? AND id = ?",
                 (merge_status, merged_at, self._project_id, task_id),
             )
+            self._touch_task_updated_at(conn, task_id)
 
     def clear_review_state(self, task_id: str) -> None:
         """Clear the review state on an implementation task.
@@ -9823,7 +9987,7 @@ class SqliteTaskStore:
 
         If task_id does not exist, this is a no-op (no error is raised).
         """
-        with self._connect() as conn:
+        with self._write_transaction() as conn:
             self._set_review_cleared_at_conn(conn, task_id, datetime.now(UTC))
 
     def _set_review_cleared_at_conn(
@@ -9839,6 +10003,7 @@ class SqliteTaskStore:
             "UPDATE tasks SET review_cleared_at = ? WHERE project_id = ? AND id = ?",
             (now, self._project_id, task_id),
         )
+        self._touch_task_updated_at(conn, task_id, now=cleared_at)
 
     def invalidate_review_state(self, task_id: str) -> None:
         """Invalidate review state on a task so it requires a new review.
@@ -9849,19 +10014,21 @@ class SqliteTaskStore:
 
         If task_id does not exist, this is a no-op (no error is raised).
         """
-        with self._connect() as conn:
+        with self._write_transaction() as conn:
             conn.execute(
                 "UPDATE tasks SET review_cleared_at = NULL WHERE project_id = ? AND id = ?",
                 (self._project_id, task_id),
             )
+            self._touch_task_updated_at(conn, task_id)
 
     def set_task_changed_diff(self, task_id: str, changed_diff: bool) -> None:
         """Persist the completed same-branch diff-change signal."""
-        with self._connect() as conn:
+        with self._write_transaction() as conn:
             conn.execute(
                 "UPDATE tasks SET changed_diff = ? WHERE project_id = ? AND id = ?",
                 (1 if changed_diff else 0, self._project_id, task_id),
             )
+            self._touch_task_updated_at(conn, task_id)
 
     def set_rebase_changed_diff(self, task_id: str, changed_diff: bool) -> None:
         """Compatibility wrapper for persisting the completed rebase diff-change signal."""
@@ -9869,21 +10036,25 @@ class SqliteTaskStore:
 
     def set_log_schema_version(self, task_id: str, version: int) -> None:
         """Set the persisted log schema marker for a task/run."""
-        with self._connect() as conn:
-            conn.execute(
+        with self._write_transaction() as conn:
+            cur = conn.execute(
                 "UPDATE tasks SET log_schema_version = ? WHERE project_id = ? AND id = ?",
                 (version, self._project_id, task_id),
             )
+            if cur.rowcount > 0:
+                self._touch_task_updated_at(conn, task_id)
 
     def set_execution_mode(self, task_id: str, mode: str | None) -> None:
         """Set persisted execution provenance mode for a task/run."""
         if mode is not None and mode not in KNOWN_EXECUTION_MODES:
             raise ValueError(f"Unknown execution mode: {mode}")
-        with self._connect() as conn:
-            conn.execute(
+        with self._write_transaction() as conn:
+            cur = conn.execute(
                 "UPDATE tasks SET execution_mode = ? WHERE project_id = ? AND id = ?",
                 (mode, self._project_id, task_id),
             )
+            if cur.rowcount > 0:
+                self._touch_task_updated_at(conn, task_id)
 
     # === Run step/substep persistence ===
 
@@ -10113,6 +10284,20 @@ class SqliteTaskStore:
                 (self._project_id,),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
+
+    def project_query_stores(self) -> tuple["SqliteTaskStore", ...]:
+        """Return query-only stores for every project represented in this database."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT DISTINCT project_id FROM tasks ORDER BY project_id ASC").fetchall()
+        return tuple(
+            SqliteTaskStore(
+                self.db_path,
+                prefix=self._prefix,
+                project_id=str(row["project_id"]),
+                open_mode="query_only",
+            )
+            for row in rows
+        )
 
     def get_impl_based_on_ids(self) -> set[str]:
         """Return the set of plan IDs that already have an implement task.
@@ -10436,11 +10621,7 @@ class SqliteTaskStore:
             return
         resolved_at = _format_db_timestamp(datetime.now(UTC))
         assert resolved_at is not None
-        query = (
-            "UPDATE task_comments "
-            "SET resolved_at = ? "
-            "WHERE project_id = ? AND task_id = ? AND resolved_at IS NULL"
-        )
+        query = "UPDATE task_comments SET resolved_at = ? WHERE project_id = ? AND task_id = ? AND resolved_at IS NULL"
         params: list[Any] = [resolved_at, self._project_id, task_id]
         if normalized_kinds is not None:
             placeholders = ", ".join("?" for _ in normalized_kinds)
@@ -10536,7 +10717,7 @@ class SqliteTaskStore:
     def replace_task_tags(self, task_id: str, tags: Iterable[str]) -> tuple[str, ...]:
         """Replace all tags on a task."""
         normalized = _normalize_tags(tags)
-        with self._connect() as conn:
+        with self._write_transaction() as conn:
             self._replace_task_tags_conn(conn, task_id, normalized)
             conn.execute(
                 'UPDATE tasks SET "group" = ? WHERE project_id = ? AND id = ?',
@@ -10573,63 +10754,66 @@ class SqliteTaskStore:
         normalized_old_tag = _normalize_tags((old_tag,))[0] if old_tag is not None else None
         changed_by_id: dict[str, bool] = {}
 
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                existing_ids = self._fetch_existing_task_ids(conn, ordered_ids)
-                current_by_id = self._fetch_tags_for_task_ids(conn, ordered_ids)
-                for task_id in ordered_ids:
-                    if task_id not in existing_ids:
-                        continue
-                    current = current_by_id.get(task_id, ())
-                    if action == "add":
-                        final_tags = _normalize_tags((*current, normalized_tag))
-                    elif action == "remove":
-                        final_tags = tuple(existing for existing in current if existing != normalized_tag)
-                    else:
-                        if normalized_old_tag is None:
-                            raise ValueError("old_tag is required for replace")
-                        final_tags = _normalize_tags(
-                            normalized_tag if existing == normalized_old_tag else existing
-                            for existing in current
-                        )
-
-                    changed = final_tags != current
-                    changed_by_id[task_id] = changed
-                    if not changed:
-                        continue
-                    self._replace_task_tags_conn(conn, task_id, final_tags)
-                    conn.execute(
-                        'UPDATE tasks SET "group" = ? WHERE project_id = ? AND id = ?',
-                        (final_tags[0] if len(final_tags) == 1 else None, self._project_id, task_id),
+        with self._write_transaction() as conn:
+            existing_ids = self._fetch_existing_task_ids(conn, ordered_ids)
+            current_by_id = self._fetch_tags_for_task_ids(conn, ordered_ids)
+            for task_id in ordered_ids:
+                if task_id not in existing_ids:
+                    continue
+                current = current_by_id.get(task_id, ())
+                if action == "add":
+                    final_tags = _normalize_tags((*current, normalized_tag))
+                elif action == "remove":
+                    final_tags = tuple(existing for existing in current if existing != normalized_tag)
+                else:
+                    if normalized_old_tag is None:
+                        raise ValueError("old_tag is required for replace")
+                    final_tags = _normalize_tags(
+                        normalized_tag if existing == normalized_old_tag else existing for existing in current
                     )
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
+
+                changed = final_tags != current
+                changed_by_id[task_id] = changed
+                if not changed:
+                    continue
+                self._replace_task_tags_conn(conn, task_id, final_tags)
+                conn.execute(
+                    'UPDATE tasks SET "group" = ? WHERE project_id = ? AND id = ?',
+                    (final_tags[0] if len(final_tags) == 1 else None, self._project_id, task_id),
+                )
 
         return changed_by_id
 
-    def get_tag_counts(self) -> dict[str, int]:
+    def get_tag_counts(self, *, all_projects: bool = False) -> dict[str, int]:
         """Return counts for every known tag."""
         if not self._query_only_supports_tags():
             return {}
         with self._connect() as conn:
-            cur = conn.execute(
-                """
-                SELECT tag, COUNT(*) AS count
-                FROM task_tags
-                WHERE project_id = ?
-                GROUP BY tag
-                ORDER BY tag ASC
-                """,
-                (self._project_id,),
-            )
+            if all_projects:
+                cur = conn.execute(
+                    """
+                    SELECT tag, COUNT(*) AS count
+                    FROM task_tags
+                    GROUP BY tag
+                    ORDER BY tag ASC
+                    """
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    SELECT tag, COUNT(*) AS count
+                    FROM task_tags
+                    WHERE project_id = ?
+                    GROUP BY tag
+                    ORDER BY tag ASC
+                    """,
+                    (self._project_id,),
+                )
             return {str(row["tag"]): int(row["count"]) for row in cur.fetchall()}
 
-    def list_tags(self) -> tuple[str, ...]:
+    def list_tags(self, *, all_projects: bool = False) -> tuple[str, ...]:
         """Return all known tags sorted alphabetically."""
-        return tuple(self.get_tag_counts().keys())
+        return tuple(self.get_tag_counts(all_projects=all_projects).keys())
 
     def get_tag_status_counts(self) -> dict[str, dict[str, int]]:
         """Return status counts for every known tag."""
@@ -10686,13 +10870,13 @@ class SqliteTaskStore:
         old_name = _normalize_tag(old_tag)
         new_name = _normalize_tag(new_tag)
 
-        with self._connect() as conn:
-            existing_old = conn.execute(
-                "SELECT COUNT(*) AS count FROM task_tags WHERE project_id = ? AND tag = ?",
+        with self._write_transaction() as conn:
+            affected_rows = conn.execute(
+                "SELECT task_id FROM task_tags WHERE project_id = ? AND tag = ? ORDER BY task_id",
                 (self._project_id, old_name),
-            ).fetchone()
-            assert existing_old is not None
-            old_count = int(existing_old["count"])
+            ).fetchall()
+            affected_task_ids = tuple(str(row["task_id"]) for row in affected_rows)
+            old_count = len(affected_task_ids)
             if old_count == 0:
                 raise ValueError(f"tag '{old_name}' not found")
 
@@ -10711,9 +10895,9 @@ class SqliteTaskStore:
                 (new_name, self._project_id, old_name),
             )
             # Keep compatibility column aligned for single-tag tasks.
-            conn.execute('UPDATE tasks SET "group" = NULL WHERE project_id = ?', (self._project_id,))
+            placeholders = ",".join("?" for _ in affected_task_ids)
             conn.execute(
-                """
+                f"""
                 UPDATE tasks
                 SET "group" = (
                     SELECT tt.tag
@@ -10723,9 +10907,11 @@ class SqliteTaskStore:
                     HAVING COUNT(*) = 1
                 )
                 WHERE project_id = ?
+                  AND id IN ({placeholders})
                 """,
-                (self._project_id,),
+                (self._project_id, *affected_task_ids),
             )
+            self._touch_tasks_updated_at(conn, affected_task_ids)
             return cur.rowcount
 
     def _find_successful_retry_task(self, task_id: str) -> Task | None:
@@ -10924,9 +11110,7 @@ class SqliteTaskStore:
     ) -> None:
         """Mark a task as completed."""
         if terminal_merge_state is not None and terminal_merge_state not in {"empty", "redundant"}:
-            raise ValueError(
-                "terminal_merge_state must be one of {'empty', 'redundant'} when provided"
-            )
+            raise ValueError("terminal_merge_state must be one of {'empty', 'redundant'} when provided")
         task.status = "completed"
         task.completed_at = datetime.now(UTC)
         task.running_pid = None
@@ -11004,8 +11188,8 @@ class SqliteTaskStore:
         lines_removed: int | None,
     ) -> None:
         """Update only the diff stats columns for a task."""
-        with self._connect() as conn:
-            conn.execute(
+        with self._write_transaction() as conn:
+            cur = conn.execute(
                 """
                 UPDATE tasks SET
                     diff_files_changed = ?,
@@ -11015,6 +11199,8 @@ class SqliteTaskStore:
                 """,
                 (files_changed, lines_added, lines_removed, self._project_id, task_id),
             )
+            if cur.rowcount > 0:
+                self._touch_task_updated_at(conn, task_id)
 
     def mark_failed(
         self,
@@ -11095,6 +11281,7 @@ class SqliteTaskStore:
 
 # === Merge status migration ===
 
+
 def needs_merge_status_migration(store: "SqliteTaskStore") -> bool:
     """Check if any tasks need merge_status backfilled."""
     if store.supports_merge_units():
@@ -11160,10 +11347,7 @@ def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
         target_branch=default_branch,
         include_diff_stats=False,
     )
-    status_by_branch = {
-        result.branch: result.merge_status
-        for result in results
-    }
+    status_by_branch = {result.branch: result.merge_status for result in results}
 
     for task in candidate_tasks:
         if task.id is None:
@@ -11360,7 +11544,7 @@ def add_task_interactive(
             print(f"  - {error}")
 
         choice = input("\n(e)dit again, (q)uit? ").strip().lower()
-        if choice == 'q':
+        if choice == "q":
             print("Task not created.")
             return None
         # Otherwise loop back to editor
@@ -11405,7 +11589,7 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
             print(f"  - {error}")
 
         choice = input("\n(e)dit again, (q)uit? ").strip().lower()
-        if choice == 'q':
+        if choice == "q":
             print("Edit cancelled.")
             return False
 
@@ -11426,8 +11610,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         }
     if local_db.resolve() == shared_db.resolve():
         raise ValueError(
-            "Active db_path already points to the legacy local DB; "
-            "set db_path to shared storage before importing."
+            "Active db_path already points to the legacy local DB; set db_path to shared storage before importing."
         )
     if _marker_matches_shared_db(config.project_dir, local_db, shared_db):
         return {
@@ -11438,23 +11621,86 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
         }
 
     task_import_columns = (
-        "id", "prompt", "status", "task_type", "slug", "branch", "log_file", "report_file", "based_on",
-        "has_commits", "duration_seconds", "num_steps_reported", "num_steps_computed", "num_turns",
-        "num_turns_reported", "num_turns_computed", "attach_count", "attach_duration_seconds", "cost_usd",
-        "created_at", "last_edited_at", "started_at", "running_pid", "completed_at", "group", "depends_on", "spec", "review_scope", "create_review",
+        "id",
+        "prompt",
+        "status",
+        "task_type",
+        "slug",
+        "branch",
+        "log_file",
+        "report_file",
+        "based_on",
+        "has_commits",
+        "duration_seconds",
+        "num_steps_reported",
+        "num_steps_computed",
+        "num_turns",
+        "num_turns_reported",
+        "num_turns_computed",
+        "attach_count",
+        "attach_duration_seconds",
+        "cost_usd",
+        "created_at",
+        "last_edited_at",
+        # updated_at is store-maintained bookkeeping rather than task content, so it
+        # is neither copied nor compared on import; comparing it would report a false
+        # conflict for rows that are otherwise byte-identical.
+        "started_at",
+        "running_pid",
+        "completed_at",
+        "group",
+        "depends_on",
+        "spec",
+        "review_scope",
+        "create_review",
         "auto_implement",
         "create_pr",
-        "same_branch", "task_type_hint", "output_content", "session_id", "pr_number", "pr_state",
-        "pr_last_synced_at", "sync_last_synced_at", "model", "provider",
-        "provider_is_explicit", "model_is_explicit", "urgent", "urgent_bumped_at", "queue_position", "input_tokens", "output_tokens",
-        "merge_status", "merged_at", "failure_reason", "completion_reason", "drop_reason", "skip_learnings", "diff_files_changed", "diff_lines_added",
-        "diff_lines_removed", "changed_diff", "review_cleared_at", "review_score",
-        "review_verify_command", "review_verify_status", "review_verify_exit_status", "review_verify_failure",
-        "review_verify_captured_at", "review_verify_head_sha", "review_verify_base_sha", "review_verify_branch",
-        "review_verify_markdown", "review_verify_cwd", "review_verify_artifact_file",
+        "same_branch",
+        "task_type_hint",
+        "output_content",
+        "session_id",
+        "pr_number",
+        "pr_state",
+        "pr_last_synced_at",
+        "sync_last_synced_at",
+        "model",
+        "provider",
+        "provider_is_explicit",
+        "model_is_explicit",
+        "urgent",
+        "urgent_bumped_at",
+        "queue_position",
+        "input_tokens",
+        "output_tokens",
+        "merge_status",
+        "merged_at",
+        "failure_reason",
+        "completion_reason",
+        "drop_reason",
+        "skip_learnings",
+        "diff_files_changed",
+        "diff_lines_added",
+        "diff_lines_removed",
+        "changed_diff",
+        "review_cleared_at",
+        "review_score",
+        "review_verify_command",
+        "review_verify_status",
+        "review_verify_exit_status",
+        "review_verify_failure",
+        "review_verify_captured_at",
+        "review_verify_head_sha",
+        "review_verify_base_sha",
+        "review_verify_branch",
+        "review_verify_markdown",
+        "review_verify_cwd",
+        "review_verify_artifact_file",
         "verify_fix_completion_outcome_json",
-        "log_schema_version", "execution_mode", "base_branch",
-        "recovery_origin", "trigger_source",
+        "log_schema_version",
+        "execution_mode",
+        "base_branch",
+        "recovery_origin",
+        "trigger_source",
     )
     task_import_columns_sql = ", ".join(f'"{c}"' if c == "group" else c for c in task_import_columns)
     legacy_task_fallbacks = {
@@ -11638,8 +11884,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
             exact_matches = [
                 row
                 for row in matches
-                if row["substep_index"] == local_row["substep_index"]
-                and row["substep_id"] == local_row["substep_id"]
+                if row["substep_index"] == local_row["substep_index"] and row["substep_id"] == local_row["substep_id"]
             ]
             identity = (
                 f"{local_row['parent_run_id']}:{local_row['parent_step_index']}:"
@@ -11682,9 +11927,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
     try:
         task_source_select_sql = _legacy_task_projection_sql()
         task_source_select_sql_qualified = _legacy_task_projection_sql(source_prefix="legacy_local.tasks")
-        local_task_rows = local_conn.execute(
-            f"SELECT {task_source_select_sql} FROM tasks ORDER BY id"
-        ).fetchall()
+        local_task_rows = local_conn.execute(f"SELECT {task_source_select_sql} FROM tasks ORDER BY id").fetchall()
 
         if dry_run:
             existing_count = 0
@@ -11771,7 +12014,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                 task_id = str(row["id"])
                 if not task_id.startswith(prefix_token):
                     continue
-                suffix = task_id[len(prefix_token):]
+                suffix = task_id[len(prefix_token) :]
                 if not suffix.isdigit():
                     continue
                 max_imported_suffix = max(max_imported_suffix, int(suffix))
@@ -11910,9 +12153,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
                         )
                 if _table_exists(local_conn, "task_comments"):
                     local_comment_columns = _table_columns(local_conn, "task_comments")
-                    local_kind_expr = (
-                        "kind" if "kind" in local_comment_columns else f"'{TASK_COMMENT_KIND_FEEDBACK}'"
-                    )
+                    local_kind_expr = "kind" if "kind" in local_comment_columns else f"'{TASK_COMMENT_KIND_FEEDBACK}'"
                     comment_rows = shared_conn.execute(
                         f"""
                         SELECT task_id, content, source, author, {local_kind_expr} AS kind, created_at, resolved_at
@@ -12007,6 +12248,7 @@ def import_legacy_local_db(config: "Config", *, dry_run: bool = False) -> dict[s
 
 # === Module-level convenience functions ===
 
+
 def _default_store() -> "SqliteTaskStore":
     """Create a SqliteTaskStore using config-derived db_path."""
     return SqliteTaskStore.default()
@@ -12037,6 +12279,7 @@ def _task_to_dict(task: "Task") -> dict:
         "output_tokens": task.output_tokens,
         "created_at": _format_db_timestamp(task.created_at),
         "last_edited_at": _format_db_timestamp(task.last_edited_at),
+        "updated_at": _format_db_timestamp(task.updated_at),
         "started_at": _format_db_timestamp(task.started_at),
         "completed_at": _format_db_timestamp(task.completed_at),
         "group": task.group,
@@ -12185,6 +12428,7 @@ def validate_prompt(prompt: str) -> list[str]:
 
 # === Manual migration v25: INTEGER PK → TEXT base36 IDs ===
 
+
 def check_migration_status(db_path: Path) -> dict:
     """Return the current schema version and any pending migrations.
 
@@ -12205,9 +12449,7 @@ def check_migration_status(db_path: Path) -> dict:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
-        cur = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
-        )
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
         if cur.fetchone() is None:
             current = 0
         else:
@@ -12254,9 +12496,7 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
     conn = sqlite3.connect(db_path, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
-        cur = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
-        )
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
         if cur.fetchone() is None:
             current = 0
         else:
@@ -12270,9 +12510,7 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
         if current > target_version:
             raise RuntimeError(f"DB is at v{current}, newer than v{target_version}")
         if current < 24 and current != 0:
-            raise RuntimeError(
-                f"DB is at v{current}. Auto-migrate to v24 first by opening the store."
-            )
+            raise RuntimeError(f"DB is at v{current}. Auto-migrate to v24 first by opening the store.")
 
         # --- backup ---
         backup_path = db_path.with_suffix(".backup.pre-v25.db")
@@ -12409,9 +12647,17 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                 )
                 """,
                 (
-                    new_id, row["prompt"], row["status"], row["task_type"], slug_val,
-                    row["branch"], row["log_file"], row["report_file"],
-                    based_on_new, row["has_commits"], row["duration_seconds"],
+                    new_id,
+                    row["prompt"],
+                    row["status"],
+                    row["task_type"],
+                    slug_val,
+                    row["branch"],
+                    row["log_file"],
+                    row["report_file"],
+                    based_on_new,
+                    row["has_commits"],
+                    row["duration_seconds"],
                     row["num_steps_reported"] if "num_steps_reported" in row.keys() else None,
                     row["num_steps_computed"] if "num_steps_computed" in row.keys() else None,
                     row["num_turns"] if "num_turns" in row.keys() else None,
@@ -12419,7 +12665,9 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
                     row["num_turns_computed"] if "num_turns_computed" in row.keys() else None,
                     row["attach_count"] if "attach_count" in row.keys() else None,
                     row["attach_duration_seconds"] if "attach_duration_seconds" in row.keys() else None,
-                    row["cost_usd"], row["created_at"], row["started_at"],
+                    row["cost_usd"],
+                    row["created_at"],
+                    row["started_at"],
                     row["running_pid"] if "running_pid" in row.keys() else None,
                     row["completed_at"],
                     row["group"],
@@ -12475,8 +12723,15 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
             for row in cur.fetchall():
                 conn.execute(
                     "INSERT INTO task_cycles_v25 (id, implementation_task_id, status, max_iterations, started_at, ended_at, stop_reason) VALUES (?,?,?,?,?,?,?)",
-                    (row["id"], _id(row["implementation_task_id"]), row["status"],
-                     row["max_iterations"], row["started_at"], row["ended_at"], row["stop_reason"]),
+                    (
+                        row["id"],
+                        _id(row["implementation_task_id"]),
+                        row["status"],
+                        row["max_iterations"],
+                        row["started_at"],
+                        row["ended_at"],
+                        row["stop_reason"],
+                    ),
                 )
         except sqlite3.OperationalError:
             logger.debug("v25 migration: task_cycles table did not exist, skipping")
@@ -12500,9 +12755,17 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
             for row in cur.fetchall():
                 conn.execute(
                     "INSERT INTO task_cycle_iterations_v25 (id, cycle_id, iteration_index, review_task_id, review_verdict, improve_task_id, state, started_at, ended_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (row["id"], row["cycle_id"], row["iteration_index"],
-                     _id(row["review_task_id"]), row["review_verdict"],
-                     _id(row["improve_task_id"]), row["state"], row["started_at"], row["ended_at"]),
+                    (
+                        row["id"],
+                        row["cycle_id"],
+                        row["iteration_index"],
+                        _id(row["review_task_id"]),
+                        row["review_verdict"],
+                        _id(row["improve_task_id"]),
+                        row["state"],
+                        row["started_at"],
+                        row["ended_at"],
+                    ),
                 )
         except sqlite3.OperationalError:
             logger.debug("v25 migration: task_cycle_iterations table did not exist, skipping")
@@ -12532,10 +12795,21 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
             for row in cur.fetchall():
                 conn.execute(
                     "INSERT INTO run_steps_v25 (id, run_id, step_index, step_id, provider, message_role, message_text, started_at, completed_at, outcome, summary, legacy_turn_id, legacy_event_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (row["id"], _id(row["run_id"]), row["step_index"], row["step_id"],
-                     row["provider"], row["message_role"], row["message_text"],
-                     row["started_at"], row["completed_at"], row["outcome"],
-                     row["summary"], row["legacy_turn_id"], row["legacy_event_id"]),
+                    (
+                        row["id"],
+                        _id(row["run_id"]),
+                        row["step_index"],
+                        row["step_id"],
+                        row["provider"],
+                        row["message_role"],
+                        row["message_text"],
+                        row["started_at"],
+                        row["completed_at"],
+                        row["outcome"],
+                        row["summary"],
+                        row["legacy_turn_id"],
+                        row["legacy_event_id"],
+                    ),
                 )
         except sqlite3.OperationalError:
             logger.debug("v25 migration: run_steps table did not exist, skipping")
@@ -12564,10 +12838,20 @@ def run_v25_migration(db_path: Path, prefix: str) -> None:
             for row in cur.fetchall():
                 conn.execute(
                     "INSERT INTO run_substeps_v25 (id, run_id, step_id, substep_index, substep_id, type, source, call_id, payload_json, timestamp, legacy_turn_id, legacy_event_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (row["id"], _id(row["run_id"]), row["step_id"], row["substep_index"],
-                     row["substep_id"], row["type"], row["source"], row["call_id"],
-                     row["payload_json"], row["timestamp"], row["legacy_turn_id"],
-                     row["legacy_event_id"]),
+                    (
+                        row["id"],
+                        _id(row["run_id"]),
+                        row["step_id"],
+                        row["substep_index"],
+                        row["substep_id"],
+                        row["type"],
+                        row["source"],
+                        row["call_id"],
+                        row["payload_json"],
+                        row["timestamp"],
+                        row["legacy_turn_id"],
+                        row["legacy_event_id"],
+                    ),
                 )
         except sqlite3.OperationalError:
             logger.debug("v25 migration: run_substeps table did not exist, skipping")
@@ -12636,9 +12920,7 @@ def run_v26_migration(db_path: Path) -> None:
         row = cur.fetchone()
         foreign_keys_original = int(row[0]) if row is not None else 1
 
-        cur = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
-        )
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
         if cur.fetchone() is None:
             current = 0
         else:
@@ -12650,9 +12932,7 @@ def run_v26_migration(db_path: Path) -> None:
         if current == target_version:
             return
         if current != 25:
-            raise RuntimeError(
-                f"v26 migration requires DB at v25; found v{current}. Run prior migrations first."
-            )
+            raise RuntimeError(f"v26 migration requires DB at v25; found v{current}. Run prior migrations first.")
 
         backup_path = db_path.with_suffix(".backup.pre-v26.db")
         if not backup_path.exists():
@@ -12880,9 +13160,7 @@ def run_v27_migration(db_path: Path) -> None:
         row = cur.fetchone()
         foreign_keys_original = int(row[0]) if row is not None else 1
 
-        cur = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
-        )
+        cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
         if cur.fetchone() is None:
             current = 0
         else:
@@ -12894,9 +13172,7 @@ def run_v27_migration(db_path: Path) -> None:
         if current == target_version:
             return
         if current != 26:
-            raise RuntimeError(
-                f"v27 migration requires DB at v26; found v{current}. Run prior migrations first."
-            )
+            raise RuntimeError(f"v27 migration requires DB at v26; found v{current}. Run prior migrations first.")
 
         backup_path = db_path.with_suffix(".backup.pre-v27.db")
         if not backup_path.exists():
@@ -12966,15 +13242,11 @@ def run_v27_migration(db_path: Path) -> None:
         """)
 
         legacy_auto_implement_expr = (
-            "auto_implement"
-            if _table_has_column(conn, "tasks", "auto_implement")
-            else "1 AS auto_implement"
+            "auto_implement" if _table_has_column(conn, "tasks", "auto_implement") else "1 AS auto_implement"
         )
         legacy_create_pr_expr = "create_pr" if _table_has_column(conn, "tasks", "create_pr") else "0 AS create_pr"
         legacy_attach_count_expr = (
-            "attach_count"
-            if _table_has_column(conn, "tasks", "attach_count")
-            else "NULL AS attach_count"
+            "attach_count" if _table_has_column(conn, "tasks", "attach_count") else "NULL AS attach_count"
         )
         legacy_attach_duration_seconds_expr = (
             "attach_duration_seconds"
@@ -13054,13 +13326,9 @@ def resolve_task_id(arg: str, project_prefix: str) -> str:
     """
     arg = arg.strip()
     if not arg:
-        raise InvalidTaskIdError(
-            f"Invalid task ID {arg!r}. Use a full prefixed task ID like '{project_prefix}-1234'."
-        )
+        raise InvalidTaskIdError(f"Invalid task ID {arg!r}. Use a full prefixed task ID like '{project_prefix}-1234'.")
     if not _FULL_TASK_ID_RE.match(arg):
-        raise InvalidTaskIdError(
-            f"Invalid task ID '{arg}'. Use a full prefixed task ID like '{project_prefix}-1234'."
-        )
+        raise InvalidTaskIdError(f"Invalid task ID '{arg}'. Use a full prefixed task ID like '{project_prefix}-1234'.")
     return arg
 
 
@@ -13102,9 +13370,7 @@ def preview_v25_migration(
     try:
         # Determine the current schema version so we can short-circuit on already-migrated DBs.
         try:
-            cur = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
-            )
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
             if cur.fetchone() is not None:
                 cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
                 row = cur.fetchone()
@@ -13148,9 +13414,7 @@ def preview_v25_migration(
                     "SELECT id FROM tasks WHERE id > ? ORDER BY RANDOM() LIMIT ?",
                     (first_rows[-1], random_sample_limit),
                 )
-                random_ids = sorted(
-                    row["id"] for row in cur3.fetchall() if isinstance(row["id"], int)
-                )
+                random_ids = sorted(row["id"] for row in cur3.fetchall() if isinstance(row["id"], int))
                 random_samples_raw = [_format_sample(old_id) for old_id in random_ids]
 
             cur2 = conn.execute("SELECT COUNT(*) AS cnt, MAX(id) AS max_id FROM tasks")
@@ -13165,11 +13429,7 @@ def preview_v25_migration(
     finally:
         conn.close()
 
-    first_post = (
-        f"{prefix}-{_encode_v25_base36(max_id + 1)}"
-        if max_id
-        else f"{prefix}-{_encode_v25_base36(1)}"
-    )
+    first_post = f"{prefix}-{_encode_v25_base36(max_id + 1)}" if max_id else f"{prefix}-{_encode_v25_base36(1)}"
     return {
         "task_count": task_count,
         "samples": samples_raw,
@@ -13194,9 +13454,7 @@ def preview_v26_migration(
     conn.row_factory = sqlite3.Row
     try:
         try:
-            cur = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
-            )
+            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
             if cur.fetchone() is not None:
                 cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
                 row = cur.fetchone()
@@ -13234,9 +13492,7 @@ def preview_v26_migration(
                 "ORDER BY RANDOM() LIMIT ?",
                 (sample_limit, random_sample_limit),
             )
-            random_ids = sorted(
-                row["id"] for row in cur2.fetchall() if isinstance(row["id"], str)
-            )
+            random_ids = sorted(row["id"] for row in cur2.fetchall() if isinstance(row["id"], str))
             random_samples = [_convert(old_id) for old_id in random_ids]
 
         cur3 = conn.execute("SELECT COUNT(*) AS cnt FROM tasks")

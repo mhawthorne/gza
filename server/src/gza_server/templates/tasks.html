@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}Tasks · gza{% endblock %}
+{% block content %}
+  <h1>Tasks</h1>
+
+  <form method="get" action="/tasks" class="filters">
+    <label>
+      Prompt
+      <input type="search" name="q" value="{{ filters.prompt }}" placeholder="Search task prompts">
+    </label>
+    <label>
+      Tags
+      <select name="tag" multiple size="5" {% if filters.untagged %}disabled{% endif %}>
+        {% for tag in known_tags %}
+          <option value="{{ tag }}" {% if tag in filters.tags %}selected{% endif %}>{{ tag }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      Status
+      <select name="status" multiple size="5">
+        {% for status in statuses %}
+          <option value="{{ status }}" {% if status in filters.statuses %}selected{% endif %}>{{ status }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      Type
+      <select name="type" multiple size="5">
+        {% for task_type in task_types %}
+          <option value="{{ task_type }}" {% if task_type in filters.task_types %}selected{% endif %}>{{ task_type }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="checkbox">
+      <input type="checkbox" name="untagged" value="true" {% if filters.untagged %}checked{% endif %}>
+      Untagged only
+    </label>
+    <label>
+      Sort
+      <select name="sort">
+        <option value="updated" {% if filters.sort == "updated" %}selected{% endif %}>Updated</option>
+        <option value="created" {% if filters.sort == "created" %}selected{% endif %}>Created</option>
+      </select>
+    </label>
+    <label>
+      Direction
+      <select name="direction">
+        <option value="desc" {% if filters.direction == "desc" %}selected{% endif %}>Newest first</option>
+        <option value="asc" {% if filters.direction == "asc" %}selected{% endif %}>Oldest first</option>
+      </select>
+    </label>
+    <div class="filter-actions">
+      <button type="submit">Apply filters</button>
+      <a href="/tasks">Clear</a>
+    </div>
+  </form>
+
+  <p>{{ rows|length }} task{% if rows|length != 1 %}s{% endif %}</p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Type</th>
+          <th>Status</th>
+          <th>Tags</th>
+          <th>Prompt</th>
+          <th><a href="{{ created_sort_url }}">Created{% if filters.sort == "created" %} {{ "↑" if filters.direction == "asc" else "↓" }}{% endif %}</a></th>
+          <th><a href="{{ updated_sort_url }}">Updated{% if filters.sort == "updated" %} {{ "↑" if filters.direction == "asc" else "↓" }}{% endif %}</a></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+          <tr data-task-id="{{ row.id }}">
+            <td><a href="/tasks/{{ row.id }}">{{ row.id }}</a></td>
+            <td>{{ row.type }}</td>
+            <td><span class="status status-{{ row.status }}">{{ row.status }}</span></td>
+            <td>
+              {% for tag in row.tags %}<span class="tag">{{ tag }}</span>{% else %}<span class="muted">—</span>{% endfor %}
+            </td>
+            <td class="prompt"><a href="/tasks/{{ row.id }}">{{ row.prompt_excerpt }}</a></td>
+            <td><time class="created" datetime="{{ row.created_at.isoformat() if row.created_at else '' }}">{{ row.created_at.strftime('%Y-%m-%d') if row.created_at else '—' }}</time></td>
+            <td><time class="updated" datetime="{{ row.updated_at.isoformat() if row.updated_at else '' }}">{{ row.age }}</time></td>
+          </tr>
+        {% else %}
+          <tr><td colspan="7" class="empty">No tasks match these filters.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endblock %}

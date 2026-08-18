@@ -45,6 +45,7 @@ from gza.db import (
     run_v26_migration,
     run_v27_migration,
     task_owns_merge_status,
+    task_updated_at,
 )
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
 from gza.review_tasks import build_auto_review_prompt
@@ -13296,3 +13297,206 @@ class TestSyncCandidates:
         candidate_ids = {task.id for task in store.get_sync_candidates(recent_days=30)}
 
         assert candidate_ids == {unit_task.id, legacy_task.id}
+
+
+class TestTaskUpdatedAt:
+    """The authoritative last-update timestamp behind `sort=updated`."""
+
+    def _store(self, tmp_path: Path) -> SqliteTaskStore:
+        return SqliteTaskStore(tmp_path / "tasks.db", prefix="gza", project_id="gza")
+
+    def _updated_at(self, store: SqliteTaskStore, task_id: str) -> datetime:
+        task = store.get(task_id)
+        assert task is not None
+        assert task.updated_at is not None
+        return task.updated_at
+
+    def test_new_task_starts_with_updated_at(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path)
+        task = store.add("Fresh task", task_type="implement")
+        assert task.id is not None
+        stored = store.get(task.id)
+        assert stored is not None
+        assert stored.updated_at is not None
+        assert task_updated_at(stored) == stored.updated_at
+
+    @pytest.mark.parametrize("previous_status", ["completed", "failed"])
+    def test_status_reset_advances_instead_of_moving_backwards(
+        self, tmp_path: Path, previous_status: str
+    ) -> None:
+        """Clearing completed_at must not make the task look older than it is."""
+        store = self._store(tmp_path)
+        task = store.add("Task that gets reset", task_type="implement")
+        assert task.id is not None
+        task.status = previous_status
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+        after_completion = task_updated_at(store.get(task.id))
+        assert after_completion is not None
+
+        reset = store.get(task.id)
+        assert reset is not None
+        reset.status = "pending"
+        reset.completed_at = None
+        store.update(reset)
+
+        after_reset = task_updated_at(store.get(task.id))
+        assert after_reset is not None
+        assert after_reset > after_completion
+
+    def test_tag_only_mutation_advances_updated_at(self, tmp_path: Path) -> None:
+        """Tag edits touch no task column, so they need an explicit advance."""
+        store = self._store(tmp_path)
+        task = store.add("Task that gets tagged", task_type="implement")
+        assert task.id is not None
+        before = task_updated_at(store.get(task.id))
+        assert before is not None
+
+        store.add_task_tags(task.id, ("fresh",))
+
+        after = task_updated_at(store.get(task.id))
+        assert after is not None
+        assert after > before
+
+    def test_bulk_tag_mutation_advances_updated_at(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path)
+        task = store.add("Task for bulk tagging", task_type="implement")
+        assert task.id is not None
+        before = task_updated_at(store.get(task.id))
+        assert before is not None
+
+        store.mutate_task_tags([task.id], action="add", tag="bulk")
+
+        after = task_updated_at(store.get(task.id))
+        assert after is not None
+        assert after > before
+
+    @pytest.mark.parametrize(
+        "mutation",
+        ["claim", "log_schema", "execution_mode", "diff_stats"],
+    )
+    def test_direct_task_mutators_advance_updated_at(self, tmp_path: Path, mutation: str) -> None:
+        store = self._store(tmp_path)
+        task = store.add("Direct mutation target", task_type="implement")
+        assert task.id is not None
+        before = self._updated_at(store, task.id)
+
+        if mutation == "claim":
+            result = store.try_mark_in_progress(task.id, 1234)
+            assert result.task is not None
+        elif mutation == "log_schema":
+            store.set_log_schema_version(task.id, 2)
+        elif mutation == "execution_mode":
+            store.set_execution_mode(task.id, "skill_inline")
+        else:
+            store.update_diff_stats(task.id, 3, 20, 4)
+
+        assert self._updated_at(store, task.id) > before
+
+    @pytest.mark.parametrize("mutation", ["reorder", "clear"])
+    def test_queue_mutators_advance_target_and_shifted_siblings(
+        self,
+        tmp_path: Path,
+        mutation: str,
+    ) -> None:
+        store = self._store(tmp_path)
+        tasks = [store.add(f"Queue task {index}") for index in range(3)]
+        task_ids = [task.id for task in tasks]
+        assert all(task_id is not None for task_id in task_ids)
+        typed_ids = [task_id for task_id in task_ids if task_id is not None]
+        for position, task_id in enumerate(typed_ids, start=1):
+            assert store.set_queue_position(task_id, position) is True
+        before = {task_id: self._updated_at(store, task_id) for task_id in typed_ids}
+
+        if mutation == "reorder":
+            assert store.set_queue_position(typed_ids[2], 1) is True
+        else:
+            assert store.clear_queue_position(typed_ids[0]) is True
+
+        for task_id in typed_ids:
+            assert self._updated_at(store, task_id) > before[task_id]
+
+    @pytest.mark.parametrize("mutation", ["supersede", "compatibility_projection"])
+    def test_merge_unit_task_mutators_advance_every_attached_task(
+        self,
+        tmp_path: Path,
+        mutation: str,
+    ) -> None:
+        store = self._store(tmp_path)
+        owner = store.add("Merge owner", task_type="implement")
+        contributor = store.add("Merge contributor", task_type="improve", based_on=owner.id)
+        assert owner.id is not None
+        assert contributor.id is not None
+        unit = store.create_merge_unit(
+            source_branch="feature/updated-at",
+            target_branch="main",
+            owner_task_id=owner.id,
+            state="unmerged",
+        )
+        store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+        store.attach_task_to_merge_unit(contributor.id, unit.id, "contributor")
+        task_ids = (owner.id, contributor.id)
+        before = {task_id: self._updated_at(store, task_id) for task_id in task_ids}
+
+        if mutation == "supersede":
+            result = store.supersede_merge_unit(unit.id)
+            assert result.changed is True
+        else:
+            store.dual_write_legacy_merge_status(unit.id)
+
+        for task_id in task_ids:
+            assert self._updated_at(store, task_id) > before[task_id]
+
+    def test_multi_task_tag_rename_advances_only_affected_tasks(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path)
+        first = store.add("First release task", tags=("release",))
+        second = store.add("Second release task", tags=("release", "backend"))
+        untouched = store.add("Untouched task", tags=("backlog",))
+        assert first.id is not None
+        assert second.id is not None
+        assert untouched.id is not None
+        before = {
+            task_id: self._updated_at(store, task_id)
+            for task_id in (first.id, second.id, untouched.id)
+        }
+
+        assert store.rename_tag("release", "launch") == 2
+
+        assert self._updated_at(store, first.id) > before[first.id]
+        assert self._updated_at(store, second.id) > before[second.id]
+        assert self._updated_at(store, untouched.id) == before[untouched.id]
+
+    def test_backdated_completion_does_not_drag_updated_at_backwards(self, tmp_path: Path) -> None:
+        """updated_at records when the row changed, not the timestamp the caller wrote."""
+        store = self._store(tmp_path)
+        task = store.add("Task with backdated completion", task_type="implement")
+        assert task.id is not None
+        before = task_updated_at(store.get(task.id))
+        assert before is not None
+
+        task.status = "completed"
+        task.completed_at = datetime(2020, 1, 1, tzinfo=UTC)
+        store.update(task)
+
+        after = task_updated_at(store.get(task.id))
+        assert after is not None
+        assert after > before
+
+    def test_legacy_row_without_updated_at_falls_back(self, tmp_path: Path) -> None:
+        """Rows predating v67 have no persisted value and use the old approximation."""
+        store = self._store(tmp_path)
+        task = store.add("Legacy row", task_type="implement")
+        assert task.id is not None
+        created = datetime(2024, 1, 1, tzinfo=UTC)
+        edited = datetime(2024, 5, 4, tzinfo=UTC)
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE tasks SET updated_at = NULL, created_at = ?, last_edited_at = ? "
+                "WHERE project_id = ? AND id = ?",
+                (created.isoformat(), edited.isoformat(), store._project_id, task.id),
+            )
+
+        stored = store.get(task.id)
+        assert stored is not None
+        assert stored.updated_at is None
+        assert task_updated_at(stored) == edited

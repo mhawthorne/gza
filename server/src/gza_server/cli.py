@@ -249,13 +249,14 @@ def _wait_for_owned_process_exit(
     state: ServerState,
     expected_start_id: str | None,
 ) -> IdentityStatus:
+    """Wait until the managed process dies or ownership is no longer verified."""
     deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
     while True:
         identity = _owned_process_status(state, expected_start_id)
         if identity is not IdentityStatus.MATCH:
             return identity
         if time.monotonic() >= deadline:
-            return IdentityStatus.MATCH
+            return identity
         time.sleep(0.05)
 
 

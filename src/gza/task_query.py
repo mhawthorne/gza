@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Literal, TypeVar
 
 from . import lineage, metrics
-from .db import SqliteTaskStore, Task as DbTask, _normalize_tags, task_id_numeric_key
+from .db import (
+    SqliteTaskStore,
+    Task as DbTask,
+    _normalize_tags,
+    task_id_numeric_key,
+    task_updated_at,
+)
 from .lifecycle_completion import task_is_complete_for_lifecycle
 from .lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows_in_read_session
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
@@ -450,8 +456,16 @@ class TaskQueryService:
         config: Any | None = None,
         git: Any | None = None,
         target_branch: str | None = None,
+        all_projects: bool = False,
     ) -> TaskQueryResult:
         """Execute a query and return projected rows."""
+        if all_projects:
+            return self._run_all_projects(
+                query,
+                config=config,
+                git=git,
+                target_branch=target_branch,
+            )
         with metrics.timer(_TASK_QUERY_METHOD_LATENCY_METRIC, labels=_TASK_QUERY_RUN_LABELS):
             projection_now = datetime.now(UTC)
             if query.scope == "lineages":
@@ -488,6 +502,37 @@ class TaskQueryService:
                 for task in tasks
             )
             return TaskQueryResult(query=query, rows=task_rows, total_count=len(all_tasks))
+
+    def _run_all_projects(
+        self,
+        query: TaskQuery,
+        *,
+        config: Any | None,
+        git: Any | None,
+        target_branch: str | None,
+    ) -> TaskQueryResult:
+        """Execute a flat task query across every project in the shared database."""
+        if query.scope != "tasks":
+            raise ValueError("all-project queries support task scope only")
+        if query.sort.field == "pickup_order":
+            raise ValueError("all-project queries do not support pickup-order sorting")
+
+        unlimited = replace(query, limit=None)
+        rows: list[TaskRow] = []
+        for project_store in self._store.project_query_stores():
+            result = TaskQueryService(project_store).run(
+                unlimited,
+                config=config,
+                git=git,
+                target_branch=target_branch,
+            )
+            rows.extend(row for row in result.rows if isinstance(row, TaskRow))
+        rows.sort(
+            key=lambda row: self._sort_key(row.task, query.sort),
+            reverse=query.sort.descending,
+        )
+        limited_rows = tuple(self._apply_limit(rows, query.limit))
+        return TaskQueryResult(query=query, rows=limited_rows, total_count=len(rows))
 
     def _collect_tasks(self, query: TaskQuery) -> list[DbTask]:
         return self._apply_limit(self._collect_tasks_unlimited(query), query.limit)
@@ -545,16 +590,12 @@ class TaskQueryService:
             )
             return [] if row is None else [row]
 
-        use_incomplete_rollup = bool(
-            query.lifecycle_state and "incomplete" in query.lifecycle_state
-        )
+        use_incomplete_rollup = bool(query.lifecycle_state and "incomplete" in query.lifecycle_state)
 
         rows: list[LineageRow]
         if use_incomplete_rollup:
             if query.task_types and len(query.task_types) > 1:
-                raise ValueError(
-                    "lineages scope with lifecycle_state=incomplete supports at most one task type"
-                )
+                raise ValueError("lineages scope with lifecycle_state=incomplete supports at most one task type")
             owner_rows, _read_context = query_lineage_owner_rows_in_read_session(
                 self._store,
                 LineageOwnerQuery(
@@ -744,8 +785,7 @@ class TaskQueryService:
                 task
                 for task in filtered
                 if any(
-                    needle in str(getattr(task, field_name, "") or "").casefold()
-                    for field_name in query.text.fields
+                    needle in str(getattr(task, field_name, "") or "").casefold() for field_name in query.text.fields
                 )
             ]
 
@@ -775,9 +815,7 @@ class TaskQueryService:
         if query.root_ids is not None:
             allowed_root_ids = set(query.root_ids)
             filtered = [
-                task
-                for task in filtered
-                if (root := _resolve_lineage_root(self._store, task)).id in allowed_root_ids
+                task for task in filtered if (root := _resolve_lineage_root(self._store, task)).id in allowed_root_ids
             ]
 
         if query.exclude_root_ids is not None:
@@ -800,37 +838,24 @@ class TaskQueryService:
             root_id = root.id
             if root_id is None:
                 return []
-            filtered = [
-                task
-                for task in filtered
-                if _resolve_lineage_root(self._store, task).id == root_id
-            ]
+            filtered = [task for task in filtered if _resolve_lineage_root(self._store, task).id == root_id]
 
         if query.exclude_lineage_of is not None:
             lineage_task = self._store.get(query.exclude_lineage_of)
             if lineage_task is not None:
                 root_id = _resolve_lineage_root(self._store, lineage_task).id
                 if root_id is not None:
-                    filtered = [
-                        task
-                        for task in filtered
-                        if _resolve_lineage_root(self._store, task).id != root_id
-                    ]
+                    filtered = [task for task in filtered if _resolve_lineage_root(self._store, task).id != root_id]
 
         if query.branch_owner_ids is not None:
             allowed_owners = set(query.branch_owner_ids)
-            filtered = [
-                task
-                for task in filtered
-                if self._resolve_branch_owner(task, query=query).id in allowed_owners
-            ]
+            filtered = [task for task in filtered if self._resolve_branch_owner(task, query=query).id in allowed_owners]
 
         if query.merge_unit_ids is not None:
             filtered = [
                 task
                 for task in filtered
-                if task.id is not None
-                and self._store.task_is_attached_to_merge_unit_ids(task.id, query.merge_unit_ids)
+                if task.id is not None and self._store.task_is_attached_to_merge_unit_ids(task.id, query.merge_unit_ids)
             ]
 
         if query.tag_filters is not None or query.exclude_tag_filters is not None:
@@ -847,9 +872,7 @@ class TaskQueryService:
 
         if query.exclude_merge_chain_state is not None:
             excluded_merge_states = set(query.exclude_merge_chain_state)
-            filtered = [
-                task for task in filtered if not self._matches_merge_chain_state(task, excluded_merge_states)
-            ]
+            filtered = [task for task in filtered if not self._matches_merge_chain_state(task, excluded_merge_states)]
 
         if query.dependency_state is not None:
             dep_states = set(query.dependency_state)
@@ -878,18 +901,12 @@ class TaskQueryService:
 
         if query.root_ids is not None:
             roots = set(query.root_ids)
-            filtered = [
-                row
-                for row in filtered
-                if _resolve_lineage_root(self._store, row.owner_task).id in roots
-            ]
+            filtered = [row for row in filtered if _resolve_lineage_root(self._store, row.owner_task).id in roots]
 
         if query.exclude_root_ids is not None:
             excluded_roots = set(query.exclude_root_ids)
             filtered = [
-                row
-                for row in filtered
-                if _resolve_lineage_root(self._store, row.owner_task).id not in excluded_roots
+                row for row in filtered if _resolve_lineage_root(self._store, row.owner_task).id not in excluded_roots
             ]
 
         if query.lineage_of is not None:
@@ -897,21 +914,13 @@ class TaskQueryService:
             if task is None:
                 return []
             root_id = _resolve_lineage_root(self._store, task).id
-            filtered = [
-                row
-                for row in filtered
-                if _resolve_lineage_root(self._store, row.owner_task).id == root_id
-            ]
+            filtered = [row for row in filtered if _resolve_lineage_root(self._store, row.owner_task).id == root_id]
 
         if query.exclude_lineage_of is not None:
             task = self._store.get(query.exclude_lineage_of)
             if task is not None:
                 root_id = _resolve_lineage_root(self._store, task).id
-                filtered = [
-                    row
-                    for row in filtered
-                    if _resolve_lineage_root(self._store, row.owner_task).id != root_id
-                ]
+                filtered = [row for row in filtered if _resolve_lineage_root(self._store, row.owner_task).id != root_id]
 
         return filtered
 
@@ -1205,6 +1214,8 @@ class TaskQueryService:
             ts = _normalize_dt(task.created_at)
         elif sort.field == "completed_at":
             ts = _normalize_dt(task.completed_at)
+        elif sort.field == "updated_at":
+            ts = _normalize_dt(task_updated_at(task))
         else:
             ts = _normalize_dt(_effective_at(task))
         return (ts, task_id_numeric_key(task.id))
@@ -1252,12 +1263,7 @@ class TaskQueryService:
         if "merged" in merge_states and owner_state == "merged":
             return True
         if "unmerged" in merge_states and (
-            owner_state == "unmerged"
-            or (
-                task.status == "unmerged"
-                and task_unit is None
-                and owner_state != "merged"
-            )
+            owner_state == "unmerged" or (task.status == "unmerged" and task_unit is None and owner_state != "merged")
         ):
             return True
         if "needs_merge" in merge_states and owner_state == "needs_merge":
@@ -1464,7 +1470,11 @@ def collect_scoped_tag_scope_gaps(
     else:
         owner_rows = tuple(owner_rows)
 
-    all_tasks = tuple(read_context.tasks) if read_context is not None and read_context.tasks is not None else tuple(store.get_all())
+    all_tasks = (
+        tuple(read_context.tasks)
+        if read_context is not None and read_context.tasks is not None
+        else tuple(store.get_all())
+    )
     members_by_owner_id = {}
     for row in owner_rows:
         owner_id = row.owner_task.id
@@ -1588,11 +1598,7 @@ def projection_fields(projection: ProjectionSpec, *, scope: QueryScope) -> tuple
         return _LINEAGE_DEFAULT_FIELDS if scope == "lineages" else _TASK_DEFAULT_FIELDS
 
     if scope == "tasks":
-        return tuple(
-            field_name
-            for field_name in preset_fields
-            if field_name not in {"member_ids", "unresolved_ids"}
-        )
+        return tuple(field_name for field_name in preset_fields if field_name not in {"member_ids", "unresolved_ids"})
     return preset_fields
 
 
@@ -1668,8 +1674,6 @@ def _flatten_lineage_tree(tree: Any) -> list[DbTask]:
     from gza.query import flatten_lineage_tree
 
     return flatten_lineage_tree(tree)
-
-
 
 
 def _query_incomplete(store: SqliteTaskStore, history_filter: Any, *, target_branch: str | None = None) -> list[Any]:

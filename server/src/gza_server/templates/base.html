@@ -4,9 +4,32 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}gza{% endblock %}</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; }
+      header, main { padding: 1rem max(1rem, calc((100vw - 76rem) / 2)); }
+      header { border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
+      a { color: inherit; }
+      .filters { display: flex; flex-wrap: wrap; gap: 1rem; align-items: end; padding: 1rem; border: 1px solid color-mix(in srgb, currentColor 20%, transparent); border-radius: .5rem; }
+      .filters label { display: grid; gap: .3rem; font-size: .85rem; font-weight: 600; }
+      .filters .checkbox { display: flex; flex-direction: row; align-items: center; padding-bottom: .5rem; }
+      input, select, button { font: inherit; padding: .4rem; }
+      .filter-actions { display: flex; gap: .75rem; align-items: center; padding-bottom: .15rem; }
+      .table-wrap { overflow-x: auto; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { padding: .7rem .5rem; text-align: left; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); vertical-align: top; }
+      th { white-space: nowrap; }
+      .prompt { min-width: 20rem; }
+      .status, .tag { display: inline-block; padding: .15rem .45rem; margin: .1rem; border-radius: 999px; background: color-mix(in srgb, currentColor 12%, transparent); font-size: .8rem; white-space: nowrap; }
+      .status { font-weight: 650; }
+      .status-failed, .status-dropped { background: color-mix(in srgb, #d33 25%, transparent); }
+      .status-completed { background: color-mix(in srgb, #2a5 25%, transparent); }
+      .muted, .empty { opacity: .65; }
+      .empty { text-align: center; padding: 2rem; }
+    </style>
   </head>
   <body>
-    <header><strong>gza</strong></header>
+    <header><strong><a href="/">gza</a></strong> · <a href="/tasks">Tasks</a></header>
     <main>{% block content %}{% endblock %}</main>
   </body>
 </html>
