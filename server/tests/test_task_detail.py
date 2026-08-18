@@ -1,10 +1,11 @@
-from datetime import UTC, datetime
+import os
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from gza_server.app import create_app
 
 from gza.db import SqliteTaskStore
-from gza_server.app import create_app
 
 
 def _client(store: SqliteTaskStore, *, project_dir: Path | None = None) -> TestClient:
@@ -47,6 +48,8 @@ def test_implement_task_detail_renders_metadata_prompt_and_full_json(tmp_path: P
     assert api_response.status_code == 200
     record = api_response.json()
     assert record["id"] == task.id
+    assert record["project_id"] == "server-test"
+    assert record["detail_url"] == f"/projects/server-test/tasks/{task.id}"
     assert record["type"] == "implement"
     assert record["task_type"] == "implement"
     assert record["prompt"] == task.prompt
@@ -97,7 +100,7 @@ def test_task_detail_links_direct_parents_and_children(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     for related in (based_on_parent, dependency_parent, based_on_child, dependency_child):
-        assert f'href="/tasks/{related.id}"' in response.text
+        assert f'href="/projects/server-test/tasks/{related.id}"' in response.text
     assert {parent["id"] for parent in record["parents"]} == {
         based_on_parent.id,
         dependency_parent.id,
@@ -136,3 +139,116 @@ def test_task_detail_resolves_task_from_another_shared_project(tmp_path: Path) -
     assert response.status_code == 200
     assert f"<h1>{beta.id}</h1>" in response.text
     assert "<h2>Beta task</h2>" in response.text
+
+
+def test_colliding_task_ids_require_project_qualification_and_keep_lineage_scoped(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "shared.db"
+    alpha_store = SqliteTaskStore(db_path, prefix="same", project_id="alpha")
+    beta_store = SqliteTaskStore(db_path, prefix="same", project_id="beta")
+    alpha_parent = alpha_store.add("Alpha parent", task_type="plan")
+    alpha = alpha_store.add("Alpha center", based_on=alpha_parent.id)
+    alpha_child = alpha_store.add("Alpha child", depends_on=alpha.id)
+    beta_parent = beta_store.add("Beta parent", task_type="plan")
+    beta = beta_store.add("Beta center", based_on=beta_parent.id)
+    beta_child = beta_store.add("Beta child", depends_on=beta.id)
+    assert alpha.id == beta.id
+    client = _client(alpha_store)
+
+    bare_html = client.get(f"/tasks/{alpha.id}")
+    bare_json = client.get(f"/api/tasks/{alpha.id}")
+    alpha_html = client.get(f"/projects/alpha/tasks/{alpha.id}")
+    alpha_json = client.get(f"/api/projects/alpha/tasks/{alpha.id}")
+    beta_html = client.get(f"/projects/beta/tasks/{beta.id}")
+    beta_json = client.get(f"/api/projects/beta/tasks/{beta.id}")
+    task_list = client.get("/tasks").text
+
+    assert bare_html.status_code == 409
+    assert "Ambiguous task ID" in bare_html.text
+    assert bare_json.status_code == 409
+    assert "ambiguous across projects: alpha, beta" in bare_json.json()["detail"]
+    assert alpha_html.status_code == beta_html.status_code == 200
+    assert "Alpha center" in alpha_html.text
+    assert "Beta center" not in alpha_html.text
+    assert "Beta center" in beta_html.text
+    assert "Alpha center" not in beta_html.text
+    assert alpha_json.json()["project_id"] == "alpha"
+    assert beta_json.json()["project_id"] == "beta"
+    assert {item["id"] for item in alpha_json.json()["parents"]} == {alpha_parent.id}
+    assert {item["id"] for item in alpha_json.json()["children"]} == {alpha_child.id}
+    assert {item["id"] for item in beta_json.json()["parents"]} == {beta_parent.id}
+    assert {item["id"] for item in beta_json.json()["children"]} == {beta_child.id}
+    assert all(
+        item["project_id"] == "alpha"
+        for item in alpha_json.json()["parents"] + alpha_json.json()["children"]
+    )
+    assert all(
+        item["project_id"] == "beta"
+        for item in beta_json.json()["parents"] + beta_json.json()["children"]
+    )
+    assert f'href="/projects/alpha/tasks/{alpha.id}"' in task_list
+    assert f'href="/projects/beta/tasks/{beta.id}"' in task_list
+
+
+def test_cross_project_plan_content_uses_owner_root_for_file_only_and_newer_file(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "shared.db"
+    server_root = tmp_path / "server-project"
+    owner_root = tmp_path / "owner-project"
+    server_root.mkdir()
+    owner_root.mkdir()
+    server_store = SqliteTaskStore(
+        db_path,
+        prefix="server",
+        project_id="server",
+        project_root=server_root,
+        project_name="Server",
+    )
+    owner_store = SqliteTaskStore(
+        db_path,
+        prefix="owner",
+        project_id="owner",
+        project_root=owner_root,
+        project_name="Owner",
+    )
+    report_dir = Path("plans")
+    (server_root / report_dir).mkdir()
+    (owner_root / report_dir).mkdir()
+
+    file_only = owner_store.add("File-only plan", task_type="plan")
+    file_only.report_file = "plans/file-only.md"
+    file_only.status = "completed"
+    file_only.completed_at = datetime.now(UTC)
+    owner_store.update(file_only)
+    (owner_root / file_only.report_file).write_text("## Owner file-only content\n")
+    (server_root / file_only.report_file).write_text("## Conflicting server file-only content\n")
+
+    newer = owner_store.add("Newer-file plan", task_type="plan")
+    newer.report_file = "plans/newer.md"
+    owner_store.mark_completed(newer, output_content="## Stale persisted content\n")
+    newer = owner_store.get(newer.id or "")
+    assert newer is not None and newer.completed_at is not None
+    owner_newer_path = owner_root / (newer.report_file or "")
+    server_newer_path = server_root / (newer.report_file or "")
+    owner_newer_path.write_text("## Owner newer file content\n")
+    server_newer_path.write_text("## Conflicting server newer content\n")
+    newer_timestamp = (newer.completed_at + timedelta(seconds=5)).timestamp()
+    os.utime(owner_newer_path, (newer_timestamp, newer_timestamp))
+    os.utime(server_newer_path, (newer_timestamp, newer_timestamp))
+
+    client = _client(server_store, project_dir=server_root)
+    cases = (
+        (file_only, "Owner file-only content", "Conflicting server file-only content"),
+        (newer, "Owner newer file content", "Conflicting server newer content"),
+    )
+    for task, expected, foreign in cases:
+        html = client.get(f"/projects/owner/tasks/{task.id}")
+        json_response = client.get(f"/api/projects/owner/tasks/{task.id}")
+
+        assert html.status_code == json_response.status_code == 200
+        assert expected in html.text
+        assert foreign not in html.text
+        assert json_response.json()["plan_content"] == f"## {expected}\n"
+        assert foreign not in json_response.json()["plan_content"]

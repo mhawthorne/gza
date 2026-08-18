@@ -15,7 +15,7 @@ from gza.db import SqliteTaskStore
 from gza.task_query import normalize_tag_filters
 
 from . import __version__
-from .task_detail import query_task_detail
+from .task_detail import AmbiguousTaskIdError, TaskDetail, query_task_detail
 from .task_list import (
     TASK_STATUSES,
     TASK_TYPES,
@@ -82,7 +82,6 @@ def create_app(
     resolve the database with gza's normal config and task-store APIs.
     """
     make_store = store_factory or (lambda: resolve_store(project_dir))
-    content_project_dir = project_dir or Path.cwd()
     server_instance_id = instance_id or os.environ.get("GZA_SERVER_INSTANCE_ID")
     app = FastAPI(title="gza-server", version=__version__)
 
@@ -139,13 +138,23 @@ def create_app(
     ) -> list[dict[str, object]]:
         return query_task_list(cast(SqliteTaskStore, make_store()), filters).rows
 
-    @app.get("/tasks/{task_id}")
-    def task_detail_page(request: Request, task_id: str):
-        detail = query_task_detail(
+    def load_task_detail(task_id: str, project_id: str | None = None) -> TaskDetail | None:
+        return query_task_detail(
             cast(SqliteTaskStore, make_store()),
             task_id,
-            project_dir=content_project_dir,
+            project_id=project_id,
         )
+
+    def render_task_detail(request: Request, task_id: str, project_id: str | None = None):
+        try:
+            detail = load_task_detail(task_id, project_id)
+        except AmbiguousTaskIdError as exc:
+            return _TEMPLATES.TemplateResponse(
+                request=request,
+                name="409.html",
+                context={"task_id": exc.task_id, "project_ids": exc.project_ids},
+                status_code=409,
+            )
         if detail is None:
             return _TEMPLATES.TemplateResponse(
                 request=request,
@@ -159,15 +168,29 @@ def create_app(
             context={"detail": detail, "task": detail.task},
         )
 
-    @app.get("/api/tasks/{task_id}")
-    def task_detail_api(task_id: str) -> dict[str, object]:
-        detail = query_task_detail(
-            cast(SqliteTaskStore, make_store()),
-            task_id,
-            project_dir=content_project_dir,
-        )
+    def task_detail_record(task_id: str, project_id: str | None = None) -> dict[str, object]:
+        try:
+            detail = load_task_detail(task_id, project_id)
+        except AmbiguousTaskIdError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if detail is None:
             raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
         return detail.json_record()
+
+    @app.get("/tasks/{task_id}")
+    def task_detail_page(request: Request, task_id: str):
+        return render_task_detail(request, task_id)
+
+    @app.get("/projects/{project_id}/tasks/{task_id}")
+    def qualified_task_detail_page(request: Request, project_id: str, task_id: str):
+        return render_task_detail(request, task_id, project_id)
+
+    @app.get("/api/tasks/{task_id}")
+    def task_detail_api(task_id: str) -> dict[str, object]:
+        return task_detail_record(task_id)
+
+    @app.get("/api/projects/{project_id}/tasks/{task_id}")
+    def qualified_task_detail_api(project_id: str, task_id: str) -> dict[str, object]:
+        return task_detail_record(task_id, project_id)
 
     return app

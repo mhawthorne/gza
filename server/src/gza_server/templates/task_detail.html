@@ -5,6 +5,7 @@
   <h1>{{ task.id }}</h1>
 
   <dl class="metadata">
+    <div><dt>Project</dt><dd>{{ detail.project_id }}</dd></div>
     <div><dt>Type</dt><dd>{{ task.task_type }}</dd></div>
     <div><dt>Status</dt><dd><span class="status status-{{ task.status }}">{{ task.status }}</span></dd></div>
     <div>
@@ -24,7 +25,7 @@
     <h3>Parents</h3>
     <ul class="lineage">
       {% for parent in detail.parents %}
-        <li><a href="/tasks/{{ parent.id }}">{{ parent.id }}</a> <span class="muted">{{ parent.task_type }} · {{ parent.relationship }}</span></li>
+        <li><a href="{{ parent.detail_url }}">{{ parent.id }}</a> <span class="muted">{{ parent.task_type }} · {{ parent.relationship }}</span></li>
       {% else %}
         <li class="muted">None</li>
       {% endfor %}
@@ -32,7 +33,7 @@
     <h3>Children</h3>
     <ul class="lineage">
       {% for child in detail.children %}
-        <li><a href="/tasks/{{ child.id }}">{{ child.id }}</a> <span class="muted">{{ child.task_type }} · {{ child.relationship }}</span></li>
+        <li><a href="{{ child.detail_url }}">{{ child.id }}</a> <span class="muted">{{ child.task_type }} · {{ child.relationship }}</span></li>
       {% else %}
         <li class="muted">None</li>
       {% endfor %}
