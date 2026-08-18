@@ -281,7 +281,13 @@ its stored action.
 - `uv run gza unstick --run` MUST preserve and render direct action outcomes from that
   scoped dispatch. A successful direct action MUST be reported as direct work, and an
   attempted direct action that remains blocked or errors MUST remain visibly blocked
-  instead of being folded into a clear-only bucket.
+  instead of being folded into a clear-only bucket. Classification MUST follow the
+  attempted execution phase, not only the top-level action name: worker-oriented launch
+  races, duplicate-child skips, and pre-spawn failures MUST NOT be rendered as direct
+  action outcomes merely because no worker was ultimately consumed. Capacity-shaped
+  worker launch races remain capacity-blocked; non-capacity worker-launch skips,
+  errors, and starts without live proof MUST render as launch-blocked instead of
+  cleared-only, with the launch diagnostic visible in command output.
 
 ## Policy knobs
 

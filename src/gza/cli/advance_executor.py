@@ -158,6 +158,7 @@ class AdvanceActionExecutionResult:
 
     action_type: str
     status: Literal["success", "skip", "error", "dry_run", "unsupported"]
+    execution_phase: Literal["direct", "worker_launch"] | None = None
     message: str = ""
     success_message: str = ""
     error_message: str = ""
@@ -489,10 +490,13 @@ def _spawn_result(
     improve_mode: str | None = None,
     failed_improve: DbTask | None = None,
 ) -> AdvanceActionExecutionResult:
+    failure_message = "" if rc == 0 else f"Failed to start {worker_label} worker for task {handled_task_id}"
     return AdvanceActionExecutionResult(
         action_type=action_type,
         status="success" if rc == 0 else "error",
-        error_message="" if rc == 0 else f"Failed to start {worker_label} worker for task {handled_task_id}",
+        execution_phase="worker_launch",
+        message=failure_message,
+        error_message=failure_message,
         worker_consuming=True,
         attempted_spawn=True,
         worker_started=rc == 0,
@@ -518,6 +522,7 @@ def _startup_preparation_failed_result(
     return AdvanceActionExecutionResult(
         action_type=action_type,
         status="error",
+        execution_phase="worker_launch",
         message=f"startup preparation failed for task {task_id}",
         error_message=f"Failed to start {worker_label} worker for task {task_id}",
         handled_task_id=task_id,
@@ -578,6 +583,7 @@ def _reserve_background_launch(
         return None, AdvanceActionExecutionResult(
             action_type=action_type,
             status="skip",
+            execution_phase="worker_launch",
             message=f"SKIP: {exc}",
             worker_label=worker_label,
         )
@@ -669,6 +675,7 @@ def _skip_duplicate_rebase_creation(
     return AdvanceActionExecutionResult(
         action_type=action_type,
         status="skip",
+        execution_phase="worker_launch",
         message=(
             f"SKIP: {format_duplicate_rebase_message(exc, parent_task_id=parent_task_id, source_branch=source_branch)}"
         ),
@@ -689,6 +696,7 @@ def _skip_duplicate_recovery_creation(
     return AdvanceActionExecutionResult(
         action_type=action_type,
         status="skip",
+        execution_phase="worker_launch",
         message=f"SKIP: {format_duplicate_active_child_message(exc, parent_task_id=task.id, task=task)}",
         worker_consuming=False,
         work_done=False,
@@ -711,6 +719,7 @@ def _worker_capacity_blocked_result(
     return AdvanceActionExecutionResult(
         action_type=action_type,
         status="skip",
+        execution_phase="worker_launch",
         message=message,
         worker_label=worker_label,
     )

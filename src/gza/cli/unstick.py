@@ -27,13 +27,27 @@ class _UnstickDirectOutcome:
 
 
 @dataclass(frozen=True)
+class _UnstickLaunchOutcome:
+    action_type: str
+    detail: str | None = None
+
+
+@dataclass(frozen=True)
 class _UnstickRunSummary:
     started_owner_ids: frozenset[str]
     capacity_blocked_owner_ids: frozenset[str]
     direct_owner_outcomes: dict[str, _UnstickDirectOutcome]
+    launch_blocked_owner_outcomes: dict[str, _UnstickLaunchOutcome]
 
 
-_ObservedRunOutcome = Literal["started", "direct", "direct_blocked", "direct_error", "capacity_blocked"]
+_ObservedRunOutcome = Literal[
+    "started",
+    "direct",
+    "direct_blocked",
+    "direct_error",
+    "capacity_blocked",
+    "launch_blocked",
+]
 
 
 def _seed_zero_slot_capacity_blocked(plan, observed: dict[str, tuple[_ObservedRunOutcome, str, str | None]]) -> None:
@@ -60,12 +74,20 @@ def _dispatch_rearmed_owners(
             started_owner_ids=frozenset(),
             capacity_blocked_owner_ids=frozenset(),
             direct_owner_outcomes={},
+            launch_blocked_owner_outcomes={},
         )
 
     snapshot = get_concurrency_snapshot(config, store, cleanup_stale=False)
     scoped_batch = min(snapshot.limit, snapshot.running + limit)
     observed: dict[str, tuple[_ObservedRunOutcome, str, str | None]] = {}
-    priority = {"direct": 0, "direct_blocked": 1, "direct_error": 1, "capacity_blocked": 2, "started": 3}
+    priority = {
+        "direct": 0,
+        "direct_blocked": 1,
+        "direct_error": 1,
+        "launch_blocked": 2,
+        "capacity_blocked": 3,
+        "started": 4,
+    }
 
     def _observe(
         owner_task_id: str,
@@ -129,6 +151,11 @@ def _dispatch_rearmed_owners(
             for owner_id, (outcome, action_type, detail) in observed.items()
             if outcome in {"direct", "direct_blocked", "direct_error"}
         },
+        launch_blocked_owner_outcomes={
+            owner_id: _UnstickLaunchOutcome(action_type=action_type, detail=detail)
+            for owner_id, (outcome, action_type, detail) in observed.items()
+            if outcome == "launch_blocked"
+        },
     )
 
 
@@ -158,6 +185,20 @@ def _print_direct_outcome_group(
         direct_detail = getattr(direct, "detail", None)
         detail = f" - {direct_detail.removeprefix('SKIP: ')}" if direct_detail else ""
         print(f"  {outcome.owner_task.id} [{reason}] {direct.action_type} {direct.status}: {prompt}{detail}")
+
+
+def _print_launch_outcome_group(
+    title: str,
+    outcomes: list[tuple[UnstickOutcome, _UnstickLaunchOutcome]],
+) -> None:
+    if not outcomes:
+        return
+    print(title)
+    for outcome, launch in outcomes:
+        prompt = truncate(outcome.owner_task.prompt, 80)
+        reason = outcome.reason_class or "unknown"
+        detail = f" - {launch.detail.removeprefix('SKIP: ')}" if launch.detail else ""
+        print(f"  {outcome.owner_task.id} [{reason}] {launch.action_type}: {prompt}{detail}")
 
 
 def cmd_unstick(args: argparse.Namespace) -> int:
@@ -205,6 +246,7 @@ def cmd_unstick(args: argparse.Namespace) -> int:
     capacity_blocked: list[UnstickOutcome] = []
     direct: list[tuple[UnstickOutcome, _UnstickDirectOutcome]] = []
     direct_blocked: list[tuple[UnstickOutcome, _UnstickDirectOutcome]] = []
+    launch_blocked: list[tuple[UnstickOutcome, _UnstickLaunchOutcome]] = []
     cleared_only: list[UnstickOutcome] = rearmed
 
     if run_cleared and rearmed:
@@ -242,28 +284,42 @@ def cmd_unstick(args: argparse.Namespace) -> int:
             and str(outcome.owner_task.id) in run_summary.direct_owner_outcomes
             and run_summary.direct_owner_outcomes[str(outcome.owner_task.id)].status != "success"
         ]
+        launch_blocked = [
+            (outcome, run_summary.launch_blocked_owner_outcomes[str(outcome.owner_task.id)])
+            for outcome in rearmed
+            if outcome.owner_task.id is not None
+            and str(outcome.owner_task.id) in run_summary.launch_blocked_owner_outcomes
+        ]
         direct_owner_ids = frozenset(run_summary.direct_owner_outcomes)
+        launch_blocked_owner_ids = frozenset(run_summary.launch_blocked_owner_outcomes)
         cleared_only = [
             outcome
             for outcome in rearmed
             if outcome.owner_task.id is None
             or str(outcome.owner_task.id)
-            not in run_summary.started_owner_ids | run_summary.capacity_blocked_owner_ids | direct_owner_ids
+            not in (
+                run_summary.started_owner_ids
+                | run_summary.capacity_blocked_owner_ids
+                | direct_owner_ids
+                | launch_blocked_owner_ids
+            )
         ]
         print(
             "Run summary: "
             f"{len(started)} started, {len(direct)} direct, {len(direct_blocked)} direct-blocked, "
-            f"{len(cleared_only)} cleared-only, {len(capacity_blocked)} capacity-blocked"
+            f"{len(launch_blocked)} launch-blocked, {len(cleared_only)} cleared-only, "
+            f"{len(capacity_blocked)} capacity-blocked"
         )
         if limit_arg is not None:
             print(f"Dispatch limit: {limit}")
     elif run_cleared:
-        print("Run summary: 0 started, 0 direct, 0 direct-blocked, 0 cleared-only, 0 capacity-blocked")
+        print("Run summary: 0 started, 0 direct, 0 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked")
 
     if run_cleared:
         _print_outcome_group("Started:", started)
         _print_direct_outcome_group("Direct:", direct)
         _print_direct_outcome_group("Direct Blocked:", direct_blocked)
+        _print_launch_outcome_group("Launch Blocked:", launch_blocked)
         _print_outcome_group("Cleared Only:", cleared_only)
         _print_outcome_group("Capacity Blocked:", capacity_blocked)
     else:

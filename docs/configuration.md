@@ -1916,6 +1916,7 @@ Plain `gza unstick` remains the clear-only / no-worker operator command. It clea
 - `started` — shared dispatch actually launched worker-consuming follow-up work
 - `direct` — shared dispatch completed direct non-worker lifecycle work, such as a green verify refresh
 - `direct-blocked` — shared dispatch attempted direct non-worker lifecycle work, but that direct action remained blocked or errored, such as a fresh red verify refresh
+- `launch-blocked` — shared dispatch attempted worker-consuming follow-up work, but launch was skipped, errored, or did not establish live worker proof
 - `cleared-only` — the owner was cleared but no worker-consuming or direct lifecycle action was attempted in that scoped pass
 - `capacity-blocked` — the next shared worker-consuming action was eligible, but no shared watch worker slots were available
 

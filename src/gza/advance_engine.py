@@ -40,6 +40,7 @@ from gza.off_topic_verify import (
     parse_review_verify_failure_set,
 )
 from gza.operator_state import terminal_no_work_lifecycle_detail
+from gza.pickup import WORKER_CONSUMING_ADVANCE_ACTION_TYPES
 from gza.plan_review_materialization import (
     build_plan_review_slice_task_specs,
     inspect_plan_review_materialization_for_repair,
@@ -221,26 +222,7 @@ FAILED_RECOVERY_RETRY_OR_REIMPLEMENT_NEXT_STEP = (
 DUPLICATE_BLOCKER_REVIEW_CYCLES = 3
 REBASE_FAILURE_CIRCUIT_BREAKER_ATTEMPTS = 3
 
-WORKER_CONSUMING_ACTIONS = frozenset(
-    {
-        "needs_rebase",
-        "create_implement",
-        "create_plan_review",
-        "run_plan_review",
-        "create_plan_improve",
-        "run_plan_improve",
-        "create_review",
-        "run_review",
-        "create_review_adjudication",
-        "run_review_adjudication",
-        "create_verify_fix",
-        "run_verify_fix",
-        "improve",
-        "run_improve",
-        "resume",
-        "retry",
-    }
-)
+WORKER_CONSUMING_ACTIONS = WORKER_CONSUMING_ADVANCE_ACTION_TYPES
 MERGEABLE_EXECUTION_STATUSES = frozenset({"completed", "unmerged"})
 VERIFY_BLOCKED_REVIEW_THRESHOLD = 2
 _LOG = logging.getLogger(__name__)

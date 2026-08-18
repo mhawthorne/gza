@@ -15309,7 +15309,7 @@ class TestIterateCommand:
         assert len(verify_calls) == 1
         assert decision.state == "passed"
         assert "Selected 1 parked owner(s)" in output
-        assert "Run summary: 0 started, 1 direct, 0 direct-blocked, 0 cleared-only, 0 capacity-blocked" in output
+        assert "Run summary: 0 started, 1 direct, 0 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
         assert "Direct:" in output
         assert f"{impl.id} [verify-fix-failed] verify_gate success" in output
 
@@ -15399,7 +15399,7 @@ class TestIterateCommand:
 
         assert result == 0
         assert len(verify_calls) == 1
-        assert "Run summary: 0 started, 1 direct, 0 direct-blocked, 0 cleared-only, 0 capacity-blocked" in output
+        assert "Run summary: 0 started, 1 direct, 0 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
         assert f"{impl.id} [verify-fix-failed] verify_gate success" in output
 
     def test_unstick_run_by_tag_invokes_fresh_verify_for_verify_fix_failed_rearm(
@@ -15450,7 +15450,7 @@ class TestIterateCommand:
         assert len(verify_calls) == 1
         assert decision.state == "passed"
         assert "Selected 1 parked owner(s)" in output
-        assert "Run summary: 0 started, 1 direct, 0 direct-blocked, 0 cleared-only, 0 capacity-blocked" in output
+        assert "Run summary: 0 started, 1 direct, 0 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
         assert "Direct:" in output
         assert f"{impl.id} [verify-fix-failed] verify_gate success" in output
 
@@ -15502,7 +15502,7 @@ class TestIterateCommand:
         assert len(verify_calls) == 1
         assert decision.state == "failed"
         assert "Selected 1 parked owner(s)" in output
-        assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 cleared-only, 0 capacity-blocked" in output
+        assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
         assert "Direct Blocked:" in output
         assert f"{impl.id} [verify-fix-failed] verify_gate blocked" in output
         assert "Started:" not in output
@@ -15647,7 +15647,7 @@ class TestIterateCommand:
         assert len(root_artifacts) == 2
         assert len(head_artifacts) == 0
         assert "Selected 1 parked owner(s)" in output
-        assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 cleared-only, 0 capacity-blocked" in output
+        assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
         assert f"{root.id} [verify-fix-failed] verify_gate blocked" in output
         assert "Started:" not in output
         assert "Cleared Only:" not in output
@@ -15708,7 +15708,7 @@ class TestIterateCommand:
         assert result == 0
         assert mock_git.worktree_add_existing.call_count == 1
         assert mock_git.worktree_remove.call_count == 1
-        assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 cleared-only, 0 capacity-blocked" in output
+        assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 launch-blocked, 0 cleared-only, 0 capacity-blocked" in output
         assert "Direct Blocked:" in output
         assert f"{impl.id} [verify-fix-failed] verify_gate blocked" in output
         assert failure_text in output
