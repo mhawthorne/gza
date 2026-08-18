@@ -9,12 +9,17 @@ import sys
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.main_integration_verify import (
+    MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+    MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+)
 from gza.runner import _make_review_verify_result
 
 from .conftest import invoke_gza, setup_config
@@ -401,6 +406,450 @@ class TestHelpOutput:
         refreshed = store.get(task.id)
         assert refreshed is not None
         assert refreshed.review_verify_status == "passed"
+
+    def test_main_verify_renders_current_red_from_structured_state_not_persisted_alert(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text(
+            (tmp_path / "gza.yaml").read_text(encoding="utf-8") + "verify_command: ./bin/tests\n",
+            encoding="utf-8",
+        )
+        state = SimpleNamespace(
+            head_sha="abc123deadbeef",
+            failing_phase="unit",
+            verify_status="failed",
+            verify_exit_status="1",
+            alert_message="main verify RED - merges halted; phase `unit` failing",
+            red_since=None,
+        )
+        check = SimpleNamespace(
+            state=state,
+            is_current=True,
+            merges_halted=True,
+            performed_verify=False,
+        )
+        fake_git = MagicMock()
+        fake_git.default_branch.return_value = "main"
+        fake_git.rev_parse_if_exists.side_effect = lambda ref: (
+            "abc123deadbeef" if ref == "refs/heads/main" else None
+        )
+
+        with (
+            patch("gza.cli.watch.Git", return_value=fake_git),
+            patch("gza.cli.watch.check_main_integration_verify", return_value=check),
+        ):
+            result = invoke_gza("main-verify", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert result.stdout.strip() == "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing"
+
+    def test_main_verify_weakens_cached_red_when_exact_target_ref_advanced(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text(
+            (tmp_path / "gza.yaml").read_text(encoding="utf-8") + "verify_command: ./bin/tests\n",
+            encoding="utf-8",
+        )
+        state = SimpleNamespace(
+            head_sha="aaaaaaaaaaaa1111",
+            failing_phase="unit",
+            verify_status="failed",
+            verify_exit_status="1",
+            alert_message="main verify RED - merges halted; phase `unit` failing",
+            red_since=None,
+        )
+        check = SimpleNamespace(
+            state=state,
+            is_current=True,
+            merges_halted=True,
+            performed_verify=False,
+        )
+        fake_git = MagicMock()
+        fake_git.default_branch.return_value = "main"
+        fake_git.rev_parse_if_exists.side_effect = lambda ref: (
+            "bbbbbbbbbbbb2222" if ref == "refs/heads/main" else None
+        )
+
+        with (
+            patch("gza.cli.watch.Git", return_value=fake_git),
+            patch("gza.cli.watch.check_main_integration_verify", return_value=check),
+        ):
+            result = invoke_gza("main-verify", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert result.stdout.strip() == (
+            "main verify red evidence stale at current HEAD; recorded target SHA no longer current"
+        )
+        assert "aaaaaaaaaaaa" not in result.stdout
+        assert "merges halted" not in result.stdout
+        fake_git.rev_parse_if_exists.assert_any_call("refs/heads/main")
+
+    def test_main_verify_fails_closed_for_malformed_unclassified_cached_halt(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text(
+            (tmp_path / "gza.yaml").read_text(encoding="utf-8") + "verify_command: ./bin/tests\n",
+            encoding="utf-8",
+        )
+        state = SimpleNamespace(
+            head_sha="aaaaaaaaaaaa1111",
+            failing_phase=None,
+            verify_status=7,
+            verify_exit_status="1",
+            alert_message="main verify RED at `aaaaaaaaaaaa` - merges halted; phase `unit` failing",
+            red_since=None,
+        )
+        check = SimpleNamespace(
+            state=state,
+            is_current=True,
+            merges_halted=True,
+            performed_verify=False,
+        )
+        fake_git = MagicMock()
+        fake_git.default_branch.return_value = "main"
+        fake_git.rev_parse_if_exists.side_effect = lambda ref: (
+            "aaaaaaaaaaaa1111" if ref == "refs/heads/main" else None
+        )
+
+        with (
+            patch("gza.cli.watch.Git", return_value=fake_git),
+            patch("gza.cli.watch.check_main_integration_verify", return_value=check),
+        ):
+            result = invoke_gza("main-verify", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert result.stdout.strip() == (
+            "main verify evidence unknown for current HEAD; invalid verify status evidence"
+        )
+        assert "aaaaaaaaaaaa" not in result.stdout
+        assert "RED" not in result.stdout
+        assert "merges halted" not in result.stdout
+
+    def test_main_verify_fails_closed_for_missing_cached_halt_evidence(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text(
+            (tmp_path / "gza.yaml").read_text(encoding="utf-8") + "verify_command: ./bin/tests\n",
+            encoding="utf-8",
+        )
+        state = SimpleNamespace(
+            gate_enabled=True,
+            head_sha="aaaaaaaaaaaa1111",
+            failing_phase=None,
+            verify_status=None,
+            verify_exit_status="1",
+            alert_message=None,
+            red_since=None,
+        )
+        check = SimpleNamespace(
+            state=state,
+            is_current=True,
+            merges_halted=True,
+            performed_verify=False,
+        )
+        fake_git = MagicMock()
+        fake_git.default_branch.return_value = "main"
+        fake_git.rev_parse_if_exists.side_effect = lambda ref: (
+            "aaaaaaaaaaaa1111" if ref == "refs/heads/main" else None
+        )
+
+        with (
+            patch("gza.cli.watch.Git", return_value=fake_git),
+            patch("gza.cli.watch.check_main_integration_verify", return_value=check),
+        ):
+            result = invoke_gza("main-verify", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert result.stdout.strip() == "main verify evidence unknown for current HEAD; verify status unavailable"
+        assert "aaaaaaaaaaaa" not in result.stdout
+        assert "RED" not in result.stdout
+        assert "merges halted" not in result.stdout
+
+    def test_main_verify_propagates_target_lookup_programming_errors(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text(
+            (tmp_path / "gza.yaml").read_text(encoding="utf-8") + "verify_command: ./bin/tests\n",
+            encoding="utf-8",
+        )
+        state = SimpleNamespace(
+            head_sha="aaaaaaaaaaaa1111",
+            failing_phase="unit",
+            verify_status="failed",
+            verify_exit_status="1",
+            alert_message="main verify RED - merges halted; phase `unit` failing",
+            red_since=None,
+        )
+        check = SimpleNamespace(
+            state=state,
+            is_current=True,
+            merges_halted=True,
+            performed_verify=False,
+        )
+        fake_git = MagicMock()
+        fake_git.default_branch.return_value = "main"
+        fake_git.rev_parse_if_exists.side_effect = AssertionError("programming contract failed")
+
+        with (
+            patch("gza.cli.watch.Git", return_value=fake_git),
+            patch("gza.cli.watch.check_main_integration_verify", return_value=check),
+            pytest.raises(AssertionError, match="programming contract failed"),
+        ):
+            invoke_gza("main-verify", "--project", str(tmp_path))
+
+    def test_main_verify_renders_current_freshness_unavailable_with_proven_target(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text(
+            (tmp_path / "gza.yaml").read_text(encoding="utf-8") + "verify_command: ./bin/tests\n",
+            encoding="utf-8",
+        )
+        state = SimpleNamespace(
+            head_sha="feedfacecafebeef",
+            failing_phase=None,
+            verify_status="unavailable",
+            verify_exit_status=MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+            alert_message="main verify freshness unproven; exact tree fingerprint unavailable",
+            red_since=None,
+        )
+        check = SimpleNamespace(
+            state=state,
+            is_current=True,
+            merges_halted=True,
+            performed_verify=True,
+        )
+        fake_git = MagicMock()
+        fake_git.default_branch.return_value = "main"
+        fake_git.rev_parse_if_exists.side_effect = lambda ref: (
+            "feedfacecafebeef" if ref == "refs/heads/main" else None
+        )
+
+        with (
+            patch("gza.cli.watch.Git", return_value=fake_git),
+            patch("gza.cli.watch.check_main_integration_verify", return_value=check),
+        ):
+            result = invoke_gza("main-verify", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert result.stdout.strip() == (
+            "main verify freshness unproven at `feedfacecafe` - merges halted; "
+            "exact tree fingerprint unavailable"
+        )
+
+    def test_main_verify_sanitizes_structured_launch_failure_with_legacy_red_alert(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text(
+            (tmp_path / "gza.yaml").read_text(encoding="utf-8") + "verify_command: ./bin/tests\n",
+            encoding="utf-8",
+        )
+        state = SimpleNamespace(
+            head_sha="feedfacecafebeef",
+            failing_phase="unit",
+            verify_status="unavailable",
+            verify_exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+            alert_message="main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
+            red_since=None,
+        )
+        check = SimpleNamespace(
+            state=state,
+            is_current=True,
+            merges_halted=False,
+            performed_verify=True,
+        )
+        fake_git = MagicMock()
+        fake_git.default_branch.return_value = "main"
+        fake_git.rev_parse_if_exists.return_value = None
+
+        with (
+            patch("gza.cli.watch.Git", return_value=fake_git),
+            patch("gza.cli.watch.check_main_integration_verify", return_value=check),
+        ):
+            result = invoke_gza("main-verify", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == (
+            "main verify misconfigured - verify command launch failed; fix the environment, not the code"
+        )
+        assert "main verify RED" not in result.stdout
+        assert "merges halted" not in result.stdout
+        assert "feedfacecafe" not in result.stdout
+
+    def test_main_verify_renders_current_unknown_status_as_unknown_evidence(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text(
+            (tmp_path / "gza.yaml").read_text(encoding="utf-8") + "verify_command: ./bin/tests\n",
+            encoding="utf-8",
+        )
+        state = SimpleNamespace(
+            gate_enabled=True,
+            head_sha="feedfacecafebeef",
+            failing_phase="unit",
+            verify_status="mystery",
+            verify_exit_status="42",
+            alert_message="main verify RED at `feedfacecafe` - merges halted; phase `unit` failing",
+            red_since=None,
+        )
+        check = SimpleNamespace(
+            state=state,
+            is_current=True,
+            merges_halted=True,
+            performed_verify=False,
+        )
+        fake_git = MagicMock()
+        fake_git.default_branch.return_value = "main"
+        fake_git.rev_parse_if_exists.side_effect = lambda ref: (
+            "feedfacecafebeef" if ref == "refs/heads/main" else None
+        )
+
+        with (
+            patch("gza.cli.watch.Git", return_value=fake_git),
+            patch("gza.cli.watch.check_main_integration_verify", return_value=check),
+        ):
+            result = invoke_gza("main-verify", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert result.stdout.strip() == (
+            "main verify evidence unknown for current HEAD; unrecognized verify status `mystery`"
+        )
+        assert "feedfacecafe" not in result.stdout
+        assert "main verify RED" not in result.stdout
+        assert "merges halted" not in result.stdout
+
+    @pytest.mark.parametrize(
+        ("state_kwargs", "expected"),
+        [
+            (
+                {"gate_enabled": True, "verify_status": "passed", "verify_exit_status": "0"},
+                "main verify passed; cached result still current and merges allowed",
+            ),
+            (
+                {"gate_enabled": False, "verify_status": "unavailable", "verify_exit_status": "not configured"},
+                "main verify disabled; merges allowed",
+            ),
+        ],
+    )
+    def test_main_verify_ignores_incompatible_legacy_attention_for_non_attention_states(
+        self,
+        tmp_path: Path,
+        state_kwargs: dict[str, object],
+        expected: str,
+    ) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text(
+            (tmp_path / "gza.yaml").read_text(encoding="utf-8") + "verify_command: ./bin/tests\n",
+            encoding="utf-8",
+        )
+        state = SimpleNamespace(
+            head_sha="feedfacecafebeef",
+            failing_phase="unit",
+            failure_signature="phase:unit",
+            alert_message=(
+                "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing; "
+                "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
+                "human intervention required"
+            ),
+            red_since=None,
+            **state_kwargs,
+        )
+        check = SimpleNamespace(
+            state=state,
+            is_current=True,
+            merges_halted=False,
+            performed_verify=False,
+        )
+        fake_git = MagicMock()
+        fake_git.default_branch.return_value = "main"
+        fake_git.rev_parse_if_exists.return_value = "feedfacecafebeef"
+
+        with (
+            patch("gza.cli.watch.Git", return_value=fake_git),
+            patch("gza.cli.watch.check_main_integration_verify", return_value=check),
+        ):
+            result = invoke_gza("main-verify", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        assert result.stdout.strip() == expected
+        assert "feedfacecafe" not in result.stdout
+        assert "main verify RED" not in result.stdout
+        assert "merges halted" not in result.stdout
+        assert "human intervention" not in result.stdout
+
+    @pytest.mark.parametrize(
+        ("verify_exit_status", "expected", "returncode"),
+        [
+            (
+                MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+                (
+                    "main verify freshness unproven at `feedfacecafe` - merges halted; "
+                    "exact tree fingerprint unavailable"
+                ),
+                1,
+            ),
+            (
+                MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+                "main verify misconfigured - verify command launch failed; fix the environment, not the code",
+                0,
+            ),
+        ],
+    )
+    def test_main_verify_prefers_structured_special_status_over_legacy_exhaustion(
+        self,
+        tmp_path: Path,
+        verify_exit_status: str,
+        expected: str,
+        returncode: int,
+    ) -> None:
+        setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text(
+            (tmp_path / "gza.yaml").read_text(encoding="utf-8") + "verify_command: ./bin/tests\n",
+            encoding="utf-8",
+        )
+        state = SimpleNamespace(
+            gate_enabled=True,
+            head_sha="feedfacecafebeef",
+            failing_phase="unit",
+            failure_signature="phase:unit",
+            verify_status="unavailable",
+            verify_exit_status=verify_exit_status,
+            alert_message=(
+                "main verify RED at `feedfacecafe` - merges halted; phase `unit` failing; "
+                "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
+                "human intervention required"
+            ),
+            red_since=None,
+        )
+        check = SimpleNamespace(
+            state=state,
+            is_current=True,
+            merges_halted=verify_exit_status != MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+            performed_verify=True,
+        )
+        fake_git = MagicMock()
+        fake_git.default_branch.return_value = "main"
+        fake_git.rev_parse_if_exists.return_value = "feedfacecafebeef"
+
+        with (
+            patch("gza.cli.watch.Git", return_value=fake_git),
+            patch("gza.cli.watch.check_main_integration_verify", return_value=check),
+        ):
+            result = invoke_gza("main-verify", "--project", str(tmp_path))
+
+        assert result.returncode == returncode
+        assert result.stdout.strip() == expected
+        assert "human intervention" not in result.stdout
+        if verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS:
+            assert "feedfacecafe" not in result.stdout
+            assert "main verify RED" not in result.stdout
+            assert "merges halted" not in result.stdout
 
     def test_flaky_reproduce_help_and_dispatch_are_registered(self, tmp_path, monkeypatch):
         """`gza flaky reproduce` should be visible in help and dispatch through the live parser."""

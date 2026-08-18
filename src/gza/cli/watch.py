@@ -93,6 +93,8 @@ from ..main_verify_format import (
     format_main_verify_status_message,
     format_red_duration as _shared_format_red_duration,
     main_verify_state_failure_signature,
+    main_verify_state_gate_disabled,
+    main_verify_state_halts_merges,
     main_verify_state_is_freshness_unavailable,
     main_verify_state_is_red_verdict,
     main_verify_state_is_remediation_exhausted,
@@ -3222,7 +3224,7 @@ def _main_verify_ordinary_attention_key(state: Any) -> str | None:
 
 
 def _main_verify_exhausted_attention_key(state: Any) -> str | None:
-    if main_verify_state_is_remediation_exhausted(state):
+    if _main_verify_state_has_active_exhausted_remediation_attention(state):
         signature = main_verify_state_failure_signature(state)
         if signature:
             return f"main-verify-remediation-exhausted:{signature}"
@@ -3231,6 +3233,27 @@ def _main_verify_exhausted_attention_key(state: Any) -> str | None:
 
 def _main_verify_attention_key(state: Any) -> str | None:
     return _main_verify_exhausted_attention_key(state) or _main_verify_ordinary_attention_key(state)
+
+
+def _main_verify_state_has_active_exhausted_remediation_attention(state: Any) -> bool:
+    return (
+        main_verify_state_is_remediation_exhausted(state)
+        and main_verify_state_halts_merges(state)
+        and not main_verify_state_is_freshness_unavailable(state)
+        and not main_verify_state_needs_non_red_attention(state)
+    )
+
+
+def _main_verify_state_should_surface_attention(state: Any) -> bool:
+    if main_verify_state_gate_disabled(state):
+        return False
+    return (
+        main_verify_state_halts_merges(state)
+        or main_verify_state_needs_non_red_attention(state)
+        or _main_verify_state_has_active_exhausted_remediation_attention(state)
+        or main_verify_state_is_freshness_unavailable(state)
+        or main_verify_state_is_red_verdict(state)
+    )
 
 
 def _clear_main_verify_counterpart_attention(*, log: "_WatchLog", state: Any, attention_key: str) -> None:
@@ -3256,6 +3279,9 @@ def _emit_main_verify_attention(
     task_id = getattr(task, "id", None)
     if task_id is None:
         return
+    if not _main_verify_state_should_surface_attention(state):
+        _clear_main_verify_attention(log=log, state=state)
+        return
     attention_key = _main_verify_attention_key(state)
     if attention_key is None:
         return
@@ -3279,6 +3305,13 @@ def _emit_main_verify_attention(
                 message=format_main_verify_status_message(state, target_proof=head_status),
             )
             return
+    if main_verify_state_halts_merges(state):
+        head_status = resolve_main_verify_target_proof(state, git=git, target_branch=target_branch)
+        log.emit_attention(
+            attention_key=attention_key,
+            message=format_main_verify_status_message(state, target_proof=head_status, now=now),
+        )
+        return
     log.emit_attention(
         attention_key=attention_key,
         message=format_main_verify_status_message(state, target_proof="current", now=now),
@@ -3307,6 +3340,9 @@ def _finalize_main_verify_attention(
     target_branch: str | None = None,
 ) -> None:
     if state is None:
+        return
+    if not _main_verify_state_should_surface_attention(state):
+        _clear_main_verify_attention(log=log, state=state)
         return
     attention_key = _main_verify_attention_key(state)
     if attention_key is None:
@@ -3339,6 +3375,13 @@ def _finalize_main_verify_attention(
         )
         return
     if not main_verify_state_is_red_verdict(state):
+        if main_verify_state_halts_merges(state):
+            head_status = resolve_main_verify_target_proof(state, git=git, target_branch=target_branch)
+            log.emit_attention(
+                attention_key=attention_key,
+                message=format_main_verify_status_message(state, target_proof=head_status, now=now),
+            )
+            return
         _clear_main_verify_attention(log=log, state=state)
         return
     head_status = resolve_main_verify_target_proof(state, git=git, target_branch=target_branch)
@@ -10229,8 +10272,17 @@ def cmd_main_verify(args: argparse.Namespace) -> int:
         force=bool(getattr(args, "force", False)),
         red_reruns=2 if bool(getattr(args, "force", False)) else 0,
     )
-    status = check.state.verify_status or "unknown"
-    phase = f" phase={check.state.failing_phase}" if check.state.failing_phase else ""
+    verify_status = getattr(check.state, "verify_status", None)
+    status = verify_status if isinstance(verify_status, str) and verify_status else "unknown"
+    failing_phase = getattr(check.state, "failing_phase", None)
+    phase = (
+        f" phase={failing_phase}"
+        if isinstance(failing_phase, str)
+        and failing_phase
+        and status not in {"passed", "unavailable"}
+        and getattr(check.state, "gate_enabled", None) is not False
+        else ""
+    )
     if check.merges_halted:
         target_proof = resolve_main_verify_target_proof(check.state, git=git, target_branch=target_branch)
         print(
@@ -10241,9 +10293,12 @@ def cmd_main_verify(args: argparse.Namespace) -> int:
             )
         )
         return 1
-    if check.state.alert_message:
+    if _main_verify_state_should_surface_attention(check.state):
         target_proof = resolve_main_verify_target_proof(check.state, git=git, target_branch=target_branch)
         print(format_main_verify_status_message(check.state, target_proof=target_proof))
+        return 0
+    if getattr(check.state, "gate_enabled", None) is False:
+        print("main verify disabled; merges allowed")
         return 0
     print(
         f"main verify {status}{phase}; merges allowed"

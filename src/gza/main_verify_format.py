@@ -17,14 +17,26 @@ MainVerifyTargetProof = Literal["current", "stale", "unproven"]
 
 _MAIN_VERIFY_REMEDIATION_EXHAUSTED_ATTENTION_RE = re.compile(
     r"automatic remediation exhausted after (?P<attempts>\d+/\d+) attempts"
-    r"(?: for (?P<signature>.+?) on [^;]+)?"
+    r"(?: for (?P<signature>.+?) on (?P<fingerprint>.+?))?(?:;|$)"
 )
+_MAIN_VERIFY_RECOGNIZED_RED_STATUSES = frozenset({"failed"})
+_MAIN_VERIFY_KNOWN_NON_RED_STATUSES = frozenset({"passed", "unavailable"})
+_MAIN_VERIFY_STATUS_ABSENT = object()
 
 
 @dataclass(frozen=True)
 class MainVerifyRemediationExhaustion:
     attempts: str
     signature: str | None
+    fingerprint: str | None = None
+
+
+@dataclass(frozen=True)
+class MainVerifyStatusClassification:
+    """Normalized structured/legacy status evidence for a main-verify state."""
+
+    kind: Literal["valid", "legacy_absent", "absent", "missing", "invalid"]
+    status: str | None = None
 
 
 def parse_main_verify_remediation_exhaustion_message(message: Any) -> MainVerifyRemediationExhaustion | None:
@@ -38,11 +50,12 @@ def parse_main_verify_remediation_exhaustion_message(message: Any) -> MainVerify
     return MainVerifyRemediationExhaustion(
         attempts=exhausted_match.group("attempts"),
         signature=signature.strip() if isinstance(signature, str) and signature.strip() else None,
+        fingerprint=exhausted_match.group("fingerprint"),
     )
 
 
 def main_verify_state_is_remediation_exhausted(state: Any) -> bool:
-    return parse_main_verify_remediation_exhaustion_message(getattr(state, "alert_message", None)) is not None
+    return main_verify_state_exhausted_remediation_attention(state) is not None
 
 
 def format_red_duration(red_since: datetime, now: datetime) -> str:
@@ -61,10 +74,7 @@ def main_verify_state_failure_signature(state: Any) -> str | None:
     signature = getattr(state, "failure_signature", None)
     if isinstance(signature, str) and signature:
         return signature
-    message = getattr(state, "alert_message", None) or ""
-    if not isinstance(message, str):
-        return None
-    exhausted = parse_main_verify_remediation_exhaustion_message(message)
+    exhausted = main_verify_state_exhausted_remediation_attention(state)
     if exhausted is not None:
         return exhausted.signature
     failing_phase = getattr(state, "failing_phase", None)
@@ -81,12 +91,56 @@ def main_verify_state_is_freshness_unavailable(state: Any) -> bool:
     return getattr(state, "verify_exit_status", None) == MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
 
 
-def main_verify_state_is_red_verdict(state: Any) -> bool:
+def main_verify_state_status_classification(state: Any) -> MainVerifyStatusClassification:
+    verify_status = getattr(state, "verify_status", _MAIN_VERIFY_STATUS_ABSENT)
     message = getattr(state, "alert_message", None)
+    has_legacy_attention = isinstance(message, str) and (
+        message.startswith("main verify RED") or parse_main_verify_remediation_exhaustion_message(message) is not None
+    )
+    if isinstance(verify_status, str):
+        if verify_status:
+            return MainVerifyStatusClassification("valid", verify_status)
+        return MainVerifyStatusClassification("invalid")
+    if verify_status is _MAIN_VERIFY_STATUS_ABSENT:
+        if has_legacy_attention:
+            return MainVerifyStatusClassification("legacy_absent")
+        return MainVerifyStatusClassification("absent")
+    if verify_status is None:
+        if has_legacy_attention:
+            return MainVerifyStatusClassification("legacy_absent")
+        return MainVerifyStatusClassification("missing")
+    return MainVerifyStatusClassification("invalid")
+
+
+def main_verify_state_gate_disabled(state: Any) -> bool:
+    return getattr(state, "gate_enabled", None) is False
+
+
+def main_verify_state_exhausted_remediation_attention(state: Any) -> MainVerifyRemediationExhaustion | None:
+    if main_verify_state_gate_disabled(state):
+        return None
+    verify_exit_status = getattr(state, "verify_exit_status", None)
+    if verify_exit_status in {
+        MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+        MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+    }:
+        return None
+    status_classification = main_verify_state_status_classification(state)
+    if status_classification.kind == "invalid":
+        return None
+    if (
+        status_classification.kind == "valid"
+        and status_classification.status not in _MAIN_VERIFY_RECOGNIZED_RED_STATUSES
+    ):
+        return None
+    return parse_main_verify_remediation_exhaustion_message(getattr(state, "alert_message", None))
+
+
+def main_verify_state_is_red_verdict(state: Any) -> bool:
+    if main_verify_state_gate_disabled(state):
+        return False
     if main_verify_state_is_remediation_exhausted(state):
         return False
-    if isinstance(message, str) and message.startswith("main verify RED"):
-        return True
     verify_status = getattr(state, "verify_status", None)
     verify_exit_status = getattr(state, "verify_exit_status", None)
     if verify_exit_status in {
@@ -94,14 +148,46 @@ def main_verify_state_is_red_verdict(state: Any) -> bool:
         MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     }:
         return False
-    return isinstance(verify_status, str) and verify_status not in {"passed", "unavailable"}
+    status_classification = main_verify_state_status_classification(state)
+    verify_status = status_classification.status
+    if status_classification.kind == "valid" and verify_status in _MAIN_VERIFY_RECOGNIZED_RED_STATUSES:
+        return True
+    if (
+        status_classification.kind in {"invalid", "missing", "absent"}
+        or verify_status in _MAIN_VERIFY_KNOWN_NON_RED_STATUSES
+        or (status_classification.kind == "valid" and verify_status is not None)
+    ):
+        return False
+    message = getattr(state, "alert_message", None)
+    if isinstance(message, str) and message.startswith("main verify RED"):
+        return True
+    return False
 
 
 def main_verify_state_needs_non_red_attention(state: Any) -> bool:
-    message = getattr(state, "alert_message", None)
-    if not isinstance(message, str) or not message:
+    return (
+        not main_verify_state_gate_disabled(state)
+        and getattr(state, "verify_exit_status", None) == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+    )
+
+
+def main_verify_state_halts_merges(state: Any) -> bool:
+    status_classification = main_verify_state_status_classification(state)
+    if status_classification.kind == "absent":
         return False
-    return getattr(state, "verify_exit_status", None) == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+    return _verify_result_halts_merges(
+        status=status_classification.status,
+        gate_enabled=getattr(state, "gate_enabled", None) is not False,
+        exit_status=getattr(state, "verify_exit_status", None),
+    )
+
+
+def _verify_result_halts_merges(*, status: str | None, gate_enabled: bool, exit_status: str | None) -> bool:
+    if not gate_enabled or status == "passed":
+        return False
+    if exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS:
+        return False
+    return True
 
 
 def resolve_main_verify_target_proof(
@@ -155,6 +241,25 @@ def _format_unproven_freshness_unavailable_message(state: Any) -> str:
     return "main verify freshness unproven at current HEAD; exact tree fingerprint unavailable"
 
 
+def _format_launch_failed_message() -> str:
+    return "main verify misconfigured - verify command launch failed; fix the environment, not the code"
+
+
+def _format_unknown_evidence_message(state: Any, *, target_proof: MainVerifyTargetProof) -> str:
+    verify_status = getattr(state, "verify_status", None)
+    if isinstance(verify_status, str) and verify_status:
+        evidence = f"unrecognized verify status `{verify_status}`"
+    elif verify_status is not None:
+        evidence = "invalid verify status evidence"
+    else:
+        evidence = "verify status unavailable"
+    if target_proof == "current":
+        return f"main verify evidence unknown for current HEAD; {evidence}"
+    if target_proof == "stale":
+        return f"main verify evidence stale for current HEAD; {evidence}"
+    return f"main verify evidence unproven for current HEAD; {evidence}"
+
+
 def format_main_verify_attention_message(
     state: Any,
     *,
@@ -162,28 +267,47 @@ def format_main_verify_attention_message(
     now: datetime | None = None,
 ) -> str | None:
     """Render current operator-facing main-verify attention without trusting persisted SHA text."""
-    message = getattr(state, "alert_message", None) or "main verify is red; merges halted"
+    message = getattr(state, "alert_message", None)
     red_since = getattr(state, "red_since", None)
-    exhausted = parse_main_verify_remediation_exhaustion_message(message)
-    if exhausted is not None:
-        signature = main_verify_state_failure_signature(state) or "unknown"
-        message = (
-            f"main verify remediation exhausted for {signature} after "
-            f"{exhausted.attempts} attempts; human intervention required"
-        )
-    elif main_verify_state_is_red_verdict(state):
-        if target_proof == "stale":
-            return None
-        if target_proof == "unproven":
-            message = _format_unproven_red_message(state)
-        else:
-            message = _format_current_red_message(state)
+    include_red_duration = False
+    exhausted = main_verify_state_exhausted_remediation_attention(state)
+    status_classification = main_verify_state_status_classification(state)
+    verify_status = status_classification.status
+    if main_verify_state_gate_disabled(state):
+        message = "main verify disabled; merges allowed"
+    elif verify_status == "passed":
+        message = "main verify passed; merges allowed"
     elif main_verify_state_is_freshness_unavailable(state):
         if target_proof == "current":
             message = _format_current_freshness_unavailable_message(state)
         else:
             message = _format_unproven_freshness_unavailable_message(state)
-    if now is not None and red_since is not None:
+    elif main_verify_state_needs_non_red_attention(state):
+        if isinstance(message, str) and message.startswith("main verify misconfigured - ") and " at `" not in message:
+            pass
+        else:
+            message = _format_launch_failed_message()
+    elif exhausted is not None:
+        signature = main_verify_state_failure_signature(state) or "unknown"
+        message = (
+            f"main verify remediation exhausted for {signature} after "
+            f"{exhausted.attempts} attempts; human intervention required"
+        )
+        include_red_duration = target_proof == "current" and (
+            status_classification.kind == "valid"
+            and status_classification.status in _MAIN_VERIFY_RECOGNIZED_RED_STATUSES
+        )
+    elif main_verify_state_is_red_verdict(state):
+        if target_proof == "current":
+            message = _format_current_red_message(state)
+            include_red_duration = True
+        elif target_proof == "stale":
+            message = _format_stale_red_message()
+        else:
+            message = _format_unproven_red_message(state)
+    else:
+        message = _format_unknown_evidence_message(state, target_proof=target_proof)
+    if include_red_duration and now is not None and red_since is not None:
         return f"{message} (red for {format_red_duration(red_since, now)})"
     return message
 
@@ -198,4 +322,4 @@ def format_main_verify_status_message(
     message = format_main_verify_attention_message(state, target_proof=target_proof, now=now)
     if message is not None:
         return message
-    return _format_stale_red_message() if target_proof == "stale" else fallback
+    return fallback

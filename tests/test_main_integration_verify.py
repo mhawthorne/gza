@@ -8,20 +8,29 @@ from types import SimpleNamespace
 from typing import Literal
 from unittest.mock import MagicMock, call, patch
 
+import pytest
+
 from gza.artifacts import store_command_output_artifact
 from gza.cli.watch import _main_verify_remediation_prompt
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.git import GitError
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
     MainIntegrationVerifyEnvironmentIdentity,
+    MainIntegrationVerifyTargetProof,
     _build_main_integration_verify_remediation,
     check_candidate_integration_verify,
     check_main_integration_verify,
     current_main_integration_verify_alert,
+    format_main_integration_verify_attention_message,
     load_main_integration_verify_state,
+    main_integration_verify_state_halts_merges,
+    main_integration_verify_state_has_exhausted_remediation_attention,
+    main_integration_verify_state_is_red_verdict,
     persist_main_integration_verify_alert_message,
+    resolve_main_integration_verify_target_proof,
     run_main_integration_verify,
 )
 from gza.runner import _compute_tree_fingerprint, _make_review_verify_result
@@ -97,6 +106,490 @@ def _seed_main_verify_task(
     )
     store.update(task)
     return task.id
+
+
+def test_format_main_integration_verify_attention_adds_sha_only_with_current_target_proof() -> None:
+    state = SimpleNamespace(
+        head_sha="abc123deadbeef",
+        failing_phase="unit",
+        verify_status="failed",
+        verify_exit_status="1",
+        alert_message="main verify RED - merges halted; phase `unit` failing",
+        red_since=None,
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof("current"),
+    )
+
+    assert rendered == "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing"
+
+
+def test_format_main_integration_verify_attention_keeps_unproven_target_non_sha_non_halt() -> None:
+    state = SimpleNamespace(
+        head_sha="abc123deadbeef",
+        failing_phase="unit",
+        verify_status="failed",
+        verify_exit_status="1",
+        alert_message="main verify RED - merges halted; phase `unit` failing",
+        red_since=None,
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof("unproven"),
+    )
+
+    assert rendered == "main verify red evidence unproven at current HEAD; current HEAD identity unavailable"
+    assert "abc123" not in rendered
+    assert "merges halted" not in rendered
+
+
+def test_format_main_integration_verify_attention_keeps_stale_target_non_sha_non_halt() -> None:
+    state = SimpleNamespace(
+        head_sha="abc123deadbeef",
+        failing_phase="unit",
+        verify_status="failed",
+        verify_exit_status="1",
+        alert_message="main verify RED - merges halted; phase `unit` failing",
+        red_since=None,
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof("stale"),
+    )
+
+    assert rendered == "main verify red evidence stale at current HEAD; recorded target SHA no longer current"
+    assert "abc123" not in rendered
+    assert "merges halted" not in rendered
+
+
+def test_format_main_integration_verify_attention_renders_freshness_sha_only_with_current_proof() -> None:
+    state = SimpleNamespace(
+        head_sha="abc123deadbeef",
+        failing_phase=None,
+        verify_status="unavailable",
+        verify_exit_status=MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+        alert_message="main verify freshness unproven; exact tree fingerprint unavailable",
+        red_since=None,
+    )
+
+    current = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof("current"),
+    )
+    unproven = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof("unproven"),
+    )
+
+    assert current == (
+        "main verify freshness unproven at `abc123deadbe` - merges halted; "
+        "exact tree fingerprint unavailable"
+    )
+    assert unproven == "main verify freshness unproven at current HEAD; exact tree fingerprint unavailable"
+    assert "abc123" not in unproven
+    assert "merges halted" not in unproven
+
+
+def test_format_main_integration_verify_attention_renders_current_unknown_status_as_unknown_evidence() -> None:
+    state = SimpleNamespace(
+        gate_enabled=True,
+        head_sha="abc123deadbeef",
+        failing_phase="unit",
+        verify_status="mystery",
+        verify_exit_status="42",
+        alert_message="main verify RED at `abc123deadbe` - merges halted; phase `unit` failing",
+        red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof("current"),
+        now=datetime(2026, 6, 24, 12, 13, tzinfo=UTC),
+    )
+
+    assert rendered == "main verify evidence unknown for current HEAD; unrecognized verify status `mystery`"
+    assert "abc123" not in rendered
+    assert "main verify RED" not in rendered
+    assert "RED" not in rendered
+    assert "merges halted" not in rendered
+    assert "red for" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("state_kwargs", "expected"),
+    [
+        (
+            {"gate_enabled": True, "verify_status": "passed", "verify_exit_status": "0"},
+            "main verify passed; merges allowed",
+        ),
+        (
+            {"gate_enabled": False, "verify_status": "unavailable", "verify_exit_status": "not configured"},
+            "main verify disabled; merges allowed",
+        ),
+    ],
+)
+def test_format_main_integration_verify_attention_suppresses_legacy_red_and_exhaustion_for_non_attention_states(
+    state_kwargs: dict[str, object],
+    expected: str,
+) -> None:
+    state = SimpleNamespace(
+        head_sha="abc123deadbeef",
+        failing_phase="unit",
+        failure_signature="phase:unit",
+        alert_message=(
+            "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing; "
+            "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
+            "human intervention required"
+        ),
+        red_since=None,
+        **state_kwargs,
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof("current"),
+    )
+
+    assert rendered == expected
+    assert "abc123" not in rendered
+    assert "main verify RED" not in rendered
+    assert "merges halted" not in rendered
+    assert "human intervention" not in rendered
+
+
+@pytest.mark.parametrize(
+    "target_status",
+    ["current", "stale", "unproven"],
+)
+@pytest.mark.parametrize(
+    ("verify_exit_status", "expected"),
+    [
+        (
+            MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+            "main verify misconfigured - verify command launch failed; fix the environment, not the code",
+        ),
+        (
+            MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+            {
+                "current": (
+                    "main verify freshness unproven at `abc123deadbe` - merges halted; "
+                    "exact tree fingerprint unavailable"
+                ),
+                "stale": "main verify freshness unproven at current HEAD; exact tree fingerprint unavailable",
+                "unproven": "main verify freshness unproven at current HEAD; exact tree fingerprint unavailable",
+            },
+        ),
+    ],
+)
+def test_format_main_integration_verify_attention_prefers_structured_special_status_over_legacy_red(
+    target_status: Literal["current", "stale", "unproven"],
+    verify_exit_status: str,
+    expected: str | dict[str, str],
+) -> None:
+    state = SimpleNamespace(
+        head_sha="abc123deadbeef",
+        failing_phase="unit",
+        verify_status="unavailable",
+        verify_exit_status=verify_exit_status,
+        alert_message="main verify RED at `abc123deadbe` - merges halted; phase `unit` failing",
+        red_since=None,
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof(target_status),
+    )
+
+    expected_text = expected[target_status] if isinstance(expected, dict) else expected
+    assert rendered == expected_text
+    assert "main verify RED" not in rendered
+    if verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS:
+        assert "abc123" not in rendered
+        assert "merges halted" not in rendered
+    elif target_status != "current":
+        assert "abc123" not in rendered
+        assert "merges halted" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("verify_exit_status", "expected"),
+    [
+        (
+            MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+            (
+                "main verify freshness unproven at `abc123deadbe` - merges halted; "
+                "exact tree fingerprint unavailable"
+            ),
+        ),
+        (
+            MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+            "main verify misconfigured - verify command launch failed; fix the environment, not the code",
+        ),
+    ],
+)
+def test_format_main_integration_verify_attention_prefers_structured_special_status_over_legacy_exhaustion(
+    verify_exit_status: str,
+    expected: str,
+) -> None:
+    state = SimpleNamespace(
+        gate_enabled=True,
+        head_sha="abc123deadbeef",
+        failing_phase="unit",
+        failure_signature="phase:unit",
+        verify_status="unavailable",
+        verify_exit_status=verify_exit_status,
+        alert_message=(
+            "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing; "
+            "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
+            "human intervention required"
+        ),
+        red_since=None,
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof("current"),
+    )
+
+    assert rendered == expected
+    assert "human intervention" not in rendered
+    if verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS:
+        assert "abc123" not in rendered
+        assert "main verify RED" not in rendered
+        assert "merges halted" not in rendered
+
+
+@pytest.mark.parametrize("target_status", ["stale", "unproven"])
+def test_format_main_integration_verify_attention_sanitizes_legacy_launch_failure_sha(
+    target_status: Literal["stale", "unproven"],
+) -> None:
+    state = SimpleNamespace(
+        head_sha="abc123deadbeef",
+        failing_phase="unit",
+        verify_status="unavailable",
+        verify_exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+        alert_message=(
+            "main verify misconfigured at `abc123deadbe` - could not launch `ruff` "
+            "for phase `unit` (not on PATH); fix the environment, not the code"
+        ),
+        red_since=None,
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof(target_status),
+    )
+
+    assert rendered == "main verify misconfigured - verify command launch failed; fix the environment, not the code"
+    assert "abc123" not in rendered
+    assert "merges halted" not in rendered
+    assert "ruff" not in rendered
+
+
+@pytest.mark.parametrize("target_status", ["stale", "unproven"])
+@pytest.mark.parametrize(
+    ("state_kwargs", "expected_fragment"),
+    [
+        ({"alert_message": None}, "verify status unavailable"),
+        (
+            {
+                "verify_status": 7,
+                "alert_message": None,
+            },
+            "invalid verify status evidence",
+        ),
+        (
+            {
+                "alert_message": "legacy alert at `abc123deadbe` says merges halted",
+            },
+            "verify status unavailable",
+        ),
+        (
+            {
+                "verify_status": 7,
+                "alert_message": "legacy alert at `abc123deadbe` says merges halted",
+            },
+            "invalid verify status evidence",
+        ),
+    ],
+)
+def test_format_main_integration_verify_attention_fails_closed_for_unclassified_state(
+    target_status: Literal["stale", "unproven"],
+    state_kwargs: dict[str, object],
+    expected_fragment: str,
+) -> None:
+    state = SimpleNamespace(
+        head_sha="abc123deadbeef",
+        failing_phase=None,
+        verify_exit_status="1",
+        red_since=None,
+        **state_kwargs,
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof(target_status),
+    )
+
+    assert f"main verify evidence {target_status} for current HEAD" in rendered
+    assert expected_fragment in rendered
+    assert "abc123" not in rendered
+    assert "merges halted" not in rendered
+    assert "legacy alert" not in rendered
+
+
+@pytest.mark.parametrize("target_status", ["current", "stale", "unproven"])
+@pytest.mark.parametrize("verify_status", [7, ""])
+@pytest.mark.parametrize(
+    "alert_message",
+    [
+        "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing",
+        (
+            "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing; "
+            "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
+            "human intervention required"
+        ),
+    ],
+)
+def test_format_main_integration_verify_attention_rejects_malformed_status_legacy_fallback(
+    target_status: Literal["current", "stale", "unproven"],
+    verify_status: object,
+    alert_message: str,
+) -> None:
+    state = SimpleNamespace(
+        gate_enabled=True,
+        head_sha="abc123deadbeef",
+        failing_phase="unit",
+        failure_signature="phase:unit",
+        verify_status=verify_status,
+        verify_exit_status="1",
+        alert_message=alert_message,
+        red_since=None,
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof(target_status),
+    )
+
+    assert main_integration_verify_state_halts_merges(state) is True
+    assert main_integration_verify_state_is_red_verdict(state) is False
+    assert main_integration_verify_state_has_exhausted_remediation_attention(state) is False
+    assert "invalid verify status evidence" in rendered
+    assert "abc123" not in rendered
+    assert "main verify RED" not in rendered
+    assert "RED" not in rendered
+    assert "merges halted" not in rendered
+    assert "human intervention required" not in rendered
+
+
+def test_format_main_integration_verify_attention_keeps_configured_missing_evidence_visible() -> None:
+    state = SimpleNamespace(
+        gate_enabled=True,
+        head_sha="abc123deadbeef",
+        failing_phase=None,
+        verify_status=None,
+        verify_exit_status="1",
+        alert_message=None,
+        red_since=None,
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof("current"),
+    )
+
+    assert main_integration_verify_state_halts_merges(state) is True
+    assert main_integration_verify_state_is_red_verdict(state) is False
+    assert main_integration_verify_state_has_exhausted_remediation_attention(state) is False
+    assert rendered == "main verify evidence unknown for current HEAD; verify status unavailable"
+    assert "abc123" not in rendered
+    assert "RED" not in rendered
+    assert "merges halted" not in rendered
+    assert "human intervention required" not in rendered
+
+
+def test_format_main_integration_verify_attention_keeps_status_absent_legacy_red_compatible() -> None:
+    state = SimpleNamespace(
+        gate_enabled=True,
+        head_sha="abc123deadbeef",
+        failing_phase="unit",
+        verify_exit_status="1",
+        alert_message="main verify RED at `abc123deadbe` - merges halted; phase `unit` failing",
+        red_since=None,
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof("current"),
+    )
+
+    assert main_integration_verify_state_halts_merges(state) is True
+    assert main_integration_verify_state_is_red_verdict(state) is True
+    assert rendered == "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing"
+
+
+def test_format_main_integration_verify_attention_keeps_status_absent_legacy_exhaustion_compatible() -> None:
+    state = SimpleNamespace(
+        gate_enabled=True,
+        head_sha="abc123deadbeef",
+        failing_phase="unit",
+        failure_signature="phase:unit",
+        verify_exit_status="1",
+        alert_message=(
+            "main verify RED at `abc123deadbe` - merges halted; phase `unit` failing; "
+            "automatic remediation exhausted after 2/2 attempts for phase:unit on fp-verified; "
+            "human intervention required"
+        ),
+        red_since=None,
+    )
+
+    rendered = format_main_integration_verify_attention_message(
+        state,
+        target_proof=MainIntegrationVerifyTargetProof("current"),
+    )
+
+    assert main_integration_verify_state_halts_merges(state) is True
+    assert main_integration_verify_state_has_exhausted_remediation_attention(state) is True
+    assert rendered == (
+        "main verify remediation exhausted for phase:unit after 2/2 attempts; "
+        "human intervention required"
+    )
+
+
+def test_resolve_main_integration_verify_target_proof_returns_unproven_for_git_errors() -> None:
+    state = SimpleNamespace(head_sha="abc123")
+    default_branch_git = MagicMock()
+    default_branch_git.default_branch.side_effect = GitError("default branch lookup failed")
+    rev_parse_git = MagicMock()
+    rev_parse_git.default_branch.return_value = "main"
+    rev_parse_git.rev_parse_if_exists.side_effect = GitError("ref lookup failed")
+
+    assert resolve_main_integration_verify_target_proof(state, default_branch_git).status == "unproven"
+    assert resolve_main_integration_verify_target_proof(state, rev_parse_git).status == "unproven"
+
+
+def test_resolve_main_integration_verify_target_proof_propagates_assertion_from_default_branch() -> None:
+    state = SimpleNamespace(head_sha="abc123")
+    git = MagicMock()
+    git.default_branch.side_effect = AssertionError("programming contract failed")
+
+    with pytest.raises(AssertionError, match="programming contract failed"):
+        resolve_main_integration_verify_target_proof(state, git)
+
+
+def test_resolve_main_integration_verify_target_proof_propagates_assertion_from_rev_parse() -> None:
+    state = SimpleNamespace(head_sha="abc123")
+    git = MagicMock()
+    git.default_branch.return_value = "main"
+    git.rev_parse_if_exists.side_effect = AssertionError("programming contract failed")
+
+    with pytest.raises(AssertionError, match="programming contract failed"):
+        resolve_main_integration_verify_target_proof(state, git)
 
 
 def test_build_main_integration_verify_remediation_uses_preferred_verify_artifact_and_bounded_excerpt(tmp_path) -> None:

@@ -1944,7 +1944,11 @@ gza main-verify [options]
 |--------|-------------|
 | `--force` | Force a fresh local main verify run now, rerun reds to classify flakes, and clear a stale halt if the rerun goes green |
 
-Without `--force`, `gza main-verify` is an inspect-first operator check. It reuses the current checkpoint when that cached result is still fresh and prints whether merges are currently allowed or halted. A current green checkpoint exits `0`; a current red or otherwise halting checkpoint exits `1`.
+Without `--force`, `gza main-verify` is an inspect-first operator check. It reuses the current checkpoint when that cached result is still fresh. A current green checkpoint exits `0` and prints that merges are allowed. A current red or otherwise halting checkpoint exits `1`; when the command can prove the checkpoint describes the current local-target SHA, the output may name that SHA and state that merges are halted.
+
+If the verify gate is disabled because no `verify_command` is configured, disabled structured state takes precedence over stale legacy failure text. `gza main-verify` exits `0` and prints that main verify is disabled and merges are allowed.
+
+If the cached checkpoint is stale for the current local target, or if the command cannot prove the target identity, `gza main-verify` still exits `1` for a structured merge-halting gate result. In those ambiguous-proof cases, the output intentionally avoids naming a SHA or claiming that merges are currently halted; it reports that the evidence is stale or unproven so operators know the exit code is the conservative gate signal.
 
 With `--force`, `gza main-verify --force` bypasses checkpoint reuse and runs the gate again against the current local-target tree. The forced path uses the same bounded red-rerun classification as watch: a red that turns green on rerun is treated as flaky, the checkpoint is refreshed to green, and the merge halt clears without requiring a direct commit to main. A red that stays red leaves behind fresh red evidence and exits `1`.
 

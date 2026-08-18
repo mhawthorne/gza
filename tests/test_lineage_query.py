@@ -6,6 +6,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
@@ -25,6 +26,10 @@ from gza.lineage_query import (
     _query_lineage_owner_rows_with_context,
     collect_stale_unmerged_sweep_candidates,
     query_lineage_owner_rows,
+)
+from gza.main_integration_verify import (
+    MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+    MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
 )
 from gza.operator_state import blocked_by_empty_prereq_label
 from gza.recovery_engine import list_failed_tasks_for_recovery
@@ -358,8 +363,8 @@ def test_query_lineage_owner_rows_tag_filter_keeps_merge_unit_representative(tmp
     git = MagicMock()
     git.branch_exists.return_value = True
     git.can_merge.return_value = True
-    git.rev_parse_if_exists.side_effect = (
-        lambda ref: "same-head" if ref == "feature/tag-filtered-merge-unit" else "target-sha" if ref == "main" else None
+    git.rev_parse_if_exists.side_effect = lambda ref: (
+        "same-head" if ref == "feature/tag-filtered-merge-unit" else "target-sha" if ref == "main" else None
     )
 
     rebase = store.get(rebase_id)
@@ -650,8 +655,8 @@ def test_query_lineage_owner_rows_without_tag_filter_keeps_merge_unit_representa
     git = MagicMock()
     git.branch_exists.return_value = True
     git.can_merge.return_value = True
-    git.rev_parse_if_exists.side_effect = (
-        lambda ref: "same-head" if ref == "feature/tag-filtered-merge-unit" else "target-sha" if ref == "main" else None
+    git.rev_parse_if_exists.side_effect = lambda ref: (
+        "same-head" if ref == "feature/tag-filtered-merge-unit" else "target-sha" if ref == "main" else None
     )
 
     rebase = store.get(rebase_id)
@@ -1757,8 +1762,8 @@ def test_query_lineage_owner_rows_prefers_impl_branch_over_orphan_rebase_owner(t
     git = MagicMock()
     git.can_merge.return_value = True
     git.branch_exists.return_value = True
-    git.rev_parse_if_exists.side_effect = (
-        lambda ref: "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
+    git.rev_parse_if_exists.side_effect = lambda ref: (
+        "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
     )
     _persist_current_green_verify(store, config, owner_task=impl, source_task=review, head_sha="same-head")
 
@@ -1873,8 +1878,8 @@ def test_query_lineage_owner_rows_excludes_orphan_rebase_descendant_from_actiona
     git = MagicMock()
     git.can_merge.return_value = False
     git.branch_exists.return_value = True
-    git.rev_parse_if_exists.side_effect = (
-        lambda ref: "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
+    git.rev_parse_if_exists.side_effect = lambda ref: (
+        "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
     )
     _persist_current_green_verify(store, config, owner_task=impl, source_task=impl, head_sha="same-head")
 
@@ -1937,8 +1942,8 @@ def test_query_lineage_owner_rows_planning_excludes_dropped_descendant_rebase(tm
     git = MagicMock()
     git.can_merge.return_value = True
     git.branch_exists.return_value = True
-    git.rev_parse_if_exists.side_effect = (
-        lambda ref: "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
+    git.rev_parse_if_exists.side_effect = lambda ref: (
+        "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
     )
     _persist_current_green_verify(store, config, owner_task=impl, source_task=impl, head_sha="same-head")
 
@@ -2402,8 +2407,8 @@ def test_query_lineage_owner_rows_keeps_legitimate_impl_branch_rebase_descendant
     git = MagicMock()
     git.can_merge.return_value = True
     git.branch_exists.return_value = True
-    git.rev_parse_if_exists.side_effect = (
-        lambda ref: "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
+    git.rev_parse_if_exists.side_effect = lambda ref: (
+        "same-head" if ref == "feature/canonical" else "base-head" if ref == "main" else None
     )
     _persist_current_green_verify(store, config, owner_task=impl, source_task=review, head_sha="same-head")
 
@@ -2456,10 +2461,12 @@ def test_query_lineage_owner_rows_planning_keeps_completed_and_failed_live_tasks
     git = MagicMock()
     git.can_merge.return_value = True
     git.branch_exists.return_value = True
-    git.rev_parse_if_exists.side_effect = (
-        lambda ref: "same-head" if ref == "feature/completed-live" else "base-head" if ref == "main" else None
+    git.rev_parse_if_exists.side_effect = lambda ref: (
+        "same-head" if ref == "feature/completed-live" else "base-head" if ref == "main" else None
     )
-    _persist_current_green_verify(store, config, owner_task=completed_impl, source_task=completed_impl, head_sha="same-head")
+    _persist_current_green_verify(
+        store, config, owner_task=completed_impl, source_task=completed_impl, head_sha="same-head"
+    )
 
     rows = query_lineage_owner_rows(
         store,
@@ -2585,8 +2592,8 @@ def test_query_lineage_owner_rows_mergeable_behind_branch_projects_normal_action
     git = MagicMock()
     git.can_merge.return_value = True
     git.branch_exists.return_value = True
-    git.rev_parse_if_exists.side_effect = (
-        lambda ref: "same-head" if ref == "feature/stale-lineage" else "base-head" if ref == "main" else None
+    git.rev_parse_if_exists.side_effect = lambda ref: (
+        "same-head" if ref == "feature/stale-lineage" else "base-head" if ref == "main" else None
     )
     git.resolve_fresh_merge_source.return_value = ("origin/feature/stale-lineage", None)
     git.count_commits_behind.return_value = 1
@@ -2643,8 +2650,8 @@ def test_query_lineage_owner_rows_projects_merge_for_approved_behind_branch(tmp_
     git = MagicMock()
     git.can_merge.return_value = True
     git.branch_exists.return_value = True
-    git.rev_parse_if_exists.side_effect = (
-        lambda ref: "same-head" if ref == "feature/approved-stale-lineage" else "base-head" if ref == "main" else None
+    git.rev_parse_if_exists.side_effect = lambda ref: (
+        "same-head" if ref == "feature/approved-stale-lineage" else "base-head" if ref == "main" else None
     )
     git.resolve_fresh_merge_source.return_value = (
         "origin/feature/approved-stale-lineage",
@@ -3278,7 +3285,9 @@ def test_read_context_preserves_store_based_on_child_order(tmp_path: Path) -> No
     store.update(newer)
 
     read_context = _read_context_for_store(store)
-    assert [task.id for task in store.get_based_on_children(parent.id)] == [task.id for task in read_context.get_based_on_children(parent.id)]
+    assert [task.id for task in store.get_based_on_children(parent.id)] == [
+        task.id for task in read_context.get_based_on_children(parent.id)
+    ]
     assert [task.id for task in store.get_based_on_children_by_type(parent.id, "implement")] == [
         task.id for task in read_context.get_based_on_children_by_type(parent.id, "implement")
     ]
@@ -3295,13 +3304,17 @@ def test_read_context_dependency_completion_matches_store_oldest_completed_retry
     dependency.completed_at = datetime(2026, 5, 16, 8, 30, tzinfo=UTC)
     store.update(dependency)
 
-    older_retry = store.add("Completed retry older", task_type="implement", based_on=dependency.id, recovery_origin="retry")
+    older_retry = store.add(
+        "Completed retry older", task_type="implement", based_on=dependency.id, recovery_origin="retry"
+    )
     assert older_retry.id is not None
     older_retry.status = "completed"
     older_retry.completed_at = datetime(2026, 5, 16, 9, 30, tzinfo=UTC)
     store.update(older_retry)
 
-    newer_retry = store.add("Completed retry newer", task_type="implement", based_on=dependency.id, recovery_origin="retry")
+    newer_retry = store.add(
+        "Completed retry newer", task_type="implement", based_on=dependency.id, recovery_origin="retry"
+    )
     assert newer_retry.id is not None
     newer_retry.status = "completed"
     newer_retry.completed_at = datetime(2026, 5, 16, 10, 30, tzinfo=UTC)
@@ -3495,7 +3508,9 @@ def test_query_lineage_owner_rows_tag_scope_keeps_untagged_dependency_resolution
     dependency.completed_at = datetime(2026, 5, 16, 8, 0, tzinfo=UTC)
     store.update(dependency)
 
-    failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id, tags=(tag,))
+    failed = store.add(
+        "Historical blocked implementation", task_type="implement", depends_on=dependency.id, tags=(tag,)
+    )
     assert failed.id is not None
     failed.status = "failed"
     failed.failure_reason = "PREREQUISITE_UNMERGED"
@@ -3699,12 +3714,7 @@ def test_query_lineage_owner_rows_hides_failed_same_slice_leaf_resolved_by_lande
         for row in rows
         if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
     }
-    unresolved_ids = {
-        task.id
-        for row in rows
-        for task in row.unresolved_tasks
-        if task.id is not None
-    }
+    unresolved_ids = {task.id for row in rows for task in row.unresolved_tasks if task.id is not None}
     assert failed.id not in failed_leaf_ids
     assert failed.id not in unresolved_ids
 
@@ -3768,12 +3778,7 @@ def test_query_lineage_owner_rows_tag_scope_keeps_untagged_merged_lineage_resolu
         for row in rows
         if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
     }
-    unresolved_ids = {
-        task.id
-        for row in rows
-        for task in row.unresolved_tasks
-        if task.id is not None
-    }
+    unresolved_ids = {task.id for row in rows for task in row.unresolved_tasks if task.id is not None}
     assert failed.id not in failed_leaf_ids
     assert failed.id not in unresolved_ids
 
@@ -3877,12 +3882,7 @@ def test_query_lineage_owner_rows_keeps_failed_same_slice_leaf_visible_without_t
         for row in rows
         if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
     }
-    unresolved_ids = {
-        task.id
-        for row in rows
-        for task in row.unresolved_tasks
-        if task.id is not None
-    }
+    unresolved_ids = {task.id for row in rows for task in row.unresolved_tasks if task.id is not None}
     assert failed.id in failed_leaf_ids
     assert failed.id in unresolved_ids
 
@@ -3953,12 +3953,7 @@ def test_query_lineage_owner_rows_keeps_failed_same_slice_leaf_with_active_unmer
         for row in rows
         if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
     }
-    unresolved_ids = {
-        task.id
-        for row in rows
-        for task in row.unresolved_tasks
-        if task.id is not None
-    }
+    unresolved_ids = {task.id for row in rows for task in row.unresolved_tasks if task.id is not None}
     assert failed.id in failed_leaf_ids
     assert failed.id in unresolved_ids
 
@@ -3998,7 +3993,9 @@ def test_query_lineage_owner_rows_hides_empty_failed_owner_resolved_by_landed_si
     )
     store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
 
-    landed = store.add("Merged sibling representative", task_type="implement", based_on=root.id, recovery_origin="manual")
+    landed = store.add(
+        "Merged sibling representative", task_type="implement", based_on=root.id, recovery_origin="manual"
+    )
     assert landed.id is not None
     _set_completed(
         landed,
@@ -4614,7 +4611,9 @@ def test_query_lineage_owner_rows_seeded_git_drives_same_suppression_as_non_seed
     )
     store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
 
-    landed = store.add("Merged sibling representative", task_type="implement", based_on=root.id, recovery_origin="manual")
+    landed = store.add(
+        "Merged sibling representative", task_type="implement", based_on=root.id, recovery_origin="manual"
+    )
     assert landed.id is not None
     _set_completed(landed, when=datetime(2026, 5, 16, 10, 0, tzinfo=UTC), branch=failed.branch, has_commits=True)
     landed.merge_status = "merged"
@@ -4639,9 +4638,7 @@ def test_query_lineage_owner_rows_seeded_git_drives_same_suppression_as_non_seed
     # _MinimalGit includes the failed branch so the git-branch-check path is exercised;
     # is_merged returns False, so suppression falls through to the lineage scan.
     def _raise_if_called(_project_dir=None):
-        raise AssertionError(
-            "_load_merge_context was called even though git + target_branch were pre-seeded"
-        )
+        raise AssertionError("_load_merge_context was called even though git + target_branch were pre-seeded")
 
     monkeypatch.setattr(recovery_engine, "_load_merge_context", _raise_if_called)
 
@@ -4691,7 +4688,9 @@ def test_query_lineage_owner_rows_seeded_git_proven_merged_suppresses_without_la
 
     root = store.add("Implementation root", task_type="implement")
     assert root.id is not None
-    _set_completed(root, when=datetime(2026, 5, 16, 8, 0, tzinfo=UTC), branch="feature/root-git-proven", has_commits=True)
+    _set_completed(
+        root, when=datetime(2026, 5, 16, 8, 0, tzinfo=UTC), branch="feature/root-git-proven", has_commits=True
+    )
     store.update(root)
 
     failed = store.add("Failed follow-up", task_type="implement", based_on=root.id, recovery_origin="manual")
@@ -4763,9 +4762,7 @@ def test_query_lineage_owner_rows_seeded_git_proven_merged_suppresses_without_la
     # Seeded git-proven path: patch _load_merge_context to raise, proving the seeded
     # context is the sole source of merge truth.
     def _raise_if_called(_project_dir=None):
-        raise AssertionError(
-            "_load_merge_context was called even though git + target_branch were pre-seeded"
-        )
+        raise AssertionError("_load_merge_context was called even though git + target_branch were pre-seeded")
 
     monkeypatch.setattr(recovery_engine, "_load_merge_context", _raise_if_called)
 
@@ -4795,7 +4792,9 @@ def test_query_lineage_owner_rows_includes_current_main_verify_red_attention(tmp
     config = Config.load(tmp_path)
     config.verify_command = "./bin/tests"
 
-    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
     assert main_verify_task.id is not None
     main_verify_task.status = "completed"
     main_verify_task.completed_at = datetime.now(UTC)
@@ -4806,7 +4805,7 @@ def test_query_lineage_owner_rows_includes_current_main_verify_red_attention(tmp
     main_verify_task.review_verify_head_sha = "abc123"
     main_verify_task.output_content = json.dumps(
         {
-            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "alert_message": "main verify RED - merges halted; phase `unit` failing",
             "captured_at": "2026-06-23T00:00:00+00:00",
             "environment_identity": _main_verify_environment_identity_payload(),
             "failing_phase": "unit",
@@ -4824,7 +4823,7 @@ def test_query_lineage_owner_rows_includes_current_main_verify_red_attention(tmp
     git = MagicMock(spec=Git)
     git.default_branch.return_value = "main"
     git.current_branch.return_value = "topic"
-    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref in {"refs/heads/main", "main"} else "topic-sha"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
 
     rows = query_lineage_owner_rows(
         store,
@@ -4866,7 +4865,9 @@ def test_query_lineage_owner_rows_ignores_ambiguous_short_main_verify_ref(
     config = Config.load(tmp_path)
     config.verify_command = "./bin/tests"
 
-    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
     assert main_verify_task.id is not None
     main_verify_task.status = "completed"
     main_verify_task.completed_at = datetime.now(UTC)
@@ -4914,6 +4915,318 @@ def test_query_lineage_owner_rows_ignores_ambiguous_short_main_verify_ref(
     assert "abc123" not in descriptions
     assert "merges halted" not in descriptions
     assert call("main") not in git.rev_parse_if_exists.call_args_list
+
+
+def test_query_lineage_owner_rows_sanitizes_current_malformed_main_verify_legacy_red(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = ""
+    main_verify_task.review_verify_exit_status = "1"
+    main_verify_task.review_verify_failure = "verify_command failed"
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failing_phase": "unit",
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == main_verify_task.id
+    assert row.next_action is not None
+    assert row.next_action["needs_attention_reason"] == "main-integration-verify-red"
+    assert "main verify evidence unknown for current HEAD; invalid verify status evidence" in row.next_action[
+        "description"
+    ]
+    assert "abc123" not in row.next_action["description"]
+    assert "RED" not in row.next_action["description"]
+    assert "merges halted" not in row.next_action["description"]
+
+
+def test_query_lineage_owner_rows_keeps_current_missing_main_verify_evidence_visible(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = None
+    main_verify_task.review_verify_exit_status = "1"
+    main_verify_task.review_verify_failure = "verify_command status missing"
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": None,
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failing_phase": None,
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == main_verify_task.id
+    assert row.next_action is not None
+    assert row.next_action["needs_attention_reason"] == "main-integration-verify-red"
+    assert "main verify evidence unknown for current HEAD; verify status unavailable" in row.next_action["description"]
+    assert "abc123" not in row.next_action["description"]
+    assert "RED" not in row.next_action["description"]
+    assert "merges halted" not in row.next_action["description"]
+
+
+@pytest.mark.parametrize(
+    ("live_main_sha", "expected"),
+    [
+        ("abc123", "main verify evidence unknown for current HEAD; verify status unavailable"),
+        ("def456", "main verify evidence stale for current HEAD; verify status unavailable"),
+        (None, "main verify evidence unproven for current HEAD; verify status unavailable"),
+    ],
+)
+def test_query_lineage_owner_rows_renders_wholly_missing_main_verify_evidence_as_proof_aware_unknown(
+    tmp_path: Path,
+    live_main_sha: str | None,
+    expected: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = None
+    main_verify_task.review_verify_exit_status = None
+    main_verify_task.review_verify_failure = None
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": None,
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failing_phase": None,
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.side_effect = lambda ref: live_main_sha if ref == "refs/heads/main" else "topic-sha"
+
+    with patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp"):
+        rows = query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(limit=None, include_skipped=True),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == main_verify_task.id
+    assert row.next_action is not None
+    assert expected in row.next_action["description"]
+    assert "abc123" not in row.next_action["description"]
+    assert "RED" not in row.next_action["description"]
+    assert "merges halted" not in row.next_action["description"]
+    assert "red for" not in row.next_action["description"]
+    assert "remediation exhausted" not in row.next_action["description"]
+
+
+def test_query_lineage_owner_rows_uses_exact_main_ref_for_current_main_verify_proof(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "failed"
+    main_verify_task.review_verify_exit_status = "1"
+    main_verify_task.review_verify_failure = "verify_command failed"
+    main_verify_task.review_verify_head_sha = "aaaaaaaaaaaa1111"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": "main verify RED at `aaaaaaaaaaaa` - merges halted; phase `unit` failing",
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failing_phase": "unit",
+            "gate_enabled": True,
+            "head_sha": "aaaaaaaaaaaa1111",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "main": "aaaaaaaaaaaa1111",
+        "refs/heads/main": "bbbbbbbbbbbb2222",
+    }.get(ref)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert not any(row.owner_task.id == main_verify_task.id for row in rows)
+    assert "main" not in [call.args[0] for call in git.rev_parse_if_exists.call_args_list]
+    git.rev_parse_if_exists.assert_any_call("refs/heads/main")
+
+
+def test_query_lineage_owner_rows_weakens_matching_fingerprint_red_when_exact_target_ref_differs(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "failed"
+    main_verify_task.review_verify_exit_status = "1"
+    main_verify_task.review_verify_failure = "verify_command failed"
+    main_verify_task.review_verify_head_sha = "aaaaaaaaaaaa1111"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": "main verify RED at `aaaaaaaaaaaa` - merges halted; phase `unit` failing",
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failing_phase": "unit",
+            "gate_enabled": True,
+            "head_sha": "aaaaaaaaaaaa1111",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.side_effect = lambda ref: "bbbbbbbbbbbb2222" if ref == "refs/heads/main" else None
+
+    with patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp"):
+        rows = query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(limit=None, include_skipped=True),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == main_verify_task.id
+    assert row.next_action is not None
+    assert row.next_action["needs_attention_reason"] == "main-integration-verify-red"
+    assert "main verify red evidence stale at current HEAD" in row.next_action["description"]
+    assert "aaaaaaaaaaaa" not in row.next_action["description"]
+    assert "merges halted" not in row.next_action["description"]
+    git.rev_parse_if_exists.assert_any_call("refs/heads/main")
 
 
 def test_query_lineage_owner_rows_keeps_auto_refreshable_stale_review_out_of_attention(
@@ -5057,7 +5370,9 @@ def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_
     config = Config.load(tmp_path)
     config.verify_command = None
 
-    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
     assert main_verify_task.id is not None
     main_verify_task.status = "completed"
     main_verify_task.completed_at = datetime.now(UTC)
@@ -5086,7 +5401,7 @@ def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_
     git = MagicMock(spec=Git)
     git.default_branch.return_value = "main"
     git.current_branch.return_value = "topic"
-    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref in {"refs/heads/main", "main"} else "topic-sha"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
 
     rows = query_lineage_owner_rows(
         store,
@@ -5107,7 +5422,9 @@ def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_
     config = Config.load(tmp_path)
     config.verify_command = "./bin/tests"
 
-    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
     assert main_verify_task.id is not None
     main_verify_task.status = "completed"
     main_verify_task.completed_at = datetime.now(UTC)
@@ -5132,7 +5449,7 @@ def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_
     git = MagicMock(spec=Git)
     git.default_branch.return_value = "main"
     git.current_branch.return_value = "topic"
-    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref in {"refs/heads/main", "main"} else "topic-sha"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
 
     rows = query_lineage_owner_rows(
         store,
@@ -5153,7 +5470,9 @@ def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_
     config = Config.load(tmp_path)
     config.verify_command = "./bin/tests"
 
-    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
     assert main_verify_task.id is not None
     main_verify_task.status = "completed"
     main_verify_task.completed_at = datetime.now(UTC)
@@ -5198,8 +5517,7 @@ def test_query_lineage_owner_rows_omits_stale_current_main_verify_red_attention_
     )
 
     assert not any(
-        row.next_action is not None
-        and row.next_action.get("needs_attention_reason") == "main-integration-verify-red"
+        row.next_action is not None and row.next_action.get("needs_attention_reason") == "main-integration-verify-red"
         for row in rows
     )
 
@@ -5212,7 +5530,9 @@ def test_query_lineage_owner_rows_keeps_visible_main_verify_attention_when_defau
     config = Config.load(tmp_path)
     config.verify_command = "./bin/tests"
 
-    main_verify_task = store.add("System alert: local main integration verify", task_type="internal", skip_learnings=True)
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
     assert main_verify_task.id is not None
     main_verify_task.status = "completed"
     main_verify_task.completed_at = datetime.now(UTC)
@@ -5241,7 +5561,7 @@ def test_query_lineage_owner_rows_keeps_visible_main_verify_attention_when_defau
     git = MagicMock(spec=Git)
     git.default_branch.return_value = "main"
     git.current_branch.return_value = "main"
-    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref in {"refs/heads/main", "main"} else "topic-sha"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
 
     with patch("gza.main_integration_verify._compute_tree_fingerprint", return_value=None):
         rows = query_lineage_owner_rows(
@@ -5263,6 +5583,545 @@ def test_query_lineage_owner_rows_keeps_visible_main_verify_attention_when_defau
     )
 
 
+@pytest.mark.parametrize("live_main_sha", ["def456", None])
+def test_query_lineage_owner_rows_weakens_default_branch_fingerprint_unavailable_when_head_unproven(
+    tmp_path: Path,
+    live_main_sha: str | None,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "failed"
+    main_verify_task.review_verify_exit_status = "1"
+    main_verify_task.review_verify_failure = "verify_command failed"
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failing_phase": "unit",
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.side_effect = lambda ref: live_main_sha if ref == "refs/heads/main" else "topic-sha"
+
+    with patch("gza.main_integration_verify._compute_tree_fingerprint", return_value=None):
+        rows = query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(limit=None, include_skipped=True),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == main_verify_task.id
+    assert row.next_action is not None
+    assert row.next_action["needs_attention_reason"] == "main-integration-verify-red"
+    assert "main verify freshness unproven at current HEAD" in row.next_action["description"]
+    assert "exact tree fingerprint unavailable" in row.next_action["description"]
+    assert "abc123" not in row.next_action["description"]
+    assert "merges halted" not in row.next_action["description"]
+
+
+@pytest.mark.parametrize("live_main_sha", ["def456", None])
+def test_query_lineage_owner_rows_uses_structured_freshness_status_over_legacy_red_alert(
+    tmp_path: Path,
+    live_main_sha: str | None,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "unavailable"
+    main_verify_task.review_verify_exit_status = MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
+    main_verify_task.review_verify_failure = (
+        "could not prove exact local target tree freshness because the tree fingerprint is unavailable"
+    )
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failing_phase": "unit",
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.side_effect = lambda ref: live_main_sha if ref == "refs/heads/main" else "topic-sha"
+
+    with patch("gza.main_integration_verify._compute_tree_fingerprint", return_value=None):
+        rows = query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(limit=None, include_skipped=True),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == main_verify_task.id
+    assert row.next_action is not None
+    assert row.next_action["needs_attention_reason"] == "main-integration-verify-red"
+    assert "main verify freshness unproven at current HEAD" in row.next_action["description"]
+    assert "exact tree fingerprint unavailable" in row.next_action["description"]
+    assert "main verify RED" not in row.next_action["description"]
+    assert "abc123" not in row.next_action["description"]
+    assert "merges halted" not in row.next_action["description"]
+
+
+@pytest.mark.parametrize(
+    ("live_main_sha", "expected"),
+    [
+        ("def456", "main verify evidence stale for current HEAD; verify status unavailable"),
+        (None, "main verify evidence unproven for current HEAD; verify status unavailable"),
+    ],
+)
+def test_query_lineage_owner_rows_fails_closed_for_malformed_unclassified_main_verify_attention(
+    tmp_path: Path,
+    live_main_sha: str | None,
+    expected: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = None
+    main_verify_task.review_verify_exit_status = "1"
+    main_verify_task.review_verify_failure = "verify_command failed"
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": "legacy alert at `abc123` says merges halted",
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failing_phase": None,
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.side_effect = lambda ref: live_main_sha if ref == "refs/heads/main" else "topic-sha"
+
+    with patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp"):
+        rows = query_lineage_owner_rows(
+            store,
+            LineageOwnerQuery(limit=None, include_skipped=True),
+            config=config,
+            git=git,
+            target_branch="main",
+        )
+
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == main_verify_task.id
+    assert row.next_action is not None
+    assert row.next_action["needs_attention_reason"] == "main-integration-verify-red"
+    assert expected in row.next_action["description"]
+    assert "abc123" not in row.next_action["description"]
+    assert "merges halted" not in row.next_action["description"]
+    assert "legacy alert" not in row.next_action["description"]
+
+
+def test_query_lineage_owner_rows_renders_current_unknown_main_verify_status_as_unknown_evidence(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "mystery"
+    main_verify_task.review_verify_exit_status = "42"
+    main_verify_task.review_verify_failure = "unexpected verify status"
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": "main verify RED at `abc123` - merges halted; phase `unit` failing",
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failing_phase": "unit",
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == main_verify_task.id
+    assert row.next_action is not None
+    assert "main verify evidence unknown for current HEAD; unrecognized verify status `mystery`" in row.next_action[
+        "description"
+    ]
+    assert "abc123" not in row.next_action["description"]
+    assert "main verify RED" not in row.next_action["description"]
+    assert "merges halted" not in row.next_action["description"]
+
+
+@pytest.mark.parametrize(
+    ("verify_status", "verify_exit_status", "gate_enabled", "config_verify_command"),
+    [
+        ("passed", "0", True, "./bin/tests"),
+        ("unavailable", "not configured", False, None),
+    ],
+)
+def test_query_lineage_owner_rows_suppresses_incompatible_legacy_main_verify_attention(
+    tmp_path: Path,
+    verify_status: str,
+    verify_exit_status: str,
+    gate_enabled: bool,
+    config_verify_command: str | None,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = config_verify_command
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests" if gate_enabled else "(verify_command unavailable)"
+    main_verify_task.review_verify_status = verify_status
+    main_verify_task.review_verify_exit_status = verify_exit_status
+    main_verify_task.review_verify_failure = None
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": (
+                "main verify RED at `abc123` - merges halted; phase `unit` failing; "
+                "automatic remediation exhausted after 2/2 attempts for phase:unit on fp; "
+                "human intervention required"
+            ),
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload() if gate_enabled else None,
+            "failure_signature": "phase:unit",
+            "failing_phase": "unit",
+            "gate_enabled": gate_enabled,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests" if gate_enabled else None,
+            "verify_timeout_grace_seconds": 5.0 if gate_enabled else None,
+            "verify_timeout_seconds": 120 if gate_enabled else None,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert not any(row.owner_task.id == main_verify_task.id for row in rows)
+
+
+@pytest.mark.parametrize(
+    ("verify_exit_status", "expected"),
+    [
+        (
+            MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+            (
+                "main verify freshness unproven at `abc123` - merges halted; "
+                "exact tree fingerprint unavailable"
+            ),
+        ),
+        (
+            MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+            "main verify misconfigured - verify command launch failed; fix the environment, not the code",
+        ),
+    ],
+)
+def test_query_lineage_owner_rows_prefers_structured_special_status_over_legacy_exhaustion(
+    tmp_path: Path,
+    verify_exit_status: str,
+    expected: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = "unavailable"
+    main_verify_task.review_verify_exit_status = verify_exit_status
+    main_verify_task.review_verify_failure = "verify unavailable"
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": (
+                "main verify RED at `abc123` - merges halted; phase `unit` failing; "
+                "automatic remediation exhausted after 2/2 attempts for phase:unit on fp; "
+                "human intervention required"
+            ),
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failure_signature": "phase:unit",
+            "failing_phase": "unit",
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    if verify_exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS:
+        assert not any(row.owner_task.id == main_verify_task.id for row in rows)
+        return
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == main_verify_task.id
+    assert row.next_action is not None
+    assert expected in row.next_action["description"]
+    assert "human intervention" not in row.next_action["description"]
+
+
+@pytest.mark.parametrize("verify_status", ["mystery", ""])
+def test_query_lineage_owner_rows_rejects_legacy_exhaustion_for_unknown_invalid_or_empty_status(
+    tmp_path: Path,
+    verify_status: object,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+
+    main_verify_task = store.add(
+        "System alert: local main integration verify", task_type="internal", skip_learnings=True
+    )
+    assert main_verify_task.id is not None
+    main_verify_task.status = "completed"
+    main_verify_task.completed_at = datetime.now(UTC)
+    main_verify_task.review_verify_command = "./bin/tests"
+    main_verify_task.review_verify_status = verify_status if isinstance(verify_status, str) else None
+    main_verify_task.review_verify_exit_status = "42"
+    main_verify_task.review_verify_failure = "unexpected verify status"
+    main_verify_task.review_verify_head_sha = "abc123"
+    main_verify_task.output_content = json.dumps(
+        {
+            "alert_message": (
+                "main verify RED at `abc123` - merges halted; "
+                "automatic remediation exhausted after 2/2 attempts for phase:unit on fp; "
+                "human intervention required"
+            ),
+            "captured_at": "2026-06-23T00:00:00+00:00",
+            "environment_identity": _main_verify_environment_identity_payload(),
+            "failure_signature": "phase:unit",
+            "failing_phase": "unit",
+            "gate_enabled": True,
+            "head_sha": "abc123",
+            "tree_fingerprint": "fp",
+            "verify_command": "./bin/tests",
+            "verify_status": verify_status,
+            "verify_timeout_grace_seconds": 5.0,
+            "verify_timeout_seconds": 120,
+        },
+        sort_keys=True,
+    )
+    store.update(main_verify_task)
+
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+    git.current_branch.return_value = "topic"
+    git.rev_parse_if_exists.side_effect = lambda ref: "abc123" if ref == "refs/heads/main" else "topic-sha"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == main_verify_task.id
+    assert row.next_action is not None
+    assert "main verify evidence unknown for current HEAD" in row.next_action["description"]
+    assert (
+        "unrecognized verify status `mystery`" if verify_status == "mystery" else "invalid verify status evidence"
+    ) in row.next_action["description"]
+    assert "abc123" not in row.next_action["description"]
+    assert "RED" not in row.next_action["description"]
+    assert "merges halted" not in row.next_action["description"]
+    assert "red for" not in row.next_action["description"]
+    assert "remediation exhausted" not in row.next_action["description"]
+
+
+def test_query_lineage_owner_rows_rejects_legacy_exhaustion_for_invalid_non_string_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    state = SimpleNamespace(
+        task=SimpleNamespace(id="gza-main", status="completed", task_type="internal"),
+        gate_enabled=True,
+        head_sha="abc123",
+        verify_status=7,
+        verify_exit_status="42",
+        failing_phase="unit",
+        failure_signature="phase:unit",
+        failure="unexpected verify status",
+        alert_message=(
+            "main verify RED at `abc123` - merges halted; "
+            "automatic remediation exhausted after 2/2 attempts for phase:unit on fp; "
+            "human intervention required"
+        ),
+        red_since=datetime(2026, 6, 24, 12, 5, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        "gza.lineage_query.current_main_integration_verify_alert",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            state=state,
+            target_proof=SimpleNamespace(status="current"),
+        ),
+    )
+    git = MagicMock(spec=Git)
+    git.default_branch.return_value = "main"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert rows
+    row = rows[0]
+    assert row.owner_task.id == "gza-main"
+    assert row.next_action is not None
+    assert "main verify evidence unknown for current HEAD; invalid verify status evidence" in row.next_action[
+        "description"
+    ]
+    assert "abc123" not in row.next_action["description"]
+    assert "RED" not in row.next_action["description"]
+    assert "merges halted" not in row.next_action["description"]
+    assert "red for" not in row.next_action["description"]
+    assert "remediation exhausted" not in row.next_action["description"]
+
+
 def test_build_merge_context_from_git_records_warning_and_clears_existing_branches_on_git_error(
     tmp_path: Path,
 ) -> None:
@@ -5280,12 +6139,8 @@ def test_build_merge_context_from_git_records_warning_and_clears_existing_branch
     assert merge_context.existing_branches is None, (
         "existing_branches should be None when local_branch_names() raises GitError"
     )
-    assert "local-branch-list" in merge_context._warning_keys, (
-        "local-branch-list warning key should be recorded"
-    )
-    assert merge_context.repository_inspection_warnings, (
-        "at least one inspection warning should be recorded"
-    )
+    assert "local-branch-list" in merge_context._warning_keys, "local-branch-list warning key should be recorded"
+    assert merge_context.repository_inspection_warnings, "at least one inspection warning should be recorded"
     assert "failed to list local branches" in merge_context.repository_inspection_warnings[0], (
         "warning text should mention the failed branch listing"
     )

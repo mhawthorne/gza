@@ -13,23 +13,12 @@ def current_local_target_head_sha(git: Any | None, *, target_branch: str | None 
         return None
     if not target_branch:
         return _rev_parse_if_exists(git, "HEAD")
-
-    current_head = _rev_parse_if_exists(git, f"refs/heads/{target_branch}")
-    if current_head is not None:
-        return current_head
-
-    try:
-        current_branch = git.current_branch()
-    except (AssertionError, GitError):
-        return None
-    if current_branch != target_branch:
-        return None
-    return _rev_parse_if_exists(git, "HEAD")
+    return _rev_parse_if_exists(git, f"refs/heads/{target_branch}")
 
 
 def _rev_parse_if_exists(git: Any, ref: str) -> str | None:
     try:
         sha = git.rev_parse_if_exists(ref)
-    except (AssertionError, GitError):
+    except GitError:
         return None
     return sha if isinstance(sha, str) and sha else None

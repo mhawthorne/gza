@@ -15,8 +15,7 @@ from typing import Any, Literal, cast
 from .artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from .config import Config
 from .db import SqliteTaskStore, Task
-from .git import Git
-from .main_verify_target import current_local_target_head_sha
+from .git import Git, GitError
 from .off_topic_verify import extract_pytest_failing_nodeids
 from .runner import (
     _capture_review_verify_result,
@@ -54,8 +53,6 @@ _FAILED_TO_SPAWN_RE = re.compile(r"Failed to spawn:\s*`(?P<tool>[^`]+)`(?::\s*(?
 _OSERROR_TOOL_RE = re.compile(
     r"(?P<detail>No such file or directory|Permission denied|Exec format error):\s*['\"](?P<tool>[^'\"]+)['\"]"
 )
-
-
 @dataclass(frozen=True)
 class MainIntegrationVerifyState:
     """Persisted verification state for the canonical local target branch."""
@@ -97,6 +94,52 @@ class MainIntegrationVerifyCheck:
     def resolved_red_signature(self) -> str | None:
         """Backward-compatible alias for callers migrated to resolved_signature."""
         return self.resolved_signature
+
+
+@dataclass(frozen=True)
+class MainIntegrationVerifyTargetProof:
+    """Proof that a persisted verify state describes the caller's current target."""
+
+    status: Literal["current", "stale", "unproven"]
+
+
+@dataclass(frozen=True)
+class MainIntegrationVerifyExhaustedRemediationAttention:
+    """Parsed exhausted-remediation evidence from structured/legacy main-verify state."""
+
+    attempts: str
+    signature: str | None
+    fingerprint: str | None
+
+
+def resolve_main_integration_verify_target_proof(
+    state: object,
+    git: Git | None,
+    *,
+    target_branch: str | None = None,
+) -> MainIntegrationVerifyTargetProof:
+    """Resolve exact local-target proof for rendering SHA-bearing halt claims."""
+    if git is None:
+        return MainIntegrationVerifyTargetProof("unproven")
+    if target_branch is None:
+        try:
+            resolved_target_branch = git.default_branch()
+        except (AttributeError, GitError):
+            return MainIntegrationVerifyTargetProof("unproven")
+        target_branch = resolved_target_branch
+    from .main_verify_format import resolve_main_verify_target_proof
+
+    return MainIntegrationVerifyTargetProof(
+        resolve_main_verify_target_proof(state, git=git, target_branch=target_branch)
+    )
+
+
+@dataclass(frozen=True)
+class CurrentMainIntegrationVerifyAlert:
+    """Current alert state paired with proof of how it relates to the live target."""
+
+    state: MainIntegrationVerifyState
+    target_proof: MainIntegrationVerifyTargetProof
 
 
 @dataclass(frozen=True)
@@ -161,11 +204,14 @@ class MainIntegrationVerifyEnvironmentIdentity:
         python_version = payload.get("python_version")
         if runner_class not in {"host", "container"}:
             return None
-        if not all(isinstance(value, str) and value for value in (
-            platform_system,
-            platform_machine,
-            python_version,
-        )):
+        if not all(
+            isinstance(value, str) and value
+            for value in (
+                platform_system,
+                platform_machine,
+                python_version,
+            )
+        ):
             return None
         if python_implementation is not None and not isinstance(python_implementation, str):
             return None
@@ -178,9 +224,7 @@ class MainIntegrationVerifyEnvironmentIdentity:
         if python_executable_family is None:
             legacy_python_executable = payload.get("python_executable")
             if isinstance(legacy_python_executable, str) and legacy_python_executable:
-                python_executable_family = _normalize_python_executable_family(
-                    legacy_python_executable
-                )
+                python_executable_family = _normalize_python_executable_family(legacy_python_executable)
         typed_runner_class = cast(Literal["host", "container"], runner_class)
         typed_platform_system = cast(str, platform_system)
         typed_platform_machine = cast(str, platform_machine)
@@ -301,13 +345,10 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
             red_since = None
     failing_phase = payload.get("failing_phase") if isinstance(payload.get("failing_phase"), str) else None
     failure_signature = payload.get("failure_signature") if isinstance(payload.get("failure_signature"), str) else None
-    if (
-        failure_signature is None
-        and _verify_result_halts_merges(
-            status=task.review_verify_status,
-            gate_enabled=_payload_gate_enabled(task, payload),
-            exit_status=task.review_verify_exit_status,
-        )
+    if failure_signature is None and _verify_result_halts_merges(
+        status=task.review_verify_status,
+        gate_enabled=_payload_gate_enabled(task, payload),
+        exit_status=task.review_verify_exit_status,
     ):
         failure_signature = _verify_failure_signature(
             failing_phase=failing_phase,
@@ -316,11 +357,7 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
         )
     pending_retirement_signatures_raw = payload.get("pending_retirement_signatures")
     pending_retirement_signatures = (
-        tuple(
-            signature
-            for signature in pending_retirement_signatures_raw
-            if isinstance(signature, str) and signature
-        )
+        tuple(signature for signature in pending_retirement_signatures_raw if isinstance(signature, str) and signature)
         if isinstance(pending_retirement_signatures_raw, list)
         else ()
     )
@@ -330,9 +367,7 @@ def load_main_integration_verify_state(store: SqliteTaskStore) -> MainIntegratio
         verify_command=_payload_verify_command(task, payload),
         verify_timeout_seconds=_coerce_optional_int(payload.get("verify_timeout_seconds")),
         verify_timeout_grace_seconds=_coerce_optional_float(payload.get("verify_timeout_grace_seconds")),
-        environment_identity=MainIntegrationVerifyEnvironmentIdentity.from_payload(
-            payload.get("environment_identity")
-        ),
+        environment_identity=MainIntegrationVerifyEnvironmentIdentity.from_payload(payload.get("environment_identity")),
         tree_fingerprint=payload.get("tree_fingerprint") if isinstance(payload.get("tree_fingerprint"), str) else None,
         head_sha=payload.get("head_sha") if isinstance(payload.get("head_sha"), str) else task.review_verify_head_sha,
         verify_status=task.review_verify_status,
@@ -434,11 +469,7 @@ def _candidate_review_verify_artifact_paths(
     if task.id is None:
         return tuple(candidates)
     artifacts = store.list_artifacts(task.id, kind=VERIFY_COMMAND_OUTPUT_ARTIFACT_KIND)
-    candidates.extend(
-        artifact.path
-        for artifact in artifacts
-        if artifact.path and artifact.path != preferred
-    )
+    candidates.extend(artifact.path for artifact in artifacts if artifact.path and artifact.path != preferred)
     return tuple(candidates)
 
 
@@ -493,7 +524,7 @@ def _build_main_verify_excerpt(output: str | None) -> str | None:
         None,
     )
     if summary_index is None:
-        excerpt_lines = lines[-MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_LINES :]
+        excerpt_lines = lines[-MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_LINES:]
     else:
         start = max(0, summary_index - 8)
         excerpt_lines = lines[start : start + MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_LINES]
@@ -502,7 +533,7 @@ def _build_main_verify_excerpt(output: str | None) -> str | None:
         return None
     if len(excerpt) <= MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_CHARS:
         return excerpt
-    trimmed = excerpt[-MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_CHARS :].lstrip()
+    trimmed = excerpt[-MAIN_VERIFY_REMEDIATION_EXCERPT_MAX_CHARS:].lstrip()
     return f"[...]\n{trimmed}"
 
 
@@ -531,11 +562,7 @@ def _normalize_verify_tool_name(raw: str | None) -> str | None:
 
 def _summarize_launch_issue_detail(detail: str) -> str:
     lowered = detail.lower()
-    if (
-        "command not found" in lowered
-        or "no such file or directory" in lowered
-        or lowered.endswith("not found")
-    ):
+    if "command not found" in lowered or "no such file or directory" in lowered or lowered.endswith("not found"):
         return "not on PATH"
     if (
         "permission denied" in lowered
@@ -658,6 +685,75 @@ def _build_freshness_unavailable_alert_message(*, head_sha: str | None) -> str:
     return "main verify freshness unproven; exact tree fingerprint unavailable"
 
 
+def main_integration_verify_state_needs_non_red_attention(state: object) -> bool:
+    from .main_verify_format import main_verify_state_needs_non_red_attention
+
+    return main_verify_state_needs_non_red_attention(state)
+
+
+def main_integration_verify_state_is_freshness_unavailable(state: object) -> bool:
+    from .main_verify_format import main_verify_state_is_freshness_unavailable
+
+    return main_verify_state_is_freshness_unavailable(state)
+
+
+def main_integration_verify_state_is_red_verdict(state: object) -> bool:
+    from .main_verify_format import main_verify_state_is_red_verdict
+
+    return main_verify_state_is_red_verdict(state)
+
+
+def main_integration_verify_state_has_exhausted_remediation_attention(state: object) -> bool:
+    from .main_verify_format import main_verify_state_is_remediation_exhausted
+
+    return main_verify_state_is_remediation_exhausted(state)
+
+
+def main_integration_verify_state_exhausted_remediation_attention(
+    state: object,
+) -> MainIntegrationVerifyExhaustedRemediationAttention | None:
+    from .main_verify_format import main_verify_state_exhausted_remediation_attention
+
+    parsed = main_verify_state_exhausted_remediation_attention(state)
+    if parsed is None:
+        return None
+    return MainIntegrationVerifyExhaustedRemediationAttention(
+        attempts=parsed.attempts,
+        signature=parsed.signature,
+        fingerprint=parsed.fingerprint,
+    )
+
+
+def main_integration_verify_state_failure_signature(state: object) -> str | None:
+    from .main_verify_format import main_verify_state_failure_signature
+
+    return main_verify_state_failure_signature(state)
+
+
+def main_integration_verify_state_halts_merges(state: object) -> bool:
+    from .main_verify_format import main_verify_state_halts_merges
+
+    return main_verify_state_halts_merges(state)
+
+
+def format_red_duration(red_since: datetime, now: datetime) -> str:
+    from .main_verify_format import format_red_duration as shared_format_red_duration
+
+    return shared_format_red_duration(red_since, now)
+
+
+def format_main_integration_verify_attention_message(
+    state: object,
+    *,
+    target_proof: MainIntegrationVerifyTargetProof,
+    now: datetime | None = None,
+) -> str:
+    """Render main-verify attention without trusting SHA-bearing persisted text."""
+    from .main_verify_format import format_main_verify_status_message
+
+    return format_main_verify_status_message(state, target_proof=target_proof.status, now=now)
+
+
 def _verify_result_halts_merges(
     *,
     status: str | None,
@@ -680,11 +776,14 @@ def _verify_result_needs_attention(
 ) -> bool:
     if not gate_enabled or not alert_message:
         return False
-    return _verify_result_halts_merges(
-        status=status,
-        gate_enabled=gate_enabled,
-        exit_status=exit_status,
-    ) or exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+    return (
+        _verify_result_halts_merges(
+            status=status,
+            gate_enabled=gate_enabled,
+            exit_status=exit_status,
+        )
+        or exit_status == MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
+    )
 
 
 def _coerce_optional_str(value: object) -> str | None:
@@ -884,21 +983,29 @@ def persist_main_integration_verify_alert_message(
         failing_phase = getattr(state, "failing_phase", None)
         verify_status = getattr(state, "verify_status", None)
         verify_exit_status = getattr(state, "verify_exit_status", None)
-        if _verify_result_halts_merges(
-            status=verify_status if isinstance(verify_status, str) else None,
-            gate_enabled=state.gate_enabled,
-            exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
-        ) and isinstance(failing_phase, str) and failing_phase:
+        if (
+            _verify_result_halts_merges(
+                status=verify_status if isinstance(verify_status, str) else None,
+                gate_enabled=state.gate_enabled,
+                exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
+            )
+            and isinstance(failing_phase, str)
+            and failing_phase
+        ):
             failure_signature = _verify_failure_signature(
                 failing_phase=failing_phase,
                 verify_status=verify_status if isinstance(verify_status, str) else None,
                 verify_exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
             )
-        elif _verify_result_halts_merges(
-            status=verify_status if isinstance(verify_status, str) else None,
-            gate_enabled=state.gate_enabled,
-            exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
-        ) and isinstance(verify_status, str) and verify_status:
+        elif (
+            _verify_result_halts_merges(
+                status=verify_status if isinstance(verify_status, str) else None,
+                gate_enabled=state.gate_enabled,
+                exit_status=verify_exit_status if isinstance(verify_exit_status, str) else None,
+            )
+            and isinstance(verify_status, str)
+            and verify_status
+        ):
             failure_signature = _verify_failure_signature(
                 failing_phase=None,
                 verify_status=verify_status,
@@ -1055,9 +1162,7 @@ def _checkpoint_is_current(
             if datetime.now(UTC) - captured_at >= timedelta(minutes=config.main_integration_verify_red_ttl_minutes):
                 return False
         return bool(
-            current_tree_fingerprint
-            and state.tree_fingerprint
-            and current_tree_fingerprint == state.tree_fingerprint
+            current_tree_fingerprint and state.tree_fingerprint and current_tree_fingerprint == state.tree_fingerprint
         )
     return bool(current_head_sha and state.head_sha and current_head_sha == state.head_sha)
 
@@ -1147,8 +1252,7 @@ def run_main_integration_verify(
     alert_message = (
         _build_launch_issue_alert_message(head_sha=head_sha, issue=launch_issue)
         if gate_enabled and launch_issue is not None
-        else
-        _build_freshness_unavailable_alert_message(head_sha=head_sha)
+        else _build_freshness_unavailable_alert_message(head_sha=head_sha)
         if gate_enabled
         and result.status == "unavailable"
         and result.exit_status == MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
@@ -1387,13 +1491,17 @@ def check_main_integration_verify(
         current_tree_fingerprint=current_tree_fingerprint,
         current_head_sha=current_head_sha,
     )
-    if checkpoint_is_current and not force and not (
-        state is not None
-        and red_reruns > 0
-        and _verify_result_halts_merges(
-            status=state.verify_status,
-            gate_enabled=state.gate_enabled,
-            exit_status=state.verify_exit_status,
+    if (
+        checkpoint_is_current
+        and not force
+        and not (
+            state is not None
+            and red_reruns > 0
+            and _verify_result_halts_merges(
+                status=state.verify_status,
+                gate_enabled=state.gate_enabled,
+                exit_status=state.verify_exit_status,
+            )
         )
     ):
         assert state is not None
@@ -1607,6 +1715,44 @@ def check_candidate_integration_verify(
     )
 
 
+def current_main_integration_verify_alert_with_target_proof(
+    store: SqliteTaskStore,
+    git: Git,
+    config: Config,
+    *,
+    runner_class: Literal["host", "container"] = "host",
+) -> CurrentMainIntegrationVerifyAlert | None:
+    """Return the red-main alert with proof for rendering live-target claims."""
+    from .main_verify_format import main_verify_state_halts_merges
+
+    state = load_main_integration_verify_state(store)
+    if state is None or not main_verify_state_halts_merges(state):
+        return None
+    if not _gate_identity_matches(state, _current_gate_identity(config, runner_class=runner_class)):
+        return None
+    default_branch = git.default_branch()
+    target_proof = resolve_main_integration_verify_target_proof(state, git, target_branch=default_branch)
+    if git.current_branch() == default_branch:
+        current_tree_fingerprint = _compute_tree_fingerprint(git)
+        if current_tree_fingerprint and state.tree_fingerprint:
+            if current_tree_fingerprint != state.tree_fingerprint:
+                return None
+            return CurrentMainIntegrationVerifyAlert(state, target_proof)
+        freshness_state = replace(
+            state,
+            verify_status="unavailable",
+            verify_exit_status=MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
+            failure=_build_freshness_unavailable_failure(),
+            alert_message=_build_freshness_unavailable_alert_message(head_sha=state.head_sha),
+        )
+        return CurrentMainIntegrationVerifyAlert(freshness_state, target_proof)
+    if target_proof.status == "stale":
+        return None
+    if target_proof.status == "current":
+        return CurrentMainIntegrationVerifyAlert(state, target_proof)
+    return None
+
+
 def current_main_integration_verify_alert(
     store: SqliteTaskStore,
     git: Git,
@@ -1614,29 +1760,11 @@ def current_main_integration_verify_alert(
     *,
     runner_class: Literal["host", "container"] = "host",
 ) -> MainIntegrationVerifyState | None:
-    """Return the current red-main alert when it still matches the live local tree."""
-    state = load_main_integration_verify_state(store)
-    if state is None or not _verify_result_halts_merges(
-        status=state.verify_status,
-        gate_enabled=state.gate_enabled,
-        exit_status=state.verify_exit_status,
-    ):
-        return None
-    if not _gate_identity_matches(state, _current_gate_identity(config, runner_class=runner_class)):
-        return None
-    default_branch = git.default_branch()
-    current_head_sha = current_local_target_head_sha(git, target_branch=default_branch)
-    if git.current_branch() == default_branch:
-        current_tree_fingerprint = _compute_tree_fingerprint(git)
-        if current_tree_fingerprint and state.tree_fingerprint:
-            return state if current_tree_fingerprint == state.tree_fingerprint else None
-        return replace(
-            state,
-            verify_status="unavailable",
-            verify_exit_status=MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
-            failure=_build_freshness_unavailable_failure(),
-            alert_message=_build_freshness_unavailable_alert_message(head_sha=current_head_sha or state.head_sha),
-        )
-    if current_head_sha and state.head_sha:
-        return state if current_head_sha == state.head_sha else None
-    return None
+    """Return the current red-main alert when it is visible for the live local tree."""
+    alert = current_main_integration_verify_alert_with_target_proof(
+        store,
+        git,
+        config,
+        runner_class=runner_class,
+    )
+    return alert.state if alert is not None else None
