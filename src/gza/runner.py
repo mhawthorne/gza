@@ -123,7 +123,7 @@ from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .providers.base import PreflightCheckResult
 from .providers.log_renderers import UnknownLogProviderError, get_log_renderer
-from .rebase_checkout import import_isolated_rebase_tip, isolated_rebase_checkout
+from .rebase_checkout import StaleRebaseImportError, import_isolated_rebase_tip, isolated_rebase_checkout
 from .rebase_diff import (
     RebaseDiffBaseline,
     RebaseDiffProvenance,
@@ -132,7 +132,12 @@ from .rebase_diff import (
     compute_rebase_changed_diff,
     compute_resolution_delta_context,
 )
-from .rebase_publish import publish_rebased_branch
+from .rebase_publish import (
+    REBASE_SUPERSEDED_COMPLETION_REASON,
+    RebasePublishResult,
+    branch_contains_rebase_target,
+    publish_rebased_branch,
+)
 from .review_scope import (
     ResolutionReviewScope,
     declares_resolution_review_mode,
@@ -1132,6 +1137,27 @@ def _has_trustworthy_green_verify_evidence_for_current_tree(log_file: Path, work
     return False
 
 
+def _superseded_rebase_output_content(
+    *,
+    branch_name: str,
+    supersession_proof_target: str | None,
+    provider_summary: str | None,
+) -> str:
+    target_text = supersession_proof_target or "the rebase target"
+    outcome = (
+        f"Superseded/no-op: '{branch_name}' already contains '{target_text}' after a concurrent "
+        "rebase; this task's isolated rebased tip was not imported."
+    )
+    if not provider_summary or not provider_summary.strip():
+        return outcome
+    return (
+        f"{outcome}\n\n"
+        "Non-authoritative provider attempt detail from the isolated checkout follows; "
+        "it is not the completed task outcome:\n\n"
+        f"{provider_summary.strip()}\n"
+    )
+
+
 def _should_complete_as_verified_empty_noop(
     *,
     exit_code: int,
@@ -1305,8 +1331,11 @@ def _finalize_rebase_completion(
     fix_was_merged_before_run: bool = False,
     improve_diff_baseline: ImproveDiffBaseline | None = None,
     rebase_diff_baseline: RebaseDiffBaseline | None = None,
+    rebase_superseded_by_concurrent_rebase: bool = False,
+    rebase_supersession_proof_target: str | None = None,
 ) -> int:
     """Publish a completed rebase before persisting completed task state."""
+    publish_results: list[RebasePublishResult] = []
     post_complete_rc = _post_complete_code_task(
         task,
         config,
@@ -1321,9 +1350,19 @@ def _finalize_rebase_completion(
         fix_was_merged_before_run=fix_was_merged_before_run,
         improve_diff_baseline=improve_diff_baseline,
         rebase_diff_baseline=rebase_diff_baseline,
+        rebase_supersession_proof_target=(
+            rebase_supersession_proof_target
+            if rebase_superseded_by_concurrent_rebase
+            else None
+        ),
+        rebase_publish_results=publish_results,
     )
     if post_complete_rc != 0:
         return post_complete_rc
+    if publish_results:
+        published_head_sha = getattr(publish_results[-1], "local_sha", None)
+        if isinstance(published_head_sha, str):
+            head_sha = published_head_sha
     if create_pr:
         pr_outcome = _ensure_work_pr_for_completed_code_task(task, config, store, worktree_git)
         if pr_outcome.kind == "nonfatal_missing_pr":
@@ -1363,6 +1402,16 @@ def _finalize_rebase_completion(
         diff_removed=diff_removed,
         head_sha=head_sha,
         base_sha=base_sha,
+        completion_reason=(
+            REBASE_SUPERSEDED_COMPLETION_REASON
+            if rebase_superseded_by_concurrent_rebase
+            else None
+        ),
+        outcome_message=(
+            f"Outcome: completed ({REBASE_SUPERSEDED_COMPLETION_REASON})"
+            if rebase_superseded_by_concurrent_rebase
+            else "Outcome: completed"
+        ),
     )
     return 0
 
@@ -8597,6 +8646,8 @@ def _complete_code_task(
     seeded_paths: set[str] | None = None,
     improve_diff_baseline: ImproveDiffBaseline | None = None,
     rebase_diff_baseline: RebaseDiffBaseline | None = None,
+    rebase_superseded_by_concurrent_rebase: bool = False,
+    rebase_supersession_proof_target: str | None = None,
     error_type: str | None = None,
 ) -> int:
     """Handle successful code-task completion (staging, commit, completion state, output).
@@ -8873,6 +8924,14 @@ def _complete_code_task(
             # Copy summary content from worktree to project dir
             summary_path.write_text(summary_content)
             output_content = summary_content
+    if rebase_superseded_by_concurrent_rebase:
+        output_content = _superseded_rebase_output_content(
+            branch_name=branch_name,
+            supersession_proof_target=rebase_supersession_proof_target,
+            provider_summary=output_content,
+        )
+        summary_dir.mkdir(parents=True, exist_ok=True)
+        summary_path.write_text(output_content)
 
     # Compute diff stats vs. default branch before marking completed
     default_branch = target_branch if target_branch is not None else worktree_git.default_branch()
@@ -8949,6 +9008,8 @@ def _complete_code_task(
             fix_was_merged_before_run=fix_was_merged_before_run,
             improve_diff_baseline=improve_diff_baseline,
             rebase_diff_baseline=rebase_diff_baseline,
+            rebase_superseded_by_concurrent_rebase=rebase_superseded_by_concurrent_rebase,
+            rebase_supersession_proof_target=rebase_supersession_proof_target,
         )
 
     verify_fix_worktree_path = _verify_fix_completion_worktree_path(config, task)
@@ -8985,6 +9046,11 @@ def _complete_code_task(
         terminal_merge_state=verified_empty_noop_terminal_merge_state,
         completion_reason=(
             VERIFIED_EMPTY_NOOP_COMPLETION_REASON if complete_as_verified_empty_noop else None
+        )
+        or (
+            REBASE_SUPERSEDED_COMPLETION_REASON
+            if rebase_superseded_by_concurrent_rebase
+            else None
         ),
         changed_diff=(
             verify_fix_changed_source
@@ -9030,6 +9096,8 @@ def _post_complete_code_task(
     fix_was_merged_before_run: bool = False,
     improve_diff_baseline: ImproveDiffBaseline | None = None,
     rebase_diff_baseline: RebaseDiffBaseline | None = None,
+    rebase_supersession_proof_target: str | None = None,
+    rebase_publish_results: list[RebasePublishResult] | None = None,
 ) -> int:
     """Run shared post-completion side effects for completed code tasks."""
     auto_learnings = maybe_auto_regenerate_learnings(store, config)
@@ -9110,11 +9178,26 @@ def _post_complete_code_task(
     # Rebase tasks run provider-side conflict resolution in the worktree.
     # Force-push from the host runner so SSH/auth follows host environment.
     if task.task_type == "rebase":
-        publish_rebased_branch(
-            worktree_git,
-            branch=branch_name,
-            baseline=rebase_diff_baseline,
-            logger=task_logger,
+        if rebase_supersession_proof_target is not None:
+            publish_result = publish_rebased_branch(
+                worktree_git,
+                branch=branch_name,
+                baseline=rebase_diff_baseline,
+                logger=task_logger,
+                supersession_proof_target=rebase_supersession_proof_target,
+            )
+        else:
+            publish_result = publish_rebased_branch(
+                worktree_git,
+                branch=branch_name,
+                baseline=rebase_diff_baseline,
+                logger=task_logger,
+            )
+        if rebase_publish_results is not None:
+            rebase_publish_results.append(publish_result)
+        publish_result_local_sha = getattr(publish_result, "local_sha", None)
+        published_rebase_head_sha = (
+            publish_result_local_sha if isinstance(publish_result_local_sha, str) else None
         )
 
     rebase_changed_diff: bool | None = None
@@ -9129,14 +9212,18 @@ def _post_complete_code_task(
                 if rebase_diff_baseline is not None
                 else RebaseDiffBaseline(old_tip=None, target_at_start=None, merge_base_at_start=None, recovered=True)
             ),
-            branch=branch_name,
+            branch=published_rebase_head_sha or branch_name,
             target=target_branch if target_branch is not None else worktree_git.default_branch(),
         )
         rebase_changed_diff = rebase_comparison.changed_diff
         assert task.id is not None
         store.set_rebase_changed_diff(task.id, rebase_comparison.changed_diff)
         task.changed_diff = rebase_comparison.changed_diff
-        resolved_head_sha = worktree_git.rev_parse_if_exists(branch_name) if branch_name else None
+        resolved_head_sha = (
+            published_rebase_head_sha
+            if published_rebase_head_sha is not None
+            else (worktree_git.rev_parse_if_exists(branch_name) if branch_name else None)
+        )
         resolved_target_sha = target_branch if target_branch is not None else worktree_git.default_branch()
         resolved_target_head_sha = worktree_git.rev_parse_if_exists(resolved_target_sha)
         task.review_scope = build_rebase_diff_provenance(
@@ -10082,6 +10169,8 @@ def _run_inner(
             return 0
 
         if task.task_type == "rebase":
+            rebase_superseded_by_concurrent_rebase = False
+            rebase_supersession_proof_target: str | None = None
             if is_rebase_in_progress(worktree_git.repo_dir):
                 task_logger.error("Rebase still in progress after provider success.")
                 _save_wip_changes(task, worktree_git, config, branch_name)
@@ -10098,16 +10187,38 @@ def _run_inner(
                 return 0
 
             if isolated_checkout is not None:
-                import_isolated_rebase_tip(
-                    destination_git=git,
-                    checkout=isolated_checkout,
-                    branch=branch_name,
-                    expected_old_sha=(
-                        rebase_diff_baseline.old_tip if rebase_diff_baseline is not None else None
-                    ),
-                    temp_ref_name=task.slug,
-                )
+                try:
+                    import_isolated_rebase_tip(
+                        destination_git=git,
+                        checkout=isolated_checkout,
+                        branch=branch_name,
+                        expected_old_sha=(
+                            rebase_diff_baseline.old_tip if rebase_diff_baseline is not None else None
+                        ),
+                        temp_ref_name=task.slug,
+                    )
+                except StaleRebaseImportError:
+                    supersession_proof_target = (
+                        rebase_diff_baseline.target_at_start
+                        if rebase_diff_baseline is not None
+                        else None
+                    )
+                    if not branch_contains_rebase_target(
+                        git,
+                        branch=branch_name,
+                        target=supersession_proof_target,
+                    ):
+                        raise
+                    task_logger.warning(
+                        "Rebased tip lost the import race, but the current branch already "
+                        f"contains {supersession_proof_target}; completing this rebase as superseded."
+                    )
+                    rebase_superseded_by_concurrent_rebase = True
+                    rebase_supersession_proof_target = supersession_proof_target
                 worktree_git = git
+        else:
+            rebase_superseded_by_concurrent_rebase = False
+            rebase_supersession_proof_target = None
 
         return _complete_code_task(
             task,
@@ -10132,6 +10243,8 @@ def _run_inner(
             seeded_paths=seeded_paths,
             improve_diff_baseline=improve_diff_baseline,
             rebase_diff_baseline=rebase_diff_baseline,
+            rebase_superseded_by_concurrent_rebase=rebase_superseded_by_concurrent_rebase,
+            rebase_supersession_proof_target=rebase_supersession_proof_target,
             error_type=result.error_type,
         )
 

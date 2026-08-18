@@ -625,6 +625,51 @@ class TestReleaseHeldPlanSource:
         assert second_rebase.id != first_rebase.id
 
 
+def test_format_duplicate_active_rebase_prefers_active_branch_and_preserves_legacy_fallback(
+    tmp_path: Path,
+) -> None:
+    from gza.cli._common import format_duplicate_active_child_message
+
+    store = SqliteTaskStore(tmp_path / "test.db")
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    failed = store.add(
+        "Failed rebase",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+        branch="feature/orphan-rebased",
+    )
+    active = store.add(
+        "Active canonical rebase",
+        task_type="rebase",
+        based_on=failed.id,
+        same_branch=True,
+        branch="feature/canonical-rebased",
+    )
+    assert failed.id is not None
+    assert active.id is not None
+
+    message = format_duplicate_active_child_message(
+        DuplicateActiveChildError(active),
+        parent_task_id=failed.id,
+        task=failed,
+    )
+
+    assert message == f"rebase already pending/in progress for branch feature/canonical-rebased: {active.id}"
+    assert "feature/orphan-rebased" not in message
+
+    active.branch = None
+    store.update(active)
+    legacy_message = format_duplicate_active_child_message(
+        DuplicateActiveChildError(active),
+        parent_task_id=failed.id,
+        task=failed,
+    )
+
+    assert legacy_message == f"rebase already pending/in progress for branch feature/orphan-rebased: {active.id}"
+
+
 def test_build_failure_diagnostics_extracts_interrupt_source(tmp_path):
     """Structured interrupt log entries should surface a termination source."""
     log_path = tmp_path / "task.log"

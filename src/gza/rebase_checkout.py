@@ -37,6 +37,10 @@ class ImportedRebaseTip:
     temp_ref: str
 
 
+class StaleRebaseImportError(GitError):
+    """Raised when the destination branch changed before isolated import."""
+
+
 def _safe_checkout_stem(value: str) -> str:
     sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
     return sanitized or "rebase"
@@ -174,7 +178,7 @@ def import_isolated_rebase_tip(
     except GitError as exc:
         current_tip = destination_git.rev_parse_if_exists(branch_ref)
         if current_tip != expected_old_sha:
-            raise GitError(
+            raise StaleRebaseImportError(
                 "Refusing to import rebased tip for "
                 f"{branch}: expected old SHA {expected_old_sha}, found {current_tip or 'missing'}"
             ) from exc

@@ -125,6 +125,17 @@ Consequences:
   proves the rebase and checks already completed successfully MUST be reconciled into
   `status == "completed"` success, preserving its recorded task artifacts. It MUST NOT be
   classified as retryable infrastructure failure or parked for manual recovery.
+- A successful rebase whose private-checkout import loses an expected-old-SHA race to
+  another completed rebase MUST complete as a terminal superseded/no-op outcome only when
+  the live source branch already contains the exact target captured for that rebase
+  attempt. It MUST NOT be recorded as
+  `GIT_ERROR`, require manual intervention, or create a needs-attention row. If that
+  containment proof is false, the import failure remains a genuine `GIT_ERROR`; if the
+  containment proof cannot be evaluated, the task MUST fail closed as `GIT_ERROR` with
+  the ancestry-proof failure surfaced to operators instead of collapsing the diagnostic
+  into only the stale-import mismatch. Persisted completion output for the superseded row
+  MUST present this superseded/no-op result as authoritative and MUST NOT present the
+  isolated checkout's losing summary as the completed task outcome.
 - Provider-side transient availability failures surfaced as stream/log errors (for
   example a Codex `turn.failed` reporting that the selected model is at capacity)
   MUST classify as a retryable provider-availability failure, not `UNKNOWN`.

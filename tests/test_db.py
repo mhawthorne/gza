@@ -23,6 +23,7 @@ from gza.db import (
     MergeTargetResolutionError,
     NewTaskParams,
     ParkedTaskRearmState,
+    RebaseBranchResolutionError,
     SchemaIntegrityError,
     SqliteTaskStore,
     StepRef,
@@ -692,6 +693,398 @@ class TestActiveChildGuard:
             enforce_single_active_sibling=True,
         )
         assert created.id is not None
+
+    def test_rebase_singleton_guard_uses_branch_across_different_parents(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        first_parent = store.add("first parent", task_type="implement")
+        first_parent.branch = "feature/parent-one"
+        store.update(first_parent)
+        second_parent = store.add("second parent", task_type="implement")
+        second_parent.branch = "feature/parent-two"
+        store.update(second_parent)
+        assert first_parent.id is not None
+        assert second_parent.id is not None
+
+        first = store.add(
+            "first rebase",
+            task_type="rebase",
+            based_on=first_parent.id,
+            same_branch=True,
+            branch="feature/shared",
+            enforce_single_active_sibling=True,
+        )
+        assert first.id is not None
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            store.add(
+                "second rebase",
+                task_type="rebase",
+                based_on=second_parent.id,
+                same_branch=True,
+                branch="feature/shared",
+                enforce_single_active_sibling=True,
+            )
+
+        assert exc_info.value.active_child.id == first.id
+
+        other_branch = store.add(
+            "other branch rebase",
+            task_type="rebase",
+            based_on=second_parent.id,
+            same_branch=True,
+            branch="feature/other",
+            enforce_single_active_sibling=True,
+        )
+        assert other_branch.id is not None
+
+    def test_rebase_singleton_guard_keeps_active_key_when_parent_branch_changes(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        first_parent = store.add("first parent", task_type="implement")
+        first_parent.branch = "feature/parent-one"
+        store.update(first_parent)
+        second_parent = store.add("second parent", task_type="implement")
+        second_parent.branch = "feature/parent-two"
+        store.update(second_parent)
+        assert first_parent.id is not None
+        assert second_parent.id is not None
+
+        active = store.add(
+            "active shared-branch rebase",
+            task_type="rebase",
+            based_on=first_parent.id,
+            same_branch=True,
+            branch="feature/shared",
+            enforce_single_active_sibling=True,
+        )
+        assert active.id is not None
+
+        first_parent.branch = "feature/renamed-parent"
+        store.update(first_parent)
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            store.add(
+                "duplicate shared-branch rebase",
+                task_type="rebase",
+                based_on=second_parent.id,
+                same_branch=True,
+                branch="feature/shared",
+                enforce_single_active_sibling=True,
+            )
+
+        assert exc_info.value.active_child.id == active.id
+
+        renamed_parent_branch = store.add(
+            "renamed-parent branch rebase",
+            task_type="rebase",
+            based_on=second_parent.id,
+            same_branch=True,
+            branch="feature/renamed-parent",
+            enforce_single_active_sibling=True,
+        )
+        assert renamed_parent_branch.id is not None
+
+    def test_rebase_singleton_guard_allows_same_parent_different_branches(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        parent = store.add("shared parent", task_type="implement")
+        assert parent.id is not None
+
+        first = store.add(
+            "first branch rebase",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            branch="feature/one",
+            enforce_single_active_sibling=True,
+        )
+        assert first.id is not None
+
+        second = store.add(
+            "second branch rebase",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            branch="feature/two",
+            enforce_single_active_sibling=True,
+        )
+        assert second.id is not None
+
+    def test_rebase_singleton_guard_blocks_legacy_branchless_rebase_by_canonical_branch(
+        self, tmp_path: Path
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        first_parent = store.add("first parent", task_type="implement")
+        first_parent.branch = "feature/shared"
+        store.update(first_parent)
+        second_parent = store.add("second parent", task_type="implement")
+        assert first_parent.id is not None
+        assert second_parent.id is not None
+
+        legacy_active = store.add(
+            "legacy active rebase",
+            task_type="rebase",
+            based_on=first_parent.id,
+            same_branch=True,
+        )
+        assert legacy_active.id is not None
+        assert legacy_active.branch is None
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            store.add(
+                "new guarded rebase",
+                task_type="rebase",
+                based_on=second_parent.id,
+                same_branch=True,
+                branch="feature/shared",
+                enforce_single_active_sibling=True,
+            )
+
+        assert exc_info.value.active_child.id == legacy_active.id
+
+    def test_rebase_singleton_guard_blocks_orphan_recovery_row_by_canonical_branch(
+        self, tmp_path: Path
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("implementation", task_type="implement")
+        impl.branch = "feature/impl"
+        store.update(impl)
+        assert impl.id is not None
+
+        failed_rebase = store.add(
+            "failed rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            branch="feature/failed-rebase",
+            base_branch="main",
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.failure_reason = "WORKER_DIED"
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        active_orphan_retry = store.add(
+            "active retry rebase",
+            task_type="rebase",
+            based_on=failed_rebase.id,
+            same_branch=True,
+            branch="feature/orphan-retry",
+            base_branch="main",
+        )
+        assert active_orphan_retry.id is not None
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            store.add(
+                "guarded implementation rebase",
+                task_type="rebase",
+                based_on=impl.id,
+                same_branch=True,
+                branch=impl.branch,
+                base_branch="main",
+                enforce_single_active_sibling=True,
+            )
+
+        assert exc_info.value.active_child.id == active_orphan_retry.id
+
+    def test_rebase_singleton_guard_blocks_guarded_recovery_after_active_canonical_rebase(
+        self, tmp_path: Path
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add("implementation", task_type="implement")
+        impl.branch = "feature/impl"
+        store.update(impl)
+        assert impl.id is not None
+
+        failed_rebase = store.add(
+            "failed rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            branch="feature/historical-orphan",
+            base_branch="main",
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.failure_reason = "WORKER_DIED"
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        active_canonical = store.add(
+            "active canonical rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            branch=impl.branch,
+            base_branch="main",
+            enforce_single_active_sibling=True,
+        )
+        assert active_canonical.id is not None
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            store.add(
+                "guarded recovery rebase",
+                task_type="rebase",
+                based_on=failed_rebase.id,
+                same_branch=True,
+                branch="feature/historical-orphan",
+                base_branch="main",
+                enforce_single_active_sibling=True,
+            )
+
+        assert exc_info.value.active_child.id == active_canonical.id
+        assert store.get("gza-4") is None
+        assert store.add("next task").id == "gza-4"
+
+    def test_branchless_attempted_rebase_singleton_guard_resolves_parent_branch(
+        self, tmp_path: Path
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        first_parent = store.add("first parent", task_type="implement")
+        first_parent.branch = "feature/shared"
+        store.update(first_parent)
+        second_parent = store.add("second parent", task_type="implement")
+        second_parent.branch = "feature/shared"
+        store.update(second_parent)
+        assert first_parent.id is not None
+        assert second_parent.id is not None
+
+        active = store.add(
+            "active rebase",
+            task_type="rebase",
+            based_on=first_parent.id,
+            same_branch=True,
+            branch="feature/shared",
+            enforce_single_active_sibling=True,
+        )
+        assert active.id is not None
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            store.add(
+                "branchless attempted rebase",
+                task_type="rebase",
+                based_on=second_parent.id,
+                same_branch=True,
+                enforce_single_active_sibling=True,
+            )
+
+        assert exc_info.value.active_child.id == active.id
+
+    def test_guarded_rebase_without_resolvable_branch_fails_closed(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        parent = store.add("unbranched parent", task_type="implement")
+        assert parent.id is not None
+
+        with pytest.raises(RebaseBranchResolutionError, match="guarded rebase requires"):
+            store.add(
+                "unresolvable rebase",
+                task_type="rebase",
+                based_on=parent.id,
+                same_branch=True,
+                enforce_single_active_sibling=True,
+            )
+
+    def test_add_tasks_with_artifact_atomic_preserves_rebase_branch_for_singleton_guard(
+        self, tmp_path: Path
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        artifact_owner = store.add("artifact owner", task_type="plan")
+        first_parent = store.add("first parent", task_type="implement")
+        second_parent = store.add("second parent", task_type="implement")
+        assert artifact_owner.id is not None
+        assert first_parent.id is not None
+        assert second_parent.id is not None
+
+        with pytest.raises(DuplicateActiveChildError):
+            store.add_tasks_with_artifact_atomic(
+                tasks=[
+                    NewTaskParams(
+                        prompt="first rebase",
+                        task_type="rebase",
+                        based_on=first_parent.id,
+                        same_branch=True,
+                        branch="feature/shared",
+                        enforce_single_active_sibling=True,
+                    ),
+                    NewTaskParams(
+                        prompt="second rebase",
+                        task_type="rebase",
+                        based_on=second_parent.id,
+                        same_branch=True,
+                        branch="feature/shared",
+                        enforce_single_active_sibling=True,
+                    ),
+                ],
+                artifact_task_id=artifact_owner.id,
+                artifact_kind="plan_review_materialization",
+                artifact_label="plan_review_materialization",
+                artifact_path=".gza/artifacts/gza-1/plan-review-materialization.txt",
+                artifact_byte_size=0,
+                artifact_sha256=hashlib.sha256(b"").hexdigest(),
+            )
+
+        assert store.get("gza-4") is None
+        assert store.add("next task").id == "gza-4"
+
+    def test_add_tasks_with_artifact_atomic_blocks_guarded_recovery_after_active_canonical_rebase(
+        self, tmp_path: Path
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        artifact_owner = store.add("artifact owner", task_type="plan")
+        impl = store.add("implementation", task_type="implement")
+        impl.branch = "feature/impl"
+        store.update(impl)
+        assert artifact_owner.id is not None
+        assert impl.id is not None
+
+        failed_rebase = store.add(
+            "failed rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            branch="feature/historical-orphan",
+            base_branch="main",
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.failure_reason = "WORKER_DIED"
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        active_canonical = store.add(
+            "active canonical rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            branch=impl.branch,
+            base_branch="main",
+            enforce_single_active_sibling=True,
+        )
+        assert active_canonical.id is not None
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            store.add_tasks_with_artifact_atomic(
+                tasks=[
+                    NewTaskParams(
+                        prompt="guarded recovery rebase",
+                        task_type="rebase",
+                        based_on=failed_rebase.id,
+                        same_branch=True,
+                        branch="feature/historical-orphan",
+                        base_branch="main",
+                        enforce_single_active_sibling=True,
+                    )
+                ],
+                artifact_task_id=artifact_owner.id,
+                artifact_kind="plan_review_materialization",
+                artifact_label="plan_review_materialization",
+                artifact_path=".gza/artifacts/gza-1/plan-review-materialization.txt",
+                artifact_byte_size=0,
+                artifact_sha256=hashlib.sha256(b"").hexdigest(),
+            )
+
+        assert exc_info.value.active_child.id == active_canonical.id
+        assert store.get("gza-5") is None
+        assert store.add("next task").id == "gza-5"
 
     def test_comments_only_improve_does_not_block_review_backed_singleton_scope(
         self, tmp_path: Path

@@ -55,6 +55,7 @@ from ..failure_reasons import is_readonly_db_failure, mark_task_failed_from_caus
 from ..git import (
     Git,
     GitError,
+    ResolvedGitRef,
     ResolvedMergeSourceRef,
     active_worktree_path_for_branch,
     cleanup_worktree_for_branch,
@@ -86,13 +87,17 @@ from ..pickup import (
     is_worker_consuming_advance_action,
 )
 from ..pr_ops import build_task_pr_content, ensure_task_pr
-from ..rebase_checkout import import_isolated_rebase_tip, isolated_rebase_checkout
+from ..rebase_checkout import StaleRebaseImportError, import_isolated_rebase_tip, isolated_rebase_checkout
 from ..rebase_diff import (
     build_rebase_diff_provenance,
     capture_rebase_diff_baseline,
     compute_rebase_changed_diff,
 )
-from ..rebase_publish import publish_rebased_branch
+from ..rebase_publish import (
+    REBASE_SUPERSEDED_COMPLETION_REASON,
+    branch_contains_rebase_target,
+    publish_rebased_branch,
+)
 from ..recovery_engine import (
     _MergeContext,
     _resolve_merged_target_task,
@@ -2235,6 +2240,8 @@ def _run_task_backed_rebase(
     try:
         logger.command(f"Rebasing '{branch}' onto '{rebase_target}'...")
         resolved_by_provider = False
+        superseded_by_concurrent_rebase = False
+        supersession_proof_target: str | None = None
         try:
             rebase_exec_git.rebase(rebase_target)
         except GitError as e:
@@ -2263,13 +2270,28 @@ def _run_task_backed_rebase(
                     worktree_path=checkout.path,
                 )
                 if resolved:
-                    import_isolated_rebase_tip(
-                        destination_git=git,
-                        checkout=checkout,
-                        branch=branch,
-                        expected_old_sha=rebase_diff_baseline.old_tip,
-                        temp_ref_name=str(rebase_task.slug or rebase_task.id or branch),
-                    )
+                    try:
+                        import_isolated_rebase_tip(
+                            destination_git=git,
+                            checkout=checkout,
+                            branch=branch,
+                            expected_old_sha=rebase_diff_baseline.old_tip,
+                            temp_ref_name=str(rebase_task.slug or rebase_task.id or branch),
+                        )
+                    except StaleRebaseImportError:
+                        supersession_target = rebase_diff_baseline.target_at_start
+                        if not branch_contains_rebase_target(
+                            git,
+                            branch=branch,
+                            target=supersession_target,
+                        ):
+                            raise
+                        logger.warning(
+                            "Rebased tip lost the import race, but the current branch already "
+                            f"contains {supersession_target}; completing this rebase as superseded."
+                        )
+                        superseded_by_concurrent_rebase = True
+                        supersession_proof_target = supersession_target
             if not resolved:
                 logger.error("Could not resolve conflicts automatically.")
                 if failure_hint_lines:
@@ -2289,12 +2311,21 @@ def _run_task_backed_rebase(
             resolved_by_provider = True
             rebase_exec_git = git
         try:
-            publish_rebased_branch(
-                rebase_exec_git,
-                branch=branch,
-                baseline=rebase_diff_baseline,
-                logger=logger,
-            )
+            if superseded_by_concurrent_rebase:
+                publish_result = publish_rebased_branch(
+                    rebase_exec_git,
+                    branch=branch,
+                    baseline=rebase_diff_baseline,
+                    logger=logger,
+                    supersession_proof_target=supersession_proof_target,
+                )
+            else:
+                publish_result = publish_rebased_branch(
+                    rebase_exec_git,
+                    branch=branch,
+                    baseline=rebase_diff_baseline,
+                    logger=logger,
+                )
         except GitError as e:
             mark_task_failed_from_cause(
                 task=rebase_task,
@@ -2306,14 +2337,21 @@ def _run_task_backed_rebase(
             )
             print()
             return 1
-        output_content = (
-            f"Resolved conflicts and rebased '{branch}' onto '{rebase_target}'."
-            if resolved_by_provider
-            else f"Rebased '{branch}' onto '{rebase_target}'."
-        )
+        if superseded_by_concurrent_rebase:
+            output_content = (
+                f"Superseded/no-op: '{branch}' already contains '{supersession_proof_target}' "
+                "after a concurrent rebase; this task's isolated rebased tip was not imported."
+            )
+        elif resolved_by_provider:
+            output_content = f"Resolved conflicts and rebased '{branch}' onto '{rebase_target}'."
+        else:
+            output_content = f"Rebased '{branch}' onto '{rebase_target}'."
 
         has_commits = _branch_has_commits(config, branch)
         head_ref = resolve_ref_if_possible(rebase_exec_git, branch)
+        publish_result_local_sha = getattr(publish_result, "local_sha", None)
+        if isinstance(publish_result_local_sha, str) and publish_result_local_sha:
+            head_ref = ResolvedGitRef(publish_result_local_sha, head_ref.warning)
         base_ref = resolve_ref_if_possible(rebase_exec_git, rebase_target)
         for warning in (head_ref.warning, base_ref.warning):
             if warning:
@@ -2321,7 +2359,7 @@ def _run_task_backed_rebase(
         comparison = compute_rebase_changed_diff(
             rebase_exec_git,
             baseline=rebase_diff_baseline,
-            branch=branch,
+            branch=head_ref.sha or branch,
             target=rebase_target,
         )
         if comparison.warning:
@@ -2340,6 +2378,11 @@ def _run_task_backed_rebase(
             changed_diff=comparison.changed_diff,
             head_sha=head_ref.sha if head_ref.sha is not None else DB_UNSET,
             base_sha=base_ref.sha if base_ref.sha is not None else DB_UNSET,
+            completion_reason=(
+                REBASE_SUPERSEDED_COMPLETION_REASON
+                if superseded_by_concurrent_rebase
+                else None
+            ),
         )
 
         target_parent_id = parent_task_id or rebase_task.based_on
@@ -2384,7 +2427,12 @@ def _run_task_backed_rebase(
 
         logger.info(f"Changed Diff: {comparison.detail}")
 
-        if resolved_by_provider:
+        if superseded_by_concurrent_rebase:
+            logger.info(
+                f"✓ Superseded/no-op rebase for {branch}; "
+                f"branch already contains {supersession_proof_target}"
+            )
+        elif resolved_by_provider:
             logger.info(f"✓ Successfully rebased {branch} with provider assistance")
         else:
             logger.info(f"✓ Successfully rebased {branch} onto {rebase_target}")

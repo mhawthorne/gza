@@ -24,13 +24,20 @@ When `gza advance` encounters a completed task whose branch has merge conflicts 
 - `task_type="rebase"`
 - `based_on=<parent_task_id>` (the implementation task)
 - `same_branch=True` (operates on the same branch as the implementation)
+- `branch=<implementation branch>` at insertion time, so the singleton guard is keyed by
+  the persisted source branch being rebased rather than by the parent row
 - `skip_learnings=True`
 - Prompt instructing the agent to use `/gza-rebase --auto`
 
 ## How rebase tasks run
 
 Rebase tasks go through the **code task path** in `runner.py:_run_inner` (not the non-code task path). This means they:
-- Resolve the branch via `_resolve_code_task_branch_name` (follows `based_on` chain to find parent's branch)
+- Resolve the branch via `_resolve_code_task_branch_name`, using the same canonical
+  rebase source-branch identity as guarded insertion. Active branchful direct rebases,
+  trigger-sourced direct rebases, and active branchful retry/resume recovery rebases
+  execute on their persisted `branch`. Only legacy branchless rows, plus terminal
+  historical branchful orphan recovery descendants, fall back to walking the
+  `based_on` lineage.
 - For non-Docker execution, set up the canonical worktree on that branch before running the
   normal code-task flow
 - For Docker-backed runner-owned `task_type="rebase"` execution, skip canonical worktree
@@ -42,9 +49,12 @@ Rebase tasks go through the **code task path** in `runner.py:_run_inner` (not th
   back into the canonical branch with an expected-old-SHA guard, then routes publication
   through the shared post-rebase helper, which verifies the rewritten tip, treats
   already-up-to-date no-op rebases as success when the branch already contains the target
-  tip, rejects anomalous non-advancing rebases without that containment proof, fails closed
-  on local/remote ref lookup uncertainty, and force-pushes the rebased branch (`git push
-  --force-with-lease`)
+  tip, treats a stale expected-old-SHA import as a superseded success only when the live
+  branch already contains the exact target captured for that attempt, rejects anomalous
+  non-advancing or stale-import rebases without that containment proof, persists
+  superseded output as an authoritative no-op rather than the losing isolated summary,
+  fails closed on local/remote ref lookup uncertainty, and force-pushes the rebased branch
+  (`git push --force-with-lease`)
 - On successful completion, the runner also computes and persists `changed_diff` on the rebase task:
   - `0` means the normalized implementation patch before and after the rebase is identical, so prior review evidence may be preserved
   - `1` means the patch changed or equivalence could not be proven, so prior review evidence must be refreshed
@@ -106,13 +116,23 @@ main working tree. Bare `gza rebase <task-id>` now only creates the pending chil
 6. On success, the host imports the rewritten private-checkout tip back into the canonical
    branch with an expected-old-SHA guard, then publishes through the shared post-rebase
    helper, which verifies the rewritten tip, treats already-up-to-date no-op rebases as
-   success when the branch already contains the target tip, rejects anomalous non-advancing
-   rebases without that containment proof, fails closed on local/remote ref lookup
-   uncertainty, and force-pushes host-side.
+   success when the branch already contains the target tip, treats a stale expected-old-SHA
+   import as a superseded success only when the live branch already contains the exact
+   target captured for that attempt, rejects anomalous non-advancing or stale-import
+   rebases without that containment proof, persists superseded output as an authoritative
+   no-op rather than the losing isolated summary, fails closed on local/remote ref lookup
+   uncertainty, surfaces ancestry-proof failures as `GIT_ERROR` diagnostics instead of
+   only the stale-import mismatch, and force-pushes host-side.
 7. The completed rebase row persists the same `changed_diff` signal used by runner-owned rebase tasks, and review invalidation only happens when that signal is not `False`.
 8. After rebase publication succeeds and the task is ready to be recorded as completed, the host reconciles the parent implementation merge unit through the shared task-scoped sync path using the canonical local target branch as the merge-proof ref. Publication mode can still differ (`--remote` may publish to `origin` host-side before completion is recorded), but completion-time merge proof does not switch to any `origin/*` ref. This lets empty-net-diff, squash-merged, or cherry-picked rebases flip the implementation back to authoritative `merged` state before the next `advance`, `watch`, or `iterate` pass reads the lineage.
 9. The canonical temporary worktree and the private rebase checkout are both removed on all
    exit paths (success, failure, exception) via cleanup in the host flow.
+
+Recovery duplicate messages for rebase singletons name the active child's
+persisted branch first, falling back to the attempted row's branch only for
+legacy active rows that were created before canonical branch persistence. This
+keeps manual retry/resume, advance, iterate, and watch output aligned with the
+branch key that actually matched the singleton guard.
 
 ## Review invalidation after rebase
 

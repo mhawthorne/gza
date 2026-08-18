@@ -1622,6 +1622,149 @@ def test_watch_cycle_recovery_mode_resumes_failed_task_before_starting_new_pendi
     assert spawn_iterate.call_args.kwargs["prepared_resume"] is True
 
 
+@pytest.mark.parametrize("recovery_action", ["resume", "retry"])
+def test_watch_cycle_rebase_duplicate_recovery_message_uses_active_canonical_branch(
+    tmp_path: Path,
+    recovery_action: str,
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "max_concurrent: 2\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.branch = "feature/canonical-rebased"
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    store.update(impl)
+
+    failed = store.add(
+        "Failed rebase",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+        branch="feature/orphan-rebased",
+        base_branch="main",
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "WORKER_DIED" if recovery_action == "resume" else "INFRASTRUCTURE_ERROR"
+    failed.session_id = "resume-session-1" if recovery_action == "resume" else None
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    active_child = store.add(
+        f"Active {recovery_action}",
+        task_type="rebase",
+        based_on=failed.id,
+        same_branch=True,
+        branch=impl.branch,
+        base_branch="main",
+    )
+    assert active_child.id is not None
+
+    row = LineageOwnerRow(
+        owner_task=impl,
+        members=(impl, failed),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(failed,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=failed,
+        recovery_leaf_task=failed,
+    )
+    decision = FailedRecoveryDecision(
+        task_id=failed.id,
+        action=recovery_action,
+        reason_code="retryable_rebase_failure",
+        reason_text=f"{recovery_action.title()} failed rebase",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+        recovery_task_id=None,
+        reuse_existing=False,
+    )
+    action = {"type": recovery_action, "description": f"{recovery_action.title()} failed rebase"}
+    precomputed_plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(row,),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(),
+            recovery_rows=(row,),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=(),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            actionable_failed=((row, failed, decision, action, True, failed),),
+            active_recovery_subject_ids=(),
+        ),
+    )
+    preview_entry = DispatchPreviewEntry(
+        lane="recovery",
+        task=failed,
+        owner_task=impl,
+        runnable=True,
+        worker_consuming=True,
+        decision=decision,
+        advance_action=action,
+        lineage_row=row,
+    )
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.build_dispatch_preview", return_value=DispatchPreview(entries=(preview_entry,))),
+        patch(
+            "gza.cli.watch.plan_watch_dispatch_entries",
+            return_value=WatchDispatchPlan(
+                entries=(preview_entry,),
+                recovery_worker_slots=1,
+                pending_slots=0,
+            ),
+        ),
+        patch(
+            f"gza.cli.watch._create_{recovery_action}_task",
+            side_effect=DuplicateActiveChildError(active_child),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("duplicate should not spawn")),
+        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("duplicate should not spawn")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("duplicate should not spawn")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            recovery_slots=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            max_recovery_attempts=config.max_resume_attempts,
+            precomputed_plan=precomputed_plan,
+        )
+
+    assert result.work_done is False
+    log_text = log_path.read_text()
+    assert f"rebase already pending/in progress for branch {impl.branch}: {active_child.id}" in log_text
+    assert "feature/orphan-rebased" not in log_text
+    permit = launch_permit(config, store)
+    permit.release()
+
+
 def test_watch_cycle_restart_failed_prioritizes_oldest_created_failed_task(tmp_path: Path) -> None:
     """With limited slots, restart-failed should recover the oldest created failed task first."""
     setup_config(tmp_path)
@@ -1772,6 +1915,8 @@ def test_watch_cycle_plain_mode_batch_one_defaults_to_recovery_first(tmp_path: P
 
     failed = store.add(f"Failed {task_type}", task_type=task_type)
     assert failed.id is not None
+    if task_type == "rebase":
+        failed.branch = "feature/rebased"
     failed.status = "failed"
     failed.failure_reason = "MAX_TURNS"
     failed.session_id = "sess-123"
@@ -10177,7 +10322,16 @@ def test_watch_cycle_with_isolation_enabled_duplicate_rebase_skips_without_error
     store.update(task)
     store.set_merge_status(task.id, "unmerged")
 
-    active_rebase = store.add("Rebase", task_type="rebase", based_on=task.id, same_branch=True)
+    prior_parent = store.add("Prior rebase parent", task_type="implement")
+    assert prior_parent.id is not None
+    active_rebase = store.add(
+        "Rebase",
+        task_type="rebase",
+        based_on=prior_parent.id,
+        same_branch=True,
+        branch=task.branch,
+        enforce_single_active_sibling=True,
+    )
     assert active_rebase.id is not None
 
     config = Config.load(tmp_path)
@@ -10207,10 +10361,6 @@ def test_watch_cycle_with_isolation_enabled_duplicate_rebase_skips_without_error
         patch("gza.cli.watch.cleanup_failed_merge_checkout", side_effect=GitError("cleanup failed")),
         patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, prepared, **_k: prepared),
         patch(
-            "gza.cli.watch._create_rebase_task",
-            side_effect=DuplicateActiveChildError(active_rebase),
-        ),
-        patch(
             "gza.cli.watch._spawn_background_worker",
             side_effect=AssertionError("duplicate rebase should not spawn"),
         ),
@@ -10228,6 +10378,8 @@ def test_watch_cycle_with_isolation_enabled_duplicate_rebase_skips_without_error
     log_text = log_path.read_text()
     assert "failed to create rebase task" not in log_text
     assert " ERROR " not in log_text
+    assert f"branch {task.branch}: {active_rebase.id}" in log_text
+    assert f"for {task.id}: {active_rebase.id}" not in log_text
     permit = launch_permit(config, store)
     permit.release()
 

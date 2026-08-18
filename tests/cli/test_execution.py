@@ -23170,6 +23170,7 @@ class TestIterateCommand:
 
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
+        impl.branch = "feature/canonical-rebased"
         impl.status = "failed"
         store.update(impl)
 
@@ -23181,11 +23182,14 @@ class TestIterateCommand:
             base_branch="main",
         )
         assert failed_rebase.id is not None
+        failed_rebase.branch = "feature/orphan-rebased"
         failed_rebase.status = "failed"
         store.update(failed_rebase)
 
         active_retry = _create_retry_task(store, failed_rebase, trigger_source="manual")
         assert active_retry.id is not None
+        active_retry.branch = impl.branch
+        store.update(active_retry)
 
         args = argparse.Namespace(
             impl_task_id=impl.id,
@@ -23223,6 +23227,11 @@ class TestIterateCommand:
                 "gza.cli.execution._resolve_iterate_merge_state_for_current_target",
                 return_value=None,
             ),
+            patch("gza.git.Git.rev_parse_if_exists", return_value=None),
+            patch(
+                "gza.git.Git._run_readonly_cached",
+                return_value=SimpleNamespace(returncode=1, stdout=""),
+            ),
             patch(
                 "gza.cli.execution._run_iterate_task_with_recovery",
                 side_effect=AssertionError("duplicate retry should not launch foreground execution"),
@@ -23232,7 +23241,8 @@ class TestIterateCommand:
 
         assert result == 1
         output = capsys.readouterr().out
-        assert f"Error: rebase already pending/in progress for {failed_rebase.id}: {active_retry.id}" in output
+        assert f"Error: rebase already pending/in progress for branch {impl.branch}: {active_retry.id}" in output
+        assert "feature/orphan-rebased" not in output
         permit = launch_permit(config, store)
         permit.release()
 
@@ -23266,6 +23276,7 @@ class TestIterateCommand:
             base_branch="main",
         )
         assert failed_rebase.id is not None
+        failed_rebase.branch = "feature/rebased"
         failed_rebase.status = "failed"
         store.update(failed_rebase)
 
@@ -25010,7 +25021,7 @@ class TestRunForeground:
         captured = capsys.readouterr()
         assert (
             captured.err.strip()
-            == f"rebase already pending/in progress for {task.id}: {active_rebase.id}"
+            == f"rebase already pending/in progress for branch {task.branch}: {active_rebase.id}"
         )
         registry = WorkerRegistry(workers_path)
         workers = registry.list_all(include_completed=True)
@@ -25211,7 +25222,7 @@ class TestRunForeground:
         captured = capsys.readouterr()
         assert (
             captured.err.strip()
-            == f"rebase already pending/in progress for {task.id}: {active_rebase.id}"
+            == f"rebase already pending/in progress for branch {task.branch}: {active_rebase.id}"
         )
         rebase_children = [t for t in store.get_based_on_children(task.id) if t.task_type == "rebase"]
         assert [child.id for child in rebase_children] == [active_rebase.id]
@@ -26342,6 +26353,8 @@ class TestForegroundInvocationContextWiring:
 
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
+        impl.branch = "feature/canonical-rebased"
+        store.update(impl)
         failed = store.add(
             "Failed rebase",
             task_type="rebase",
@@ -26350,11 +26363,14 @@ class TestForegroundInvocationContextWiring:
             base_branch="main",
         )
         assert failed.id is not None
+        failed.branch = "feature/orphan-rebased"
         failed.status = "failed"
         store.update(failed)
 
         active_retry = _create_retry_task(store, failed, trigger_source="manual")
         assert active_retry.id is not None
+        active_retry.branch = impl.branch
+        store.update(active_retry)
 
         args = argparse.Namespace(
             project_dir=tmp_path,
@@ -26371,7 +26387,8 @@ class TestForegroundInvocationContextWiring:
 
         assert rc == 1
         output = capsys.readouterr().out
-        assert f"Error: rebase already pending/in progress for {failed.id}: {active_retry.id}" in output
+        assert f"Error: rebase already pending/in progress for branch {impl.branch}: {active_retry.id}" in output
+        assert "feature/orphan-rebased" not in output
         permit = launch_permit(config, store)
         permit.release()
 
@@ -26421,6 +26438,8 @@ class TestForegroundInvocationContextWiring:
 
         impl = store.add("Implement feature", task_type="implement")
         assert impl.id is not None
+        impl.branch = "feature/canonical-rebased"
+        store.update(impl)
         failed = store.add(
             "Failed rebase",
             task_type="rebase",
@@ -26429,12 +26448,15 @@ class TestForegroundInvocationContextWiring:
             base_branch="main",
         )
         assert failed.id is not None
+        failed.branch = "feature/orphan-rebased"
         failed.status = "failed"
         failed.session_id = "resume-session-1"
         store.update(failed)
 
         active_resume = _create_resume_task(store, failed, trigger_source="manual")
         assert active_resume.id is not None
+        active_resume.branch = impl.branch
+        store.update(active_resume)
 
         args = argparse.Namespace(
             project_dir=tmp_path,
@@ -26451,7 +26473,8 @@ class TestForegroundInvocationContextWiring:
 
         assert rc == 1
         output = capsys.readouterr().out
-        assert f"Error: rebase already pending/in progress for {failed.id}: {active_resume.id}" in output
+        assert f"Error: rebase already pending/in progress for branch {impl.branch}: {active_resume.id}" in output
+        assert "feature/orphan-rebased" not in output
         permit = launch_permit(config, store)
         permit.release()
 
@@ -27138,7 +27161,7 @@ class TestRunAsWorker:
         mock_run.assert_not_called()
         captured = capsys.readouterr()
         assert (
-            f"rebase already pending/in progress for {task.id}: {active_rebase.id}"
+            f"rebase already pending/in progress for branch {task.branch}: {active_rebase.id}"
             in captured.err
         )
         assert "Worker error:" not in captured.out
@@ -27832,6 +27855,7 @@ class TestRecoveryTaskScopeCloning:
                 same_branch=True,
                 base_branch="main",
             )
+            original.branch = "feature/scoped"
         else:
             review = store.add("Review scoped slice", task_type="review", based_on=impl.id)
             assert review.id is not None

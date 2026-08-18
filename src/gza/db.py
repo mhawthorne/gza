@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
 import gza.metrics as metrics
 from gza.artifact_paths import normalize_artifact_path
+from gza.rebase_identity import rebase_persisted_branch_is_authoritative
 from gza.resume_policy import RESUMABLE_FAILURE_REASONS, is_resumable_failure_reason
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,7 @@ __all__ = [
     "ManualMigrationRequired",
     "MergeTargetResolutionError",
     "NewTaskParams",
+    "RebaseBranchResolutionError",
     "SchemaIntegrityError",
     "Task",
     "TaskArtifact",
@@ -192,6 +194,10 @@ class DuplicateActiveChildError(ValueError):
             f"active {active_child.task_type} child already exists for parent "
             f"{active_child.based_on}: {active_child.id}"
         )
+
+
+class RebaseBranchResolutionError(ValueError):
+    """Raised when a guarded rebase cannot resolve its singleton branch key."""
 
 
 def _observe_sqlite_latency(seconds: float, *, labels: dict[str, str]) -> None:
@@ -860,6 +866,7 @@ class NewTaskParams:
     auto_implement: bool = True
     create_pr: bool = False
     same_branch: bool = False
+    branch: str | None = None
     base_branch: str | None = None
     task_type_hint: str | None = None
     model: str | None = None
@@ -5324,6 +5331,7 @@ class SqliteTaskStore:
         auto_implement: bool = True,
         create_pr: bool = False,
         same_branch: bool = False,
+        branch: str | None = None,
         base_branch: str | None = None,
         task_type_hint: str | None = None,
         model: str | None = None,
@@ -5351,6 +5359,7 @@ class SqliteTaskStore:
             auto_implement=auto_implement,
             create_pr=create_pr,
             same_branch=same_branch,
+            branch=branch,
             base_branch=base_branch,
             task_type_hint=task_type_hint,
             model=model,
@@ -5393,7 +5402,20 @@ class SqliteTaskStore:
         model_is_explicit = params.model_is_explicit
         if model_is_explicit is None:
             model_is_explicit = params.model is not None
-        if params.enforce_single_active_sibling and params.based_on is not None:
+        if params.enforce_single_active_sibling and params.task_type == "rebase":
+            branch_key = self._resolve_new_rebase_target_branch_conn(conn, params)
+            if branch_key is None:
+                raise RebaseBranchResolutionError(
+                    "guarded rebase requires a resolvable source branch from "
+                    "params.branch or its based_on lineage"
+                )
+            active_children = self.get_active_rebase_tasks_resolving_to_branch(
+                branch_key,
+                conn=conn,
+            )
+            if active_children:
+                raise DuplicateActiveChildError(active_children[0])
+        elif params.enforce_single_active_sibling and params.based_on is not None:
             active_children = self.get_active_children_of_type(
                 params.based_on,
                 params.task_type,
@@ -5405,8 +5427,8 @@ class SqliteTaskStore:
         new_id = params.task_id or self._next_id(conn)
         conn.execute(
             """
-            INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, base_branch, task_type_hint, model, provider, provider_is_explicit, model_is_explicit, recovery_origin, trigger_source, urgent, skip_learnings)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO tasks (project_id, id, prompt, task_type, based_on, created_at, "group", depends_on, spec, review_scope, create_review, auto_implement, create_pr, same_branch, branch, base_branch, task_type_hint, model, provider, provider_is_explicit, model_is_explicit, recovery_origin, trigger_source, urgent, skip_learnings)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 self._project_id,
@@ -5423,6 +5445,7 @@ class SqliteTaskStore:
                 1 if params.auto_implement else 0,
                 1 if params.create_pr else 0,
                 1 if params.same_branch else 0,
+                params.branch,
                 params.base_branch,
                 params.task_type_hint,
                 params.model,
@@ -6265,6 +6288,132 @@ class SqliteTaskStore:
             )
             return self._rows_to_tasks(owned_conn, cur.fetchall())
 
+    def get_active_tasks_of_type_for_branch(
+        self,
+        task_type: str,
+        branch: str,
+        *,
+        conn: sqlite3.Connection | None = None,
+    ) -> list[Task]:
+        """Return active tasks of one type operating on a branch."""
+        query = """
+                SELECT * FROM tasks
+                WHERE project_id = ?
+                  AND task_type = ?
+                  AND branch = ?
+                  AND status IN ('pending', 'in_progress')
+                ORDER BY created_at ASC
+                """
+        if conn is not None:
+            cur = conn.execute(
+                query,
+                (self._project_id, task_type, branch),
+            )
+            return self._rows_to_tasks(conn, cur.fetchall())
+        with self._connect() as owned_conn:
+            cur = owned_conn.execute(
+                query,
+                (self._project_id, task_type, branch),
+            )
+            return self._rows_to_tasks(owned_conn, cur.fetchall())
+
+    def _resolve_new_rebase_target_branch_conn(self, conn: sqlite3.Connection, params: NewTaskParams) -> str | None:
+        """Resolve the singleton branch key for a rebase before it is inserted."""
+
+        attempted = Task(
+            id=params.task_id,
+            prompt=params.prompt,
+            task_type=params.task_type,
+            based_on=params.based_on,
+            branch=params.branch,
+            recovery_origin=params.recovery_origin,
+            trigger_source=params.trigger_source,
+        )
+        return self._resolve_rebase_target_branch_conn(conn, attempted)
+
+    def get_active_rebase_tasks_resolving_to_branch(
+        self,
+        branch: str,
+        *,
+        conn: sqlite3.Connection | None = None,
+        include_branchless_only: bool = False,
+    ) -> list[Task]:
+        """Return active rebase rows whose singleton key resolves to ``branch``."""
+
+        branch_clause = "AND branch IS NULL" if include_branchless_only else ""
+        query_params: tuple[str, ...]
+        if include_branchless_only:
+            query_params = (self._project_id,)
+        else:
+            query_params = (self._project_id,)
+        query = f"""
+                SELECT * FROM tasks
+                WHERE project_id = ?
+                  AND task_type = 'rebase'
+                  AND status IN ('pending', 'in_progress')
+                  {branch_clause}
+                ORDER BY created_at ASC
+                """
+
+        def _query(open_conn: sqlite3.Connection) -> list[Task]:
+            cur = open_conn.execute(query, query_params)
+            candidates = self._rows_to_tasks(open_conn, cur.fetchall())
+
+            return [
+                task
+                for task in candidates
+                if self._resolve_rebase_target_branch_conn(open_conn, task) == branch
+            ]
+
+        if conn is not None:
+            return _query(conn)
+        with self._connect() as owned_conn:
+            return _query(owned_conn)
+
+    def _resolve_rebase_target_branch_conn(self, conn: sqlite3.Connection, task: Task) -> str | None:
+        """Resolve a rebase lineage's canonical branch inside the active transaction."""
+
+        if task.task_type == "rebase" and task.branch:
+            parent_task_type: str | None = None
+            parent_cur = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task.based_on),
+            ) if task.based_on is not None else None
+            if parent_cur is not None:
+                parent_rows = self._rows_to_tasks(conn, parent_cur.fetchall())
+                parent_task_type = parent_rows[0].task_type if parent_rows else None
+            if rebase_persisted_branch_is_authoritative(task, parent_task_type=parent_task_type):
+                return task.branch
+
+        visited_ids: set[str] = set()
+        current: Task | None = task
+        oldest_rebase_with_branch: Task | None = None
+
+        while current is not None:
+            if current.id is not None:
+                if current.id in visited_ids:
+                    return None
+                visited_ids.add(current.id)
+
+            if current.task_type != "rebase":
+                if current.branch:
+                    return current.branch
+                return oldest_rebase_with_branch.branch if oldest_rebase_with_branch else None
+
+            if current.branch:
+                oldest_rebase_with_branch = current
+
+            if current.based_on is None:
+                break
+            cur = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, current.based_on),
+            )
+            rows = self._rows_to_tasks(conn, cur.fetchall())
+            current = rows[0] if rows else None
+
+        return oldest_rebase_with_branch.branch if oldest_rebase_with_branch else None
+
     def get_lineage_children(self, task_id: str) -> list[Task]:
         """Return direct lineage children linked by based_on or depends_on.
 
@@ -6779,6 +6928,7 @@ class SqliteTaskStore:
                         auto_implement=params.auto_implement,
                         create_pr=params.create_pr,
                         same_branch=params.same_branch,
+                        branch=params.branch,
                         base_branch=params.base_branch,
                         task_type_hint=params.task_type_hint,
                         model=params.model,

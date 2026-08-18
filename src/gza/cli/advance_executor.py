@@ -662,13 +662,16 @@ def _skip_duplicate_rebase_creation(
     permit: LaunchPermit | None,
     exc: DuplicateActiveChildError,
     parent_task_id: str | None,
+    source_branch: str | None = None,
 ) -> AdvanceActionExecutionResult:
     if permit is not None:
         permit.release()
     return AdvanceActionExecutionResult(
         action_type=action_type,
         status="skip",
-        message=f"SKIP: {format_duplicate_rebase_message(exc, parent_task_id=parent_task_id)}",
+        message=(
+            f"SKIP: {format_duplicate_rebase_message(exc, parent_task_id=parent_task_id, source_branch=source_branch)}"
+        ),
         worker_consuming=False,
         work_done=False,
     )
@@ -3179,6 +3182,7 @@ def execute_advance_action(
                 permit=permit,
                 exc=exc,
                 parent_task_id=rebase_parent_task.id,
+                source_branch=rebase_parent_task.branch,
             )
         prepared_rebase_task, prepare_error = _prepare_background_start(
             context=context,
@@ -3323,6 +3327,7 @@ def execute_advance_action(
                 permit=permit,
                 exc=exc,
                 parent_task_id=task.id,
+                source_branch=task.branch,
             )
         prepared_rebase_task, prepare_error = _prepare_background_start(
             context=context,

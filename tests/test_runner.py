@@ -20,7 +20,8 @@ from gza.canonical_checkout import CanonicalCheckoutStatus
 from gza.cli import _create_improve_task, _create_rebase_task
 from gza.cli.advance_engine import determine_next_action
 from gza.config import BranchStrategy, Config
-from gza.db import SqliteTaskStore, StepRef, Task, TaskStats
+from gza.branch_resolution import resolve_rebase_target_branch
+from gza.db import DuplicateActiveChildError, SqliteTaskStore, StepRef, Task, TaskStats
 from gza.git import Git, GitError, ResolvedMergeSourceRef
 from gza.github import GitHub, GitHubError, PullRequestDetails
 from gza.improve_diff import ImproveDiffResult
@@ -28,7 +29,7 @@ from gza.lineage import get_plan_for_task
 from gza.log_paths import ops_log_path_for
 from gza.providers import ClaudeProvider, RunResult
 from gza.providers.base import PreflightCheckResult
-from gza.rebase_checkout import IsolatedRebaseCheckout
+from gza.rebase_checkout import IsolatedRebaseCheckout, StaleRebaseImportError
 from gza.rebase_diff import RebaseDiffBaseline, parse_rebase_diff_provenance
 from gza.recovery_engine import decide_failed_task_recovery
 from gza.recovery_transients import classify_transient_recovery_terminal
@@ -9871,6 +9872,12 @@ class TestExtractedRunInnerHelpers:
         config.branch_strategy.default_type = "feature"
         return config
 
+    def _git_with_existing_branches(self, *branches: str) -> Mock:
+        git = Mock(spec=Git)
+        existing = set(branches)
+        git.branch_exists.side_effect = lambda branch: branch in existing
+        return git
+
     def test_resolve_code_task_branch_name_walks_lineage(self, tmp_path: Path):
         """same_branch lineage resolution should return an ancestor branch that exists."""
         db_path = tmp_path / "test.db"
@@ -9991,6 +9998,208 @@ class TestExtractedRunInnerHelpers:
 
         assert rc == 0
         worktree_git.push_force_with_lease.assert_called_once_with(impl.branch, remote="origin")
+
+    @pytest.mark.parametrize("factory_name", ["retry", "resume"])
+    def test_rebase_recovery_creation_uses_canonical_branch_for_singleton_guard(
+        self, tmp_path: Path, factory_name: str
+    ) -> None:
+        from gza.cli._common import _create_resume_task, _create_retry_task
+        from gza.db import DuplicateActiveChildError
+
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl = store.add(prompt="impl", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/impl"
+        store.update(impl)
+
+        failed_rebase = store.add(
+            prompt="failed rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            branch="feature/orphan-rebase-retry",
+            base_branch="main",
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.failure_reason = "WORKER_DIED"
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        active_rebase = store.add(
+            prompt="active canonical rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            branch=impl.branch,
+            base_branch="main",
+            enforce_single_active_sibling=True,
+        )
+        assert active_rebase.id == "gza-3"
+
+        factory = _create_retry_task if factory_name == "retry" else _create_resume_task
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            factory(store, failed_rebase, trigger_source="auto-recovery")
+
+        assert exc_info.value.active_child.id == active_rebase.id
+        assert store.get("gza-4") is None
+        assert store.add("next task").id == "gza-4"
+
+    def test_direct_rebase_runtime_uses_persisted_branch_after_parent_branch_mutation(
+        self, tmp_path: Path
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = self._make_config(tmp_path)
+        impl = store.add(prompt="impl", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/old"
+        store.update(impl)
+
+        active = store.add(
+            prompt="active rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            branch=impl.branch,
+            base_branch="main",
+            enforce_single_active_sibling=True,
+        )
+        assert active.id is not None
+
+        impl.branch = "feature/new"
+        store.update(impl)
+
+        assert resolve_rebase_target_branch(store, active) == "feature/old"
+        git = self._git_with_existing_branches("feature/old", "feature/new")
+        branch_name = _resolve_code_task_branch_name(active, config, store, git, resume=False)
+        assert branch_name == "feature/old"
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            store.add(
+                prompt="duplicate old branch rebase",
+                task_type="rebase",
+                based_on=impl.id,
+                same_branch=True,
+                branch="feature/old",
+                base_branch="main",
+                enforce_single_active_sibling=True,
+            )
+        assert exc_info.value.active_child.id == active.id
+
+        renamed_branch = store.add(
+            prompt="renamed branch rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            branch="feature/new",
+            base_branch="main",
+            enforce_single_active_sibling=True,
+        )
+        assert renamed_branch.id is not None
+        assert resolve_rebase_target_branch(store, renamed_branch) == "feature/new"
+
+    @pytest.mark.parametrize("factory_name", ["retry", "resume"])
+    def test_rebase_recovery_runtime_uses_persisted_branch_after_parent_branch_mutation(
+        self, tmp_path: Path, factory_name: str
+    ) -> None:
+        from gza.cli._common import _create_resume_task, _create_retry_task
+
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = self._make_config(tmp_path)
+        impl = store.add(prompt="impl", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/old"
+        store.update(impl)
+
+        failed_rebase = store.add(
+            prompt="failed rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+            branch=impl.branch,
+            base_branch="main",
+        )
+        assert failed_rebase.id is not None
+        failed_rebase.status = "failed"
+        failed_rebase.failure_reason = "WORKER_DIED"
+        failed_rebase.completed_at = datetime.now(UTC)
+        store.update(failed_rebase)
+
+        factory = _create_retry_task if factory_name == "retry" else _create_resume_task
+        active = factory(store, failed_rebase, trigger_source="auto-recovery")
+        assert active.id is not None
+        assert active.branch == "feature/old"
+        assert active.recovery_origin == factory_name
+
+        impl.branch = "feature/new"
+        store.update(impl)
+
+        assert resolve_rebase_target_branch(store, active) == "feature/old"
+        git = self._git_with_existing_branches("feature/old", "feature/new")
+        branch_name = _resolve_code_task_branch_name(active, config, store, git, resume=False)
+        assert branch_name == "feature/old"
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            store.add(
+                prompt="duplicate old branch rebase",
+                task_type="rebase",
+                based_on=failed_rebase.id,
+                same_branch=True,
+                branch="feature/old",
+                base_branch="main",
+                recovery_origin=factory_name,
+                enforce_single_active_sibling=True,
+            )
+        assert exc_info.value.active_child.id == active.id
+
+        renamed_branch = store.add(
+            prompt="renamed branch rebase",
+            task_type="rebase",
+            based_on=failed_rebase.id,
+            same_branch=True,
+            branch="feature/new",
+            base_branch="main",
+            recovery_origin=factory_name,
+            enforce_single_active_sibling=True,
+        )
+        assert renamed_branch.id is not None
+        assert resolve_rebase_target_branch(store, renamed_branch) == "feature/new"
+
+    def test_branchless_legacy_rebase_runtime_falls_back_to_lineage_branch(
+        self, tmp_path: Path
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = self._make_config(tmp_path)
+        impl = store.add(prompt="impl", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/legacy"
+        store.update(impl)
+
+        legacy_active = store.add(
+            prompt="legacy active rebase",
+            task_type="rebase",
+            based_on=impl.id,
+            same_branch=True,
+        )
+        assert legacy_active.id is not None
+        assert legacy_active.branch is None
+        assert resolve_rebase_target_branch(store, legacy_active) == "feature/legacy"
+
+        git = self._git_with_existing_branches("feature/legacy")
+        branch_name = _resolve_code_task_branch_name(legacy_active, config, store, git, resume=False)
+        assert branch_name == "feature/legacy"
+
+        with pytest.raises(DuplicateActiveChildError) as exc_info:
+            store.add(
+                prompt="new guarded rebase",
+                task_type="rebase",
+                based_on=impl.id,
+                same_branch=True,
+                branch="feature/legacy",
+                base_branch="main",
+                enforce_single_active_sibling=True,
+            )
+        assert exc_info.value.active_child.id == legacy_active.id
 
     def test_select_worktree_base_ref_prefers_origin_when_origin_ahead(self):
         """Base ref selection should choose origin/main when origin is strictly ahead."""
@@ -18146,6 +18355,7 @@ class TestExtractedRunInnerHelpers:
         mock_main_git = Mock(spec=Git)
         mock_main_git.default_branch.return_value = "main"
         mock_main_git.current_branch.return_value = "main"
+        mock_main_git.is_ancestor.return_value = False
 
         with (
             patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
@@ -18167,7 +18377,7 @@ class TestExtractedRunInnerHelpers:
             patch("gza.runner.is_rebase_in_progress", return_value=False),
             patch(
                 "gza.runner.import_isolated_rebase_tip",
-                side_effect=GitError(
+                side_effect=StaleRebaseImportError(
                     "Refusing to import rebased tip for feature/rebase-parent: expected old SHA old-tip, found moved-tip"
                 ),
             ),
@@ -18181,12 +18391,734 @@ class TestExtractedRunInnerHelpers:
         assert refreshed is not None
         assert refreshed.status == "failed"
         assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.completion_reason is None
 
         surfaced = capsys.readouterr().out
         assert (
             "Git error: Refusing to import rebased tip for feature/rebase-parent: "
             "expected old SHA old-tip, found moved-tip"
         ) in surfaced
+
+    def test_run_inner_docker_rebase_stale_import_completes_as_superseded_when_branch_contains_captured_target(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: true\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        assert parent.id is not None
+        parent.slug = "20260512-parent-impl"
+        parent.branch = "feature/rebase-parent"
+        store.mark_completed(parent, branch=parent.branch, log_file="logs/parent.log", has_commits=True)
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            base_branch="main",
+        )
+        assert task.id is not None
+        task.slug = "20260512-runner-rebase-stale-import-superseded"
+        store.update(task)
+
+        isolated_path = tmp_path / "isolated-rebase-stale-superseded"
+        isolated_path.mkdir(parents=True, exist_ok=True)
+        (isolated_path / ".git").mkdir(exist_ok=True)
+        isolated_summary = (
+            isolated_path
+            / ".gza"
+            / "summaries"
+            / "20260512-runner-rebase-stale-import-superseded.md"
+        )
+        isolated_summary.parent.mkdir(parents=True, exist_ok=True)
+        isolated_summary.write_text(
+            "Successfully rebased and published the losing isolated head.\n"
+        )
+
+        isolated_git = Mock(spec=Git)
+        isolated_git.repo_dir = isolated_path
+        isolated_git.status_porcelain.return_value = set()
+
+        checkout = IsolatedRebaseCheckout(
+            path=isolated_path,
+            git=isolated_git,
+            branch=parent.branch,
+            target_ref="main",
+            imported_refs=(),
+            source_repo=tmp_path,
+        )
+
+        class _CheckoutContext:
+            def __enter__(self_nonlocal) -> IsolatedRebaseCheckout:
+                return checkout
+
+            def __exit__(self_nonlocal, exc_type, exc, tb) -> None:
+                return None
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=2.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.current_branch.return_value = "main"
+        mock_main_git.is_ancestor.side_effect = lambda ancestor, branch: (
+            ancestor == "start-target" and branch == parent.branch
+        )
+        mock_main_git.get_diff_numstat.return_value = ""
+        mock_main_git.rev_parse_if_exists.side_effect = lambda ref: {
+            parent.branch: "winning-head",
+            "main": "moved-target-head",
+        }.get(ref)
+
+        with (
+            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch(
+                "gza.runner.capture_rebase_diff_baseline",
+                return_value=RebaseDiffBaseline(
+                    old_tip="old-tip",
+                    target_at_start="start-target",
+                    merge_base_at_start="merge-base",
+                ),
+            ),
+            patch("gza.runner.is_rebase_in_progress", return_value=False),
+            patch(
+                "gza.runner.import_isolated_rebase_tip",
+                side_effect=StaleRebaseImportError(
+                    "Refusing to import rebased tip for feature/rebase-parent: expected old SHA old-tip, found moved-tip"
+                ),
+            ),
+            patch("gza.runner.publish_rebased_branch") as publish_rebased_branch,
+            patch(
+                "gza.runner.compute_rebase_changed_diff",
+                return_value=SimpleNamespace(changed_diff=False, warning=None, detail="no"),
+            ),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 0
+        publish_rebased_branch.assert_called_once()
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.failure_reason is None
+        assert refreshed.completion_reason == "rebase-superseded-by-concurrent-rebase"
+        assert refreshed.drop_reason is None
+        assert refreshed.output_content is not None
+        assert refreshed.output_content.startswith(
+            "Superseded/no-op: 'feature/rebase-parent' already contains 'start-target' "
+            "after a concurrent rebase; this task's isolated rebased tip was not imported."
+        )
+        assert "Non-authoritative provider attempt detail" in refreshed.output_content
+        assert refreshed.output_content.index("Superseded/no-op") < refreshed.output_content.index(
+            "Successfully rebased and published the losing isolated head."
+        )
+
+        copied_summary = (
+            tmp_path
+            / ".gza"
+            / "summaries"
+            / "20260512-runner-rebase-stale-import-superseded.md"
+        )
+        assert copied_summary.read_text() == refreshed.output_content
+
+        assert refreshed.log_file is not None
+        log_text = ops_log_path_for(config.project_dir / refreshed.log_file).read_text()
+        mock_main_git.is_ancestor.assert_called_once_with("start-target", parent.branch)
+        assert "contains start-target; completing this rebase as superseded" in log_text
+        assert "Outcome: completed (rebase-superseded-by-concurrent-rebase)" in log_text
+
+    def test_run_inner_docker_rebase_stale_import_fails_when_publish_candidate_lacks_captured_target(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: true\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        assert parent.id is not None
+        parent.branch = "feature/rebase-parent"
+        store.mark_completed(parent, branch=parent.branch, log_file="logs/parent.log", has_commits=True)
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            base_branch="main",
+        )
+        assert task.id is not None
+        task.slug = "20260512-runner-rebase-stale-import-publish-race"
+        store.update(task)
+
+        isolated_path = tmp_path / "isolated-rebase-stale-publish-race"
+        isolated_path.mkdir(parents=True, exist_ok=True)
+        (isolated_path / ".git").mkdir(exist_ok=True)
+        isolated_git = Mock(spec=Git)
+        isolated_git.repo_dir = isolated_path
+        isolated_git.status_porcelain.return_value = set()
+
+        checkout = IsolatedRebaseCheckout(
+            path=isolated_path,
+            git=isolated_git,
+            branch=parent.branch,
+            target_ref="main",
+            imported_refs=(),
+            source_repo=tmp_path,
+        )
+
+        class _CheckoutContext:
+            def __enter__(self_nonlocal) -> IsolatedRebaseCheckout:
+                return checkout
+
+            def __exit__(self_nonlocal, exc_type, exc, tb) -> None:
+                return None
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=2.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.current_branch.return_value = "main"
+        mock_main_git.get_diff_numstat.return_value = ""
+        mock_main_git.rev_parse.return_value = "unproven-head"
+        mock_main_git.rev_parse_if_exists.side_effect = lambda ref: {
+            parent.branch: "stale-containing-head",
+            "main": "main-head",
+            "origin/feature/rebase-parent": "remote-old",
+        }.get(ref)
+        mock_main_git.is_ancestor.side_effect = lambda ancestor, ref: (
+            ancestor == "start-target" and ref == parent.branch
+        )
+
+        with (
+            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch(
+                "gza.runner.capture_rebase_diff_baseline",
+                return_value=RebaseDiffBaseline(
+                    old_tip="old-tip",
+                    target_at_start="start-target",
+                    merge_base_at_start="merge-base",
+                ),
+            ),
+            patch("gza.runner.is_rebase_in_progress", return_value=False),
+            patch(
+                "gza.runner.import_isolated_rebase_tip",
+                side_effect=StaleRebaseImportError(
+                    "Refusing to import rebased tip for feature/rebase-parent: expected old SHA old-tip, found moved-tip"
+                ),
+            ),
+            patch("gza.runner._complete_code_task", wraps=_complete_code_task),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 1
+        mock_main_git.push_ref_force_with_lease.assert_not_called()
+        mock_main_git.push_force_with_lease.assert_not_called()
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.completion_reason is None
+
+    def test_run_inner_docker_rebase_stale_import_surfaces_wrapped_ancestry_proof_error(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: true\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        assert parent.id is not None
+        parent.slug = "20260512-parent-impl"
+        parent.branch = "feature/rebase-parent"
+        store.mark_completed(parent, branch=parent.branch, log_file="logs/parent.log", has_commits=True)
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            base_branch="main",
+        )
+        assert task.id is not None
+        task.slug = "20260512-runner-rebase-proof-error"
+        store.update(task)
+
+        isolated_path = tmp_path / "isolated-rebase-proof-error"
+        isolated_path.mkdir(parents=True, exist_ok=True)
+        (isolated_path / ".git").mkdir(exist_ok=True)
+
+        isolated_git = Mock(spec=Git)
+        isolated_git.repo_dir = isolated_path
+        isolated_git.status_porcelain.return_value = set()
+
+        checkout = IsolatedRebaseCheckout(
+            path=isolated_path,
+            git=isolated_git,
+            branch=parent.branch,
+            target_ref="main",
+            imported_refs=(),
+            source_repo=tmp_path,
+        )
+
+        class _CheckoutContext:
+            def __enter__(self_nonlocal) -> IsolatedRebaseCheckout:
+                return checkout
+
+            def __exit__(self_nonlocal, exc_type, exc, tb) -> None:
+                return None
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=2.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.current_branch.return_value = "main"
+        mock_main_git.is_ancestor.side_effect = RuntimeError("proof subprocess unavailable")
+
+        with (
+            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch(
+                "gza.runner.capture_rebase_diff_baseline",
+                return_value=RebaseDiffBaseline(
+                    old_tip="old-tip",
+                    target_at_start="start-target",
+                    merge_base_at_start="merge-base",
+                ),
+            ),
+            patch("gza.runner.is_rebase_in_progress", return_value=False),
+            patch(
+                "gza.runner.import_isolated_rebase_tip",
+                side_effect=StaleRebaseImportError(
+                    "Refusing to import rebased tip for feature/rebase-parent: expected old SHA old-tip"
+                ),
+            ),
+            patch("gza.runner._complete_code_task", side_effect=AssertionError("should fail before completion")),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 1
+        mock_main_git.is_ancestor.assert_called_once_with("start-target", parent.branch)
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.completion_reason is None
+        output = capsys.readouterr().out
+        assert "Failed to verify stale rebase import supersession proof for feature/rebase-parent" in output
+        assert "proof subprocess unavailable" in output
+
+    def test_run_inner_docker_rebase_stale_import_publishes_and_persists_proven_head(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: true\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        assert parent.id is not None
+        parent.branch = "feature/rebase-parent"
+        store.mark_completed(parent, branch=parent.branch, log_file="logs/parent.log", has_commits=True)
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            base_branch="main",
+        )
+        assert task.id is not None
+        task.slug = "20260512-runner-rebase-stale-import-proven-head"
+        store.update(task)
+
+        isolated_path = tmp_path / "isolated-rebase-stale-proven-head"
+        isolated_path.mkdir(parents=True, exist_ok=True)
+        (isolated_path / ".git").mkdir(exist_ok=True)
+        isolated_git = Mock(spec=Git)
+        isolated_git.repo_dir = isolated_path
+        isolated_git.status_porcelain.return_value = set()
+
+        checkout = IsolatedRebaseCheckout(
+            path=isolated_path,
+            git=isolated_git,
+            branch=parent.branch,
+            target_ref="main",
+            imported_refs=(),
+            source_repo=tmp_path,
+        )
+
+        class _CheckoutContext:
+            def __enter__(self_nonlocal) -> IsolatedRebaseCheckout:
+                return checkout
+
+            def __exit__(self_nonlocal, exc_type, exc, tb) -> None:
+                return None
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=2.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.current_branch.return_value = "main"
+        mock_main_git.get_diff_numstat.return_value = ""
+        mock_main_git.rev_parse.return_value = "proven-head"
+        mock_main_git.rev_parse_if_exists.side_effect = lambda ref: {
+            parent.branch: "changed-after-proof",
+            "proven-head": "proven-head",
+            "main": "main-head",
+            "origin/feature/rebase-parent": "remote-old",
+        }.get(ref)
+        mock_main_git.is_ancestor.side_effect = lambda ancestor, ref: (
+            ancestor == "start-target" and ref in {parent.branch, "proven-head"}
+        )
+
+        with (
+            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch(
+                "gza.runner.capture_rebase_diff_baseline",
+                return_value=RebaseDiffBaseline(
+                    old_tip="old-tip",
+                    target_at_start="start-target",
+                    merge_base_at_start="merge-base",
+                ),
+            ),
+            patch("gza.runner.is_rebase_in_progress", return_value=False),
+            patch(
+                "gza.runner.import_isolated_rebase_tip",
+                side_effect=StaleRebaseImportError(
+                    "Refusing to import rebased tip for feature/rebase-parent: expected old SHA old-tip, found moved-tip"
+                ),
+            ),
+            patch(
+                "gza.runner.compute_rebase_changed_diff",
+                return_value=SimpleNamespace(changed_diff=False, warning=None, detail="no"),
+            ),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 0
+        mock_main_git.push_ref_force_with_lease.assert_called_once_with(
+            "proven-head",
+            parent.branch,
+            remote="origin",
+            expected_remote_oid="remote-old",
+        )
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "completed"
+        assert refreshed.completion_reason == "rebase-superseded-by-concurrent-rebase"
+        assert "Resolved head SHA: proven-head" in (refreshed.review_scope or "")
+
+    def test_run_inner_docker_rebase_stale_import_remains_git_error_when_only_moved_target_is_contained(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: true\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        assert parent.id is not None
+        parent.slug = "20260512-parent-impl"
+        parent.branch = "feature/rebase-parent"
+        store.mark_completed(parent, branch=parent.branch, log_file="logs/parent.log", has_commits=True)
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            base_branch="main",
+        )
+        assert task.id is not None
+        task.slug = "20260512-runner-rebase-stale-import-git-error"
+        store.update(task)
+
+        isolated_path = tmp_path / "isolated-rebase-stale-git-error"
+        isolated_path.mkdir(parents=True, exist_ok=True)
+        (isolated_path / ".git").mkdir(exist_ok=True)
+
+        isolated_git = Mock(spec=Git)
+        isolated_git.repo_dir = isolated_path
+        isolated_git.status_porcelain.return_value = set()
+
+        checkout = IsolatedRebaseCheckout(
+            path=isolated_path,
+            git=isolated_git,
+            branch=parent.branch,
+            target_ref="main",
+            imported_refs=(),
+            source_repo=tmp_path,
+        )
+
+        class _CheckoutContext:
+            def __enter__(self_nonlocal) -> IsolatedRebaseCheckout:
+                return checkout
+
+            def __exit__(self_nonlocal, exc_type, exc, tb) -> None:
+                return None
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=2.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.current_branch.return_value = "main"
+        mock_main_git.is_ancestor.side_effect = lambda ancestor, branch: (
+            ancestor == "main" and branch == parent.branch
+        )
+
+        with (
+            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch("gza.runner.maybe_auto_regenerate_learnings", return_value=None),
+            patch(
+                "gza.runner.capture_rebase_diff_baseline",
+                return_value=RebaseDiffBaseline(
+                    old_tip="old-tip",
+                    target_at_start="start-target",
+                    merge_base_at_start="merge-base",
+                ),
+            ),
+            patch("gza.runner.is_rebase_in_progress", return_value=False),
+            patch(
+                "gza.runner.import_isolated_rebase_tip",
+                side_effect=StaleRebaseImportError(
+                    "Refusing to import rebased tip for feature/rebase-parent: expected old SHA old-tip, found moved-tip"
+                ),
+            ),
+            patch("gza.runner._complete_code_task", side_effect=AssertionError("should fail before completion")),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 1
+        mock_main_git.is_ancestor.assert_called_once_with("start-target", parent.branch)
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.completion_reason is None
+
+    @pytest.mark.parametrize(
+        "import_error",
+        [
+            GitError("Cannot import rebased tip for feature/rebase-parent without an expected old SHA"),
+            GitError("fetch failed"),
+            GitError("failed to resolve imported temp ref"),
+            GitError("update-ref failed while expected old SHA was still current"),
+        ],
+    )
+    def test_run_inner_docker_rebase_non_stale_import_errors_remain_git_error_even_when_branch_contains_target(
+        self,
+        tmp_path: Path,
+        import_error: GitError,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: testproject\n"
+            "project_id: default\n"
+            "db_path: .gza/gza.db\n"
+            "use_docker: true\n"
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path)
+
+        parent = store.add(prompt="Implement parent", task_type="implement")
+        assert parent.id is not None
+        parent.slug = "20260512-parent-impl"
+        parent.branch = "feature/rebase-parent"
+        store.mark_completed(parent, branch=parent.branch, log_file="logs/parent.log", has_commits=True)
+
+        task = store.add(
+            prompt="Rebase parent branch",
+            task_type="rebase",
+            based_on=parent.id,
+            same_branch=True,
+            base_branch="main",
+        )
+        assert task.id is not None
+        task.slug = "20260512-runner-rebase-non-stale-import"
+        store.update(task)
+
+        isolated_path = tmp_path / "isolated-rebase-non-stale"
+        isolated_path.mkdir(parents=True, exist_ok=True)
+        (isolated_path / ".git").mkdir(exist_ok=True)
+
+        isolated_git = Mock(spec=Git)
+        isolated_git.repo_dir = isolated_path
+        isolated_git.status_porcelain.return_value = set()
+
+        checkout = IsolatedRebaseCheckout(
+            path=isolated_path,
+            git=isolated_git,
+            branch=parent.branch,
+            target_ref="main",
+            imported_refs=(),
+            source_repo=tmp_path,
+        )
+
+        class _CheckoutContext:
+            def __enter__(self_nonlocal) -> IsolatedRebaseCheckout:
+                return checkout
+
+            def __exit__(self_nonlocal, exc_type, exc, tb) -> None:
+                return None
+
+        mock_provider = Mock()
+        mock_provider.name = "TestProvider"
+        mock_provider.run.return_value = RunResult(
+            exit_code=0,
+            duration_seconds=2.0,
+            num_turns_reported=1,
+            cost_usd=0.01,
+            error_type=None,
+        )
+
+        mock_main_git = Mock(spec=Git)
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.current_branch.return_value = "main"
+        mock_main_git.is_ancestor.return_value = True
+
+        with (
+            patch("gza.runner._resolve_code_task_branch_name", return_value=parent.branch),
+            patch("gza.runner._setup_code_task_worktree", side_effect=AssertionError("shared worktree path should be skipped")),
+            patch("gza.runner.isolated_rebase_checkout", return_value=_CheckoutContext()),
+            patch("gza.runner._stage_worktree_agent_resources", return_value=0),
+            patch("gza.runner._copy_learnings_to_worktree"),
+            patch("gza.runner._seed_extraction_bundle_if_present", return_value=ExtractionSeedResult()),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner._resolve_task_timeout_budget", return_value=ResolvedTimeoutBudget(minutes=15, reason="test budget")),
+            patch(
+                "gza.runner.capture_rebase_diff_baseline",
+                return_value=RebaseDiffBaseline(
+                    old_tip="old-tip",
+                    target_at_start="start-target",
+                    merge_base_at_start="merge-base",
+                ),
+            ),
+            patch("gza.runner.is_rebase_in_progress", return_value=False),
+            patch("gza.runner.import_isolated_rebase_tip", side_effect=import_error),
+            patch("gza.runner._complete_code_task", side_effect=AssertionError("should fail before completion")),
+            patch("gza.runner.task_footer"),
+        ):
+            rc = _run_inner(task, config, config, store, mock_provider, mock_main_git, resume=False)
+
+        assert rc == 1
+        mock_main_git.is_ancestor.assert_not_called()
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "GIT_ERROR"
+        assert refreshed.completion_reason is None
 
     def test_post_complete_resumed_rebase_marks_changed_diff_unknown_and_invalidates_review(
         self,

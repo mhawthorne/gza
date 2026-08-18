@@ -49,6 +49,64 @@ def test_publish_rebased_branch_pushes_when_remote_ref_is_stale() -> None:
 
     assert result.pushed is True
     git.push_force_with_lease.assert_called_once_with("feature/rebased", remote="origin")
+    git.push_ref_force_with_lease.assert_not_called()
+
+
+def test_publish_rebased_branch_superseded_pushes_proven_candidate_sha() -> None:
+    git = Mock(spec=Git)
+    git.rev_parse.return_value = "proven-head"
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        "origin/feature/rebased": "remote-old",
+    }.get(ref)
+    git.is_ancestor.return_value = True
+
+    result = publish_rebased_branch(
+        git,
+        branch="feature/rebased",
+        baseline=RebaseDiffBaseline(
+            old_tip="old-sha",
+            target_at_start="target-sha",
+            merge_base_at_start="merge-base",
+        ),
+        supersession_proof_target="target-sha",
+    )
+
+    assert result.local_sha == "proven-head"
+    assert result.pushed is True
+    git.is_ancestor.assert_called_once_with("target-sha", "proven-head")
+    git.push_ref_force_with_lease.assert_called_once_with(
+        "proven-head",
+        "feature/rebased",
+        remote="origin",
+        expected_remote_oid="remote-old",
+    )
+    git.push_force_with_lease.assert_not_called()
+
+
+def test_publish_rebased_branch_superseded_rejects_unproven_candidate_sha() -> None:
+    git = Mock(spec=Git)
+    git.rev_parse.return_value = "unproven-head"
+    git.rev_parse_if_exists.return_value = "remote-old"
+    git.is_ancestor.return_value = False
+    logger = Mock()
+
+    with pytest.raises(GitError, match="Refusing superseded rebase publication"):
+        publish_rebased_branch(
+            git,
+            branch="feature/rebased",
+            baseline=RebaseDiffBaseline(
+                old_tip="old-sha",
+                target_at_start="target-sha",
+                merge_base_at_start="merge-base",
+            ),
+            logger=logger,
+            supersession_proof_target="target-sha",
+        )
+
+    git.is_ancestor.assert_called_once_with("target-sha", "unproven-head")
+    git.push_ref_force_with_lease.assert_not_called()
+    git.push_force_with_lease.assert_not_called()
+    logger.error.assert_called_once()
 
 
 def test_publish_rebased_branch_succeeds_when_rebase_is_already_up_to_date() -> None:

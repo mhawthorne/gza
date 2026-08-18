@@ -24,6 +24,7 @@ from gza.branch_publication import BranchPublicationState, persist_branch_public
 from gza.cli._common import (
     PLAN_REVIEW_MATERIALIZATION_AUTO_REPAIR_DROP_REASON,
     _create_retry_task,
+    _create_rebase_task,
     _materialize_plan_review_slices,
     _repair_plan_review_slice_materialization,
     resolve_improve_action,
@@ -5304,6 +5305,7 @@ def test_duplicate_singleton_recovery_action_skips_and_releases_reserved_launch_
 
     impl = store.add("Implement feature", task_type="implement")
     assert impl.id is not None
+    impl.branch = "feature/canonical-rebased"
     failed = store.add(
         "Failed rebase",
         task_type="rebase",
@@ -5312,6 +5314,7 @@ def test_duplicate_singleton_recovery_action_skips_and_releases_reserved_launch_
         base_branch="main",
     )
     assert failed.id is not None
+    failed.branch = "feature/orphan-rebased"
     failed.status = "failed"
     failed.failure_reason = "WORKER_DIED" if action_type == "resume" else "INFRASTRUCTURE_ERROR"
     failed.session_id = "resume-session-1" if action_type == "resume" else None
@@ -5323,6 +5326,7 @@ def test_duplicate_singleton_recovery_action_skips_and_releases_reserved_launch_
         task_type="rebase",
         based_on=failed.id,
         same_branch=True,
+        branch=impl.branch,
         base_branch="main",
         enforce_single_active_sibling=True,
     )
@@ -5364,7 +5368,8 @@ def test_duplicate_singleton_recovery_action_skips_and_releases_reserved_launch_
     assert result.status == "skip"
     assert result.worker_consuming is False
     assert result.work_done is False
-    assert result.message == f"SKIP: rebase already pending/in progress for {failed.id}: {active_child.id}"
+    assert result.message == f"SKIP: rebase already pending/in progress for branch {impl.branch}: {active_child.id}"
+    assert "feature/orphan-rebased" not in result.message
     permit = launch_permit(config, store)
     permit.release()
 
@@ -5665,7 +5670,13 @@ def test_needs_rebase_duplicate_active_rebase_skips_and_releases_capacity(tmp_pa
     _mark_completed(impl, branch="feature/needs-rebase-duplicate")
     store.update(impl)
 
-    active_rebase = store.add("Rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    active_rebase = store.add(
+        "Rebase",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+        branch=impl.branch,
+    )
     assert active_rebase.id is not None
 
     context = AdvanceActionExecutionContext(
@@ -5691,7 +5702,88 @@ def test_needs_rebase_duplicate_active_rebase_skips_and_releases_capacity(tmp_pa
     assert result.status == "skip"
     assert result.worker_consuming is False
     assert result.work_done is False
-    assert result.message == f"SKIP: rebase already pending/in progress for {impl.id}: {active_rebase.id}"
+    assert result.message == f"SKIP: rebase already pending/in progress for branch {impl.branch}: {active_rebase.id}"
+    permit = launch_permit(config, store)
+    permit.release()
+
+
+def test_needs_rebase_orphan_recovery_duplicate_skips_and_releases_capacity(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text() + "max_concurrent: 1\n")
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/impl")
+    store.update(impl)
+
+    failed_rebase = store.add(
+        "Failed rebase",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+        branch="feature/failed-rebase",
+        base_branch="main",
+    )
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.failure_reason = "WORKER_DIED"
+    failed_rebase.completed_at = datetime.now(UTC)
+    store.update(failed_rebase)
+
+    active_orphan_retry = store.add(
+        "Active orphan retry",
+        task_type="rebase",
+        based_on=failed_rebase.id,
+        same_branch=True,
+        branch="feature/orphan-retry",
+        base_branch="main",
+    )
+    assert active_orphan_retry.id is not None
+
+    def _create_guarded_rebase(parent: DbTask) -> DbTask:
+        assert parent.id is not None
+        assert parent.branch is not None
+        return _create_rebase_task(
+            store,
+            parent.id,
+            parent.branch,
+            "main",
+            trigger_source="manual",
+        )
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=_create_guarded_rebase,
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("duplicate skip must not spawn a worker"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda *_args, **_kwargs: pytest.fail("unused"),
+        config=config,
+    )
+
+    result = execute_advance_action(task=impl, action={"type": "needs_rebase"}, context=context)
+
+    assert result.status == "skip"
+    assert result.worker_consuming is False
+    assert result.work_done is False
+    assert result.message == (
+        f"SKIP: rebase already pending/in progress for branch {impl.branch}: {active_orphan_retry.id}"
+    )
+    assert {task.id for task in store.get_all() if task.task_type == "rebase"} == {
+        failed_rebase.id,
+        active_orphan_retry.id,
+    }
     permit = launch_permit(config, store)
     permit.release()
 
@@ -6684,7 +6776,13 @@ def test_reconcile_branch_divergence_duplicate_targeted_rebase_skips_and_release
     _mark_completed(impl, branch="feature/reconcile-duplicate")
     store.update(impl)
 
-    active_rebase = store.add("Rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    active_rebase = store.add(
+        "Rebase",
+        task_type="rebase",
+        based_on=impl.id,
+        same_branch=True,
+        branch=impl.branch,
+    )
     assert active_rebase.id is not None
 
     context = AdvanceActionExecutionContext(
@@ -6720,7 +6818,7 @@ def test_reconcile_branch_divergence_duplicate_targeted_rebase_skips_and_release
     assert result.status == "skip"
     assert result.worker_consuming is False
     assert result.work_done is False
-    assert result.message == f"SKIP: rebase already pending/in progress for {impl.id}: {active_rebase.id}"
+    assert result.message == f"SKIP: rebase already pending/in progress for branch {impl.branch}: {active_rebase.id}"
     permit = launch_permit(config, store)
     permit.release()
 

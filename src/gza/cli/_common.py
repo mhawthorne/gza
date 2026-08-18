@@ -2733,6 +2733,7 @@ def _create_rebase_task(
         based_on=parent_task_id,
         enforce_single_active_sibling=True,
         same_branch=True,
+        branch=branch,
         base_branch=target_branch,
         review_scope=(
             _resolved_review_scope_metadata(parent_task)
@@ -2745,8 +2746,16 @@ def _create_rebase_task(
     )
 
 
-def format_duplicate_rebase_message(exc: DuplicateActiveChildError, *, parent_task_id: str | None = None) -> str:
+def format_duplicate_rebase_message(
+    exc: DuplicateActiveChildError,
+    *,
+    parent_task_id: str | None = None,
+    source_branch: str | None = None,
+) -> str:
     """Render a stable operator-facing message for duplicate active rebase children."""
+    if source_branch and exc.active_child.id:
+        label = _duplicate_active_child_label(exc.active_child)
+        return f"{label} already pending/in progress for branch {source_branch}: {exc.active_child.id}"
     return format_duplicate_active_child_message(
         exc,
         parent_task_id=parent_task_id,
@@ -3868,6 +3877,11 @@ def _create_resume_task(
     preserve_provider = bool(
         original_task.provider and (original_task.provider_is_explicit or carry_session)
     )
+    resume_branch = (
+        resolve_rebase_target_branch(store, original_task)
+        if original_task.task_type == "rebase"
+        else original_task.branch
+    )
     new_task = store.add(
         prompt=original_task.prompt,
         task_type=original_task.task_type,
@@ -3879,6 +3893,7 @@ def _create_resume_task(
         auto_implement=original_task.auto_implement is not False,
         create_pr=original_task.create_pr,
         same_branch=original_task.same_branch,
+        branch=resume_branch,
         task_type_hint=original_task.task_type_hint,
         based_on=original_task.id,  # Track resume lineage (points to failed task)
         model=original_task.model,
@@ -3889,11 +3904,9 @@ def _create_resume_task(
         trigger_source=trigger_source,
         enforce_single_active_sibling=_recovery_task_requires_singleton_guard(original_task),
     )
-    # Copy session_id and branch from original task so the resumed run
-    # continues the Claude Code session and uses the same branch.
+    # Copy session_id so the resumed run continues the provider thread.
     assert new_task.id is not None
     new_task.session_id = original_task.session_id
-    new_task.branch = original_task.branch
     store.update(new_task)
     return new_task
 
@@ -3916,14 +3929,17 @@ def _create_retry_task(
     assert original_task.id is not None
     retry_same_branch = original_task.same_branch
     retry_base_branch: str | None = None
+    retry_branch = original_task.branch
     should_fork_retry_branch = (
         original_task.task_type == "implement" and original_task.same_branch and original_task.branch
     )
     if should_fork_retry_branch:
         retry_same_branch = False
         retry_base_branch = original_task.branch
+        retry_branch = None
     elif original_task.task_type == "rebase":
         retry_base_branch = resolve_rebase_base_branch(store, original_task)
+        retry_branch = resolve_rebase_target_branch(store, original_task)
 
     retry_task = store.add(
         prompt=original_task.prompt,
@@ -3936,6 +3952,7 @@ def _create_retry_task(
         auto_implement=original_task.auto_implement is not False,
         create_pr=original_task.create_pr,
         same_branch=retry_same_branch,
+        branch=retry_branch if retry_same_branch else None,
         task_type_hint=original_task.task_type_hint,
         based_on=original_task.id,
         model=original_task.model,
@@ -3948,9 +3965,6 @@ def _create_retry_task(
         enforce_single_active_sibling=_recovery_task_requires_singleton_guard(original_task),
     )
     updates_needed = False
-    if retry_task.same_branch and original_task.branch and retry_task.branch != original_task.branch:
-        retry_task.branch = original_task.branch
-        updates_needed = True
 
     if (
         original_task.task_type != "implement"
@@ -3960,13 +3974,13 @@ def _create_retry_task(
         original_unit = _resolve_retry_merge_unit(store, original_task)
         if original_unit is not None:
             store.attach_task_to_merge_unit(retry_task.id, original_unit.id, merge_unit_membership_role(retry_task))
-            if retry_task.same_branch and original_unit.source_branch and retry_task.branch != original_unit.source_branch:
+            if (
+                original_task.task_type != "rebase"
+                and retry_task.same_branch
+                and original_unit.source_branch
+                and retry_task.branch != original_unit.source_branch
+            ):
                 retry_task.branch = original_unit.source_branch
-                updates_needed = True
-        elif automatic_recovery and retry_task.same_branch and original_task.task_type == "rebase":
-            target_branch = resolve_rebase_target_branch(store, original_task)
-            if target_branch and retry_task.branch != target_branch:
-                retry_task.branch = target_branch
                 updates_needed = True
 
     if updates_needed:
@@ -3998,6 +4012,15 @@ def format_duplicate_active_child_message(
     display_task = task or active_child
     parent_id = parent_task_id or active_child.based_on
     label = _duplicate_active_child_label(display_task)
+    if display_task.task_type == "rebase" or active_child.task_type == "rebase":
+        branch = active_child.branch or display_task.branch
+        if branch and active_child.id:
+            return f"{label} already pending/in progress for branch {branch}: {active_child.id}"
+        if parent_id and parent_id == active_child.based_on and active_child.id:
+            return f"{label} already pending/in progress for {parent_id}: {active_child.id}"
+        if active_child.id:
+            return f"{label} already pending/in progress: {active_child.id}"
+        return f"{label} already pending/in progress"
     if parent_id and active_child.id:
         return f"{label} already pending/in progress for {parent_id}: {active_child.id}"
     if active_child.id:

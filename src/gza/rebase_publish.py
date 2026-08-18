@@ -29,6 +29,9 @@ class RebasePublishResult:
     remote_sha_before_push: str | None
 
 
+REBASE_SUPERSEDED_COMPLETION_REASON = "rebase-superseded-by-concurrent-rebase"
+
+
 def _short_ref(ref: str | None | object) -> str:
     if isinstance(ref, str) and ref:
         return ref[:12]
@@ -42,6 +45,26 @@ def _branch_already_contains_target(git: Git, *, branch: str, target: str | None
     return git.is_ancestor(target, branch)
 
 
+def branch_contains_rebase_target(git: Git, *, branch: str | None, target: str | None) -> bool:
+    """Return whether the current branch tip proves the rebase target is already included."""
+    if not branch or not target:
+        return False
+    try:
+        return _branch_already_contains_target(git, branch=branch, target=target) is True
+    except GitError as exc:
+        message = (
+            f"Failed to verify stale rebase import supersession proof for {branch}: "
+            f"could not prove whether it contains {target}: {exc}"
+        )
+        raise GitError(message) from exc
+    except Exception as exc:
+        message = (
+            f"Failed to verify stale rebase import supersession proof for {branch}: "
+            f"could not prove whether it contains {target}: {exc}"
+        )
+        raise GitError(message) from exc
+
+
 def publish_rebased_branch(
     git: Git,
     *,
@@ -49,6 +72,7 @@ def publish_rebased_branch(
     baseline: RebaseDiffBaseline | None,
     logger: RebasePublishLogger | None = None,
     remote: str = "origin",
+    supersession_proof_target: str | None = None,
 ) -> RebasePublishResult:
     """Verify and publish a rebased branch to its remote.
 
@@ -71,6 +95,28 @@ def publish_rebased_branch(
     previous_sha = baseline.old_tip if baseline is not None else None
     branch_advanced = previous_sha is not None and previous_sha != local_sha
     pushed = remote_sha_before_push != local_sha
+
+    if supersession_proof_target is not None:
+        try:
+            contains_supersession_target = git.is_ancestor(supersession_proof_target, local_sha)
+        except GitError:
+            raise
+        except Exception as exc:
+            message = (
+                f"Failed to verify superseded rebase publication proof for {branch} "
+                f"at {_short_ref(local_sha)}: {exc}"
+            )
+            if logger is not None:
+                logger.error(message)
+            raise GitError(message) from exc
+        if not contains_supersession_target:
+            message = (
+                f"Refusing superseded rebase publication for {branch}: candidate "
+                f"{_short_ref(local_sha)} does not contain target {_short_ref(supersession_proof_target)}"
+            )
+            if logger is not None:
+                logger.error(message)
+            raise GitError(message)
 
     if logger is not None:
         if branch_advanced:
@@ -112,7 +158,15 @@ def publish_rebased_branch(
     if logger is not None:
         logger.command(f"Pushing {branch} to {remote} with --force-with-lease...")
     try:
-        git.push_force_with_lease(branch, remote=remote)
+        if supersession_proof_target is not None:
+            git.push_ref_force_with_lease(
+                local_sha,
+                branch,
+                remote=remote,
+                expected_remote_oid=remote_sha_before_push or "",
+            )
+        else:
+            git.push_force_with_lease(branch, remote=remote)
     except GitError as exc:
         if logger is not None:
             logger.error(f"Error pushing rebased branch '{branch}' to {remote}: {exc}")

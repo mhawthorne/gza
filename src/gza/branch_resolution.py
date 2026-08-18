@@ -3,15 +3,25 @@
 from __future__ import annotations
 
 from .db import SqliteTaskStore, Task as DbTask
+from .rebase_identity import rebase_persisted_branch_is_authoritative
 
 
 def resolve_rebase_target_task(store: SqliteTaskStore, task: DbTask) -> DbTask | None:
     """Return the canonical lineage task a rebase chain should operate on.
 
-    Prefer the nearest non-rebase ancestor when it has a branch. If that
-    ancestor lacks a branch, fall back to the oldest rebase task in the chain
-    that still recorded one.
+    Active branchful direct rebases, trigger-sourced direct rebases, and active
+    branchful retry/resume recovery rebases use their persisted branch as the
+    canonical source branch. Legacy branchless rows and terminal historical
+    orphan recovery descendants fall back to the lineage walk.
     """
+    if task.task_type == "rebase" and task.branch:
+        parent_task_type: str | None = None
+        if task.based_on is not None:
+            parent = store.get(task.based_on)
+            parent_task_type = parent.task_type if parent is not None else None
+        if rebase_persisted_branch_is_authoritative(task, parent_task_type=parent_task_type):
+            return task
+
     visited_ids: set[str] = set()
     current: DbTask | None = task
     oldest_rebase_with_branch: DbTask | None = None
@@ -38,10 +48,9 @@ def resolve_rebase_target_task(store: SqliteTaskStore, task: DbTask) -> DbTask |
 def resolve_rebase_target_branch(store: SqliteTaskStore, task: DbTask) -> str | None:
     """Return the implementation branch a rebase lineage should operate on.
 
-    Rebase recovery descendants can inherit a failed rebase task whose stored
-    branch is already an orphan retry branch. Walk the full based_on lineage and
-    prefer the nearest non-rebase ancestor's branch; if that ancestor branch is
-    missing, fall back to the oldest recorded rebase branch in the chain.
+    Active branchful direct and retry/resume rebase rows execute on the same
+    persisted source branch used by the singleton guard. Legacy branchless rows
+    and terminal historical orphan recovery descendants use lineage fallback.
     """
     target_task = resolve_rebase_target_task(store, task)
     return target_task.branch if target_task is not None else None
