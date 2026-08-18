@@ -8,6 +8,7 @@ import os
 import re
 import signal as signal_mod
 import sqlite3
+import subprocess
 from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,7 +28,7 @@ from gza.db import DuplicateActiveChildError, SqliteTaskStore, task_id_numeric_k
 from gza.git import Git
 from gza.log_paths import ops_log_path_for
 from gza.query import build_lineage_tree
-from gza.review_verify_state import persist_verify_gate_artifact
+from gza.review_verify_state import VERIFY_GATE_ARTIFACT_KIND, persist_verify_gate_artifact
 from gza.runner import DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
 from gza.workers import WorkerMetadata, WorkerRegistry
 
@@ -10637,6 +10638,7 @@ class TestIterateCommand:
         verify_calls: list[object] = []
         mock_git.current_branch.return_value = "main"
         mock_git.branch_exists.return_value = True
+        mock_git.ref_exists.return_value = False
         mock_git.can_merge.return_value = True
         mock_git.rev_parse_if_exists.side_effect = lambda ref: head_sha if ref in {impl.branch, "HEAD"} else None
         mock_git.worktree_add_existing.side_effect = (
@@ -15503,6 +15505,150 @@ class TestIterateCommand:
         assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 cleared-only, 0 capacity-blocked" in output
         assert "Direct Blocked:" in output
         assert f"{impl.id} [verify-fix-failed] verify_gate blocked" in output
+        assert "Started:" not in output
+        assert "Cleared Only:" not in output
+
+    @pytest.mark.parametrize("selection_mode", ["explicit-id", "tag"])
+    def test_unstick_run_recovered_verify_fix_failed_rearms_and_persists_fresh_verify_on_root(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        selection_mode: str,
+    ) -> None:
+        from gza.cli.unstick import cmd_unstick
+        from gza.lineage_query import LineageOwnerRow
+        from gza.review_verify_state import resolve_verify_gate_decision
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        root, head = self._make_failed_root_with_completed_recovery_descendant(
+            store,
+            branch=f"feature/unstick-recovered-{selection_mode}-verify-fix-failed",
+        )
+        root.tags = ("verify-refresh",)
+        head.tags = ("verify-refresh",)
+        store.update(root)
+        store.update(head)
+        config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
+            store,
+            tmp_path,
+            root,
+            head_sha=f"unstick-recovered-{selection_mode}-head",
+            captured_at=datetime(2000, 1, 1, tzinfo=UTC),
+        )
+
+        args = argparse.Namespace(
+            task_ids=(root.id,) if selection_mode == "explicit-id" else (),
+            reasons=("verify-fix-failed",),
+            all=False,
+            run=True,
+            limit=1,
+            tags=["verify-refresh"] if selection_mode == "tag" else None,
+            all_tags=False,
+            project_dir=tmp_path,
+        )
+        mock_git = MagicMock()
+        owner_row = LineageOwnerRow(
+            owner_task=root,
+            members=(root, head),
+            tree=None,
+            lineage_status="needs_attention",
+            next_action={
+                "type": "needs_discussion",
+                "description": "verify gate is still red after completed verify_fix",
+                "needs_attention_reason": "verify-fix-failed",
+                "subject_task_id": root.id,
+            },
+            next_action_reason="needs_attention",
+            unresolved_tasks=(head,),
+            unresolved_leaf_summary=(),
+        )
+        with ExitStack() as stack:
+            verify_calls = self._patch_fresh_verify_gate(
+                stack,
+                config=config,
+                store=store,
+                mock_git=mock_git,
+                impl=head,
+                head_sha=f"unstick-recovered-{selection_mode}-head",
+                status="failed",
+                failure="pytest still failed",
+            )
+            stack.enter_context(
+                patch(
+                    "gza.unstick.reconcile_branch_merge_truth",
+                    return_value=[SimpleNamespace(merge_status="unmerged")],
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "gza.unstick.query_lineage_owner_rows_in_read_session",
+                    return_value=((owner_row,), object()),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "gza.cli.watch.determine_next_action",
+                    return_value={
+                        "type": "verify_gate",
+                        "description": "Run verify gate before review",
+                        "verify_gate_phase": "pre_review",
+                        "verify_gate_state": "failed",
+                        "verify_gate_explicit_refresh": True,
+                        "verify_owner_task": root,
+                    },
+                )
+            )
+            stack.enter_context(patch("gza.git.Git.ref_exists", return_value=False))
+            stack.enter_context(
+                patch(
+                    "gza.git.Git._run",
+                    return_value=SimpleNamespace(returncode=1, stdout="", stderr=""),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "gza.git.Git._run_readonly_cached",
+                    return_value=SimpleNamespace(returncode=1, stdout="", stderr=""),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "subprocess.run",
+                    return_value=subprocess.CompletedProcess(args=["git"], returncode=1, stdout="", stderr=""),
+                )
+            )
+            result = cmd_unstick(args)
+            output = capsys.readouterr().out
+            root_rearm = store.get_parked_task_rearm(
+                subject_kind="task",
+                subject_id=root.id,
+                attention_reason="verify-fix-failed",
+            )
+            root_decision = resolve_verify_gate_decision(store, root, config=config, git=mock_git)
+            head_decision = resolve_verify_gate_decision(store, head, config=config, git=mock_git)
+            root_artifacts = store.list_artifacts(root.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+            head_artifacts = store.list_artifacts(head.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+
+        assert result == 0
+        assert len(verify_calls) == 1
+        assert root_rearm is not None
+        assert root_rearm.manual_rearm_epoch == 1
+        assert (
+            store.get_parked_task_rearm(
+                subject_kind="task",
+                subject_id=head.id,
+                attention_reason="verify-fix-failed",
+            )
+            is None
+        )
+        assert root_decision.state == "failed"
+        assert head_decision.state == "missing"
+        assert len(root_artifacts) == 2
+        assert len(head_artifacts) == 0
+        assert "Selected 1 parked owner(s)" in output
+        assert "Run summary: 0 started, 0 direct, 1 direct-blocked, 0 cleared-only, 0 capacity-blocked" in output
+        assert f"{root.id} [verify-fix-failed] verify_gate blocked" in output
         assert "Started:" not in output
         assert "Cleared Only:" not in output
 

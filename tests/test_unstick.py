@@ -202,6 +202,43 @@ def _make_verify_fix_failed_owner(store, *, prompt: str, branch: str, tags: tupl
     return impl, owner_row
 
 
+def _make_recovered_verify_fix_failed_owner(store, *, prompt: str, branch: str, tags: tuple[str, ...] = ()):
+    root = store.add(prompt, task_type="implement", tags=tags)
+    assert root.id is not None
+    root.status = "failed"
+    root.failure_reason = "MAX_TURNS"
+    root.completed_at = datetime.now(UTC)
+    root.branch = branch
+    root.has_commits = True
+    store.update(root)
+
+    recovery = store.add(prompt, task_type="implement", based_on=root.id, tags=tags)
+    assert recovery.id is not None
+    recovery.status = "completed"
+    recovery.completed_at = datetime.now(UTC)
+    recovery.branch = branch
+    recovery.has_commits = True
+    store.update(recovery)
+    store.set_merge_status(recovery.id, "unmerged")
+
+    owner_row = LineageOwnerRow(
+        owner_task=root,
+        members=(root, recovery),
+        tree=None,
+        lineage_status="needs_attention",
+        next_action={
+            "type": "needs_discussion",
+            "description": "verify gate is still red after completed verify_fix",
+            "needs_attention_reason": "verify-fix-failed",
+            "subject_task_id": root.id,
+        },
+        next_action_reason="needs_attention",
+        unresolved_tasks=(recovery,),
+        unresolved_leaf_summary=(),
+    )
+    return root, recovery, owner_row
+
+
 def test_discover_parked_tasks_includes_owner_row_reconcile_and_watch_backstop(tmp_path: Path) -> None:
     config, store = _config_and_store(tmp_path)
     git = _GitDouble()
@@ -783,6 +820,93 @@ def test_select_and_clear_parked_tasks_rearms_verify_fix_failed_by_tag_scope(tmp
         store.get_parked_task_rearm(
             subject_kind="task",
             subject_id=other.id,
+            attention_reason="verify-fix-failed",
+        )
+        is None
+    )
+
+
+def test_select_and_clear_parked_tasks_rearms_recovered_verify_fix_failed_on_root_by_explicit_id(
+    tmp_path: Path,
+) -> None:
+    config, store = _config_and_store(tmp_path)
+    git = _GitDouble()
+    root, recovery, owner_row = _make_recovered_verify_fix_failed_owner(
+        store,
+        prompt="Recovered verify fix failed clear",
+        branch="feature/recovered-verify-fix-failed-clear",
+    )
+    assert root.id is not None
+    assert recovery.id is not None
+
+    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((owner_row,), object())):
+        result = select_and_clear_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+            task_ids=(root.id,),
+            reason_classes=("verify-fix-failed",),
+        )
+
+    assert [(outcome.owner_task.id, outcome.status, outcome.reason_class) for outcome in result.outcomes] == [
+        (root.id, "rearmed", "verify-fix-failed"),
+    ]
+    root_rearm = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=root.id,
+        attention_reason="verify-fix-failed",
+    )
+    assert root_rearm is not None
+    assert root_rearm.manual_rearm_epoch == 1
+    assert (
+        store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id=recovery.id,
+            attention_reason="verify-fix-failed",
+        )
+        is None
+    )
+
+
+def test_select_and_clear_parked_tasks_rearms_recovered_verify_fix_failed_on_root_by_tag_scope(
+    tmp_path: Path,
+) -> None:
+    config, store = _config_and_store(tmp_path)
+    git = _GitDouble()
+    root, recovery, owner_row = _make_recovered_verify_fix_failed_owner(
+        store,
+        prompt="Tagged recovered verify fix failed clear",
+        branch="feature/tagged-recovered-verify-fix-failed-clear",
+        tags=("ops",),
+    )
+    assert root.id is not None
+    assert recovery.id is not None
+
+    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((owner_row,), object())):
+        result = select_and_clear_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+            tags=("ops",),
+            reason_classes=("verify-fix-failed",),
+        )
+
+    assert [(outcome.owner_task.id, outcome.status, outcome.reason_class) for outcome in result.outcomes] == [
+        (root.id, "rearmed", "verify-fix-failed"),
+    ]
+    root_rearm = store.get_parked_task_rearm(
+        subject_kind="task",
+        subject_id=root.id,
+        attention_reason="verify-fix-failed",
+    )
+    assert root_rearm is not None
+    assert root_rearm.manual_rearm_epoch == 1
+    assert (
+        store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id=recovery.id,
             attention_reason="verify-fix-failed",
         )
         is None
