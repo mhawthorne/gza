@@ -32,6 +32,7 @@ from .task_tags import (
     TagMutation,
     apply_bulk_tag_mutation,
     edit_task_tags,
+    parse_task_tag_edit,
     parse_tag_mutation,
     writable_project_store,
 )
@@ -433,10 +434,12 @@ def create_app(
     @app.post("/api/tasks/{task_id}/tags")
     async def task_tags_api(request: Request, task_id: str):
         payload, is_json = await _request_payload(request)
-        project_id_value = payload.get("project_id")
-        project_id = str(project_id_value) if project_id_value else None
         try:
-            detail = load_task_detail(task_id, project_id)
+            edit = parse_task_tag_edit(payload, is_json=is_json)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            detail = load_task_detail(task_id, edit.project_id)
         except AmbiguousTaskIdError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         if detail is None:
@@ -446,8 +449,8 @@ def create_app(
             tags, changed = edit_task_tags(
                 mutation_store,
                 task_id,
-                add=_payload_values(payload, "add"),
-                remove=_payload_values(payload, "remove"),
+                add=edit.add,
+                remove=edit.remove,
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

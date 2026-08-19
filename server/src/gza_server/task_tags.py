@@ -27,11 +27,73 @@ class TagMutation:
         return f"replace tag '{self.old_tag}' with '{self.tag}'"
 
 
+@dataclass(frozen=True)
+class TaskTagEdit:
+    """Validated tag-edit fields for one task."""
+
+    add: tuple[str, ...]
+    remove: tuple[str, ...]
+    project_id: str | None
+
+
+def _string_value(value: object, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a string")
+    if not value.strip():
+        raise ValueError(f"{field} must not be empty")
+    return value
+
+
+def _form_string_values(payload: dict[str, Any], key: str) -> tuple[str, ...]:
+    value = payload.get(key)
+    if value is None:
+        return ()
+    values = value if isinstance(value, list) else [value]
+    parsed: list[str] = []
+    for item in values:
+        if not isinstance(item, str):
+            raise ValueError(f"{key} must be a string")
+        if item.strip():
+            parsed.append(item)
+    return tuple(parsed)
+
+
+def parse_task_tag_edit(payload: dict[str, Any], *, is_json: bool) -> TaskTagEdit:
+    """Validate one task's JSON API or server-rendered form tag edit."""
+    project_id_value = payload.get("project_id")
+    if is_json:
+        if "project_id" in payload:
+            project_id = _string_value(project_id_value, "project_id")
+        else:
+            project_id = None
+        values: dict[str, tuple[str, ...]] = {}
+        for key in ("add", "remove"):
+            raw_value = payload.get(key, [])
+            if not isinstance(raw_value, list):
+                raise ValueError(f"{key} must be an array of strings")
+            values[key] = tuple(_string_value(item, key) for item in raw_value)
+    else:
+        project_id = (
+            _string_value(project_id_value, "project_id")
+            if project_id_value is not None
+            else None
+        )
+        values = {
+            key: _form_string_values(payload, key)
+            for key in ("add", "remove")
+        }
+    return TaskTagEdit(
+        add=values["add"],
+        remove=values["remove"],
+        project_id=project_id,
+    )
+
+
 def normalize_tags(values: list[str]) -> tuple[str, ...]:
     """Apply Gza's public tag normalization semantics to request values."""
     normalized: set[str] = set()
     for value in values:
-        tag = " ".join(str(value).split()).lower()
+        tag = " ".join(value.split()).lower()
         if not tag:
             raise ValueError("tag must not be empty")
         normalized.add(tag)
@@ -41,32 +103,34 @@ def normalize_tags(values: list[str]) -> tuple[str, ...]:
 def parse_tag_mutation(payload: dict[str, Any]) -> TagMutation:
     """Parse exactly one add/remove/replace mutation from JSON or form data."""
     if "mutation" in payload:
-        kind = str(payload.get("mutation", ""))
+        kind = _string_value(payload.get("mutation"), "mutation")
         if kind in {"add", "remove"}:
-            candidates = [(kind, payload.get("mutation_tag"))]
-        elif kind == "replace":
-            candidates = [(kind, (payload.get("old_tag"), payload.get("new_tag")))]
-        else:
-            candidates = []
-    else:
-        candidates = [
-            (kind, payload[kind])
-            for kind in ("add", "remove", "replace")
-            if payload.get(kind) is not None
-        ]
+            tag = normalize_tags([_string_value(payload.get("mutation_tag"), "mutation_tag")])[0]
+            return TagMutation(kind=kind, tag=tag)
+        if kind == "replace":
+            old_tag = normalize_tags([_string_value(payload.get("old_tag"), "old_tag")])[0]
+            new_tag = normalize_tags([_string_value(payload.get("new_tag"), "new_tag")])[0]
+            return TagMutation(kind="replace", old_tag=old_tag, tag=new_tag)
+        raise ValueError("exactly one tag mutation is required")
+
+    candidates = [
+        (kind, payload[kind])
+        for kind in ("add", "remove", "replace")
+        if payload.get(kind) is not None
+    ]
 
     if len(candidates) != 1:
         raise ValueError("exactly one tag mutation is required")
 
     kind, raw_value = candidates[0]
     if kind in {"add", "remove"}:
-        tag = normalize_tags([str(raw_value or "")])[0]
+        tag = normalize_tags([_string_value(raw_value, kind)])[0]
         return TagMutation(kind=kind, tag=tag)
 
-    if not isinstance(raw_value, (list, tuple)) or len(raw_value) != 2:
+    if not isinstance(raw_value, list) or len(raw_value) != 2:
         raise ValueError("replace requires exactly two tags: OLD and NEW")
-    old_tag = normalize_tags([str(raw_value[0])])[0]
-    new_tag = normalize_tags([str(raw_value[1])])[0]
+    old_tag = normalize_tags([_string_value(raw_value[0], "old_tag")])[0]
+    new_tag = normalize_tags([_string_value(raw_value[1], "new_tag")])[0]
     return TagMutation(kind="replace", old_tag=old_tag, tag=new_tag)
 
 
@@ -88,14 +152,14 @@ def edit_task_tags(
     store: SqliteTaskStore,
     task_id: str,
     *,
-    add: list[str],
-    remove: list[str],
+    add: tuple[str, ...],
+    remove: tuple[str, ...],
 ) -> tuple[tuple[str, ...], bool]:
     """Add and remove tags from one task through Gza's tag edit API."""
     if not add and not remove:
         raise ValueError("at least one tag must be added or removed")
-    additions = set(normalize_tags(add))
-    removals = set(normalize_tags(remove))
+    additions = set(normalize_tags(list(add)))
+    removals = set(normalize_tags(list(remove)))
     current = store.get_task_tags(task_id)
     final = tuple(sorted((set(current) - removals) | additions))
     if final == current:
