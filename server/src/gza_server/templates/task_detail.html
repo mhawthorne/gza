@@ -20,6 +20,26 @@
     <div><dt>Duration</dt><dd>{{ '%.1f seconds'|format(task.duration_seconds) if task.duration_seconds is not none else '—' }}</dd></div>
   </dl>
 
+  <section class="tag-editor">
+    <h2>Edit tags</h2>
+    <form method="post" action="/api/tasks/{{ task.id }}/tags">
+      <input type="hidden" name="project_id" value="{{ detail.project_id }}">
+      <label>
+        Add tag
+        <input type="text" name="add" placeholder="release">
+      </label>
+      {% if task.tags %}
+        <fieldset>
+          <legend>Remove tags</legend>
+          {% for tag in task.tags %}
+            <label class="tag-choice"><input type="checkbox" name="remove" value="{{ tag }}"> {{ tag }}</label>
+          {% endfor %}
+        </fieldset>
+      {% endif %}
+      <p><button type="submit">Update tags</button></p>
+    </form>
+  </section>
+
   <section>
     <h2>Lineage</h2>
     <h3>Parents</h3>

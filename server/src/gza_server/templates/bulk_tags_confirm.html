@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Confirm bulk retag · gza{% endblock %}
+{% block content %}
+  <h1>Confirm bulk retag</h1>
+  <p><strong>Mutation:</strong> {{ mutation.summary }}</p>
+  <p>Matched {{ matched_tasks|length }} task{% if matched_tasks|length != 1 %}s{% endif %}:</p>
+  <ul>
+    {% for task in matched_tasks %}
+      <li><code>{{ task.id }}</code> <span class="muted">{{ task.project_id }}</span></li>
+    {% else %}
+      <li class="muted">No tasks matched.</li>
+    {% endfor %}
+  </ul>
+  <form method="post" action="/api/tasks/tags/bulk">
+    {% for key, value in filters.query_pairs() %}
+      <input type="hidden" name="{{ key }}" value="{{ value }}">
+    {% endfor %}
+    {% for task in matched_tasks %}
+      <input type="hidden" name="target" value="{{ task.project_id }}|{{ task.id }}">
+    {% endfor %}
+    <input type="hidden" name="targets_frozen" value="true">
+    <input type="hidden" name="mutation" value="{{ mutation.kind }}">
+    {% if mutation.kind == "replace" %}
+      <input type="hidden" name="old_tag" value="{{ mutation.old_tag }}">
+      <input type="hidden" name="new_tag" value="{{ mutation.tag }}">
+    {% else %}
+      <input type="hidden" name="mutation_tag" value="{{ mutation.tag }}">
+    {% endif %}
+    <input type="hidden" name="confirmed" value="true">
+    <button type="submit">Apply to {{ matched_tasks|length }} task{% if matched_tasks|length != 1 %}s{% endif %}</button>
+    <a href="{{ filters.url('/tasks') }}">Cancel</a>
+  </form>
+{% endblock %}

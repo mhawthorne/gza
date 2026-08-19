@@ -6,8 +6,10 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, cast
+from urllib.parse import parse_qs
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from gza.config import Config
@@ -22,6 +24,12 @@ from .task_list import (
     TaskListFilters,
     query_task_list,
 )
+from .task_tags import (
+    apply_bulk_tag_mutation,
+    edit_task_tags,
+    parse_tag_mutation,
+    writable_project_store,
+)
 
 
 class TaskStore(Protocol):
@@ -35,6 +43,7 @@ class TaskStore(Protocol):
 
 
 StoreFactory = Callable[[], TaskStore]
+MutationStoreFactory = Callable[[str], SqliteTaskStore]
 _TEMPLATES = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
 
@@ -70,10 +79,69 @@ def resolve_store(project_dir: Path | None = None) -> SqliteTaskStore:
     return SqliteTaskStore.from_config(config, open_mode="query_only")
 
 
+def _payload_values(payload: dict[str, object], key: str) -> list[str]:
+    value = payload.get(key, [])
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    return [str(value)] if str(value).strip() else []
+
+
+def _payload_bool(payload: dict[str, object], key: str) -> bool:
+    value = payload.get(key, False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, list):
+        value = value[-1] if value else False
+    return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+async def _request_payload(request: Request) -> tuple[dict[str, object], bool]:
+    """Read either the durable JSON API shape or a server-rendered form body."""
+    is_json = request.headers.get("content-type", "").split(";", 1)[0] == "application/json"
+    if is_json:
+        value = await request.json()
+        if not isinstance(value, dict):
+            raise HTTPException(status_code=422, detail="request body must be an object")
+        return cast(dict[str, object], value), True
+    parsed = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+    payload: dict[str, object] = {
+        key: values if len(values) > 1 else values[0]
+        for key, values in parsed.items()
+    }
+    return payload, False
+
+
+def _bulk_filters(payload: dict[str, object]) -> TaskListFilters:
+    tags = normalize_tag_filters(tuple(_payload_values(payload, "tag"))) or ()
+    untagged = _payload_bool(payload, "untagged")
+    if tags and untagged:
+        raise HTTPException(status_code=422, detail="tag and untagged filters cannot be combined")
+    return TaskListFilters(
+        prompt=str(payload.get("q", "")),
+        tags=tags,
+        statuses=tuple(_payload_values(payload, "status")),
+        task_types=tuple(_payload_values(payload, "type")),
+        untagged=untagged,
+    )
+
+
+def _bulk_targets(payload: dict[str, object]) -> list[dict[str, object]]:
+    targets: list[dict[str, object]] = []
+    for value in _payload_values(payload, "target"):
+        project_id, separator, task_id = value.partition("|")
+        if not separator or not project_id or not task_id:
+            raise HTTPException(status_code=422, detail="invalid bulk retag target")
+        targets.append({"project_id": project_id, "id": task_id})
+    return targets
+
+
 def create_app(
     *,
     project_dir: Path | None = None,
     store_factory: StoreFactory | None = None,
+    mutation_store_factory: MutationStoreFactory | None = None,
     instance_id: str | None = None,
 ) -> FastAPI:
     """Build the server application.
@@ -82,6 +150,12 @@ def create_app(
     resolve the database with gza's normal config and task-store APIs.
     """
     make_store = store_factory or (lambda: resolve_store(project_dir))
+    make_mutation_store = mutation_store_factory or (
+        lambda project_id: writable_project_store(
+            cast(SqliteTaskStore, make_store()),
+            project_id,
+        )
+    )
     server_instance_id = instance_id or os.environ.get("GZA_SERVER_INSTANCE_ID")
     app = FastAPI(title="gza-server", version=__version__)
 
@@ -138,6 +212,61 @@ def create_app(
     ) -> list[dict[str, object]]:
         return query_task_list(cast(SqliteTaskStore, make_store()), filters).rows
 
+    @app.post("/api/tasks/tags/bulk")
+    async def bulk_task_tags(request: Request):
+        payload, is_json = await _request_payload(request)
+        filters = _bulk_filters(payload)
+        if not filters.has_selection:
+            raise HTTPException(
+                status_code=422,
+                detail="bulk retag requires at least one selection filter",
+            )
+        try:
+            mutation = parse_tag_mutation(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        base_store = cast(SqliteTaskStore, make_store())
+        rows = query_task_list(base_store, filters).rows
+        targets_are_frozen = _payload_bool(payload, "targets_frozen")
+        if _payload_bool(payload, "confirmed") and targets_are_frozen:
+            rows = _bulk_targets(payload)
+        matched = [
+            {"id": str(row["id"]), "project_id": str(row["project_id"])}
+            for row in rows
+        ]
+        confirmed = _payload_bool(payload, "confirmed")
+        if not confirmed:
+            if is_json:
+                return {
+                    "matched_tasks": matched,
+                    "mutation": mutation.summary,
+                    "confirmed": False,
+                }
+            return _TEMPLATES.TemplateResponse(
+                request=request,
+                name="bulk_tags_confirm.html",
+                context={
+                    "matched_tasks": matched,
+                    "mutation": mutation,
+                    "filters": filters,
+                },
+            )
+
+        changed_count = apply_bulk_tag_mutation(make_mutation_store, rows, mutation)
+        result = {
+            "matched_tasks": matched,
+            "mutation": mutation.summary,
+            "changed_count": changed_count,
+        }
+        if is_json:
+            return result
+        return _TEMPLATES.TemplateResponse(
+            request=request,
+            name="bulk_tags_result.html",
+            context=result,
+        )
+
     def load_task_detail(task_id: str, project_id: str | None = None) -> TaskDetail | None:
         return query_task_detail(
             cast(SqliteTaskStore, make_store()),
@@ -192,5 +321,35 @@ def create_app(
     @app.get("/api/projects/{project_id}/tasks/{task_id}")
     def qualified_task_detail_api(project_id: str, task_id: str) -> dict[str, object]:
         return task_detail_record(task_id, project_id)
+
+    @app.post("/api/tasks/{task_id}/tags")
+    async def task_tags_api(request: Request, task_id: str):
+        payload, is_json = await _request_payload(request)
+        project_id_value = payload.get("project_id")
+        project_id = str(project_id_value) if project_id_value else None
+        try:
+            detail = load_task_detail(task_id, project_id)
+        except AmbiguousTaskIdError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if detail is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        try:
+            mutation_store = make_mutation_store(detail.project_id)
+            tags, changed = edit_task_tags(
+                mutation_store,
+                task_id,
+                add=_payload_values(payload, "add"),
+                remove=_payload_values(payload, "remove"),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not is_json:
+            return RedirectResponse(detail.detail_url, status_code=303)
+        return {
+            "id": task_id,
+            "project_id": detail.project_id,
+            "tags": list(tags),
+            "changed": changed,
+        }
 
     return app
