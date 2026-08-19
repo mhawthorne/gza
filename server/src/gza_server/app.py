@@ -15,7 +15,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from gza.config import Config
+from gza.config import Config, ConfigError
 from gza.db import SqliteTaskStore
 from gza.task_query import normalize_tag_filters
 
@@ -60,7 +60,7 @@ class _BulkPreviewState:
     filters: TaskListFilters
     mutation: TagMutation
     targets: tuple[tuple[str, str], ...]
-    stores: dict[str, SqliteTaskStore]
+    project_ids: tuple[str, ...]
 
 
 def _task_list_filters(
@@ -329,7 +329,16 @@ def create_app(
                 {"project_id": project_id, "id": task_id}
                 for project_id, task_id in state.targets
             ]
-            result = apply_bulk_tag_mutation(state.stores, rows, state.mutation)
+            stores: dict[str, SqliteTaskStore] = {}
+            for project_id in state.project_ids:
+                try:
+                    stores[project_id] = make_mutation_store(project_id)
+                except (ConfigError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"could not resolve mutation store for project {project_id}",
+                    ) from exc
+            result = apply_bulk_tag_mutation(stores, rows, state.mutation)
             response_context = _bulk_result_context(rows, state.mutation.summary, result)
             if is_json:
                 return response_context
@@ -356,25 +365,17 @@ def create_app(
             {"id": str(row["id"]), "project_id": str(row["project_id"])}
             for row in rows
         ]
-        stores: dict[str, SqliteTaskStore] = {}
-        for project_id in dict.fromkeys(str(row["project_id"]) for row in matched):
-            try:
-                stores[project_id] = make_mutation_store(project_id)
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"could not resolve mutation store for project {project_id}",
-                ) from exc
         targets = tuple(
             (str(row["project_id"]), str(row["id"]))
             for row in matched
         )
+        project_ids = tuple(dict.fromkeys(project_id for project_id, _task_id in targets))
         preview_token = save_bulk_preview(
             _BulkPreviewState(
                 filters=filters,
                 mutation=mutation,
                 targets=targets,
-                stores=stores,
+                project_ids=project_ids,
             )
         )
         if is_json:

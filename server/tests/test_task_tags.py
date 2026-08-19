@@ -1,4 +1,5 @@
 import re
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlencode
@@ -336,6 +337,76 @@ def test_bulk_replace_previews_then_applies_to_cross_project_filtered_set(
     assert _query_tags(alpha_store, beta.id, project_id="beta") == ("new",)
     assert _query_tags(alpha_store, pending.id, project_id="alpha") == ("old",)
     assert _query_tags(alpha_store, plan.id, project_id="beta") == ("old",)
+
+
+def test_html_cancel_and_json_bulk_previews_are_query_only_and_do_not_run_repairs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: server-test\n"
+        "project_id: servertest\n"
+        "project_prefix: srv\n"
+        "db_path: .gza/gza.db\n",
+        encoding="utf-8",
+    )
+    db_path = tmp_path / ".gza" / "gza.db"
+    store = SqliteTaskStore(
+        db_path,
+        prefix="srv",
+        project_id="servertest",
+        project_root=tmp_path,
+    )
+    task = store.add("Legacy grouped task", group="legacy")
+    assert task.id is not None
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "DELETE FROM task_tags WHERE project_id = ? AND task_id = ?",
+            ("servertest", task.id),
+        )
+
+    original_from_config = SqliteTaskStore.from_config.__func__
+    open_modes: list[str] = []
+
+    def tracking_from_config(
+        cls: type[SqliteTaskStore],
+        config: object,
+        **kwargs: object,
+    ) -> SqliteTaskStore:
+        open_modes.append(str(kwargs.get("open_mode", "readwrite")))
+        return original_from_config(cls, config, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        SqliteTaskStore,
+        "from_config",
+        classmethod(tracking_from_config),
+    )
+    client = TestClient(
+        create_app(project_dir=tmp_path),
+        headers={"origin": "http://testserver"},
+    )
+    request_data = {"status": "pending", "mutation": "add", "mutation_tag": "new"}
+
+    html_preview = client.post("/api/tasks/tags/bulk", data=request_data)
+    canceled = client.get("/tasks?status=pending")
+    json_preview = client.post(
+        "/api/tasks/tags/bulk",
+        json={"status": ["pending"], "mutation": "add", "mutation_tag": "new"},
+    )
+
+    assert html_preview.status_code == 200
+    assert "Confirm bulk retag" in html_preview.text
+    assert canceled.status_code == 200
+    assert json_preview.status_code == 200
+    assert json_preview.json()["confirmed"] is False
+    assert open_modes
+    assert set(open_modes) == {"query_only"}
+    with sqlite3.connect(db_path) as conn:
+        persisted_tags = conn.execute(
+            "SELECT tag FROM task_tags WHERE project_id = ? AND task_id = ?",
+            ("servertest", task.id),
+        ).fetchall()
+    assert persisted_tags == []
 
 
 def test_bulk_confirm_freezes_an_empty_match_set(tmp_path: Path) -> None:
@@ -766,22 +837,109 @@ def test_bulk_apply_skips_task_deleted_after_cross_project_preview(tmp_path: Pat
     assert _query_tags(alpha_store, alpha.id, project_id="alpha") == ("new", "old")
 
 
-def test_bulk_preview_preflights_every_store_before_any_mutation(tmp_path: Path) -> None:
+def test_bulk_apply_resolves_every_store_before_any_mutation(tmp_path: Path) -> None:
     db_path = tmp_path / "shared.db"
     alpha_store = SqliteTaskStore(db_path, prefix="alpha", project_id="alpha")
     beta_store = SqliteTaskStore(db_path, prefix="beta", project_id="beta")
     alpha = alpha_store.add("Alpha", tags=("old",))
     beta = beta_store.add("Beta", tags=("old",))
     assert alpha.id and beta.id
-    client = _client(alpha_store, mutation_stores={"alpha": alpha_store})
+    events: list[str] = []
+
+    class RecordingStore:
+        def __init__(self, project_id: str, store: SqliteTaskStore) -> None:
+            self.project_id = project_id
+            self.store = store
+
+        def mutate_task_tags(self, *args: object, **kwargs: object) -> dict[str, bool]:
+            events.append(f"mutate:{self.project_id}")
+            return self.store.mutate_task_tags(*args, **kwargs)  # type: ignore[arg-type]
+
+    stores = {
+        "alpha": RecordingStore("alpha", alpha_store),
+        "beta": RecordingStore("beta", beta_store),
+    }
+
+    def mutation_store_factory(project_id: str) -> SqliteTaskStore:
+        events.append(f"resolve:{project_id}")
+        return stores[project_id]  # type: ignore[return-value]
+
+    client = TestClient(
+        create_app(
+            store_factory=lambda: alpha_store,
+            mutation_store_factory=mutation_store_factory,
+        )
+    )
+    request_data = {"status": ["pending"], "mutation": "add", "mutation_tag": "new"}
+
+    preview = client.post("/api/tasks/tags/bulk", json=request_data).json()
+
+    assert events == []
+    response = client.post(
+        "/api/tasks/tags/bulk",
+        json={
+            **request_data,
+            "target": [
+                f'{task["project_id"]}|{task["id"]}'
+                for task in preview["matched_tasks"]
+            ],
+            "preview_token": preview["preview_token"],
+            "confirmed": True,
+        },
+    )
+
+    assert response.status_code == 200
+    first_mutation = next(index for index, event in enumerate(events) if event.startswith("mutate:"))
+    assert set(events[:first_mutation]) == {"resolve:alpha", "resolve:beta"}
+    assert len(events[:first_mutation]) == 2
+    assert _query_tags(alpha_store, alpha.id, project_id="alpha") == ("new", "old")
+    assert _query_tags(alpha_store, beta.id, project_id="beta") == ("new", "old")
+
+
+def test_bulk_apply_resolution_failure_prevents_every_mutation(tmp_path: Path) -> None:
+    db_path = tmp_path / "shared.db"
+    alpha_store = SqliteTaskStore(db_path, prefix="alpha", project_id="alpha")
+    beta_store = SqliteTaskStore(db_path, prefix="beta", project_id="beta")
+    alpha = alpha_store.add("Alpha", tags=("old",))
+    beta = beta_store.add("Beta", tags=("old",))
+    assert alpha.id and beta.id
+    mutation_calls: list[str] = []
+
+    class UnexpectedMutationStore:
+        def mutate_task_tags(self, *args: object, **kwargs: object) -> dict[str, bool]:
+            mutation_calls.append("mutated")
+            return {}
+
+    def mutation_store_factory(project_id: str) -> SqliteTaskStore:
+        if project_id == "beta":
+            raise ValueError("project configuration is unavailable")
+        return UnexpectedMutationStore()  # type: ignore[return-value]
+
+    client = TestClient(
+        create_app(
+            store_factory=lambda: alpha_store,
+            mutation_store_factory=mutation_store_factory,
+        )
+    )
+    request_data = {"status": ["pending"], "mutation": "add", "mutation_tag": "new"}
+    preview = client.post("/api/tasks/tags/bulk", json=request_data).json()
 
     response = client.post(
         "/api/tasks/tags/bulk",
-        json={"status": ["pending"], "mutation": "add", "mutation_tag": "new"},
+        json={
+            **request_data,
+            "target": [
+                f'{task["project_id"]}|{task["id"]}'
+                for task in preview["matched_tasks"]
+            ],
+            "preview_token": preview["preview_token"],
+            "confirmed": True,
+        },
     )
 
     assert response.status_code == 422
     assert response.json()["detail"] == "could not resolve mutation store for project beta"
+    assert mutation_calls == []
     assert _query_tags(alpha_store, alpha.id, project_id="alpha") == ("old",)
     assert _query_tags(alpha_store, beta.id, project_id="beta") == ("old",)
 
