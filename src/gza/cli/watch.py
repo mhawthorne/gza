@@ -1823,6 +1823,7 @@ def _query_owner_rows_with_context(
     any_tag: bool = False,
     owner_task_ids: tuple[str, ...] | None = None,
     task_ids: tuple[str, ...] | None = None,
+    selector_filter_mode: Literal["intersection", "union"] = "intersection",
     max_recovery_attempts: int,
     include_skipped: bool,
     persist_post_merge_rebase_state: bool = True,
@@ -1839,6 +1840,7 @@ def _query_owner_rows_with_context(
             max_recovery_attempts=max_recovery_attempts,
             owner_task_ids=owner_task_ids,
             task_ids=task_ids,
+            selector_filter_mode=selector_filter_mode,
         ),
         config=config,
         git=git,
@@ -1859,6 +1861,7 @@ def _query_owner_rows(
     any_tag: bool = False,
     owner_task_ids: tuple[str, ...] | None = None,
     task_ids: tuple[str, ...] | None = None,
+    selector_filter_mode: Literal["intersection", "union"] = "intersection",
     max_recovery_attempts: int,
     include_skipped: bool,
     persist_post_merge_rebase_state: bool = True,
@@ -1873,6 +1876,7 @@ def _query_owner_rows(
         any_tag=any_tag,
         owner_task_ids=owner_task_ids,
         task_ids=task_ids,
+        selector_filter_mode=selector_filter_mode,
         max_recovery_attempts=max_recovery_attempts,
         include_skipped=include_skipped,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
@@ -1944,11 +1948,19 @@ def _query_scoped_owner_rows_with_context(
     rows: list[LineageOwnerRow] = []
     read_context: RecoveryReadContext | None = None
     for selector in selectors:
+        raw_task = store.get(selector.raw_task_id) if selector.raw_task_id is not None else None
+        raw_self_scopes_failed_leaf = (
+            selector.raw_task_id == selector.startup_owner_id
+            and raw_task is not None
+            and raw_task.status == "failed"
+        )
         selector_task_ids = (
             None
-            if selector.raw_task_id is None or selector.raw_task_id == selector.startup_owner_id
+            if selector.raw_task_id is None
+            or (selector.raw_task_id == selector.startup_owner_id and not raw_self_scopes_failed_leaf)
             else (selector.raw_task_id,)
         )
+        selector_owner_ids = None if raw_self_scopes_failed_leaf else (selector.startup_owner_id,)
         selector_rows, selector_context = _query_owner_rows_with_context(
             store=store,
             config=config,
@@ -1956,8 +1968,9 @@ def _query_scoped_owner_rows_with_context(
             target_branch=target_branch,
             tags=tags,
             any_tag=any_tag,
-            owner_task_ids=(selector.startup_owner_id,),
+            owner_task_ids=selector_owner_ids,
             task_ids=selector_task_ids,
+            selector_filter_mode="union" if selector_owner_ids is not None and selector_task_ids is not None else "intersection",
             max_recovery_attempts=max_recovery_attempts,
             include_skipped=include_skipped,
         )
@@ -1972,6 +1985,7 @@ def _query_scoped_owner_rows_with_context(
                     if task.id is not None
                     and task.id != selector.startup_owner_id
                     and task.status == "failed"
+                    and task.same_branch
                     and resolve_lineage_owner_task_id(store, task.id) == selector.startup_owner_id
                 )
             )
@@ -1985,6 +1999,7 @@ def _query_scoped_owner_rows_with_context(
                     any_tag=any_tag,
                     owner_task_ids=(selector.startup_owner_id,),
                     task_ids=(failed_member_id,),
+                    selector_filter_mode="union",
                     max_recovery_attempts=max_recovery_attempts,
                     include_skipped=include_skipped,
                 )
@@ -2010,6 +2025,12 @@ def _resolve_watch_scope_owner_ids(
         if task is None:
             raise ValueError(f"unknown task ID: {raw_task_id}")
 
+        owner_task: DbTask | None = None
+        if task.same_branch and task.based_on:
+            base_task = store.get(task.based_on)
+            if base_task is not None:
+                owner_task = resolve_lineage_owner_task(store, base_task)
+
         rows = _query_owner_rows(
             store=store,
             config=config,
@@ -2019,9 +2040,9 @@ def _resolve_watch_scope_owner_ids(
             include_skipped=True,
             task_ids=(raw_task_id,),
         )
-        if rows:
-            owner_task = _resolve_incomplete_owner_task(store, cast(Any, rows[0]))
-        else:
+        if owner_task is None and rows:
+            owner_task = rows[0].owner_task
+        elif owner_task is None:
             owner_task = resolve_lineage_owner_task(store, task)
         if owner_task.id is None:
             raise ValueError(f"unable to resolve owner for task ID: {raw_task_id}")
@@ -4004,6 +4025,7 @@ def _emit_transition_events(
     restart_failed_mode: bool = False,
     max_recovery_attempts: int = 1,
     scoped_owner_ids: tuple[str, ...] | None = None,
+    scoped_selector_recovery_closure_by_owner: Mapping[str, frozenset[str]] | None = None,
 ) -> tuple[str, ...]:
     # Detector-owned transitions come from snapshot diffs, regardless of which
     # process caused the state change. START remains detector-owned for the
@@ -4016,7 +4038,12 @@ def _emit_transition_events(
         old_status = old_row.get("status")
         new_row = new[task_id]
         new_status = new_row.get("status")
-        if not _transition_task_matches_scope(store, task_id, scoped_owner_ids):
+        if not _transition_task_matches_scope(
+            store,
+            task_id,
+            scoped_owner_ids,
+            scoped_selector_recovery_closure_by_owner,
+        ):
             continue
 
         task_type = new_row.get("task_type") or "implement"
@@ -5341,12 +5368,18 @@ def _collect_completed_transition_ids(
     tags: tuple[str, ...] | None = None,
     any_tag: bool = False,
     scoped_owner_ids: tuple[str, ...] | None = None,
+    scoped_selector_recovery_closure_by_owner: Mapping[str, frozenset[str]] | None = None,
 ) -> list[str]:
     completed_ids: list[str] = []
     for task_id, _old_status, new_row in _iter_status_transitions(old, new):
         if new_row.get("status") != "completed":
             continue
-        if not _transition_task_matches_scope(store, task_id, scoped_owner_ids):
+        if not _transition_task_matches_scope(
+            store,
+            task_id,
+            scoped_owner_ids,
+            scoped_selector_recovery_closure_by_owner,
+        ):
             continue
         if not _task_matches_tags(store, task_id, tags, any_tag):
             continue
@@ -5370,12 +5403,18 @@ def _collect_unhandled_failures(
     tags: tuple[str, ...] | None = None,
     any_tag: bool = False,
     scoped_owner_ids: tuple[str, ...] | None = None,
+    scoped_selector_recovery_closure_by_owner: Mapping[str, frozenset[str]] | None = None,
 ) -> list[_ObservedFailure]:
     failures: list[_ObservedFailure] = []
     for task_id, _old_status, new_row in _iter_status_transitions(old, new):
         if new_row.get("status") != "failed":
             continue
-        if not _transition_task_matches_scope(store, task_id, scoped_owner_ids):
+        if not _transition_task_matches_scope(
+            store,
+            task_id,
+            scoped_owner_ids,
+            scoped_selector_recovery_closure_by_owner,
+        ):
             continue
         if not _task_matches_tags(store, task_id, tags, any_tag):
             continue
@@ -5570,6 +5609,8 @@ def _emit_recovery_dry_run_report(
                 retry += 1
             if decision.action == "reconcile":
                 reconcile += 1
+            continue
+        if should_hide_failed_recovery_decision(decision):
             continue
         if task.id in visible_task_ids:
             continue
@@ -6189,6 +6230,7 @@ def _evaluate_blind_parked_auto_rearm(
             scoped_owner_ids is not None
             and owner_id not in scoped_owner_id_set
             and subject_id not in scoped_owner_id_set
+            and resolve_lineage_owner_task_id(store, subject_id) not in scoped_owner_id_set
         ):
             continue
         render_task_id = owner_id
@@ -6216,6 +6258,19 @@ def _evaluate_blind_parked_auto_rearm(
 
         guard_task = owner_task
         scoped_leaf_has_live_work = False
+        subject_is_effective_leaf_scope = (
+            scoped_owner_ids is not None
+            and subject_id in scoped_owner_id_set
+            and (
+                subject_id != owner_id
+                or scope_kind_by_effective_id.get(subject_id) == "effective_leaf"
+                or (
+                    scoped_task_ids is None
+                    and startup_scoped_owner_ids is None
+                    and candidate.subject_task.status == "failed"
+                )
+            )
+        )
         if scoped_owner_ids is not None and subject_id in scoped_owner_id_set and subject_id != owner_id:
             guard_task = replace(candidate.subject_task, merge_status=None, has_commits=True)
             if guard_task.branch:
@@ -6229,22 +6284,32 @@ def _evaluate_blind_parked_auto_rearm(
         elif scoped_owner_ids is not None and owner_id in scoped_owner_id_set and subject_id != owner_id:
             guard_task = replace(candidate.subject_task, merge_status=None, has_commits=True)
             if guard_task.branch:
-                scoped_leaf_has_live_work = (
-                    git.has_non_empty_source_diff_against_target(
-                        guard_task.branch,
-                        target_branch,
-                    )
-                    is True
-                )
-        guard_reason = (
-            None
-            if scoped_leaf_has_live_work
-            else skip_reason_for_landed_or_moot(
-                store,
-                git=git,
-                target_branch=target_branch,
-                task=guard_task,
-            )
+                scoped_leaf_has_live_work = git.has_non_empty_source_diff_against_target(
+                    guard_task.branch,
+                    target_branch,
+                ) is True
+        elif (
+            scoped_owner_ids is not None
+            and resolve_lineage_owner_task_id(store, subject_id) in scoped_owner_id_set
+        ):
+            guard_task = replace(candidate.subject_task, merge_status=None, has_commits=True)
+            if guard_task.branch:
+                scoped_leaf_has_live_work = git.has_non_empty_source_diff_against_target(
+                    guard_task.branch,
+                    target_branch,
+                ) is True
+        elif subject_is_effective_leaf_scope:
+            guard_task = replace(candidate.subject_task, merge_status=None, has_commits=True)
+            if guard_task.branch:
+                scoped_leaf_has_live_work = git.has_non_empty_source_diff_against_target(
+                    guard_task.branch,
+                    target_branch,
+                ) is True
+        guard_reason = None if scoped_leaf_has_live_work else skip_reason_for_landed_or_moot(
+            store,
+            git=git,
+            target_branch=target_branch,
+            task=guard_task,
         )
         if guard_reason is not None:
             decisions.append(
@@ -6397,6 +6462,18 @@ def _derive_effective_scoped_owner_ids(
             for row in owner_rows:
                 row_owner_id = row.owner_task.id
                 if (
+                    row_owner_id is not None
+                    and row.recovery_leaf_task is not None
+                    and row.recovery_leaf_task.id == raw_task_id
+                    and (
+                        has_proven_leaf_scope
+                        or _row_owner_has_terminal_merge_proof(row)
+                    )
+                    and resolve_lineage_owner_task_id(store, row_owner_id) == scoped_owner_id
+                ):
+                    matching_row_ids = [str(raw_task_id)]
+                    break
+                if (
                     row_owner_id == scoped_owner_id
                     and row.recovery_leaf_task is not None
                     and row.recovery_leaf_task.id == raw_task_id
@@ -6424,8 +6501,11 @@ def _derive_effective_scoped_owner_ids(
                 break
             row_member_ids = _scoped_member_task_ids([row], ())
             if (
-                scoped_owner_id in row_member_ids
-                or resolve_lineage_owner_task_id(store, row_owner_id) == scoped_owner_id
+                raw_task_id != scoped_owner_id
+                and (
+                    scoped_owner_id in row_member_ids
+                    or resolve_lineage_owner_task_id(store, row_owner_id) == scoped_owner_id
+                )
             ):
                 matching_row_ids.append(row_owner_id)
         if len(set(matching_row_ids)) == 1:
@@ -6493,32 +6573,167 @@ def _missing_scoped_owner_row_is_active(
     *,
     store: SqliteTaskStore,
     owner_id: str,
+    scoped_selector_task_ids: frozenset[str],
     running_task_ids: set[str],
+    include_lineage_members: bool,
 ) -> bool:
     owner_task = store.get(owner_id)
     if owner_task is None:
-        return False
+        member_tasks: list[DbTask] = []
+        member_ids: set[str] = set()
+    else:
+        member_tasks = [owner_task]
+        member_ids = {owner_id}
 
-    member_tasks: list[DbTask] = [owner_task]
-    member_ids = {owner_id}
-    for task in store.get_all():
-        task_id = task.id
-        if task_id is None or task_id in member_ids:
+    for task_id in scoped_selector_task_ids:
+        if task_id in member_ids:
             continue
-        if resolve_lineage_owner_task_id(store, task_id) != owner_id:
+        task = store.get(task_id)
+        if task is None:
             continue
         member_tasks.append(task)
         member_ids.add(task_id)
+
+    if include_lineage_members:
+        for task in store.get_all():
+            member_task_id = task.id
+            if member_task_id is None or member_task_id in member_ids:
+                continue
+            if resolve_lineage_owner_task_id(store, member_task_id) != owner_id:
+                continue
+            member_tasks.append(task)
+            member_ids.add(member_task_id)
 
     if member_ids.intersection(running_task_ids):
         return True
 
     for task in member_tasks:
-        if task.status == "dropped":
-            continue
-        if not task_is_complete_for_lifecycle(task, merge_state=task.merge_status):
+        if task.id is not None and _scoped_selector_task_is_active(
+            store=store,
+            task_id=task.id,
+            running_task_ids=running_task_ids,
+        ):
             return True
     return False
+
+
+def _scoped_selector_recovery_closure_by_owner(
+    *,
+    store: SqliteTaskStore,
+    scoped_owner_ids: tuple[str, ...],
+    scoped_task_ids: tuple[str, ...] | None,
+    config: Config | None,
+    git: Git | None,
+    target_branch: str | None,
+    max_recovery_attempts: int,
+) -> dict[str, frozenset[str]]:
+    if scoped_task_ids is None:
+        return {}
+
+    scoped_owner_id_set = set(scoped_owner_ids)
+    closure_by_owner: dict[str, set[str]] = {}
+    for raw_task_id in scoped_task_ids:
+        raw_task = store.get(raw_task_id)
+        if raw_task is None or raw_task.id is None:
+            continue
+        raw_owner_id = raw_task_id if raw_task_id in scoped_owner_id_set else resolve_lineage_owner_task(store, raw_task).id
+        if raw_owner_id is None or raw_owner_id not in scoped_owner_id_set:
+            continue
+        if raw_task.status != "failed":
+            continue
+        if raw_owner_id != raw_task_id and not _scoped_failed_selector_has_actionable_owner_row(
+            store=store,
+            raw_task_id=raw_task_id,
+            raw_owner_id=str(raw_owner_id),
+            config=config,
+            git=git,
+            target_branch=target_branch,
+            max_recovery_attempts=max_recovery_attempts,
+        ):
+            continue
+
+        closure_ids = closure_by_owner.setdefault(raw_owner_id, set())
+        closure_ids.add(raw_task_id)
+        stack = [
+            child
+            for child in store.get_based_on_children(raw_task_id)
+            if child.recovery_origin in {"resume", "retry"}
+        ]
+        while stack:
+            current = stack.pop()
+            if current.id is None or current.id in closure_ids:
+                continue
+            closure_ids.add(current.id)
+            merge_unit = store.resolve_merge_unit_for_task(current.id)
+            if merge_unit is not None:
+                if merge_unit.owner_task_id is not None:
+                    closure_ids.add(merge_unit.owner_task_id)
+                for attached in store.list_tasks_for_merge_unit(merge_unit.id):
+                    if attached.id is not None:
+                        closure_ids.add(attached.id)
+            stack.extend(
+                child
+                for child in store.get_based_on_children(current.id)
+                if child.recovery_origin in {"resume", "retry"}
+            )
+
+    return {owner_id: frozenset(task_ids) for owner_id, task_ids in closure_by_owner.items()}
+
+
+def _scoped_failed_selector_has_actionable_owner_row(
+    *,
+    store: SqliteTaskStore,
+    raw_task_id: str,
+    raw_owner_id: str,
+    config: Config | None,
+    git: Git | None,
+    target_branch: str | None,
+    max_recovery_attempts: int,
+) -> bool:
+    rows = _query_owner_rows(
+        store=store,
+        config=config,
+        git=git,
+        target_branch=target_branch,
+        owner_task_ids=(raw_owner_id,),
+        task_ids=(raw_task_id,),
+        max_recovery_attempts=max_recovery_attempts,
+        include_skipped=True,
+    )
+    for row in rows:
+        if row.owner_task.id == raw_task_id and row.lineage_status != "skipped":
+            return True
+        if row.owner_task.id != raw_owner_id:
+            continue
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id == raw_task_id:
+            return True
+        if raw_task_id in {str(member.id) for member in row.members if member.id is not None}:
+            return True
+        if raw_task_id in {str(task.id) for task in row.unresolved_tasks if task.id is not None}:
+            return True
+    return False
+
+
+def _scoped_selector_task_is_active(
+    *,
+    store: SqliteTaskStore,
+    task_id: str,
+    running_task_ids: set[str],
+) -> bool:
+    if task_id in running_task_ids:
+        return True
+    task = store.get(task_id)
+    if task is None or task.status == "dropped":
+        return False
+    if task.status in {"pending", "in_progress"}:
+        return True
+    if task.status == "failed":
+        return False
+    merge_unit = store.resolve_merge_unit_for_task(task_id)
+    if task.status == "completed" and not task.has_commits and merge_unit is None:
+        return False
+    merge_state = merge_unit.state if merge_unit is not None else task.merge_status
+    return not task_is_complete_for_lifecycle(task, merge_state=merge_state)
 
 
 def _scoped_owner_active_count(
@@ -6526,8 +6741,11 @@ def _scoped_owner_active_count(
     store: SqliteTaskStore,
     owner_rows: list[LineageOwnerRow],
     scoped_owner_ids: tuple[str, ...],
+    scoped_task_ids: tuple[str, ...] | None = None,
     running_task_ids: set[str],
     planned_active_owner_ids: frozenset[str] = frozenset(),
+    max_recovery_attempts: int = 1,
+    scoped_selector_recovery_closure_by_owner: Mapping[str, frozenset[str]] | None = None,
 ) -> int:
     rows_by_owner_id: dict[str, list[LineageOwnerRow]] = {}
     rows_by_leaf_id: dict[str, LineageOwnerRow] = {}
@@ -6536,8 +6754,22 @@ def _scoped_owner_active_count(
             rows_by_owner_id.setdefault(row.owner_task.id, []).append(row)
         if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None:
             rows_by_leaf_id[str(row.recovery_leaf_task.id)] = row
+    selector_closure_by_owner = (
+        dict(scoped_selector_recovery_closure_by_owner)
+        if scoped_selector_recovery_closure_by_owner is not None
+        else _scoped_selector_recovery_closure_by_owner(
+            store=store,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            config=None,
+            git=None,
+            target_branch=None,
+            max_recovery_attempts=max_recovery_attempts,
+        )
+    )
     active = 0
     for owner_id in scoped_owner_ids:
+        selector_closure_task_ids = selector_closure_by_owner.get(owner_id, frozenset())
         scoped_leaf_row = rows_by_leaf_id.get(owner_id)
         if scoped_leaf_row is not None and _row_is_effective_leaf_scope(scoped_leaf_row, owner_id):
             if _effective_leaf_scope_is_active(
@@ -6552,6 +6784,20 @@ def _scoped_owner_active_count(
 
         scoped_rows = rows_by_owner_id.get(owner_id, [])
         if not scoped_rows:
+            owner_task = store.get(owner_id)
+            if scoped_task_ids is not None and owner_task is not None:
+                selected_tasks = [store.get(task_id) for task_id in scoped_task_ids]
+                if selected_tasks and all(
+                    task is not None
+                    and task.status == "failed"
+                    and task.branch == owner_task.branch
+                    and task.has_commits is False
+                    for task in selected_tasks
+                ):
+                    owner_unit = store.resolve_merge_unit_for_task(owner_id)
+                    owner_state = owner_unit.state if owner_unit is not None else owner_task.merge_status
+                    if merge_state_is_terminal_for_lifecycle(owner_state):
+                        continue
             if _effective_leaf_scope_is_active(
                 store=store,
                 leaf_id=owner_id,
@@ -6561,18 +6807,38 @@ def _scoped_owner_active_count(
             ):
                 active += 1
                 continue
+            if any(
+                planned_id in selector_closure_task_ids
+                or _task_is_descendant_of(store, planned_id, owner_id)
+                or resolve_lineage_owner_task_id(store, planned_id) == owner_id
+                for planned_id in planned_active_owner_ids
+            ):
+                active += 1
+                continue
             task = store.get(owner_id)
             if task is not None and task.status == "failed":
                 continue
             if _missing_scoped_owner_row_is_active(
                 store=store,
                 owner_id=owner_id,
+                scoped_selector_task_ids=selector_closure_task_ids,
                 running_task_ids=running_task_ids,
+                include_lineage_members=scoped_task_ids is None,
             ):
                 active += 1
             continue
         member_ids = _scoped_member_task_ids(scoped_rows, (owner_id,))
         if member_ids.intersection(running_task_ids):
+            active += 1
+            continue
+        if any(
+            _scoped_selector_task_is_active(
+                store=store,
+                task_id=task_id,
+                running_task_ids=running_task_ids,
+            )
+            for task_id in selector_closure_task_ids
+        ):
             active += 1
             continue
         if any(member.status in {"pending", "in_progress"} for row in scoped_rows for member in row.members):
@@ -6642,12 +6908,25 @@ def _scoped_watch_activity(
     )
     planned_active_owner_ids = _collect_planned_active_owner_ids(plan.analysis)
     effective_scoped_owner_ids = getattr(plan.analysis, "effective_scoped_owner_ids", None) or scoped_owner_ids
+    scoped_git = Git(config.project_dir)
+    selector_closure_by_owner = _scoped_selector_recovery_closure_by_owner(
+        store=store,
+        scoped_owner_ids=scoped_owner_ids,
+        scoped_task_ids=scoped_task_ids,
+        config=config,
+        git=scoped_git,
+        target_branch=plan.analysis.target_branch,
+        max_recovery_attempts=max_recovery_attempts,
+    )
     active_count = _scoped_owner_active_count(
         store=store,
         owner_rows=list(plan.analysis.owner_rows),
         scoped_owner_ids=effective_scoped_owner_ids,
+        scoped_task_ids=scoped_task_ids,
         running_task_ids=set(plan.running_task_ids),
         planned_active_owner_ids=planned_active_owner_ids,
+        max_recovery_attempts=max_recovery_attempts,
+        scoped_selector_recovery_closure_by_owner=selector_closure_by_owner,
     )
     return _ScopedWatchActivity(
         active_count=active_count,
@@ -6657,6 +6936,11 @@ def _scoped_watch_activity(
 
 def _collect_planned_active_owner_ids(analysis: _WatchCycleAnalysis) -> frozenset[str]:
     active_owner_ids: set[str] = set()
+    for row in analysis.recovery_rows:
+        owner_id = row.owner_task.id
+        recovery_leaf_id = row.recovery_leaf_task.id if row.recovery_leaf_task is not None else None
+        if owner_id is not None and recovery_leaf_id in analysis.active_recovery_subject_ids:
+            active_owner_ids.add(str(owner_id))
     for row, _task, action in analysis.action_plan:
         owner_id = row.owner_task.id
         if owner_id is None:
@@ -6680,10 +6964,15 @@ def _transition_task_matches_scope(
     store: SqliteTaskStore,
     task_id: str,
     scoped_owner_ids: tuple[str, ...] | None,
+    scoped_selector_recovery_closure_by_owner: Mapping[str, frozenset[str]] | None = None,
 ) -> bool:
     if scoped_owner_ids is None:
         return True
     if task_id in scoped_owner_ids:
+        return True
+    if scoped_selector_recovery_closure_by_owner is not None and any(
+        task_id in closure_ids for closure_ids in scoped_selector_recovery_closure_by_owner.values()
+    ):
         return True
     task = store.get(task_id)
     if task is None:
@@ -9969,8 +10258,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
         except ValueError as exc:
             print(f"Error: {exc}")
             return 1
+        scoped_task_ids: tuple[str, ...] | None = raw_task_ids
     else:
         scoped_owner_ids = None
+        scoped_task_ids = None
     effective_scoped_owner_ids = scoped_owner_ids
     stop_requested = False
     stop_signal: int | None = None
@@ -10037,11 +10328,27 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 now=datetime.now(UTC),
             )
 
+        def _current_scoped_selector_recovery_closure_by_owner() -> dict[str, frozenset[str]] | None:
+            if scoped_owner_ids is None:
+                return None
+            scoped_git = Git(config.project_dir)
+            scoped_target_branch = scoped_git.default_branch()
+            return _scoped_selector_recovery_closure_by_owner(
+                store=store,
+                scoped_owner_ids=scoped_owner_ids,
+                scoped_task_ids=scoped_task_ids,
+                config=config,
+                git=scoped_git,
+                target_branch=scoped_target_branch,
+                max_recovery_attempts=max_recovery_attempts,
+            )
+
         def _process_failure_boundary(
             old_snapshot: dict[str, dict[str, str | None]],
             new_snapshot: dict[str, dict[str, str | None]],
             *,
             boundary_scoped_owner_ids: tuple[str, ...] | None,
+            scoped_selector_recovery_closure_by_owner: Mapping[str, frozenset[str]] | None,
         ) -> bool:
             completed_ids = _collect_completed_transition_ids(
                 old_snapshot,
@@ -10050,6 +10357,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 tags=tag_filters,
                 any_tag=any_tag,
                 scoped_owner_ids=boundary_scoped_owner_ids,
+                scoped_selector_recovery_closure_by_owner=scoped_selector_recovery_closure_by_owner,
             )
             _reset_failure_backoff_for_completed_owners(
                 store=store,
@@ -10067,6 +10375,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 tags=tag_filters,
                 any_tag=any_tag,
                 scoped_owner_ids=boundary_scoped_owner_ids,
+                scoped_selector_recovery_closure_by_owner=scoped_selector_recovery_closure_by_owner,
             )
             return _record_failure_backoff_updates(
                 config=config,
@@ -10260,6 +10569,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
             _prime_effective_scope_for_boundary()
             pre_cycle_snapshot = _task_snapshot(store)
+            pre_cycle_scoped_selector_recovery_closure_by_owner = (
+                _current_scoped_selector_recovery_closure_by_owner()
+            )
             pre_cycle_confirmed_start_ids = _emit_transition_events(
                 previous_snapshot,
                 pre_cycle_snapshot,
@@ -10269,6 +10581,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 restart_failed_mode=dispatch_mode == "recovery_only",
                 max_recovery_attempts=max_recovery_attempts,
                 scoped_owner_ids=effective_scoped_owner_ids,
+                scoped_selector_recovery_closure_by_owner=pre_cycle_scoped_selector_recovery_closure_by_owner,
             )
             cycle_confirmed_start_count = _process_expected_start_boundary(
                 store=store,
@@ -10283,6 +10596,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 previous_snapshot,
                 pre_cycle_snapshot,
                 boundary_scoped_owner_ids=effective_scoped_owner_ids,
+                scoped_selector_recovery_closure_by_owner=pre_cycle_scoped_selector_recovery_closure_by_owner,
             ):
                 previous_snapshot = pre_cycle_snapshot
                 break
@@ -10362,6 +10676,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
             )
 
             current_snapshot = _task_snapshot(store)
+            post_cycle_scoped_selector_recovery_closure_by_owner = (
+                _current_scoped_selector_recovery_closure_by_owner()
+            )
             post_cycle_confirmed_start_ids = _emit_transition_events(
                 previous_snapshot,
                 current_snapshot,
@@ -10371,6 +10688,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 restart_failed_mode=dispatch_mode == "recovery_only",
                 max_recovery_attempts=max_recovery_attempts,
                 scoped_owner_ids=effective_scoped_owner_ids,
+                scoped_selector_recovery_closure_by_owner=post_cycle_scoped_selector_recovery_closure_by_owner,
             )
             cycle_result.confirmed_start_count += _process_expected_start_boundary(
                 store=store,
@@ -10384,6 +10702,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 previous_snapshot,
                 current_snapshot,
                 boundary_scoped_owner_ids=effective_scoped_owner_ids,
+                scoped_selector_recovery_closure_by_owner=post_cycle_scoped_selector_recovery_closure_by_owner,
             ):
                 previous_snapshot = current_snapshot
                 break

@@ -956,11 +956,29 @@ def is_resolved_by_merged_target(
     """Return whether a failed side-quest task is obsolete because its target impl merged."""
     if task.id is None or task.status != "failed" or task.task_type not in _MERGED_TARGET_RESOLUTION_TYPES:
         return False
-    if task.task_type == "improve" and task.same_branch:
-        # Same-branch improve tasks can represent real post-merge follow-up work.
-        return False
     target_task = _resolve_merged_target_task(store, task, read_context=read_context)
     if target_task is None:
+        return False
+    if task.same_branch:
+        if task.branch and target_task.branch and task.branch != target_task.branch:
+            return False
+        return task.has_commits is not True and task_is_merged(store, target_task, read_context=read_context)
+    task_unit = (
+        read_context.resolve_merge_unit_for_task(task.id)
+        if read_context is not None
+        else store.resolve_merge_unit_for_task(task.id)
+    )
+    if task_unit is not None and task_unit.owner_task_id == task.id:
+        return merge_state_is_terminal_for_lifecycle(task_unit.state)
+    if task.branch and target_task.branch:
+        if task.branch != target_task.branch:
+            return False
+        if task.has_commits is True:
+            return False
+    elif task.branch or target_task.branch:
+        if task.branch is not None:
+            return False
+    elif task.has_commits is True:
         return False
     return task_is_merged(store, target_task, read_context=read_context)
 
@@ -1167,7 +1185,11 @@ def _task_lineage_branch_keys(
     if task.branch:
         keys.add(task.branch)
     target_task = _resolve_merged_target_task(store, task, read_context=read_context)
-    if target_task is not None and target_task.branch:
+    if (
+        target_task is not None
+        and target_task.branch
+        and (not task.branch or task.branch == target_task.branch or task.same_branch)
+    ):
         keys.add(target_task.branch)
     return keys
 
@@ -1181,6 +1203,11 @@ def _resolve_task_merge_unit(
     if read_context is not None:
         return read_context.resolve_merge_unit_for_task(task_id)
     return store.resolve_merge_unit_for_task(task_id)
+
+
+def _task_is_explicit_no_work(task: DbTask) -> bool:
+    """Return whether task metadata affirmatively proves no committed work."""
+    return task.has_commits is False
 
 
 def _is_resolved_by_landed_merge_unit_or_owner(
@@ -1199,12 +1226,12 @@ def _is_resolved_by_landed_merge_unit_or_owner(
     unit = _resolve_task_merge_unit(store, task.id, read_context=read_context)
     if unit is not None:
         if unit.state == "merged":
-            return True
+            return unit.owner_task_id == task.id or _task_is_explicit_no_work(task) or task.branch is None
         owner_task_id = unit.owner_task_id
         if owner_task_id and owner_task_id != task.id:
             owner_unit = _resolve_task_merge_unit(store, owner_task_id, read_context=read_context)
             if owner_unit is not None and owner_unit.state == "merged":
-                return True
+                return _task_is_explicit_no_work(task) or task.branch is None
     return False
 
 
@@ -1258,12 +1285,22 @@ def _is_resolved_by_landed_lineage(
                     if task.id is not None:
                         resolved_merge_unit = store.resolve_merge_unit_for_task(task.id)
                         if resolved_merge_unit is not None and resolved_merge_unit.target_branch == target_branch:
-                            persisted_state = resolved_merge_unit.state
-                    if persisted_state is not None and merge_state_is_terminal_for_lifecycle(persisted_state):
+                            if resolved_merge_unit.owner_task_id == task.id:
+                                persisted_state = resolved_merge_unit.state
+                    if (
+                        persisted_state in {"empty", "redundant"}
+                        and task.task_type not in _MERGED_TARGET_RESOLUTION_TYPES
+                    ):
+                        return False
+                    if persisted_state == "merged" or (
+                        persisted_state is not None
+                        and merge_state_is_terminal_for_lifecycle(persisted_state)
+                        and task.task_type in _MERGED_TARGET_RESOLUTION_TYPES
+                    ):
                         branch_merge_state = persisted_state
                     else:
                         merged_proof = merge_context.git.is_merged(task.branch, target_branch)
-                        if merged_proof:
+                        if merged_proof or task.task_type in _MERGED_TARGET_RESOLUTION_TYPES:
                             branch_merge_state = classify_branch_merge_state_for_target(
                                 git=merge_context.git,
                                 source_branch=task.branch,
@@ -1274,9 +1311,12 @@ def _is_resolved_by_landed_lineage(
                                 recorded_head_sha=resolved_merge_unit.head_sha if resolved_merge_unit is not None else None,
                             ).state
                 merge_context.branch_resolution[branch_resolution_key] = branch_merge_state
-            branch_merged = branch_merge_state == "merged"
-            if branch_merged:
+            if branch_merge_state == "merged":
                 return True
+            if merge_state_is_terminal_for_lifecycle(branch_merge_state):
+                return task.task_type in _MERGED_TARGET_RESOLUTION_TYPES
+            if task.has_commits:
+                return False
         except (GitError, AttributeError) as exc:
             _record_repository_inspection_warning(
                 merge_context,
@@ -1517,7 +1557,7 @@ def _task_has_provider_output(task: DbTask) -> bool:
 
 
 def _task_has_recoverable_real_work(task: DbTask) -> bool:
-    return bool(task.has_commits or _task_has_provider_output(task))
+    return task.has_commits is not False or _task_has_provider_output(task)
 
 
 def _prerequisite_unmerged_has_recoverable_real_work(task: DbTask) -> bool:

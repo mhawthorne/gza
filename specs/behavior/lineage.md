@@ -78,11 +78,15 @@ records provenance on recovery edges.
 - **P6 — Terminal landed/no-work units are not actionable.** An active merge unit in a
   terminal landed/no-work state (`merged`, `empty`, or `redundant`) is not an actionable
   owner row on operator or recovery-selection surfaces. `gza incomplete`, watch
-  needs-attention reporting, and recovery-target selection MUST suppress that owner row
-  unless a failed descendant carries unique unmerged work that is not represented on the
-  unit's target. This keep/drop boundary MUST be proven from unique-unmerged-work truth,
-  not inferred from task type. If the query cannot prove that a failed descendant has no
-  unique unmerged work against the target, it MUST keep that descendant visible and let
+  needs-attention reporting, and recovery-target selection MUST suppress that owner row.
+  A `merged` owner is terminal even when older failed leaves remain in its lineage; those
+  leaves MUST NOT keep the landed owner parked for manual intervention, regardless of
+  descendant timestamps. If a failed descendant carries distinct unique unmerged work that
+  is not represented on the landed unit's target, that descendant's own unresolved merge
+  unit SHOULD surface as its own owner row instead of re-opening the merged owner. This
+  keep/drop boundary MUST be proven from unique-unmerged-work truth, not inferred from task
+  type. If the query cannot prove that a distinct failed descendant has no unique unmerged
+  work against the target, it MUST keep that descendant visible and let
   [recovery.md](recovery.md) decide the recovery action; visibility fails closed.
 
 ## The canonical operations
@@ -154,8 +158,15 @@ The intended resolution order, first match wins:
 For operator-facing parked/needs-attention signals produced by failed-task recovery, failed
 side-quest descendants that rescue or validate an implementation (`review`, `improve`,
 `rebase`, and `fix`) MUST name the owning implementation / merge-unit owner as the surfaced
-subject. The failed leaf remains detail within that owner's signal; it MUST NOT become a
-separate top-level stuck owner row by itself.
+subject when they are historical members of the same unresolved work unit. The failed leaf
+remains detail within that owner's signal; it MUST NOT become a separate top-level stuck
+owner row by itself.
+
+Terminal landed/no-work owners are the exception defined by P6: same-unit historical
+side quests remain detail and do not reopen the landed owner, while a failed descendant
+whose branch or merge-unit evidence proves, or cannot disprove, distinct unique unmerged
+work MUST surface under that descendant's own unresolved merge-unit owner, or under the
+distinct legacy leaf itself when no merge-unit record exists.
 
 *Implementation note: `lineage_query.py` `_load_indexes` owner-resolution cascade;
 `db.resolve_merge_unit_owner_task` (canonical `owner_task_id`). Rules 2 and 4 predate
