@@ -39,6 +39,12 @@ def _query_tags(
     return match.task.tags
 
 
+def _hidden_value(html: str, name: str) -> str:
+    match = re.search(rf'name="{name}" value="([^"]+)"', html)
+    assert match is not None
+    return match.group(1)
+
+
 def test_task_tag_editor_adds_and_removes_tags_on_completed_task(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
     task = store.add("Already shipped", tags=("release", "keep"))
@@ -142,7 +148,7 @@ def test_bulk_replace_previews_then_applies_to_cross_project_filtered_set(
             [
                 *(request_data.items()),
                 *(("target", target) for target in targets),
-                ("targets_frozen", "true"),
+                ("preview_token", _hidden_value(preview.text, "preview_token")),
                 ("confirmed", "true"),
             ]
         ),
@@ -172,7 +178,7 @@ def test_bulk_confirm_freezes_an_empty_match_set(tmp_path: Path) -> None:
         "/api/tasks/tags/bulk",
         data={
             **request_data,
-            "targets_frozen": "true",
+            "preview_token": _hidden_value(preview.text, "preview_token"),
             "confirmed": "true",
         },
     )
@@ -189,12 +195,186 @@ def test_bulk_retag_refuses_no_selection_without_mutating(tmp_path: Path) -> Non
 
     response = _client(store).post(
         "/api/tasks/tags/bulk",
-        json={"add": "new", "confirmed": True},
+        json={"add": "new"},
     )
 
     assert response.status_code == 422
     assert response.json()["detail"] == "bulk retag requires at least one selection filter"
     assert _query_tags(store, task.id, project_id="server-test") == ("old",)
+
+
+def test_bulk_apply_rejects_target_tampering_without_mutating(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    failed = store.add("Failed task", tags=("old",))
+    failed.status = "failed"
+    store.update(failed)
+    pending = store.add("Pending task", tags=("old",))
+    assert failed.id and pending.id
+    client = _client(store)
+    request_data = {"status": "failed", "mutation": "add", "mutation_tag": "new"}
+    preview = client.post("/api/tasks/tags/bulk", data=request_data)
+    targets = re.findall(r'name="target" value="([^"]+)"', preview.text)
+
+    response = client.post(
+        "/api/tasks/tags/bulk",
+        content=urlencode(
+            [
+                *request_data.items(),
+                *(("target", target) for target in targets),
+                ("target", f"server-test|{pending.id}"),
+                ("preview_token", _hidden_value(preview.text, "preview_token")),
+                ("confirmed", "true"),
+            ]
+        ),
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+
+    assert response.status_code == 422
+    assert _query_tags(store, failed.id, project_id="server-test") == ("old",)
+    assert _query_tags(store, pending.id, project_id="server-test") == ("old",)
+
+
+def test_bulk_apply_rejects_mutation_tampering_without_mutating(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Failed task", tags=("old",))
+    task.status = "failed"
+    store.update(task)
+    assert task.id
+    client = _client(store)
+    request_data = {"status": "failed", "mutation": "add", "mutation_tag": "new"}
+    preview = client.post("/api/tasks/tags/bulk", data=request_data)
+
+    response = client.post(
+        "/api/tasks/tags/bulk",
+        data={
+            **request_data,
+            "target": f"server-test|{task.id}",
+            "mutation_tag": "tampered",
+            "preview_token": _hidden_value(preview.text, "preview_token"),
+            "confirmed": "true",
+        },
+    )
+
+    assert response.status_code == 422
+    assert _query_tags(store, task.id, project_id="server-test") == ("old",)
+
+
+def test_bulk_apply_rejects_confirmation_without_preview_state(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Pending task", tags=("old",))
+    assert task.id
+
+    response = _client(store).post(
+        "/api/tasks/tags/bulk",
+        json={
+            "status": ["pending"],
+            "mutation": "add",
+            "mutation_tag": "new",
+            "target": [f"server-test|{task.id}"],
+            "confirmed": True,
+        },
+    )
+
+    assert response.status_code == 422
+    assert _query_tags(store, task.id, project_id="server-test") == ("old",)
+
+
+def test_bulk_apply_skips_task_deleted_after_cross_project_preview(tmp_path: Path) -> None:
+    db_path = tmp_path / "shared.db"
+    alpha_store = SqliteTaskStore(db_path, prefix="alpha", project_id="alpha")
+    beta_store = SqliteTaskStore(db_path, prefix="beta", project_id="beta")
+    alpha = alpha_store.add("Alpha", tags=("old",))
+    beta = beta_store.add("Beta", tags=("old",))
+    assert alpha.id and beta.id
+    client = _client(
+        alpha_store,
+        mutation_stores={"alpha": alpha_store, "beta": beta_store},
+    )
+    request_data = {"status": ["pending"], "mutation": "add", "mutation_tag": "new"}
+    preview = client.post("/api/tasks/tags/bulk", json=request_data).json()
+    targets = [
+        f'{task["project_id"]}|{task["id"]}'
+        for task in preview["matched_tasks"]
+    ]
+    assert beta_store.delete(beta.id)
+
+    response = client.post(
+        "/api/tasks/tags/bulk",
+        json={
+            **request_data,
+            "target": targets,
+            "preview_token": preview["preview_token"],
+            "confirmed": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["changed_tasks"] == [{"project_id": "alpha", "id": alpha.id}]
+    assert response.json()["skipped_tasks"] == [{"project_id": "beta", "id": beta.id}]
+    assert response.json()["changed_count"] == 1
+    assert response.json()["skipped_count"] == 1
+    assert _query_tags(alpha_store, alpha.id, project_id="alpha") == ("new", "old")
+
+
+def test_bulk_preview_preflights_every_store_before_any_mutation(tmp_path: Path) -> None:
+    db_path = tmp_path / "shared.db"
+    alpha_store = SqliteTaskStore(db_path, prefix="alpha", project_id="alpha")
+    beta_store = SqliteTaskStore(db_path, prefix="beta", project_id="beta")
+    alpha = alpha_store.add("Alpha", tags=("old",))
+    beta = beta_store.add("Beta", tags=("old",))
+    assert alpha.id and beta.id
+    client = _client(alpha_store, mutation_stores={"alpha": alpha_store})
+
+    response = client.post(
+        "/api/tasks/tags/bulk",
+        json={"status": ["pending"], "mutation": "add", "mutation_tag": "new"},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "could not resolve mutation store for project beta"
+    assert _query_tags(alpha_store, alpha.id, project_id="alpha") == ("old",)
+    assert _query_tags(alpha_store, beta.id, project_id="beta") == ("old",)
+
+
+def test_bulk_apply_reports_committed_and_failed_targets(tmp_path: Path) -> None:
+    class FailingStore:
+        def mutate_task_tags(self, *args: object, **kwargs: object) -> dict[str, bool]:
+            raise RuntimeError("write unavailable")
+
+    db_path = tmp_path / "shared.db"
+    alpha_store = SqliteTaskStore(db_path, prefix="alpha", project_id="alpha")
+    beta_store = SqliteTaskStore(db_path, prefix="beta", project_id="beta")
+    alpha = alpha_store.add("Alpha", tags=("old",))
+    beta = beta_store.add("Beta", tags=("old",))
+    assert alpha.id and beta.id
+    client = _client(
+        alpha_store,
+        mutation_stores={"alpha": alpha_store, "beta": FailingStore()},  # type: ignore[dict-item]
+    )
+    request_data = {"status": ["pending"], "mutation": "add", "mutation_tag": "new"}
+    preview = client.post("/api/tasks/tags/bulk", json=request_data).json()
+
+    response = client.post(
+        "/api/tasks/tags/bulk",
+        json={
+            **request_data,
+            "target": [
+                f'{task["project_id"]}|{task["id"]}'
+                for task in preview["matched_tasks"]
+            ],
+            "preview_token": preview["preview_token"],
+            "confirmed": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["changed_tasks"] == [{"project_id": "alpha", "id": alpha.id}]
+    assert response.json()["failed_tasks"] == [{"project_id": "beta", "id": beta.id}]
+    assert response.json()["failures"] == [
+        {"project_id": "beta", "error": "write unavailable"}
+    ]
+    assert _query_tags(alpha_store, alpha.id, project_id="alpha") == ("new", "old")
+    assert _query_tags(alpha_store, beta.id, project_id="beta") == ("old",)
 
 
 def test_bulk_retag_requires_exactly_one_mutation(tmp_path: Path) -> None:

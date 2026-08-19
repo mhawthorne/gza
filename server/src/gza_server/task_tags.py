@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
@@ -102,24 +103,82 @@ def edit_task_tags(
     return store.replace_task_tags(task_id, final), True
 
 
+QualifiedTaskId = tuple[str, str]
+
+
+@dataclass(frozen=True)
+class BulkTagMutationResult:
+    """Explicit outcome for a potentially multi-project bulk mutation."""
+
+    changed: tuple[QualifiedTaskId, ...]
+    unchanged: tuple[QualifiedTaskId, ...]
+    skipped: tuple[QualifiedTaskId, ...]
+    failed: tuple[QualifiedTaskId, ...]
+    failures: tuple[tuple[str, str], ...]
+
+    @property
+    def changed_count(self) -> int:
+        return len(self.changed)
+
+    @property
+    def skipped_count(self) -> int:
+        return len(self.skipped)
+
+    @property
+    def unchanged_count(self) -> int:
+        return len(self.unchanged)
+
+    @property
+    def failed_count(self) -> int:
+        return len(self.failed)
+
+
 def apply_bulk_tag_mutation(
-    store_for_project: Callable[[str], SqliteTaskStore],
+    stores_by_project: Mapping[str, SqliteTaskStore],
     rows: list[dict[str, object]],
     mutation: TagMutation,
-) -> int:
-    """Apply a frozen matched set through the same primitive as ``gza retag``."""
+) -> BulkTagMutationResult:
+    """Apply a frozen set and report every changed, missing, or failed target."""
     ids_by_project: dict[str, list[str]] = {}
     for row in rows:
         ids_by_project.setdefault(str(row["project_id"]), []).append(str(row["id"]))
 
-    changed_count = 0
+    missing_stores = set(ids_by_project) - stores_by_project.keys()
+    if missing_stores:
+        missing = ", ".join(sorted(missing_stores))
+        raise ValueError(f"Mutation stores were not preflighted for projects: {missing}")
+
+    changed_ids: list[QualifiedTaskId] = []
+    unchanged_ids: list[QualifiedTaskId] = []
+    skipped_ids: list[QualifiedTaskId] = []
+    failed_ids: list[QualifiedTaskId] = []
+    failures: list[tuple[str, str]] = []
     for project_id, task_ids in ids_by_project.items():
-        store = store_for_project(project_id)
-        changed = store.mutate_task_tags(
-            task_ids,
-            action=mutation.kind,
-            tag=mutation.tag,
-            old_tag=mutation.old_tag,
-        )
-        changed_count += sum(changed.values())
-    return changed_count
+        try:
+            changed = stores_by_project[project_id].mutate_task_tags(
+                task_ids,
+                action=mutation.kind,
+                tag=mutation.tag,
+                old_tag=mutation.old_tag,
+            )
+        except Exception as exc:
+            # Multi-project stores cannot share one transaction. Preserve an
+            # honest partial-result contract if a preflighted store later fails.
+            failed_ids.extend((project_id, task_id) for task_id in task_ids)
+            failures.append((project_id, str(exc)))
+            continue
+        for task_id in task_ids:
+            qualified_id = (project_id, task_id)
+            if task_id not in changed:
+                skipped_ids.append(qualified_id)
+            elif changed[task_id]:
+                changed_ids.append(qualified_id)
+            else:
+                unchanged_ids.append(qualified_id)
+    return BulkTagMutationResult(
+        changed=tuple(changed_ids),
+        unchanged=tuple(unchanged_ids),
+        skipped=tuple(skipped_ids),
+        failed=tuple(failed_ids),
+        failures=tuple(failures),
+    )

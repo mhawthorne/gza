@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import os
+import secrets
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, Any, Literal, Protocol, cast
 from urllib.parse import parse_qs
 
@@ -25,6 +28,8 @@ from .task_list import (
     query_task_list,
 )
 from .task_tags import (
+    BulkTagMutationResult,
+    TagMutation,
     apply_bulk_tag_mutation,
     edit_task_tags,
     parse_tag_mutation,
@@ -45,6 +50,16 @@ class TaskStore(Protocol):
 StoreFactory = Callable[[], TaskStore]
 MutationStoreFactory = Callable[[str], SqliteTaskStore]
 _TEMPLATES = Jinja2Templates(directory=Path(__file__).parent / "templates")
+
+
+@dataclass(frozen=True)
+class _BulkPreviewState:
+    """Server-authenticated state for one confirmed bulk mutation."""
+
+    filters: TaskListFilters
+    mutation: TagMutation
+    targets: tuple[tuple[str, str], ...]
+    stores: dict[str, SqliteTaskStore]
 
 
 def _task_list_filters(
@@ -137,6 +152,38 @@ def _bulk_targets(payload: dict[str, object]) -> list[dict[str, object]]:
     return targets
 
 
+def _qualified_target_records(
+    targets: tuple[tuple[str, str], ...],
+) -> list[dict[str, str]]:
+    return [
+        {"project_id": project_id, "id": task_id}
+        for project_id, task_id in targets
+    ]
+
+
+def _bulk_result_context(
+    rows: list[dict[str, object]],
+    mutation_summary: str,
+    result: BulkTagMutationResult,
+) -> dict[str, object]:
+    return {
+        "matched_tasks": rows,
+        "mutation": mutation_summary,
+        "changed_count": result.changed_count,
+        "unchanged_count": result.unchanged_count,
+        "skipped_count": result.skipped_count,
+        "failed_count": result.failed_count,
+        "changed_tasks": _qualified_target_records(result.changed),
+        "unchanged_tasks": _qualified_target_records(result.unchanged),
+        "skipped_tasks": _qualified_target_records(result.skipped),
+        "failed_tasks": _qualified_target_records(result.failed),
+        "failures": [
+            {"project_id": project_id, "error": error}
+            for project_id, error in result.failures
+        ],
+    }
+
+
 def create_app(
     *,
     project_dir: Path | None = None,
@@ -158,6 +205,21 @@ def create_app(
     )
     server_instance_id = instance_id or os.environ.get("GZA_SERVER_INSTANCE_ID")
     app = FastAPI(title="gza-server", version=__version__)
+    bulk_previews: dict[str, _BulkPreviewState] = {}
+    bulk_previews_lock = Lock()
+
+    def save_bulk_preview(state: _BulkPreviewState) -> str:
+        token = secrets.token_urlsafe(32)
+        with bulk_previews_lock:
+            # Bound abandoned confirmation pages without weakening nonce entropy.
+            if len(bulk_previews) >= 256:
+                bulk_previews.pop(next(iter(bulk_previews)))
+            bulk_previews[token] = state
+        return token
+
+    def take_bulk_preview(token: str) -> _BulkPreviewState | None:
+        with bulk_previews_lock:
+            return bulk_previews.pop(token, None)
 
     @app.get("/api/health")
     def health() -> dict[str, object]:
@@ -215,6 +277,48 @@ def create_app(
     @app.post("/api/tasks/tags/bulk")
     async def bulk_task_tags(request: Request):
         payload, is_json = await _request_payload(request)
+        confirmed = _payload_bool(payload, "confirmed")
+        if confirmed:
+            preview_token = str(payload.get("preview_token", ""))
+            state = take_bulk_preview(preview_token)
+            if state is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="a valid, unused bulk preview is required",
+                )
+            try:
+                submitted_filters = _bulk_filters(payload)
+                submitted_mutation = parse_tag_mutation(payload)
+                submitted_targets = tuple(
+                    (str(row["project_id"]), str(row["id"]))
+                    for row in _bulk_targets(payload)
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if (
+                submitted_filters != state.filters
+                or submitted_mutation != state.mutation
+                or submitted_targets != state.targets
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="bulk apply does not match its authenticated preview",
+                )
+
+            rows = [
+                {"project_id": project_id, "id": task_id}
+                for project_id, task_id in state.targets
+            ]
+            result = apply_bulk_tag_mutation(state.stores, rows, state.mutation)
+            response_context = _bulk_result_context(rows, state.mutation.summary, result)
+            if is_json:
+                return response_context
+            return _TEMPLATES.TemplateResponse(
+                request=request,
+                name="bulk_tags_result.html",
+                context=response_context,
+            )
+
         filters = _bulk_filters(payload)
         if not filters.has_selection:
             raise HTTPException(
@@ -228,43 +332,47 @@ def create_app(
 
         base_store = cast(SqliteTaskStore, make_store())
         rows = query_task_list(base_store, filters).rows
-        targets_are_frozen = _payload_bool(payload, "targets_frozen")
-        if _payload_bool(payload, "confirmed") and targets_are_frozen:
-            rows = _bulk_targets(payload)
         matched = [
             {"id": str(row["id"]), "project_id": str(row["project_id"])}
             for row in rows
         ]
-        confirmed = _payload_bool(payload, "confirmed")
-        if not confirmed:
-            if is_json:
-                return {
-                    "matched_tasks": matched,
-                    "mutation": mutation.summary,
-                    "confirmed": False,
-                }
-            return _TEMPLATES.TemplateResponse(
-                request=request,
-                name="bulk_tags_confirm.html",
-                context={
-                    "matched_tasks": matched,
-                    "mutation": mutation,
-                    "filters": filters,
-                },
+        stores: dict[str, SqliteTaskStore] = {}
+        for project_id in dict.fromkeys(str(row["project_id"]) for row in matched):
+            try:
+                stores[project_id] = make_mutation_store(project_id)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"could not resolve mutation store for project {project_id}",
+                ) from exc
+        targets = tuple(
+            (str(row["project_id"]), str(row["id"]))
+            for row in matched
+        )
+        preview_token = save_bulk_preview(
+            _BulkPreviewState(
+                filters=filters,
+                mutation=mutation,
+                targets=targets,
+                stores=stores,
             )
-
-        changed_count = apply_bulk_tag_mutation(make_mutation_store, rows, mutation)
-        result = {
-            "matched_tasks": matched,
-            "mutation": mutation.summary,
-            "changed_count": changed_count,
-        }
+        )
         if is_json:
-            return result
+            return {
+                "matched_tasks": matched,
+                "mutation": mutation.summary,
+                "confirmed": False,
+                "preview_token": preview_token,
+            }
         return _TEMPLATES.TemplateResponse(
             request=request,
-            name="bulk_tags_result.html",
-            context=result,
+            name="bulk_tags_confirm.html",
+            context={
+                "matched_tasks": matched,
+                "mutation": mutation,
+                "filters": filters,
+                "preview_token": preview_token,
+            },
         )
 
     def load_task_detail(task_id: str, project_id: str | None = None) -> TaskDetail | None:

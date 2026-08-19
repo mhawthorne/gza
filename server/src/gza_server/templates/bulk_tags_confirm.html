@@ -12,13 +12,13 @@
     {% endfor %}
   </ul>
   <form method="post" action="/api/tasks/tags/bulk">
+    <input type="hidden" name="preview_token" value="{{ preview_token }}">
     {% for key, value in filters.query_pairs() %}
       <input type="hidden" name="{{ key }}" value="{{ value }}">
     {% endfor %}
     {% for task in matched_tasks %}
       <input type="hidden" name="target" value="{{ task.project_id }}|{{ task.id }}">
     {% endfor %}
-    <input type="hidden" name="targets_frozen" value="true">
     <input type="hidden" name="mutation" value="{{ mutation.kind }}">
     {% if mutation.kind == "replace" %}
       <input type="hidden" name="old_tag" value="{{ mutation.old_tag }}">
