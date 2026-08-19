@@ -102,7 +102,12 @@ def normalize_tags(values: list[str]) -> tuple[str, ...]:
 
 def parse_tag_mutation(payload: dict[str, Any]) -> TagMutation:
     """Parse exactly one add/remove/replace mutation from JSON or form data."""
+    direct_fields = tuple(
+        kind for kind in ("add", "remove", "replace") if kind in payload
+    )
     if "mutation" in payload:
+        if direct_fields:
+            raise ValueError("exactly one tag mutation is required")
         kind = _string_value(payload.get("mutation"), "mutation")
         if kind in {"add", "remove"}:
             tag = normalize_tags([_string_value(payload.get("mutation_tag"), "mutation_tag")])[0]
@@ -113,16 +118,11 @@ def parse_tag_mutation(payload: dict[str, Any]) -> TagMutation:
             return TagMutation(kind="replace", old_tag=old_tag, tag=new_tag)
         raise ValueError("exactly one tag mutation is required")
 
-    candidates = [
-        (kind, payload[kind])
-        for kind in ("add", "remove", "replace")
-        if payload.get(kind) is not None
-    ]
-
-    if len(candidates) != 1:
+    if len(direct_fields) != 1:
         raise ValueError("exactly one tag mutation is required")
 
-    kind, raw_value = candidates[0]
+    kind = direct_fields[0]
+    raw_value = payload[kind]
     if kind in {"add", "remove"}:
         tag = normalize_tags([_string_value(raw_value, kind)])[0]
         return TagMutation(kind=kind, tag=tag)

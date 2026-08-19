@@ -21,7 +21,8 @@ def _client(
         create_app(
             store_factory=lambda: store,
             mutation_store_factory=lambda project_id: stores[project_id],
-        )
+        ),
+        headers={"origin": "http://testserver"},
     )
 
 
@@ -92,7 +93,10 @@ def test_task_tag_write_store_resolves_through_project_config(tmp_path: Path) ->
     task = store.add("Configured task", tags=("old",))
     assert task.id is not None
 
-    response = TestClient(create_app(project_dir=tmp_path)).post(
+    response = TestClient(
+        create_app(project_dir=tmp_path),
+        headers={"origin": "http://testserver"},
+    ).post(
         f"/api/tasks/{task.id}/tags",
         json={"add": ["new"]},
     )
@@ -189,6 +193,85 @@ def test_task_tag_form_accepts_scalar_remove_with_blank_add_field(tmp_path: Path
 
     assert response.status_code == 303
     assert _query_tags(store, task.id, project_id="server-test") == ()
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "content_type", "body"),
+    [
+        ("task", "application/json", b'{"add": ['),
+        ("task", "application/x-www-form-urlencoded", b"add=\xff"),
+        ("bulk", "application/json", b'{"status": ['),
+        ("bulk", "application/x-www-form-urlencoded", b"status=\xff"),
+    ],
+    ids=["task-json", "task-form", "bulk-json", "bulk-form"],
+)
+def test_tag_mutation_endpoints_reject_malformed_bodies_before_resolution(
+    tmp_path: Path,
+    endpoint: str,
+    content_type: str,
+    body: bytes,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Tagged task", tags=("old",))
+    assert task.id is not None
+    query_resolutions: list[None] = []
+    mutation_resolutions: list[str] = []
+
+    def store_factory() -> SqliteTaskStore:
+        query_resolutions.append(None)
+        return store
+
+    def mutation_store_factory(project_id: str) -> SqliteTaskStore:
+        mutation_resolutions.append(project_id)
+        return store
+
+    client = TestClient(
+        create_app(
+            store_factory=store_factory,
+            mutation_store_factory=mutation_store_factory,
+        ),
+        headers={"origin": "http://testserver"},
+    )
+    path = f"/api/tasks/{task.id}/tags" if endpoint == "task" else "/api/tasks/tags/bulk"
+
+    response = client.post(path, content=body, headers={"content-type": content_type})
+
+    assert response.status_code == 400
+    assert "preview_token" not in response.json()
+    assert query_resolutions == []
+    assert mutation_resolutions == []
+    assert _query_tags(store, task.id, project_id="server-test") == ("old",)
+
+
+def test_task_tag_form_rejects_cross_origin_write_then_accepts_rendered_form(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Tagged task", tags=("old",))
+    assert task.id is not None
+    client = _client(store)
+    page = client.get(f"/tasks/{task.id}")
+    action_match = re.search(r'<form method="post" action="([^"]+)">', page.text)
+    assert action_match is not None
+
+    rejected = client.post(
+        action_match.group(1),
+        data={"project_id": "server-test", "add": "new"},
+        headers={"origin": "https://hostile.example"},
+        follow_redirects=False,
+    )
+
+    assert rejected.status_code == 403
+    assert _query_tags(store, task.id, project_id="server-test") == ("old",)
+
+    accepted = client.post(
+        action_match.group(1),
+        data={"project_id": "server-test", "add": "new"},
+        follow_redirects=False,
+    )
+
+    assert accepted.status_code == 303
+    assert _query_tags(store, task.id, project_id="server-test") == ("new", "old")
 
 
 def test_bulk_replace_previews_then_applies_to_cross_project_filtered_set(
@@ -324,7 +407,8 @@ def test_bulk_preview_rejects_non_string_add_remove_without_confirmation_or_muta
         create_app(
             store_factory=lambda: store,
             mutation_store_factory=mutation_store_factory,
-        )
+        ),
+        headers={"origin": "http://testserver"},
     )
     response = client.post(
         "/api/tasks/tags/bulk",
@@ -361,7 +445,8 @@ def test_bulk_preview_rejects_invalid_mutation_tag_without_confirmation_or_mutat
         create_app(
             store_factory=lambda: store,
             mutation_store_factory=mutation_store_factory,
-        )
+        ),
+        headers={"origin": "http://testserver"},
     ).post(
         "/api/tasks/tags/bulk",
         json={
@@ -403,7 +488,8 @@ def test_bulk_preview_rejects_non_string_replace_fields_without_confirmation_or_
         create_app(
             store_factory=lambda: store,
             mutation_store_factory=mutation_store_factory,
-        )
+        ),
+        headers={"origin": "http://testserver"},
     ).post(
         "/api/tasks/tags/bulk",
         json={
@@ -443,6 +529,95 @@ def test_bulk_preview_rejects_non_string_direct_replace_operands_without_mutatio
 
     assert response.status_code == 422
     assert "preview_token" not in response.json()
+    assert _query_tags(store, task.id, project_id="server-test") == ("old",)
+
+
+@pytest.mark.parametrize(
+    "direct_field",
+    [
+        {"add": "other"},
+        {"remove": "old"},
+        {"replace": ["old", "other"]},
+    ],
+    ids=["add", "remove", "replace"],
+)
+def test_bulk_preview_rejects_discriminator_mixed_with_direct_mutation(
+    tmp_path: Path,
+    direct_field: dict[str, object],
+) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Selected task", tags=("old",))
+    assert task.id is not None
+    resolved_projects: list[str] = []
+    client = TestClient(
+        create_app(
+            store_factory=lambda: store,
+            mutation_store_factory=lambda project_id: (
+                resolved_projects.append(project_id) or store
+            ),
+        )
+    )
+
+    response = client.post(
+        "/api/tasks/tags/bulk",
+        json={
+            "status": ["pending"],
+            "mutation": "add",
+            "mutation_tag": "new",
+            **direct_field,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "preview_token" not in response.json()
+    assert resolved_projects == []
+    assert _query_tags(store, task.id, project_id="server-test") == ("old",)
+
+
+@pytest.mark.parametrize(
+    "mutation_payload",
+    [
+        {"add": "new", "remove": None},
+        {"add": "new", "replace": None},
+        {"remove": "old", "add": None},
+        {"remove": "old", "replace": None},
+        {"replace": ["old", "new"], "add": None},
+        {"replace": ["old", "new"], "remove": None},
+    ],
+    ids=[
+        "add-null-remove",
+        "add-null-replace",
+        "remove-null-add",
+        "remove-null-replace",
+        "replace-null-add",
+        "replace-null-remove",
+    ],
+)
+def test_bulk_preview_rejects_direct_mutation_with_null_competing_field(
+    tmp_path: Path,
+    mutation_payload: dict[str, object],
+) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Selected task", tags=("old",))
+    assert task.id is not None
+    resolved_projects: list[str] = []
+    client = TestClient(
+        create_app(
+            store_factory=lambda: store,
+            mutation_store_factory=lambda project_id: (
+                resolved_projects.append(project_id) or store
+            ),
+        )
+    )
+
+    response = client.post(
+        "/api/tasks/tags/bulk",
+        json={"status": ["pending"], **mutation_payload},
+    )
+
+    assert response.status_code == 422
+    assert "preview_token" not in response.json()
+    assert resolved_projects == []
     assert _query_tags(store, task.id, project_id="server-test") == ("old",)
 
 
@@ -520,6 +695,38 @@ def test_bulk_apply_rejects_confirmation_without_preview_state(tmp_path: Path) -
 
     assert response.status_code == 422
     assert _query_tags(store, task.id, project_id="server-test") == ("old",)
+
+
+def test_bulk_form_apply_requires_same_origin_and_preserves_preview_state(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Pending task", tags=("old",))
+    assert task.id is not None
+    client = _client(store)
+    request_data = {"status": "pending", "mutation": "add", "mutation_tag": "new"}
+    preview = client.post("/api/tasks/tags/bulk", data=request_data)
+    apply_data = {
+        **request_data,
+        "target": f"server-test|{task.id}",
+        "preview_token": _hidden_value(preview.text, "preview_token"),
+        "confirmed": "true",
+    }
+
+    rejected = client.post(
+        "/api/tasks/tags/bulk",
+        data=apply_data,
+        headers={"origin": "https://hostile.example"},
+    )
+
+    assert rejected.status_code == 403
+    assert _query_tags(store, task.id, project_id="server-test") == ("old",)
+
+    applied = client.post("/api/tasks/tags/bulk", data=apply_data)
+
+    assert applied.status_code == 200
+    assert "Updated 1 task." in applied.text
+    assert _query_tags(store, task.id, project_id="server-test") == ("new", "old")
 
 
 def test_bulk_apply_skips_task_deleted_after_cross_project_preview(tmp_path: Path) -> None:

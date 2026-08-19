@@ -116,17 +116,35 @@ def _payload_bool(payload: dict[str, object], key: str) -> bool:
 async def _request_payload(request: Request) -> tuple[dict[str, object], bool]:
     """Read either the durable JSON API shape or a server-rendered form body."""
     is_json = request.headers.get("content-type", "").split(";", 1)[0] == "application/json"
-    if is_json:
-        value = await request.json()
-        if not isinstance(value, dict):
-            raise HTTPException(status_code=422, detail="request body must be an object")
-        return cast(dict[str, object], value), True
-    parsed = parse_qs((await request.body()).decode("utf-8"), keep_blank_values=True)
+    try:
+        if is_json:
+            value = await request.json()
+            if not isinstance(value, dict):
+                raise HTTPException(status_code=422, detail="request body must be an object")
+            return cast(dict[str, object], value), True
+        parsed = parse_qs(
+            (await request.body()).decode("utf-8"),
+            keep_blank_values=True,
+            encoding="utf-8",
+            errors="strict",
+        )
+    except (UnicodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="malformed request body") from exc
     payload: dict[str, object] = {
         key: values if len(values) > 1 else values[0]
         for key, values in parsed.items()
     }
     return payload, False
+
+
+def _require_same_origin_form(request: Request, *, is_json: bool) -> None:
+    """Reject browser-form writes that were not submitted by this server."""
+    if is_json:
+        return
+    expected_origin = f"{request.url.scheme}://{request.url.netloc}".lower()
+    supplied_origin = request.headers.get("origin", "").lower()
+    if not supplied_origin or supplied_origin != expected_origin:
+        raise HTTPException(status_code=403, detail="same-origin form submission required")
 
 
 def _bulk_filters(payload: dict[str, object]) -> TaskListFilters:
@@ -278,6 +296,7 @@ def create_app(
     @app.post("/api/tasks/tags/bulk")
     async def bulk_task_tags(request: Request):
         payload, is_json = await _request_payload(request)
+        _require_same_origin_form(request, is_json=is_json)
         confirmed = _payload_bool(payload, "confirmed")
         if confirmed:
             preview_token = str(payload.get("preview_token", ""))
@@ -434,6 +453,7 @@ def create_app(
     @app.post("/api/tasks/{task_id}/tags")
     async def task_tags_api(request: Request, task_id: str):
         payload, is_json = await _request_payload(request)
+        _require_same_origin_form(request, is_json=is_json)
         try:
             edit = parse_task_tag_edit(payload, is_json=is_json)
         except ValueError as exc:
