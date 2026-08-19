@@ -72,14 +72,14 @@
       </thead>
       <tbody>
         {% for row in rows %}
-          <tr data-task-id="{{ row.id }}">
-            <td><a href="/tasks/{{ row.id }}">{{ row.id }}</a></td>
+          <tr data-task-id="{{ row.id }}" data-project-id="{{ row.project_id }}">
+            <td><a href="{{ row.detail_url }}">{{ row.id }}</a></td>
             <td>{{ row.type }}</td>
             <td><span class="status status-{{ row.status }}">{{ row.status }}</span></td>
             <td>
               {% for tag in row.tags %}<span class="tag">{{ tag }}</span>{% else %}<span class="muted">—</span>{% endfor %}
             </td>
-            <td class="prompt"><a href="/tasks/{{ row.id }}">{{ row.prompt_excerpt }}</a></td>
+            <td class="prompt"><a href="{{ row.detail_url }}">{{ row.prompt_excerpt }}</a></td>
             <td><time class="created" datetime="{{ row.created_at.isoformat() if row.created_at else '' }}">{{ row.created_at.strftime('%Y-%m-%d') if row.created_at else '—' }}</time></td>
             <td><time class="updated" datetime="{{ row.updated_at.isoformat() if row.updated_at else '' }}">{{ row.age }}</time></td>
           </tr>

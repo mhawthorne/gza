@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Ambiguous task · gza{% endblock %}
+{% block content %}
+  <h1>Ambiguous task ID</h1>
+  <p><code>{{ task_id }}</code> exists in more than one project. Choose a project-qualified link from the task list.</p>
+  <ul>
+    {% for project_id in project_ids %}
+      <li><a href="/projects/{{ project_id }}/tasks/{{ task_id }}">{{ project_id }}</a></li>
+    {% endfor %}
+  </ul>
+  <p><a href="/tasks">← All tasks</a></p>
+{% endblock %}

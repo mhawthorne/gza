@@ -4379,6 +4379,16 @@ class SqliteTaskStore:
         """Return deterministic startup warnings collected during store open."""
         return tuple(self._startup_warnings)
 
+    @property
+    def project_id(self) -> str:
+        """Return the canonical project identity scoped by this store."""
+        return self._project_id
+
+    @property
+    def project_root(self) -> Path | None:
+        """Return the registered root for this project, when available."""
+        return self._project_root
+
     def supports_merge_units(self) -> bool:
         """Return whether merge-unit tables are available on this DB handle."""
         if self._open_mode == "query_only":
@@ -10288,12 +10298,23 @@ class SqliteTaskStore:
     def project_query_stores(self) -> tuple["SqliteTaskStore", ...]:
         """Return query-only stores for every project represented in this database."""
         with self._connect() as conn:
-            rows = conn.execute("SELECT DISTINCT project_id FROM tasks ORDER BY project_id ASC").fetchall()
+            rows = conn.execute(
+                """
+                SELECT task_projects.project_id, projects.root_path, projects.config_path,
+                       projects.project_name, projects.project_prefix
+                FROM (SELECT DISTINCT project_id FROM tasks) AS task_projects
+                LEFT JOIN projects ON projects.id = task_projects.project_id
+                ORDER BY task_projects.project_id ASC
+                """
+            ).fetchall()
         return tuple(
             SqliteTaskStore(
                 self.db_path,
-                prefix=self._prefix,
+                prefix=str(row["project_prefix"] or self._prefix),
                 project_id=str(row["project_id"]),
+                project_root=Path(str(row["root_path"])) if row["root_path"] else None,
+                config_path=Path(str(row["config_path"])) if row["config_path"] else None,
+                project_name=str(row["project_name"]) if row["project_name"] else None,
                 open_mode="query_only",
             )
             for row in rows

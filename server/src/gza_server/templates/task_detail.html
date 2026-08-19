@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}{{ task.id }} · gza{% endblock %}
+{% block content %}
+  <p><a href="/tasks">← All tasks</a></p>
+  <h1>{{ task.id }}</h1>
+
+  <dl class="metadata">
+    <div><dt>Project</dt><dd>{{ detail.project_id }}</dd></div>
+    <div><dt>Type</dt><dd>{{ task.task_type }}</dd></div>
+    <div><dt>Status</dt><dd><span class="status status-{{ task.status }}">{{ task.status }}</span></dd></div>
+    <div>
+      <dt>Tags</dt>
+      <dd>{% for tag in task.tags %}<span class="tag">{{ tag }}</span>{% else %}<span class="muted">—</span>{% endfor %}</dd>
+    </div>
+    <div><dt>Branch</dt><dd>{{ task.branch or "—" }}</dd></div>
+    <div><dt>Created</dt><dd><time datetime="{{ task.created_at.isoformat() if task.created_at else '' }}">{{ task.created_at.strftime('%Y-%m-%d %H:%M:%S UTC') if task.created_at else '—' }}</time></dd></div>
+    <div><dt>Updated</dt><dd><time datetime="{{ detail.updated_at.isoformat() if detail.updated_at else '' }}">{{ detail.updated_at.strftime('%Y-%m-%d %H:%M:%S UTC') if detail.updated_at else '—' }}</time></dd></div>
+    <div><dt>Started</dt><dd><time datetime="{{ task.started_at.isoformat() if task.started_at else '' }}">{{ task.started_at.strftime('%Y-%m-%d %H:%M:%S UTC') if task.started_at else '—' }}</time></dd></div>
+    <div><dt>Completed</dt><dd><time datetime="{{ task.completed_at.isoformat() if task.completed_at else '' }}">{{ task.completed_at.strftime('%Y-%m-%d %H:%M:%S UTC') if task.completed_at else '—' }}</time></dd></div>
+    <div><dt>Duration</dt><dd>{{ '%.1f seconds'|format(task.duration_seconds) if task.duration_seconds is not none else '—' }}</dd></div>
+  </dl>
+
+  <section>
+    <h2>Lineage</h2>
+    <h3>Parents</h3>
+    <ul class="lineage">
+      {% for parent in detail.parents %}
+        <li><a href="{{ parent.detail_url }}">{{ parent.id }}</a> <span class="muted">{{ parent.task_type }} · {{ parent.relationship }}</span></li>
+      {% else %}
+        <li class="muted">None</li>
+      {% endfor %}
+    </ul>
+    <h3>Children</h3>
+    <ul class="lineage">
+      {% for child in detail.children %}
+        <li><a href="{{ child.detail_url }}">{{ child.id }}</a> <span class="muted">{{ child.task_type }} · {{ child.relationship }}</span></li>
+      {% else %}
+        <li class="muted">None</li>
+      {% endfor %}
+    </ul>
+  </section>
+
+  <section>
+    <h2>Prompt</h2>
+    <div class="markdown">{{ detail.prompt_html }}</div>
+  </section>
+
+  {% if detail.plan_html is not none %}
+    <section>
+      <h2>Plan</h2>
+      <div class="markdown">{{ detail.plan_html }}</div>
+    </section>
+  {% endif %}
+{% endblock %}

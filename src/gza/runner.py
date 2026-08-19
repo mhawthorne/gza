@@ -3077,14 +3077,14 @@ def build_prompt(
     )
 
 
-def _get_task_output(task: Task, project_dir: Path) -> str | None:
+def get_task_output(task: Task, project_dir: Path | None) -> str | None:
     """Get task output content, preferring DB over filesystem.
 
     Auto-sync: If report_file exists and is newer than completed_at,
     read from disk instead of DB (allows users to edit plans).
     """
     # Check if file has been modified after task completion
-    if task.report_file and task.completed_at:
+    if project_dir is not None and task.report_file and task.completed_at:
         path = project_dir / task.report_file
         if path.exists():
             file_mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
@@ -3097,19 +3097,23 @@ def _get_task_output(task: Task, project_dir: Path) -> str | None:
         return task.output_content
 
     # Fall back to file (local mode, backward compat)
-    if task.report_file:
+    if project_dir is not None and task.report_file:
         path = project_dir / task.report_file
         if path.exists():
             return path.read_text()
 
     # Final fallback for code-task summaries when report_file/output_content are absent.
     # This supports older tasks where summary content exists only on disk.
-    if task.slug and task.task_type in {"task", "implement", "improve", "fix"}:
+    if project_dir is not None and task.slug and task.task_type in {"task", "implement", "improve", "fix"}:
         summary_path = project_dir / SUMMARY_DIR / f"{task.slug}.md"
         if summary_path.exists():
             return summary_path.read_text()
 
     return None
+
+
+# Backward-compatible private alias for existing internal callers.
+_get_task_output = get_task_output
 
 
 def _compact_output_summary(content: str, max_chars: int = REVIEW_IMPROVE_SUMMARY_MAX_CHARS) -> str:

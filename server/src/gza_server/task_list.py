@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Literal, cast
 from urllib.parse import urlencode
 
-from gza.db import SqliteTaskStore, Task, task_updated_at
+from gza.db import SqliteTaskStore, task_updated_at
 from gza.task_query import (
     SortSpec,
     TaskQueryPresets,
@@ -90,7 +90,7 @@ def query_task_list(
     )
     result = TaskQueryService(store).run(query, all_projects=True)
     rendered_at = now or datetime.now(UTC)
-    rows = [_task_row(cast(TaskRow, row).task, now=rendered_at) for row in result.rows]
+    rows = [_task_row(cast(TaskRow, row), now=rendered_at) for row in result.rows]
     return TaskListResult(
         rows=rows,
         known_tags=store.list_tags(all_projects=True),
@@ -98,10 +98,16 @@ def query_task_list(
     )
 
 
-def _task_row(task: Task, *, now: datetime) -> dict[str, object]:
+def _task_row(row: TaskRow, *, now: datetime) -> dict[str, object]:
+    task = row.task
     updated_at = task_updated_at(task)
+    assert task.id is not None
+    detail_url = f"/projects/{row.project_id}/tasks/{task.id}"
     return {
         "id": task.id,
+        "project_id": row.project_id,
+        "detail_url": detail_url,
+        "api_url": f"/api{detail_url}",
         "type": task.task_type,
         "status": task.status,
         "tags": list(task.tags),

@@ -74,12 +74,12 @@ def _client(store: SqliteTaskStore) -> TestClient:
 
 
 def _html_task_ids(html: str) -> list[str]:
-    return re.findall(r'<tr data-task-id="([^"]+)">', html)
+    return re.findall(r'<tr data-task-id="([^"]+)"(?:\s[^>]*)?>', html)
 
 
 def _html_updated_at(html: str, task_id: str) -> str:
     match = re.search(
-        rf'<tr data-task-id="{re.escape(task_id)}">.*?<time class="updated" datetime="([^"]*)">',
+        rf'<tr data-task-id="{re.escape(task_id)}"(?:\s[^>]*)?>.*?<time class="updated" datetime="([^"]*)">',
         html,
         flags=re.DOTALL,
     )
@@ -164,6 +164,9 @@ def test_task_rows_include_requested_fields_and_detail_links(
     assert stored.updated_at is not None
     assert api_row == {
         "id": tasks["alpha"].id,
+        "project_id": "server-test",
+        "detail_url": f"/projects/server-test/tasks/{tasks['alpha'].id}",
+        "api_url": f"/api/projects/server-test/tasks/{tasks['alpha'].id}",
         "type": "implement",
         "status": "completed",
         "tags": ["backend", "release"],
@@ -173,7 +176,7 @@ def test_task_rows_include_requested_fields_and_detail_links(
         "updated_at": stored.updated_at.isoformat().replace("+00:00", "Z"),
         "age": api_row["age"],
     }
-    assert f'href="/tasks/{tasks["alpha"].id}"' in html
+    assert f'href="/projects/server-test/tasks/{tasks["alpha"].id}"' in html
     assert 'class="status status-completed"' in html
     assert '<span class="tag">backend</span>' in html
 

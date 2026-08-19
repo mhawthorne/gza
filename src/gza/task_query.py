@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, time, timedelta
+from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from . import lineage, metrics
@@ -120,6 +121,8 @@ class TaskRow:
 
     task: DbTask
     values: Mapping[str, object]
+    project_id: str
+    project_root: Path | None
 
 
 @dataclass(frozen=True)
@@ -1020,6 +1023,8 @@ class TaskQueryService:
         return TaskRow(
             task=task,
             values=self._apply_projection(values, query.projection, scope="tasks"),
+            project_id=self._store.project_id,
+            project_root=self._store.project_root,
         )
 
     def _project_lineage_row(
