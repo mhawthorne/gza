@@ -27,6 +27,133 @@ def _client(store: SqliteTaskStore) -> TestClient:
     )
 
 
+def _shared_project_stores(
+    tmp_path: Path,
+) -> tuple[SqliteTaskStore, SqliteTaskStore]:
+    db_path = tmp_path / "shared.db"
+    stores: list[SqliteTaskStore] = []
+    for project_id in ("alpha", "beta"):
+        project_root = tmp_path / project_id
+        project_root.mkdir()
+        (project_root / "gza.yaml").write_text(
+            f"project_name: {project_id.title()}\n"
+            f"project_id: {project_id}\n"
+            "project_prefix: same\n"
+            f"db_path: {db_path}\n",
+            encoding="utf-8",
+        )
+        stores.append(
+            SqliteTaskStore(
+                db_path,
+                prefix="same",
+                project_id=project_id,
+                project_root=project_root,
+                project_name=project_id.title(),
+            )
+        )
+    return stores[0], stores[1]
+
+
+def _production_mutation_client(store: SqliteTaskStore) -> TestClient:
+    return TestClient(
+        create_app(store_factory=lambda: store),
+        headers={"origin": "http://testserver"},
+    )
+
+
+def test_shared_database_prompt_edit_selects_qualified_project_store(
+    tmp_path: Path,
+) -> None:
+    alpha_store, beta_store = _shared_project_stores(tmp_path)
+    alpha = alpha_store.add("Alpha original prompt", task_type="implement")
+    beta = beta_store.add("Beta original prompt", task_type="implement")
+    assert alpha.id is not None and alpha.id == beta.id
+
+    response = _production_mutation_client(alpha_store).post(
+        f"/api/tasks/{alpha.id}/prompt",
+        json={"project_id": "alpha", "prompt": "Alpha updated prompt"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["project_id"] == "alpha"
+    assert alpha_store.get(alpha.id).prompt == "Alpha updated prompt"  # type: ignore[union-attr]
+    assert beta_store.get(beta.id).prompt == "Beta original prompt"  # type: ignore[union-attr]
+
+
+def test_shared_database_plan_edit_uses_qualified_owner_root_and_row(
+    tmp_path: Path,
+) -> None:
+    alpha_store, beta_store = _shared_project_stores(tmp_path)
+    alpha = alpha_store.add("Alpha plan", task_type="plan")
+    beta = beta_store.add("Beta plan", task_type="plan")
+    assert alpha.id is not None and alpha.id == beta.id
+    relative_report = Path("plans") / "shared.md"
+    original_by_project = {
+        "alpha": "## Alpha original plan\n",
+        "beta": "## Beta original plan\n",
+    }
+    for store, task in ((alpha_store, alpha), (beta_store, beta)):
+        original = original_by_project[store.project_id]
+        report_path = store.project_root / relative_report  # type: ignore[operator]
+        report_path.parent.mkdir(parents=True)
+        report_path.write_text(original, encoding="utf-8")
+        task.report_file = relative_report.as_posix()
+        task.output_content = original
+        store.update(task)
+
+    updated = "## Alpha revised plan\n\n1. Ship safely\n"
+    response = _production_mutation_client(alpha_store).post(
+        f"/api/tasks/{alpha.id}/plan",
+        json={"project_id": "alpha", "plan": updated},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["project_id"] == "alpha"
+    assert alpha_store.get(alpha.id).output_content == updated  # type: ignore[union-attr]
+    assert beta_store.get(beta.id).output_content == original_by_project["beta"]  # type: ignore[union-attr]
+    assert (alpha_store.project_root / relative_report).read_text() == updated  # type: ignore[operator]
+    assert (beta_store.project_root / relative_report).read_text() == original_by_project["beta"]  # type: ignore[operator]
+
+
+def test_shared_database_prompt_edit_rejects_ambiguous_unknown_and_mismatched_project(
+    tmp_path: Path,
+) -> None:
+    alpha_store, beta_store = _shared_project_stores(tmp_path)
+    alpha = alpha_store.add("Alpha original prompt", task_type="implement")
+    beta = beta_store.add("Beta original prompt", task_type="implement")
+    assert alpha.id is not None and alpha.id == beta.id
+    client = _production_mutation_client(alpha_store)
+
+    ambiguous = client.post(
+        f"/api/tasks/{alpha.id}/prompt",
+        json={"prompt": "Ambiguous update"},
+    )
+    unknown = client.post(
+        f"/api/tasks/{alpha.id}/prompt",
+        json={"project_id": "unknown", "prompt": "Unknown update"},
+    )
+
+    assert alpha_store.project_root is not None
+    (alpha_store.project_root / "gza.yaml").write_text(
+        "project_name: Mismatched\n"
+        "project_id: mismatched\n"
+        "project_prefix: same\n"
+        f"db_path: {alpha_store.db_path}\n",
+        encoding="utf-8",
+    )
+    mismatched = client.post(
+        f"/api/tasks/{alpha.id}/prompt",
+        json={"project_id": "alpha", "prompt": "Mismatched update"},
+    )
+
+    assert ambiguous.status_code == 409
+    assert "ambiguous across projects: alpha, beta" in ambiguous.json()["detail"]
+    assert unknown.status_code == 404
+    assert mismatched.status_code == 422
+    assert alpha_store.get(alpha.id).prompt == "Alpha original prompt"  # type: ignore[union-attr]
+    assert beta_store.get(beta.id).prompt == "Beta original prompt"  # type: ignore[union-attr]
+
+
 def test_pending_prompt_form_edit_persists_redirects_and_rerenders(tmp_path: Path) -> None:
     store = SqliteTaskStore(
         tmp_path / "tasks.db",
