@@ -14,6 +14,7 @@ from urllib.parse import parse_qs
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, ValidationError
 
 from gza.config import Config, ConfigError
 from gza.db import SqliteTaskStore
@@ -67,6 +68,28 @@ class _BulkPreviewState:
     mutation: TagMutation
     targets: tuple[tuple[str, str], ...]
     project_ids: tuple[str, ...]
+
+
+class _JsonBulkRequest(BaseModel):
+    """Strict durable-API schema for bulk tag requests."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    q: StrictStr = ""
+    tag: list[StrictStr] = Field(default_factory=list)
+    status: list[StrictStr] = Field(default_factory=list)
+    task_type: list[StrictStr] = Field(default_factory=list, alias="type")
+    untagged: StrictBool = False
+    confirmed: StrictBool = False
+    target: list[StrictStr] = Field(default_factory=list)
+    preview_token: StrictStr = ""
+    mutation: StrictStr | None = None
+    mutation_tag: StrictStr | None = None
+    old_tag: StrictStr | None = None
+    new_tag: StrictStr | None = None
+    add: StrictStr | None = None
+    remove: StrictStr | None = None
+    replace: list[StrictStr] | None = None
 
 
 def _task_list_filters(
@@ -141,6 +164,27 @@ async def _request_payload(request: Request) -> tuple[dict[str, object], bool]:
         for key, values in parsed.items()
     }
     return payload, False
+
+
+def _validate_bulk_payload(
+    payload: dict[str, object],
+    *,
+    is_json: bool,
+) -> dict[str, object]:
+    """Validate JSON strictly while preserving rendered-form coercion."""
+    if not is_json:
+        return payload
+    try:
+        validated = _JsonBulkRequest.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_context=False, include_url=False),
+        ) from exc
+    return cast(
+        dict[str, object],
+        validated.model_dump(by_alias=True, exclude_unset=True),
+    )
 
 
 def _require_same_origin_form(request: Request, *, is_json: bool) -> None:
@@ -303,6 +347,7 @@ def create_app(
     async def bulk_task_tags(request: Request):
         payload, is_json = await _request_payload(request)
         _require_same_origin_form(request, is_json=is_json)
+        payload = _validate_bulk_payload(payload, is_json=is_json)
         confirmed = _payload_bool(payload, "confirmed")
         if confirmed:
             preview_token = str(payload.get("preview_token", ""))

@@ -494,6 +494,111 @@ def test_bulk_retag_refuses_no_selection_without_mutating(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("q", None),
+        ("q", {"unexpected": True}),
+        ("tag", "release"),
+        ("tag", [["nested"]]),
+        ("status", 7),
+        ("status", [None]),
+        ("type", {"unexpected": True}),
+        ("type", [["nested"]]),
+    ],
+    ids=[
+        "q-null",
+        "q-object",
+        "tag-scalar",
+        "tag-nested",
+        "status-scalar",
+        "status-null-member",
+        "type-object",
+        "type-nested",
+    ],
+)
+def test_bulk_json_preview_rejects_invalid_filter_schema_without_side_effects(
+    tmp_path: Path,
+    field: str,
+    invalid_value: object,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Selected task", tags=("old",))
+    assert task.id is not None
+    query_resolutions: list[None] = []
+    mutation_resolutions: list[str] = []
+
+    def store_factory() -> SqliteTaskStore:
+        query_resolutions.append(None)
+        return store
+
+    def mutation_store_factory(project_id: str) -> SqliteTaskStore:
+        mutation_resolutions.append(project_id)
+        return store
+
+    response = TestClient(
+        create_app(
+            store_factory=store_factory,
+            mutation_store_factory=mutation_store_factory,
+        )
+    ).post(
+        "/api/tasks/tags/bulk",
+        json={
+            "status": ["pending"],
+            "mutation": "add",
+            "mutation_tag": "new",
+            field: invalid_value,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "preview_token" not in response.json()
+    assert query_resolutions == []
+    assert mutation_resolutions == []
+    assert _query_tags(store, task.id, project_id="server-test") == ("old",)
+
+
+@pytest.mark.parametrize("field", ["untagged", "confirmed"])
+@pytest.mark.parametrize(
+    "invalid_value",
+    [None, "true", 1, [True]],
+    ids=["null", "string", "integer", "array"],
+)
+def test_bulk_json_rejects_non_boolean_flags_without_side_effects(
+    tmp_path: Path,
+    field: str,
+    invalid_value: object,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Selected task", tags=("old",))
+    assert task.id is not None
+    query_resolutions: list[None] = []
+    mutation_resolutions: list[str] = []
+
+    response = TestClient(
+        create_app(
+            store_factory=lambda: query_resolutions.append(None) or store,
+            mutation_store_factory=lambda project_id: (
+                mutation_resolutions.append(project_id) or store
+            ),
+        )
+    ).post(
+        "/api/tasks/tags/bulk",
+        json={
+            "status": ["pending"],
+            "mutation": "add",
+            "mutation_tag": "new",
+            field: invalid_value,
+        },
+    )
+
+    assert response.status_code == 422
+    assert "preview_token" not in response.json()
+    assert query_resolutions == []
+    assert mutation_resolutions == []
+    assert _query_tags(store, task.id, project_id="server-test") == ("old",)
+
+
+@pytest.mark.parametrize(
     "mutation_payload",
     [
         {kind: value}
