@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Bulk retag {% if failed_count %}partially complete{% else %}complete{% endif %} · gza{% endblock %}
+{% block content %}
+  <h1>Bulk retag {% if failed_count %}partially complete{% else %}complete{% endif %}</h1>
+  <p class="notice">Updated {{ changed_count }} task{% if changed_count != 1 %}s{% endif %}.</p>
+  {% if skipped_count %}
+    <p>Skipped {{ skipped_count }} task{% if skipped_count != 1 %}s{% endif %} deleted after preview:</p>
+    <ul>
+      {% for task in skipped_tasks %}
+        <li><code>{{ task.id }}</code> <span class="muted">{{ task.project_id }}</span></li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+  {% if failed_count %}
+    <p class="notice">Failed to update {{ failed_count }} task{% if failed_count != 1 %}s{% endif %}:</p>
+    <ul>
+      {% for task in failed_tasks %}
+        <li><code>{{ task.id }}</code> <span class="muted">{{ task.project_id }}</span></li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+  <p><strong>Mutation:</strong> {{ mutation }}</p>
+  <p>{{ matched_tasks|length }} task{% if matched_tasks|length != 1 %}s{% endif %} matched the filters.</p>
+  <p><a href="/tasks">Return to tasks</a></p>
+{% endblock %}

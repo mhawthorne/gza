@@ -5860,6 +5860,92 @@ class SqliteTaskStore:
             if task.id is not None:
                 task.updated_at = self._replace_task_tags_conn(conn, task.id, normalized_tags)
 
+    def update_pending_prompt(
+        self,
+        task_id: str,
+        prompt: str,
+        *,
+        edited_at: datetime,
+    ) -> Task | None:
+        """Atomically update only the prompt fields of a pending task.
+
+        ``None`` means the task is missing or no longer pending.  The status
+        predicate and field-scoped update share one immediate transaction so a
+        worker claim cannot be overwritten by a stale editor snapshot.
+        """
+        with self._write_transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                return None
+
+            current = self._rows_to_tasks(conn, [row])[0]
+            if current.prompt == prompt:
+                return current
+
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                SET prompt = ?, last_edited_at = ?
+                WHERE project_id = ? AND id = ? AND status = 'pending'
+                """,
+                (
+                    prompt,
+                    _format_db_timestamp(edited_at),
+                    self._project_id,
+                    task_id,
+                ),
+            )
+            if cur.rowcount == 0:
+                return None
+            self._touch_task_updated_at(conn, task_id, now=edited_at)
+            updated_row = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
+            ).fetchone()
+            assert updated_row is not None
+            return self._rows_to_tasks(conn, [updated_row])[0]
+
+    def update_plan_content(
+        self,
+        task_id: str,
+        content: str,
+        report_file: str,
+        *,
+        edited_at: datetime,
+    ) -> Task | None:
+        """Atomically update only persisted plan-content metadata.
+
+        ``None`` means the task is missing or no longer a plan task.  Lifecycle
+        and all other task fields retain their current database values.
+        """
+        with self._write_transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                SET output_content = ?, report_file = ?, last_edited_at = ?
+                WHERE project_id = ? AND id = ? AND task_type = 'plan'
+                """,
+                (
+                    content,
+                    report_file,
+                    _format_db_timestamp(edited_at),
+                    self._project_id,
+                    task_id,
+                ),
+            )
+            if cur.rowcount == 0:
+                return None
+            self._touch_task_updated_at(conn, task_id, now=edited_at)
+            updated_row = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
+            ).fetchone()
+            assert updated_row is not None
+            return self._rows_to_tasks(conn, [updated_row])[0]
+
     def delete(self, task_id: str) -> bool:
         """Delete a task by ID. Returns True if deleted."""
         with self._connect() as conn:
@@ -10805,6 +10891,47 @@ class SqliteTaskStore:
 
         return changed_by_id
 
+    def mutate_task_tag_delta(
+        self,
+        task_ids: Iterable[str],
+        *,
+        add: Iterable[str] = (),
+        remove: Iterable[str] = (),
+    ) -> dict[str, bool]:
+        """Apply additions and removals to current task tags in one transaction.
+
+        Additions win when the same normalized tag appears in both inputs. Missing
+        task IDs are omitted from the result so callers can distinguish them from
+        existing tasks whose tags were unchanged.
+        """
+        ordered_ids = tuple(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        if not ordered_ids:
+            return {}
+
+        additions = set(_normalize_tags(add))
+        removals = set(_normalize_tags(remove))
+        changed_by_id: dict[str, bool] = {}
+
+        with self._write_transaction() as conn:
+            existing_ids = self._fetch_existing_task_ids(conn, ordered_ids)
+            current_by_id = self._fetch_tags_for_task_ids(conn, ordered_ids)
+            for task_id in ordered_ids:
+                if task_id not in existing_ids:
+                    continue
+                current = current_by_id.get(task_id, ())
+                final_tags = tuple(sorted((set(current) - removals) | additions))
+                changed = final_tags != current
+                changed_by_id[task_id] = changed
+                if not changed:
+                    continue
+                self._replace_task_tags_conn(conn, task_id, final_tags)
+                conn.execute(
+                    'UPDATE tasks SET "group" = ? WHERE project_id = ? AND id = ?',
+                    (final_tags[0] if len(final_tags) == 1 else None, self._project_id, task_id),
+                )
+
+        return changed_by_id
+
     def get_tag_counts(self, *, all_projects: bool = False) -> dict[str, int]:
         """Return counts for every known tag."""
         if not self._query_only_supports_tags():
@@ -11398,6 +11525,63 @@ def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
 
 # === Editor support ===
 
+
+class TaskPromptEditConflict(ValueError):
+    """A task prompt could not be edited because its current state forbids it."""
+
+
+class TaskPromptValidationError(ValueError):
+    """A task prompt failed the canonical prompt validation rules."""
+
+    def __init__(self, errors: list[str]) -> None:
+        self.errors = tuple(errors)
+        super().__init__("; ".join(errors))
+
+
+def normalize_task_prompt(prompt: str) -> str:
+    """Normalize and validate prompt Markdown for every prompt-edit entry point."""
+    normalized = prompt.strip()
+    errors = validate_prompt(normalized)
+    if errors:
+        raise TaskPromptValidationError(errors)
+    return normalized
+
+
+def edit_task_prompt(
+    store: SqliteTaskStore,
+    task_id: str,
+    prompt: str,
+    *,
+    edited_at: datetime | None = None,
+) -> Task:
+    """Atomically edit only the prompt fields of a pending task."""
+    current = store.get(task_id)
+    if current is None:
+        raise TaskPromptEditConflict(f"Task {task_id} no longer exists")
+    if current.status != "pending":
+        raise TaskPromptEditConflict(
+            f"Task {task_id} is {current.status}; "
+            "prompt edits are only allowed for pending tasks."
+        )
+
+    normalized = normalize_task_prompt(prompt)
+    updated = store.update_pending_prompt(
+        task_id,
+        normalized,
+        edited_at=edited_at or datetime.now(UTC),
+    )
+    if updated is not None:
+        return updated
+
+    current = store.get(task_id)
+    if current is None:
+        raise TaskPromptEditConflict(f"Task {task_id} no longer exists")
+    raise TaskPromptEditConflict(
+        f"Task {task_id} is {current.status}; "
+        "prompt edits are only allowed for pending tasks."
+    )
+
+
 TASK_TEMPLATE_HEADER = """# Enter your task prompt below.
 # Lines starting with # are comments and will be ignored.
 # Save and close the editor when done.
@@ -11576,6 +11760,7 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
 
     Returns True if edited successfully, False if cancelled.
     """
+    assert task.id is not None
     while True:
         prompt = edit_prompt(
             initial_content=task.prompt,
@@ -11596,14 +11781,14 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
             print("Edit cancelled")
             return False
 
-        errors = validate_prompt(prompt)
-
-        if not errors:
-            if task.prompt != prompt:
-                task.prompt = prompt
-                task.last_edited_at = datetime.now(UTC)
-            store.update(task)
+        try:
+            edit_task_prompt(store, task.id, prompt)
             return True
+        except TaskPromptValidationError as exc:
+            errors = exc.errors
+        except TaskPromptEditConflict as exc:
+            print(f"Error: {exc}")
+            return False
 
         print("Validation errors:")
         for error in errors:

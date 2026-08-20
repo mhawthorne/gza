@@ -56,6 +56,35 @@
     </div>
   </form>
 
+  <section class="tag-editor">
+    <h2>Bulk retag filtered tasks</h2>
+    <p class="muted">A filter is required. You will review the matching task IDs before anything changes.</p>
+    <form method="post" action="/api/tasks/tags/bulk">
+      {% for key, value in filters.query_pairs() %}
+        <input type="hidden" name="{{ key }}" value="{{ value }}">
+      {% endfor %}
+      <fieldset>
+        <legend>Choose exactly one mutation</legend>
+        <label><input type="radio" name="mutation" value="add" required> Add tag</label>
+        <label><input type="radio" name="mutation" value="remove"> Remove tag</label>
+        <label>
+          Tag to add or remove
+          <input type="text" name="mutation_tag">
+        </label>
+        <label><input type="radio" name="mutation" value="replace"> Replace tag</label>
+        <label>
+          Old tag
+          <input type="text" name="old_tag">
+        </label>
+        <label>
+          New tag
+          <input type="text" name="new_tag">
+        </label>
+      </fieldset>
+      <p><button type="submit">Review bulk change</button></p>
+    </form>
+  </section>
+
   <p>{{ rows|length }} task{% if rows|length != 1 %}s{% endif %}</p>
   <div class="table-wrap">
     <table>

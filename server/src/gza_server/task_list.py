@@ -35,6 +35,17 @@ class TaskListFilters:
     sort: SortField = "updated"
     direction: SortDirection = "desc"
 
+    @property
+    def has_selection(self) -> bool:
+        """Whether bulk operations are constrained by at least one real filter."""
+        return bool(
+            self.prompt.strip()
+            or self.tags
+            or self.statuses
+            or self.task_types
+            or self.untagged
+        )
+
     def query_pairs(self, **overrides: str) -> list[tuple[str, str]]:
         """Return form-compatible query pairs, preserving repeated filters."""
         pairs: list[tuple[str, str]] = []

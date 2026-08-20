@@ -205,11 +205,13 @@ class _StubMergeGit:
         merged_side_branches: set[str] | None = None,
         empty_merged_branches: set[str] | None = None,
         default_branch: str = "main",
+        prove_empty_diff: bool = False,
     ) -> None:
         self.merged_side_branches = merged_side_branches or set()
         self.empty_merged_branches = empty_merged_branches or set()
         self.merged_branches = self.merged_side_branches | self.empty_merged_branches
         self.default_branch = default_branch
+        self.prove_empty_diff = prove_empty_diff
 
     def resolve_fresh_merge_source(self, branch: str):
         from gza.git import ResolvedMergeSourceRef
@@ -237,6 +239,13 @@ class _StubMergeGit:
         if branch in self.merged_branches:
             return 0
         return 1
+
+    def has_non_empty_source_diff_against_target(self, source_ref: str, target: str) -> bool | None:
+        if target != self.default_branch:
+            return None
+        if source_ref in self.empty_merged_branches:
+            return False if self.prove_empty_diff else None
+        return True
 
     def is_on_first_parent_history(self, commit: str, target: str) -> bool:
         return target == self.default_branch and commit in self.empty_merged_branches
@@ -295,11 +304,13 @@ def _stub_merge_context(
     merged_side_branches: set[str] | None = None,
     empty_merged_branches: set[str] | None = None,
     default_branch: str = "main",
+    prove_empty_diff: bool = False,
 ) -> None:
     git = _StubMergeGit(
         merged_side_branches=merged_side_branches,
         empty_merged_branches=empty_merged_branches,
         default_branch=default_branch,
+        prove_empty_diff=prove_empty_diff,
     )
     monkeypatch.setattr(
         recovery_engine,
@@ -372,6 +383,72 @@ def test_recovery_engine_suppresses_failed_sidequests_when_target_impl_is_merged
     assert decision.reason_code == "resolved_by_merged_target"
     assert decision.reason_text == "target implementation already merged"
     assert get_failed_recovery_needs_attention_reason(store, failed, decision=decision, max_recovery_attempts=1) is None
+    assert list_failed_tasks_for_recovery(store) == []
+
+
+@pytest.mark.parametrize("task_type", ["improve", "rebase"])
+def test_list_failed_tasks_for_recovery_keeps_same_branch_sidequest_with_live_unmerged_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task_type: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
+
+    impl = _completed_impl(store, merge_status="merged")
+    assert impl.id is not None
+    impl.branch = "feature/live-sidequest-work"
+    store.update(impl)
+    owner_unit = store.create_merge_unit(
+        source_branch=impl.branch,
+        target_branch="main",
+        owner_task_id=impl.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(impl.id, owner_unit.id, "owner")
+
+    failed = _failed_sidequest(store, task_type=task_type, impl_id=impl.id, reason="WORKER_DIED")
+    failed.same_branch = True
+    failed.branch = impl.branch
+    failed.has_commits = True
+    store.update(failed)
+    store.attach_task_to_merge_unit(failed.id, owner_unit.id, task_type)
+
+    assert is_resolved_by_merged_target(store, failed) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+
+
+@pytest.mark.parametrize("task_type", ["improve", "rebase"])
+def test_list_failed_tasks_for_recovery_suppresses_same_branch_sidequest_when_git_proves_empty(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task_type: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    branch = "feature/empty-sidequest-work"
+    _stub_merge_context(monkeypatch, empty_merged_branches={branch}, prove_empty_diff=True)
+
+    impl = _completed_impl(store, merge_status="merged")
+    assert impl.id is not None
+    impl.branch = branch
+    store.update(impl)
+    owner_unit = store.create_merge_unit(
+        source_branch=branch,
+        target_branch="main",
+        owner_task_id=impl.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(impl.id, owner_unit.id, "owner")
+
+    failed = _failed_sidequest(store, task_type=task_type, impl_id=impl.id, reason="WORKER_DIED")
+    failed.same_branch = True
+    failed.branch = branch
+    failed.has_commits = True
+    store.update(failed)
+    store.attach_task_to_merge_unit(failed.id, owner_unit.id, task_type)
+
     assert list_failed_tasks_for_recovery(store) == []
 
 
@@ -1144,6 +1221,50 @@ def test_list_failed_tasks_for_recovery_filters_fast_forward_landed_descendant_v
         merge_context=recovery_engine._load_merge_context(tmp_path),
     ) is True
     assert list_failed_tasks_for_recovery(store) == []
+
+
+@pytest.mark.parametrize(("has_commits", "expected_visible"), ((None, True), (False, False)))
+def test_list_failed_tasks_for_recovery_keeps_unknown_distinct_contributor_under_merged_owner_unit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    has_commits: bool | None,
+    expected_visible: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
+
+    owner = store.add("Merged owner with distinct failed contributor", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/recovery-merged-owner"
+    owner.has_commits = True
+    owner.completed_at = datetime.now(UTC)
+    store.update(owner)
+    unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, unit.id, "owner")
+
+    failed_contributor = store.add("Distinct failed improve", task_type="improve", based_on=owner.id)
+    assert failed_contributor.id is not None
+    failed_contributor.status = "failed"
+    failed_contributor.failure_reason = "WORKER_DIED"
+    failed_contributor.branch = "feature/recovery-distinct-contributor"
+    failed_contributor.has_commits = has_commits
+    failed_contributor.completed_at = datetime.now(UTC)
+    store.update(failed_contributor)
+    store.attach_task_to_merge_unit(failed_contributor.id, unit.id, "contributor")
+
+    failed = list_failed_tasks_for_recovery(store)
+
+    if expected_visible:
+        assert [task.id for task in failed] == [failed_contributor.id]
+    else:
+        assert failed == []
 
 
 def test_list_failed_tasks_for_recovery_keeps_failed_descendant_under_merged_manual_follow_up_root(
