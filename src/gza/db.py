@@ -743,6 +743,15 @@ class Task:
         return self.depends_on is not None
 
 
+@dataclass(frozen=True)
+class PendingTaskEditResult:
+    """Transaction-observed state around an atomic pending-task edit."""
+
+    before: Task
+    after: Task
+    changed_fields: frozenset[str]
+
+
 def task_updated_at(task: Task) -> datetime | None:
     """Return the authoritative last-update time for a task.
 
@@ -5907,6 +5916,143 @@ class SqliteTaskStore:
             ).fetchone()
             assert updated_row is not None
             return self._rows_to_tasks(conn, [updated_row])[0]
+
+    def update_pending_task_edit(
+        self,
+        task_id: str,
+        prompt: str,
+        *,
+        field_updates: Mapping[str, object] | None = None,
+        tag_action: Literal["clear", "set", "add", "remove"] | None = None,
+        tag_values: Iterable[str] = (),
+        edited_at: datetime,
+    ) -> PendingTaskEditResult | None:
+        """Atomically apply a prompt edit and its requested companion mutations.
+
+        The pending-state guard and every requested write share one immediate
+        transaction. Only explicitly requested editable columns whose current
+        values differ are updated, so a stale CLI snapshot cannot overwrite
+        lifecycle fields after a worker claim. The result contains the row as
+        observed inside the transaction so callers can report real changes and
+        no-ops. ``None`` means the task is missing or no longer pending.
+        """
+        updates = dict(field_updates or {})
+        allowed_fields = {
+            "auto_implement",
+            "based_on",
+            "create_pr",
+            "create_review",
+            "depends_on",
+            "model",
+            "model_is_explicit",
+            "provider",
+            "provider_is_explicit",
+            "recovery_origin",
+            "skip_learnings",
+            "task_type",
+        }
+        invalid_fields = set(updates) - allowed_fields
+        if invalid_fields:
+            invalid = ", ".join(sorted(invalid_fields))
+            raise ValueError(f"unsupported pending task edit fields: {invalid}")
+
+        normalized_tag_values = _normalize_tags(tag_values)
+        boolean_fields = {
+            "auto_implement",
+            "create_pr",
+            "create_review",
+            "model_is_explicit",
+            "provider_is_explicit",
+            "skip_learnings",
+        }
+
+        with self._write_transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                return None
+
+            before = self._rows_to_tasks(conn, [row])[0]
+            assignments: list[str] = []
+            values: list[object] = []
+            changed_fields: set[str] = set()
+            meaningful_edit = False
+            if row["prompt"] != prompt:
+                assignments.append("prompt = ?")
+                values.append(prompt)
+                changed_fields.add("prompt")
+                meaningful_edit = True
+
+            for field, value in updates.items():
+                persisted_value = (1 if value else 0) if field in boolean_fields else value
+                if row[field] == persisted_value:
+                    continue
+                assignments.append(f"{field} = ?")
+                values.append(persisted_value)
+                changed_fields.add(field)
+                meaningful_edit = meaningful_edit or field == "task_type"
+
+            if meaningful_edit:
+                assignments.append("last_edited_at = ?")
+                values.append(_format_db_timestamp(edited_at))
+
+            if assignments:
+                cur = conn.execute(
+                    f"""
+                    UPDATE tasks
+                    SET {', '.join(assignments)}
+                    WHERE project_id = ? AND id = ? AND status = 'pending'
+                    """,
+                    (*values, self._project_id, task_id),
+                )
+                if cur.rowcount == 0:
+                    return None
+
+            if tag_action is not None:
+                current_tags = self._fetch_tags_for_task_ids(conn, (task_id,)).get(task_id, ())
+                if tag_action == "clear":
+                    final_tags: tuple[str, ...] = ()
+                elif tag_action == "set":
+                    final_tags = normalized_tag_values
+                elif tag_action == "add":
+                    final_tags = _normalize_tags((*current_tags, *normalized_tag_values))
+                else:
+                    removed_tags = set(normalized_tag_values)
+                    final_tags = tuple(tag for tag in current_tags if tag not in removed_tags)
+
+                if final_tags != current_tags:
+                    changed_fields.add("tags")
+                    self._replace_task_tags_conn(
+                        conn,
+                        task_id,
+                        final_tags,
+                        touch_updated_at=False,
+                    )
+                    conn.execute(
+                        'UPDATE tasks SET "group" = ? WHERE project_id = ? AND id = ?',
+                        (
+                            final_tags[0] if len(final_tags) == 1 else None,
+                            self._project_id,
+                            task_id,
+                        ),
+                    )
+
+            if changed_fields:
+                self._touch_task_updated_at(conn, task_id, now=edited_at)
+
+            updated_row = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
+            ).fetchone()
+            assert updated_row is not None
+            after = self._rows_to_tasks(conn, [updated_row])[0]
+            return PendingTaskEditResult(
+                before=before,
+                after=after,
+                changed_fields=frozenset(changed_fields),
+            )
 
     def update_plan_content(
         self,
@@ -11527,6 +11673,47 @@ def edit_task_prompt(
     updated = store.update_pending_prompt(
         task_id,
         normalized,
+        edited_at=edited_at or datetime.now(UTC),
+    )
+    if updated is not None:
+        return updated
+
+    current = store.get(task_id)
+    if current is None:
+        raise TaskPromptEditConflict(f"Task {task_id} no longer exists")
+    raise TaskPromptEditConflict(
+        f"Task {task_id} is {current.status}; "
+        "prompt edits are only allowed for pending tasks."
+    )
+
+
+def edit_task_prompt_with_mutations(
+    store: SqliteTaskStore,
+    task_id: str,
+    prompt: str,
+    *,
+    field_updates: Mapping[str, object] | None = None,
+    tag_action: Literal["clear", "set", "add", "remove"] | None = None,
+    tag_values: Iterable[str] = (),
+    edited_at: datetime | None = None,
+) -> PendingTaskEditResult:
+    """Atomically edit a pending prompt and all companion field/tag mutations."""
+    current = store.get(task_id)
+    if current is None:
+        raise TaskPromptEditConflict(f"Task {task_id} no longer exists")
+    if current.status != "pending":
+        raise TaskPromptEditConflict(
+            f"Task {task_id} is {current.status}; "
+            "prompt edits are only allowed for pending tasks."
+        )
+
+    normalized = normalize_task_prompt(prompt)
+    updated = store.update_pending_task_edit(
+        task_id,
+        normalized,
+        field_updates=field_updates,
+        tag_action=tag_action,
+        tag_values=tag_values,
         edited_at=edited_at or datetime.now(UTC),
     )
     if updated is not None:
