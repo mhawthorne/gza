@@ -70,7 +70,7 @@ from gza.review_verify_state import (
     persist_verify_gate_artifact,
     refresh_preserved_rebase_review_verify_heads,
 )
-from gza.runner import CROSS_PROJECT_TAG, ReviewVerifyResult
+from gza.runner import CROSS_PROJECT_TAG, ProjectBoundary, ReviewVerifyResult
 
 
 class _FakeGit:
@@ -7313,6 +7313,59 @@ def test_cross_project_tag_allows_out_of_scope_change_to_advance(tmp_path: Path)
 
     assert action["type"] == "verify_gate"
     assert action["verify_gate_phase"] == "pre_review"
+
+
+def test_server_task_root_changes_require_explicit_cross_project_authorization(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    server_dir = tmp_path / "server"
+    server_dir.mkdir()
+    (server_dir / "gza.yaml").write_text("project_name: gza-server\nverify_command: ./bin/tests\n")
+    config.project_dir = server_dir
+    config.enforce_project_scope = True
+    setattr(
+        config,
+        "_project_boundary_cache",
+        ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("server"),
+            local_dependencies=(),
+        ),
+    )
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feat/server-root-changes",
+        when=datetime(2026, 5, 16, 9, 0, tzinfo=UTC),
+    )
+    root_owned_paths = (
+        "src/gza/cli/execution.py",
+        "src/gza/db.py",
+        "tests/cli/test_execution.py",
+        "tests/test_db.py",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        name_status_by_range={
+            "main...feat/server-root-changes": "".join(f"M\t{path}\n" for path in root_owned_paths),
+        },
+    )
+
+    unauthorized_action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert unauthorized_action["type"] == "needs_discussion"
+    assert unauthorized_action["needs_attention_reason"] == "project-scope-violation"
+    assert unauthorized_action["failure_reason"] == "PROJECT_SCOPE_VIOLATION"
+    assert unauthorized_action["out_of_scope_paths"] == root_owned_paths
+
+    impl.tags = ("cross-project",)
+    store.update(impl)
+
+    authorized_action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert authorized_action["type"] == "verify_gate"
+    assert authorized_action["verify_gate_phase"] == "pre_review"
 
 
 def test_default_cross_project_allows_out_of_scope_change_to_advance(tmp_path: Path) -> None:
