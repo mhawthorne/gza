@@ -55,7 +55,7 @@ from ..db import (
     _normalize_tags,
     add_task_interactive,
     edit_task_interactive,
-    edit_task_prompt,
+    edit_task_prompt_with_mutations,
     normalize_task_prompt,
     task_id_numeric_key,
 )
@@ -2809,7 +2809,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
                 print(f"  - {error}")
             return 1
 
-    tag_action: str | None = None
+    tag_action: Literal["clear", "set", "add", "remove"] | None = None
     tag_values: tuple[str, ...] = ()
     if getattr(args, "clear_tags", False):
         tag_action = "clear"
@@ -2825,18 +2825,21 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
     update_messages: list[str] = []
     info_messages: list[str] = []
+    field_updates: dict[str, object] = {}
     changed = False
 
     # Handle --based-on flag (lineage/parent relationship)
     if based_on_id is not None:
         task.based_on = based_on_id
         task.recovery_origin = "manual"
+        field_updates.update(based_on=based_on_id, recovery_origin="manual")
         update_messages.append(f"✓ Set task {task.id} based_on task {based_on_id}")
         changed = True
 
     # Handle --depends-on flag (execution blocking dependency)
     if depends_on_id is not None:
         task.depends_on = depends_on_id
+        field_updates["depends_on"] = depends_on_id
         update_messages.append(f"✓ Set task {task.id} to depend on task {depends_on_id}")
         changed = True
     elif getattr(args, "clear_depends_on", False):
@@ -2845,6 +2848,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         else:
             previous_depends_on = task.depends_on
             task.depends_on = None
+            field_updates["depends_on"] = None
             update_messages.append(
                 f"✓ Cleared execution dependency for task {task.id} (was {previous_depends_on})"
             )
@@ -2853,24 +2857,28 @@ def cmd_edit(args: argparse.Namespace) -> int:
     # Handle --review flag
     if hasattr(args, "review") and args.review:
         task.create_review = True
+        field_updates["create_review"] = True
         update_messages.append(f"✓ Enabled automatic review task creation for task {task.id}")
         changed = True
 
     # Handle --pr flag
     if getattr(args, "create_pr", False):
         task.create_pr = True
+        field_updates["create_pr"] = True
         update_messages.append(f"✓ Enabled PR creation/reuse request for successful completion of task {task.id}")
         changed = True
 
     if hold_flag_requested:
         if hold_for_review_requested:
             task.auto_implement = False
+            field_updates["auto_implement"] = False
             update_messages.append(
                 f"✓ Enabled hold-for-review for plan task {task.id}; automatic implementation follow-up is disabled"
             )
             changed = True
         else:
             if enable_held_plan_source_auto_implement(task):
+                field_updates["auto_implement"] = True
                 update_messages.append(f"✓ Enabled automatic implementation follow-up for plan task {task.id}")
                 changed = True
             else:
@@ -2882,6 +2890,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if hasattr(args, "model") and args.model is not None:
         task.model = args.model
         task.model_is_explicit = True
+        field_updates.update(model=args.model, model_is_explicit=True)
         update_messages.append(f"✓ Set model override to '{args.model}' for task {task.id}")
         changed = True
 
@@ -2889,12 +2898,14 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if hasattr(args, "provider") and args.provider is not None:
         task.provider = args.provider
         task.provider_is_explicit = True
+        field_updates.update(provider=args.provider, provider_is_explicit=True)
         update_messages.append(f"✓ Set provider override to '{args.provider}' for task {task.id}")
         changed = True
 
     # Handle --no-learnings flag
     if hasattr(args, "skip_learnings") and args.skip_learnings:
         task.skip_learnings = True
+        field_updates["skip_learnings"] = True
         update_messages.append(f"✓ Set skip_learnings for task {task.id}")
         changed = True
 
@@ -2906,6 +2917,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         else:
             task.task_type = new_type
             task.last_edited_at = datetime.now(UTC)
+            field_updates["task_type"] = new_type
             update_messages.append(f"✓ Converted task {task.id} to {new_type}")
             changed = True
 
@@ -2932,7 +2944,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
             print(f"Error: {exc}")
             return 1
         task.tags = final_tags
-        tag_message = f"✓ Added tags for task {task_row_id}: {', '.join(final_tags)}"
+        tag_message = f"✓ Updated tags for task {task_row_id}: {', '.join(final_tags)}"
     elif tag_action == "remove":
         try:
             removed_tags = set(_normalize_tags(tag_values))
@@ -2943,7 +2955,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         task.tags = final_tags
         tag_message = f"✓ Updated tags for task {task_row_id}: {', '.join(final_tags) if final_tags else '(none)'}"
 
-    if changed or tag_action is not None:
+    if not prompt_requested and (changed or tag_action is not None):
         store.update(task)
         if tag_message is not None:
             update_messages.append(tag_message)
@@ -2953,12 +2965,31 @@ def cmd_edit(args: argparse.Namespace) -> int:
         assert new_prompt is not None
         if task.prompt == new_prompt:
             info_messages.append(f"Task {task.id} prompt unchanged")
-        else:
-            try:
-                edit_task_prompt(store, task_row_id, new_prompt)
-            except (TaskPromptEditConflict, TaskPromptValidationError) as exc:
-                print(f"Error: {exc}")
-                return 1
+        try:
+            updated_task = edit_task_prompt_with_mutations(
+                store,
+                task_row_id,
+                new_prompt,
+                field_updates=field_updates,
+                tag_action=tag_action,
+                tag_values=tag_values,
+            )
+        except (TaskPromptEditConflict, TaskPromptValidationError) as exc:
+            print(f"Error: {exc}")
+            return 1
+        if tag_action is not None:
+            if tag_action == "clear":
+                tag_message = f"✓ Cleared tags for task {task_row_id}"
+            elif tag_action == "set":
+                rendered_tags = ", ".join(updated_task.tags) if updated_task.tags else "(none)"
+                tag_message = f"✓ Set tags for task {task_row_id}: {rendered_tags}"
+            elif tag_action == "add":
+                tag_message = f"✓ Updated tags for task {task_row_id}: {', '.join(updated_task.tags)}"
+            else:
+                rendered_tags = ", ".join(updated_task.tags) if updated_task.tags else "(none)"
+                tag_message = f"✓ Updated tags for task {task_row_id}: {rendered_tags}"
+            update_messages.append(tag_message)
+        if task.prompt != new_prompt:
             update_messages.append(f"✓ Updated task {task.id}")
             prompt_changed = True
 

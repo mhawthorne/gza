@@ -715,6 +715,7 @@ All other edit flags (`--based-on`, `--depends-on`, `--clear-depends-on`, `--exp
 Pending `implement` tasks also cannot be edited onto a held-plan dependency or a `based_on` lineage rooted at a held plan; release the plan first.
 
 Non-conflicting edit mutations can be combined in one invocation. Tag mutation flags remain mutually exclusive with each other.
+When an invocation includes `--prompt` or `--prompt-file`, its prompt, metadata, and tag mutations are committed atomically after rechecking that the task is still pending. If that pending-state guard fails, none of the requested mutations are persisted.
 
 ### retag
 
