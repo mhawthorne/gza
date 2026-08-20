@@ -8,8 +8,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from gza.db import SqliteTaskStore
-from gza.task_query import TaskQuery, TaskQueryService, TaskRow
+from gza.task_query import TaskQuery, TaskQueryService, TaskRow, normalize_tag_filters
 from gza_server.app import create_app
+from gza_server.task_tags import parse_tag_mutation, parse_task_tag_edit
 
 
 def _client(
@@ -46,6 +47,50 @@ def _hidden_value(html: str, name: str) -> str:
     match = re.search(rf'name="{name}" value="([^"]+)"', html)
     assert match is not None
     return match.group(1)
+
+
+def test_task_tag_edit_parser_matches_shared_gza_normalization() -> None:
+    raw_tags = [
+        "  Release\t\tTrain  ",
+        "release train",
+        "\u2003BETA\u00a0 lane\n",
+        "beta lane",
+    ]
+
+    parsed = parse_task_tag_edit(
+        {"add": raw_tags, "remove": list(reversed(raw_tags))},
+        is_json=True,
+    )
+    shared = normalize_tag_filters(tuple(raw_tags))
+
+    assert shared == ("beta lane", "release train")
+    assert parsed.add == shared
+    assert parsed.remove == shared
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "mutation": "replace",
+            "old_tag": "  Release\t Train ",
+            "new_tag": "\u2003BETA\u00a0 Lane\n",
+        },
+        {"replace": ["  Release\t Train ", "\u2003BETA\u00a0 Lane\n"]},
+    ],
+    ids=["discriminator", "direct"],
+)
+def test_bulk_tag_mutation_parser_matches_shared_gza_normalization(
+    payload: dict[str, object],
+) -> None:
+    parsed = parse_tag_mutation(payload)
+    shared_old = normalize_tag_filters(("  Release\t Train ",))
+    shared_new = normalize_tag_filters(("\u2003BETA\u00a0 Lane\n",))
+
+    assert shared_old is not None
+    assert shared_new is not None
+    assert parsed.old_tag == shared_old[0]
+    assert parsed.tag == shared_new[0]
 
 
 def test_task_tag_editor_adds_and_removes_tags_on_completed_task(tmp_path: Path) -> None:
