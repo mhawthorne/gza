@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.task_query import normalize_tag_filters
 
 
 @dataclass(frozen=True)
@@ -83,21 +84,17 @@ def parse_task_tag_edit(payload: dict[str, Any], *, is_json: bool) -> TaskTagEdi
             for key in ("add", "remove")
         }
     return TaskTagEdit(
-        add=values["add"],
-        remove=values["remove"],
+        add=normalize_tag_filters(values["add"]) or (),
+        remove=normalize_tag_filters(values["remove"]) or (),
         project_id=project_id,
     )
 
 
-def normalize_tags(values: list[str]) -> tuple[str, ...]:
-    """Apply Gza's public tag normalization semantics to request values."""
-    normalized: set[str] = set()
-    for value in values:
-        tag = " ".join(value.split()).lower()
-        if not tag:
-            raise ValueError("tag must not be empty")
-        normalized.add(tag)
-    return tuple(sorted(normalized))
+def _normalize_mutation_tag(value: str) -> str:
+    """Adapt Gza's collection normalizer for one validated mutation operand."""
+    normalized = normalize_tag_filters((value,))
+    assert normalized is not None
+    return normalized[0]
 
 
 def parse_tag_mutation(payload: dict[str, Any]) -> TagMutation:
@@ -110,11 +107,17 @@ def parse_tag_mutation(payload: dict[str, Any]) -> TagMutation:
             raise ValueError("exactly one tag mutation is required")
         kind = _string_value(payload.get("mutation"), "mutation")
         if kind in {"add", "remove"}:
-            tag = normalize_tags([_string_value(payload.get("mutation_tag"), "mutation_tag")])[0]
+            tag = _normalize_mutation_tag(
+                _string_value(payload.get("mutation_tag"), "mutation_tag")
+            )
             return TagMutation(kind=kind, tag=tag)
         if kind == "replace":
-            old_tag = normalize_tags([_string_value(payload.get("old_tag"), "old_tag")])[0]
-            new_tag = normalize_tags([_string_value(payload.get("new_tag"), "new_tag")])[0]
+            old_tag = _normalize_mutation_tag(
+                _string_value(payload.get("old_tag"), "old_tag")
+            )
+            new_tag = _normalize_mutation_tag(
+                _string_value(payload.get("new_tag"), "new_tag")
+            )
             return TagMutation(kind="replace", old_tag=old_tag, tag=new_tag)
         raise ValueError("exactly one tag mutation is required")
 
@@ -124,13 +127,13 @@ def parse_tag_mutation(payload: dict[str, Any]) -> TagMutation:
     kind = direct_fields[0]
     raw_value = payload[kind]
     if kind in {"add", "remove"}:
-        tag = normalize_tags([_string_value(raw_value, kind)])[0]
+        tag = _normalize_mutation_tag(_string_value(raw_value, kind))
         return TagMutation(kind=kind, tag=tag)
 
     if not isinstance(raw_value, list) or len(raw_value) != 2:
         raise ValueError("replace requires exactly two tags: OLD and NEW")
-    old_tag = normalize_tags([_string_value(raw_value[0], "old_tag")])[0]
-    new_tag = normalize_tags([_string_value(raw_value[1], "new_tag")])[0]
+    old_tag = _normalize_mutation_tag(_string_value(raw_value[0], "old_tag"))
+    new_tag = _normalize_mutation_tag(_string_value(raw_value[1], "new_tag"))
     return TagMutation(kind="replace", old_tag=old_tag, tag=new_tag)
 
 
@@ -158,8 +161,8 @@ def edit_task_tags(
     """Add and remove tags from one task through Gza's tag edit API."""
     if not add and not remove:
         raise ValueError("at least one tag must be added or removed")
-    additions = set(normalize_tags(list(add)))
-    removals = set(normalize_tags(list(remove)))
+    additions = set(normalize_tag_filters(add) or ())
+    removals = set(normalize_tag_filters(remove) or ())
     current = store.get_task_tags(task_id)
     final = tuple(sorted((set(current) - removals) | additions))
     if final == current:
