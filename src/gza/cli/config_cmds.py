@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from statistics import median
-from typing import Any, cast
+from typing import Any, assert_never, cast
 
 from rich.table import Table
 
@@ -38,6 +38,7 @@ from ..git import Git
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..log_paths import paired_log_paths, slug_from_log_path
 from ..merge_state import resolve_task_merge_state_for_target
+from ..report_sync import ReportSyncStatus, synchronize_task_report
 from ..task_slug import get_slug_display_text
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import get_review_verdict, get_store, resolve_id
@@ -2828,26 +2829,17 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def _sync_one_report(task: "Task", config: Config, store: "SqliteTaskStore", *, dry_run: bool) -> str:
+def _sync_one_report(
+    task_id: str,
+    store: "SqliteTaskStore",
+    *,
+    dry_run: bool,
+) -> ReportSyncStatus:
     """Sync a single task's report file from disk to DB.
 
     Returns a status string: 'synced', 'unchanged', 'missing', or 'no_report'.
     """
-    if not task.report_file:
-        return "no_report"
-
-    report_path = config.project_dir / task.report_file
-    if not report_path.exists():
-        return "missing"
-
-    disk_content = report_path.read_text()
-    if task.output_content == disk_content:
-        return "unchanged"
-
-    if not dry_run:
-        task.output_content = disk_content
-        store.update(task)
-    return "synced"
+    return synchronize_task_report(store, task_id, dry_run=dry_run).status
 
 
 def cmd_sync_report(args: argparse.Namespace) -> int:
@@ -2873,10 +2865,12 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
         synced = 0
         unchanged = 0
         missing = 0
+        skipped = 0
         prefix = "[dry-run] " if dry_run else ""
 
         for task in tasks_with_reports:
-            status = _sync_one_report(task, config, store, dry_run=dry_run)
+            assert task.id is not None
+            status = _sync_one_report(task.id, store, dry_run=dry_run)
             if status == "synced":
                 console.print(f"{prefix}[green]Synced {task.id} ({task.report_file})[/green]")
                 synced += 1
@@ -2884,8 +2878,18 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
                 unchanged += 1
             elif status == "missing":
                 missing += 1
+            elif status == "no_report":
+                console.print(
+                    f"{prefix}[yellow]Skipped {task.id}: report file metadata was removed[/yellow]"
+                )
+                skipped += 1
+            else:
+                assert_never(status)
 
-        console.print(f"\n{prefix}{synced} synced, {unchanged} unchanged, {missing} missing")
+        console.print(
+            f"\n{prefix}{synced} synced, {unchanged} unchanged, "
+            f"{missing} missing, {skipped} skipped"
+        )
         return 0
 
     # Single task mode
@@ -2900,7 +2904,7 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
         console.print(f"[red]Error: Task {task_id} has no report file[/red]")
         return 1
 
-    status = _sync_one_report(task, config, store, dry_run=dry_run)
+    status = _sync_one_report(task_id, store, dry_run=dry_run)
     prefix = "[dry-run] " if dry_run else ""
 
     if status == "missing":
@@ -2908,8 +2912,13 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
         return 1
     elif status == "unchanged":
         console.print(f"[dim]Task {task_id} already in sync — no changes needed.[/dim]")
-    else:
+    elif status == "no_report":
+        console.print(f"[red]Error: Task {task_id} no longer has a report file[/red]")
+        return 1
+    elif status == "synced":
         console.print(f"{prefix}[green]Synced report for task {task_id} from disk to DB.[/green]")
+    else:
+        assert_never(status)
     return 0
 
 

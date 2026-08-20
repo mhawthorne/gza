@@ -2255,9 +2255,13 @@ Sync report file content from disk into the database `output_content` field. Use
 
 ```bash
 gza sync-report <task_id>
+gza sync-report --all
 ```
 
 `task_id` must be a full prefixed task ID (for example `gza-1234`).
+In `--all` mode, the final summary accounts for every initially selected task as
+synced, unchanged, missing, or skipped. A task is skipped if its report-file
+metadata is removed concurrently after target discovery.
 
 Examples use `gza-1234`, and validation is format-based (`{prefix}-{decimal}`) with variable-length decimal suffixes.
 

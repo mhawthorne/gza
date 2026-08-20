@@ -13,15 +13,19 @@ from unittest.mock import patch
 
 import pytest
 
+import gza.cli.config_cmds as config_cmds_module
 from gza.artifacts import store_command_output_artifact
 from gza.cli.config_cmds import (
     CheckTarget,
     _extract_preflight_failure_detail,
     cmd_preflight,
+    cmd_sync_report,
     resolve_preflight_targets,
 )
 from gza.config import Config, ProviderConfig, TaskTypeConfig
+from gza.db import SqliteTaskStore
 from gza.providers.base import PreflightCheckResult, RunResult
+from gza.report_sync import ReportSyncStatus
 
 from .conftest import invoke_gza, make_store, setup_config
 
@@ -4339,6 +4343,90 @@ class TestSyncReportCommand:
         result = invoke_gza("sync-report", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 1
         assert "no report file" in result.stdout
+
+    def test_sync_report_errors_if_report_metadata_is_removed_after_precheck(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A locked refetch that finds no report must not be rendered as success."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Plan task", task_type="plan")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.report_file = ".gza/plans/raced-plan.md"
+        store.update(task)
+
+        original_sync = config_cmds_module._sync_one_report
+
+        def clear_report_then_sync(
+            task_id: str,
+            cli_store: SqliteTaskStore,
+            *,
+            dry_run: bool,
+        ) -> ReportSyncStatus:
+            concurrent_store = make_store(tmp_path)
+            concurrent_task = concurrent_store.get(task_id)
+            assert concurrent_task is not None
+            concurrent_task.report_file = None
+            concurrent_store.update(concurrent_task)
+            return original_sync(task_id, cli_store, dry_run=dry_run)
+
+        monkeypatch.setattr(config_cmds_module, "_sync_one_report", clear_report_then_sync)
+
+        result = cmd_sync_report(
+            argparse.Namespace(project_dir=tmp_path, task_id=task.id, dry_run=False, all=False)
+        )
+
+        assert result == 1
+        output = capsys.readouterr().out
+        assert "no longer has a report file" in output
+        assert "Synced report" not in output
+
+    def test_sync_report_all_accounts_for_report_metadata_removed_after_scan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Bulk sync explicitly accounts for a report removed after target discovery."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Plan task", task_type="plan")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.report_file = ".gza/plans/raced-plan.md"
+        store.update(task)
+
+        original_sync = config_cmds_module._sync_one_report
+
+        def clear_report_then_sync(
+            task_id: str,
+            cli_store: SqliteTaskStore,
+            *,
+            dry_run: bool,
+        ) -> ReportSyncStatus:
+            concurrent_store = make_store(tmp_path)
+            concurrent_task = concurrent_store.get(task_id)
+            assert concurrent_task is not None
+            concurrent_task.report_file = None
+            concurrent_store.update(concurrent_task)
+            return original_sync(task_id, cli_store, dry_run=dry_run)
+
+        monkeypatch.setattr(config_cmds_module, "_sync_one_report", clear_report_then_sync)
+
+        result = cmd_sync_report(
+            argparse.Namespace(project_dir=tmp_path, task_id=None, dry_run=False, all=True)
+        )
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert f"Skipped {task.id}" in output
+        assert "0 synced, 0 unchanged, 0 missing, 1 skipped" in output
 
     def test_sync_report_error_task_not_found(self, tmp_path: Path):
         """sync-report returns error when task does not exist."""

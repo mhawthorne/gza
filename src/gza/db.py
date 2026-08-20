@@ -5921,24 +5921,53 @@ class SqliteTaskStore:
         ``None`` means the task is missing or no longer a plan task.  Lifecycle
         and all other task fields retain their current database values.
         """
+        return self.update_report_content(
+            task_id,
+            content,
+            report_file=report_file,
+            edited_at=edited_at,
+            required_task_type="plan",
+        )
+
+    def update_report_content(
+        self,
+        task_id: str,
+        content: str,
+        *,
+        report_file: str | None = None,
+        edited_at: datetime | None = None,
+        required_task_type: str | None = None,
+    ) -> Task | None:
+        """Atomically update only a task's persisted report-content fields.
+
+        ``None`` means the task is missing or does not have the required task
+        type. Lifecycle and all other task fields retain their current values.
+        ``report_file`` and ``edited_at`` are changed only when supplied.
+        """
         with self._write_transaction() as conn:
+            assignments = ["output_content = ?"]
+            values: list[Any] = [content]
+            if report_file is not None:
+                assignments.append("report_file = ?")
+                values.append(report_file)
+            if edited_at is not None:
+                assignments.append("last_edited_at = ?")
+                values.append(_format_db_timestamp(edited_at))
+
+            predicates = ["project_id = ?", "id = ?"]
+            values.extend((self._project_id, task_id))
+            if required_task_type is not None:
+                predicates.append("task_type = ?")
+                values.append(required_task_type)
+
             cur = conn.execute(
-                """
-                UPDATE tasks
-                SET output_content = ?, report_file = ?, last_edited_at = ?
-                WHERE project_id = ? AND id = ? AND task_type = 'plan'
-                """,
-                (
-                    content,
-                    report_file,
-                    _format_db_timestamp(edited_at),
-                    self._project_id,
-                    task_id,
-                ),
+                f"UPDATE tasks SET {', '.join(assignments)} "
+                f"WHERE {' AND '.join(predicates)}",
+                values,
             )
             if cur.rowcount == 0:
                 return None
-            self._touch_task_updated_at(conn, task_id, now=edited_at)
+            self._touch_task_updated_at(conn, task_id, now=edited_at or datetime.now(UTC))
             updated_row = conn.execute(
                 "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
                 (self._project_id, task_id),
