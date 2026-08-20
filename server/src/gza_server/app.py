@@ -21,6 +21,12 @@ from gza.task_query import normalize_tag_filters
 
 from . import __version__
 from .task_detail import AmbiguousTaskIdError, TaskDetail, query_task_detail
+from .task_edit import (
+    TaskEditConflict,
+    edit_task_plan,
+    edit_task_prompt,
+    parse_content_edit,
+)
 from .task_list import (
     TASK_STATUSES,
     TASK_TYPES,
@@ -32,8 +38,8 @@ from .task_tags import (
     TagMutation,
     apply_bulk_tag_mutation,
     edit_task_tags,
-    parse_task_tag_edit,
     parse_tag_mutation,
+    parse_task_tag_edit,
     writable_project_store,
 )
 
@@ -403,7 +409,16 @@ def create_app(
             project_id=project_id,
         )
 
-    def render_task_detail(request: Request, task_id: str, project_id: str | None = None):
+    def render_task_detail(
+        request: Request,
+        task_id: str,
+        project_id: str | None = None,
+        *,
+        edit_mode: str | None = None,
+        edited_content: str | None = None,
+        edit_error: str | None = None,
+        status_code: int = 200,
+    ):
         try:
             detail = load_task_detail(task_id, project_id)
         except AmbiguousTaskIdError as exc:
@@ -420,10 +435,29 @@ def create_app(
                 context={"task_id": task_id},
                 status_code=404,
             )
+        rejected_edit_mode: str | None = None
+        prompt_eligible = detail.task.status == "pending"
+        plan_eligible = detail.task.task_type == "plan" and detail.plan_content is not None
+        if edit_mode == "prompt" and not prompt_eligible:
+            if edit_error is not None and edited_content is not None:
+                rejected_edit_mode = edit_mode
+            edit_mode = None
+        if edit_mode == "plan" and not plan_eligible:
+            if edit_error is not None and edited_content is not None:
+                rejected_edit_mode = edit_mode
+            edit_mode = None
         return _TEMPLATES.TemplateResponse(
             request=request,
             name="task_detail.html",
-            context={"detail": detail, "task": detail.task},
+            context={
+                "detail": detail,
+                "task": detail.task,
+                "edit_mode": edit_mode,
+                "edited_content": edited_content,
+                "edit_error": edit_error,
+                "rejected_edit_mode": rejected_edit_mode,
+            },
+            status_code=status_code,
         )
 
     def task_detail_record(task_id: str, project_id: str | None = None) -> dict[str, object]:
@@ -436,12 +470,17 @@ def create_app(
         return detail.json_record()
 
     @app.get("/tasks/{task_id}")
-    def task_detail_page(request: Request, task_id: str):
-        return render_task_detail(request, task_id)
+    def task_detail_page(request: Request, task_id: str, edit: str | None = None):
+        return render_task_detail(request, task_id, edit_mode=edit)
 
     @app.get("/projects/{project_id}/tasks/{task_id}")
-    def qualified_task_detail_page(request: Request, project_id: str, task_id: str):
-        return render_task_detail(request, task_id, project_id)
+    def qualified_task_detail_page(
+        request: Request,
+        project_id: str,
+        task_id: str,
+        edit: str | None = None,
+    ):
+        return render_task_detail(request, task_id, project_id, edit_mode=edit)
 
     @app.get("/api/tasks/{task_id}")
     def task_detail_api(task_id: str) -> dict[str, object]:
@@ -483,5 +522,68 @@ def create_app(
             "tags": list(tags),
             "changed": changed,
         }
+
+    async def edit_task_content(request: Request, task_id: str, field: str):
+        payload, is_json = await _request_payload(request)
+        _require_same_origin_form(request, is_json=is_json)
+        submitted = payload.get(field)
+        try:
+            edit = parse_content_edit(payload, field)
+        except ValueError as exc:
+            if is_json or not isinstance(submitted, str):
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return render_task_detail(
+                request,
+                task_id,
+                edit_mode=field,
+                edited_content=submitted,
+                edit_error=str(exc),
+                status_code=422,
+            )
+
+        try:
+            detail = load_task_detail(task_id, edit.project_id)
+        except AmbiguousTaskIdError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if detail is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+        try:
+            mutation_store = make_mutation_store(detail.project_id)
+            if field == "prompt":
+                updated = edit_task_prompt(mutation_store, task_id, edit.content)
+                response_content = updated.prompt
+            else:
+                edit_task_plan(mutation_store, task_id, edit.content)
+                response_content = edit.content
+        except (ConfigError, TaskEditConflict, ValueError) as exc:
+            status = 409 if isinstance(exc, TaskEditConflict) else 422
+            if is_json:
+                raise HTTPException(status_code=status, detail=str(exc)) from exc
+            return render_task_detail(
+                request,
+                task_id,
+                edit.project_id,
+                edit_mode=field,
+                edited_content=edit.content,
+                edit_error=str(exc),
+                status_code=status,
+            )
+
+        if not is_json:
+            return RedirectResponse(detail.detail_url, status_code=303)
+        return {
+            "id": task_id,
+            "project_id": detail.project_id,
+            field if field == "prompt" else "plan_content": response_content,
+        }
+
+    @app.post("/api/tasks/{task_id}/prompt")
+    async def task_prompt_api(request: Request, task_id: str):
+        return await edit_task_content(request, task_id, "prompt")
+
+    @app.post("/api/tasks/{task_id}/plan")
+    async def task_plan_api(request: Request, task_id: str):
+        return await edit_task_content(request, task_id, "plan")
 
     return app

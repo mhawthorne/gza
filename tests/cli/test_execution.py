@@ -1899,7 +1899,14 @@ class TestRetagCommand:
 
         task = store.add("Original prompt text")
 
-        result = invoke_gza("edit", str(task.id), "--prompt", "New prompt from command line", "--project", str(tmp_path))
+        result = invoke_gza(
+            "edit",
+            str(task.id),
+            "--prompt",
+            "  New prompt from command line  ",
+            "--project",
+            str(tmp_path),
+        )
 
         assert result.returncode == 0
         assert "Updated task" in result.stdout
@@ -1908,6 +1915,73 @@ class TestRetagCommand:
         updated = store.get(task.id)
         assert updated.prompt == "New prompt from command line"
         assert updated.last_edited_at is not None
+
+    def test_edit_prompt_claim_interleaving_rejects_without_overwriting_lifecycle(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        worker_store = make_store(tmp_path)
+        task = store.add("Original pending prompt")
+        assert task.id is not None
+        real_edit_task_prompt = _execution_module.edit_task_prompt
+        claim_holder: dict[str, object] = {}
+
+        def claim_before_persistence(store_arg, task_id: str, prompt: str):
+            claim = worker_store.try_mark_in_progress(task_id, pid=9753)
+            assert claim.task is not None
+            claim_holder["task"] = claim.task
+            return real_edit_task_prompt(store_arg, task_id, prompt)
+
+        monkeypatch.setattr(
+            _execution_module,
+            "edit_task_prompt",
+            claim_before_persistence,
+        )
+        result = invoke_gza(
+            "edit",
+            task.id,
+            "--prompt",
+            "Updated prompt that must be rejected",
+            "--review",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "prompt edits are only allowed for pending tasks" in result.stdout
+        persisted = worker_store.get(task.id)
+        claimed = claim_holder["task"]
+        assert persisted is not None
+        assert persisted.prompt == "Original pending prompt"
+        assert persisted.create_review is True
+        assert persisted.status == "in_progress"
+        assert persisted.started_at == claimed.started_at
+        assert persisted.running_pid == 9753
+
+    def test_edit_prompt_non_pending_uses_canonical_rule(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Original pending prompt")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+        result = invoke_gza(
+            "edit",
+            task.id,
+            "--prompt",
+            "Updated prompt that must be rejected",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 1
+        assert "prompt edits are only allowed for pending tasks" in result.stdout
+        persisted = store.get(task.id)
+        assert persisted is not None
+        assert persisted.prompt == "Original pending prompt"
 
     def test_edit_prompt_stamps_last_edited_at(self, tmp_path: Path):
         """Meaningful prompt edits should stamp last_edited_at."""
