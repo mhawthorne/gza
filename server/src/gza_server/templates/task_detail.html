@@ -62,13 +62,35 @@
 
   <section>
     <h2>Prompt</h2>
-    <div class="markdown">{{ detail.prompt_html }}</div>
+    {% if task.status == "pending" and edit_mode != "prompt" %}<p><a class="edit-link" href="{{ detail.detail_url }}?edit=prompt">edit prompt</a></p>{% endif %}
+    {% if edit_mode == "prompt" %}
+      {% if edit_error %}<p class="error" role="alert">{{ edit_error }}</p>{% endif %}
+      <form class="content-editor" method="post" action="/api/tasks/{{ task.id }}/prompt">
+        <input type="hidden" name="project_id" value="{{ detail.project_id }}">
+        <label for="prompt-content">Prompt Markdown</label>
+        <textarea id="prompt-content" name="prompt" rows="16">{{ edited_content if edited_content is not none else task.prompt }}</textarea>
+        <p><button type="submit">Save prompt</button> <a href="{{ detail.detail_url }}">Cancel</a></p>
+      </form>
+    {% else %}
+      <div class="markdown">{{ detail.prompt_html }}</div>
+    {% endif %}
   </section>
 
-  {% if detail.plan_html is not none %}
+  {% if detail.plan_content is not none %}
     <section>
       <h2>Plan</h2>
-      <div class="markdown">{{ detail.plan_html }}</div>
+      {% if edit_mode != "plan" %}<p><a class="edit-link" href="{{ detail.detail_url }}?edit=plan">edit plan</a></p>{% endif %}
+      {% if edit_mode == "plan" %}
+        {% if edit_error %}<p class="error" role="alert">{{ edit_error }}</p>{% endif %}
+        <form class="content-editor" method="post" action="/api/tasks/{{ task.id }}/plan">
+          <input type="hidden" name="project_id" value="{{ detail.project_id }}">
+          <label for="plan-content">Plan Markdown</label>
+          <textarea id="plan-content" name="plan" rows="20">{{ edited_content if edited_content is not none else detail.plan_content }}</textarea>
+          <p><button type="submit">Save plan</button> <a href="{{ detail.detail_url }}">Cancel</a></p>
+        </form>
+      {% else %}
+        <div class="markdown">{{ detail.plan_html }}</div>
+      {% endif %}
     </section>
   {% endif %}
 {% endblock %}
