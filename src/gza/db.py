@@ -5937,12 +5937,16 @@ class SqliteTaskStore:
         report_file: str | None = None,
         edited_at: datetime | None = None,
         required_task_type: str | None = None,
+        expected_report_file: str | None | object = DB_UNSET,
     ) -> Task | None:
         """Atomically update only a task's persisted report-content fields.
 
         ``None`` means the task is missing or does not have the required task
-        type. Lifecycle and all other task fields retain their current values.
-        ``report_file`` and ``edited_at`` are changed only when supplied.
+        type, or its report file does not match ``expected_report_file`` when
+        supplied. Lifecycle and all other task fields retain their current
+        values. ``report_file`` and ``edited_at`` are changed only when
+        supplied. The expected-value predicate uses SQLite ``IS`` semantics so
+        both a concrete path and ``NULL`` are compared correctly.
         """
         with self._write_transaction() as conn:
             assignments = ["output_content = ?"]
@@ -5959,6 +5963,9 @@ class SqliteTaskStore:
             if required_task_type is not None:
                 predicates.append("task_type = ?")
                 values.append(required_task_type)
+            if expected_report_file is not DB_UNSET:
+                predicates.append("report_file IS ?")
+                values.append(expected_report_file)
 
             cur = conn.execute(
                 f"UPDATE tasks SET {', '.join(assignments)} "

@@ -38,7 +38,7 @@ from ..git import Git
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..log_paths import paired_log_paths, slug_from_log_path
 from ..merge_state import resolve_task_merge_state_for_target
-from ..report_sync import ReportSyncStatus, synchronize_task_report
+from ..report_sync import ReportSyncResult, synchronize_task_report
 from ..task_slug import get_slug_display_text
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import get_review_verdict, get_store, resolve_id
@@ -2834,12 +2834,12 @@ def _sync_one_report(
     store: "SqliteTaskStore",
     *,
     dry_run: bool,
-) -> ReportSyncStatus:
+) -> ReportSyncResult:
     """Sync a single task's report file from disk to DB.
 
-    Returns a status string: 'synced', 'unchanged', 'missing', or 'no_report'.
+    Returns the authoritative result produced after the task-scoped lock is held.
     """
-    return synchronize_task_report(store, task_id, dry_run=dry_run).status
+    return synchronize_task_report(store, task_id, dry_run=dry_run)
 
 
 def cmd_sync_report(args: argparse.Namespace) -> int:
@@ -2870,17 +2870,33 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
 
         for task in tasks_with_reports:
             assert task.id is not None
-            status = _sync_one_report(task.id, store, dry_run=dry_run)
+            sync_result = _sync_one_report(task.id, store, dry_run=dry_run)
+            status = sync_result.status
+            locked_task = sync_result.task
             if status == "synced":
-                console.print(f"{prefix}[green]Synced {task.id} ({task.report_file})[/green]")
+                console.print(
+                    f"{prefix}[green]Synced {locked_task.id} "
+                    f"({locked_task.report_file})[/green]"
+                )
                 synced += 1
             elif status == "unchanged":
                 unchanged += 1
             elif status == "missing":
+                console.print(
+                    f"{prefix}[red]Missing {locked_task.id} "
+                    f"({locked_task.report_file})[/red]"
+                )
                 missing += 1
             elif status == "no_report":
                 console.print(
-                    f"{prefix}[yellow]Skipped {task.id}: report file metadata was removed[/yellow]"
+                    f"{prefix}[yellow]Skipped {locked_task.id}: "
+                    "report file metadata was removed[/yellow]"
+                )
+                skipped += 1
+            elif status == "conflict":
+                console.print(
+                    f"{prefix}[yellow]Skipped {locked_task.id}: report file metadata "
+                    f"changed concurrently to {locked_task.report_file or 'none'}[/yellow]"
                 )
                 skipped += 1
             else:
@@ -2904,19 +2920,30 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
         console.print(f"[red]Error: Task {task_id} has no report file[/red]")
         return 1
 
-    status = _sync_one_report(task_id, store, dry_run=dry_run)
+    sync_result = _sync_one_report(task_id, store, dry_run=dry_run)
+    status = sync_result.status
+    locked_task = sync_result.task
     prefix = "[dry-run] " if dry_run else ""
 
     if status == "missing":
-        console.print(f"[red]Error: Report file not found: {task.report_file}[/red]")
+        console.print(f"[red]Error: Report file not found: {locked_task.report_file}[/red]")
         return 1
     elif status == "unchanged":
         console.print(f"[dim]Task {task_id} already in sync — no changes needed.[/dim]")
     elif status == "no_report":
         console.print(f"[red]Error: Task {task_id} no longer has a report file[/red]")
         return 1
+    elif status == "conflict":
+        console.print(
+            f"[red]Error: Task {task_id} report file metadata changed concurrently "
+            f"to {locked_task.report_file or 'none'}; nothing was synchronized[/red]"
+        )
+        return 1
     elif status == "synced":
-        console.print(f"{prefix}[green]Synced report for task {task_id} from disk to DB.[/green]")
+        console.print(
+            f"{prefix}[green]Synced report for task {task_id} "
+            f"from {locked_task.report_file} to DB.[/green]"
+        )
     else:
         assert_never(status)
     return 0

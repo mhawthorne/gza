@@ -326,10 +326,12 @@ def test_plan_save_and_cli_report_sync_share_lock_and_preserve_lifecycle(
     http_revision = "## HTTP revision\n\nThis complete revision wins."
     http_file_written = threading.Event()
     release_http_save = threading.Event()
-    cli_started = threading.Event()
+    cli_lock_attempted = threading.Event()
     cli_crossed_lock = threading.Event()
+    cli_thread = threading.local()
     original_replace = report_sync_module._replace_text
     original_disk_sync = report_sync_module._sync_disk_revision
+    original_flock = report_sync_module.fcntl.flock
 
     def paused_replace(path: Path, content: str) -> None:
         original_replace(path, content)
@@ -341,12 +343,20 @@ def test_plan_save_and_cli_report_sync_share_lock_and_preserve_lifecycle(
         cli_crossed_lock.set()
         return original_disk_sync(*args, **kwargs)
 
-    def started_cli_sync() -> str:
-        cli_started.set()
+    def observed_flock(fd: int, operation: int) -> None:
+        if operation == report_sync_module.fcntl.LOCK_EX and getattr(
+            cli_thread, "syncing", False
+        ):
+            cli_lock_attempted.set()
+        original_flock(fd, operation)
+
+    def started_cli_sync():
+        cli_thread.syncing = True
         return _sync_one_report(stale_cli_task.id, cli_store, dry_run=False)
 
     monkeypatch.setattr(report_sync_module, "_replace_text", paused_replace)
     monkeypatch.setattr(report_sync_module, "_sync_disk_revision", observed_disk_sync)
+    monkeypatch.setattr(report_sync_module.fcntl, "flock", observed_flock)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         http_save = executor.submit(
@@ -360,12 +370,12 @@ def test_plan_save_and_cli_report_sync_share_lock_and_preserve_lifecycle(
         claim = observer_store.try_mark_in_progress(task.id, pid=2468)
         assert claim.task is not None
         cli_sync = executor.submit(started_cli_sync)
-        assert cli_started.wait(timeout=5)
+        assert cli_lock_attempted.wait(timeout=5)
         assert not cli_crossed_lock.wait(timeout=0.2)
 
         release_http_save.set()
         http_save.result(timeout=5)
-        assert cli_sync.result(timeout=5) == "unchanged"
+        assert cli_sync.result(timeout=5).status == "unchanged"
 
     persisted = observer_store.get(task.id)
     assert persisted is not None

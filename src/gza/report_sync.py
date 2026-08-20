@@ -15,7 +15,7 @@ from typing import Literal
 from .db import SqliteTaskStore, Task, TaskPromptEditConflict
 from .runner import get_task_output, get_task_output_paths
 
-ReportSyncStatus = Literal["synced", "unchanged", "missing", "no_report"]
+ReportSyncStatus = Literal["synced", "unchanged", "missing", "no_report", "conflict"]
 
 
 class TaskReportSyncConflict(TaskPromptEditConflict):
@@ -115,9 +115,19 @@ def _sync_disk_revision(
         return ReportSyncResult("synced", task, report_path)
 
     assert task.id is not None
-    updated = store.update_report_content(task.id, disk_content)
+    updated = store.update_report_content(
+        task.id,
+        disk_content,
+        expected_report_file=task.report_file,
+    )
     if updated is None:
-        raise TaskReportSyncConflict(f"Task {task.id} no longer exists")
+        current = _require_task(store, task.id)
+        current_path = (
+            _report_path(current, project_root, allow_default=False)
+            if current.report_file
+            else None
+        )
+        return ReportSyncResult("conflict", current, current_path)
     return ReportSyncResult("synced", updated, report_path)
 
 
