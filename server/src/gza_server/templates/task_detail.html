@@ -76,7 +76,7 @@
     {% endif %}
   </section>
 
-  {% if detail.plan_content is not none %}
+  {% if detail.plan_content is not none or edit_mode == "plan" %}
     <section>
       <h2>Plan</h2>
       {% if edit_mode != "plan" %}<p><a class="edit-link" href="{{ detail.detail_url }}?edit=plan">edit plan</a></p>{% endif %}

@@ -441,7 +441,7 @@ def create_app(
             and edit_error is None
         ):
             edit_mode = None
-        if edit_mode == "plan" and (
+        if edit_mode == "plan" and edit_error is None and (
             detail.task.task_type != "plan" or detail.plan_content is None
         ):
             edit_mode = None

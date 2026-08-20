@@ -5860,6 +5860,92 @@ class SqliteTaskStore:
             if task.id is not None:
                 task.updated_at = self._replace_task_tags_conn(conn, task.id, normalized_tags)
 
+    def update_pending_prompt(
+        self,
+        task_id: str,
+        prompt: str,
+        *,
+        edited_at: datetime,
+    ) -> Task | None:
+        """Atomically update only the prompt fields of a pending task.
+
+        ``None`` means the task is missing or no longer pending.  The status
+        predicate and field-scoped update share one immediate transaction so a
+        worker claim cannot be overwritten by a stale editor snapshot.
+        """
+        with self._write_transaction() as conn:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                return None
+
+            current = self._rows_to_tasks(conn, [row])[0]
+            if current.prompt == prompt:
+                return current
+
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                SET prompt = ?, last_edited_at = ?
+                WHERE project_id = ? AND id = ? AND status = 'pending'
+                """,
+                (
+                    prompt,
+                    _format_db_timestamp(edited_at),
+                    self._project_id,
+                    task_id,
+                ),
+            )
+            if cur.rowcount == 0:
+                return None
+            self._touch_task_updated_at(conn, task_id, now=edited_at)
+            updated_row = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
+            ).fetchone()
+            assert updated_row is not None
+            return self._rows_to_tasks(conn, [updated_row])[0]
+
+    def update_plan_content(
+        self,
+        task_id: str,
+        content: str,
+        report_file: str,
+        *,
+        edited_at: datetime,
+    ) -> Task | None:
+        """Atomically update only persisted plan-content metadata.
+
+        ``None`` means the task is missing or no longer a plan task.  Lifecycle
+        and all other task fields retain their current database values.
+        """
+        with self._write_transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                SET output_content = ?, report_file = ?, last_edited_at = ?
+                WHERE project_id = ? AND id = ? AND task_type = 'plan'
+                """,
+                (
+                    content,
+                    report_file,
+                    _format_db_timestamp(edited_at),
+                    self._project_id,
+                    task_id,
+                ),
+            )
+            if cur.rowcount == 0:
+                return None
+            self._touch_task_updated_at(conn, task_id, now=edited_at)
+            updated_row = conn.execute(
+                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                (self._project_id, task_id),
+            ).fetchone()
+            assert updated_row is not None
+            return self._rows_to_tasks(conn, [updated_row])[0]
+
     def delete(self, task_id: str) -> bool:
         """Delete a task by ID. Returns True if deleted."""
         with self._connect() as conn:
