@@ -38,8 +38,8 @@ from .task_tags import (
     TagMutation,
     apply_bulk_tag_mutation,
     edit_task_tags,
-    parse_task_tag_edit,
     parse_tag_mutation,
+    parse_task_tag_edit,
     writable_project_store,
 )
 
@@ -435,15 +435,16 @@ def create_app(
                 context={"task_id": task_id},
                 status_code=404,
             )
-        if (
-            edit_mode == "prompt"
-            and detail.task.status != "pending"
-            and edit_error is None
-        ):
+        rejected_edit_mode: str | None = None
+        prompt_eligible = detail.task.status == "pending"
+        plan_eligible = detail.task.task_type == "plan" and detail.plan_content is not None
+        if edit_mode == "prompt" and not prompt_eligible:
+            if edit_error is not None and edited_content is not None:
+                rejected_edit_mode = edit_mode
             edit_mode = None
-        if edit_mode == "plan" and edit_error is None and (
-            detail.task.task_type != "plan" or detail.plan_content is None
-        ):
+        if edit_mode == "plan" and not plan_eligible:
+            if edit_error is not None and edited_content is not None:
+                rejected_edit_mode = edit_mode
             edit_mode = None
         return _TEMPLATES.TemplateResponse(
             request=request,
@@ -454,6 +455,7 @@ def create_app(
                 "edit_mode": edit_mode,
                 "edited_content": edited_content,
                 "edit_error": edit_error,
+                "rejected_edit_mode": rejected_edit_mode,
             },
             status_code=status_code,
         )

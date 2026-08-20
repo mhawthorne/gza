@@ -12,8 +12,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from gza.db import SqliteTaskStore, Task, validate_prompt
+from gza.db import (
+    SqliteTaskStore,
+    Task,
+    TaskPromptEditConflict as TaskEditConflict,
+    edit_task_prompt as _edit_task_prompt,
+)
 from gza.runner import get_task_output, get_task_output_paths
+
+edit_task_prompt = _edit_task_prompt
 
 
 @dataclass(frozen=True)
@@ -22,10 +29,6 @@ class ContentEdit:
 
     content: str
     project_id: str | None
-
-
-class TaskEditConflict(ValueError):
-    """The task changed state and can no longer accept the requested edit."""
 
 
 def parse_content_edit(payload: dict[str, Any], field: str) -> ContentEdit:
@@ -41,34 +44,6 @@ def parse_content_edit(payload: dict[str, Any], field: str) -> ContentEdit:
     else:
         project_id = project_id_value
     return ContentEdit(content=content, project_id=project_id)
-
-
-def edit_task_prompt(store: SqliteTaskStore, task_id: str, prompt: str) -> Task:
-    """Persist a prompt using the validation and timestamps used by ``gza edit``."""
-    task = _require_task(store, task_id)
-    if task.status != "pending":
-        raise TaskEditConflict(
-            f"Task {task_id} is {task.status}; prompt edits are only allowed for pending tasks."
-        )
-
-    normalized = prompt.strip()
-    errors = validate_prompt(normalized)
-    if errors:
-        raise ValueError("; ".join(errors))
-    updated = store.update_pending_prompt(
-        task_id,
-        normalized,
-        edited_at=datetime.now(UTC),
-    )
-    if updated is None:
-        current = store.get(task_id)
-        if current is None:
-            raise TaskEditConflict(f"Task {task_id} no longer exists")
-        raise TaskEditConflict(
-            f"Task {task_id} is {current.status}; "
-            "prompt edits are only allowed for pending tasks."
-        )
-    return updated
 
 
 def edit_task_plan(store: SqliteTaskStore, task_id: str, content: str) -> Task:

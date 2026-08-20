@@ -8,10 +8,11 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-
-from gza.db import SqliteTaskStore
-from gza_server.app import create_app
 from gza_server import task_edit as task_edit_module
+from gza_server.app import create_app
+
+import gza.db as db_module
+from gza.db import SqliteTaskStore
 
 
 def _client(store: SqliteTaskStore) -> TestClient:
@@ -41,7 +42,7 @@ def test_pending_prompt_form_edit_persists_redirects_and_rerenders(tmp_path: Pat
         f"/api/tasks/{task.id}/prompt",
         data={
             "project_id": "server-test",
-            "prompt": "## Updated prompt\n\nShip the **safe** version.",
+            "prompt": "  \n## Updated prompt\n\nShip the **safe** version.\n  ",
         },
         follow_redirects=False,
     )
@@ -90,7 +91,10 @@ def test_non_pending_prompt_has_no_affordance_and_rejection_preserves_text(
     assert response.status_code == 409
     assert "prompt edits are only allowed for pending tasks" in response.text
     assert html.escape(attempted) in response.text
-    assert 'name="prompt"' in response.text
+    assert 'name="prompt"' not in response.text
+    assert 'class="content-editor"' not in response.text
+    assert "Save prompt" not in response.text
+    assert 'class="submitted-content"' in response.text
     assert api_response.status_code == 409
     assert "prompt edits are only allowed for pending tasks" in api_response.json()["detail"]
     unchanged = store.get(task.id)
@@ -166,14 +170,14 @@ def test_prompt_edit_rejects_worker_claim_between_read_and_persistence(
     assert task.id is not None
     read_complete = threading.Event()
     allow_persistence = threading.Event()
-    original_validate = task_edit_module.validate_prompt
+    original_normalize = db_module.normalize_task_prompt
 
-    def paused_validate(prompt: str) -> list[str]:
+    def paused_normalize(prompt: str) -> str:
         read_complete.set()
         assert allow_persistence.wait(timeout=5)
-        return original_validate(prompt)
+        return original_normalize(prompt)
 
-    monkeypatch.setattr(task_edit_module, "validate_prompt", paused_validate)
+    monkeypatch.setattr(db_module, "normalize_task_prompt", paused_normalize)
     with ThreadPoolExecutor(max_workers=1) as executor:
         edit = executor.submit(
             task_edit_module.edit_task_prompt,
@@ -303,7 +307,11 @@ def test_non_plan_form_rejection_preserves_error_and_submitted_markdown(
     assert response.status_code == 422
     assert f"Task {task.id} is not a plan task" in response.text
     assert html.escape(attempted) in response.text
-    assert 'name="plan"' in response.text
+    assert 'name="plan"' not in response.text
+    assert 'class="content-editor"' not in response.text
+    assert "Save plan" not in response.text
+    assert 'class="submitted-content"' in response.text
+    assert "?edit=plan" not in response.text
     forced_edit = client.get(f"/tasks/{task.id}?edit=plan")
     assert 'name="plan"' not in forced_edit.text
 
@@ -347,4 +355,35 @@ def test_plan_form_rejection_preserves_text_when_file_content_disappears(
     assert response.status_code == 422
     assert f"Task {task.id} has no plan content to edit" in response.text
     assert html.escape(attempted) in response.text
-    assert 'name="plan"' in response.text
+    assert 'name="plan"' not in response.text
+    assert 'class="content-editor"' not in response.text
+    assert "Save plan" not in response.text
+    assert 'class="submitted-content"' in response.text
+    assert "?edit=plan" not in response.text
+
+
+def test_eligible_prompt_validation_error_preserves_exact_text_in_active_editor(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(
+        tmp_path / "tasks.db",
+        prefix="srv",
+        project_id="server-test",
+        project_root=tmp_path,
+    )
+    task = store.add("Original pending prompt", task_type="implement")
+    assert task.id is not None
+    client = _client(store)
+    attempted = "  short  "
+
+    response = client.post(
+        f"/api/tasks/{task.id}/prompt",
+        data={"project_id": "server-test", "prompt": attempted},
+    )
+
+    assert response.status_code == 422
+    assert "Prompt is too short" in response.text
+    assert f">{html.escape(attempted)}</textarea>" in response.text
+    assert 'name="prompt"' in response.text
+    assert 'class="content-editor"' in response.text
+    assert "Save prompt" in response.text

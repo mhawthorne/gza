@@ -11484,6 +11484,63 @@ def migrate_merge_status(store: "SqliteTaskStore", git: "object") -> None:
 
 # === Editor support ===
 
+
+class TaskPromptEditConflict(ValueError):
+    """A task prompt could not be edited because its current state forbids it."""
+
+
+class TaskPromptValidationError(ValueError):
+    """A task prompt failed the canonical prompt validation rules."""
+
+    def __init__(self, errors: list[str]) -> None:
+        self.errors = tuple(errors)
+        super().__init__("; ".join(errors))
+
+
+def normalize_task_prompt(prompt: str) -> str:
+    """Normalize and validate prompt Markdown for every prompt-edit entry point."""
+    normalized = prompt.strip()
+    errors = validate_prompt(normalized)
+    if errors:
+        raise TaskPromptValidationError(errors)
+    return normalized
+
+
+def edit_task_prompt(
+    store: SqliteTaskStore,
+    task_id: str,
+    prompt: str,
+    *,
+    edited_at: datetime | None = None,
+) -> Task:
+    """Atomically edit only the prompt fields of a pending task."""
+    current = store.get(task_id)
+    if current is None:
+        raise TaskPromptEditConflict(f"Task {task_id} no longer exists")
+    if current.status != "pending":
+        raise TaskPromptEditConflict(
+            f"Task {task_id} is {current.status}; "
+            "prompt edits are only allowed for pending tasks."
+        )
+
+    normalized = normalize_task_prompt(prompt)
+    updated = store.update_pending_prompt(
+        task_id,
+        normalized,
+        edited_at=edited_at or datetime.now(UTC),
+    )
+    if updated is not None:
+        return updated
+
+    current = store.get(task_id)
+    if current is None:
+        raise TaskPromptEditConflict(f"Task {task_id} no longer exists")
+    raise TaskPromptEditConflict(
+        f"Task {task_id} is {current.status}; "
+        "prompt edits are only allowed for pending tasks."
+    )
+
+
 TASK_TEMPLATE_HEADER = """# Enter your task prompt below.
 # Lines starting with # are comments and will be ignored.
 # Save and close the editor when done.
@@ -11662,6 +11719,7 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
 
     Returns True if edited successfully, False if cancelled.
     """
+    assert task.id is not None
     while True:
         prompt = edit_prompt(
             initial_content=task.prompt,
@@ -11682,14 +11740,14 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
             print("Edit cancelled")
             return False
 
-        errors = validate_prompt(prompt)
-
-        if not errors:
-            if task.prompt != prompt:
-                task.prompt = prompt
-                task.last_edited_at = datetime.now(UTC)
-            store.update(task)
+        try:
+            edit_task_prompt(store, task.id, prompt)
             return True
+        except TaskPromptValidationError as exc:
+            errors = exc.errors
+        except TaskPromptEditConflict as exc:
+            print(f"Error: {exc}")
+            return False
 
         print("Validation errors:")
         for error in errors:
