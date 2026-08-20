@@ -716,6 +716,7 @@ Pending `implement` tasks also cannot be edited onto a held-plan dependency or a
 
 Non-conflicting edit mutations can be combined in one invocation. Tag mutation flags remain mutually exclusive with each other.
 When an invocation includes `--prompt` or `--prompt-file`, its prompt, metadata, and tag mutations are committed atomically after rechecking that the task is still pending. If that pending-state guard fails, none of the requested mutations are persisted.
+Change and no-op messages for these combined edits reflect the task state observed inside that transaction, including edits made after the command's initial lookup.
 
 ### retag
 

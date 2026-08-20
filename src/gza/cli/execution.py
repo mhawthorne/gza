@@ -2843,12 +2843,12 @@ def cmd_edit(args: argparse.Namespace) -> int:
         update_messages.append(f"✓ Set task {task.id} to depend on task {depends_on_id}")
         changed = True
     elif getattr(args, "clear_depends_on", False):
+        field_updates["depends_on"] = None
         if task.depends_on is None:
             info_messages.append(f"Task {task.id} already has no execution dependency")
         else:
             previous_depends_on = task.depends_on
             task.depends_on = None
-            field_updates["depends_on"] = None
             update_messages.append(
                 f"✓ Cleared execution dependency for task {task.id} (was {previous_depends_on})"
             )
@@ -2877,8 +2877,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
             )
             changed = True
         else:
+            field_updates["auto_implement"] = True
             if enable_held_plan_source_auto_implement(task):
-                field_updates["auto_implement"] = True
                 update_messages.append(f"✓ Enabled automatic implementation follow-up for plan task {task.id}")
                 changed = True
             else:
@@ -2912,12 +2912,12 @@ def cmd_edit(args: argparse.Namespace) -> int:
     # Handle type conversion without opening editor
     if args.explore or args.task:
         new_type = "explore" if args.explore else "implement"
+        field_updates["task_type"] = new_type
         if task.task_type == new_type:
             info_messages.append(f"Task {task.id} is already a {new_type}")
         else:
             task.task_type = new_type
             task.last_edited_at = datetime.now(UTC)
-            field_updates["task_type"] = new_type
             update_messages.append(f"✓ Converted task {task.id} to {new_type}")
             changed = True
 
@@ -2963,10 +2963,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
     prompt_changed = False
     if prompt_requested:
         assert new_prompt is not None
-        if task.prompt == new_prompt:
-            info_messages.append(f"Task {task.id} prompt unchanged")
         try:
-            updated_task = edit_task_prompt_with_mutations(
+            edit_result = edit_task_prompt_with_mutations(
                 store,
                 task_row_id,
                 new_prompt,
@@ -2977,8 +2975,94 @@ def cmd_edit(args: argparse.Namespace) -> int:
         except (TaskPromptEditConflict, TaskPromptValidationError) as exc:
             print(f"Error: {exc}")
             return 1
+
+        before = edit_result.before
+        updated_task = edit_result.after
+        changed_fields = edit_result.changed_fields
+        update_messages = []
+        info_messages = []
+
+        if based_on_id is not None:
+            if "based_on" in changed_fields or "recovery_origin" in changed_fields:
+                update_messages.append(f"✓ Set task {task.id} based_on task {based_on_id}")
+            else:
+                info_messages.append(f"Task {task.id} is already based_on task {based_on_id}")
+
+        if depends_on_id is not None:
+            if "depends_on" in changed_fields:
+                update_messages.append(f"✓ Set task {task.id} to depend on task {depends_on_id}")
+            else:
+                info_messages.append(f"Task {task.id} already depends on task {depends_on_id}")
+        elif getattr(args, "clear_depends_on", False):
+            if "depends_on" in changed_fields:
+                update_messages.append(
+                    f"✓ Cleared execution dependency for task {task.id} (was {before.depends_on})"
+                )
+            else:
+                info_messages.append(f"Task {task.id} already has no execution dependency")
+
+        if hasattr(args, "review") and args.review:
+            if "create_review" in changed_fields:
+                update_messages.append(f"✓ Enabled automatic review task creation for task {task.id}")
+            else:
+                info_messages.append(f"Task {task.id} already has automatic review task creation enabled")
+
+        if getattr(args, "create_pr", False):
+            if "create_pr" in changed_fields:
+                update_messages.append(
+                    f"✓ Enabled PR creation/reuse request for successful completion of task {task.id}"
+                )
+            else:
+                info_messages.append(f"Task {task.id} already has PR creation/reuse requested")
+
+        if hold_flag_requested:
+            if hold_for_review_requested:
+                if "auto_implement" in changed_fields:
+                    update_messages.append(
+                        f"✓ Enabled hold-for-review for plan task {task.id}; "
+                        "automatic implementation follow-up is disabled"
+                    )
+                else:
+                    info_messages.append(f"Task {task.id} already has hold-for-review enabled")
+            elif "auto_implement" in changed_fields:
+                update_messages.append(
+                    f"✓ Enabled automatic implementation follow-up for plan task {task.id}"
+                )
+            else:
+                info_messages.append(
+                    f"Task {task.id} already has automatic implementation follow-up enabled"
+                )
+
+        if hasattr(args, "model") and args.model is not None:
+            if {"model", "model_is_explicit"} & changed_fields:
+                update_messages.append(f"✓ Set model override to '{args.model}' for task {task.id}")
+            else:
+                info_messages.append(f"Task {task.id} already has model override '{args.model}'")
+
+        if hasattr(args, "provider") and args.provider is not None:
+            if {"provider", "provider_is_explicit"} & changed_fields:
+                update_messages.append(f"✓ Set provider override to '{args.provider}' for task {task.id}")
+            else:
+                info_messages.append(f"Task {task.id} already has provider override '{args.provider}'")
+
+        if hasattr(args, "skip_learnings") and args.skip_learnings:
+            if "skip_learnings" in changed_fields:
+                update_messages.append(f"✓ Set skip_learnings for task {task.id}")
+            else:
+                info_messages.append(f"Task {task.id} already skips learnings")
+
+        if args.explore or args.task:
+            new_type = "explore" if args.explore else "implement"
+            if "task_type" in changed_fields:
+                update_messages.append(f"✓ Converted task {task.id} to {new_type}")
+            else:
+                info_messages.append(f"Task {task.id} is already a {new_type}")
+
         if tag_action is not None:
-            if tag_action == "clear":
+            if "tags" not in changed_fields:
+                tag_message = f"Task {task_row_id} tags unchanged"
+                info_messages.append(tag_message)
+            elif tag_action == "clear":
                 tag_message = f"✓ Cleared tags for task {task_row_id}"
             elif tag_action == "set":
                 rendered_tags = ", ".join(updated_task.tags) if updated_task.tags else "(none)"
@@ -2988,12 +3072,15 @@ def cmd_edit(args: argparse.Namespace) -> int:
             else:
                 rendered_tags = ", ".join(updated_task.tags) if updated_task.tags else "(none)"
                 tag_message = f"✓ Updated tags for task {task_row_id}: {rendered_tags}"
-            update_messages.append(tag_message)
-        if task.prompt != new_prompt:
+            if "tags" in changed_fields:
+                update_messages.append(tag_message)
+        if "prompt" in changed_fields:
             update_messages.append(f"✓ Updated task {task.id}")
             prompt_changed = True
+        else:
+            info_messages.append(f"Task {task.id} prompt unchanged")
 
-    if changed or tag_action is not None or prompt_changed:
+    if changed or tag_action is not None or prompt_changed or (prompt_requested and update_messages):
         for message in update_messages:
             print(message)
         for message in info_messages:

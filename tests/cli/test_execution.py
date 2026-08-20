@@ -1992,6 +1992,212 @@ class TestRetagCommand:
         assert persisted.started_at == claimed.started_at
         assert persisted.running_pid == 9753
 
+    def test_edit_prompt_clear_dependency_uses_transaction_observed_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        concurrent_store = make_store(tmp_path)
+        blocker = store.add("Concurrent dependency task")
+        task = store.add("Requested prompt text")
+        assert blocker.id is not None
+        assert task.id is not None
+        assert task.depends_on is None
+        real_edit = _execution_module.edit_task_prompt_with_mutations
+        interleaved: dict[str, object] = {}
+
+        def assign_dependency_before_edit(store_arg, task_id: str, prompt: str, **kwargs):
+            concurrent = concurrent_store.get(task_id)
+            assert concurrent is not None
+            concurrent.depends_on = blocker.id
+            concurrent.urgent = True
+            concurrent.queue_position = 7
+            concurrent_store.update(concurrent)
+            interleaved["task"] = concurrent_store.get(task_id)
+            return real_edit(store_arg, task_id, prompt, **kwargs)
+
+        monkeypatch.setattr(
+            _execution_module,
+            "edit_task_prompt_with_mutations",
+            assign_dependency_before_edit,
+        )
+        result = invoke_gza(
+            "edit",
+            task.id,
+            "--prompt",
+            "Updated requested prompt",
+            "--clear-depends-on",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert f"Cleared execution dependency for task {task.id} (was {blocker.id})" in result.stdout
+        assert "already has no execution dependency" not in result.stdout
+        persisted = concurrent_store.get(task.id)
+        concurrent = interleaved["task"]
+        assert persisted is not None
+        assert persisted.prompt == "Updated requested prompt"
+        assert persisted.depends_on is None
+        assert persisted.status == concurrent.status
+        assert persisted.started_at == concurrent.started_at
+        assert persisted.running_pid == concurrent.running_pid
+        assert persisted.completed_at == concurrent.completed_at
+        assert persisted.urgent is True
+        assert persisted.queue_position == 7
+
+    def test_edit_prompt_release_hold_uses_transaction_observed_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        concurrent_store = make_store(tmp_path)
+        task = store.add("Requested plan prompt", task_type="plan", auto_implement=True)
+        assert task.id is not None
+        real_edit = _execution_module.edit_task_prompt_with_mutations
+        interleaved: dict[str, object] = {}
+
+        def add_hold_before_edit(store_arg, task_id: str, prompt: str, **kwargs):
+            concurrent = concurrent_store.get(task_id)
+            assert concurrent is not None
+            concurrent.auto_implement = False
+            concurrent.urgent = True
+            concurrent.queue_position = 7
+            concurrent_store.update(concurrent)
+            interleaved["task"] = concurrent_store.get(task_id)
+            return real_edit(store_arg, task_id, prompt, **kwargs)
+
+        monkeypatch.setattr(
+            _execution_module,
+            "edit_task_prompt_with_mutations",
+            add_hold_before_edit,
+        )
+        result = invoke_gza(
+            "edit",
+            task.id,
+            "--prompt",
+            "Updated requested plan prompt",
+            "--no-hold-for-review",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert f"Enabled automatic implementation follow-up for plan task {task.id}" in result.stdout
+        assert "already has automatic implementation follow-up enabled" not in result.stdout
+        persisted = concurrent_store.get(task.id)
+        concurrent = interleaved["task"]
+        assert persisted is not None
+        assert persisted.prompt == "Updated requested plan prompt"
+        assert persisted.auto_implement is True
+        assert persisted.status == concurrent.status
+        assert persisted.started_at == concurrent.started_at
+        assert persisted.running_pid == concurrent.running_pid
+        assert persisted.completed_at == concurrent.completed_at
+        assert persisted.urgent is True
+        assert persisted.queue_position == 7
+
+    def test_edit_prompt_type_conversion_uses_transaction_observed_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        concurrent_store = make_store(tmp_path)
+        task = store.add("Requested implementation prompt", task_type="implement")
+        assert task.id is not None
+        real_edit = _execution_module.edit_task_prompt_with_mutations
+        interleaved: dict[str, object] = {}
+
+        def convert_type_before_edit(store_arg, task_id: str, prompt: str, **kwargs):
+            concurrent = concurrent_store.get(task_id)
+            assert concurrent is not None
+            concurrent.task_type = "explore"
+            concurrent.urgent = True
+            concurrent.queue_position = 7
+            concurrent_store.update(concurrent)
+            interleaved["task"] = concurrent_store.get(task_id)
+            return real_edit(store_arg, task_id, prompt, **kwargs)
+
+        monkeypatch.setattr(
+            _execution_module,
+            "edit_task_prompt_with_mutations",
+            convert_type_before_edit,
+        )
+        result = invoke_gza(
+            "edit",
+            task.id,
+            "--prompt",
+            "Updated requested implementation prompt",
+            "--task",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert f"Converted task {task.id} to implement" in result.stdout
+        assert f"Task {task.id} is already a implement" not in result.stdout
+        persisted = concurrent_store.get(task.id)
+        concurrent = interleaved["task"]
+        assert persisted is not None
+        assert persisted.prompt == "Updated requested implementation prompt"
+        assert persisted.task_type == "implement"
+        assert persisted.status == concurrent.status
+        assert persisted.started_at == concurrent.started_at
+        assert persisted.running_pid == concurrent.running_pid
+        assert persisted.completed_at == concurrent.completed_at
+        assert persisted.urgent is True
+        assert persisted.queue_position == 7
+
+    def test_edit_matching_prompt_uses_transaction_observed_state(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        concurrent_store = make_store(tmp_path)
+        requested_prompt = "Requested prompt remains authoritative"
+        task = store.add(requested_prompt)
+        assert task.id is not None
+        real_edit = _execution_module.edit_task_prompt_with_mutations
+        interleaved: dict[str, object] = {}
+
+        def change_prompt_before_edit(store_arg, task_id: str, prompt: str, **kwargs):
+            concurrent = concurrent_store.get(task_id)
+            assert concurrent is not None
+            concurrent.prompt = "Concurrent replacement prompt"
+            concurrent.urgent = True
+            concurrent.queue_position = 7
+            concurrent_store.update(concurrent)
+            interleaved["task"] = concurrent_store.get(task_id)
+            return real_edit(store_arg, task_id, prompt, **kwargs)
+
+        monkeypatch.setattr(
+            _execution_module,
+            "edit_task_prompt_with_mutations",
+            change_prompt_before_edit,
+        )
+        result = invoke_gza(
+            "edit",
+            task.id,
+            "--prompt",
+            requested_prompt,
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        assert f"✓ Updated task {task.id}" in result.stdout
+        assert "prompt unchanged" not in result.stdout
+        persisted = concurrent_store.get(task.id)
+        concurrent = interleaved["task"]
+        assert persisted is not None
+        assert persisted.prompt == requested_prompt
+        assert persisted.status == concurrent.status
+        assert persisted.started_at == concurrent.started_at
+        assert persisted.running_pid == concurrent.running_pid
+        assert persisted.completed_at == concurrent.completed_at
+        assert persisted.urgent is True
+        assert persisted.queue_position == 7
+
     def test_edit_completed_prompt_with_tag_rejects_without_partial_mutation(
         self, tmp_path: Path
     ) -> None:
