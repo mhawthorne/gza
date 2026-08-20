@@ -38,6 +38,7 @@ from ..git import Git
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..log_paths import paired_log_paths, slug_from_log_path
 from ..merge_state import resolve_task_merge_state_for_target
+from ..report_sync import synchronize_task_report
 from ..task_slug import get_slug_display_text
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import get_review_verdict, get_store, resolve_id
@@ -2828,26 +2829,12 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def _sync_one_report(task: "Task", config: Config, store: "SqliteTaskStore", *, dry_run: bool) -> str:
+def _sync_one_report(task_id: str, store: "SqliteTaskStore", *, dry_run: bool) -> str:
     """Sync a single task's report file from disk to DB.
 
     Returns a status string: 'synced', 'unchanged', 'missing', or 'no_report'.
     """
-    if not task.report_file:
-        return "no_report"
-
-    report_path = config.project_dir / task.report_file
-    if not report_path.exists():
-        return "missing"
-
-    disk_content = report_path.read_text()
-    if task.output_content == disk_content:
-        return "unchanged"
-
-    if not dry_run:
-        task.output_content = disk_content
-        store.update(task)
-    return "synced"
+    return synchronize_task_report(store, task_id, dry_run=dry_run).status
 
 
 def cmd_sync_report(args: argparse.Namespace) -> int:
@@ -2876,7 +2863,8 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
         prefix = "[dry-run] " if dry_run else ""
 
         for task in tasks_with_reports:
-            status = _sync_one_report(task, config, store, dry_run=dry_run)
+            assert task.id is not None
+            status = _sync_one_report(task.id, store, dry_run=dry_run)
             if status == "synced":
                 console.print(f"{prefix}[green]Synced {task.id} ({task.report_file})[/green]")
                 synced += 1
@@ -2900,7 +2888,7 @@ def cmd_sync_report(args: argparse.Namespace) -> int:
         console.print(f"[red]Error: Task {task_id} has no report file[/red]")
         return 1
 
-    status = _sync_one_report(task, config, store, dry_run=dry_run)
+    status = _sync_one_report(task_id, store, dry_run=dry_run)
     prefix = "[dry-run] " if dry_run else ""
 
     if status == "missing":
