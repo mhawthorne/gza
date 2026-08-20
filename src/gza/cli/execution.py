@@ -49,12 +49,15 @@ from ..db import (
     InvalidTaskIdError,
     SqliteTaskStore,
     Task as DbTask,
+    TaskPromptEditConflict,
+    TaskPromptValidationError,
     _launch_editor,
     _normalize_tags,
     add_task_interactive,
     edit_task_interactive,
+    edit_task_prompt,
+    normalize_task_prompt,
     task_id_numeric_key,
-    validate_prompt,
 )
 from ..dependency_preconditions import plan_dependency_awaits_review
 from ..derived_tags import resolve_derived_task_tags
@@ -2648,11 +2651,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
     prompt_file_arg = getattr(args, "prompt_file", None) if hasattr(args, "prompt_file") else None
     prompt_arg = getattr(args, "prompt", None) if hasattr(args, "prompt") else None
+    prompt_flag_requested = prompt_file_arg is not None or prompt_arg is not None
     pending_only_flags: list[str] = []
-    if prompt_file_arg is not None:
-        pending_only_flags.append("--prompt-file")
-    if prompt_arg is not None:
-        pending_only_flags.append("--prompt")
     if getattr(args, "based_on_flag", None) is not None:
         pending_only_flags.append("--based-on")
     if getattr(args, "depends_on_flag", None) is not None:
@@ -2706,9 +2706,17 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if task.status != "pending" and (
         pending_only_flags
         or non_pending_hold_error is not None
-        or (not tag_mutation_flags and not non_pending_hold_edit_allowed)
+        or (
+            not tag_mutation_flags
+            and not non_pending_hold_edit_allowed
+            and not prompt_flag_requested
+        )
     ):
-        if pending_only_flags or (not tag_mutation_flags and not non_pending_hold_edit_allowed):
+        if pending_only_flags or (
+            not tag_mutation_flags
+            and not non_pending_hold_edit_allowed
+            and not prompt_flag_requested
+        ):
             print(
                 f"Error: Task {task_id} is {task.status}; non-pending tasks only allow "
                 "tag edits via --set-tags, --add-tag, --remove-tag, or --clear-tags.",
@@ -2775,7 +2783,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if prompt_file_arg is not None:
         try:
             with open(prompt_file_arg) as f:
-                new_prompt = f.read().strip()
+                new_prompt = f.read()
         except FileNotFoundError:
             print(f"Error: File not found: {prompt_file_arg}")
             return 1
@@ -2787,16 +2795,17 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if prompt_arg is not None:
         prompt_requested = True
         if prompt_arg == "-":
-            new_prompt = sys.stdin.read().strip()
+            new_prompt = sys.stdin.read()
         else:
             new_prompt = prompt_arg
 
     if prompt_requested:
         assert new_prompt is not None
-        errors = validate_prompt(new_prompt)
-        if errors:
+        try:
+            new_prompt = normalize_task_prompt(new_prompt)
+        except TaskPromptValidationError as exc:
             print("Validation errors:")
-            for error in errors:
+            for error in exc.errors:
                 print(f"  - {error}")
             return 1
 
@@ -2900,17 +2909,6 @@ def cmd_edit(args: argparse.Namespace) -> int:
             update_messages.append(f"✓ Converted task {task.id} to {new_type}")
             changed = True
 
-    # Handle non-interactive prompt editing
-    if prompt_requested:
-        assert new_prompt is not None
-        if task.prompt == new_prompt:
-            info_messages.append(f"Task {task.id} prompt unchanged")
-        else:
-            task.prompt = new_prompt
-            task.last_edited_at = datetime.now(UTC)
-            update_messages.append(f"✓ Updated task {task.id}")
-            changed = True
-
     tag_message: str | None = None
     if tag_action is not None:
         # Let store.update derive the legacy group mirror from the final tag set.
@@ -2950,7 +2948,21 @@ def cmd_edit(args: argparse.Namespace) -> int:
         if tag_message is not None:
             update_messages.append(tag_message)
 
-    if changed or tag_action is not None:
+    prompt_changed = False
+    if prompt_requested:
+        assert new_prompt is not None
+        if task.prompt == new_prompt:
+            info_messages.append(f"Task {task.id} prompt unchanged")
+        else:
+            try:
+                edit_task_prompt(store, task_row_id, new_prompt)
+            except (TaskPromptEditConflict, TaskPromptValidationError) as exc:
+                print(f"Error: {exc}")
+                return 1
+            update_messages.append(f"✓ Updated task {task.id}")
+            prompt_changed = True
+
+    if changed or tag_action is not None or prompt_changed:
         for message in update_messages:
             print(message)
         for message in info_messages:

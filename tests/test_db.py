@@ -5247,7 +5247,7 @@ class TestEditPromptDefaultContent:
         def mock_run(cmd):
             temp_file = cmd[1]
             with open(temp_file, "w", encoding="utf-8") as f:
-                f.write("Updated prompt from editor")
+                f.write("  Updated prompt from editor  \n")
 
             class Result:
                 returncode = 0
@@ -5262,6 +5262,91 @@ class TestEditPromptDefaultContent:
         assert reloaded is not None
         assert reloaded.prompt == "Updated prompt from editor"
         assert reloaded.last_edited_at is not None
+
+    def test_edit_task_prompt_normalizes_validates_and_rejects_non_pending_atomically(
+        self, tmp_path: Path
+    ) -> None:
+        from gza.db import (
+            SqliteTaskStore,
+            TaskPromptEditConflict,
+            TaskPromptValidationError,
+            edit_task_prompt,
+        )
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Original pending prompt")
+        assert task.id is not None
+
+        updated = edit_task_prompt(store, task.id, "  Updated canonical prompt  \n")
+        assert updated.prompt == "Updated canonical prompt"
+        assert updated.last_edited_at is not None
+
+        with pytest.raises(TaskPromptValidationError, match="too short"):
+            edit_task_prompt(store, task.id, "  short  ")
+
+        claim = store.try_mark_in_progress(task.id, pid=2468)
+        assert claim.task is not None
+        with pytest.raises(
+            TaskPromptEditConflict,
+            match="prompt edits are only allowed for pending tasks",
+        ):
+            edit_task_prompt(store, task.id, "A valid but stale prompt edit")
+
+        persisted = store.get(task.id)
+        assert persisted is not None
+        assert persisted.prompt == "Updated canonical prompt"
+        assert persisted.status == "in_progress"
+        assert persisted.started_at == claim.task.started_at
+        assert persisted.running_pid == 2468
+
+    def test_edit_task_interactive_rejects_claimed_task_without_overwriting_lifecycle(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.db import SqliteTaskStore, edit_task_interactive
+
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add(prompt="Original pending prompt")
+        assert task.id is not None
+        claim = store.try_mark_in_progress(task.id, pid=1357)
+        assert claim.task is not None
+
+        def mock_run(cmd):
+            Path(cmd[1]).write_text("Updated prompt from editor", encoding="utf-8")
+            return type("Result", (), {"returncode": 0})()
+
+        monkeypatch.setattr("gza.db._launch_editor", mock_run)
+
+        assert edit_task_interactive(store, task) is False
+        assert "prompt edits are only allowed for pending tasks" in capsys.readouterr().out
+        persisted = store.get(task.id)
+        assert persisted is not None
+        assert persisted.prompt == "Original pending prompt"
+        assert persisted.status == "in_progress"
+        assert persisted.started_at == claim.task.started_at
+        assert persisted.running_pid == 1357
+
+    def test_edit_task_interactive_uses_canonical_validation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.db import SqliteTaskStore, edit_task_interactive
+
+        store = SqliteTaskStore(tmp_path / "test.db")
+        task = store.add(prompt="Original pending prompt")
+        assert task.id is not None
+
+        def mock_run(cmd):
+            Path(cmd[1]).write_text("  short  ", encoding="utf-8")
+            return type("Result", (), {"returncode": 0})()
+
+        monkeypatch.setattr("gza.db._launch_editor", mock_run)
+        monkeypatch.setattr("builtins.input", lambda _prompt: "q")
+
+        assert edit_task_interactive(store, task) is False
+        assert "Prompt is too short" in capsys.readouterr().out
+        persisted = store.get(task.id)
+        assert persisted is not None
+        assert persisted.prompt == "Original pending prompt"
 
 
 class TestFailureReasonTracking:

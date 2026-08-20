@@ -3,24 +3,44 @@
 from __future__ import annotations
 
 import os
+import secrets
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import Annotated, Any, Literal, Protocol, cast
+from urllib.parse import parse_qs
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from gza.config import Config
+from gza.config import Config, ConfigError
 from gza.db import SqliteTaskStore
 from gza.task_query import normalize_tag_filters
 
 from . import __version__
 from .task_detail import AmbiguousTaskIdError, TaskDetail, query_task_detail
+from .task_edit import (
+    TaskEditConflict,
+    edit_task_plan,
+    edit_task_prompt,
+    parse_content_edit,
+)
 from .task_list import (
     TASK_STATUSES,
     TASK_TYPES,
     TaskListFilters,
     query_task_list,
+)
+from .task_tags import (
+    BulkTagMutationResult,
+    TagMutation,
+    apply_bulk_tag_mutation,
+    edit_task_tags,
+    parse_tag_mutation,
+    parse_task_tag_edit,
+    writable_project_store,
 )
 
 
@@ -35,7 +55,18 @@ class TaskStore(Protocol):
 
 
 StoreFactory = Callable[[], TaskStore]
+MutationStoreFactory = Callable[[str], SqliteTaskStore]
 _TEMPLATES = Jinja2Templates(directory=Path(__file__).parent / "templates")
+
+
+@dataclass(frozen=True)
+class _BulkPreviewState:
+    """Server-authenticated state for one confirmed bulk mutation."""
+
+    filters: TaskListFilters
+    mutation: TagMutation
+    targets: tuple[tuple[str, str], ...]
+    project_ids: tuple[str, ...]
 
 
 def _task_list_filters(
@@ -70,10 +101,119 @@ def resolve_store(project_dir: Path | None = None) -> SqliteTaskStore:
     return SqliteTaskStore.from_config(config, open_mode="query_only")
 
 
+def _payload_values(payload: dict[str, object], key: str) -> list[str]:
+    value = payload.get(key, [])
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    return [str(value)] if str(value).strip() else []
+
+
+def _payload_bool(payload: dict[str, object], key: str) -> bool:
+    value = payload.get(key, False)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, list):
+        value = value[-1] if value else False
+    return str(value).lower() in {"1", "true", "yes", "on"}
+
+
+async def _request_payload(request: Request) -> tuple[dict[str, object], bool]:
+    """Read either the durable JSON API shape or a server-rendered form body."""
+    is_json = request.headers.get("content-type", "").split(";", 1)[0] == "application/json"
+    try:
+        if is_json:
+            value = await request.json()
+            if not isinstance(value, dict):
+                raise HTTPException(status_code=422, detail="request body must be an object")
+            return cast(dict[str, object], value), True
+        parsed = parse_qs(
+            (await request.body()).decode("utf-8"),
+            keep_blank_values=True,
+            encoding="utf-8",
+            errors="strict",
+        )
+    except (UnicodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="malformed request body") from exc
+    payload: dict[str, object] = {
+        key: values if len(values) > 1 else values[0]
+        for key, values in parsed.items()
+    }
+    return payload, False
+
+
+def _require_same_origin_form(request: Request, *, is_json: bool) -> None:
+    """Reject browser-form writes that were not submitted by this server."""
+    if is_json:
+        return
+    expected_origin = f"{request.url.scheme}://{request.url.netloc}".lower()
+    supplied_origin = request.headers.get("origin", "").lower()
+    if not supplied_origin or supplied_origin != expected_origin:
+        raise HTTPException(status_code=403, detail="same-origin form submission required")
+
+
+def _bulk_filters(payload: dict[str, object]) -> TaskListFilters:
+    tags = normalize_tag_filters(tuple(_payload_values(payload, "tag"))) or ()
+    untagged = _payload_bool(payload, "untagged")
+    if tags and untagged:
+        raise HTTPException(status_code=422, detail="tag and untagged filters cannot be combined")
+    return TaskListFilters(
+        prompt=str(payload.get("q", "")),
+        tags=tags,
+        statuses=tuple(_payload_values(payload, "status")),
+        task_types=tuple(_payload_values(payload, "type")),
+        untagged=untagged,
+    )
+
+
+def _bulk_targets(payload: dict[str, object]) -> list[dict[str, object]]:
+    targets: list[dict[str, object]] = []
+    for value in _payload_values(payload, "target"):
+        project_id, separator, task_id = value.partition("|")
+        if not separator or not project_id or not task_id:
+            raise HTTPException(status_code=422, detail="invalid bulk retag target")
+        targets.append({"project_id": project_id, "id": task_id})
+    return targets
+
+
+def _qualified_target_records(
+    targets: tuple[tuple[str, str], ...],
+) -> list[dict[str, str]]:
+    return [
+        {"project_id": project_id, "id": task_id}
+        for project_id, task_id in targets
+    ]
+
+
+def _bulk_result_context(
+    rows: list[dict[str, object]],
+    mutation_summary: str,
+    result: BulkTagMutationResult,
+) -> dict[str, object]:
+    return {
+        "matched_tasks": rows,
+        "mutation": mutation_summary,
+        "changed_count": result.changed_count,
+        "unchanged_count": result.unchanged_count,
+        "skipped_count": result.skipped_count,
+        "failed_count": result.failed_count,
+        "changed_tasks": _qualified_target_records(result.changed),
+        "unchanged_tasks": _qualified_target_records(result.unchanged),
+        "skipped_tasks": _qualified_target_records(result.skipped),
+        "failed_tasks": _qualified_target_records(result.failed),
+        "failures": [
+            {"project_id": project_id, "error": error}
+            for project_id, error in result.failures
+        ],
+    }
+
+
 def create_app(
     *,
     project_dir: Path | None = None,
     store_factory: StoreFactory | None = None,
+    mutation_store_factory: MutationStoreFactory | None = None,
     instance_id: str | None = None,
 ) -> FastAPI:
     """Build the server application.
@@ -82,8 +222,29 @@ def create_app(
     resolve the database with gza's normal config and task-store APIs.
     """
     make_store = store_factory or (lambda: resolve_store(project_dir))
+    make_mutation_store = mutation_store_factory or (
+        lambda project_id: writable_project_store(
+            cast(SqliteTaskStore, make_store()),
+            project_id,
+        )
+    )
     server_instance_id = instance_id or os.environ.get("GZA_SERVER_INSTANCE_ID")
     app = FastAPI(title="gza-server", version=__version__)
+    bulk_previews: dict[str, _BulkPreviewState] = {}
+    bulk_previews_lock = Lock()
+
+    def save_bulk_preview(state: _BulkPreviewState) -> str:
+        token = secrets.token_urlsafe(32)
+        with bulk_previews_lock:
+            # Bound abandoned confirmation pages without weakening nonce entropy.
+            if len(bulk_previews) >= 256:
+                bulk_previews.pop(next(iter(bulk_previews)))
+            bulk_previews[token] = state
+        return token
+
+    def take_bulk_preview(token: str) -> _BulkPreviewState | None:
+        with bulk_previews_lock:
+            return bulk_previews.pop(token, None)
 
     @app.get("/api/health")
     def health() -> dict[str, object]:
@@ -138,6 +299,109 @@ def create_app(
     ) -> list[dict[str, object]]:
         return query_task_list(cast(SqliteTaskStore, make_store()), filters).rows
 
+    @app.post("/api/tasks/tags/bulk")
+    async def bulk_task_tags(request: Request):
+        payload, is_json = await _request_payload(request)
+        _require_same_origin_form(request, is_json=is_json)
+        confirmed = _payload_bool(payload, "confirmed")
+        if confirmed:
+            preview_token = str(payload.get("preview_token", ""))
+            state = take_bulk_preview(preview_token)
+            if state is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="a valid, unused bulk preview is required",
+                )
+            try:
+                submitted_filters = _bulk_filters(payload)
+                submitted_mutation = parse_tag_mutation(payload)
+                submitted_targets = tuple(
+                    (str(row["project_id"]), str(row["id"]))
+                    for row in _bulk_targets(payload)
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if (
+                submitted_filters != state.filters
+                or submitted_mutation != state.mutation
+                or submitted_targets != state.targets
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="bulk apply does not match its authenticated preview",
+                )
+
+            rows = [
+                {"project_id": project_id, "id": task_id}
+                for project_id, task_id in state.targets
+            ]
+            stores: dict[str, SqliteTaskStore] = {}
+            for project_id in state.project_ids:
+                try:
+                    stores[project_id] = make_mutation_store(project_id)
+                except (ConfigError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"could not resolve mutation store for project {project_id}",
+                    ) from exc
+            result = apply_bulk_tag_mutation(stores, rows, state.mutation)
+            response_context = _bulk_result_context(rows, state.mutation.summary, result)
+            if is_json:
+                return response_context
+            return _TEMPLATES.TemplateResponse(
+                request=request,
+                name="bulk_tags_result.html",
+                context=response_context,
+            )
+
+        filters = _bulk_filters(payload)
+        if not filters.has_selection:
+            raise HTTPException(
+                status_code=422,
+                detail="bulk retag requires at least one selection filter",
+            )
+        try:
+            mutation = parse_tag_mutation(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        base_store = cast(SqliteTaskStore, make_store())
+        rows = query_task_list(base_store, filters).rows
+        matched = [
+            {"id": str(row["id"]), "project_id": str(row["project_id"])}
+            for row in rows
+        ]
+        targets = tuple(
+            (str(row["project_id"]), str(row["id"]))
+            for row in matched
+        )
+        project_ids = tuple(dict.fromkeys(project_id for project_id, _task_id in targets))
+        preview_token = save_bulk_preview(
+            _BulkPreviewState(
+                filters=filters,
+                mutation=mutation,
+                targets=targets,
+                project_ids=project_ids,
+            )
+        )
+        if is_json:
+            return {
+                "matched_tasks": matched,
+                "mutation": mutation.summary,
+                "confirmed": False,
+                "preview_token": preview_token,
+            }
+        return _TEMPLATES.TemplateResponse(
+            request=request,
+            name="bulk_tags_confirm.html",
+            context={
+                "matched_tasks": matched,
+                "mutation": mutation,
+                "filters": filters,
+                "preview_token": preview_token,
+            },
+        )
+
     def load_task_detail(task_id: str, project_id: str | None = None) -> TaskDetail | None:
         return query_task_detail(
             cast(SqliteTaskStore, make_store()),
@@ -145,7 +409,16 @@ def create_app(
             project_id=project_id,
         )
 
-    def render_task_detail(request: Request, task_id: str, project_id: str | None = None):
+    def render_task_detail(
+        request: Request,
+        task_id: str,
+        project_id: str | None = None,
+        *,
+        edit_mode: str | None = None,
+        edited_content: str | None = None,
+        edit_error: str | None = None,
+        status_code: int = 200,
+    ):
         try:
             detail = load_task_detail(task_id, project_id)
         except AmbiguousTaskIdError as exc:
@@ -162,10 +435,29 @@ def create_app(
                 context={"task_id": task_id},
                 status_code=404,
             )
+        rejected_edit_mode: str | None = None
+        prompt_eligible = detail.task.status == "pending"
+        plan_eligible = detail.task.task_type == "plan" and detail.plan_content is not None
+        if edit_mode == "prompt" and not prompt_eligible:
+            if edit_error is not None and edited_content is not None:
+                rejected_edit_mode = edit_mode
+            edit_mode = None
+        if edit_mode == "plan" and not plan_eligible:
+            if edit_error is not None and edited_content is not None:
+                rejected_edit_mode = edit_mode
+            edit_mode = None
         return _TEMPLATES.TemplateResponse(
             request=request,
             name="task_detail.html",
-            context={"detail": detail, "task": detail.task},
+            context={
+                "detail": detail,
+                "task": detail.task,
+                "edit_mode": edit_mode,
+                "edited_content": edited_content,
+                "edit_error": edit_error,
+                "rejected_edit_mode": rejected_edit_mode,
+            },
+            status_code=status_code,
         )
 
     def task_detail_record(task_id: str, project_id: str | None = None) -> dict[str, object]:
@@ -178,12 +470,17 @@ def create_app(
         return detail.json_record()
 
     @app.get("/tasks/{task_id}")
-    def task_detail_page(request: Request, task_id: str):
-        return render_task_detail(request, task_id)
+    def task_detail_page(request: Request, task_id: str, edit: str | None = None):
+        return render_task_detail(request, task_id, edit_mode=edit)
 
     @app.get("/projects/{project_id}/tasks/{task_id}")
-    def qualified_task_detail_page(request: Request, project_id: str, task_id: str):
-        return render_task_detail(request, task_id, project_id)
+    def qualified_task_detail_page(
+        request: Request,
+        project_id: str,
+        task_id: str,
+        edit: str | None = None,
+    ):
+        return render_task_detail(request, task_id, project_id, edit_mode=edit)
 
     @app.get("/api/tasks/{task_id}")
     def task_detail_api(task_id: str) -> dict[str, object]:
@@ -192,5 +489,101 @@ def create_app(
     @app.get("/api/projects/{project_id}/tasks/{task_id}")
     def qualified_task_detail_api(project_id: str, task_id: str) -> dict[str, object]:
         return task_detail_record(task_id, project_id)
+
+    @app.post("/api/tasks/{task_id}/tags")
+    async def task_tags_api(request: Request, task_id: str):
+        payload, is_json = await _request_payload(request)
+        _require_same_origin_form(request, is_json=is_json)
+        try:
+            edit = parse_task_tag_edit(payload, is_json=is_json)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            detail = load_task_detail(task_id, edit.project_id)
+        except AmbiguousTaskIdError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if detail is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        try:
+            mutation_store = make_mutation_store(detail.project_id)
+            tags, changed = edit_task_tags(
+                mutation_store,
+                task_id,
+                add=edit.add,
+                remove=edit.remove,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if not is_json:
+            return RedirectResponse(detail.detail_url, status_code=303)
+        return {
+            "id": task_id,
+            "project_id": detail.project_id,
+            "tags": list(tags),
+            "changed": changed,
+        }
+
+    async def edit_task_content(request: Request, task_id: str, field: str):
+        payload, is_json = await _request_payload(request)
+        _require_same_origin_form(request, is_json=is_json)
+        submitted = payload.get(field)
+        try:
+            edit = parse_content_edit(payload, field)
+        except ValueError as exc:
+            if is_json or not isinstance(submitted, str):
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            return render_task_detail(
+                request,
+                task_id,
+                edit_mode=field,
+                edited_content=submitted,
+                edit_error=str(exc),
+                status_code=422,
+            )
+
+        try:
+            detail = load_task_detail(task_id, edit.project_id)
+        except AmbiguousTaskIdError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if detail is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+
+        try:
+            mutation_store = make_mutation_store(detail.project_id)
+            if field == "prompt":
+                updated = edit_task_prompt(mutation_store, task_id, edit.content)
+                response_content = updated.prompt
+            else:
+                edit_task_plan(mutation_store, task_id, edit.content)
+                response_content = edit.content
+        except (ConfigError, TaskEditConflict, ValueError) as exc:
+            status = 409 if isinstance(exc, TaskEditConflict) else 422
+            if is_json:
+                raise HTTPException(status_code=status, detail=str(exc)) from exc
+            return render_task_detail(
+                request,
+                task_id,
+                edit.project_id,
+                edit_mode=field,
+                edited_content=edit.content,
+                edit_error=str(exc),
+                status_code=status,
+            )
+
+        if not is_json:
+            return RedirectResponse(detail.detail_url, status_code=303)
+        return {
+            "id": task_id,
+            "project_id": detail.project_id,
+            field if field == "prompt" else "plan_content": response_content,
+        }
+
+    @app.post("/api/tasks/{task_id}/prompt")
+    async def task_prompt_api(request: Request, task_id: str):
+        return await edit_task_content(request, task_id, "prompt")
+
+    @app.post("/api/tasks/{task_id}/plan")
+    async def task_plan_api(request: Request, task_id: str):
+        return await edit_task_content(request, task_id, "plan")
 
     return app

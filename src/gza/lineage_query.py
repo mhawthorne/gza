@@ -116,6 +116,7 @@ class LineageOwnerQuery:
     max_recovery_attempts: int | None = None
     owner_task_ids: tuple[str, ...] | None = None
     task_ids: tuple[str, ...] | None = None
+    selector_filter_mode: Literal["intersection", "union"] = "intersection"
 
 
 @dataclass(frozen=True)
@@ -344,6 +345,39 @@ def _task_is_effectively_merged(
 ) -> bool:
     return merge_state_is_terminal_for_lifecycle(
         _task_effective_merge_state(task, merge_units_by_task_id=merge_units_by_task_id)
+    )
+
+
+def _owner_has_terminal_resolution_for_incomplete_display(
+    owner: DbTask,
+    *,
+    merge_units_by_task_id: Mapping[str, MergeUnit],
+) -> bool:
+    owner_id = owner.id or ""
+    owner_merge_unit = merge_units_by_task_id.get(owner_id)
+    if owner_merge_unit is not None:
+        return merge_state_is_terminal_for_lifecycle(owner_merge_unit.state)
+    return owner.status == "completed" and owner.merge_status == "merged"
+
+
+def _failed_leaf_should_surface_apart_from_completed_owner(
+    *,
+    failed_task: DbTask,
+    completed_owner: DbTask,
+    owner_merge_unit: MergeUnit | None,
+    leaf_merge_unit: MergeUnit | None,
+    git: Git | None,
+    target_branch: str | None = None,
+) -> bool:
+    if failed_task.id is None or failed_task.id == completed_owner.id:
+        return False
+    return _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+        failed_task=failed_task,
+        completed_owner=completed_owner,
+        owner_merge_unit=owner_merge_unit,
+        leaf_merge_unit=leaf_merge_unit,
+        git=git,
+        target_branch=target_branch,
     )
 
 
@@ -583,7 +617,7 @@ def is_lineage_resolved(snapshot: LineageOwnerSnapshot) -> LineageResolution:
         task.id
         for task in snapshot.members
         if task.id is not None
-        and _task_is_effectively_merged(task, merge_units_by_task_id=snapshot.merge_units_by_task_id)
+        and _task_effective_merge_state(task, merge_units_by_task_id=snapshot.merge_units_by_task_id) == "merged"
     ]
     if merged_member_ids:
         reasons.append("branch_merged")
@@ -841,15 +875,60 @@ def _resolve_owner_merge_unit(
     return max(units.values(), key=lambda unit: (unit.updated_at, unit.id))
 
 
+def _leaf_may_have_unique_work(failed_task: DbTask) -> bool:
+    """Fail-closed reading of ``has_commits`` for unproven failed leaves.
+
+    ``None`` means the worker never recorded commit metadata, which is *unknown*, not
+    proof of no work. Per lineage spec P6 visibility fails closed, so unknown keeps the
+    descendant visible; only an affirmative ``False`` suppresses it.
+    """
+    return failed_task.has_commits is not False
+
+
+def _leaf_has_explicit_no_work(failed_task: DbTask) -> bool:
+    return failed_task.has_commits is False
+
+
 def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
     *,
     failed_task: DbTask,
+    completed_owner: DbTask,
     owner_merge_unit: MergeUnit | None,
     leaf_merge_unit: MergeUnit | None,
     git: Git | None,
+    target_branch: str | None = None,
 ) -> bool:
     if owner_merge_unit is None:
-        return failed_task.task_type not in {"review", "improve", "rebase"}
+        if not (completed_owner.status == "completed" and completed_owner.merge_status == "merged"):
+            return True
+        if failed_task.branch == completed_owner.branch and failed_task.has_commits is False:
+            return False
+        if git is not None and target_branch and failed_task.branch:
+            try:
+                classification = classify_branch_merge_state_for_target(
+                    git=git,
+                    source_branch=failed_task.branch,
+                    target_branch=target_branch,
+                    persisted_state=None,
+                    merged_proof=None,
+                    source_has_commits=None,
+                    recorded_head_sha=leaf_merge_unit.head_sha if leaf_merge_unit is not None else None,
+                    on_warning=_LOG.warning,
+                )
+            except Exception as exc:
+                _LOG.warning(
+                    "Could not prove legacy failed leaf %s merge state against terminal owner target %s: %s",
+                    failed_task.id,
+                    target_branch,
+                    exc,
+                )
+                return True
+            return not merge_state_is_terminal_for_lifecycle(classification.state)
+        if failed_task.same_branch:
+            return False
+        if failed_task.branch and completed_owner.branch:
+            return failed_task.branch != completed_owner.branch or _leaf_may_have_unique_work(failed_task)
+        return _leaf_may_have_unique_work(failed_task)
     if not merge_state_is_terminal_for_lifecycle(owner_merge_unit.state):
         return True
 
@@ -860,7 +939,9 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
     leaf_targets_owner = leaf_merge_unit is not None and leaf_merge_unit.target_branch == owner_target
     leaf_has_own_merge_unit = leaf_merge_unit is not None and leaf_merge_unit.owner_task_id == failed_task.id
     if failed_task.branch is None and not leaf_has_own_merge_unit:
-        return False
+        if leaf_targets_owner:
+            return False
+        return _leaf_may_have_unique_work(failed_task)
     if leaf_targets_owner and leaf_has_own_merge_unit and leaf_merge_unit is not None:
         if leaf_merge_unit.state == "unmerged" and git is None:
             # Persisted unmerged state on the failed leaf's own merge unit is enough to keep
@@ -868,25 +949,42 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
             return True
         if merge_state_is_terminal_for_lifecycle(leaf_merge_unit.state):
             return False
-    if (
-        leaf_targets_owner
-        and not leaf_has_own_merge_unit
-        and failed_task.task_type in {"review", "improve", "rebase", "fix"}
-    ):
-        return False
+    if leaf_targets_owner and not leaf_has_own_merge_unit:
+        if failed_task.branch == completed_owner.branch and failed_task.has_commits is False:
+            return False
+        if git is not None and failed_task.branch:
+            try:
+                classification = classify_branch_merge_state_for_target(
+                    git=git,
+                    source_branch=failed_task.branch,
+                    target_branch=owner_target,
+                    persisted_state=None,
+                    merged_proof=None,
+                    source_has_commits=None,
+                    recorded_head_sha=leaf_merge_unit.head_sha if leaf_merge_unit is not None else None,
+                    on_warning=_LOG.warning,
+                )
+            except Exception as exc:
+                _LOG.warning(
+                    "Could not inspect same-unit failed leaf %s against terminal owner target %s: %s",
+                    failed_task.id,
+                    owner_target,
+                    exc,
+                )
+                return _leaf_may_have_unique_work(failed_task)
+            return not merge_state_is_terminal_for_lifecycle(classification.state)
+        return _leaf_may_have_unique_work(failed_task)
 
     source_branch = failed_task.branch
     if source_branch is None and leaf_targets_owner and leaf_merge_unit is not None:
         source_branch = leaf_merge_unit.source_branch
     if not source_branch:
-        return (
-            True
-            if leaf_targets_owner
-            and leaf_has_own_merge_unit
-            and leaf_merge_unit is not None
-            and leaf_merge_unit.state == "unmerged"
-            else False
-        )
+        if leaf_targets_owner and leaf_has_own_merge_unit and leaf_merge_unit is not None:
+            if leaf_merge_unit.state == "unmerged":
+                return True
+            if merge_state_is_terminal_for_lifecycle(leaf_merge_unit.state):
+                return False
+        return not _leaf_has_explicit_no_work(failed_task)
 
     if git is None:
         return True
@@ -905,7 +1003,7 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
             target_branch=owner_target,
             persisted_state=None,
             merged_proof=None,
-            source_has_commits=failed_task.has_commits,
+            source_has_commits=None,
             recorded_head_sha=leaf_merge_unit.head_sha if leaf_merge_unit is not None else None,
             on_warning=_LOG.warning,
         )
@@ -1015,7 +1113,7 @@ def collect_stale_unmerged_sweep_candidates(
     live_owner_ids = _collect_live_owner_ids_for_stale_dependency_links(store, indexes=indexes)
     candidates: list[StaleUnmergedSweepCandidate] = []
 
-    for owner_id, owner, owner_members, _root in _candidate_owner_rows(
+    for owner_id, owner, owner_members, _root, _owner_matches_owner_filter in _candidate_owner_rows(
         indexes,
         LineageOwnerQuery(limit=None, exclude_dropped_from_planning=True),
         owner_ids_filter=None,
@@ -1094,8 +1192,8 @@ def _candidate_owner_rows(
     *,
     owner_ids_filter: set[str] | None,
     task_ids_filter: set[str] | None,
-) -> tuple[tuple[str, DbTask, tuple[DbTask, ...], DbTask], ...]:
-    candidates: list[tuple[str, DbTask, tuple[DbTask, ...], DbTask]] = []
+) -> tuple[tuple[str, DbTask, tuple[DbTask, ...], DbTask, bool], ...]:
+    candidates: list[tuple[str, DbTask, tuple[DbTask, ...], DbTask, bool]] = []
     for owner_id, owner_members in indexes.members_by_owner_id.items():
         owner = indexes.task_by_id.get(owner_id)
         if owner is None:
@@ -1135,15 +1233,25 @@ def _candidate_owner_rows(
                     for task in indexes.skipped_same_branch_members_by_root_id.get(owner_id, ())
                     if task.id is not None
                 )
-        if owner_ids_filter is not None:
-            if owner_id not in owner_ids_filter:
-                continue
-        if task_ids_filter is not None and not member_matches_task_filter:
+        owner_matches_owner_filter = owner_ids_filter is not None and owner_id in owner_ids_filter
+        use_union_filter = query.selector_filter_mode == "union"
+        if owner_ids_filter is not None and task_ids_filter is None and not owner_matches_owner_filter:
+            continue
+        if task_ids_filter is not None and owner_ids_filter is None and not member_matches_task_filter:
+            continue
+        if (
+            owner_ids_filter is not None
+            and task_ids_filter is not None
+            and (
+                (use_union_filter and not owner_matches_owner_filter and not member_matches_task_filter)
+                or (not use_union_filter and (not owner_matches_owner_filter or not member_matches_task_filter))
+            )
+        ):
             continue
         root = indexes.root_by_task_id.get(owner.id or "", owner)
         if _is_broken_same_branch_owner(owner=owner, root=root):
             continue
-        candidates.append((owner_id, owner, tuple(owner_members), root))
+        candidates.append((owner_id, owner, tuple(owner_members), root, owner_matches_owner_filter))
     return tuple(candidates)
 
 
@@ -1297,9 +1405,11 @@ def _query_lineage_owner_rows_with_context(
     from .cli.advance_engine import determine_next_action, failed_recovery_decision_to_attention_action
     from .query import is_lineage_complete
     from .recovery_engine import (
+        _MergeContext,
         apply_pending_recovery_reconciliations,
         build_merge_context_from_git,
         decide_failed_task_recovery,
+        empty_task_requires_recovery,
         get_completed_recovery_descendant,
         get_completed_same_slice_sibling_attempt,
         get_completed_sibling_recovery,
@@ -1357,7 +1467,7 @@ def _query_lineage_owner_rows_with_context(
             git,
             branch_names=(
                 task.branch
-                for _owner_id, _owner, owner_members, _root in candidate_owner_rows
+                for _owner_id, _owner, owner_members, _root, _owner_matches_owner_filter in candidate_owner_rows
                 for task in owner_members
                 if task.branch
             ),
@@ -1366,7 +1476,112 @@ def _query_lineage_owner_rows_with_context(
         )
 
         rows: list[LineageOwnerRow] = []
-        for owner_id, owner, owner_members, root in candidate_owner_rows:
+
+        def _append_terminal_rerooted_failed_leaf_row(
+            *,
+            root: DbTask,
+            failed_leaf: DbTask,
+            owner_members: tuple[DbTask, ...],
+            drop_excluded_task_ids: frozenset[str],
+            recovery_merge_context: Any,
+        ) -> None:
+            max_recovery_attempts = query.max_recovery_attempts if query.max_recovery_attempts is not None else 1
+            decision = decide_failed_task_recovery(
+                store,
+                failed_leaf,
+                max_recovery_attempts=max_recovery_attempts,
+                merge_context=recovery_merge_context,
+                read_context=read_context,
+            )
+            attention_action = failed_recovery_decision_to_attention_action(
+                store,
+                failed_leaf,
+                decision,
+                max_recovery_attempts=max_recovery_attempts,
+                read_context=read_context,
+            )
+            recovery_action_task: DbTask | None = failed_leaf
+            recovery_leaf_task: DbTask | None = failed_leaf
+            planning_task: DbTask | None = recovery_action_task
+            action: dict[str, Any] | None = None
+            if decision.reason_code == "recovery_has_newer_unresolved_descendant":
+                active_recovery_task = (
+                    store.get(decision.recovery_task_id)
+                    if isinstance(decision.recovery_task_id, str) and decision.recovery_task_id
+                    else None
+                )
+                if active_recovery_task is None or active_recovery_task.status not in {"pending", "in_progress"}:
+                    return
+            if decision.action in {"resume", "retry"}:
+                recovery_action = {
+                    "type": decision.action,
+                    "description": decision.reason_text,
+                    "recovery_task_id": decision.recovery_task_id,
+                }
+                candidate = build_watch_progress_candidate(
+                    store,
+                    subject_task=failed_leaf,
+                    action=recovery_action,
+                    action_task=failed_leaf,
+                    failed_task=failed_leaf,
+                )
+                action = get_active_watch_no_progress_attention(store, candidate=candidate)
+            elif attention_action is not None:
+                action = attention_action
+
+            if action is None and config is not None and git is not None and target_branch:
+                action = determine_next_action(
+                    config,
+                    store,
+                    git,
+                    failed_leaf,
+                    target_branch,
+                    impl_based_on_ids=indexes.non_dropped_impl_source_ids,
+                    max_resume_attempts=query.max_recovery_attempts,
+                    persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+                    persist_review_clearance=persist_review_clearance,
+                    read_context=read_context,
+                )
+            lineage_status = _classify_lineage_status(action) if action is not None else "actionable"
+            if not query.include_skipped and lineage_status == "skipped":
+                return
+            if not _owner_matches_tag_filters(failed_leaf, query, tag_matcher=task_matches_tag_filters):
+                return
+
+            unresolved_tasks_for_row = (failed_leaf,)
+            tree, rendered_members = _build_owner_tree(
+                root_task=root,
+                owner_task=failed_leaf,
+                unresolved_tasks=unresolved_tasks_for_row,
+                based_on_children=indexes.based_on_children,
+                depends_on_children=indexes.depends_on_children,
+                drop_excluded_task_ids=drop_excluded_task_ids,
+            )
+            summaries = (
+                UnresolvedLeafSummary(
+                    task_id=failed_leaf.id or "unknown",
+                    status=failed_leaf.status,
+                    task_type=failed_leaf.task_type,
+                    reason=failed_leaf.failure_reason or failed_leaf.completion_reason,
+                ),
+            )
+            rows.append(
+                LineageOwnerRow(
+                    owner_task=failed_leaf,
+                    members=rendered_members or owner_members,
+                    tree=tree,
+                    lineage_status=lineage_status,
+                    next_action=action,
+                    next_action_reason=str(action.get("description", "")) if action is not None else "",
+                    unresolved_tasks=unresolved_tasks_for_row,
+                    unresolved_leaf_summary=summaries,
+                    lifecycle_action_task=None,
+                    recovery_action_task=planning_task,
+                    recovery_leaf_task=recovery_leaf_task,
+                )
+            )
+
+        for owner_id, owner, owner_members, root, owner_matches_owner_filter in candidate_owner_rows:
             merge_units_by_member = {
                 task.id: indexes.merge_units_by_task_id[task.id]
                 for task in owner_members
@@ -1379,11 +1594,33 @@ def _query_lineage_owner_rows_with_context(
             orphaned_same_branch_tasks: list[DbTask] = []
             skipped_same_branch_members = indexes.skipped_same_branch_members_by_root_id.get(owner_id, ())
             owner_merge_unit = _resolve_owner_merge_unit(owner, merge_units_by_member=merge_units_by_member)
+            terminal_owner_resolution = _owner_has_terminal_resolution_for_incomplete_display(
+                owner,
+                merge_units_by_task_id=merge_units_by_member,
+            )
+            owner_recovery_merge_context = (
+                read_context.merge_context if isinstance(read_context.merge_context, _MergeContext) else None
+            )
+            if (
+                terminal_owner_resolution
+                and owner.status == "failed"
+                and owner_merge_unit is not None
+                and effective_no_work_merge_state(owner, owner_merge_unit.state) in {"empty", "redundant"}
+                and empty_task_requires_recovery(
+                    store,
+                    owner,
+                    merge_state=effective_no_work_merge_state(owner, owner_merge_unit.state),
+                    merge_context=owner_recovery_merge_context,
+                    read_context=read_context,
+                )
+            ):
+                terminal_owner_resolution = False
 
             merged_owner_branch = any(
                 _task_is_effectively_merged(task, merge_units_by_task_id=merge_units_by_member)
                 for task in owner_members
             )
+            owner_scope_matches_all_members = owner_matches_owner_filter and not terminal_owner_resolution
 
             for task in sorted(owner_members, key=lambda item: (_task_event_time(item), task_id_numeric_key(item.id))):
                 if task.id is None:
@@ -1398,7 +1635,7 @@ def _query_lineage_owner_rows_with_context(
                 ):
                     continue
                 merge_unit = merge_units_by_member.get(task.id)
-                matches = _matches_task_filters(
+                matches = owner_scope_matches_all_members or _matches_task_filters(
                     task,
                     query,
                     tag_matcher=task_matches_tag_filters,
@@ -1457,11 +1694,13 @@ def _query_lineage_owner_rows_with_context(
                         continue
                     keep_failed_leaf_visible = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
                         failed_task=task,
+                        completed_owner=owner,
                         owner_merge_unit=owner_merge_unit,
                         leaf_merge_unit=merge_unit,
                         git=git,
+                        target_branch=target_branch,
                     )
-                    if task.id == owner.id and task.id in visible_failed_ids:
+                    if task.id == owner.id and task.id in visible_failed_ids and not terminal_owner_resolution:
                         keep_failed_leaf_visible = True
                     if merged_owner_branch and not keep_failed_leaf_visible:
                         continue
@@ -1552,10 +1791,81 @@ def _query_lineage_owner_rows_with_context(
                     )
                 )
             )
-            resolved_in_query = (
-                any(reason == "recovery_chain_completed" for reason in resolution.reasons)
-                or ("branch_merged" in resolution.reasons and not failed_leaves)
-                or ("lineage_complete" in resolution.reasons and not has_unimplemented_source and not unresolved_tasks)
+            owner_merge_state = _task_effective_merge_state(
+                owner,
+                merge_units_by_task_id=merge_units_by_member,
+            )
+            rerootable_failed_leaves = (
+                [
+                    task
+                    for task in matching_failed_leaves
+                    if not (
+                        query.owner_task_ids is not None
+                        and query.task_ids is None
+                        and not task.same_branch
+                    )
+                    and _failed_leaf_should_surface_apart_from_completed_owner(
+                        failed_task=task,
+                        completed_owner=owner,
+                        owner_merge_unit=owner_merge_unit,
+                        leaf_merge_unit=merge_units_by_member.get(task.id or ""),
+                        git=git,
+                        target_branch=target_branch,
+                    )
+                ]
+                if terminal_owner_resolution
+                else []
+            )
+            rerooted_failed_owner = (
+                max(rerootable_failed_leaves, key=lambda task: (_task_event_time(task), task_id_numeric_key(task.id)))
+                if rerootable_failed_leaves
+                else None
+            )
+            if terminal_owner_resolution:
+                if rerooted_failed_owner is None and not has_empty_prereq_blocked_pending:
+                    continue
+                if rerootable_failed_leaves:
+                    recovery_merge_context = None
+                    if reuse_recovery_merge_context:
+                        from .recovery_engine import _MergeContext
+
+                        if isinstance(read_context.merge_context, _MergeContext):
+                            recovery_merge_context = read_context.merge_context
+                    for failed_leaf in sorted(
+                        rerootable_failed_leaves,
+                        key=lambda task: (_task_event_time(task), task_id_numeric_key(task.id)),
+                    ):
+                        _append_terminal_rerooted_failed_leaf_row(
+                            root=root,
+                            failed_leaf=failed_leaf,
+                            owner_members=tuple(owner_members),
+                            drop_excluded_task_ids=drop_excluded_task_ids,
+                            recovery_merge_context=recovery_merge_context,
+                        )
+                    continue
+                terminal_owner_id = owner.id
+                rerootable_failed_leaf_ids = {
+                    task.id for task in rerootable_failed_leaves if task.id is not None
+                }
+                unresolved_tasks = [
+                    task
+                    for task in unresolved_tasks
+                    if task.id in rerootable_failed_leaf_ids or task.id != terminal_owner_id
+                ]
+                matching_failed_leaves = [
+                    task for task in matching_failed_leaves if task.id in rerootable_failed_leaf_ids
+                ]
+            resolved_in_query = any(
+                reason == "recovery_chain_completed"
+                for reason in resolution.reasons
+            ) or (
+                "branch_merged" in resolution.reasons
+                and (not failed_leaves or (terminal_owner_resolution and not rerootable_failed_leaves))
+                and (owner_merge_state != "merged" or terminal_owner_resolution)
+            ) or (
+                "lineage_complete" in resolution.reasons
+                and not has_unimplemented_source
+                and not unresolved_tasks
             )
             if resolved_in_query:
                 continue
@@ -1601,7 +1911,13 @@ def _query_lineage_owner_rows_with_context(
                     read_context=read_context,
                 )
                 if decision.reason_code == "recovery_has_newer_unresolved_descendant":
-                    continue
+                    active_recovery_task = (
+                        store.get(decision.recovery_task_id)
+                        if isinstance(decision.recovery_task_id, str) and decision.recovery_task_id
+                        else None
+                    )
+                    if active_recovery_task is None or active_recovery_task.status not in {"pending", "in_progress"}:
+                        continue
                 if failed_task.task_type == "improve" and lifecycle_action_task is not None:
                     continue
                 if decision.action != "skip" or attention_action is not None:
@@ -1704,12 +2020,13 @@ def _query_lineage_owner_rows_with_context(
             lineage_status = _classify_lineage_status(action) if action is not None else "actionable"
             if not query.include_skipped and lineage_status == "skipped":
                 continue
-            if not _owner_matches_tag_filters(owner, query, tag_matcher=task_matches_tag_filters):
+            row_owner = rerooted_failed_owner or owner
+            if not _owner_matches_tag_filters(row_owner, query, tag_matcher=task_matches_tag_filters):
                 continue
 
             tree, rendered_members = _build_owner_tree(
                 root_task=root,
-                owner_task=owner,
+                owner_task=row_owner,
                 unresolved_tasks=tuple(unresolved_tasks),
                 based_on_children=indexes.based_on_children,
                 depends_on_children=indexes.depends_on_children,
@@ -1726,7 +2043,7 @@ def _query_lineage_owner_rows_with_context(
                 if task.id is not None
             )
             base_row = LineageOwnerRow(
-                owner_task=owner,
+                owner_task=row_owner,
                 members=rendered_members,
                 tree=tree,
                 lineage_status=lineage_status,

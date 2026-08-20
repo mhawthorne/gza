@@ -60,6 +60,7 @@ from gza.cli.watch import (
     SCOPED_WATCH_COMPLETE_MESSAGE,
     WatchSlotAllocation,
     _active_failure_backoff_owner_ids,
+    _build_watch_cycle_plan,
     _collect_advance_completed_tasks,
     _collect_completed_transition_ids,
     _collect_live_running_state,
@@ -874,6 +875,67 @@ def test_watch_query_owner_rows_uses_one_read_session_connection(
 
     assert [row.owner_task.id for row in rows] == [failed.id]
     assert len([conn for close_on_exit, conn in opened_connections if close_on_exit is False]) == 1
+
+
+def test_watch_query_owner_rows_keeps_same_branch_failed_leaf_with_live_unmerged_work(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    branch = "feature/watch-live-sidequest-work"
+
+    owner = store.add("Watch merged owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    owner.branch = branch
+    owner.completed_at = datetime(2026, 5, 18, 9, 0, tzinfo=UTC)
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed = store.add("Watch failed improve with live work", task_type="improve", based_on=owner.id, same_branch=True)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "WORKER_DIED"
+    failed.has_commits = True
+    failed.branch = branch
+    failed.completed_at = datetime(2026, 5, 18, 10, 0, tzinfo=UTC)
+    store.update(failed)
+    store.attach_task_to_merge_unit(failed.id, owner_unit.id, "improve")
+
+    git = _make_watch_git()
+    git.local_branch_names = MagicMock(return_value=frozenset({"main", branch}))  # type: ignore[method-assign]
+
+    rows, _ = _query_owner_rows_with_context(
+        store=store,
+        config=config,
+        git=git,
+        target_branch="main",
+        max_recovery_attempts=config.max_resume_attempts,
+        include_skipped=True,
+    )
+    scoped_rows, _ = _query_owner_rows_with_context(
+        store=store,
+        config=config,
+        git=git,
+        target_branch="main",
+        task_ids=(failed.id,),
+        selector_filter_mode="union",
+        max_recovery_attempts=config.max_resume_attempts,
+        include_skipped=True,
+    )
+
+    assert [row.owner_task.id for row in rows] == [failed.id]
+    assert [row.owner_task.id for row in scoped_rows] == [failed.id]
+    assert all(row.recovery_leaf_task is not None and row.recovery_leaf_task.id == failed.id for row in rows + scoped_rows)
 
 
 def test_watch_query_owner_rows_flushes_prerequisite_reconciliation_after_read_session(
@@ -1964,7 +2026,8 @@ def test_watch_cycle_plain_mode_batch_one_defaults_to_recovery_first(tmp_path: P
         assert isinstance(prepared_child_id, str)
         assert spawned_task.id == prepared_child_id
     assert store.get(pending_impl.id).status == "pending"
-    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    log_path = tmp_path / ".gza" / "watch.log"
+    log_text = log_path.read_text() if log_path.exists() else ""
     assert result.expected_starts == {}
     assert result.confirmed_start_count == 1
     assert "RECOVR" not in log_text
@@ -2876,7 +2939,8 @@ def test_watch_cycle_restart_failed_terminalizes_dead_pending_retry_child_before
     assert refreshed_retry_child.status == "failed"
     assert refreshed_retry_child.failure_reason == "NO_ACTIVITY"
     assert spawn_iterate.call_count == 0
-    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    log_path = tmp_path / ".gza" / "watch.log"
+    log_text = log_path.read_text() if log_path.exists() else ""
     assert "BACKOFF" in log_text
     assert f"{failed.id} retry delayed" in log_text
 
@@ -37677,11 +37741,1048 @@ def test_cmd_watch_restart_failed_dry_run_suppresses_failed_sidequests_with_merg
     assert "resolved_by_merged_target" not in stdout
 
 
-def test_cmd_watch_restart_failed_dry_run_keeps_failed_descendant_visible_under_completed_non_recovery_ancestor(
+@pytest.mark.parametrize("selected_index", (0, 1))
+def test_watch_scoped_distinct_legacy_leaf_selects_only_named_leaf(
+    tmp_path: Path,
+    selected_index: int,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Merged owner with scoped distinct leaves", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/scoped-distinct-owner"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    owner.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(owner)
+
+    leaves: list[DbTask] = []
+    for index, task_type in enumerate(("improve", "rebase")):
+        leaf = store.add(f"Distinct failed {task_type}", task_type=task_type, based_on=owner.id)
+        assert leaf.id is not None
+        leaf.status = "failed"
+        leaf.failure_reason = f"FAILED_{index}"
+        leaf.branch = f"feature/scoped-distinct-leaf-{index}"
+        leaf.has_commits = True
+        leaf.completed_at = datetime(2026, 4, 28, 10, 1 + index, 0, tzinfo=UTC)
+        store.update(leaf)
+        leaves.append(leaf)
+
+    selected = leaves[selected_index]
+    excluded = leaves[1 - selected_index]
+    scoped_owner_ids = watch_module._resolve_watch_scope_owner_ids(
+        store,
+        (str(selected.id),),
+        max_recovery_attempts=1,
+        config=config,
+    )
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        plan = _build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=(str(selected.id),),
+        )
+
+    assert scoped_owner_ids == (selected.id,)
+    assert [row.owner_task.id for row in plan.analysis.owner_rows] == [selected.id]
+    row = plan.analysis.owner_rows[0]
+    assert row.recovery_leaf_task is not None
+    assert row.recovery_leaf_task.id == selected.id
+    assert [task.id for task in row.unresolved_tasks] == [selected.id]
+    assert excluded.id not in {task.id for task in row.members}
+
+
+def test_watch_scoped_forked_failed_rebase_without_merge_unit_remains_selectable(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Merged owner before forked rebase", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/forked-rebase-owner"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    owner.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(owner)
+
+    failed_rebase = store.add("Forked failed rebase", task_type="rebase", based_on=owner.id)
+    assert failed_rebase.id is not None
+    failed_rebase.status = "failed"
+    failed_rebase.failure_reason = "GIT_ERROR"
+    failed_rebase.branch = "feature/forked-rebase-leaf"
+    failed_rebase.has_commits = True
+    failed_rebase.completed_at = datetime(2026, 4, 28, 10, 1, 0, tzinfo=UTC)
+    store.update(failed_rebase)
+
+    scoped_owner_ids = watch_module._resolve_watch_scope_owner_ids(
+        store,
+        (str(failed_rebase.id),),
+        max_recovery_attempts=1,
+        config=config,
+    )
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        plan = _build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=(str(failed_rebase.id),),
+        )
+
+    assert scoped_owner_ids == (failed_rebase.id,)
+    assert [row.owner_task.id for row in plan.analysis.owner_rows] == [failed_rebase.id]
+
+
+def test_cmd_watch_scoped_same_unit_failed_leaf_under_merged_owner_exits_without_sleep(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Merged owner with same-unit failed review", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/scoped-same-unit-owner"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    owner.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(owner)
+
+    failed_review = store.add("Same-unit failed review", task_type="review", based_on=owner.id, depends_on=owner.id)
+    assert failed_review.id is not None
+    failed_review.status = "failed"
+    failed_review.failure_reason = "WORKER_DIED"
+    failed_review.branch = owner.branch
+    failed_review.has_commits = False
+    failed_review.completed_at = datetime(2026, 4, 28, 10, 1, 0, tzinfo=UTC)
+    store.update(failed_review)
+
+    pending_retry = store.add(
+        "Pending retry for historical review",
+        task_type="review",
+        based_on=failed_review.id,
+        recovery_origin="retry",
+    )
+    assert pending_retry.id is not None
+    pending_retry.status = "pending"
+    pending_retry.branch = owner.branch
+    store.update(pending_retry)
+
+    running_resume = store.add(
+        "Running resume for historical review",
+        task_type="review",
+        based_on=failed_review.id,
+        recovery_origin="resume",
+    )
+    assert running_resume.id is not None
+    running_resume.status = "in_progress"
+    running_resume.branch = owner.branch
+    store.update(running_resume)
+    WorkerRegistry(config.workers_path).register(
+        WorkerMetadata(
+            worker_id="w-scoped-same-unit-running-recovery",
+            task_id=running_resume.id,
+            pid=os.getpid(),
+            started_at=datetime.now(UTC).isoformat(),
+            status="running",
+            startup_log_file=".gza/workers/w-scoped-same-unit-running-recovery.startup.log",
+        )
+    )
+
+    failed_sibling = store.add("Distinct failed rebase sibling", task_type="rebase", based_on=owner.id)
+    assert failed_sibling.id is not None
+    failed_sibling.status = "failed"
+    failed_sibling.failure_reason = "GIT_ERROR"
+    failed_sibling.branch = "feature/scoped-same-unit-distinct-sibling"
+    failed_sibling.has_commits = True
+    failed_sibling.completed_at = datetime(2026, 4, 28, 10, 2, 0, tzinfo=UTC)
+    store.update(failed_sibling)
+
+    scoped_owner_ids = watch_module._resolve_watch_scope_owner_ids(
+        store,
+        (str(failed_review.id),),
+        max_recovery_attempts=1,
+        config=config,
+    )
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        active_count = watch_module._scoped_watch_active_count(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=(str(failed_review.id),),
+        )
+        plan = _build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=(str(failed_review.id),),
+        )
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_ids=[failed_review.id],
+        batch=1,
+        poll=5,
+        max_idle=None,
+        max_iterations=10,
+        restart_failed=False,
+        restart_failed_batch=None,
+        max_resume_attempts=None,
+        dry_run=False,
+        show_skipped=False,
+        quiet=True,
+        yes=True,
+        resumed_reexec=False,
+        tags=None,
+        any_tag=False,
+        all_tags=False,
+        auto_restart_on_drift=True,
+    )
+
+    assert scoped_owner_ids == (owner.id,)
+    assert active_count == 0
+    assert plan.analysis.owner_rows == ()
+    assert plan.analysis.recovery_rows == ()
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._sleep_interruptibly") as sleep,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    sleep.assert_not_called()
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert SCOPED_WATCH_COMPLETE_MESSAGE in log_text
+    assert failed_sibling.id not in log_text
+    assert pending_retry.id not in log_text
+
+
+def test_watch_scoped_terminal_merged_owner_does_not_select_distinct_failed_descendant(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Merged owner with explicit scope", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/scoped-terminal-owner"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    owner.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(owner)
+
+    failed_leaf = store.add("Distinct failed descendant", task_type="rebase", based_on=owner.id)
+    assert failed_leaf.id is not None
+    failed_leaf.status = "failed"
+    failed_leaf.failure_reason = "GIT_ERROR"
+    failed_leaf.branch = "feature/scoped-terminal-owner-distinct-leaf"
+    failed_leaf.has_commits = True
+    failed_leaf.completed_at = datetime(2026, 4, 28, 10, 1, 0, tzinfo=UTC)
+    store.update(failed_leaf)
+
+    scoped_owner_ids = watch_module._resolve_watch_scope_owner_ids(
+        store,
+        (str(owner.id),),
+        max_recovery_attempts=1,
+        config=config,
+    )
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        plan = _build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=(str(owner.id),),
+    )
+
+    assert scoped_owner_ids == (owner.id,)
+    assert plan.analysis.owner_rows == ()
+
+
+@pytest.mark.parametrize("recovery_status", ("pending", "in_progress"))
+def test_watch_scoped_distinct_leaf_active_until_own_recovery_resolves(
+    tmp_path: Path,
+    recovery_status: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Merged owner with recoverable distinct leaf", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/scoped-recovery-owner"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    owner.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(owner)
+
+    failed_leaf = store.add("Distinct failed improve", task_type="improve", based_on=owner.id)
+    assert failed_leaf.id is not None
+    failed_leaf.status = "failed"
+    failed_leaf.failure_reason = "WORKER_DIED"
+    failed_leaf.branch = "feature/scoped-recovery-leaf"
+    failed_leaf.has_commits = True
+    failed_leaf.completed_at = datetime(2026, 4, 28, 10, 1, 0, tzinfo=UTC)
+    store.update(failed_leaf)
+
+    recovery = store.add(
+        "Pending recovered distinct improve",
+        task_type="improve",
+        based_on=failed_leaf.id,
+        recovery_origin="retry",
+    )
+    assert recovery.id is not None
+    recovery.status = recovery_status
+    recovery.branch = failed_leaf.branch
+    store.update(recovery)
+    recovery_worker_id = "w-scoped-distinct-running-recovery"
+    if recovery_status == "in_progress":
+        WorkerRegistry(config.workers_path).register(
+            WorkerMetadata(
+                worker_id=recovery_worker_id,
+                task_id=recovery.id,
+                pid=os.getpid(),
+                started_at=datetime.now(UTC).isoformat(),
+                status="running",
+                startup_log_file=f".gza/workers/{recovery_worker_id}.startup.log",
+            )
+        )
+
+    scoped_owner_ids = watch_module._resolve_watch_scope_owner_ids(
+        store,
+        (str(failed_leaf.id),),
+        max_recovery_attempts=1,
+        config=config,
+    )
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        active_before = watch_module._scoped_watch_active_count(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=(str(failed_leaf.id),),
+        )
+
+        log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+        cycle = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+            recovery_slots=1,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=(str(failed_leaf.id),),
+        )
+
+    assert active_before == 1
+    assert cycle.scoped_active == 1
+    assert cycle.scoped_done is False
+
+    if recovery_status == "in_progress":
+        WorkerRegistry(config.workers_path).remove(recovery_worker_id)
+    store.mark_completed(
+        recovery,
+        has_commits=True,
+        branch=failed_leaf.branch,
+    )
+    completed_recovery = store.get(recovery.id)
+    assert completed_recovery is not None
+    recovery_unit = store.resolve_merge_unit_for_task(recovery.id)
+    assert recovery_unit is not None
+    assert recovery_unit.state == "unmerged"
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        active_after = watch_module._scoped_watch_active_count(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=(str(failed_leaf.id),),
+        )
+        plan_after = _build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=(str(failed_leaf.id),),
+        )
+
+    planned_ids = {
+        row.lifecycle_action_task.id
+        for row in plan_after.analysis.lifecycle_rows
+        if row.lifecycle_action_task is not None
+    }
+    assert active_after == 1
+    assert recovery.id in planned_ids
+
+
+def test_watch_scoped_distinct_leaf_counts_deeper_running_recovery_descendant(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Merged owner with deeper recovery", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/scoped-deeper-owner"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    owner.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(owner)
+
+    failed_leaf = store.add("Distinct failed improve", task_type="improve", based_on=owner.id)
+    assert failed_leaf.id is not None
+    failed_leaf.status = "failed"
+    failed_leaf.failure_reason = "WORKER_DIED"
+    failed_leaf.branch = "feature/scoped-deeper-leaf"
+    failed_leaf.has_commits = True
+    failed_leaf.completed_at = datetime(2026, 4, 28, 10, 1, 0, tzinfo=UTC)
+    store.update(failed_leaf)
+
+    failed_retry = store.add(
+        "Failed retry",
+        task_type="improve",
+        based_on=failed_leaf.id,
+        recovery_origin="retry",
+    )
+    assert failed_retry.id is not None
+    failed_retry.status = "failed"
+    failed_retry.failure_reason = "WORKER_DIED"
+    failed_retry.branch = failed_leaf.branch
+    store.update(failed_retry)
+
+    running_resume = store.add(
+        "Running resume",
+        task_type="improve",
+        based_on=failed_retry.id,
+        recovery_origin="resume",
+    )
+    assert running_resume.id is not None
+    running_resume.status = "in_progress"
+    running_resume.branch = failed_leaf.branch
+    store.update(running_resume)
+    WorkerRegistry(config.workers_path).register(
+        WorkerMetadata(
+            worker_id="w-scoped-recovery-running",
+            task_id=running_resume.id,
+            pid=os.getpid(),
+            started_at=datetime.now(UTC).isoformat(),
+            status="running",
+            startup_log_file=".gza/workers/w-scoped-recovery-running.startup.log",
+        )
+    )
+
+    scoped_owner_ids = watch_module._resolve_watch_scope_owner_ids(
+        store,
+        (str(failed_leaf.id),),
+        max_recovery_attempts=1,
+        config=config,
+    )
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        active = watch_module._scoped_watch_active_count(
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=(str(failed_leaf.id),),
+        )
+        cycle = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            recovery_slots=1,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=(str(failed_leaf.id),),
+        )
+
+    assert active == 1
+    assert cycle.scoped_active == 1
+    assert cycle.scoped_done is False
+
+
+def test_watch_scoped_distinct_leaf_recovery_closure_does_not_inflate_other_selector(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    first_owner = store.add("Merged owner with active recovery", task_type="implement")
+    second_owner = store.add("Merged owner without active recovery", task_type="implement")
+    for index, owner in enumerate((first_owner, second_owner), start=1):
+        assert owner.id is not None
+        owner.status = "completed"
+        owner.branch = f"feature/scoped-two-owner-{index}"
+        owner.has_commits = True
+        owner.merge_status = "merged"
+        owner.completed_at = datetime(2026, 4, 28, 10, index, 0, tzinfo=UTC)
+        store.update(owner)
+
+    active_leaf = store.add("Active failed improve", task_type="improve", based_on=first_owner.id)
+    inactive_leaf = store.add("Inactive failed improve", task_type="improve", based_on=second_owner.id)
+    for owner, leaf in ((first_owner, active_leaf), (second_owner, inactive_leaf)):
+        assert leaf.id is not None
+        leaf.status = "failed"
+        leaf.failure_reason = "WORKER_DIED"
+        leaf.branch = f"feature/scoped-two-leaf-{owner.id}"
+        leaf.has_commits = True
+        leaf.completed_at = datetime(2026, 4, 28, 10, 5, 0, tzinfo=UTC)
+        store.update(leaf)
+
+    recovery = store.add(
+        "Only first recovery",
+        task_type="improve",
+        based_on=active_leaf.id,
+        recovery_origin="retry",
+    )
+    assert recovery.id is not None
+    recovery.status = "pending"
+    recovery.branch = active_leaf.branch
+    store.update(recovery)
+
+    inactive_recovery = store.add(
+        "Inactive completed recovery",
+        task_type="improve",
+        based_on=inactive_leaf.id,
+        recovery_origin="retry",
+    )
+    assert inactive_recovery.id is not None
+    store.mark_completed(inactive_recovery, has_commits=False)
+
+    scoped_task_ids = (str(active_leaf.id), str(inactive_leaf.id))
+    scoped_owner_ids = watch_module._resolve_watch_scope_owner_ids(
+        store,
+        scoped_task_ids,
+        max_recovery_attempts=1,
+        config=config,
+    )
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        active_count = watch_module._scoped_watch_active_count(
+            config=config,
+            store=store,
+            batch=2,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+        )
+
+    assert scoped_owner_ids == (active_leaf.id, second_owner.id)
+    assert active_count == 1
+
+
+@pytest.mark.parametrize("leaf_task_type", ("improve", "rebase", "review", "fix"))
+def test_watch_scoped_stale_same_unit_leaf_live_reroot_keeps_scope_active(
+    tmp_path: Path,
+    leaf_task_type: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Merged owner with stale failed leaves", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/scoped-stale-owner"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    owner.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="owner-head",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    selected_leaf = store.add(f"Selected failed {leaf_task_type}", task_type=leaf_task_type, based_on=owner.id)
+    sibling_leaf = store.add(f"Sibling failed {leaf_task_type}", task_type=leaf_task_type, based_on=owner.id)
+    for index, leaf in enumerate((selected_leaf, sibling_leaf), start=1):
+        assert leaf.id is not None
+        leaf.status = "failed"
+        leaf.failure_reason = "WORKER_DIED"
+        leaf.branch = f"feature/scoped-stale-leaf-{index}"
+        leaf.has_commits = False
+        leaf.completed_at = datetime(2026, 4, 28, 10, index, 0, tzinfo=UTC)
+        store.update(leaf)
+        store.attach_task_to_merge_unit(leaf.id, owner_unit.id, "contributor")
+
+    selected_recovery = store.add(
+        "Selected pending retry",
+        task_type=leaf_task_type,
+        based_on=selected_leaf.id,
+        recovery_origin="retry",
+    )
+    sibling_recovery = store.add(
+        "Sibling pending retry",
+        task_type=leaf_task_type,
+        based_on=sibling_leaf.id,
+        recovery_origin="retry",
+    )
+    for leaf, recovery in ((selected_leaf, selected_recovery), (sibling_leaf, sibling_recovery)):
+        assert recovery.id is not None
+        recovery.status = "pending"
+        recovery.branch = leaf.branch
+        store.update(recovery)
+
+    class _LiveUnmergedLeafGit(Git):
+        def __init__(self, repo_dir: Path | None = None) -> None:
+            self.repo_dir = repo_dir or tmp_path
+            self._cache = None
+
+        def default_branch(self) -> str:
+            return "main"
+
+        def current_branch(self) -> str:
+            return "main"
+
+        def local_branch_names(self) -> frozenset[str]:  # type: ignore[override]
+            return frozenset({"main", str(selected_leaf.branch), str(sibling_leaf.branch)})
+
+        def branch_exists(self, branch: str) -> bool:
+            return branch in self.local_branch_names()
+
+        def branches_exist(self, branches: object) -> dict[str, bool]:
+            if not isinstance(branches, (tuple, list, set, frozenset)):
+                return {}
+            return {str(branch): self.branch_exists(str(branch)) for branch in branches}
+
+        def ref_exists(self, ref: str) -> bool:
+            return ref in self.local_branch_names()
+
+        def worktree_list(self) -> list[dict[str, str]]:
+            return [{"path": str(self.repo_dir)}]
+
+        def can_merge(self, source_branch: str, target_branch: str) -> bool:
+            del source_branch, target_branch
+            return True
+
+        def resolve_fresh_merge_source(self, branch: str, **_kwargs: object):
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch if self.branch_exists(branch) else None)
+
+        def resolve_refs(self, refs: object, *, peel: str = "commit") -> dict[str, str | None]:
+            del peel
+            if not isinstance(refs, (tuple, list, set, frozenset)):
+                return {}
+            return {str(ref): self.rev_parse_if_exists(str(ref)) for ref in refs}
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:  # type: ignore[override]
+            if ref in {"main", "main^{commit}"}:
+                return "main-sha"
+            if ref == selected_leaf.branch:
+                return "selected-sha"
+            if ref == sibling_leaf.branch:
+                return "sibling-sha"
+            return None
+
+        def merge_base(self, ref1: str, ref2: str) -> str:  # type: ignore[override]
+            del ref1, ref2
+            return "main-sha"
+
+        def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:  # type: ignore[override]
+            del branch, into, use_cherry
+            return False
+
+        def count_commits_ahead(self, source_ref: str, target_ref: str) -> int:  # type: ignore[override]
+            del source_ref, target_ref
+            return 1
+
+        def count_commits_ahead_checked(self, source_ref: str, target_ref: str) -> int | None:  # type: ignore[override]
+            del source_ref, target_ref
+            return 1
+
+        def has_non_empty_source_diff_against_target(self, source_ref: str, target_ref: str) -> bool | None:  # type: ignore[override]
+            del source_ref, target_ref
+            return True
+
+        def get_diff_name_status(
+            self,
+            revision_range: str,
+            paths: tuple[str, ...] | list[str] = (),
+            *,
+            check: bool = False,
+        ) -> str:  # type: ignore[override]
+            del revision_range, paths, check
+            return "M\tfeature.txt\n"
+
+    raw_scope = (str(selected_leaf.id),)
+    scoped_owner_ids = watch_module._resolve_watch_scope_owner_ids(
+        store,
+        raw_scope,
+        max_recovery_attempts=1,
+        config=config,
+    )
+    assert scoped_owner_ids == (owner.id,)
+
+    live_git = _LiveUnmergedLeafGit(tmp_path)
+    scoped_closure = watch_module._scoped_selector_recovery_closure_by_owner(
+        store=store,
+        scoped_owner_ids=scoped_owner_ids,
+        scoped_task_ids=raw_scope,
+        config=config,
+        git=live_git,
+        target_branch="main",
+        max_recovery_attempts=1,
+    )
+    assert scoped_closure == {owner.id: frozenset({selected_leaf.id, selected_recovery.id})}
+
+    def fake_git_subprocess_run(args: object, **_kwargs: object) -> SimpleNamespace:
+        if (
+            isinstance(args, (tuple, list))
+            and len(args) == 4
+            and Path(str(args[0])).name == "git"
+            and tuple(args[1:]) == ("worktree", "list", "--porcelain")
+        ):
+            return SimpleNamespace(
+                args=args,
+                returncode=0,
+                stdout=f"worktree {tmp_path}\nHEAD main-sha\nbranch refs/heads/main\n\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected git subprocess: {args!r}")
+
+    with (
+        patch("gza.cli.watch.Git", side_effect=lambda *_args, **_kwargs: _LiveUnmergedLeafGit(tmp_path)),
+        patch("gza.git.subprocess.run", side_effect=fake_git_subprocess_run),
+    ):
+        plan = _build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=2,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=raw_scope,
+        )
+        cycle = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=1,
+            dry_run=True,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            recovery_slots=1,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=raw_scope,
+        )
+
+    assert [row.owner_task.id for row in plan.analysis.owner_rows] == [selected_leaf.id]
+    assert [row.owner_task.id for row in plan.analysis.recovery_rows] == [selected_leaf.id]
+    assert sibling_leaf.id not in {row.owner_task.id for row in plan.analysis.owner_rows}
+    assert sibling_recovery.id not in plan.analysis.pending_recovery_task_ids
+    assert cycle.scoped_active == 1
+    assert cycle.scoped_done is False
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_ids=[str(selected_leaf.id)],
+        batch=2,
+        poll=5,
+        max_idle=None,
+        max_iterations=1,
+        restart_failed=False,
+        restart_failed_batch=None,
+        max_resume_attempts=1,
+        dry_run=True,
+        show_skipped=False,
+        quiet=True,
+        yes=True,
+        resumed_reexec=False,
+        tags=None,
+        any_tag=False,
+        auto_restart_on_drift=True,
+    )
+    with (
+        patch("gza.cli.watch.Git", side_effect=lambda *_args, **_kwargs: _LiveUnmergedLeafGit(tmp_path)),
+        patch("gza.git.subprocess.run", side_effect=fake_git_subprocess_run),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        assert cmd_watch(args) == 0
+
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert SCOPED_WATCH_COMPLETE_MESSAGE not in log_text
+
+
+def _setup_scoped_distinct_leaf_with_recovery_sibling(
+    tmp_path: Path,
+) -> tuple[Config, SqliteTaskStore, DbTask, DbTask, DbTask, DbTask, DbTask, tuple[str, ...]]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Merged owner with selected recovery", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.branch = "feature/scoped-selected-owner"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    owner.completed_at = datetime(2026, 4, 28, 10, 0, 0, tzinfo=UTC)
+    store.update(owner)
+
+    selected_leaf = store.add("Selected failed improve", task_type="improve", based_on=owner.id)
+    sibling_leaf = store.add("Sibling failed improve", task_type="improve", based_on=owner.id)
+    for index, leaf in enumerate((selected_leaf, sibling_leaf), start=1):
+        assert leaf.id is not None
+        leaf.status = "failed"
+        leaf.failure_reason = "WORKER_DIED"
+        leaf.branch = f"feature/scoped-selected-leaf-{index}"
+        leaf.has_commits = True
+        leaf.completed_at = datetime(2026, 4, 28, 10, index, 0, tzinfo=UTC)
+        store.update(leaf)
+
+    selected_recovery = store.add(
+        "Selected pending retry",
+        task_type="improve",
+        based_on=selected_leaf.id,
+        recovery_origin="retry",
+    )
+    sibling_recovery = store.add(
+        "Sibling pending retry",
+        task_type="improve",
+        based_on=sibling_leaf.id,
+        recovery_origin="retry",
+    )
+    for leaf, recovery in ((selected_leaf, selected_recovery), (sibling_leaf, sibling_recovery)):
+        assert recovery.id is not None
+        recovery.status = "pending"
+        recovery.branch = leaf.branch
+        store.update(recovery)
+
+    scoped_owner_ids = watch_module._resolve_watch_scope_owner_ids(
+        store,
+        (str(selected_leaf.id),),
+        max_recovery_attempts=1,
+        config=config,
+    )
+    assert scoped_owner_ids == (selected_leaf.id,)
+    return config, store, owner, selected_leaf, selected_recovery, sibling_leaf, sibling_recovery, scoped_owner_ids
+
+
+def test_watch_scoped_distinct_leaf_dispatches_existing_pending_recovery_without_sibling(
+    tmp_path: Path,
+) -> None:
+    (
+        config,
+        store,
+        _owner,
+        selected_leaf,
+        selected_recovery,
+        _sibling_leaf,
+        sibling_recovery,
+        scoped_owner_ids,
+    ) = _setup_scoped_distinct_leaf_with_recovery_sibling(tmp_path)
+
+    launched_task_ids: list[str] = []
+
+    def spawn_worker(*_args: object, **kwargs: object) -> int:
+        task_id = str(kwargs["task_id"])
+        launched_task_ids.append(task_id)
+        assert task_id == selected_recovery.id
+        _mark_watch_task_running(store, task_id)
+        return 0
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch(
+            "gza.cli.advance_engine.determine_next_action",
+            return_value={"type": "retry", "description": "reuse pending retry"},
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=spawn_worker),
+    ):
+        cycle = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            recovery_slots=1,
+            max_recovery_attempts=1,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=(str(selected_leaf.id),),
+        )
+
+    assert launched_task_ids == [selected_recovery.id]
+    assert cycle.work_done is True
+    assert cycle.confirmed_start_count == 1
+    assert store.get(selected_recovery.id).status == "in_progress"  # type: ignore[union-attr]
+    assert store.get(sibling_recovery.id).status == "pending"  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("transition", ("start", "complete", "fail"))
+def test_watch_scoped_distinct_leaf_recovery_transitions_exclude_sibling(
+    tmp_path: Path,
+    transition: str,
+) -> None:
+    (
+        config,
+        store,
+        _owner,
+        selected_leaf,
+        selected_recovery,
+        _sibling_leaf,
+        sibling_recovery,
+        scoped_owner_ids,
+    ) = _setup_scoped_distinct_leaf_with_recovery_sibling(tmp_path)
+
+    old_snapshot = _task_snapshot(store)
+    if transition == "start":
+        _mark_watch_task_running(store, selected_recovery.id)
+        _mark_watch_task_running(store, sibling_recovery.id)
+    elif transition == "complete":
+        store.mark_completed(selected_recovery, has_commits=True, branch=selected_recovery.branch)
+        store.mark_completed(sibling_recovery, has_commits=True, branch=sibling_recovery.branch)
+    else:
+        for recovery in (selected_recovery, sibling_recovery):
+            recovery.status = "failed"
+            recovery.failure_reason = "WORKER_DIED"
+            recovery.completed_at = datetime.now(UTC)
+            store.update(recovery)
+    new_snapshot = _task_snapshot(store)
+
+    scoped_closure = watch_module._scoped_selector_recovery_closure_by_owner(
+        store=store,
+        scoped_owner_ids=scoped_owner_ids,
+        scoped_task_ids=(str(selected_leaf.id),),
+        config=config,
+        git=_make_watch_git(),
+        target_branch="main",
+        max_recovery_attempts=1,
+    )
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    confirmed_start_ids = _emit_transition_events(
+        old_snapshot,
+        new_snapshot,
+        store=store,
+        config=config,
+        log=log,
+        max_recovery_attempts=1,
+        scoped_owner_ids=scoped_owner_ids,
+        scoped_selector_recovery_closure_by_owner=scoped_closure,
+    )
+    completed_ids = _collect_completed_transition_ids(
+        old_snapshot,
+        new_snapshot,
+        store=store,
+        scoped_owner_ids=scoped_owner_ids,
+        scoped_selector_recovery_closure_by_owner=scoped_closure,
+    )
+    failures = _collect_unhandled_failures(
+        old_snapshot,
+        new_snapshot,
+        store=store,
+        config=config,
+        max_recovery_attempts=1,
+        scoped_owner_ids=scoped_owner_ids,
+        scoped_selector_recovery_closure_by_owner=scoped_closure,
+    )
+    log_path = tmp_path / ".gza" / "watch.log"
+    log_text = log_path.read_text() if log_path.exists() else ""
+
+    if transition == "start":
+        assert confirmed_start_ids == (selected_recovery.id,)
+        assert selected_recovery.id not in log_text
+    elif transition == "complete":
+        assert completed_ids == [selected_recovery.id]
+        assert f"DONE      {selected_recovery.id}" in log_text
+    else:
+        assert [failure.task_id for failure in failures] == [selected_recovery.id]
+        assert f"FAIL      {selected_recovery.id}" in log_text
+    assert sibling_recovery.id not in confirmed_start_ids
+    assert sibling_recovery.id not in completed_ids
+    assert sibling_recovery.id not in {failure.task_id for failure in failures}
+    assert str(sibling_recovery.id) not in log_text
+
+
+def test_cmd_watch_restart_failed_dry_run_keeps_failed_descendant_with_own_unmerged_unit_visible_under_completed_ancestor(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A completed non-recovery ancestor must not hide a failed descendant in watch recovery output."""
+    """A completed non-recovery ancestor must not hide distinct failed descendant work."""
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\ndb_path: .gza/gza.db\nrequire_review_before_merge: false\n"
     )
@@ -37705,15 +38806,30 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_descendant_visible_under_
     manual_follow_up.merge_status = "merged"
     manual_follow_up.completed_at = datetime(2026, 4, 28, 10, 5, 0, tzinfo=UTC)
     store.update(manual_follow_up)
+    manual_unit = store.create_merge_unit(
+        source_branch=manual_follow_up.branch,
+        target_branch="main",
+        owner_task_id=manual_follow_up.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(manual_follow_up.id, manual_unit.id, "owner")
 
     failed_descendant = store.add(manual_follow_up.prompt, task_type="implement", based_on=manual_follow_up.id)
     assert failed_descendant.id is not None
     failed_descendant.status = "failed"
     failed_descendant.failure_reason = "MAX_TURNS"
     failed_descendant.session_id = manual_follow_up.session_id
-    failed_descendant.branch = manual_follow_up.branch
+    failed_descendant.branch = "feature/manual-recovery"
+    failed_descendant.has_commits = True
     failed_descendant.completed_at = datetime(2026, 4, 28, 10, 10, 0, tzinfo=UTC)
     store.update(failed_descendant)
+    failed_unit = store.create_merge_unit(
+        source_branch=failed_descendant.branch,
+        target_branch="main",
+        owner_task_id=failed_descendant.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(failed_descendant.id, failed_unit.id, "owner")
 
     args = argparse.Namespace(
         project_dir=tmp_path,
@@ -37737,7 +38853,7 @@ def test_cmd_watch_restart_failed_dry_run_keeps_failed_descendant_visible_under_
     assert rc == 0
     stdout = capsys.readouterr().out
     assert failed_descendant.id in stdout
-    assert "Needs attention" in stdout
+    assert "resume" in stdout
 
 
 def test_cmd_watch_restart_failed_dry_run_keeps_failed_parent_visible_with_pending_manual_follow_up(
