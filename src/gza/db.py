@@ -10891,6 +10891,47 @@ class SqliteTaskStore:
 
         return changed_by_id
 
+    def mutate_task_tag_delta(
+        self,
+        task_ids: Iterable[str],
+        *,
+        add: Iterable[str] = (),
+        remove: Iterable[str] = (),
+    ) -> dict[str, bool]:
+        """Apply additions and removals to current task tags in one transaction.
+
+        Additions win when the same normalized tag appears in both inputs. Missing
+        task IDs are omitted from the result so callers can distinguish them from
+        existing tasks whose tags were unchanged.
+        """
+        ordered_ids = tuple(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        if not ordered_ids:
+            return {}
+
+        additions = set(_normalize_tags(add))
+        removals = set(_normalize_tags(remove))
+        changed_by_id: dict[str, bool] = {}
+
+        with self._write_transaction() as conn:
+            existing_ids = self._fetch_existing_task_ids(conn, ordered_ids)
+            current_by_id = self._fetch_tags_for_task_ids(conn, ordered_ids)
+            for task_id in ordered_ids:
+                if task_id not in existing_ids:
+                    continue
+                current = current_by_id.get(task_id, ())
+                final_tags = tuple(sorted((set(current) - removals) | additions))
+                changed = final_tags != current
+                changed_by_id[task_id] = changed
+                if not changed:
+                    continue
+                self._replace_task_tags_conn(conn, task_id, final_tags)
+                conn.execute(
+                    'UPDATE tasks SET "group" = ? WHERE project_id = ? AND id = ?',
+                    (final_tags[0] if len(final_tags) == 1 else None, self._project_id, task_id),
+                )
+
+        return changed_by_id
+
     def get_tag_counts(self, *, all_projects: bool = False) -> dict[str, int]:
         """Return counts for every known tag."""
         if not self._query_only_supports_tags():

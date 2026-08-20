@@ -106,6 +106,103 @@ def test_task_tag_write_store_resolves_through_project_config(tmp_path: Path) ->
     assert _query_tags(store, task.id, project_id="servertest") == ("new", "old")
 
 
+def test_task_tag_edit_preserves_tag_added_after_detail_resolution(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Concurrently tagged task", tags=("old",))
+    assert task.id is not None
+
+    class InterleavingStore:
+        def __init__(self) -> None:
+            self.interleaved = False
+
+        def mutate_task_tag_delta(self, *args: object, **kwargs: object) -> dict[str, bool]:
+            assert self.interleaved is False
+            self.interleaved = True
+            store.mutate_task_tags([task.id], action="add", tag="concurrent")
+            return store.mutate_task_tag_delta(*args, **kwargs)  # type: ignore[arg-type]
+
+        def get_task_tags(self, task_id: str) -> tuple[str, ...]:
+            observed = store.get_task_tags(task_id)
+            if not self.interleaved:
+                self.interleaved = True
+                store.mutate_task_tags([task_id], action="add", tag="concurrent")
+            return observed
+
+        def replace_task_tags(self, *args: object, **kwargs: object) -> tuple[str, ...]:
+            return store.replace_task_tags(*args, **kwargs)  # type: ignore[arg-type]
+
+    interleaving_store = InterleavingStore()
+
+    client = TestClient(
+        create_app(
+            store_factory=lambda: store,
+            mutation_store_factory=lambda _project_id: interleaving_store,  # type: ignore[arg-type,return-value]
+        ),
+        headers={"origin": "http://testserver"},
+    )
+
+    response = client.post(
+        f"/api/tasks/{task.id}/tags",
+        json={"add": ["new"], "remove": ["old"]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["tags"] == ["concurrent", "new"]
+    assert interleaving_store.interleaved is True
+    assert _query_tags(store, task.id, project_id="server-test") == ("concurrent", "new")
+
+
+@pytest.mark.parametrize("is_json", [True, False], ids=["json", "form"])
+def test_task_tag_edit_reports_task_deleted_before_mutation(
+    tmp_path: Path,
+    is_json: bool,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Deleted during edit", tags=("old",))
+    assert task.id is not None
+
+    class DeletingStore:
+        def __init__(self) -> None:
+            self.deleted = False
+
+        def _delete(self) -> None:
+            if not self.deleted:
+                self.deleted = True
+                assert store.delete(task.id) is True
+
+        def mutate_task_tag_delta(self, *args: object, **kwargs: object) -> dict[str, bool]:
+            self._delete()
+            return store.mutate_task_tag_delta(*args, **kwargs)  # type: ignore[arg-type]
+
+        def get_task_tags(self, task_id: str) -> tuple[str, ...]:
+            observed = store.get_task_tags(task_id)
+            self._delete()
+            return observed
+
+        def replace_task_tags(self, *args: object, **kwargs: object) -> tuple[str, ...]:
+            return store.replace_task_tags(*args, **kwargs)  # type: ignore[arg-type]
+
+    deleting_store = DeletingStore()
+
+    client = TestClient(
+        create_app(
+            store_factory=lambda: store,
+            mutation_store_factory=lambda _project_id: deleting_store,  # type: ignore[arg-type,return-value]
+        ),
+        headers={"origin": "http://testserver"},
+    )
+
+    request_kwargs = {"json": {"remove": ["old"]}} if is_json else {
+        "data": {"remove": "old"},
+        "follow_redirects": False,
+    }
+    response = client.post(f"/api/tasks/{task.id}/tags", **request_kwargs)
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == f"Task {task.id} no longer exists"
+    assert deleting_store.deleted is True
+
+
 @pytest.mark.parametrize("field", ["add", "remove"])
 @pytest.mark.parametrize(
     "invalid_value",

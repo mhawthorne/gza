@@ -506,7 +506,7 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
         try:
             mutation_store = make_mutation_store(detail.project_id)
-            tags, changed = edit_task_tags(
+            tag_edit_result = edit_task_tags(
                 mutation_store,
                 task_id,
                 add=edit.add,
@@ -514,6 +514,12 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if tag_edit_result is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Task {task_id} no longer exists",
+            )
+        tags, changed = tag_edit_result
         if not is_json:
             return RedirectResponse(detail.detail_url, status_code=303)
         return {

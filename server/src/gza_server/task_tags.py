@@ -154,17 +154,18 @@ def edit_task_tags(
     *,
     add: tuple[str, ...],
     remove: tuple[str, ...],
-) -> tuple[tuple[str, ...], bool]:
+) -> tuple[tuple[str, ...], bool] | None:
     """Add and remove tags from one task through Gza's tag edit API."""
     if not add and not remove:
         raise ValueError("at least one tag must be added or removed")
-    additions = set(normalize_tags(list(add)))
-    removals = set(normalize_tags(list(remove)))
-    current = store.get_task_tags(task_id)
-    final = tuple(sorted((set(current) - removals) | additions))
-    if final == current:
-        return current, False
-    return store.replace_task_tags(task_id, final), True
+    changed_by_id = store.mutate_task_tag_delta(
+        [task_id],
+        add=add,
+        remove=remove,
+    )
+    if task_id not in changed_by_id:
+        return None
+    return store.get_task_tags(task_id), changed_by_id[task_id]
 
 
 QualifiedTaskId = tuple[str, str]

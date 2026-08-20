@@ -13384,6 +13384,37 @@ class TestSyncCandidates:
         assert candidate_ids == {unit_task.id, legacy_task.id}
 
 
+class TestTaskTagDeltaMutation:
+    """Atomic combined tag-delta behavior for public callers."""
+
+    def test_applies_combined_delta_and_additions_win(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "tasks.db", prefix="gza", project_id="gza")
+        task = store.add("Retag me", tags=("keep", "old", "shared"))
+        assert task.id is not None
+
+        changed = store.mutate_task_tag_delta(
+            [task.id],
+            add=(" New ", "shared"),
+            remove=("old", "shared"),
+        )
+
+        assert changed == {task.id: True}
+        assert store.get_task_tags(task.id) == ("keep", "new", "shared")
+
+    def test_omits_missing_ids_and_reports_unchanged_existing_ids(self, tmp_path: Path) -> None:
+        store = SqliteTaskStore(tmp_path / "tasks.db", prefix="gza", project_id="gza")
+        task = store.add("Already tagged", tags=("keep",))
+        assert task.id is not None
+
+        changed = store.mutate_task_tag_delta(
+            [task.id, "gza-999"],
+            add=("keep",),
+            remove=("absent",),
+        )
+
+        assert changed == {task.id: False}
+
+
 class TestTaskUpdatedAt:
     """The authoritative last-update timestamp behind `sort=updated`."""
 
@@ -13455,6 +13486,16 @@ class TestTaskUpdatedAt:
         after = task_updated_at(store.get(task.id))
         assert after is not None
         assert after > before
+
+    def test_tag_delta_mutation_advances_updated_at(self, tmp_path: Path) -> None:
+        store = self._store(tmp_path)
+        task = store.add("Task for tag delta", tags=("old",))
+        assert task.id is not None
+        before = self._updated_at(store, task.id)
+
+        store.mutate_task_tag_delta([task.id], add=("new",), remove=("old",))
+
+        assert self._updated_at(store, task.id) > before
 
     @pytest.mark.parametrize(
         "mutation",
