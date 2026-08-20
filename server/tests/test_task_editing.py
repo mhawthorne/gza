@@ -12,6 +12,8 @@ from gza_server import task_edit as task_edit_module
 from gza_server.app import create_app
 
 import gza.db as db_module
+import gza.report_sync as report_sync_module
+from gza.cli.config_cmds import _sync_one_report
 from gza.db import SqliteTaskStore
 
 
@@ -241,7 +243,7 @@ def test_concurrent_plan_edits_keep_file_and_scoped_db_fields_synchronized(
     first_file_written = threading.Event()
     release_first_writer = threading.Event()
     second_replace_entered = threading.Event()
-    original_replace = task_edit_module._replace_text
+    original_replace = report_sync_module._replace_text
 
     def controlled_replace(path: Path, content: str) -> None:
         original_replace(path, content)
@@ -251,7 +253,7 @@ def test_concurrent_plan_edits_keep_file_and_scoped_db_fields_synchronized(
         elif content == second_content:
             second_replace_entered.set()
 
-    monkeypatch.setattr(task_edit_module, "_replace_text", controlled_replace)
+    monkeypatch.setattr(report_sync_module, "_replace_text", controlled_replace)
     with ThreadPoolExecutor(max_workers=2) as executor:
         first_save = executor.submit(
             task_edit_module.edit_task_plan,
@@ -283,6 +285,105 @@ def test_concurrent_plan_edits_keep_file_and_scoped_db_fields_synchronized(
     assert persisted.status == "in_progress"
     assert persisted.started_at == claim.task.started_at
     assert persisted.running_pid == 9876
+
+
+def test_plan_save_and_cli_report_sync_share_lock_and_preserve_lifecycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "tasks.db"
+    http_store = SqliteTaskStore(
+        db_path,
+        prefix="srv",
+        project_id="server-test",
+        project_root=tmp_path,
+    )
+    cli_store = SqliteTaskStore(
+        db_path,
+        prefix="srv",
+        project_id="server-test",
+        project_root=tmp_path,
+    )
+    observer_store = SqliteTaskStore(
+        db_path,
+        prefix="srv",
+        project_id="server-test",
+        project_root=tmp_path,
+    )
+    task = http_store.add("Create a plan", task_type="plan")
+    assert task.id is not None
+    report_path = tmp_path / ".gza" / "plans" / "cross-entry.md"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    disk_revision = "## Disk revision\n\nWaiting to be synchronized."
+    report_path.write_text(disk_revision, encoding="utf-8")
+    task.report_file = report_path.relative_to(tmp_path).as_posix()
+    task.output_content = "## Older DB revision"
+    http_store.update(task)
+    stale_cli_task = cli_store.get(task.id)
+    assert stale_cli_task is not None
+    assert stale_cli_task.id is not None
+
+    http_revision = "## HTTP revision\n\nThis complete revision wins."
+    http_file_written = threading.Event()
+    release_http_save = threading.Event()
+    cli_lock_attempted = threading.Event()
+    cli_crossed_lock = threading.Event()
+    cli_thread = threading.local()
+    original_replace = report_sync_module._replace_text
+    original_disk_sync = report_sync_module._sync_disk_revision
+    original_flock = report_sync_module.fcntl.flock
+
+    def paused_replace(path: Path, content: str) -> None:
+        original_replace(path, content)
+        if content == http_revision:
+            http_file_written.set()
+            assert release_http_save.wait(timeout=5)
+
+    def observed_disk_sync(*args: object, **kwargs: object):
+        cli_crossed_lock.set()
+        return original_disk_sync(*args, **kwargs)
+
+    def observed_flock(fd: int, operation: int) -> None:
+        if operation == report_sync_module.fcntl.LOCK_EX and getattr(
+            cli_thread, "syncing", False
+        ):
+            cli_lock_attempted.set()
+        original_flock(fd, operation)
+
+    def started_cli_sync():
+        cli_thread.syncing = True
+        return _sync_one_report(stale_cli_task.id, cli_store, dry_run=False)
+
+    monkeypatch.setattr(report_sync_module, "_replace_text", paused_replace)
+    monkeypatch.setattr(report_sync_module, "_sync_disk_revision", observed_disk_sync)
+    monkeypatch.setattr(report_sync_module.fcntl, "flock", observed_flock)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        http_save = executor.submit(
+            task_edit_module.edit_task_plan,
+            http_store,
+            task.id,
+            http_revision,
+        )
+        assert http_file_written.wait(timeout=5)
+
+        claim = observer_store.try_mark_in_progress(task.id, pid=2468)
+        assert claim.task is not None
+        cli_sync = executor.submit(started_cli_sync)
+        assert cli_lock_attempted.wait(timeout=5)
+        assert not cli_crossed_lock.wait(timeout=0.2)
+
+        release_http_save.set()
+        http_save.result(timeout=5)
+        assert cli_sync.result(timeout=5).status == "unchanged"
+
+    persisted = observer_store.get(task.id)
+    assert persisted is not None
+    assert report_path.read_text(encoding="utf-8") == http_revision
+    assert persisted.output_content == http_revision
+    assert persisted.status == "in_progress"
+    assert persisted.started_at == claim.task.started_at
+    assert persisted.running_pid == 2468
 
 
 def test_non_plan_form_rejection_preserves_error_and_submitted_markdown(

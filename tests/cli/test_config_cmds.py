@@ -7,21 +7,27 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+import gza.cli.config_cmds as config_cmds_module
 from gza.artifacts import store_command_output_artifact
 from gza.cli.config_cmds import (
     CheckTarget,
     _extract_preflight_failure_detail,
     cmd_preflight,
+    cmd_sync_report,
     resolve_preflight_targets,
 )
 from gza.config import Config, ProviderConfig, TaskTypeConfig
+from gza.db import SqliteTaskStore
 from gza.providers.base import PreflightCheckResult, RunResult
+from gza.report_sync import ReportSyncResult, synchronize_task_report
 
 from .conftest import invoke_gza, make_store, setup_config
 
@@ -4339,6 +4345,264 @@ class TestSyncReportCommand:
         result = invoke_gza("sync-report", str(task.id), "--project", str(tmp_path))
         assert result.returncode == 1
         assert "no report file" in result.stdout
+
+    def test_sync_report_errors_if_report_metadata_is_removed_after_precheck(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A locked refetch that finds no report must not be rendered as success."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Plan task", task_type="plan")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.report_file = ".gza/plans/raced-plan.md"
+        store.update(task)
+
+        original_sync = config_cmds_module._sync_one_report
+
+        def clear_report_then_sync(
+            task_id: str,
+            cli_store: SqliteTaskStore,
+            *,
+            dry_run: bool,
+        ) -> ReportSyncResult:
+            concurrent_store = make_store(tmp_path)
+            concurrent_task = concurrent_store.get(task_id)
+            assert concurrent_task is not None
+            concurrent_task.report_file = None
+            concurrent_store.update(concurrent_task)
+            return original_sync(task_id, cli_store, dry_run=dry_run)
+
+        monkeypatch.setattr(config_cmds_module, "_sync_one_report", clear_report_then_sync)
+
+        result = cmd_sync_report(
+            argparse.Namespace(project_dir=tmp_path, task_id=task.id, dry_run=False, all=False)
+        )
+
+        assert result == 1
+        output = capsys.readouterr().out
+        assert "no longer has a report file" in output
+        assert "Synced report" not in output
+
+    def test_sync_report_all_accounts_for_report_metadata_removed_after_scan(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Bulk sync explicitly accounts for a report removed after target discovery."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Plan task", task_type="plan")
+        assert task.id is not None
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.report_file = ".gza/plans/raced-plan.md"
+        store.update(task)
+
+        original_sync = config_cmds_module._sync_one_report
+
+        def clear_report_then_sync(
+            task_id: str,
+            cli_store: SqliteTaskStore,
+            *,
+            dry_run: bool,
+        ) -> ReportSyncResult:
+            concurrent_store = make_store(tmp_path)
+            concurrent_task = concurrent_store.get(task_id)
+            assert concurrent_task is not None
+            concurrent_task.report_file = None
+            concurrent_store.update(concurrent_task)
+            return original_sync(task_id, cli_store, dry_run=dry_run)
+
+        monkeypatch.setattr(config_cmds_module, "_sync_one_report", clear_report_then_sync)
+
+        result = cmd_sync_report(
+            argparse.Namespace(project_dir=tmp_path, task_id=None, dry_run=False, all=True)
+        )
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert f"Skipped {task.id}" in output
+        assert "0 synced, 0 unchanged, 0 missing, 1 skipped" in output
+
+    @pytest.mark.parametrize(
+        ("replacement_report_file", "expected_result_path"),
+        [
+            (None, None),
+            (".gza/plans/replacement.md", ".gza/plans/replacement.md"),
+        ],
+    )
+    def test_sync_report_rejects_report_metadata_change_after_disk_read(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        replacement_report_file: str | None,
+        expected_result_path: str | None,
+    ) -> None:
+        """Disk content is persisted only against the path that supplied it."""
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(
+            config.db_path,
+            prefix=config.project_prefix,
+            project_root=tmp_path,
+        )
+        concurrent_store = SqliteTaskStore(
+            config.db_path,
+            prefix=config.project_prefix,
+            project_root=tmp_path,
+        )
+        task = store.add("Plan task", task_type="plan")
+        assert task.id is not None
+        path_a = ".gza/plans/source-a.md"
+        report_path_a = tmp_path / path_a
+        report_path_a.parent.mkdir(parents=True, exist_ok=True)
+        report_path_a.write_text("content from A", encoding="utf-8")
+        task.report_file = path_a
+        task.output_content = "older DB content"
+        store.update(task)
+        claim = store.try_mark_in_progress(task.id, pid=8642)
+        assert claim.task is not None
+
+        persistence_attempted = threading.Event()
+        allow_persistence = threading.Event()
+        original_update = store.update_report_content
+
+        def paused_update(*args: object, **kwargs: object):
+            persistence_attempted.set()
+            assert allow_persistence.wait(timeout=5)
+            return original_update(*args, **kwargs)
+
+        monkeypatch.setattr(store, "update_report_content", paused_update)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            sync = executor.submit(synchronize_task_report, store, task.id)
+            assert persistence_attempted.wait(timeout=5)
+            concurrent_task = concurrent_store.get(task.id)
+            assert concurrent_task is not None
+            concurrent_task.report_file = replacement_report_file
+            concurrent_store.update(concurrent_task)
+            allow_persistence.set()
+            sync_result = sync.result(timeout=5)
+
+        assert sync_result.status == "conflict"
+        assert sync_result.task.report_file == replacement_report_file
+        if expected_result_path is None:
+            assert sync_result.report_path is None
+        else:
+            assert sync_result.report_path == (tmp_path / expected_result_path).resolve()
+        persisted = concurrent_store.get(task.id)
+        assert persisted is not None
+        assert persisted.report_file == replacement_report_file
+        assert persisted.output_content == "older DB content"
+        assert persisted.output_content != "content from A"
+        assert persisted.status == "in_progress"
+        assert persisted.started_at == claim.task.started_at
+        assert persisted.running_pid == 8642
+
+    def test_sync_report_all_renders_locked_replacement_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Bulk output names the path selected by the locked refetch."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Plan task", task_type="plan")
+        assert task.id is not None
+        path_a = ".gza/plans/discovered-a.md"
+        path_b = ".gza/plans/locked-b.md"
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        task.report_file = path_a
+        task.output_content = "older DB content"
+        store.update(task)
+        report_path_b = tmp_path / path_b
+        report_path_b.parent.mkdir(parents=True, exist_ok=True)
+        report_path_b.write_text("content from B", encoding="utf-8")
+
+        original_sync = config_cmds_module._sync_one_report
+
+        def replace_report_then_sync(
+            task_id: str,
+            cli_store: SqliteTaskStore,
+            *,
+            dry_run: bool,
+        ) -> ReportSyncResult:
+            concurrent_store = make_store(tmp_path)
+            concurrent_task = concurrent_store.get(task_id)
+            assert concurrent_task is not None
+            concurrent_task.report_file = path_b
+            concurrent_store.update(concurrent_task)
+            return original_sync(task_id, cli_store, dry_run=dry_run)
+
+        monkeypatch.setattr(config_cmds_module, "_sync_one_report", replace_report_then_sync)
+
+        result = cmd_sync_report(
+            argparse.Namespace(project_dir=tmp_path, task_id=None, dry_run=False, all=True)
+        )
+
+        assert result == 0
+        output = capsys.readouterr().out
+        assert f"Synced {task.id} ({path_b})" in output
+        assert path_a not in output
+        persisted = store.get(task.id)
+        assert persisted is not None
+        assert persisted.report_file == path_b
+        assert persisted.output_content == "content from B"
+
+    def test_sync_report_single_renders_locked_missing_replacement_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Single-target missing output names the path selected under the lock."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Plan task", task_type="plan")
+        assert task.id is not None
+        path_a = ".gza/plans/prechecked-a.md"
+        path_b = ".gza/plans/locked-missing-b.md"
+        task.report_file = path_a
+        task.output_content = "older DB content"
+        store.update(task)
+
+        original_sync = config_cmds_module._sync_one_report
+
+        def replace_report_then_sync(
+            task_id: str,
+            cli_store: SqliteTaskStore,
+            *,
+            dry_run: bool,
+        ) -> ReportSyncResult:
+            concurrent_store = make_store(tmp_path)
+            concurrent_task = concurrent_store.get(task_id)
+            assert concurrent_task is not None
+            concurrent_task.report_file = path_b
+            concurrent_store.update(concurrent_task)
+            return original_sync(task_id, cli_store, dry_run=dry_run)
+
+        monkeypatch.setattr(config_cmds_module, "_sync_one_report", replace_report_then_sync)
+
+        result = cmd_sync_report(
+            argparse.Namespace(project_dir=tmp_path, task_id=task.id, dry_run=False, all=False)
+        )
+
+        assert result == 1
+        output = capsys.readouterr().out
+        assert f"Report file not found: {path_b}" in output
+        assert path_a not in output
+        persisted = store.get(task.id)
+        assert persisted is not None
+        assert persisted.report_file == path_b
+        assert persisted.output_content == "older DB content"
 
     def test_sync_report_error_task_not_found(self, tmp_path: Path):
         """sync-report returns error when task does not exist."""
