@@ -3,9 +3,23 @@
 project_name: gza-server
 project_id: gzaserver
 
+# Subprojects of the gza repo share the core project's task DB.
+# Resolved relative to this project_dir (server/), so it points at the
+# repo-root .gza/gza.db that the core `gza` project also uses.
+# Without this pin, server inherits ~/.gza/config.yaml's global shared DB,
+# which splits gza's tasks across two databases and blocks a single watch.
+db_path: ../.gza/gza.db
+
 verify_command: './bin/tests'
 autonomous_verify_timeout_seconds: 300
 docker_setup_command: 'uv sync'
+
+# server/ legitimately needs to change core gza code (shared models, CLI
+# wiring), so cross-project edits are the norm here, not an exception worth
+# tagging each task for. Scope safety is retained: paths outside every
+# discovered project root still fail closed, and verification fans out to
+# each affected project's own verify_command.
+default_cross_project: true
 
 branch_strategy: date_slug
 
