@@ -379,3 +379,103 @@ def test_tag_and_untagged_are_rejected_together(
 
     assert response.status_code == 422
     assert response.json()["detail"] == "tag and untagged filters cannot be combined"
+
+
+@pytest.fixture
+def many_tasks_store(tmp_path: Path) -> tuple[SqliteTaskStore, list[Task]]:
+    store = SqliteTaskStore(tmp_path / "many.db", prefix="srv", project_id="server-test")
+    tasks = [store.add(f"Bulk task {index:03d}", task_type="implement") for index in range(120)]
+    return store, tasks
+
+
+def test_tasks_page_defaults_to_fifty_rows(
+    many_tasks_store: tuple[SqliteTaskStore, list[Task]],
+) -> None:
+    store, tasks = many_tasks_store
+    html = _client(store).get("/tasks").text
+
+    assert len(_html_task_ids(html)) == 50
+    assert f"of {len(tasks)} tasks" in html
+    assert "Page 1 of 3" in html
+
+
+def test_tasks_pages_partition_the_full_result_set(
+    many_tasks_store: tuple[SqliteTaskStore, list[Task]],
+) -> None:
+    store, tasks = many_tasks_store
+    client = _client(store)
+
+    paged: list[str] = []
+    for page in (1, 2, 3):
+        paged.extend(_html_task_ids(client.get(f"/tasks?page={page}").text))
+
+    assert len(paged) == len(tasks)
+    assert len(set(paged)) == len(tasks)
+    assert set(paged) == {task.id for task in tasks}
+
+
+def test_tasks_last_page_holds_the_remainder(
+    many_tasks_store: tuple[SqliteTaskStore, list[Task]],
+) -> None:
+    store, _ = many_tasks_store
+    html = _client(store).get("/tasks?page=3").text
+
+    assert len(_html_task_ids(html)) == 20
+    assert "Showing <strong>101–120</strong>" in html
+
+
+def test_tasks_per_page_is_clamped_to_supported_sizes(
+    many_tasks_store: tuple[SqliteTaskStore, list[Task]],
+) -> None:
+    store, _ = many_tasks_store
+    client = _client(store)
+
+    assert len(_html_task_ids(client.get("/tasks?per_page=25").text)) == 25
+    assert len(_html_task_ids(client.get("/tasks?per_page=100").text)) == 100
+    # An unsupported size falls back to the default rather than rendering everything.
+    assert len(_html_task_ids(client.get("/tasks?per_page=9000").text)) == 50
+
+
+def test_tasks_page_past_the_end_shows_the_last_page(
+    many_tasks_store: tuple[SqliteTaskStore, list[Task]],
+) -> None:
+    store, _ = many_tasks_store
+    html = _client(store).get("/tasks?page=999").text
+
+    assert len(_html_task_ids(html)) == 20
+    assert "Page 3 of 3" in html
+
+
+def test_pagination_links_preserve_active_filters(
+    seeded_store: tuple[SqliteTaskStore, dict[str, Task]],
+) -> None:
+    store, _ = seeded_store
+    html = _client(store).get("/tasks?status=pending&type=plan&per_page=25").text
+
+    # Every pager link carries the active filters forward.
+    pager_links = re.findall(r'href="(/tasks\?[^"]+)"', html)
+    assert pager_links
+    for link in pager_links:
+        assert "status=pending" in link
+        assert "type=plan" in link
+
+    # The active page size is shown as current rather than as a link.
+    assert "<strong>25</strong>" in html
+    assert "per_page=50" in html
+
+
+def test_pagination_does_not_narrow_bulk_retag_scope(
+    many_tasks_store: tuple[SqliteTaskStore, list[Task]],
+) -> None:
+    """Bulk retag targets every filtered task, not just the rendered page."""
+    store, tasks = many_tasks_store
+    client = _client(store)
+
+    response = client.post(
+        "/api/tasks/tags/bulk",
+        data={"q": "Bulk task", "mutation": "add", "mutation_tag": "swept"},
+        headers={"origin": "http://testserver", "referer": "http://testserver/tasks"},
+    )
+
+    assert response.status_code == 200
+    assert str(len(tasks)) in response.text

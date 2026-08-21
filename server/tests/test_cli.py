@@ -188,6 +188,7 @@ def test_start_replaces_state_for_dead_pid(tmp_path):
             return_value=IdentityStatus.DEAD,
         ),
         patch("gza_server.cli.find_free_port", return_value=8765),
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
         patch("gza_server.cli.subprocess.Popen", return_value=process),
         patch("gza_server.cli.health_identity_matches", return_value=True),
         patch("gza_server.cli.webbrowser.open"),
@@ -373,7 +374,10 @@ def test_stop_force_terminates_verified_process_after_endpoint_disappears(tmp_pa
         call(1234, signal.SIGTERM),
         call(1234, signal.SIGKILL),
     ]
-    urlopen_mock.assert_called_once()
+    # A matching start marker settles identity on its own, so the health
+    # endpoint is never consulted -- which is what lets a wedged server be
+    # stopped at all.
+    urlopen_mock.assert_not_called()
     assert not path.exists()
 
 
@@ -456,26 +460,58 @@ def test_stop_does_not_sigkill_pid_whose_start_marker_changed(tmp_path):
     assert not path.exists()
 
 
-def test_stop_preserves_state_when_start_marker_unavailable_before_sigkill(tmp_path):
+def test_stop_escalates_when_start_marker_becomes_unreadable_mid_exit(tmp_path):
+    """An exiting process can be alive with no readable start marker.
+
+    Refusing to escalate there left a server that ignored SIGTERM running
+    forever. Once SIGTERM has been sent to a PID we verified, an unreadable
+    marker means the process is on its way out, so the stop proceeds.
+    """
     path = tmp_path / "gza-server.json"
     _write_state(path, process_start_id="stable-start")
+    alive = {"value": True}
+
+    def kill_process(pid: int, sig: int) -> None:
+        if sig == signal.SIGKILL:
+            alive["value"] = False
+
     with (
-        patch("gza_server.cli.process_is_alive", return_value=True),
+        patch("gza_server.cli.process_is_alive", side_effect=lambda pid: alive["value"]),
         patch(
             "gza_server.cli.process_start_id",
-            side_effect=["stable-start", "stable-start", None],
+            side_effect=["stable-start", "stable-start", None, None, None],
         ),
         patch("gza_server.cli.urlopen", return_value=_health_response()),
         patch(
             "gza_server.cli._wait_for_owned_process_exit",
-            return_value=IdentityStatus.MATCH,
+            # SIGTERM is ignored; the process only goes after SIGKILL.
+            side_effect=[IdentityStatus.MATCH, IdentityStatus.DEAD],
         ),
+        patch("gza_server.cli.os.kill", side_effect=kill_process) as kill,
+    ):
+        assert stop_server(path) == "stopped"
+
+    assert kill.call_args_list == [
+        call(1234, signal.SIGTERM),
+        call(1234, signal.SIGKILL),
+    ]
+    assert not path.exists()
+
+
+def test_stop_still_refuses_an_unverifiable_process_before_signalling(tmp_path):
+    """Escalation is only licensed after ownership was verified and SIGTERM sent."""
+    path = tmp_path / "gza-server.json"
+    _write_state(path, process_start_id="stable-start")
+    with (
+        patch("gza_server.cli.process_is_alive", return_value=True),
+        patch("gza_server.cli.process_start_id", return_value=None),
+        patch("gza_server.cli.urlopen", return_value=_health_response()),
         patch("gza_server.cli.os.kill") as kill,
     ):
         with pytest.raises(LifecycleError, match="cannot stop.*state was preserved"):
             stop_server(path)
 
-    kill.assert_called_once_with(1234, signal.SIGTERM)
+    kill.assert_not_called()
     assert path.exists()
 
 
@@ -676,6 +712,7 @@ def test_start_early_exit_reaps_child_and_reports_bounded_startup_output(tmp_pat
     with (
         patch("gza_server.cli.find_free_port", return_value=8765),
         patch("gza_server.cli.subprocess.Popen", side_effect=spawn),
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
         patch("gza_server.cli.webbrowser.open") as browser_open,
     ):
         with pytest.raises(LifecycleError, match="status 3") as exc_info:
@@ -697,6 +734,7 @@ def test_start_timeout_terminates_and_reaps_child_without_publishing(tmp_path):
     with (
         patch("gza_server.cli.find_free_port", return_value=8765),
         patch("gza_server.cli.subprocess.Popen", return_value=process),
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
         patch(
             "gza_server.cli.wait_until_ready",
             side_effect=LifecycleError(
@@ -876,6 +914,7 @@ def test_start_keyboard_interrupt_force_cleans_child_and_reraises(tmp_path):
     with (
         patch("gza_server.cli.find_free_port", return_value=8765),
         patch("gza_server.cli.subprocess.Popen", return_value=process),
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
         patch("gza_server.cli.wait_until_ready", side_effect=KeyboardInterrupt),
         patch("gza_server.cli.webbrowser.open") as browser_open,
     ):
@@ -909,6 +948,7 @@ def test_start_waits_for_delayed_health_before_publication_and_browser(tmp_path)
     with (
         patch("gza_server.cli.find_free_port", return_value=8765),
         patch("gza_server.cli.subprocess.Popen", return_value=process),
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
         patch("gza_server.cli.health_identity_matches", side_effect=delayed_health),
         patch("gza_server.cli.time.sleep"),
         patch("gza_server.cli.webbrowser.open", browser_patched),
@@ -939,6 +979,7 @@ def test_concurrent_starts_publish_one_managed_process(tmp_path):
     with (
         patch("gza_server.cli.find_free_port", return_value=8765),
         patch("gza_server.cli.subprocess.Popen", return_value=process) as popen,
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
         patch("gza_server.cli.wait_until_ready", side_effect=coordinated_readiness),
         patch(
             "gza_server.cli.classify_server_identity",
@@ -962,3 +1003,73 @@ def test_concurrent_starts_publish_one_managed_process(tmp_path):
     assert state.pid == process.pid
     process.terminate.assert_not_called()
     process.kill.assert_not_called()
+
+
+def test_process_start_id_is_readable_without_proc(tmp_path):
+    """macOS has no /proc; identity must not silently degrade to nothing there."""
+    import os as _os
+
+    from gza_server.cli import process_start_id
+
+    assert process_start_id(_os.getpid())
+
+
+def test_stop_escalates_to_sigkill_when_shutdown_closes_the_health_endpoint(tmp_path):
+    """A server draining a slow request stops answering health checks first.
+
+    Treating that unreachable endpoint as a lost identity used to abort the stop
+    before SIGKILL, leaving the process running -- the reported symptom.
+    """
+    path = tmp_path / "gza-server.json"
+    _write_state(path, process_start_id="")
+    signals: list[int] = []
+
+    with (
+        patch("gza_server.cli.process_is_alive", return_value=True),
+        # No start marker available at all, so identity can only come from health.
+        patch("gza_server.cli.process_start_id", return_value=None),
+        # Health answers once for the initial ownership check, then the socket
+        # closes and every later probe fails.
+        patch(
+            "gza_server.cli.urlopen",
+            side_effect=[
+                # Answers the ownership checks, then SIGTERM closes the socket.
+                _health_response(),
+                _health_response(),
+                *[OSError("connection refused")] * 50,
+            ],
+        ),
+        patch("gza_server.cli.STOP_TIMEOUT_SECONDS", 0.05),
+        patch("gza_server.cli.os.kill", side_effect=lambda pid, sig: signals.append(sig)),
+    ):
+        with pytest.raises(LifecycleError, match="did not exit after SIGKILL"):
+            stop_server(path)
+
+    assert signal.SIGTERM in signals
+    assert signal.SIGKILL in signals
+
+
+def test_stop_kills_a_hung_server_and_removes_state(tmp_path):
+    """The full recovery path: SIGTERM ignored, SIGKILL lands, state cleared."""
+    path = tmp_path / "gza-server.json"
+    _write_state(path, process_start_id="stable-start")
+    signals: list[int] = []
+    alive = {"value": True}
+
+    def kill(pid: int, sig: int) -> None:
+        signals.append(sig)
+        if sig == signal.SIGKILL:
+            alive["value"] = False
+
+    with (
+        patch("gza_server.cli.process_is_alive", side_effect=lambda pid: alive["value"]),
+        patch("gza_server.cli.process_start_id", return_value="stable-start"),
+        patch("gza_server.cli.urlopen", return_value=_health_response()),
+        patch("gza_server.cli.STOP_TIMEOUT_SECONDS", 0.05),
+        patch("gza_server.cli.os.kill", side_effect=kill),
+    ):
+        result = stop_server(path)
+
+    assert result == "stopped"
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert not path.exists()

@@ -35,6 +35,7 @@ HEALTH_REQUEST_TIMEOUT_SECONDS = 0.25
 STARTUP_POLL_INTERVAL_SECONDS = 0.05
 STARTUP_DIAGNOSTIC_MAX_BYTES = 2000
 DARWIN_PROCESS_START_ENV = {"LC_ALL": "C", "TZ": "UTC"}
+PS_TIMEOUT_SECONDS = 5.0
 
 
 class LifecycleError(RuntimeError):
@@ -140,8 +141,13 @@ def process_is_alive(pid: int) -> bool:
 
 
 def process_start_id(pid: int) -> str | None:
-    """Return the platform's stable start marker for a PID, when it can be read."""
-    if sys.platform == "linux":
+    """Return the platform's stable start marker for a PID, when it can be read.
+
+    A PID alone is not an identity: the kernel reuses it, so a signal aimed at
+    a recorded PID can land on an unrelated process. Pairing the PID with the
+    time it started makes that reuse detectable.
+    """
+    if sys.platform.startswith("linux"):
         return _linux_process_start_id(pid)
     if sys.platform == "darwin":
         return _darwin_process_start_id(pid)
@@ -162,7 +168,11 @@ def _linux_process_start_id(pid: int) -> str | None:
 
 
 def _darwin_process_start_id(pid: int) -> str | None:
-    """Return macOS's stable process start time for a PID, when it can be read."""
+    """Read absolute process start time via ps, for platforms without /proc.
+
+    macOS has no /proc, which previously left every process here unidentifiable
+    and forced identity to rest entirely on the HTTP health endpoint.
+    """
     try:
         environment = {**os.environ, **DARWIN_PROCESS_START_ENV}
         result = subprocess.run(
@@ -171,7 +181,7 @@ def _darwin_process_start_id(pid: int) -> str | None:
             check=False,
             env=environment,
             text=True,
-            timeout=0.5,
+            timeout=PS_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -232,6 +242,11 @@ def classify_server_identity(state: ServerState) -> IdentityStatus:
             return IdentityStatus.UNVERIFIABLE
         if current_start_id != state.process_start_id:
             return IdentityStatus.MISMATCH
+        # A matching start marker already proves this is the process we
+        # launched. Requiring a health response on top of it made a server too
+        # busy to answer within the health timeout unstoppable, which is the
+        # state a server most needs stopping from.
+        return IdentityStatus.MATCH
     return _health_identity_status(state)
 
 
@@ -245,15 +260,31 @@ def _raise_unverifiable(state: ServerState, action: str) -> None:
 def _owned_process_status(
     state: ServerState,
     expected_start_id: str | None,
+    *,
+    terminating: bool = False,
 ) -> IdentityStatus:
-    """Revalidate the strongest available identity for a previously matched server."""
+    """Revalidate the strongest available identity for a previously matched server.
+
+    ``terminating`` marks the phase after we have already verified ownership and
+    signalled the process. A server that is shutting down closes its listening
+    socket before it exits, so its health endpoint goes away while the process is
+    still alive. Treating that as a lost identity used to abort the stop before
+    it could escalate, leaving the process running -- so during termination an
+    unreachable endpoint means "still exiting", not "no longer ours".
+    """
     if not process_is_alive(state.pid):
         return IdentityStatus.DEAD
     if expected_start_id is None:
-        return _health_identity_status(state)
+        status = _health_identity_status(state)
+        if terminating and status is IdentityStatus.UNVERIFIABLE:
+            return IdentityStatus.MATCH
+        return status
     current_start_id = process_start_id(state.pid)
     if current_start_id is None:
-        return IdentityStatus.UNVERIFIABLE
+        # A process caught mid-exit can be alive with no readable start marker.
+        # While terminating that means "still going", not "no longer ours";
+        # the next poll sees it gone.
+        return IdentityStatus.MATCH if terminating else IdentityStatus.UNVERIFIABLE
     if current_start_id != expected_start_id:
         return IdentityStatus.MISMATCH
     return IdentityStatus.MATCH
@@ -274,9 +305,11 @@ def _signal_owned_process(
     state: ServerState,
     expected_start_id: str | None,
     sig: signal.Signals,
+    *,
+    terminating: bool = False,
 ) -> IdentityStatus:
     """Signal only after an immediate strict ownership revalidation."""
-    identity = _owned_process_status(state, expected_start_id)
+    identity = _owned_process_status(state, expected_start_id, terminating=terminating)
     if identity is not IdentityStatus.MATCH:
         return identity
     try:
@@ -481,7 +514,10 @@ def stop_server(path: Path) -> str:
         if identity is IdentityStatus.UNVERIFIABLE:
             _raise_unverifiable(state, "stop")
 
-        owned_start_id = state.process_start_id or None
+        # Pin the strongest identity available right now. State written on a
+        # platform that could not read a start marker still gets one here, so a
+        # PID recycled mid-stop is detected rather than signalled blindly.
+        owned_start_id = state.process_start_id or process_start_id(state.pid)
         signal_status = _signal_owned_process(
             state,
             owned_start_id,
@@ -501,6 +537,7 @@ def stop_server(path: Path) -> str:
                 state,
                 owned_start_id,
                 signal.SIGKILL,
+                terminating=True,
             )
             if signal_status is IdentityStatus.UNVERIFIABLE:
                 _raise_unverifiable(state, "stop")

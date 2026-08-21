@@ -2,8 +2,13 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from gza.db import SqliteTaskStore
+from gza.task_types import ALL_TASK_STATUSES
+
 from gza_server import __version__
 from gza_server.app import create_app
+
+_STYLESHEET = Path(__file__).resolve().parents[1] / "src" / "gza_server" / "static" / "app.css"
 
 
 class FakeStore:
@@ -53,11 +58,48 @@ def test_health_resolves_database_through_gza_config_and_store(tmp_path):
     assert response.json()["task_count"] == 0
 
 
-def test_index_renders_jinja_template():
-    app = create_app(store_factory=FakeStore)
+def test_index_dashboard_reports_status_counts_and_recent_tasks(tmp_path: Path):
+    store = SqliteTaskStore(tmp_path / "dash.db", prefix="srv", project_id="dash-test")
+    pending = store.add("Dashboard pending task")
+    failed = store.add("Dashboard failed task")
+    failed.status = "failed"
+    store.update(failed)
 
-    response = TestClient(app).get("/")
+    response = TestClient(create_app(store_factory=lambda: store)).get("/")
 
     assert response.status_code == 200
-    assert "<h1>gza server</h1>" in response.text
-    assert f"Version {__version__}" in response.text
+    assert __version__ in response.text
+    # Every status keeps a cell, including the ones with nothing in them.
+    for status in ALL_TASK_STATUSES:
+        assert f"status-cell-{status}" in response.text
+    assert "2 tasks" in response.text
+    assert pending.id in response.text
+    assert failed.id in response.text
+
+
+def test_index_dashboard_status_cells_link_to_filtered_task_lists(tmp_path: Path):
+    store = SqliteTaskStore(tmp_path / "links.db", prefix="srv", project_id="dash-test")
+    store.add("Dashboard pending task")
+
+    response = TestClient(create_app(store_factory=lambda: store)).get("/")
+
+    for status in ALL_TASK_STATUSES:
+        assert f'href="/tasks?status={status}"' in response.text
+
+
+def test_stylesheet_is_served() -> None:
+    client = TestClient(create_app(store_factory=lambda: None))
+    response = client.get("/static/app.css")
+
+    assert response.status_code == 200
+    assert "text/css" in response.headers["content-type"]
+
+
+def test_every_task_status_has_a_style_rule() -> None:
+    """A status with no rule silently renders as the default grey pill."""
+    stylesheet = _STYLESHEET.read_text()
+
+    missing = [
+        status for status in ALL_TASK_STATUSES if f".status-{status}" not in stylesheet
+    ]
+    assert not missing, f"statuses without a style rule: {missing}"

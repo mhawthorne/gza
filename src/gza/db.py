@@ -12230,6 +12230,26 @@ class SqliteTaskStore:
         """Return all known tags sorted alphabetically."""
         return tuple(self.get_tag_counts(all_projects=all_projects).keys())
 
+    def get_status_counts(self, *, all_projects: bool = False) -> dict[str, int]:
+        """Return a task count per status, aggregated in SQL.
+
+        Callers that only need totals should use this rather than projecting
+        rows: a status breakdown over the whole corpus is one grouped scan,
+        where the query service would pay per-row lineage and dependency
+        resolution for results it then discards.
+        """
+        with self._connect() as conn:
+            if all_projects:
+                cur = conn.execute(
+                    "SELECT status, COUNT(*) AS count FROM tasks GROUP BY status"
+                )
+            else:
+                cur = conn.execute(
+                    "SELECT status, COUNT(*) AS count FROM tasks WHERE project_id = ? GROUP BY status",
+                    (self._project_id,),
+                )
+            return {row["status"]: row["count"] for row in cur.fetchall()}
+
     def get_tag_status_counts(self) -> dict[str, dict[str, int]]:
         """Return status counts for every known tag."""
         if not self._query_only_supports_tags():

@@ -4,49 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}gza{% endblock %}</title>
-    <style>
-      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-      body { margin: 0; }
-      header, main { padding: 1rem max(1rem, calc((100vw - 76rem) / 2)); }
-      header { border-bottom: 1px solid color-mix(in srgb, currentColor 20%, transparent); }
-      a { color: inherit; }
-      .filters { display: flex; flex-wrap: wrap; gap: 1rem; align-items: end; padding: 1rem; border: 1px solid color-mix(in srgb, currentColor 20%, transparent); border-radius: .5rem; }
-      .filters label { display: grid; gap: .3rem; font-size: .85rem; font-weight: 600; }
-      .filters .checkbox { display: flex; flex-direction: row; align-items: center; padding-bottom: .5rem; }
-      input, select, button, textarea { font: inherit; padding: .4rem; }
-      fieldset { padding: 1rem; border: 1px solid color-mix(in srgb, currentColor 20%, transparent); border-radius: .5rem; }
-      fieldset label { display: block; margin: .5rem 0; }
-      .filter-actions { display: flex; gap: .75rem; align-items: center; padding-bottom: .15rem; }
-      .table-wrap { overflow-x: auto; }
-      table { width: 100%; border-collapse: collapse; }
-      th, td { padding: .7rem .5rem; text-align: left; border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent); vertical-align: top; }
-      th { white-space: nowrap; }
-      .prompt { min-width: 20rem; }
-      .status, .tag { display: inline-block; padding: .15rem .45rem; margin: .1rem; border-radius: 999px; background: color-mix(in srgb, currentColor 12%, transparent); font-size: .8rem; white-space: nowrap; }
-      .status { font-weight: 650; }
-      .status-failed, .status-dropped { background: color-mix(in srgb, #d33 25%, transparent); }
-      .status-completed { background: color-mix(in srgb, #2a5 25%, transparent); }
-      .muted, .empty { opacity: .65; }
-      .empty { text-align: center; padding: 2rem; }
-      .metadata { display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: .75rem; }
-      .metadata div { padding: .75rem; border: 1px solid color-mix(in srgb, currentColor 15%, transparent); border-radius: .4rem; }
-      .metadata dt { font-size: .8rem; font-weight: 650; opacity: .7; }
-      .metadata dd { margin: .3rem 0 0; overflow-wrap: anywhere; }
-      section { margin-top: 2rem; }
-      .lineage { padding-left: 1.25rem; }
-      .markdown { max-width: 52rem; padding: 1rem; border-left: .25rem solid color-mix(in srgb, currentColor 20%, transparent); overflow-wrap: anywhere; }
-      .markdown > :first-child { margin-top: 0; }
-      .markdown > :last-child { margin-bottom: 0; }
-      .markdown pre { overflow-x: auto; padding: .75rem; background: color-mix(in srgb, currentColor 8%, transparent); }
-      .tag-editor { max-width: 44rem; }
-      .tag-editor .tag-choice { display: inline-flex; gap: .25rem; align-items: center; margin-right: .75rem; }
-      .notice { padding: .8rem 1rem; border-left: .25rem solid color-mix(in srgb, #2a5 60%, currentColor); }
-      .edit-link { font-size: .85rem; font-weight: 400; }
-      .content-editor { max-width: 52rem; }
-      .content-editor label { display: block; margin-bottom: .4rem; font-weight: 650; }
-      .content-editor textarea { box-sizing: border-box; width: 100%; resize: vertical; }
-      .error { max-width: 52rem; padding: .8rem 1rem; border-left: .25rem solid #d33; }
-    </style>
+    <link rel="stylesheet" href="/static/app.css">
   </head>
   <body>
     <header><strong><a href="/">gza</a></strong> · <a href="/tasks">Tasks</a></header>

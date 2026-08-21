@@ -3,6 +3,42 @@
 {% block content %}
   <h1>Tasks</h1>
 
+  {% macro pager(position) %}
+    <nav class="pager pager-{{ position }}" aria-label="Task list pages">
+      <p class="pager-count">
+        {% if result.total %}
+          Showing <strong>{{ result.first_index }}–{{ result.last_index }}</strong> of {{ result.total }} task{% if result.total != 1 %}s{% endif %}
+        {% else %}
+          No tasks match these filters
+        {% endif %}
+      </p>
+      <div class="pager-controls">
+        {% if result.has_previous %}
+          <a href="{{ page_url(1) }}" rel="first">« First</a>
+          <a href="{{ page_url(result.page.page - 1) }}" rel="prev">‹ Prev</a>
+        {% else %}
+          <span class="muted">« First</span>
+          <span class="muted">‹ Prev</span>
+        {% endif %}
+        <span class="pager-position">Page {{ result.page.page }} of {{ result.page_count }}</span>
+        {% if result.has_next %}
+          <a href="{{ page_url(result.page.page + 1) }}" rel="next">Next ›</a>
+          <a href="{{ page_url(result.page_count) }}" rel="last">Last »</a>
+        {% else %}
+          <span class="muted">Next ›</span>
+          <span class="muted">Last »</span>
+        {% endif %}
+      </div>
+      <div class="pager-size">
+        Per page:
+        {% for size in page_sizes %}
+          {% if size == result.page.per_page %}<strong>{{ size }}</strong>{% else %}<a href="{{ per_page_url(size) }}">{{ size }}</a>{% endif %}
+        {% endfor %}
+      </div>
+    </nav>
+  {% endmacro %}
+
+
   <form method="get" action="/tasks" class="filters">
     <label>
       Prompt
@@ -10,7 +46,7 @@
     </label>
     <label>
       Tags
-      <select name="tag" multiple size="5" {% if filters.untagged %}disabled{% endif %}>
+      <select name="tag" multiple size="4" {% if filters.untagged %}disabled{% endif %}>
         {% for tag in known_tags %}
           <option value="{{ tag }}" {% if tag in filters.tags %}selected{% endif %}>{{ tag }}</option>
         {% endfor %}
@@ -18,7 +54,7 @@
     </label>
     <label>
       Status
-      <select name="status" multiple size="5">
+      <select name="status" multiple size="4">
         {% for status in statuses %}
           <option value="{{ status }}" {% if status in filters.statuses %}selected{% endif %}>{{ status }}</option>
         {% endfor %}
@@ -26,7 +62,7 @@
     </label>
     <label>
       Type
-      <select name="type" multiple size="5">
+      <select name="type" multiple size="4">
         {% for task_type in task_types %}
           <option value="{{ task_type }}" {% if task_type in filters.task_types %}selected{% endif %}>{{ task_type }}</option>
         {% endfor %}
@@ -56,9 +92,9 @@
     </div>
   </form>
 
-  <section class="tag-editor">
-    <h2>Bulk retag filtered tasks</h2>
-    <p class="muted">A filter is required. You will review the matching task IDs before anything changes.</p>
+  <details class="tag-editor">
+    <summary><h2>Bulk retag filtered tasks</h2></summary>
+    <p class="muted">A filter is required. This applies to <strong>every</strong> task matching the current filters, not just the {{ rows|length }} shown on this page. You will review the matching task IDs before anything changes.</p>
     <form method="post" action="/api/tasks/tags/bulk">
       {% for key, value in filters.query_pairs() %}
         <input type="hidden" name="{{ key }}" value="{{ value }}">
@@ -83,9 +119,9 @@
       </fieldset>
       <p><button type="submit">Review bulk change</button></p>
     </form>
-  </section>
+  </details>
 
-  <p>{{ rows|length }} task{% if rows|length != 1 %}s{% endif %}</p>
+  {{ pager("top") }}
   <div class="table-wrap">
     <table>
       <thead>
@@ -118,4 +154,5 @@
       </tbody>
     </table>
   </div>
+  {{ pager("bottom") }}
 {% endblock %}

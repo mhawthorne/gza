@@ -1832,6 +1832,30 @@ class TestTaskChaining:
         count = store.count_blocked_tasks()
         assert count == 0
 
+    def test_get_status_counts_groups_tasks_by_status(self, tmp_path: Path):
+        """Status totals come from one grouped scan, not from loading tasks."""
+        store = SqliteTaskStore(tmp_path / "counts.db")
+        store.add("Still pending one")
+        store.add("Still pending two")
+        done = store.add("Finished")
+        done.status = "completed"
+        done.completed_at = datetime.now(UTC)
+        store.update(done)
+
+        counts = store.get_status_counts()
+
+        assert counts["pending"] == 2
+        assert counts["completed"] == 1
+        # Statuses with no tasks are absent rather than reported as zero.
+        assert "failed" not in counts
+
+    def test_get_status_counts_totals_match_the_task_table(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "totals.db")
+        for index in range(7):
+            store.add(f"Task {index}")
+
+        assert sum(store.get_status_counts().values()) == len(store.get_all())
+
     def test_get_tag_status_counts(self, tmp_path: Path):
         """Tag status counts should come from the canonical tag API."""
         db_path = tmp_path / "test.db"

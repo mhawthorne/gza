@@ -13,6 +13,7 @@ from urllib.parse import parse_qs
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, ValidationError
 
@@ -29,8 +30,11 @@ from .task_edit import (
     parse_content_edit,
 )
 from .task_list import (
+    DEFAULT_PAGE_SIZE,
+    PAGE_SIZES,
     TASK_STATUSES,
     TASK_TYPES,
+    PageSpec,
     TaskListFilters,
     query_task_list,
 )
@@ -58,6 +62,8 @@ class TaskStore(Protocol):
 StoreFactory = Callable[[], TaskStore]
 MutationStoreFactory = Callable[[str], SqliteTaskStore]
 _TEMPLATES = Jinja2Templates(directory=Path(__file__).parent / "templates")
+_STATIC_DIR = Path(__file__).parent / "static"
+_DASHBOARD_RECENT_ROWS = 10
 
 
 @dataclass(frozen=True)
@@ -274,6 +280,7 @@ def create_app(
     )
     server_instance_id = instance_id or os.environ.get("GZA_SERVER_INSTANCE_ID")
     app = FastAPI(title="gza-server", version=__version__)
+    app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
     bulk_previews: dict[str, _BulkPreviewState] = {}
     bulk_previews_lock = Lock()
 
@@ -303,23 +310,60 @@ def create_app(
 
     @app.get("/")
     def index(request: Request):
+        store = cast(SqliteTaskStore, make_store())
+        counts = store.get_status_counts(all_projects=True)
+        # Show every status in its canonical order, including the empty ones:
+        # a zero is information, and a disappearing cell moves its neighbours.
+        status_counts = [
+            {"status": status, "count": counts.get(status, 0)} for status in TASK_STATUSES
+        ]
+        recent = query_task_list(
+            store,
+            TaskListFilters(),
+            page=PageSpec(page=1, per_page=_DASHBOARD_RECENT_ROWS),
+        )
         return _TEMPLATES.TemplateResponse(
             request=request,
             name="index.html",
-            context={"version": __version__},
+            context={
+                "version": __version__,
+                "status_counts": status_counts,
+                "total_tasks": sum(counts.values()),
+                "project_count": len(store.project_query_stores()),
+                "recent": recent.rows,
+            },
         )
 
     @app.get("/tasks")
     def tasks_page(
         request: Request,
         filters: Annotated[TaskListFilters, Depends(_task_list_filters)],
+        page: Annotated[int, Query(ge=1)] = 1,
+        per_page: Annotated[int, Query()] = DEFAULT_PAGE_SIZE,
     ):
-        result = query_task_list(cast(SqliteTaskStore, make_store()), filters)
+        page_spec = PageSpec.normalized(page, per_page)
+        result = query_task_list(
+            cast(SqliteTaskStore, make_store()),
+            filters,
+            page=page_spec,
+        )
         return _TEMPLATES.TemplateResponse(
             request=request,
             name="tasks.html",
             context={
                 "rows": result.rows,
+                "result": result,
+                "page_sizes": PAGE_SIZES,
+                "page_url": lambda number: filters.url(
+                    "/tasks",
+                    page=str(number),
+                    per_page=str(result.page.per_page),
+                ),
+                "per_page_url": lambda size: filters.url(
+                    "/tasks",
+                    page="1",
+                    per_page=str(size),
+                ),
                 "known_tags": result.known_tags,
                 "statuses": TASK_STATUSES,
                 "task_types": TASK_TYPES,
