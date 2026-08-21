@@ -315,16 +315,19 @@ closed and be treated as changed.
   MUST NOT infer stale branch-head advancement from absence alone.
 - If a completed changed-diff rebase row has lost or partially lost its persisted
   pre/post-rebase provenance, lifecycle MUST first try to re-derive that provenance from
-  local git refs and reflogs and persist the repaired rebase metadata on a writable path
-  before query-only lifecycle rendering depends on it, and before lifecycle validates or
-  repairs any dependent resolution review.
+  local git refs and reflogs. Writable lifecycle paths MUST persist the repaired rebase
+  metadata before evaluating dependent resolution-review state. Read-only/query lifecycle
+  paths MAY apply the proven repair in memory for that evaluation, MUST NOT write the
+  repaired metadata, and MUST leave durable repair for the next write-capable lifecycle
+  path.
 - If persisted metadata for a required resolution review is missing, stale, or inconsistent
   with the authoritative post-rebase context, lifecycle MUST then try to re-derive the
   resolved post-rebase head/target SHAs from the repaired rebase provenance plus the live
-  rebase branch head and the current or persisted merge target, then repair the review
-  task's persisted resolution-review metadata from that shared context on a writable path
-  before query-only lifecycle rendering depends on it and before
-  evaluating merge eligibility.
+  rebase branch head and the current or persisted merge target. Writable lifecycle paths
+  MUST repair the review task's persisted resolution-review metadata from that shared
+  context before evaluating merge eligibility. Read-only/query lifecycle paths MAY apply
+  the proven review-scope repair in memory for that evaluation, MUST NOT write it, and
+  MUST leave durable repair for the next write-capable lifecycle path.
 - If lifecycle still cannot resolve or validate the metadata that defines a required
   resolution review after that re-derivation-and-repair attempt, it MUST fail closed and
   park the lineage with `resolution-review-metadata-invalid`. It MUST NOT silently preserve

@@ -938,7 +938,7 @@ def test_watch_query_owner_rows_keeps_same_branch_failed_leaf_with_live_unmerged
     assert all(row.recovery_leaf_task is not None and row.recovery_leaf_task.id == failed.id for row in rows + scoped_rows)
 
 
-def test_watch_query_owner_rows_flushes_prerequisite_reconciliation_after_read_session(
+def test_watch_query_owner_rows_flush_prerequisite_reconciliation_after_read_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1014,10 +1014,10 @@ def test_watch_query_owner_rows_flushes_prerequisite_reconciliation_after_read_s
 
     assert [row.owner_task.id for row in rows] == [failed.id]
     assert depths
-    assert all(depth == 0 for _name, depth in depths)
-    merge_unit = store.resolve_merge_unit_for_task(failed.id)
-    assert merge_unit is not None
-    assert merge_unit.state == "empty"
+    assert all(depth == 0 for _operation, depth in depths)
+    unit = store.resolve_merge_unit_for_task(failed.id)
+    assert unit is not None
+    assert unit.state == "empty"
 
     rows_after, _ = _query_owner_rows_with_context(
         store=store,

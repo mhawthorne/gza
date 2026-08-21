@@ -1212,10 +1212,10 @@ def test_incomplete_preset_flushes_prerequisite_reconciliation_after_read_sessio
 
     assert result.rows == ()
     assert depths
-    assert all(depth == 0 for _name, depth in depths)
-    merge_unit = store.resolve_merge_unit_for_task(failed.id)
-    assert merge_unit is not None
-    assert merge_unit.state == "empty"
+    assert all(depth == 0 for _operation, depth in depths)
+    unit = store.resolve_merge_unit_for_task(failed.id)
+    assert unit is not None
+    assert unit.state == "empty"
 
 
 def test_incomplete_preset_projects_held_plan_as_awaiting_human_when_context_available(tmp_path: Path) -> None:

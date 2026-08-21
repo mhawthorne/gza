@@ -1383,8 +1383,8 @@ def query_lineage_owner_rows_in_read_session(
             config=config,
             git=git,
             target_branch=target_branch,
-            persist_post_merge_rebase_state=persist_post_merge_rebase_state,
-            persist_review_clearance=persist_review_clearance,
+            persist_post_merge_rebase_state=False,
+            persist_review_clearance=False,
             reuse_recovery_merge_context=reuse_recovery_merge_context,
         )
     apply_pending_recovery_reconciliations(store, read_context=read_context)

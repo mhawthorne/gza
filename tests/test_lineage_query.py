@@ -3099,7 +3099,7 @@ def test_query_lineage_owner_rows_builds_owner_trees_without_store_lineage_child
     assert lineage_child_calls == []
 
 
-def test_collect_recovery_lane_entries_performs_prerequisite_reconciliation_writes_only_after_read_session(
+def test_collect_recovery_lane_entries_flushes_prerequisite_reconciliation_after_read_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3172,10 +3172,10 @@ def test_collect_recovery_lane_entries_performs_prerequisite_reconciliation_writ
 
     assert [entry.task.id for entry in entries] == []
     assert depths
-    assert all(depth == 0 for _name, depth in depths)
-    merge_unit = store.resolve_merge_unit_for_task(failed.id)
-    assert merge_unit is not None
-    assert merge_unit.state == "empty"
+    assert all(depth == 0 for _operation, depth in depths)
+    unit = store.resolve_merge_unit_for_task(failed.id)
+    assert unit is not None
+    assert unit.state == "empty"
 
 
 def test_query_lineage_owner_rows_reconciles_historical_prerequisite_unmerged_empty_branch_outside_read_session(

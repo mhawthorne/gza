@@ -10,7 +10,7 @@ from gza.branch_publication import BranchPublicationState, persist_branch_public
 from gza.config import Config, ConfigError
 from gza.db import MergeTargetResolutionError, SqliteTaskStore, Task
 from gza.git import Git, GitError
-from gza.lineage_query import LineageOwnerQuery, _load_indexes, query_lineage_owner_rows_in_read_session
+from gza.lineage_query import LineageOwnerQuery, _load_indexes, query_lineage_owner_rows, query_lineage_owner_rows_in_read_session
 from gza.operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL, MOOT_REDUNDANT_LIFECYCLE_DETAIL
 from gza.recovery_engine import (
     FailedRecoveryDecision,
@@ -1966,7 +1966,7 @@ def test_recovery_engine_branchless_pr_required_parks_for_manual_repair(tmp_path
     )
 
 
-def test_query_lineage_owner_rows_in_read_session_persists_legacy_pr_required_reclassification(
+def test_query_lineage_owner_rows_in_read_session_persists_legacy_pr_required_reclassification_after_read(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -2000,6 +2000,99 @@ def test_query_lineage_owner_rows_in_read_session_persists_legacy_pr_required_re
     refreshed = store.get(failed.id)
     assert refreshed is not None
     assert refreshed.failure_reason == "BRANCH_UNPUSHABLE"
+
+
+def test_query_lineage_owner_rows_in_read_session_persists_prerequisite_no_work_after_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    dependency = store.add("Dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Failed downstream", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.branch = "feature/prereq-empty"
+    failed.has_commits = False
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=_StubEmptyBranchGit(), default_branch="main"),
+    )
+
+    query_lineage_owner_rows_in_read_session(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            statuses=("failed",),
+            include_skipped=True,
+            max_recovery_attempts=1,
+            owner_task_ids=(failed.id,),
+        ),
+        config=config,
+        git=None,
+        target_branch=None,
+    )
+
+    unit = store.resolve_merge_unit_for_task(failed.id)
+    assert unit is not None
+    assert unit.state == "empty"
+
+
+def test_query_lineage_owner_rows_in_read_session_persists_historical_rebase_success_after_read(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    task = store.add("Failed rebase", task_type="rebase")
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "GIT_ERROR"
+    task.log_file = "logs/rebase-success-query-read-session.log"
+    task.branch = "feature/rebase-success-query-read-session"
+    task.has_commits = True
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+
+    log_path = tmp_path / task.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "Rebase completed successfully on feature/example onto local main\n"
+        "All checks passed!\n"
+    )
+
+    query_lineage_owner_rows_in_read_session(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            statuses=("failed",),
+            include_skipped=True,
+            max_recovery_attempts=1,
+            owner_task_ids=(task.id,),
+        ),
+        config=config,
+        git=None,
+        target_branch=None,
+    )
+
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "completed"
+    assert refreshed.failure_reason is None
 
 
 def test_recovery_engine_branch_unpushable_recovery_disabled_parks(tmp_path: Path) -> None:

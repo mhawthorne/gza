@@ -1137,10 +1137,10 @@ class TestQueryIncomplete:
 
         assert lineages == []
         assert depths
-        assert all(depth == 0 for _name, depth in depths)
-        merge_unit = store.resolve_merge_unit_for_task(failed.id)
-        assert merge_unit is not None
-        assert merge_unit.state == "empty"
+        assert all(depth == 0 for _operation, depth in depths)
+        unit = store.resolve_merge_unit_for_task(failed.id)
+        assert unit is not None
+        assert unit.state == "empty"
 
     def test_status_failed_excludes_completed_unmerged_rows(self, tmp_path: Path):
         store = self._store(tmp_path)

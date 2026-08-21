@@ -127,10 +127,11 @@ class ReviewClearancePersistenceResult:
 
 @dataclass(frozen=True)
 class ReviewScopeRepairResult:
-    """Outcome of trying to persist repaired review-scope metadata."""
+    """Outcome of making repaired review-scope metadata available."""
 
     task: Task
     persisted: bool
+    applied_in_memory: bool = False
     blocked_by_readonly: bool = False
 
 
@@ -1036,6 +1037,7 @@ def repair_rebase_review_scope_provenance(
     rebase_task: Task,
     git: Git,
     target_branch: str | None = None,
+    persist: bool = True,
 ) -> ReviewScopeRepairResult:
     """Recover and persist a clobbered rebase provenance block when local refs still prove it."""
     if rebase_task.id is None or rebase_task.task_type != "rebase" or not rebase_task.branch:
@@ -1067,7 +1069,12 @@ def repair_rebase_review_scope_provenance(
         resolved_head_sha=recovered.resolved_head_sha,
         resolved_target_sha=recovered.resolved_target_sha,
     )
-    return persist_repaired_review_scope(store, task=rebase_task, repaired_scope=rebuilt_scope)
+    return persist_repaired_review_scope(
+        store,
+        task=rebase_task,
+        repaired_scope=rebuilt_scope,
+        persist=persist,
+    )
 
 
 def rebase_review_scope_provenance_is_complete(review_scope: str | None) -> bool:
@@ -1160,6 +1167,7 @@ def repair_resolution_review_scope_provenance(
     review_task: Task,
     git: Git,
     target_branch: str | None = None,
+    persist: bool = True,
 ) -> ReviewScopeRepairResult:
     """Recover clobbered resolution-review provenance from the associated rebase row."""
     if review_task.id is None or review_task.task_type != "review":
@@ -1207,9 +1215,14 @@ def repair_resolution_review_scope_provenance(
             rebase_task=rebase_task,
             git=git,
             target_branch=target_branch,
+            persist=persist,
         )
-        if not rebase_repair.persisted:
-            return ReviewScopeRepairResult(task=review_task, persisted=False, blocked_by_readonly=True)
+        if not rebase_repair.persisted and not rebase_repair.applied_in_memory:
+            return ReviewScopeRepairResult(
+                task=review_task,
+                persisted=False,
+                blocked_by_readonly=rebase_repair.blocked_by_readonly,
+            )
 
     provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
     if provenance is None or not resolution_delta_provenance_is_complete(provenance):
@@ -1224,7 +1237,12 @@ def repair_resolution_review_scope_provenance(
         pre_rebase_target_sha=provenance.target_at_start,
         pre_rebase_merge_base_sha=provenance.merge_base_at_start,
     )
-    return persist_repaired_review_scope(store, task=review_task, repaired_scope=rebuilt_scope)
+    return persist_repaired_review_scope(
+        store,
+        task=review_task,
+        repaired_scope=rebuilt_scope,
+        persist=persist,
+    )
 
 
 def backfill_changed_diff_rebase_review_scope_provenance(
@@ -1276,10 +1294,14 @@ def persist_repaired_review_scope(
     *,
     task: Task,
     repaired_scope: str,
+    persist: bool = True,
 ) -> ReviewScopeRepairResult:
-    """Persist repaired review-scope metadata without mutating the live task on failure."""
+    """Apply repaired review-scope metadata, optionally without writing to storage."""
     if task.review_scope == repaired_scope:
         return ReviewScopeRepairResult(task=task, persisted=True)
+    if not persist:
+        task.review_scope = repaired_scope
+        return ReviewScopeRepairResult(task=task, persisted=False, applied_in_memory=True)
     repaired_task = replace(task, review_scope=repaired_scope)
     try:
         store.update(repaired_task)

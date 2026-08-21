@@ -43,7 +43,7 @@ from gza.artifacts import store_command_output_artifact
 from gza.config import Config
 from gza.db import NewTaskParams, SqliteTaskStore, Task as DbTask
 from gza.git import Git, GitError
-from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows
+from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows, query_lineage_owner_rows_in_read_session
 from gza.plan_review_materialization import (
     PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
     PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
@@ -71,6 +71,7 @@ from gza.review_verify_state import (
     refresh_preserved_rebase_review_verify_heads,
 )
 from gza.runner import CROSS_PROJECT_TAG, ReviewVerifyResult
+from gza.task_query import collect_scoped_tag_scope_gaps
 
 
 class _FakeGit:
@@ -5386,6 +5387,88 @@ def test_changed_rebase_completed_approved_resolution_review_with_blank_pre_reba
     assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
+def test_read_only_advance_evaluation_uses_repaired_resolution_scope_without_persisting(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-resolution-read-only-repair",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    assert impl.id is not None
+    assert rebase.id is not None
+    original_scope = (
+        "Review mode: resolution\n"
+        f"Implementation task: {impl.id}\n"
+        f"Rebase task: {rebase.id}\n"
+        "Pre-rebase head SHA: \n"
+        "Pre-rebase target SHA: \n"
+        "Pre-rebase merge-base SHA: \n"
+        "Resolved head SHA: rebased-sha\n"
+        "Resolved target SHA: target-sha\n"
+        "\n"
+        "Review only the conflict-resolution delta introduced by this rebase.\n"
+        "Do not re-review the whole implementation except where context is required."
+    )
+    review.review_scope = original_scope
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+    )
+
+    with store.read_session():
+        read_only_action = evaluate_advance_rules(
+            config,
+            store,
+            git,
+            impl,
+            "main",
+            persist_post_merge_rebase_state=False,
+            persist_review_clearance=False,
+        )
+
+    stored_after_read_only = store.get(review.id)
+    assert stored_after_read_only is not None
+    assert stored_after_read_only.review_scope == original_scope
+
+    write_action = evaluate_advance_rules(config, store, git, impl, "main")
+    repaired_review = store.get(review.id)
+
+    assert read_only_action["type"] == write_action["type"] == "verify_gate"
+    assert read_only_action["verify_gate_phase"] == write_action["verify_gate_phase"] == "pre_merge"
+    assert read_only_action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+    assert repaired_review is not None
+    _assert_resolution_review_scope_matches_context(repaired_review.review_scope, impl=impl, rebase=rebase)
+    assert repaired_review.review_scope != original_scope
+
+
 def test_changed_rebase_completed_resolution_review_missing_pre_rebase_target_still_parks(
     tmp_path: Path,
     monkeypatch,
@@ -6099,6 +6182,203 @@ def test_changed_rebase_with_missing_persisted_provenance_rederives_resolution_r
     assert action["type"] == "verify_gate"
     assert action["verify_gate_phase"] == "pre_review"
     assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+
+
+def test_lineage_owner_read_session_applies_chained_resolution_repairs_without_persisting(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-query-readonly-chain",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    impl.tags = ("scope-tag",)
+    store.update(impl)
+    assert impl.id is not None
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    rebase.review_scope = "Rebase diff provenance: yes\nResolved head SHA: rebased-head\nRecovered baseline: no"
+    store.update(rebase)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_scope = _resolution_review_scope_for(
+        impl,
+        rebase,
+        resolved_head_sha="rebased-head",
+        resolved_target_sha="target-now",
+    )
+    store.update(review)
+    original_rebase_scope = rebase.review_scope
+    original_review_scope = review.review_scope
+
+    assert rebase.completed_at is not None
+    rebase_ts = int(rebase.completed_at.timestamp())
+    pre_head = "b" * 40
+    rebased_head = "c" * 40
+    target_now = "e" * 40
+    _write_reflog(
+        tmp_path,
+        impl.branch,
+        (
+            f"{'a'*40} {pre_head} user <u@example.com> {rebase_ts - 10} +0000\tcommit: prior",
+            f"{pre_head} {rebased_head} user <u@example.com> {rebase_ts - 1} +0000\t"
+            f"rebase (finish): refs/heads/{impl.branch} onto {target_now}",
+        ),
+    )
+    _write_reflog(
+        tmp_path,
+        "main",
+        (f"{'d'*40} {target_now} user <u@example.com> {rebase_ts - 2} +0000\tcommit: target",),
+    )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: rebased_head, "main": target_now},
+        merge_base_by_ref={(pre_head, target_now): "pre-rebase-merge-base"},
+    )
+    git.repo_dir = tmp_path
+
+    read_rows, _read_context = query_lineage_owner_rows_in_read_session(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            tags=("scope-tag",),
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            owner_task_ids=(impl.id,),
+        ),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    stored_rebase_after_read = store.get(rebase.id)
+    stored_review_after_read = store.get(review.id)
+    assert stored_rebase_after_read is not None
+    assert stored_review_after_read is not None
+    assert stored_rebase_after_read.review_scope == original_rebase_scope
+    assert stored_review_after_read.review_scope == original_review_scope
+
+    write_rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            tags=("scope-tag",),
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            owner_task_ids=(impl.id,),
+        ),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(read_rows) == len(write_rows) == 1
+    read_action = read_rows[0].next_action
+    write_action = write_rows[0].next_action
+    assert read_action is not None
+    assert write_action is not None
+    assert read_action["type"] == write_action["type"] == "verify_gate"
+    assert read_action["verify_gate_phase"] == write_action["verify_gate_phase"] == "pre_merge"
+    assert read_action.get("needs_attention_reason") == write_action.get("needs_attention_reason")
+
+    repaired_rebase = store.get(rebase.id)
+    repaired_review = store.get(review.id)
+    assert repaired_rebase is not None
+    assert repaired_review is not None
+    assert repaired_rebase.review_scope != original_rebase_scope
+    assert repaired_review.review_scope != original_review_scope
+    _assert_resolution_review_scope_matches_context(
+        repaired_review.review_scope,
+        impl=impl,
+        rebase=rebase,
+        resolved_head_sha="rebased-head",
+        resolved_target_sha=target_now,
+    )
+
+
+def test_collect_scoped_tag_scope_gaps_uses_readonly_resolution_repairs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-scope-gap-readonly",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    impl.tags = ("scope-tag",)
+    store.update(impl)
+    assert impl.id is not None
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase, resolved_head_sha="rebased-sha", resolved_target_sha="target-sha")
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_scope = _resolution_review_scope_for(impl, rebase)
+    store.update(review)
+    original_rebase_scope = rebase.review_scope
+    original_review_scope = review.review_scope
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+    )
+
+    gaps = collect_scoped_tag_scope_gaps(
+        store,
+        tag_filters=("scope-tag",),
+        any_tag=False,
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    stored_rebase = store.get(rebase.id)
+    stored_review = store.get(review.id)
+    assert gaps == []
+    assert stored_rebase is not None
+    assert stored_review is not None
+    assert stored_rebase.review_scope == original_rebase_scope
+    assert stored_review.review_scope == original_review_scope
 
 
 def test_changed_rebase_with_missing_persisted_provenance_stays_parked_without_rebase_reflog_proof(

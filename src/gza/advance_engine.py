@@ -372,6 +372,7 @@ class AdvanceContext:
     max_noop_improve_cycles: int
     max_resume_attempts: int
     selected_for_merge: bool = False
+    persist_derived_state: bool = True
 
     auto_implement_enabled: bool = True
     has_non_dropped_implement_descendant: bool = False
@@ -2130,17 +2131,20 @@ def _resolve_resolution_review_metadata_shas(
     ctx: AdvanceContext,
     *,
     rebase_task: DbTask | None,
+    persist_scope_repair: bool | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """Resolve resolution-review head/target SHAs from provenance or live refs."""
     if rebase_task is None or rebase_task.id is None:
         return None, None, None
+    persist_repair = ctx.persist_derived_state if persist_scope_repair is None else persist_scope_repair
     repair_result = repair_rebase_review_scope_provenance(
         ctx.store,
         rebase_task=rebase_task,
         git=ctx.git,
         target_branch=ctx.target_branch,
+        persist=persist_repair,
     )
-    if not repair_result.persisted:
+    if not repair_result.persisted and not repair_result.applied_in_memory:
         return rebase_task.id, None, None
     provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
     resolved_head_sha = provenance.resolved_head_sha if provenance is not None else None
@@ -2211,8 +2215,9 @@ def _resolution_review_metadata_matches_context(
         rebase_task=rebase_task,
         git=ctx.git,
         target_branch=ctx.target_branch,
+        persist=ctx.persist_derived_state,
     )
-    if not repair_result.persisted:
+    if not repair_result.persisted and not repair_result.applied_in_memory:
         return False
     provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
     if provenance is None or not resolution_delta_provenance_is_complete(provenance):
@@ -2259,8 +2264,9 @@ def _repair_resolution_review_scope_from_context(
         rebase_task=rebase_task,
         git=ctx.git,
         target_branch=ctx.target_branch,
+        persist=ctx.persist_derived_state,
     )
-    if not repair_result.persisted:
+    if not repair_result.persisted and not repair_result.applied_in_memory:
         return None
     provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
     if provenance is None or not resolution_delta_provenance_is_complete(provenance):
@@ -2284,8 +2290,9 @@ def _repair_resolution_review_scope_from_context(
         store,
         task=review_task,
         repaired_scope=rebuilt_scope,
+        persist=ctx.persist_derived_state,
     )
-    if not repair_result.persisted:
+    if not repair_result.persisted and not repair_result.applied_in_memory:
         return None
     return parse_resolution_review_scope(review_task.review_scope)
 
@@ -2303,8 +2310,9 @@ def _resolve_valid_resolution_review_metadata(
         review_task=review_task,
         git=ctx.git,
         target_branch=ctx.target_branch,
+        persist=ctx.persist_derived_state,
     )
-    if not repair_result.persisted:
+    if not repair_result.persisted and not repair_result.applied_in_memory:
         return None
     scope_text = review_task.review_scope
     try:
@@ -5343,6 +5351,7 @@ def _build_base_advance_context(
     is_resumable_failed: bool,
     has_resume_children: bool,
     resume_chain_depth: int,
+    persist_derived_state: bool,
 ) -> AdvanceContext:
     """Build the DB-known portion of advance context shared by cheap and full paths."""
     return AdvanceContext(
@@ -5364,6 +5373,7 @@ def _build_base_advance_context(
         plan_slice_target_timeout_minutes=_plan_review_timeout_budget_minutes(config),
         max_noop_improve_cycles=effective_max_noop_improves,
         max_resume_attempts=effective_max_resume,
+        persist_derived_state=persist_derived_state,
         auto_implement_enabled=auto_implement_enabled,
         failed_recovery_decision=failed_recovery_decision,
         failed_recovery_attention_reason=failed_recovery_attention_reason,
@@ -5996,6 +6006,7 @@ def resolve_advance_context(
             is_resumable_failed=is_resumable_failed,
             has_resume_children=has_resume_children,
             resume_chain_depth=resume_chain_depth,
+            persist_derived_state=persist_post_merge_rebase_state,
         )
         return replace(
             base_ctx,
@@ -6024,6 +6035,7 @@ def resolve_advance_context(
                 is_resumable_failed=is_resumable_failed,
                 has_resume_children=has_resume_children,
                 resume_chain_depth=resume_chain_depth,
+                persist_derived_state=persist_post_merge_rebase_state,
             ),
             selected_for_merge=selected_for_merge,
         )
@@ -6091,6 +6103,7 @@ def resolve_advance_context(
         is_resumable_failed=is_resumable_failed,
         has_resume_children=has_resume_children,
         resume_chain_depth=resume_chain_depth,
+        persist_derived_state=persist_post_merge_rebase_state,
     )
     ctx = replace(
         ctx,
