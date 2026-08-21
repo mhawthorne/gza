@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from numbers import Integral
@@ -232,13 +233,26 @@ def _source_ref_contains_recorded_head(
     try:
         return is_ancestor(recorded_head_sha, source_ref)
     except Exception as exc:
+        detail = " ".join(str(exc).split()) or exc.__class__.__name__
+        if _is_unresolvable_recorded_head_ancestor_error(exc, recorded_head_sha):
+            logger.debug(
+                f"Could not verify whether {source_ref!r} contains recorded head {recorded_head_sha!r}: "
+                f"{detail}; validating no-work state against recorded-head patch presence instead"
+            )
+            return None
         if on_warning is not None:
-            detail = " ".join(str(exc).split()) or exc.__class__.__name__
             on_warning(
                 f"Could not verify whether {source_ref!r} contains recorded head {recorded_head_sha!r}: "
                 f"{detail}; validating no-work state against recorded-head patch presence instead"
             )
         return None
+
+
+def _is_unresolvable_recorded_head_ancestor_error(exc: BaseException, recorded_head_sha: str) -> bool:
+    """Return whether an ancestry proof failed because the recorded commit object is gone."""
+    detail = str(exc)
+    invalid_operands = re.findall(r"Not a valid commit name\s+([^\s]+)", detail)
+    return any(operand.strip("'\"") == recorded_head_sha for operand in invalid_operands)
 
 
 def _recorded_head_patch_is_present_on_target(

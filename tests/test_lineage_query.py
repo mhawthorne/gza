@@ -15,7 +15,7 @@ import gza.recovery_engine as recovery_engine
 from gza import dependency_preconditions as dependency_preconditions_module
 from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.config import Config
-from gza.db import MergeUnit, SqliteTaskStore
+from gza.db import MergeUnit, SqliteTaskStore, Task as DbTask
 from gza.dispatch_preview import DispatchPreview
 from gza.git import Git, GitError, ResolvedMergeSourceRef
 from gza.lineage_query import (
@@ -234,6 +234,241 @@ class _LineageMergeStateGit:
     def has_non_empty_source_diff_against_target(self, source_ref: str, target: str) -> bool | None:
         self.probes.append(("has_non_empty_source_diff_against_target", f"{source_ref}->{target}"))
         return self.net_diff
+
+
+class _RecordedHeadProofGit:
+    def __init__(self, *, ancestor_error: Exception, source_ref: str = "feature/failed-leaf") -> None:
+        self.ancestor_error = ancestor_error
+        self.source_ref = source_ref
+        self.is_ancestor_calls = 0
+        self.patch_present_calls = 0
+        self.ancestor_probes: list[tuple[str, str]] = []
+        self.patch_present_probes: list[tuple[str, str]] = []
+
+    def resolve_fresh_merge_source(self, branch: str) -> ResolvedMergeSourceRef:
+        return ResolvedMergeSourceRef(self.source_ref if branch == "feature/failed-leaf" else branch)
+
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        if ref == self.source_ref:
+            return "source-sha"
+        if ref == "main":
+            return "target-sha"
+        return None
+
+    def count_commits_ahead_checked(self, _source_ref: str, _target_ref: str) -> int | None:
+        return 0
+
+    def is_merged(self, _branch: str, _target: str) -> bool:
+        return False
+
+    def has_non_empty_source_diff_against_target(self, _source_ref: str, _target: str) -> bool | None:
+        return False
+
+    def is_ancestor(self, _ancestor: str, _descendant: str) -> bool:
+        self.is_ancestor_calls += 1
+        self.ancestor_probes.append((_ancestor, _descendant))
+        raise self.ancestor_error
+
+    def is_patch_equivalent_commit_present_on_target(self, _commit: str, _target: str) -> bool:
+        self.patch_present_calls += 1
+        self.patch_present_probes.append((_commit, _target))
+        return False
+
+
+def _terminal_owner_failed_leaf_case(tmp_path: Path) -> tuple[SqliteTaskStore, DbTask, DbTask, MergeUnit, MergeUnit]:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    owner = store.add("Merged owner", task_type="implement")
+    owner.status = "completed"
+    owner.completed_at = datetime(2026, 8, 21, 8, 0, tzinfo=UTC)
+    owner.branch = "feature/owner"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    store.update(owner)
+    assert owner.id is not None
+
+    failed = store.add("Failed leaf", task_type="implement", based_on=owner.id, recovery_origin="manual")
+    failed.status = "failed"
+    failed.completed_at = datetime(2026, 8, 21, 9, 0, tzinfo=UTC)
+    failed.branch = "feature/failed-leaf"
+    failed.has_commits = True
+    store.update(failed)
+    assert failed.id is not None
+
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="owner-head",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+    leaf_unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="unmerged",
+        head_sha="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    )
+    store.attach_task_to_merge_unit(failed.id, leaf_unit.id, "owner")
+    return store, owner, failed, owner_unit, leaf_unit
+
+
+def test_failed_leaf_dead_recorded_head_uses_fallback_without_warning_and_reuses_cache(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _store, owner, failed, owner_unit, leaf_unit = _terminal_owner_failed_leaf_case(tmp_path)
+    git = _RecordedHeadProofGit(
+        ancestor_error=GitError(
+            "git merge-base --is-ancestor deadbeefdeadbeefdeadbeefdeadbeefdeadbeef "
+            "feature/failed-leaf failed: fatal: Not a valid commit name "
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        )
+    )
+    cache = {}
+
+    with caplog.at_level("WARNING"):
+        first = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+            failed_task=failed,
+            completed_owner=owner,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=leaf_unit,
+            git=git,  # type: ignore[arg-type]
+            classification_cache=cache,
+        )
+        second = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+            failed_task=failed,
+            completed_owner=owner,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=leaf_unit,
+            git=git,  # type: ignore[arg-type]
+            classification_cache=cache,
+        )
+
+    assert first is True
+    assert second is True
+    assert git.is_ancestor_calls == 1
+    assert git.patch_present_calls == 1
+    assert caplog.records == []
+
+
+def test_failed_leaf_recorded_head_genuine_git_error_still_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _store, owner, failed, owner_unit, leaf_unit = _terminal_owner_failed_leaf_case(tmp_path)
+    git = _RecordedHeadProofGit(
+        ancestor_error=GitError(
+            "git merge-base --is-ancestor deadbeefdeadbeefdeadbeefdeadbeefdeadbeef "
+            "feature/failed-leaf failed: fatal: unable to read repository"
+        )
+    )
+
+    with caplog.at_level("WARNING", logger="gza.lineage_query"):
+        result = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+            failed_task=failed,
+            completed_owner=owner,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=leaf_unit,
+            git=git,  # type: ignore[arg-type]
+        )
+
+    assert result is True
+    assert git.is_ancestor_calls == 1
+    assert git.patch_present_calls == 1
+    assert any("Could not verify whether" in record.getMessage() for record in caplog.records)
+
+
+def test_failed_leaf_recorded_head_bad_source_ref_still_warns_and_uses_fallback(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _store, owner, failed, owner_unit, leaf_unit = _terminal_owner_failed_leaf_case(tmp_path)
+    git = _RecordedHeadProofGit(
+        ancestor_error=GitError(
+            "git merge-base --is-ancestor deadbeefdeadbeefdeadbeefdeadbeefdeadbeef "
+            "refs/heads/feature/failed-leaf failed:\n"
+            "fatal: Not a valid commit name refs/heads/feature/failed-leaf"
+        ),
+        source_ref="refs/heads/feature/failed-leaf",
+    )
+
+    with caplog.at_level("WARNING", logger="gza.lineage_query"):
+        result = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+            failed_task=failed,
+            completed_owner=owner,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=leaf_unit,
+            git=git,  # type: ignore[arg-type]
+        )
+
+    assert result is True
+    assert git.ancestor_probes == [("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "refs/heads/feature/failed-leaf")]
+    assert git.patch_present_probes == [("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "main")]
+    assert any(
+        record.levelname == "WARNING" and "Could not verify whether" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_query_lineage_owner_rows_reuses_failed_leaf_cache_for_terminal_rerooting(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    owner = store.add("Merged owner", task_type="implement")
+    owner.status = "completed"
+    owner.completed_at = datetime(2026, 8, 21, 8, 0, tzinfo=UTC)
+    owner.branch = "feature/owner"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    store.update(owner)
+    assert owner.id is not None
+
+    failed = store.add("Failed leaf", task_type="implement", based_on=owner.id, recovery_origin="manual")
+    failed.status = "failed"
+    failed.completed_at = datetime(2026, 8, 21, 9, 0, tzinfo=UTC)
+    failed.branch = "feature/failed-leaf"
+    failed.has_commits = True
+    store.update(failed)
+    assert failed.id is not None
+
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="owner-head",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+    leaf_unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+        head_sha="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+    )
+    store.attach_task_to_merge_unit(failed.id, leaf_unit.id, "contributor")
+    git = _RecordedHeadProofGit(
+        ancestor_error=GitError(
+            "git merge-base --is-ancestor deadbeefdeadbeefdeadbeefdeadbeefdeadbeef "
+            "refs/heads/feature/failed-leaf failed: fatal: Not a valid commit name "
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+        ),
+        source_ref="refs/heads/feature/failed-leaf",
+    )
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        git=git,  # type: ignore[arg-type]
+        target_branch="main",
+        persist_post_merge_rebase_state=False,
+        persist_review_clearance=False,
+    )
+
+    assert [row.owner_task.id for row in rows] == [failed.id]
+    assert rows[0].unresolved_tasks == (failed,)
+    assert rows[0].recovery_leaf_task == failed
+    assert git.ancestor_probes == [("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "refs/heads/feature/failed-leaf")]
+    assert git.patch_present_probes == [("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "main")]
 
 
 def _build_tag_filtered_merge_unit_case(tmp_path: Path) -> tuple[SqliteTaskStore, str, str, str]:

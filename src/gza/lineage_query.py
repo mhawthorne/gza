@@ -20,7 +20,7 @@ from .main_integration_verify import (
     main_integration_verify_attention_reason,
 )
 from .main_verify_format import format_main_verify_status_message, resolve_main_verify_target_proof
-from .merge_state import classify_branch_merge_state_for_target
+from .merge_state import classify_branch_merge_state_for_target, resolve_task_merge_source
 from .metrics import instrument_module_functions
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 from .recovery_read_context import RecoveryReadContext
@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 LineageStatus = Literal["resolved", "actionable", "needs_attention", "waiting", "skipped"]
 ResolutionReason = Literal["lineage_complete", "branch_merged", "recovery_chain_completed"]
 _LOG = logging.getLogger(__name__)
+_FailedLeafMergeClassificationCache = dict[tuple[str | None, str | None, str], Any]
 
 
 @dataclass(frozen=True)
@@ -368,6 +369,7 @@ def _failed_leaf_should_surface_apart_from_completed_owner(
     leaf_merge_unit: MergeUnit | None,
     git: Git | None,
     target_branch: str | None = None,
+    classification_cache: _FailedLeafMergeClassificationCache | None = None,
 ) -> bool:
     if failed_task.id is None or failed_task.id == completed_owner.id:
         return False
@@ -378,7 +380,36 @@ def _failed_leaf_should_surface_apart_from_completed_owner(
         leaf_merge_unit=leaf_merge_unit,
         git=git,
         target_branch=target_branch,
+        classification_cache=classification_cache,
     )
+
+
+def _classify_failed_leaf_merge_state(
+    *,
+    git: Git,
+    source_branch: str | None,
+    target_branch: str,
+    recorded_head_sha: str | None,
+    classification_cache: _FailedLeafMergeClassificationCache | None,
+) -> Any:
+    source_ref = resolve_task_merge_source(git, source_branch).ref if source_branch else None
+    cache_key = (source_ref, recorded_head_sha, target_branch)
+    if classification_cache is not None and cache_key in classification_cache:
+        return classification_cache[cache_key]
+    classification = classify_branch_merge_state_for_target(
+        git=git,
+        source_branch=source_branch,
+        source_ref=source_ref,
+        target_branch=target_branch,
+        persisted_state=None,
+        merged_proof=None,
+        source_has_commits=None,
+        recorded_head_sha=recorded_head_sha,
+        on_warning=_LOG.warning,
+    )
+    if classification_cache is not None:
+        classification_cache[cache_key] = classification
+    return classification
 
 
 def _matches_status_filters(
@@ -897,6 +928,7 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
     leaf_merge_unit: MergeUnit | None,
     git: Git | None,
     target_branch: str | None = None,
+    classification_cache: _FailedLeafMergeClassificationCache | None = None,
 ) -> bool:
     if owner_merge_unit is None:
         if not (completed_owner.status == "completed" and completed_owner.merge_status == "merged"):
@@ -905,15 +937,12 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
             return False
         if git is not None and target_branch and failed_task.branch:
             try:
-                classification = classify_branch_merge_state_for_target(
+                classification = _classify_failed_leaf_merge_state(
                     git=git,
                     source_branch=failed_task.branch,
                     target_branch=target_branch,
-                    persisted_state=None,
-                    merged_proof=None,
-                    source_has_commits=None,
                     recorded_head_sha=leaf_merge_unit.head_sha if leaf_merge_unit is not None else None,
-                    on_warning=_LOG.warning,
+                    classification_cache=classification_cache,
                 )
             except Exception as exc:
                 _LOG.warning(
@@ -954,15 +983,12 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
             return False
         if git is not None and failed_task.branch:
             try:
-                classification = classify_branch_merge_state_for_target(
+                classification = _classify_failed_leaf_merge_state(
                     git=git,
                     source_branch=failed_task.branch,
                     target_branch=owner_target,
-                    persisted_state=None,
-                    merged_proof=None,
-                    source_has_commits=None,
                     recorded_head_sha=leaf_merge_unit.head_sha if leaf_merge_unit is not None else None,
-                    on_warning=_LOG.warning,
+                    classification_cache=classification_cache,
                 )
             except Exception as exc:
                 _LOG.warning(
@@ -997,15 +1023,12 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
         return False
 
     try:
-        classification = classify_branch_merge_state_for_target(
+        classification = _classify_failed_leaf_merge_state(
             git=git,
             source_branch=source_branch,
             target_branch=owner_target,
-            persisted_state=None,
-            merged_proof=None,
-            source_has_commits=None,
             recorded_head_sha=leaf_merge_unit.head_sha if leaf_merge_unit is not None else None,
-            on_warning=_LOG.warning,
+            classification_cache=classification_cache,
         )
     except Exception as exc:
         _LOG.warning(
@@ -1463,6 +1486,7 @@ def _query_lineage_owner_rows_with_context(
             task.id: index for index, task in enumerate(visible_failed_tasks) if task.id is not None
         }
         source_followup_cache: dict[str, SourceFollowupState] = {}
+        failed_leaf_merge_classification_cache: _FailedLeafMergeClassificationCache = {}
         prime_advance_planning_refs(
             git,
             branch_names=(
@@ -1699,6 +1723,7 @@ def _query_lineage_owner_rows_with_context(
                         leaf_merge_unit=merge_unit,
                         git=git,
                         target_branch=target_branch,
+                        classification_cache=failed_leaf_merge_classification_cache,
                     )
                     if task.id == owner.id and task.id in visible_failed_ids and not terminal_owner_resolution:
                         keep_failed_leaf_visible = True
@@ -1811,6 +1836,7 @@ def _query_lineage_owner_rows_with_context(
                         leaf_merge_unit=merge_units_by_member.get(task.id or ""),
                         git=git,
                         target_branch=target_branch,
+                        classification_cache=failed_leaf_merge_classification_cache,
                     )
                 ]
                 if terminal_owner_resolution
