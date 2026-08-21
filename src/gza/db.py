@@ -17,6 +17,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
 
+import yaml
+
 import gza.metrics as metrics
 from gza.artifact_paths import normalize_artifact_path
 from gza.rebase_identity import rebase_persisted_branch_is_authoritative
@@ -45,6 +47,9 @@ __all__ = [
     "BehaviorCheckRun",
     "DB_UNSET",
     "DuplicateActiveChildError",
+    "ExecutionProjectDisabled",
+    "ExecutionProjectResolved",
+    "ExecutionProjectSelector",
     "KNOWN_FAILURE_REASONS",
     "KNOWN_EXECUTION_MODES",
     "TASK_COMMENT_KINDS",
@@ -74,6 +79,7 @@ __all__ = [
     "preview_v26_migration",
     "check_migration_status",
     "import_legacy_local_db",
+    "resolve_execution_projects",
     "resolve_task_id",
     "task_id_numeric_key",
     "task_updated_at",
@@ -83,6 +89,22 @@ __all__ = [
 
 StoreOpenMode = Literal["readwrite", "query_only"]
 SqliteIsolationLevel = Literal["DEFERRED", "EXCLUSIVE", "IMMEDIATE"] | None
+ExecutionProjectSelectorKind = Literal["path", "registry_id"]
+ExecutionProjectDisableReason = Literal[
+    "empty_root_path",
+    "empty_config_path",
+    "missing_root",
+    "missing_config",
+    "config_invalid",
+    "registry_project_missing",
+    "project_id_mismatch",
+    "db_path_mismatch",
+    "duplicate_selection",
+    "linked_worktree",
+    "db_unavailable",
+    "manual_migration_required",
+    "schema_incompatible",
+]
 
 TASK_COMMENT_KIND_FEEDBACK = "feedback"
 TASK_COMMENT_KIND_REVIEW_SCOPE = "review_scope"
@@ -92,6 +114,9 @@ TASK_COMMENT_KINDS: frozenset[str] = frozenset(
         TASK_COMMENT_KIND_REVIEW_SCOPE,
     }
 )
+
+_SCHEMA_BOOTSTRAP_LOCKS: dict[Path, threading.Lock] = {}
+_SCHEMA_BOOTSTRAP_LOCKS_GUARD = threading.Lock()
 
 
 # Known failure reason categories
@@ -202,9 +227,938 @@ class RebaseBranchResolutionError(ValueError):
     """Raised when a guarded rebase cannot resolve its singleton branch key."""
 
 
+@dataclass(frozen=True)
+class ExecutionProjectSelector:
+    """One explicit watch execution project selection."""
+
+    selector_key: str
+    kind: ExecutionProjectSelectorKind
+    value: str | Path
+
+
+@dataclass(frozen=True)
+class ExecutionProjectResolved:
+    """A validated project runtime target for execution-oriented callers."""
+
+    selector_key: str
+    project_id: str
+    project_name: str
+    project_prefix: str
+    root_path: Path
+    config_path: Path
+    db_path: Path
+    config: "Config"
+
+    def open_runtime_store(self) -> "SqliteTaskStore":
+        """Open the read-write runtime store after the caller owns the project lease."""
+        from .config import Config, ConfigError
+
+        try:
+            current_config = Config.load(self.root_path)
+        except (RuntimeError, ValueError) as exc:
+            if not _is_expected_config_load_path_error(exc):
+                raise
+            raise SchemaIntegrityError(f"Execution project config is invalid at activation: {exc}") from exc
+        except (ConfigError, OSError, yaml.YAMLError) as exc:
+            raise SchemaIntegrityError(f"Execution project config is invalid at activation: {exc}") from exc
+
+        try:
+            current_config_path = Config.config_path(current_config.project_dir).resolve()
+        except (RuntimeError, ValueError) as exc:
+            if not _is_expected_config_load_path_error(exc):
+                raise
+            raise SchemaIntegrityError(f"Execution project config path is invalid at activation: {exc}") from exc
+        except OSError as exc:
+            raise SchemaIntegrityError(f"Execution project config path is invalid at activation: {exc}") from exc
+        try:
+            current_db_path = current_config.db_path.resolve()
+        except (RuntimeError, ValueError) as exc:
+            if not _is_expected_config_load_path_error(exc):
+                raise
+            raise SchemaIntegrityError(f"Execution project DB path is invalid at activation: {exc}") from exc
+        except OSError as exc:
+            raise SchemaIntegrityError(f"Execution project DB path is invalid at activation: {exc}") from exc
+        current_db_incompatibility = _classify_existing_execution_db(current_db_path)
+        if current_db_incompatibility is not None:
+            reason, message = current_db_incompatibility
+            if reason == "db_unavailable":
+                raise SchemaIntegrityError(f"Execution project config is invalid at activation: {message}")
+        if current_config_path != self.config_path:
+            raise SchemaIntegrityError(
+                f"Execution project config resolved to {current_config_path} at activation, expected {self.config_path}."
+            )
+        if current_config.project_id != self.project_id:
+            raise SchemaIntegrityError(
+                f"Execution project project_id changed at activation: {current_config.project_id}, expected {self.project_id}."
+            )
+        if current_config.project_prefix != self.project_prefix:
+            raise SchemaIntegrityError(
+                "Execution project project_prefix changed at activation: "
+                f"{current_config.project_prefix}, expected {self.project_prefix}."
+            )
+        if current_db_path != self.db_path:
+            raise SchemaIntegrityError(
+                f"Execution project DB path changed at activation: {current_db_path}, expected {self.db_path}."
+            )
+
+        db_incompatibility = _classify_existing_execution_db(self.db_path)
+        if db_incompatibility is not None:
+            reason, message = db_incompatibility
+            if reason == "manual_migration_required":
+                try:
+                    pending_versions = _pending_manual_migration_versions(self.db_path)
+                except sqlite3.Error as exc:
+                    if _is_execution_db_availability_sqlite_error(exc):
+                        raise SchemaIntegrityError(
+                            f"Execution project DB became unavailable while rereading manual migration state: {exc}"
+                        ) from exc
+                    raise SchemaIntegrityError(
+                        f"Execution project DB schema changed while rereading manual migration state: {exc}"
+                    ) from exc
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise SchemaIntegrityError(
+                        f"Execution project DB changed while rereading manual migration state: {exc}"
+                    ) from exc
+                raise ManualMigrationRequired(pending_versions or sorted(_MANUAL_MIGRATION_VERSIONS))
+            raise SchemaIntegrityError(message)
+        try:
+            return SqliteTaskStore.from_config(current_config)
+        except ConfigError as exc:
+            raise SchemaIntegrityError(f"Execution project config is invalid at activation: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class ExecutionProjectDisabled:
+    """A selected project that is not safe to execute right now."""
+
+    selector_key: str
+    reason: ExecutionProjectDisableReason
+    message: str
+    project_id: str | None = None
+    root_path: Path | None = None
+    config_path: Path | None = None
+    db_path: Path | None = None
+
+
+@dataclass(frozen=True)
+class _ExecutionProjectCandidate:
+    selector: ExecutionProjectSelector
+    selected_project_id: str
+    expected_project_id: str | None
+    root_path: Path
+    config_path: Path
+    db_path: Path
+    config: "Config"
+
+
 def _observe_sqlite_latency(seconds: float, *, labels: dict[str, str]) -> None:
     """Record one aggregate sqlite latency observation with bounded labels."""
     metrics.observe_latency(_SQLITE_OPERATION_LATENCY_METRIC, seconds, labels=labels)
+
+
+def _disabled_execution_project(
+    selector_key: str,
+    reason: ExecutionProjectDisableReason,
+    message: str,
+    *,
+    project_id: str | None = None,
+    root_path: Path | None = None,
+    config_path: Path | None = None,
+    db_path: Path | None = None,
+) -> ExecutionProjectDisabled:
+    return ExecutionProjectDisabled(
+        selector_key=selector_key,
+        reason=reason,
+        message=message,
+        project_id=project_id,
+        root_path=root_path,
+        config_path=config_path,
+        db_path=db_path,
+    )
+
+
+def _resolve_execution_filesystem_path(raw_path: str | Path) -> tuple[Path | None, str | None]:
+    try:
+        return Path(os.path.expanduser(str(raw_path))).resolve(), None
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, str(exc)
+
+
+def _is_expected_config_load_path_error(exc: RuntimeError | ValueError) -> bool:
+    message = str(exc)
+    return (
+        "Symlink loop from" in message
+        or "embedded null" in message
+        or "embedded null byte" in message
+        or "source code string cannot contain null bytes" in message
+    )
+
+
+def _path_is_dir(path: Path) -> tuple[bool, str | None]:
+    try:
+        return path.exists() and path.is_dir(), None
+    except (OSError, RuntimeError, ValueError) as exc:
+        return False, str(exc)
+
+
+def _path_is_file(path: Path) -> tuple[bool, str | None]:
+    try:
+        return path.exists() and path.is_file(), None
+    except (OSError, RuntimeError, ValueError) as exc:
+        return False, str(exc)
+
+
+def _validate_execution_core_schema(
+    conn: sqlite3.Connection,
+    db_path: Path,
+) -> tuple[ExecutionProjectDisableReason, str] | None:
+    """Validate execution-critical schema artifacts without applying repair."""
+    if not _table_exists(conn, "tasks"):
+        return (
+            "schema_incompatible",
+            f"Database {db_path} is missing required table tasks.",
+        )
+
+    missing_task_columns = _missing_required_columns(conn, "tasks", _QUERY_ONLY_REQUIRED_TASK_COLUMNS)
+    if missing_task_columns:
+        return (
+            "schema_incompatible",
+            f"Database {db_path} is missing required column tasks.{missing_task_columns[0]}.",
+        )
+
+    return None
+
+
+def _parse_schema_version_value(db_path: Path, raw_version: Any) -> tuple[int | None, str | None]:
+    if raw_version is None:
+        return None, f"Database {db_path} has no schema_version row."
+    version_value = raw_version
+    try:
+        schema_version = int(version_value)
+    except (TypeError, ValueError) as exc:
+        return None, f"Database {db_path} has an invalid schema_version value: {raw_version!r} ({exc})."
+    return schema_version, None
+
+
+def _classify_existing_execution_db(
+    db_path: Path,
+) -> tuple[ExecutionProjectDisableReason, str] | None:
+    """Classify read-only schema compatibility for an existing execution DB."""
+    try:
+        db_exists = db_path.exists()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return (
+            "db_unavailable",
+            f"Database path is invalid or inaccessible for execution: {db_path} ({exc})",
+        )
+
+    if not db_exists:
+        ancestor = db_path.parent
+        try:
+            while not ancestor.exists() and ancestor != ancestor.parent:
+                if ancestor.is_symlink():
+                    return (
+                        "db_unavailable",
+                        f"Database ancestor path is invalid or inaccessible for execution bootstrap: {ancestor}",
+                    )
+                ancestor = ancestor.parent
+            ancestor_exists = ancestor.exists()
+            ancestor_is_dir = ancestor.is_dir() if ancestor_exists else False
+        except (OSError, RuntimeError, ValueError) as exc:
+            return (
+                "db_unavailable",
+                f"Database ancestor path is invalid or inaccessible for execution bootstrap: {ancestor} ({exc})",
+            )
+        if ancestor_exists and not ancestor_is_dir:
+            return (
+                "db_unavailable",
+                f"Database ancestor path is not a directory: {ancestor}",
+            )
+        if ancestor_exists and not os.access(ancestor, os.W_OK | os.X_OK):
+            return (
+                "db_unavailable",
+                f"Database ancestor path is not writable for execution bootstrap: {ancestor}",
+            )
+        return None
+
+    try:
+        resolved_db_path = db_path.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return (
+            "db_unavailable",
+            f"Database path is invalid or inaccessible for execution: {db_path} ({exc})",
+        )
+
+    uri = resolved_db_path.as_uri() + "?mode=ro"
+    try:
+        with sqlite3.connect(
+            uri,
+            uri=True,
+            isolation_level=None,
+            timeout=30,
+            factory=_ClosingSqliteConnection,
+        ) as conn:
+            conn.row_factory = sqlite3.Row
+            if not _table_exists(conn, "schema_version"):
+                return (
+                    "schema_incompatible",
+                    f"Database {db_path} is missing schema_version; existing databases are not initialized implicitly.",
+                )
+
+            schema_row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+            if schema_row is None or schema_row["version"] is None:
+                return (
+                    "schema_incompatible",
+                    f"Database {db_path} has no schema_version row.",
+                )
+
+            schema_version, schema_version_error = _parse_schema_version_value(db_path, schema_row["version"])
+            if schema_version_error is not None or schema_version is None:
+                return (
+                    "schema_incompatible",
+                    schema_version_error or f"Database {db_path} has no schema_version row.",
+                )
+
+            if schema_version > SCHEMA_VERSION:
+                return (
+                    "schema_incompatible",
+                    f"Database schema v{schema_version} is newer than supported v{SCHEMA_VERSION}.",
+                )
+
+            for target_version, _migration_sql in _MIGRATIONS:
+                if schema_version < target_version and target_version in _MANUAL_MIGRATION_VERSIONS:
+                    return (
+                        "manual_migration_required",
+                        f"Database {db_path} requires manual migration v{target_version} before execution.",
+                    )
+
+            if schema_version == SCHEMA_VERSION:
+                core_schema_issue = _validate_execution_core_schema(conn, db_path)
+                if core_schema_issue is not None:
+                    return core_schema_issue
+    except sqlite3.Error as exc:
+        if _is_execution_db_availability_sqlite_error(exc):
+            return (
+                "db_unavailable",
+                f"Database {db_path} is temporarily unavailable: {exc}",
+            )
+        return (
+            "schema_incompatible",
+            f"Database {db_path} could not be read as a compatible SQLite task database: {exc}",
+        )
+
+    return None
+
+
+def _pending_manual_migration_versions(db_path: Path) -> list[int]:
+    if not db_path.exists():
+        return []
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    with sqlite3.connect(
+        uri,
+        uri=True,
+        isolation_level=None,
+        timeout=30,
+        factory=_ClosingSqliteConnection,
+    ) as conn:
+        conn.row_factory = sqlite3.Row
+        if not _table_exists(conn, "schema_version"):
+            return []
+        row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+        current_version = int(row["version"]) if row and row["version"] is not None else 0
+    return [
+        target_version
+        for target_version, _migration_sql in _MIGRATIONS
+        if current_version < target_version and target_version in _MANUAL_MIGRATION_VERSIONS
+    ]
+
+
+def _schema_bootstrap_lock(db_path: Path) -> threading.Lock:
+    resolved = db_path.resolve()
+    with _SCHEMA_BOOTSTRAP_LOCKS_GUARD:
+        lock = _SCHEMA_BOOTSTRAP_LOCKS.get(resolved)
+        if lock is None:
+            lock = threading.Lock()
+            _SCHEMA_BOOTSTRAP_LOCKS[resolved] = lock
+        return lock
+
+
+def _is_execution_db_availability_sqlite_error(exc: sqlite3.Error) -> bool:
+    """Return True when SQLite reports an expected availability failure."""
+    message = str(exc).lower()
+    return (
+        "unable to open database file" in message
+        or "database is locked" in message
+        or "database table is locked" in message
+        or "database is busy" in message
+        or "disk i/o error" in message
+        or "permission denied" in message
+        or "readonly" in message
+        or "read-only" in message
+    )
+
+
+@dataclass(frozen=True)
+class _GitMarkerDiscovery:
+    marker: Path | None
+    inspection_error: str | None = None
+
+
+def _nearest_git_marker(path: Path) -> _GitMarkerDiscovery:
+    for candidate in (path, *path.parents):
+        marker = candidate / ".git"
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            continue
+        except (OSError, RuntimeError, ValueError) as exc:
+            return _GitMarkerDiscovery(marker=marker, inspection_error=str(exc))
+        return _GitMarkerDiscovery(marker=marker)
+    return _GitMarkerDiscovery(marker=None)
+
+
+def _gitfile_gitdir(marker: Path) -> Path | None:
+    try:
+        text = marker.read_text(encoding="utf-8").strip()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    raw_gitdir = text[len("gitdir:") :].strip()
+    if not raw_gitdir:
+        return None
+    gitdir = Path(raw_gitdir)
+    if not gitdir.is_absolute():
+        gitdir = marker.parent / gitdir
+    try:
+        return gitdir.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _gitdir_common_dir(gitdir: Path) -> Path | None:
+    commondir_file = gitdir / "commondir"
+    try:
+        if not commondir_file.exists():
+            return gitdir.resolve()
+        raw_commondir = commondir_file.read_text(encoding="utf-8").strip()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not raw_commondir:
+        return None
+    common_dir = Path(raw_commondir)
+    if not common_dir.is_absolute():
+        common_dir = gitdir / common_dir
+    try:
+        return common_dir.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _gitfile_points_to_linked_worktree(marker: Path) -> bool:
+    gitdir = _gitfile_gitdir(marker)
+    if gitdir is None:
+        return True
+    if gitdir.parent.name == "worktrees":
+        return True
+    common_dir = _gitdir_common_dir(gitdir)
+    if common_dir is None:
+        return True
+    return common_dir != gitdir
+
+
+def _symlinked_git_marker_is_canonical(marker: Path) -> bool:
+    try:
+        target = marker.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    try:
+        if target.is_dir():
+            common_dir = _gitdir_common_dir(target)
+            return common_dir is not None and common_dir == target
+        if target.is_file():
+            return not _gitfile_points_to_linked_worktree(target)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return False
+
+
+def _is_canonical_project_checkout(path: Path) -> bool:
+    """Return whether ``path`` is safe to persist as a canonical project root."""
+    marker_discovery = _nearest_git_marker(path)
+    marker = marker_discovery.marker
+    if marker_discovery.inspection_error is not None:
+        return False
+    if marker is None:
+        return True
+    try:
+        if marker.is_symlink():
+            return _symlinked_git_marker_is_canonical(marker)
+        if marker.is_dir():
+            return True
+        if marker.is_file():
+            return not _gitfile_points_to_linked_worktree(marker)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return False
+
+
+def _execution_project_registry_row(
+    anchor_store: "SqliteTaskStore",
+    selector: ExecutionProjectSelector,
+) -> tuple[sqlite3.Row | None, ExecutionProjectDisabled | None]:
+    project_id = str(selector.value)
+    try:
+        db_path = anchor_store.db_path.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return None, _disabled_execution_project(
+            selector.selector_key,
+            "db_unavailable",
+            f"Registry DB path is invalid or inaccessible: {anchor_store.db_path} ({exc})",
+            project_id=project_id,
+            db_path=None,
+        )
+
+    uri = db_path.as_uri() + "?mode=ro"
+    try:
+        with sqlite3.connect(
+            uri,
+            uri=True,
+            isolation_level=None,
+            timeout=30,
+            factory=_ClosingSqliteConnection,
+        ) as conn:
+            conn.row_factory = sqlite3.Row
+            return (
+                conn.execute(
+                    """
+                    SELECT id, root_path, config_path, project_name, project_prefix
+                    FROM projects
+                    WHERE id = ?
+                    """,
+                    (project_id,),
+                ).fetchone(),
+                None,
+            )
+    except sqlite3.Error as exc:
+        if _is_execution_db_availability_sqlite_error(exc):
+            reason: ExecutionProjectDisableReason = "db_unavailable"
+            message = f"Registry DB {db_path} is temporarily unavailable: {exc}"
+        else:
+            reason = "schema_incompatible"
+            message = f"Registry DB {db_path} does not have a compatible projects registry schema: {exc}"
+        return None, _disabled_execution_project(
+            selector.selector_key,
+            reason,
+            message,
+            project_id=project_id,
+            db_path=db_path,
+        )
+
+
+def _execution_project_paths_from_selector(
+    anchor_store: "SqliteTaskStore",
+    selector: ExecutionProjectSelector,
+) -> tuple[str, Path | None, Path | None, str | None, ExecutionProjectDisabled | None]:
+    if selector.kind == "path":
+        raw_root = str(selector.value)
+        if not raw_root.strip():
+            return (
+                "",
+                None,
+                None,
+                None,
+                _disabled_execution_project(
+                    selector.selector_key,
+                    "empty_root_path",
+                    "Execution project root path is empty.",
+                ),
+            )
+        root_path, path_error = _resolve_execution_filesystem_path(raw_root)
+        if path_error is not None or root_path is None:
+            return (
+                "",
+                None,
+                None,
+                None,
+                _disabled_execution_project(
+                    selector.selector_key,
+                    "missing_root",
+                    f"Execution project root path is invalid or inaccessible: {raw_root!r} ({path_error})",
+                ),
+            )
+        config_path = root_path / "gza.yaml"
+        return "", root_path, config_path, None, None
+
+    if selector.kind != "registry_id":
+        raise ValueError(f"Unknown execution project selector kind: {selector.kind}")
+
+    project_id = str(selector.value)
+    row, registry_disabled = _execution_project_registry_row(anchor_store, selector)
+    if registry_disabled is not None:
+        return (
+            project_id,
+            None,
+            None,
+            project_id,
+            registry_disabled,
+        )
+    if row is None:
+        return (
+            project_id,
+            None,
+            None,
+            project_id,
+            _disabled_execution_project(
+                selector.selector_key,
+                "registry_project_missing",
+                f"Registry project not found in anchor DB: {project_id}",
+                project_id=project_id,
+                db_path=anchor_store.db_path.resolve(),
+            ),
+        )
+
+    root_raw = str(row["root_path"] or "")
+    config_raw = str(row["config_path"] or "")
+    registry_root_path, root_path_error = (
+        _resolve_execution_filesystem_path(root_raw) if root_raw.strip() else (None, None)
+    )
+    registry_config_path, config_path_error = (
+        _resolve_execution_filesystem_path(config_raw) if config_raw.strip() else (None, None)
+    )
+    if not root_raw.strip():
+        return (
+            project_id,
+            None,
+            registry_config_path,
+            project_id,
+            _disabled_execution_project(
+                selector.selector_key,
+                "empty_root_path",
+                f"Registry project {project_id} has an empty root_path.",
+                project_id=project_id,
+                config_path=registry_config_path,
+                db_path=anchor_store.db_path.resolve(),
+            ),
+        )
+    if root_path_error is not None or registry_root_path is None:
+        return (
+            project_id,
+            None,
+            registry_config_path,
+            project_id,
+            _disabled_execution_project(
+                selector.selector_key,
+                "missing_root",
+                f"Registry project {project_id} root_path is invalid or inaccessible: {root_raw!r} ({root_path_error})",
+                project_id=project_id,
+                config_path=registry_config_path,
+                db_path=anchor_store.db_path.resolve(),
+            ),
+        )
+    if not config_raw.strip():
+        return (
+            project_id,
+            registry_root_path,
+            None,
+            project_id,
+            _disabled_execution_project(
+                selector.selector_key,
+                "empty_config_path",
+                f"Registry project {project_id} has an empty config_path.",
+                project_id=project_id,
+                root_path=registry_root_path,
+                db_path=anchor_store.db_path.resolve(),
+            ),
+        )
+    if config_path_error is not None or registry_config_path is None:
+        return (
+            project_id,
+            registry_root_path,
+            None,
+            project_id,
+            _disabled_execution_project(
+                selector.selector_key,
+                "missing_config",
+                f"Registry project {project_id} config_path is invalid or inaccessible: {config_raw!r} ({config_path_error})",
+                project_id=project_id,
+                root_path=registry_root_path,
+                db_path=anchor_store.db_path.resolve(),
+            ),
+        )
+
+    return project_id, registry_root_path, registry_config_path, project_id, None
+
+
+def _preflight_execution_project(
+    anchor_store: "SqliteTaskStore",
+    selector: ExecutionProjectSelector,
+) -> _ExecutionProjectCandidate | ExecutionProjectDisabled:
+    from .config import Config, ConfigError
+
+    selected_project_id, root_path, config_path, expected_project_id, disabled = _execution_project_paths_from_selector(
+        anchor_store, selector
+    )
+    if disabled is not None:
+        return disabled
+
+    assert root_path is not None
+    assert config_path is not None
+
+    root_is_dir, root_stat_error = _path_is_dir(root_path)
+    if not root_is_dir:
+        message = f"Execution project root does not exist or is not a directory: {root_path}"
+        if root_stat_error is not None:
+            message = f"Execution project root is invalid or inaccessible: {root_path} ({root_stat_error})"
+        return _disabled_execution_project(
+            selector.selector_key,
+            "missing_root",
+            message,
+            project_id=expected_project_id,
+            root_path=root_path,
+            config_path=config_path,
+            db_path=anchor_store.db_path.resolve() if selector.kind == "registry_id" else None,
+        )
+    config_is_file, config_stat_error = _path_is_file(config_path)
+    if not config_is_file:
+        message = f"Execution project config does not exist or is not a file: {config_path}"
+        if config_stat_error is not None:
+            message = f"Execution project config is invalid or inaccessible: {config_path} ({config_stat_error})"
+        return _disabled_execution_project(
+            selector.selector_key,
+            "missing_config",
+            message,
+            project_id=expected_project_id,
+            root_path=root_path,
+            config_path=config_path,
+            db_path=anchor_store.db_path.resolve() if selector.kind == "registry_id" else None,
+        )
+
+    if selector.kind == "registry_id" and not _is_canonical_project_checkout(root_path):
+        return _disabled_execution_project(
+            selector.selector_key,
+            "linked_worktree",
+            f"Registry project {selected_project_id} root_path is not a canonical checkout: {root_path}",
+            project_id=expected_project_id,
+            root_path=root_path,
+            config_path=config_path,
+            db_path=anchor_store.db_path.resolve(),
+        )
+
+    try:
+        config = Config.load(root_path)
+    except (RuntimeError, ValueError) as exc:
+        if not _is_expected_config_load_path_error(exc):
+            raise
+        return _disabled_execution_project(
+            selector.selector_key,
+            "db_unavailable",
+            f"Execution project path is invalid or inaccessible while loading config: {exc}",
+            project_id=expected_project_id,
+            root_path=root_path,
+            config_path=config_path,
+            db_path=anchor_store.db_path.resolve() if selector.kind == "registry_id" else None,
+        )
+    except (ConfigError, OSError, UnicodeError, yaml.YAMLError) as exc:
+        return _disabled_execution_project(
+            selector.selector_key,
+            "config_invalid",
+            f"Execution project config is invalid: {exc}",
+            project_id=expected_project_id,
+            root_path=root_path,
+            config_path=config_path,
+            db_path=anchor_store.db_path.resolve() if selector.kind == "registry_id" else None,
+        )
+
+    resolved_db_path, db_path_error = _resolve_execution_filesystem_path(config.db_path)
+    if db_path_error is not None or resolved_db_path is None:
+        return _disabled_execution_project(
+            selector.selector_key,
+            "db_unavailable",
+            f"Execution project DB path is invalid or inaccessible: {config.db_path} ({db_path_error})",
+            project_id=config.project_id,
+            root_path=root_path,
+            config_path=config_path,
+            db_path=None,
+        )
+
+    try:
+        resolved_config_path = Config.config_path(config.project_dir).resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return _disabled_execution_project(
+            selector.selector_key,
+            "missing_config",
+            f"Execution project config path is invalid or inaccessible: {exc}",
+            project_id=config.project_id,
+            root_path=root_path,
+            config_path=config_path,
+            db_path=resolved_db_path,
+        )
+    if resolved_config_path != config_path:
+        return _disabled_execution_project(
+            selector.selector_key,
+            "missing_config",
+            f"Execution project config resolved to {resolved_config_path}, expected {config_path}.",
+            project_id=config.project_id,
+            root_path=root_path,
+            config_path=config_path,
+            db_path=resolved_db_path,
+        )
+
+    if expected_project_id is not None and config.project_id != selected_project_id:
+        return _disabled_execution_project(
+            selector.selector_key,
+            "project_id_mismatch",
+            f"Registry project {selected_project_id} loaded config project_id {config.project_id}.",
+            project_id=config.project_id,
+            root_path=root_path,
+            config_path=config_path,
+            db_path=resolved_db_path,
+        )
+    if selector.kind == "registry_id" and resolved_db_path != anchor_store.db_path.resolve():
+        return _disabled_execution_project(
+            selector.selector_key,
+            "db_path_mismatch",
+            f"Registry project {selected_project_id} resolved DB {resolved_db_path}, expected {anchor_store.db_path.resolve()}.",
+            project_id=selected_project_id,
+            root_path=root_path,
+            config_path=config_path,
+            db_path=resolved_db_path,
+        )
+
+    return _ExecutionProjectCandidate(
+        selector=selector,
+        selected_project_id=selected_project_id,
+        expected_project_id=expected_project_id,
+        root_path=root_path,
+        config_path=config_path,
+        db_path=resolved_db_path,
+        config=config,
+    )
+
+
+def _resolve_preflighted_execution_project(
+    candidate: _ExecutionProjectCandidate,
+) -> ExecutionProjectResolved | ExecutionProjectDisabled:
+    selector = candidate.selector
+    config = candidate.config
+    resolved_db_path = candidate.db_path
+    db_incompatibility = _classify_existing_execution_db(resolved_db_path)
+    if db_incompatibility is not None:
+        reason, message = db_incompatibility
+        return _disabled_execution_project(
+            selector.selector_key,
+            reason,
+            message,
+            project_id=config.project_id,
+            root_path=candidate.root_path,
+            config_path=candidate.config_path,
+            db_path=resolved_db_path,
+        )
+
+    return ExecutionProjectResolved(
+        selector_key=selector.selector_key,
+        project_id=config.project_id,
+        project_name=config.project_name,
+        project_prefix=config.project_prefix,
+        root_path=candidate.root_path,
+        config_path=candidate.config_path,
+        db_path=resolved_db_path,
+        config=config,
+    )
+
+
+def resolve_execution_projects(
+    anchor_store: "SqliteTaskStore",
+    selectors: Iterable[ExecutionProjectSelector],
+) -> tuple[ExecutionProjectResolved | ExecutionProjectDisabled, ...]:
+    """Resolve watch execution selections without using browsing/query fan-out."""
+    materialized = tuple(selectors)
+    selector_key_counts: dict[str, int] = {}
+    for selector in materialized:
+        selector_key_counts[selector.selector_key] = selector_key_counts.get(selector.selector_key, 0) + 1
+
+    duplicate_selector_keys = {key for key, count in selector_key_counts.items() if count > 1}
+    preflighted: list[_ExecutionProjectCandidate | ExecutionProjectDisabled] = []
+    for selector in materialized:
+        preflighted.append(_preflight_execution_project(anchor_store, selector))
+
+    identity_counts: dict[tuple[Path, str], int] = {}
+    for result in preflighted:
+        if isinstance(result, _ExecutionProjectCandidate):
+            identity = (result.db_path, result.config.project_id)
+        elif result.project_id is not None and result.db_path is not None:
+            identity = (result.db_path, result.project_id)
+        else:
+            continue
+        identity_counts[identity] = identity_counts.get(identity, 0) + 1
+    duplicate_identities = {identity for identity, count in identity_counts.items() if count > 1}
+
+    results: list[ExecutionProjectResolved | ExecutionProjectDisabled] = []
+    for result in preflighted:
+        selector_key = result.selector.selector_key if isinstance(result, _ExecutionProjectCandidate) else result.selector_key
+        if isinstance(result, ExecutionProjectDisabled):
+            if selector_key in duplicate_selector_keys:
+                results.append(
+                    _disabled_execution_project(
+                        result.selector_key,
+                        "duplicate_selection",
+                        f"Execution project selector key {result.selector_key!r} was selected more than once.",
+                        project_id=result.project_id,
+                        root_path=result.root_path,
+                        config_path=result.config_path,
+                        db_path=result.db_path,
+                    )
+                )
+                continue
+            if (
+                result.project_id is not None
+                and result.db_path is not None
+                and (result.db_path, result.project_id) in duplicate_identities
+            ):
+                results.append(
+                    _disabled_execution_project(
+                        result.selector_key,
+                        "duplicate_selection",
+                        f"Execution project {result.project_id} at {result.db_path} was selected more than once.",
+                        project_id=result.project_id,
+                        root_path=result.root_path,
+                        config_path=result.config_path,
+                        db_path=result.db_path,
+                    )
+                )
+                continue
+            results.append(result)
+            continue
+        identity = (result.db_path, result.config.project_id)
+        if selector_key in duplicate_selector_keys:
+            results.append(
+                _disabled_execution_project(
+                    result.selector.selector_key,
+                    "duplicate_selection",
+                    f"Execution project selector key {result.selector.selector_key!r} was selected more than once.",
+                    project_id=result.config.project_id,
+                    root_path=result.root_path,
+                    config_path=result.config_path,
+                    db_path=result.db_path,
+                )
+            )
+            continue
+        if identity in duplicate_identities:
+            results.append(
+                _disabled_execution_project(
+                    result.selector.selector_key,
+                    "duplicate_selection",
+                    f"Execution project {result.config.project_id} at {result.db_path} was selected more than once.",
+                    project_id=result.config.project_id,
+                    root_path=result.root_path,
+                    config_path=result.config_path,
+                    db_path=result.db_path,
+                )
+            )
+            continue
+        results.append(_resolve_preflighted_execution_project(result))
+    return tuple(results)
 
 
 def _timed_sqlite_connect(
@@ -4498,92 +5452,114 @@ class SqliteTaskStore:
             ManualMigrationRequired: When the DB needs a manual migration (e.g. v25/v26).
                 The caller should run ``gza migrate`` then re-open the store.
         """
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
-            # Check if schema_version table exists
-            cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
-            if cur.fetchone() is None:
-                # Fresh database - create full current schema directly
-                conn.executescript(SCHEMA)
-                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
-            else:
-                # Check current version and migrate if needed
-                cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
-                row = cur.fetchone()
-                current_version = row["version"] if row else 0
-                _ensure_required_auto_migration_artifacts(conn, target_version=current_version)
-
-                pending_manual: list[int] = []
-                for target_version, migration_sql in _MIGRATIONS:
-                    if current_version < target_version:
-                        if target_version in _MANUAL_MIGRATION_VERSIONS:
-                            pending_manual.append(target_version)
-                            # Don't advance current_version; stop processing further
-                            break
-                        if target_version == 36:
-                            try:
-                                _run_v35_to_v36_migration(conn, self._project_id, self._prefix)
-                            except sqlite3.OperationalError as exc:
-                                if _is_readonly_operational_error(exc):
-                                    raise SchemaIntegrityError(
-                                        "Cannot auto-migrate schema v35->v36 on a read-only database. "
-                                        "Use a writable database to complete migration, then retry."
-                                    ) from exc
-                                raise
-                        elif target_version == 44:
-                            _run_v43_to_v44_migration(conn)
-                        elif migration_sql is not None:
-                            for stmt in _split_sql_statements(migration_sql):
-                                stmt = stmt.strip()
-                                if stmt:
-                                    try:
-                                        conn.execute(stmt)
-                                    except sqlite3.OperationalError as exc:
-                                        if _is_ignorable_migration_operational_error(exc):
-                                            # Duplicate artifact from partially-applied/idempotent migration.
-                                            continue
-                                        raise
-                        _validate_auto_migration_target(conn, target_version)
-                        conn.execute("UPDATE schema_version SET version = ?", (target_version,))
-                        current_version = target_version
-
-                if pending_manual:
-                    raise ManualMigrationRequired(pending_manual)
-
-                if row is None:
+        with _schema_bootstrap_lock(self.db_path):
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._connect() as conn:
+                cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
+                if cur.fetchone() is None:
+                    existing_objects = conn.execute(
+                        """
+                        SELECT name FROM sqlite_master
+                        WHERE name NOT LIKE 'sqlite_%'
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    if existing_objects is not None:
+                        raise SchemaIntegrityError(
+                            "Database is missing schema_version; existing databases are not initialized implicitly."
+                        )
+                    # Fresh database - create full current schema directly.
+                    conn.executescript(SCHEMA)
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+                else:
+                    cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
+                    row = cur.fetchone()
+                    current_version, schema_version_error = _parse_schema_version_value(
+                        self.db_path,
+                        row["version"] if row else None,
+                    )
+                    if schema_version_error is not None or current_version is None:
+                        raise SchemaIntegrityError(
+                            schema_version_error or f"Database {self.db_path} has no schema_version row."
+                        )
+                    if current_version > SCHEMA_VERSION:
+                        raise SchemaIntegrityError(
+                            f"Database schema v{current_version} is newer than supported v{SCHEMA_VERSION}."
+                        )
+                    _ensure_required_auto_migration_artifacts(conn, target_version=current_version)
 
-            _backfill_task_tags_from_group(conn)
+                    pending_manual: list[int] = []
+                    for target_version, migration_sql in _MIGRATIONS:
+                        if current_version < target_version:
+                            if target_version in _MANUAL_MIGRATION_VERSIONS:
+                                pending_manual.append(target_version)
+                                break
+                            if target_version == 36:
+                                try:
+                                    _run_v35_to_v36_migration(conn, self._project_id, self._prefix)
+                                except sqlite3.OperationalError as exc:
+                                    if _is_readonly_operational_error(exc):
+                                        raise SchemaIntegrityError(
+                                            "Cannot auto-migrate schema v35->v36 on a read-only database. "
+                                            "Use a writable database to complete migration, then retry."
+                                        ) from exc
+                                    raise
+                            elif target_version == 44:
+                                _run_v43_to_v44_migration(conn)
+                            elif migration_sql is not None:
+                                for stmt in _split_sql_statements(migration_sql):
+                                    stmt = stmt.strip()
+                                    if stmt:
+                                        try:
+                                            conn.execute(stmt)
+                                        except sqlite3.OperationalError as exc:
+                                            if _is_ignorable_migration_operational_error(exc):
+                                                # Duplicate artifact from partially-applied/idempotent migration.
+                                                continue
+                                            raise
+                            _validate_auto_migration_target(conn, target_version)
+                            conn.execute("UPDATE schema_version SET version = ?", (target_version,))
+                            current_version = target_version
 
-            def _safe_project_backfill(sql: str) -> None:
-                try:
-                    conn.execute(sql, (self._project_id,))
-                except sqlite3.OperationalError as exc:
-                    if "readonly" not in str(exc).lower():
-                        raise
+                    if pending_manual:
+                        raise ManualMigrationRequired(pending_manual)
 
-            if _table_has_column(conn, "tasks", "project_id"):
-                _safe_project_backfill("UPDATE tasks SET project_id = ? WHERE project_id IS NULL OR project_id = ''")
-            if _table_has_column(conn, "run_steps", "project_id"):
-                _safe_project_backfill(
-                    "UPDATE run_steps SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
-                )
-            if _table_has_column(conn, "run_substeps", "project_id"):
-                _safe_project_backfill(
-                    "UPDATE run_substeps SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
-                )
-            if _table_has_column(conn, "task_comments", "project_id"):
-                _safe_project_backfill(
-                    "UPDATE task_comments SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
-                )
-            if _table_has_column(conn, "task_tags", "project_id"):
-                _safe_project_backfill(
-                    "UPDATE task_tags SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
-                )
+                    if row is None:
+                        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
 
-            # Repair required artifacts for current schemas when external damage
-            # or partial migrations removed them.
-            _ensure_required_auto_migration_artifacts(conn, target_version=SCHEMA_VERSION)
+                _backfill_task_tags_from_group(conn)
+
+                def _safe_project_backfill(sql: str) -> None:
+                    try:
+                        conn.execute(sql, (self._project_id,))
+                    except sqlite3.OperationalError as exc:
+                        if "readonly" not in str(exc).lower():
+                            raise
+
+                if _table_has_column(conn, "tasks", "project_id"):
+                    _safe_project_backfill(
+                        "UPDATE tasks SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+                    )
+                if _table_has_column(conn, "run_steps", "project_id"):
+                    _safe_project_backfill(
+                        "UPDATE run_steps SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+                    )
+                if _table_has_column(conn, "run_substeps", "project_id"):
+                    _safe_project_backfill(
+                        "UPDATE run_substeps SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+                    )
+                if _table_has_column(conn, "task_comments", "project_id"):
+                    _safe_project_backfill(
+                        "UPDATE task_comments SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+                    )
+                if _table_has_column(conn, "task_tags", "project_id"):
+                    _safe_project_backfill(
+                        "UPDATE task_tags SET project_id = ? WHERE project_id IS NULL OR project_id = ''"
+                    )
+
+                # Repair required artifacts for current schemas when external damage
+                # or partial migrations removed them.
+                _ensure_required_auto_migration_artifacts(conn, target_version=SCHEMA_VERSION)
 
 
     def _ensure_db_query_only(self) -> None:
@@ -4936,39 +5912,189 @@ class SqliteTaskStore:
             ")"
         )
 
+    def _observed_project_paths_for_registration(self) -> tuple[str, str]:
+        """Return the concrete project paths observed on this store open."""
+        if self._project_root is None or self._config_path is None:
+            return "", ""
+
+        try:
+            root_path = self._project_root.resolve()
+            config_path = self._config_path.resolve()
+            if not root_path.is_dir() or not config_path.is_file():
+                return "", ""
+        except (OSError, RuntimeError, ValueError):
+            return "", ""
+        return str(root_path), str(config_path)
+
+    def _canonical_project_paths_for_registration(self) -> tuple[str, str]:
+        """Return canonical root/config paths safe for automatic registration."""
+        observed_root_path, observed_config_path = self._observed_project_paths_for_registration()
+        if not observed_root_path or not observed_config_path:
+            return "", ""
+
+        root_path = Path(observed_root_path)
+        config_path = Path(observed_config_path)
+        if not _is_canonical_project_checkout(root_path):
+            return "", ""
+
+        try:
+            from .config import Config, ConfigError
+
+            config = Config.load(root_path)
+        except (RuntimeError, ValueError) as exc:
+            if not _is_expected_config_load_path_error(exc):
+                raise
+            return "", ""
+        except (ConfigError, OSError, UnicodeError, yaml.YAMLError):
+            return "", ""
+
+        project_id, project_prefix = _project_identity_from_config(config)
+        config_path_getter = getattr(config, "config_path", None)
+        resolved_config_path = (
+            config_path_getter(getattr(config, "project_dir", None))
+            if callable(config_path_getter) and isinstance(getattr(config, "project_dir", None), Path)
+            else None
+        )
+        if project_id != self._project_id or project_prefix != self._prefix:
+            return "", ""
+        try:
+            loaded_config_path = resolved_config_path.resolve() if resolved_config_path is not None else None
+            loaded_db_path = config.db_path.resolve()
+            store_db_path = self.db_path.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return "", ""
+        if loaded_config_path != config_path:
+            return "", ""
+        if loaded_db_path != store_db_path:
+            return "", ""
+        return str(root_path), str(config_path)
+
+    def _warn_project_registry_path_conflict(
+        self,
+        *,
+        stored_root_path: str,
+        stored_config_path: str,
+        observed_root_path: str,
+        observed_config_path: str,
+    ) -> None:
+        if not observed_root_path or not observed_config_path:
+            return
+        warning = (
+            f"Project registry path conflict for {self._project_id}: "
+            f"stored root_path={stored_root_path!r}, config_path={stored_config_path!r}; "
+            f"observed root_path={observed_root_path!r}, config_path={observed_config_path!r}. "
+            "Keeping stored canonical paths; canonical replacement is not yet available. "
+            "Use an explicit project path selector for this run if you need to bypass the registry row."
+        )
+        if warning not in self._startup_warnings:
+            self._startup_warnings.append(warning)
+
+    def _project_registry_path_update(
+        self,
+        *,
+        stored_root_path: str,
+        stored_config_path: str,
+        observed_root_path: str,
+        observed_config_path: str,
+    ) -> tuple[str, str]:
+        stored_has_root = bool(stored_root_path.strip())
+        stored_has_config = bool(stored_config_path.strip())
+        observed_pair = bool(observed_root_path.strip() and observed_config_path.strip())
+
+        if not stored_has_root and not stored_has_config:
+            if observed_pair:
+                return observed_root_path, observed_config_path
+            return stored_root_path, stored_config_path
+
+        if stored_has_root and stored_has_config:
+            if observed_pair and (stored_root_path, stored_config_path) != (observed_root_path, observed_config_path):
+                self._warn_project_registry_path_conflict(
+                    stored_root_path=stored_root_path,
+                    stored_config_path=stored_config_path,
+                    observed_root_path=observed_root_path,
+                    observed_config_path=observed_config_path,
+                )
+            return stored_root_path, stored_config_path
+
+        if observed_pair:
+            self._warn_project_registry_path_conflict(
+                stored_root_path=stored_root_path,
+                stored_config_path=stored_config_path,
+                observed_root_path=observed_root_path,
+                observed_config_path=observed_config_path,
+            )
+        return stored_root_path, stored_config_path
+
     def _ensure_project_row(self) -> None:
         """Ensure the current project is registered in the shared DB."""
         now = _format_db_timestamp(datetime.now(UTC))
         assert now is not None
-        with self._connect() as conn:
-            try:
+        root_path, config_path = self._canonical_project_paths_for_registration()
+        observed_root_path, observed_config_path = self._observed_project_paths_for_registration()
+        try:
+            with self._write_transaction() as conn:
+                existing = conn.execute(
+                    "SELECT root_path, config_path FROM projects WHERE id = ?",
+                    (self._project_id,),
+                ).fetchone()
+                if existing is None:
+                    conn.execute(
+                        """
+                        INSERT INTO projects (
+                            id, root_path, config_path, project_name, project_prefix, db_layout_version, created_at, last_seen_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            self._project_id,
+                            root_path,
+                            config_path,
+                            self._project_name or self._prefix,
+                            self._prefix,
+                            SCHEMA_VERSION,
+                            now,
+                            now,
+                        ),
+                    )
+                    return
+
+                stored_root_path = str(existing["root_path"] or "")
+                stored_config_path = str(existing["config_path"] or "")
+                stored_has_no_paths = not stored_root_path.strip() and not stored_config_path.strip()
+                if stored_has_no_paths:
+                    updated_root_path, updated_config_path = (
+                        (root_path, config_path) if root_path and config_path else (stored_root_path, stored_config_path)
+                    )
+                else:
+                    updated_root_path, updated_config_path = self._project_registry_path_update(
+                        stored_root_path=stored_root_path,
+                        stored_config_path=stored_config_path,
+                        observed_root_path=observed_root_path,
+                        observed_config_path=observed_config_path,
+                    )
                 conn.execute(
                     """
-                    INSERT INTO projects (
-                        id, root_path, config_path, project_name, project_prefix, db_layout_version, created_at, last_seen_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(id) DO UPDATE SET
-                        root_path = excluded.root_path,
-                        config_path = excluded.config_path,
-                        project_name = excluded.project_name,
-                        project_prefix = excluded.project_prefix,
-                        db_layout_version = excluded.db_layout_version,
-                        last_seen_at = excluded.last_seen_at
+                    UPDATE projects
+                    SET root_path = ?,
+                        config_path = ?,
+                        project_name = ?,
+                        project_prefix = ?,
+                        db_layout_version = ?,
+                        last_seen_at = ?
+                    WHERE id = ?
                     """,
                     (
-                        self._project_id,
-                        str(self._project_root.resolve()) if self._project_root else "",
-                        str(self._config_path.resolve()) if self._config_path else "",
+                        updated_root_path,
+                        updated_config_path,
                         self._project_name or self._prefix,
                         self._prefix,
                         SCHEMA_VERSION,
                         now,
-                        now,
+                        self._project_id,
                     ),
                 )
-            except sqlite3.OperationalError as exc:
-                if "readonly" not in str(exc).lower():
-                    raise
+        except sqlite3.OperationalError as exc:
+            if "readonly" not in str(exc).lower():
+                raise
 
     @contextmanager
     def read_session(self):

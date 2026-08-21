@@ -245,9 +245,8 @@ def get_store(config: Config, *, open_mode: StoreOpenMode = "readwrite") -> Sqli
             Callers should run ``gza migrate`` to fix this.
     """
     store = SqliteTaskStore.from_config(config, open_mode=open_mode)
-    if open_mode == "query_only":
-        for warning in store.startup_warnings():
-            print(f"Warning: {warning}", file=sys.stderr)
+    for warning in store.startup_warnings():
+        print(f"Warning: {warning}", file=sys.stderr)
     return store
 
 

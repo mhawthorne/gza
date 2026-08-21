@@ -5,6 +5,7 @@ import io
 import os
 import re
 import signal
+import sqlite3
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import UTC, datetime
@@ -15,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gza.config import Config
+from gza.cli._common import get_store
 from gza.db import SqliteTaskStore
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
@@ -23,6 +25,79 @@ from gza.main_integration_verify import (
 from gza.runner import _make_review_verify_result
 
 from .conftest import invoke_gza, setup_config
+
+
+def _write_project_config(
+    project_dir: Path,
+    *,
+    project_name: str,
+    project_id: str,
+    db_path: Path,
+    project_prefix: str = "gza",
+) -> None:
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "gza.yaml").write_text(
+        "\n".join(
+            [
+                f"project_name: {project_name}",
+                f"project_id: {project_id}",
+                f"project_prefix: {project_prefix}",
+                f"db_path: {db_path}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def test_get_store_warns_for_readwrite_canonical_registry_conflict(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    shared_db = tmp_path / "shared.db"
+    canonical_a = tmp_path / "canonical-a"
+    canonical_b = tmp_path / "canonical-b"
+    _write_project_config(canonical_a, project_name="CanonicalA", project_id="shared", db_path=shared_db)
+    _write_project_config(canonical_b, project_name="CanonicalB", project_id="shared", db_path=shared_db)
+    (canonical_a / ".git").mkdir()
+    (canonical_b / ".git").mkdir()
+
+    get_store(Config.load(canonical_a))
+    capsys.readouterr()
+    get_store(Config.load(canonical_b))
+
+    captured = capsys.readouterr()
+    assert "Warning: Project registry path conflict for shared" in captured.err
+    assert str(canonical_a.resolve()) in captured.err
+    assert str(canonical_b.resolve()) in captured.err
+    with sqlite3.connect(shared_db) as conn:
+        row = conn.execute("SELECT root_path, config_path FROM projects WHERE id = ?", ("shared",)).fetchone()
+    assert row == (str(canonical_a.resolve()), str((canonical_a / "gza.yaml").resolve()))
+
+
+def test_get_store_warns_for_readwrite_linked_registry_conflict_without_promoting_linked_path(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    shared_db = tmp_path / "shared.db"
+    canonical = tmp_path / "canonical"
+    linked = tmp_path / "linked"
+    _write_project_config(canonical, project_name="Canonical", project_id="shared", db_path=shared_db)
+    _write_project_config(linked, project_name="Linked", project_id="shared", db_path=shared_db)
+    (canonical / ".git").mkdir()
+    (linked / ".git").write_text("gitdir: ../canonical/.git/worktrees/linked\n", encoding="utf-8")
+
+    get_store(Config.load(canonical))
+    capsys.readouterr()
+    get_store(Config.load(linked))
+
+    captured = capsys.readouterr()
+    assert "Warning: Project registry path conflict for shared" in captured.err
+    assert str(canonical.resolve()) in captured.err
+    assert str(linked.resolve()) in captured.err
+    with sqlite3.connect(shared_db) as conn:
+        row = conn.execute("SELECT root_path, config_path FROM projects WHERE id = ?", ("shared",)).fetchone()
+    assert row == (str(canonical.resolve()), str((canonical / "gza.yaml").resolve()))
 
 
 class TestHelpOutput:

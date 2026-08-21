@@ -753,8 +753,11 @@ def _resolve_code_task_timeout_scaling_fields(
 
 
 def _read_yaml_dict(path: Path) -> dict:
-    with open(path) as f:
-        data = yaml.safe_load(f) or {}
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+    except UnicodeError as exc:
+        raise ConfigError(f"Configuration in {path} could not be decoded as text: {exc}") from exc
     if not isinstance(data, dict):
         raise ConfigError(f"Configuration in {path} must be a YAML dictionary/object")
     return data
