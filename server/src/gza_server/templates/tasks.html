@@ -46,7 +46,7 @@
     </label>
     <label>
       Tags
-      <select name="tag" multiple size="5" {% if filters.untagged %}disabled{% endif %}>
+      <select name="tag" multiple size="4" {% if filters.untagged %}disabled{% endif %}>
         {% for tag in known_tags %}
           <option value="{{ tag }}" {% if tag in filters.tags %}selected{% endif %}>{{ tag }}</option>
         {% endfor %}
@@ -54,7 +54,7 @@
     </label>
     <label>
       Status
-      <select name="status" multiple size="5">
+      <select name="status" multiple size="4">
         {% for status in statuses %}
           <option value="{{ status }}" {% if status in filters.statuses %}selected{% endif %}>{{ status }}</option>
         {% endfor %}
@@ -62,7 +62,7 @@
     </label>
     <label>
       Type
-      <select name="type" multiple size="5">
+      <select name="type" multiple size="4">
         {% for task_type in task_types %}
           <option value="{{ task_type }}" {% if task_type in filters.task_types %}selected{% endif %}>{{ task_type }}</option>
         {% endfor %}
@@ -92,8 +92,8 @@
     </div>
   </form>
 
-  <section class="tag-editor">
-    <h2>Bulk retag filtered tasks</h2>
+  <details class="tag-editor">
+    <summary><h2>Bulk retag filtered tasks</h2></summary>
     <p class="muted">A filter is required. This applies to <strong>every</strong> task matching the current filters, not just the {{ rows|length }} shown on this page. You will review the matching task IDs before anything changes.</p>
     <form method="post" action="/api/tasks/tags/bulk">
       {% for key, value in filters.query_pairs() %}
@@ -119,7 +119,7 @@
       </fieldset>
       <p><button type="submit">Review bulk change</button></p>
     </form>
-  </section>
+  </details>
 
   {{ pager("top") }}
   <div class="table-wrap">
