@@ -46,6 +46,9 @@ This document answers questions the engine spec intentionally does not:
   new worker spawns, so later worker starts evaluate against the freshest landed target.
 - **S5 — Scope is explicit.** When tag filters are active, watch MUST act only on
   in-scope work: merges, recovery, new starts, queue pickup, and operator summaries.
+  In multi-project mode, scope is the ordered set of project selections plus each
+  selection's own tag filter. Unkeyed tag flags are allowed only when the invocation
+  resolves exactly one execution project.
 - **S6 — Human-required states are standing operator signals.** Repeated failures,
   backoff, drift restart, idle exit, and human-needed parked states MUST surface explicit
   operator signals. For every watch cycle, `watch` MUST emit an operator-visible `Needs
@@ -65,14 +68,367 @@ This document answers questions the engine spec intentionally does not:
   creates such work, it MUST do so through deduped supervisor rules, not ad hoc per-pass
   task creation.
 
+## Multi-project supervisor contract
+
+This contract permits a single `gza watch` process to supervise more than one project.
+The multi-project shape is a two-level scheduler:
+
+- The **fleet supervisor** owns the ordered selected project set, one aggregate worker
+  budget, the poll and idle boundary, cross-project selection strategy, aggregate
+  confirmation and dry-run output, installed-code drift re-exec, and the watch lease set.
+- A **project runtime** owns exactly one loaded project config, task store, Git context,
+  worker registry, detailed project logs, tag filter, lifecycle/recovery state, local
+  pickup order, and project-local health. Every mutation or worker launch MUST pass
+  through the runtime for the task's owning project.
+
+Multi-project mode MUST remain explicit. The selected set is an ordered list of command
+or manifest records keyed by a command-local selector name. Each record resolves to one
+execution project plus that project's own tag filter and tag matching mode. The selector
+name is part of supervisor identity for logs, summaries, attention keys, backoff maps, and
+strategy state, because task IDs and project IDs can collide across unrelated databases.
+Project declaration order is the stable tie-breaker and the priority order for strategies
+that use priority semantics.
+
+### Scope, tags, and selectors
+
+- A selected project with no keyed tags means all tasks in that project.
+- Repeated keyed tags for one selector use the current any-tag matching semantics unless
+  that selector is explicitly placed in all-tags mode.
+- Unkeyed `--tag` / `--all-tags` semantics are valid whenever the invocation resolves
+  exactly one execution project, including an explicit single `--watch-project`
+  selection. An invocation that resolves more than one execution project MUST reject an
+  unkeyed global tag or global all-tags flag because ownership is ambiguous.
+- Positional raw task/merge-unit selectors are valid only when the invocation resolves
+  exactly one execution project. A multi-project invocation MUST reject positional raw task
+  IDs or merge-unit selectors before runtime construction because raw IDs can collide
+  across databases. Keyed multi-project task selectors are out of scope until a later
+  contract specifies their syntax and validation.
+- Duplicate selector names and duplicate resolved `(db_path, project_id)` selections MUST
+  fail closed before supervision starts.
+
+### Global phase barrier
+
+A fleet cycle MUST preserve S4 across the entire selected set, not merely within each
+project. One multi-project cycle MUST execute these barriers in order:
+
+1. Resolve or revalidate selected projects, refresh changed configs at the cycle boundary,
+   and acquire a watch lease before enabling any newly healthy project.
+2. Reconcile or observe runtime state independently for every selected project according
+   to that runtime state's capabilities. States with validated config and an owned lease
+   MAY perform mutating reconciliation as specified below. States without validated
+   config or without an owned lease MUST be limited to read-only liveness and occupancy
+   observations.
+3. Compute aggregate live worker, starting-worker, and unsettled reservation state across
+   all selected runtimes, deduplicating by PID where the same process is visible through
+   more than one source.
+4. Analyze every selected runtime that is enabled for planning with its own config, store,
+   Git context, and tag filter.
+5. Execute all project-local direct lifecycle work in declared project order before any
+   new worker dispatch in any project. A direct action that changes one project, such as a
+   merge or main-verify result, invalidates only that project's analysis; the supervisor
+   MUST re-plan that project before exposing a worker-dispatch head.
+6. Spend aggregate worker slots through the common fleet dispatch loop. The loop asks
+   the cross-project strategy to choose between currently eligible per-project head
+   candidates, dispatches through the selected runtime, waits for that launch to settle
+   under the existing bounded settlement rules, refreshes aggregate occupancy, and then
+   exposes the selected runtime's next locally ordered head candidate before invoking the
+   strategy again. It MUST repeat until either `dispatch_slots` is zero or no selected
+   runtime can expose an eligible head.
+7. Observe transitions per project, emit aggregate and project-prefixed summaries, decide
+   re-exec/idle/stop once for the fleet, and sleep once using the global poll interval.
+
+The supervisor MUST NOT run a complete single-project cycle for project A, start workers
+there, and only then evaluate project B's direct landing work. That ordering violates the
+fleet-wide direct-action-before-dispatch barrier.
+
+### Aggregate slot accounting
+
+- The multi-project supervisor batch is one global watch budget. `aggregate_running`
+  MUST count only task-executing live workers from every selected runtime after
+  reconciliation. Starting workers and unsettled reservations MUST NOT inflate
+  `aggregate_running`.
+- Dispatch capacity is governed by aggregate occupancy, not by `aggregate_running`
+  alone. The supervisor MUST compute `aggregate_occupied` as the count of deduplicated
+  slot claims across selected runtimes, then compute
+  `dispatch_slots = max(0, supervisor_batch - aggregate_occupied)`.
+- A slot claim is one task-executing live worker, one starting worker, or one unsettled
+  global reservation. The same launch MUST produce at most one claim: deduplicate by
+  worker PID when available, then by a launch token proven globally unique across the
+  supervised fleet, or by a project-qualified fallback identity that includes supervisor
+  selector/runtime identity, resolved `(db_path, project_id)`, and task ID. A bare task ID
+  MUST NOT deduplicate slot claims across project runtimes. Stronger evidence replaces
+  weaker evidence for the same launch. A starting worker launched by this supervisor is
+  covered by its unsettled reservation until settlement; an adopted starting worker
+  without a known reservation MUST create an equivalent occupied claim until it proves
+  task-executing or terminal.
+- Starting workers and unsettled provisional reservations remain distinct aggregate
+  buckets for reporting. The supervisor MUST include every known live task-executing
+  worker, known starting worker, and known unsettled reservation from selected runtimes
+  in aggregate occupancy, even when the runtime state currently allows only read-only
+  observation. Provisional global reservations MUST cover the plan-to-live settlement
+  window so same-process launches cannot oversubscribe the fleet budget.
+- Runtime state controls dispatch eligibility separately from occupancy. A runtime
+  consumes zero aggregate capacity only when it has no known live task-executing worker,
+  starting worker, or unsettled reservation. Healthy projects MAY use all currently free
+  global slots, subject to their own local launch permit and explicit local cap.
+- Aggregate occupancy MUST be refreshed after each settled launch. After a settled
+  successful dispatch, the selected runtime MUST expose its next locally ordered head, if
+  any, and the supervisor MUST continue the same fleet dispatch loop while both
+  `dispatch_slots > 0` and an eligible head remain. If a launch reaches a terminal result
+  before running or never proves live within the bounded settlement window, the
+  provisional global reservation MUST be released, aggregate occupancy MUST be refreshed,
+  and the same cycle MAY continue to another eligible candidate.
+- Existing project-local launch permits remain required. They protect races with manual
+  commands and local `max_concurrent`; the aggregate budget protects this supervisor's
+  selected watch-managed work. A true hard ceiling across unrelated DBs and all commands
+  requires a machine-global registry or permit and is outside this contract.
+- Worker-consuming recovery capacity is allocated from the same fleet budget. The
+  supervisor MUST NOT multiply `watch.recovery_slots` by the number of projects.
+  In multi-project mode, the effective recovery reservation is one supervisor-global value
+  resolved before per-project runtime analysis: explicit CLI `--recovery-slots` wins over
+  a supervisor manifest value, which wins over the anchor/supervisor config's
+  `watch.recovery_slots`, which wins over the default. Selected project configs do not
+  provide competing recovery-slot reservations. `--recovery-only` is a global run-mode
+  override: after `dispatch_slots = max(0, supervisor_batch - aggregate_occupied)` is
+  computed for the current fleet pass, `effective_recovery_slots` MUST equal
+  `dispatch_slots`. This is the fleet equivalent of the legacy `recovery_slots = batch`
+  preset and continues to suppress pending pickup. Otherwise, the resolved reservation
+  value is `effective_recovery_slots` for the fleet dispatch lanes below.
+
+### Local pickup order and cross-project strategies
+
+Each project runtime MUST produce recovery and pending candidates in that project's
+existing local order. For pending pickup, local order is non-null `queue_position` first,
+then `queue_position ASC`, `urgent DESC`, `urgent_bumped_at DESC`, and `created_at ASC`,
+with dependency-runnable filtering applied locally. The cross-project strategy chooses
+only between eligible project heads. It MUST NOT reorder candidates within one project.
+
+The fleet dispatch loop has two worker-consuming lanes:
+
+1. **Recovery lane.** When recovery pickup is enabled, each runtime exposes at most its
+   current locally ordered recovery head. The supervisor arbitrates those heads with the
+   selected cross-project strategy for at most
+   `min(dispatch_slots, effective_recovery_slots)` worker-consuming starts. Recovery
+   heads beyond that supervisor-global allocation wait for a later cycle or for scoped
+   recovery rules that explicitly bypass pending pickup. Under `--recovery-only`,
+   `effective_recovery_slots` equals `dispatch_slots`, so enough eligible recovery heads
+   MUST be allowed to fill every free fleet slot.
+2. **Pending lane.** When pending pickup is enabled, each runtime exposes at most its
+   current locally ordered pending head. The supervisor offers this lane all remaining
+   dispatch capacity after the recovery lane, including any unused recovery allocation
+   when fewer recovery heads are available than `effective_recovery_slots`.
+
+Pending pickup MUST NOT bypass an available worker-consuming recovery head while the
+recovery lane still has unused supervisor-global recovery allocation. Unused recovery
+allocation is donated immediately to pending in the same cycle; it is not held idle for a
+possible later recovery candidate discovered after pending starts. `--recovery-only`
+sets the fleet recovery allocation to all current dispatch capacity and disables the
+pending lane. `--pending-only` disables the global failed-task recovery lane.
+In a scoped single-project watch, existing scoped recovery and pending suppression rules
+remain the lane gates.
+
+Strategy state MUST be deterministic across lanes. Round-robin and weighted-round-robin
+MUST maintain separate persistent cursor/quota state for the recovery lane and the
+pending lane so draining one lane does not advance the other lane's cursor. Project
+priority has no mutable cursor; it applies the same declared project order in both lanes.
+
+The supervisor MUST NOT create, assign, compare, or infer a global cross-project
+`queue_position`. In particular, it MUST NOT arbitrate all runnable rows from all projects
+by one global `queue_position` or timestamp query. Cross-project scheduling is strategy
+arbitration over project-local heads.
+
+The initial named strategies are:
+
+- **`round-robin` (default):** Visit one eligible head per project in declared project
+  order and persist the cursor across cycles. When capacity remains after one pass, the
+  strategy MUST begin another round within the same fleet cycle, using each selected
+  runtime's refreshed local head after any successful dispatch. Empty projects and
+  runtimes whose current capability state exposes no eligible head are skipped without
+  spending a turn. With
+  continued eligibility and eventual slot turnover, no selected project is starved;
+  restarting at the first project every cycle is not valid because it can starve later
+  projects when slots are scarce.
+- **`weighted-round-robin`:** Give each project its positive configured number of turns per
+  round while retaining a persistent cursor. When capacity remains after every eligible
+  project's current weighted turns are exhausted, the strategy MUST begin another
+  weighted round within the same fleet cycle. If a fleet cycle ends in the middle of a
+  weighted round because aggregate capacity is exhausted, the strategy MUST preserve both
+  cursor position and any unfinished in-round quota for the next cycle. Weight zero MUST
+  be rejected rather than used as an implicit disable switch. Positive-weight projects are
+  not starved, though lower weights receive fewer starts and longer waits.
+- **`project-priority`:** Always choose the first eligible project's head, falling through
+  only when earlier projects are empty or their current capability state exposes no
+  eligible head. This strategy intentionally permits starvation: a continuously runnable
+  earlier project can indefinitely prevent later projects from starting. Startup output
+  and operator documentation MUST state that behavior plainly.
+
+`oldest-first` is not part of the initial named set. A later strategy MAY add a global-age
+policy, but it must do so explicitly through the strategy interface and without adding a
+global queue-position ordering.
+
+When the scheduler implementation lands, targeted strategy tests MUST prove that a batch
+larger than the eligible project count starts multiple locally ordered candidates from a
+project in one fleet cycle, weighted turns repeat across same-cycle rounds, a cycle ending
+mid-round resumes from preserved cursor and quota state, recovery receives no more than
+the configured supervisor-global reserved starts before pending receives remaining
+capacity, pending cannot bypass available reserved recovery, unused recovery allocation
+is donated according to the lane rule above, lane cursor behavior remains deterministic,
+and dispatch stops only when aggregate capacity or eligible heads are exhausted.
+
+### Leases, holds, invalid config, and isolation
+
+- Watch supervision uses one lease name, `watch-supervisor`, for both legacy
+  single-project and multi-project watch.
+- A multi-project startup MUST acquire `(project_id, watch-supervisor)` for every resolved
+  healthy selected project in deterministic selector order before the first mutation or
+  preview that assumes exclusivity. A startup lease conflict for any otherwise valid
+  selected project MUST abort the requested healthy set and release leases already
+  acquired; the supervisor MUST NOT silently run a surprising subset.
+- Invalid or unhealthy projects are represented explicitly as runtime states with
+  explicit capabilities:
+  - `enabled`: config is valid and the lease is owned. The runtime MAY perform normal
+    mutating reconciliation, direct lifecycle work, candidate planning, and worker
+    dispatch.
+  - `config-invalid`: the current config failed validation or identity checks. The
+    runtime MUST NOT perform task persistence, permit reservation, queue mutation,
+    lifecycle repair, worker launch, or any other write derived from stale last-known-good
+    configuration. It MAY contribute read-only observations about already-known live
+    workers, starting workers, and unsettled launches to aggregate occupancy when those
+    observations can be collected without loading or trusting the invalid config.
+  - `lease-conflict`: config is valid but this supervisor does not own the project's
+    watch lease. At startup this state aborts the requested healthy set as specified
+    above. If a later renew/adoption attempt loses ownership, the runtime MUST NOT
+    perform mutating reconciliation, lifecycle repair, queue mutation, permit reservation,
+    or worker launch until ownership is recovered. It MAY contribute read-only liveness
+    and occupancy observations for already-known workers/reservations so capacity output
+    remains truthful.
+  - `docker-held` and `git-health-held`: config is valid and the lease remains owned, but
+    the local execution precondition is red. The runtime MAY retain the lease and perform
+    only the mutating reconciliation needed to keep already-live worker state accurate and
+    the durable hold/attention state truthful. It MUST suppress new launches and ordinary
+    direct lifecycle mutations that require the failed precondition until the hold clears.
+  - `main-red/merge-held`: config is valid and the lease remains owned. The runtime MUST
+    hold only ordinary merge actions for the affected local target/merge lane while still
+    performing observation, required mutating reconciliation, bounded rerun bookkeeping,
+    and the `system-main-verify` remediation creation/reuse/queue-bump/dispatch path
+    defined by this spec and
+    [main-verify-self-heal.md](main-verify-self-heal.md). It MUST NOT suppress worker
+    dispatch for that remediation lane merely because ordinary merges are held.
+  - `locally-capped` or launch-capacity blocked: config is valid and the lease remains
+    owned, but the project-local launch permit or local cap has no launch capacity. The
+    runtime MAY observe and reconcile existing live/starting work, but MUST expose no new
+    worker-consuming dispatch candidate until local capacity is available.
+  - temporary launch holds/failures that are not capacity exhaustion MAY suppress only
+    the affected launch attempt while preserving read-only observation and other
+    eligible direct or worker work that is safe for that runtime state.
+  Expected project operational failures are caught at the project boundary, logged with
+  selector name, project ID, and root, and retried at later global poll boundaries.
+  Programming or invariant errors MUST NOT be swallowed as ordinary project holds.
+- A project whose config fails validation MUST fail closed before task persistence, permit
+  reservation, queue mutation, lifecycle repair, or worker launch for that project. Watch
+  MUST NOT execute with a stale last-known-good config after the current config fails
+  validation. If the project later validates, the supervisor MUST acquire or renew that
+  project's lease before enabling it.
+- Docker unavailability, Git-health red, deterministic main-red/merge holds, local caps,
+  and launch holds isolate to the owning project. They MUST NOT block healthy projects
+  from direct work or worker dispatch. A runtime state that retains an owned lease MUST
+  keep that lease so a separate single-project watch cannot take over during a temporary
+  hold; a runtime without an owned lease MUST remain read-only until the lease is
+  acquired or renewed.
+- Backoff, no-progress, parked-attention, and failure maps MUST be keyed by selector name
+  plus project identity and owner/merge-unit identity. Identical task IDs from different
+  databases MUST NOT collide.
+- Owned leases MUST be released in reverse acquisition order on normal exit, startup
+  rollback, handled signals, and confirmation refusal. Installed-code drift re-exec MUST
+  preserve the ordered selector set and the run token so the new process can adopt its
+  live rows and leases idempotently instead of conflicting with itself.
+
+When the runtime implementation lands, targeted regressions MUST prove both safety
+boundaries in this state model:
+
+- A runtime with an invalid reload or later lease conflict performs no writes while its
+  known live/startup occupancy is still counted read-only and healthy projects continue.
+- A deterministic main-red state blocks ordinary merges for the affected lane while still
+  creating or reusing, queue-bumping, and dispatching the matching
+  `system-main-verify` remediation, without blocking healthy projects.
+- Two unrelated databases that contain the same task ID and no usable PID evidence remain
+  two occupied claims unless a launch token proves they are the same globally unique
+  launch, so the supervisor does not expose a phantom dispatch slot.
+
+### Global idle, re-exec, and observability
+
+- Global idle means there is no direct work, runnable candidate, live task-executing
+  worker, starting worker, or unsettled launch across selected runtimes. Disabled or held
+  runtimes with no known live or reserved work remain visible in summaries but MUST NOT
+  keep the process falsely active forever; `max_idle` MAY exit with an unhealthy-project
+  summary.
+- Drift detection is process-global. Re-exec happens only at a fleet cycle boundary and
+  MUST preserve the full ordered selectors, keyed tags, tag modes, strategy state,
+  manifest identity when used, and lease token. The restarted supervisor MUST adopt all
+  detached workers and owned leases before new dispatch.
+- Detailed project-owned logs belong in each project's configured `.gza` area. Aggregate
+  supervisor state and the aggregate supervisor log MUST resolve to one supervisor-owned
+  state directory in this order: an explicit aggregate state/log directory override wins;
+  otherwise a manifest invocation defaults to `<manifest directory>/.gza/watch-supervisor`;
+  otherwise the fallback is `<anchor project root>/.gza/watch-supervisor`. The aggregate
+  supervisor log is written under that resolved directory. Console and aggregate events
+  MUST be prefixed by selector name. A log-path failure in one project degrades that sink
+  and surfaces a warning without losing other projects' events.
+
+### Supervisor policy versus project-local execution settings
+
+The multi-project supervisor owns global policy: supervisor batch, poll interval,
+`max_idle`, strategy, project order, keyed tag selection, tag modes, weights, the
+worker-consuming recovery-slot reservation, confirmation, dry-run behavior, drift re-exec,
+aggregate logging, and aggregate lease coordination. CLI values override a reusable
+supervisor manifest. In legacy single-project mode, absent global values continue to come
+from that project's `watch` config.
+
+Each project remains the source of its own execution and lifecycle settings, including
+provider/model routing, `verify_command`, `unit_verify_command`,
+`autonomous_verify_timeout_seconds`, Docker and setup settings, `advance_mode`, worktree
+paths, target branch, quiet-period policy, recovery eligibility and recovery attempt
+policy, local worker registry, local logs, and explicit local `max_concurrent`. The
+project runtime decides which local failed work is actionable through the shared recovery
+policy; the supervisor decides how many worker-consuming recovery starts may reserve the
+aggregate fleet budget. A CLI setting documented as an all-project override, such as
+`--max-iterations`, MAY override the corresponding project setting for every selected
+runtime; otherwise settings MUST NOT bleed between project configs. Loading one project's
+execution config MUST NOT silently replace supervisor presentation/theme state chosen by
+the anchor or supervisor config.
+
+### Settled compatibility choices before CLI integration
+
+These choices are part of the initial multi-project contract and MUST be enforced before
+the multi-project CLI is enabled:
+
+- Positional task-ID or merge-unit scoped watch is rejected whenever more than one project
+  is selected. Legacy single-project positional scope remains compatible.
+- Round-robin cursor state must survive continuous-process drift re-exec; durable
+  persistence across a full stop/start is optional unless a later contract requires it.
+- Aggregate supervisor state and logging MUST use the same deterministic directory
+  resolution rule as the observability contract: explicit override, then
+  `<manifest directory>/.gza/watch-supervisor` for manifest invocations, then
+  `<anchor project root>/.gza/watch-supervisor` for no-manifest invocations. Fleet state
+  MUST NOT be written into every selected project's task DB.
+- Explicit per-project `max_concurrent` remains a local sub-cap in multi-project mode,
+  while supervisor batch controls aggregate watch appetite.
+
 ## Core invariants
+
+Unless the multi-project supervisor contract above explicitly says otherwise, these
+invariants describe both legacy single-project watch and each project runtime inside a
+multi-project fleet cycle.
 
 ### 1. One cycle has a fixed order
 
 Each watch cycle MUST execute these phases in order:
 
 1. **Reconcile runtime state.** Reap or reconcile stale in-progress state, then discover
-   live detached workers and live in-progress tasks.
+   live detached workers and live in-progress tasks. In a multi-project fleet, this
+   phase is mutating reconciliation only for runtime states with validated config and an
+   owned lease; `config-invalid` and `lease-conflict` runtimes are limited to read-only
+   liveness and occupancy observation until validation and lease ownership are restored.
 2. **Compute capacity.** Derive current `running` and `slots`.
 3. **Evaluate direct lifecycle work first.** Execute merge-ready and every other
    actionable non-worker lifecycle action selected by the shared lifecycle gate before
@@ -218,10 +574,14 @@ Each watch cycle MUST execute these phases in order:
    remaining worker-slot accounting as every other same-cycle dispatch. Cooldown identity
    is subject plus parked reason, so a burst of watch cycles or merges inside one cooldown
    window yields at most one blind auto-rearm attempt for that pair.
-5. **Spend slots on worker-consuming actions.** Use remaining capacity for recovery and
-   lifecycle worker starts selected by the shared engine. Recovery allocation is not a
-   pending leftover: the supervisor MUST reserve worker-consuming recovery capacity before
-   pending pickup, and `--recovery-only` MUST gate pending pickup entirely while any
+5. **Spend slots on worker-consuming actions.** Use remaining `dispatch_slots` for
+   recovery and lifecycle worker starts selected by the shared engine. In multi-project
+   mode, the supervisor MUST use the recovery lane and pending lane defined in
+   [Local pickup order and cross-project strategies](#local-pickup-order-and-cross-project-strategies).
+   Recovery allocation is not a pending leftover: the supervisor MUST offer
+   worker-consuming recovery heads the configured supervisor-global recovery allocation
+   before pending pickup. Under `--recovery-only`, that allocation MUST be all current
+   fleet dispatch capacity, and pending pickup MUST be gated entirely while any
    actionable in-scope recovery remains, even if that recovery action is direct and does
    not consume a worker slot.
    Before pending pickup begins, the supervisor MUST examine pending work in the same
@@ -344,21 +704,29 @@ The batch limit means "maintain at most N concurrent detached worker processes,"
   in-flight startup work even when the task row has not yet stamped `running_pid` for the
   main iterate loop. They MUST derive `stale` from reconciled worker liveness, not from
   the task row's empty `running_pid` alone.
-- The effective watch worker target for a pass MUST be `min(batch, max_concurrent)`.
-  When `max_concurrent` is unset, `gza watch` MUST derive the runtime cap from the
-  effective watch batch for that run, including any CLI `--batch` override.
-- `slots` MUST equal `max(0, min(batch, max_concurrent) - running)`.
-- If the requested `batch` exceeds an explicit `max_concurrent`, watch MUST emit one
-  startup warning that the requested batch was capped by the global ceiling.
-- `watch.recovery_slots` (default `1`) MUST reserve that many worker slots per cycle for
-  actionable failed-task recovery before pending pickup, capped by available slots and
-  actionable in-scope worker-consuming recovery count, when pending pickup is enabled.
-- The rule is uniform for worker-consuming recovery. There is no separate batch-1 policy:
-  with batch 1 and the default `watch.recovery_slots = 1`, plain watch gives the single
-  slot to worker-consuming recovery until that lane drains. `--pending-only` is the
-  operator escape hatch for single-slot pending-only behavior, and `--recovery-only` is
-  the `recovery_slots = batch` extreme that also suppresses pending pickup while direct
-  actionable recovery remains.
+- In legacy single-project mode, the effective watch worker target for a pass MUST be
+  `min(batch, max_concurrent)`. When `max_concurrent` is unset, `gza watch` MUST derive
+  the runtime cap from the effective watch batch for that run, including any CLI `--batch`
+  override. In multi-project mode, supervisor batch is the aggregate cap and each
+  project's explicit `max_concurrent` remains a local sub-cap.
+- In legacy single-project mode, `slots` MUST equal
+  `max(0, min(batch, max_concurrent) - running)`.
+- In legacy single-project mode, if the requested `batch` exceeds an explicit
+  `max_concurrent`, watch MUST emit one startup warning that the requested batch was
+  capped by the configured ceiling.
+- In legacy single-project mode, `watch.recovery_slots` (default `1`) MUST reserve that
+  many worker slots per cycle for actionable failed-task recovery before pending pickup,
+  capped by available slots and actionable in-scope worker-consuming recovery count, when
+  pending pickup is enabled.
+- The legacy single-project rule is uniform for worker-consuming recovery. There is no
+  separate batch-1 policy: with batch 1 and the default `watch.recovery_slots = 1`, plain
+  watch gives the single slot to worker-consuming recovery until that lane drains.
+  `--pending-only` is the operator escape hatch for single-slot pending-only behavior,
+  and `--recovery-only` is the `recovery_slots = batch` extreme that also suppresses
+  pending pickup while direct actionable recovery remains. Multi-project
+  `--recovery-only` preserves the same command contract by making the effective recovery
+  allocation equal every currently free fleet dispatch slot, not the configured
+  reservation.
 - Explicit merge-unit scope disables pending pickup entirely, so worker-consuming
   in-scope recovery MUST be able to use all available slots in that scoped pass unless
   the operator explicitly selected `--pending-only`; config/default
@@ -433,17 +801,30 @@ When the installed `gza` package fingerprint changes while watch is running:
 - This lane is distinct from the system-precondition hold/resume path in section 2.
   Required-Docker unavailability is a supervisor hold condition, not a task failure.
 - Newly observed failures that the shared recovery policy does not auto-resume/retry MUST
-  increment the failure streak for that failing lineage owner / merge unit, not a single
-  process-global streak.
+  increment the failure streak for that failing lineage owner / merge unit and MUST retain
+  that owner in the owning project runtime's distinct failing-owner set, not a single
+  process-global set shared across unrelated projects.
+- The project-runtime halt metric is the **distinct failing-owner count**: the number of
+  owner units in that runtime with retained failure-backoff state. Repeated failures from
+  one owner MUST only advance that owner's streak/backoff and MUST NOT increase this
+  project-runtime halt count. An owner leaves the count only when its retained
+  failure-backoff state is reset after owner-scoped work completes; cooldown expiry alone
+  removes the temporary dispatch quarantine but does not clear the owner from the halt
+  count.
 - The configured exponential backoff policy (`watch.failure_backoff_initial`,
   `watch.failure_backoff_max`) MUST quarantine only the failing owner. Backoff on owner A
   MUST NOT block dispatch of runnable work from owners B, C, and so on in the same or a
   later cycle.
-- `watch.failure_halt_after` MUST be keyed to fleet-wide failure, not repeated failures on
-  one owner alone. A single poisoned owner MAY keep its own escalating streak/backoff
-  without halting the whole watch process.
-- A nonzero per-owner failure streak and each quarantine/halt decision MUST be
-  operator-visible and MUST name the affected owner.
+- `watch.failure_halt_after` MUST be keyed to the owning project runtime's distinct
+  failing-owner count, not repeated failures on one owner alone and not a fleet-wide count
+  shared across projects. In multi-project mode, reaching the threshold holds only that
+  project runtime for human intervention; healthy project runtimes continue to reconcile,
+  run direct work, and dispatch. In legacy single-project mode, the single project runtime
+  is the whole invocation, so reaching the threshold retains the existing one-runtime stop
+  behavior.
+- A nonzero per-owner failure streak, a nonzero project-runtime distinct failing-owner
+  count, and each quarantine/halt/hold decision MUST be operator-visible and MUST name the
+  affected owner or project runtime.
 - Watch MUST reuse the shared bounded recovery policy; it MUST NOT invent a different
   resume/retry/manual boundary from `advance` or `iterate`.
 
@@ -634,19 +1015,19 @@ The existence of these knobs is contract; their values are operator policy.
 
 | Knob | Governs |
 |------|---------|
-| `watch.batch` | Maximum concurrent detached worker processes the supervisor maintains |
-| `max_concurrent` | Global hard ceiling applied to detached worker launches across commands; watch clamps batch to this when explicit |
-| `watch.poll` | Delay between completed cycles |
-| `watch.max_idle` | Consecutive idle loop time before clean exit |
-| `watch.max_iterations` | Iterate-worker loop cap for implementation chains launched by watch |
-| `watch.recovery_slots` | Slots per cycle reserved for worker-consuming failed-task recovery before pending pickup |
-| `watch.failure_backoff_initial` / `watch.failure_backoff_max` | Exponential cooldown after non-auto-resumable failures |
-| `watch.failure_halt_after` | Failure streak threshold that stops watch for human intervention |
-| `watch.transient_recovery_backoff_max` | Maximum persisted cooldown for transient failed recovery/improve retries |
-| `watch.no_progress_cycles` | Repeated unchanged watch-action cycles before the supervisor parks the subject with `watch-no-progress-backstop` |
-| `watch.slot_settle_seconds` | Bounded wait for selected work to prove live execution; only live proof occupies a slot, while terminal-before-running outcomes release provisional budget and no-live-proof outcomes remain undispatched |
-| `watch.no_activity_timeout` | Reconciliation threshold for deciding a registered worker for a pending or in-progress task has gone silent and must be failed/reconciled |
-| `--tag` / `--all-tags` | Supervisor execution scope (`--tag` matches any requested tag by default; `--all-tags` requires all of them) |
+| `watch.batch` / supervisor batch | Maximum concurrent detached worker processes the supervisor maintains; in multi-project mode this is one supervisor-global aggregate watch budget enforced by `dispatch_slots = max(0, supervisor_batch - aggregate_occupied)` |
+| `max_concurrent` | Project-local launch ceiling; legacy single-project watch clamps batch to this when explicit, and multi-project watch treats each selected project's value as a local sub-cap |
+| `watch.poll` / supervisor poll | Delay between completed cycles; in multi-project mode this is one supervisor-global fleet-level sleep boundary |
+| `watch.max_idle` / supervisor max-idle | Consecutive idle loop time before clean exit; in multi-project mode idle is aggregate across selected runtimes |
+| `watch.max_iterations` | Iterate-worker loop cap for implementation chains launched by watch; an explicit CLI override may apply to every selected project, otherwise each project runtime uses its own value |
+| `watch.recovery_slots` / supervisor recovery slots | Worker-consuming failed-task recovery reservation before pending pickup; in legacy single-project mode this comes from that project's watch config when no CLI value is supplied, while in multi-project mode it is one supervisor-global recovery-lane allocation resolved by CLI, then manifest, then anchor/supervisor config, then default, not multiplied per project, and donated to pending when unused in the same cycle; `--recovery-only` overrides the effective recovery allocation to all current dispatch capacity and suppresses pending pickup |
+| `watch.failure_backoff_initial` / `watch.failure_backoff_max` | Project-local exponential cooldown after non-auto-resumable failures |
+| `watch.failure_halt_after` | Project-local distinct failing-owner threshold that stops or holds that runtime for human intervention; repeated failures from one owner advance only that owner's backoff streak |
+| `watch.transient_recovery_backoff_max` | Project-local maximum persisted cooldown for transient failed recovery/improve retries |
+| `watch.no_progress_cycles` | Project-local repeated unchanged watch-action cycles before the supervisor parks the subject with `watch-no-progress-backstop` |
+| `watch.slot_settle_seconds` | Project-local bounded wait for selected work to prove live execution; only live proof occupies a slot, while terminal-before-running outcomes release provisional budget and no-live-proof outcomes remain undispatched |
+| `watch.no_activity_timeout` | Project-local reconciliation threshold for deciding a registered worker for a pending or in-progress task has gone silent and must be failed/reconciled |
+| `--tag` / `--all-tags`; keyed selector tags | Unkeyed `--tag` / `--all-tags` are accepted whenever the invocation resolves exactly one execution project (`--tag` matches any requested tag by default; `--all-tags` requires all of them). Invocations that resolve more than one execution project MUST use keyed selector or manifest tags and MUST reject unkeyed global tag flags |
 | `--[no-]auto-restart-on-drift` | Whether installed-code drift triggers automatic re-exec at the next cycle boundary |
 
 Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to

@@ -11,13 +11,13 @@ The CLI is great for driving gza but poor for *browsing* it. The primary workflo
 ## Packaging & Layout
 
 - Monorepo subproject in this repo (e.g. `server/`), with its own `gza.yaml` below the repo root. Gza's existing subproject support gives it an enforced write boundary (`PROJECT_SCOPE_VIOLATION` outside the subtree) and its **own `verify_command`** — core's verify surface is untouched by server work, and vice versa.
-- Server tasks are filed into the server subproject; core tasks into the root project. Watch is per-project — run a watch per subproject as needed; a multi-project watch is a possible later enhancement, not a prerequisite.
+- Server tasks are filed into the server subproject; core tasks into the root project. The multi-project watch supervisor may supervise both projects from one process while preserving each project's own config, store, worker registry, logs, and execution boundary.
 - Gza core takes no web dependencies. The server's deps (FastAPI/Flask, uvicorn, markdown) belong to the subproject's own package (installable as an optional extra, e.g. `gza[server]`).
 - A future JavaScript frontend becomes a sibling subproject (e.g. `frontend/`) with its own `gza.yaml` and node/TS verify command, its build served as static files by the Python server. Phase 1 does not require it.
 
 ## Process model
 
-- The server is its **own process** (`gza server start` / `stop` / `status` / `open`), never embedded in watch: watch re-execs on self-merges under the editable install, and a request-handler bug must not be able to take down the scheduler. Phase 1 needs no live process at all — browsing/curation works with watch stopped.
+- The server is its **own process** (`gza server start` / `stop` / `status` / `open`), never embedded in watch or the multi-project watch supervisor: watch re-execs on self-merges under the editable install, and a request-handler bug must not be able to take down the scheduler. Phase 1 needs no live process at all — browsing/curation works with watch stopped.
 - The backend imports gza's Python APIs (task store, query filters, retag/edit semantics), so schema, migrations, and edit invariants stay enforced in one place. It resolves data via the standard shared-DB config, so it sees all projects.
 - For phase-2 liveness it reads the same state watch writes (DB + log files) — watch-adjacent, not watch-embedded.
 - Server-rendered Python (templates, markdown renderer, htmx-level interactivity) for phase 1; no frontend build toolchain until phase 2 features demand one.

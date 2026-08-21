@@ -106,6 +106,11 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   Automation MUST halt merges for that failure, and the supervisor MUST create or reuse
   exactly one active remediation attempt for that failure identity, backed by a
   remediation task that aims to fix the failing phase or gate.
+- That deterministic-red hold applies only to ordinary merge actions for the affected
+  local target/merge lane. It MUST NOT suppress creation, reuse, queue-bumping, or
+  worker dispatch of the bounded `system-main-verify` remediation path for the same
+  failure identity, and it MUST NOT block healthy project runtimes in a multi-project
+  watch fleet.
 - The bounded rerun evidence MUST carry the observed environment identity (at minimum
   runner class plus host/container-relevant runtime traits, or an explicit
   `unknown/unavailable` marker when that identity could not be captured) into

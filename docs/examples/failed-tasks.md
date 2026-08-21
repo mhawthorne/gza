@@ -47,7 +47,7 @@ For bulk unattended recovery after fixing an environment issue, use the watch re
 
 | Command | Behavior | Use when |
 |---------|----------|----------|
-| `gza watch --recovery-only` | Send the full watch batch to failed-task recovery, choosing `resume` or `retry` per task | You want watch to drain the failed queue before resuming normal pending processing |
+| `gza watch --recovery-only` | Send the full watch batch, or all free supervisor dispatch slots in multi-project mode, to failed-task recovery, choosing `resume` or `retry` per task | You want watch to drain the failed queue before resuming normal pending processing |
 | `gza watch --recovery-only --dry-run` | Print the recovery decision report and exit | You want to inspect which failed tasks would `resume`, `retry`, or need operator attention before starting recovery |
 | `gza watch --recovery-only --dry-run --show-skipped` | Include ordinary skipped failed tasks in the recovery decision report | You want to inspect why some non-attention failed tasks would still be skipped |
 | `gza watch --recovery-only --show-skipped` | Include skipped failed tasks in live watch logs | You want recovery-only watch logs to explain why some failed tasks are being skipped |
@@ -97,7 +97,7 @@ Retry creates a new task that reuses the same branch (if it exists) but starts a
 
 ## Recover failed tasks with watch
 
-`gza watch` now has a built-in two-lane split. By default, `watch.recovery_slots = 1`, so each watch pass reserves one slot for worker-consuming failed-task recovery before pending pickup and leaves the remaining slots for pending work. Use `gza watch --recovery-only` to dedicate the full batch to failed-task recovery, `gza watch --recovery-first` to allow only explicitly positioned pending work after recovery, or `gza watch --pending-only` to disable recovery and keep the watch loop pending-only.
+`gza watch` now has a built-in two-lane split. By default, `watch.recovery_slots = 1`, so each watch pass reserves one slot for worker-consuming failed-task recovery before pending pickup and leaves the remaining slots for pending work. Use `gza watch --recovery-only` to dedicate the full batch to failed-task recovery, or every free supervisor dispatch slot in multi-project mode. Use `gza watch --recovery-first` to allow only explicitly positioned pending work after recovery, or `gza watch --pending-only` to disable recovery and keep the watch loop pending-only.
 
 Preview the recovery plan first:
 

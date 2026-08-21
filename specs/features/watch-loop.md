@@ -27,7 +27,7 @@ gza watch [--batch N] [--poll S] [--max-idle T] [--max-iterations N] \
 | `--max-idle T` | (none) | Exit after T seconds of consecutive idle time (no flag = run forever) |
 | `--max-iterations N` | 10 | Max review/improve iterations for iterate mode on implement tasks |
 | `--recovery-slots N` | 1 | Slots per cycle reserved for worker-consuming failed-task recovery before pending pickup |
-| `--recovery-only` | false | Preset: dedicate the full batch to failed-task recovery and suppress pending pickup until actionable recovery drains |
+| `--recovery-only` | false | Preset: dedicate the full batch, or all free supervisor dispatch slots in multi-project mode, to failed-task recovery and suppress pending pickup until actionable recovery drains |
 | `--pending-only` | false | Preset: disable failed-task recovery and use all slots for pending work |
 | `--dry-run` | false | Show what each cycle would do without executing |
 
@@ -92,11 +92,11 @@ When slots are available, fill them in this priority order:
 
 1. **Merges** — merge completed tasks that are ready. Merges don't consume a slot (they're synchronous and fast). This runs first so that newly freed branches don't cause rebase conflicts for other tasks.
 
-2. **Allocate recovery vs pending lanes** — worker-consuming failed-task recovery is no longer "whatever slots are left after pending pickup." Each cycle reserves `min(slots, recovery_slots, worker_consuming_recovery_count)` worker slots for the recovery lane and gives the remainder to pending work when pending pickup is enabled. With the default `recovery_slots: 1`, plain watch always gives worker-consuming recovery first claim on one worker slot per cycle when an in-scope worker-consuming recovery action exists. This rule is uniform: at `--batch 1`, the default plain watch becomes recovery-first until the worker-consuming recovery lane drains. Operators who want a single-slot pending-only loop must opt into `--pending-only`. In explicit scoped watch, pending pickup is disabled, so in-scope worker-consuming recovery can use all available slots in that pass unless the operator explicitly selected `--pending-only`.
+2. **Allocate recovery vs pending lanes** — worker-consuming failed-task recovery is no longer "whatever slots are left after pending pickup." Each cycle reserves `min(slots, recovery_slots, worker_consuming_recovery_count)` worker slots for the recovery lane and gives the remainder to pending work when pending pickup is enabled. `--recovery-only` replaces that normal reservation with all currently free dispatch slots. With the default `recovery_slots: 1`, plain watch always gives worker-consuming recovery first claim on one worker slot per cycle when an in-scope worker-consuming recovery action exists. This rule is uniform: at `--batch 1`, the default plain watch becomes recovery-first until the worker-consuming recovery lane drains. Operators who want a single-slot pending-only loop must opt into `--pending-only`. In explicit scoped watch, pending pickup is disabled, so in-scope worker-consuming recovery can use all available slots in that pass unless the operator explicitly selected `--pending-only`.
 
-3. **Run failed-task recovery** — the recovery lane uses the shared recovery engine, so eligibility is not limited to timeout/resource resumes. Actionable recovery may include `resume`, `retry`, or direct reconcile-style handling for failed tasks such as `WORKER_DIED`, depending on the shared policy. Direct reconcile-style recovery remains actionable for mode gating even when it does not spend a worker slot in plain watch. `--recovery-only` is the `recovery_slots = batch` extreme and suppresses pending pickup while any actionable in-scope recovery remains, including direct actions that do not themselves consume a worker slot.
+3. **Run failed-task recovery** — the recovery lane uses the shared recovery engine, so eligibility is not limited to timeout/resource resumes. Actionable recovery may include `resume`, `retry`, or direct reconcile-style handling for failed tasks such as `WORKER_DIED`, depending on the shared policy. Direct reconcile-style recovery remains actionable for mode gating even when it does not spend a worker slot in plain watch. `--recovery-only` is the `recovery_slots = batch` extreme in single-project watch. In multi-project watch, it is the fleet equivalent: every currently free supervisor dispatch slot is available to recovery work. In both modes, it suppresses pending pickup while any actionable in-scope recovery remains, including direct actions that do not themselves consume a worker slot.
 
-4. **Start new pending tasks** — pull from the pending queue (ordered by urgent flag, then insertion order) only after the recovery lane has taken its reserved share for the cycle. For implement tasks, spawn in **iterate mode** with `--max-iterations` so the worker does the full review/improve loop autonomously. For plan/explore tasks, spawn as plain workers (no iterate).
+4. **Start new pending tasks** — pull from the locally runnable pending queue only after the recovery lane has taken its reserved share for the cycle. Pending pickup order is explicit `queue_position` first in ascending order, then urgent tasks by newest `urgent_bumped_at`, then FIFO by oldest `created_at`; tasks blocked by unresolved dependencies are filtered out locally before pickup. For implement tasks, spawn in **iterate mode** with `--max-iterations` so the worker does the full review/improve loop autonomously. For plan/explore tasks, spawn as plain workers (no iterate).
 
 ### Iterate mode for implement tasks
 
@@ -114,22 +114,28 @@ Plan and explore tasks don't go through review/improve, so they spawn as plain `
 
 Tasks are selected from the pending queue in this order:
 
-1. **Urgent first** — tasks flagged as urgent are picked before all others
-2. **FIFO within each lane** — within urgent and normal, insertion order
+1. **Explicit positions first** — non-null `queue_position` values are picked before unpositioned tasks, in ascending numeric order
+2. **Urgent lane** — unpositioned urgent tasks are picked next, newest `urgent_bumped_at` first
+3. **FIFO remainder** — remaining unpositioned normal tasks are picked by oldest `created_at`
+
+Tasks blocked by unresolved dependencies remain pending but are excluded from runnable pickup until their dependencies complete.
 
 ### Queue management: `gza queue`
 
 ```bash
-gza queue                  # list pending tasks in pickup order (urgent first, then FIFO)
-gza queue bump <id>        # move task to urgent lane (front of queue)
+gza queue                  # list runnable dispatch rows in pickup order
+gza queue next <id>        # assign the next explicit queue position
+gza queue move <id> <pos>  # assign an explicit queue position
+gza queue clear <id>       # remove explicit positioning
+gza queue bump <id>        # move task to the urgent lane
 gza queue unbump <id>      # move task back to normal lane
 ```
 
 `gza add --next "prompt"` is sugar for add + bump in one step.
 
-Implementation: a boolean `urgent` column on the task table (default false). `get_pending()` sorts by `(urgent DESC, created_at ASC)`.
+Implementation: pending pickup uses the shared dispatch preview order. It selects runnable pending rows by non-null `queue_position` first, then `queue_position ASC`, `urgent DESC`, `urgent_bumped_at DESC`, and `created_at ASC`, with dependency-runnable filtering applied before dispatch.
 
-This avoids numeric priorities (which are a waste of time to manage) while solving the main use case: "I just noticed a bug and want it picked up in the next cycle." If arbitrary reordering is needed later, swap the boolean for an integer position column — the `queue` command is already the interface, just add `move` subcommands.
+This keeps explicit operator ordering available without requiring every task to be numbered. Use positions for precise release slices, the urgent lane for newly important unpositioned work, and FIFO for the ordinary backlog.
 
 ## Activity Log
 
@@ -197,9 +203,9 @@ Open question: once watch exists, does `advance` remain useful as a standalone c
 
 ### Prerequisites
 
-- `urgent` column on task table + migration
-- `gza queue` command (list, bump, unbump)
+- Pending queue metadata (`queue_position`, `urgent`, `urgent_bumped_at`) and migrations
+- `gza queue` command (list, next, move, clear, bump, unbump)
 - `--next` flag on `gza add`
-- `get_pending()` updated to sort by urgent flag
+- Shared pending pickup query/preview using explicit positions, urgent bump time, FIFO, and local dependency-runnable filtering
 - Ability to spawn iterate-mode background workers (not just plain work)
 - Worker registry cleanup / PID liveness checking
