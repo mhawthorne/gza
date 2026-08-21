@@ -56,6 +56,9 @@ DEFAULT_UNIT_VERIFY_COMMAND = ""
 DEFAULT_INNER_VERIFY_COMMAND = ""
 DEFAULT_USE_DOCKER = True
 DEFAULT_DOCKER_STARTUP_TIMEOUT = 60
+# The local server binds a fixed port so its URL is stable across restarts.
+# 0 means "let the OS pick", which is only useful for throwaway instances.
+DEFAULT_SERVER_PORT = 8765
 DEFAULT_ENFORCE_PROJECT_SCOPE = True
 DEFAULT_DEFAULT_CROSS_PROJECT = False
 DEFAULT_BRANCH_MODE = "multi"  # "single" or "multi"
@@ -164,6 +167,7 @@ VALID_CONFIG_FIELDS = {
     "code_task_diff_timeout_cap_minutes",
     "recommend_rebase_behind_commits", "tmux", "learnings_window",
     "learnings_interval", "learnings_max_items", "behavior_monitor", "spec_coherence", "theme", "colors", "no_color",
+    "server_port",
 }
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "db_path": None,
@@ -962,6 +966,21 @@ def _load_strict_number_field(data: dict, field_name: str, default: int | float)
     return float(value)
 
 
+def _validate_server_port(value: object) -> int:
+    """Validate the local server's listening port.
+
+    0 is allowed and means "let the OS choose an ephemeral port". Any other
+    value must be a real, bindable port number.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError("'server_port' must be an integer")
+    if value != 0 and not (1024 <= value <= 65535):
+        raise ConfigError(
+            f"'server_port' must be 0 or between 1024 and 65535, got {value}"
+        )
+    return value
+
+
 def _validate_optional_positive_int_field(
     value: object,
     field_name: str,
@@ -1527,6 +1546,7 @@ class Config:
     log_dir: str = DEFAULT_LOG_DIR
     use_docker: bool = DEFAULT_USE_DOCKER
     docker_startup_timeout: int = DEFAULT_DOCKER_STARTUP_TIMEOUT
+    server_port: int = DEFAULT_SERVER_PORT
     enforce_project_scope: bool = DEFAULT_ENFORCE_PROJECT_SCOPE
     default_cross_project: bool = DEFAULT_DEFAULT_CROSS_PROJECT
     docker_image: str = ""
@@ -2079,6 +2099,7 @@ class Config:
             "docker_startup_timeout",
         )
         assert docker_startup_timeout is not None
+        server_port = _validate_server_port(data.get("server_port", DEFAULT_SERVER_PORT))
         timeout_minutes = _validate_optional_positive_int_field(
             data.get("timeout_minutes", DEFAULT_TIMEOUT_MINUTES),
             "timeout_minutes",
@@ -3098,6 +3119,7 @@ class Config:
             db_path_value=db_path_raw or "",
             use_docker=use_docker,
             docker_startup_timeout=docker_startup_timeout,
+            server_port=server_port,
             enforce_project_scope=enforce_project_scope,
             default_cross_project=default_cross_project,
             docker_image=data.get("docker_image", ""),

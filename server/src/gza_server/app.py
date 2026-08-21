@@ -43,6 +43,7 @@ from .task_tags import (
     TagMutation,
     apply_bulk_tag_mutation,
     edit_task_tags,
+    parse_selected_task_ids,
     parse_tag_mutation,
     parse_task_tag_edit,
     writable_project_store,
@@ -259,6 +260,39 @@ def _bulk_result_context(
     }
 
 
+def _selection_mutation_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Let one tag field serve all three mutations.
+
+    The selection toolbar offers a single "Tag" box plus a "Replace this tag"
+    box, so Replace arrives as old_tag plus mutation_tag. Fill in new_tag here
+    rather than mirroring the value with a script, so the form keeps working
+    with JavaScript disabled.
+    """
+    if payload.get("mutation") != "replace" or payload.get("new_tag"):
+        return payload
+    return {**payload, "new_tag": payload.get("mutation_tag", "")}
+
+
+def _selection_return_url(
+    payload: dict[str, Any],
+    mutation: TagMutation,
+    result: BulkTagMutationResult,
+) -> str:
+    """Rebuild the originating task-list URL and attach an outcome notice."""
+    filters = _bulk_filters(payload)
+    page = str(payload.get("page") or "1")
+    per_page = str(payload.get("per_page") or DEFAULT_PAGE_SIZE)
+    return filters.url(
+        "/tasks",
+        page=page,
+        per_page=per_page,
+        applied=mutation.summary,
+        changed=str(result.changed_count),
+        unchanged=str(result.unchanged_count),
+        failed=str(result.failed_count + result.skipped_count),
+    )
+
+
 def create_app(
     *,
     project_dir: Path | None = None,
@@ -340,6 +374,10 @@ def create_app(
         filters: Annotated[TaskListFilters, Depends(_task_list_filters)],
         page: Annotated[int, Query(ge=1)] = 1,
         per_page: Annotated[int, Query()] = DEFAULT_PAGE_SIZE,
+        applied: Annotated[str | None, Query()] = None,
+        changed: Annotated[int, Query(ge=0)] = 0,
+        unchanged: Annotated[int, Query(ge=0)] = 0,
+        failed: Annotated[int, Query(ge=0)] = 0,
     ):
         page_spec = PageSpec.normalized(page, per_page)
         result = query_task_list(
@@ -353,6 +391,16 @@ def create_app(
             context={
                 "rows": result.rows,
                 "result": result,
+                "notice": (
+                    {
+                        "applied": applied,
+                        "changed": changed,
+                        "unchanged": unchanged,
+                        "failed": failed,
+                    }
+                    if applied
+                    else None
+                ),
                 "page_sizes": PAGE_SIZES,
                 "page_url": lambda number: filters.url(
                     "/tasks",
@@ -386,6 +434,49 @@ def create_app(
         filters: Annotated[TaskListFilters, Depends(_task_list_filters)],
     ) -> list[dict[str, object]]:
         return query_task_list(cast(SqliteTaskStore, make_store()), filters).rows
+
+    @app.post("/api/tasks/tags/selected")
+    async def selected_task_tags(request: Request):
+        """Retag a hand-picked set of tasks.
+
+        Deliberately has no preview step, unlike the filter-scoped bulk route.
+        There the operator is trusting a filter to describe a set they cannot
+        see, so the preview is the only chance to catch an over-broad match.
+        Here they ticked each row themselves, and the confirmation would be
+        asking them to re-read a list they just built.
+        """
+        payload, is_json = await _request_payload(request)
+        _require_same_origin_form(request, is_json=is_json)
+        try:
+            targets = parse_selected_task_ids(payload)
+            mutation = parse_tag_mutation(_selection_mutation_payload(payload))
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        rows = [
+            {"project_id": project_id, "id": task_id}
+            for project_id, task_id in targets
+        ]
+        stores: dict[str, SqliteTaskStore] = {}
+        for project_id in dict.fromkeys(project_id for project_id, _ in targets):
+            try:
+                stores[project_id] = make_mutation_store(project_id)
+            except (ConfigError, ValueError) as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"could not resolve mutation store for project {project_id}",
+                ) from exc
+
+        result = apply_bulk_tag_mutation(stores, rows, mutation)
+        response_context = _bulk_result_context(rows, mutation.summary, result)
+        if is_json:
+            return response_context
+        # Return to the list the selection was made from, so the operator can
+        # keep working through the same filtered set.
+        return RedirectResponse(
+            _selection_return_url(payload, mutation, result),
+            status_code=303,
+        )
 
     @app.post("/api/tasks/tags/bulk")
     async def bulk_task_tags(request: Request):

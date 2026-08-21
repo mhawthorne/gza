@@ -199,6 +199,17 @@ def test_cross_project_plan_content_uses_owner_root_for_file_only_and_newer_file
     owner_root = tmp_path / "owner-project"
     server_root.mkdir()
     owner_root.mkdir()
+    # Both roots need a real config: the shared database only registers a
+    # project root for a configured checkout whose identity matches, and an
+    # unregistered root cannot be resolved back to its own plan files.
+    (server_root / "gza.yaml").write_text(
+        "project_name: Server\nproject_id: server\nproject_prefix: server\ndb_path: ../shared.db\n",
+        encoding="utf-8",
+    )
+    (owner_root / "gza.yaml").write_text(
+        "project_name: Owner\nproject_id: owner\nproject_prefix: owner\ndb_path: ../shared.db\n",
+        encoding="utf-8",
+    )
     server_store = SqliteTaskStore(
         db_path,
         prefix="server",

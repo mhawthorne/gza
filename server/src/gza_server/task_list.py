@@ -22,7 +22,7 @@ SortDirection = Literal["asc", "desc"]
 
 TASK_STATUSES = ALL_TASK_STATUSES
 
-PAGE_SIZES = (25, 50, 100)
+PAGE_SIZES = (25, 50, 100, 200)
 DEFAULT_PAGE_SIZE = 50
 
 
@@ -39,7 +39,7 @@ class PageSpec:
     per_page: int = DEFAULT_PAGE_SIZE
 
     @classmethod
-    def normalized(cls, page: int | None, per_page: int | None) -> "PageSpec":
+    def normalized(cls, page: int | None, per_page: int | None) -> PageSpec:
         """Clamp untrusted query parameters to a supported page window."""
         size = per_page if per_page in PAGE_SIZES else DEFAULT_PAGE_SIZE
         return cls(page=max(1, page or 1), per_page=size)

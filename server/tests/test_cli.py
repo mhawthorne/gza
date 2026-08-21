@@ -1,29 +1,36 @@
 import json
-from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
 import os
-from pathlib import Path
 import signal
+import socket
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, call, patch
 from urllib.error import URLError
 
 import pytest
-
 from gza_server.cli import (
     DARWIN_PROCESS_START_ENV,
+    PORT_ENV_VAR,
+    PS_TIMEOUT_SECONDS,
+    RELOAD_DIR,
     IdentityStatus,
     LifecycleError,
     ServerState,
+    claim_port,
     open_server,
     process_start_id,
     read_state,
+    resolve_port,
     start_server,
-    status_server,
     state_file_path,
+    status_server,
     stop_server,
 )
+
+from gza.config import DEFAULT_SERVER_PORT
 
 
 def _write_state(
@@ -110,9 +117,13 @@ def test_start_spawns_uvicorn_records_state_opens_browser_and_returns_url(tmp_pa
     assert state.process_start_id == "spawn-start"
     datetime.fromisoformat(state.started_at)
     command = popen.call_args.args[0]
-    assert command[-5:] == ["--factory", "--host", "127.0.0.1", "--port", "8765"]
+    assert command[-8:-3] == ["--factory", "--host", "127.0.0.1", "--port", "8765"]
     assert "gza_server.app:create_app" in command
     assert "--no-access-log" in command
+    # Reload is on by default and scoped to the package, not the working
+    # directory, which here holds a task database that writes constantly.
+    assert command[-2:] == ["--reload-dir", str(RELOAD_DIR)]
+    assert "--reload" in command
     assert popen.call_args.kwargs["stdout"] is not subprocess.DEVNULL
     assert popen.call_args.kwargs["stderr"] is subprocess.STDOUT
     assert popen.call_args.kwargs["env"]["GZA_SERVER_INSTANCE_ID"] == state.instance_id
@@ -134,7 +145,7 @@ def test_process_start_id_reads_macos_lstart():
         check=False,
         env={**os.environ, **DARWIN_PROCESS_START_ENV},
         text=True,
-        timeout=0.5,
+        timeout=PS_TIMEOUT_SECONDS,
     )
 
 
@@ -1073,3 +1084,143 @@ def test_stop_kills_a_hung_server_and_removes_state(tmp_path):
     assert result == "stopped"
     assert signals == [signal.SIGTERM, signal.SIGKILL]
     assert not path.exists()
+
+
+def test_start_can_disable_reload(tmp_path):
+    path = tmp_path / "gza-server.json"
+    process = MagicMock()
+    process.pid = 2468
+    process.poll.return_value = None
+    with (
+        patch("gza_server.cli.find_free_port", return_value=8765),
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
+        patch("gza_server.cli.subprocess.Popen", return_value=process) as popen,
+        patch("gza_server.cli.health_identity_matches", return_value=True),
+        patch("gza_server.cli.webbrowser.open"),
+    ):
+        start_server(path, reload=False)
+
+    command = popen.call_args.args[0]
+    assert "--reload" not in command
+    assert "--reload-dir" not in command
+
+
+def test_stop_signals_the_whole_process_group(tmp_path):
+    """Under --reload the recorded pid is a supervisor with a worker child.
+
+    Signalling the pid alone would leave the worker holding the port.
+    """
+    path = tmp_path / "gza-server.json"
+    _write_state(path, process_start_id="stable-start")
+    with (
+        patch("gza_server.cli.process_is_alive", return_value=True),
+        patch("gza_server.cli.process_start_id", return_value="stable-start"),
+        patch(
+            "gza_server.cli._wait_for_owned_process_exit",
+            side_effect=[IdentityStatus.MATCH, IdentityStatus.DEAD],
+        ),
+        patch("gza_server.cli.os.getpgid", return_value=1234) as getpgid,
+        patch("gza_server.cli.os.killpg") as killpg,
+        patch("gza_server.cli.os.kill") as kill,
+    ):
+        assert stop_server(path) == "stopped"
+
+    getpgid.assert_called_with(1234)
+    assert killpg.call_args_list == [
+        call(1234, signal.SIGTERM),
+        call(1234, signal.SIGKILL),
+    ]
+    kill.assert_not_called()
+    assert not path.exists()
+
+
+def test_stop_falls_back_to_the_pid_when_the_group_is_already_gone(tmp_path):
+    """A process mid-exit can lose its group before its pid."""
+    path = tmp_path / "gza-server.json"
+    _write_state(path, process_start_id="stable-start")
+    with (
+        patch("gza_server.cli.process_is_alive", return_value=True),
+        patch("gza_server.cli.process_start_id", return_value="stable-start"),
+        patch(
+            "gza_server.cli._wait_for_owned_process_exit",
+            return_value=IdentityStatus.DEAD,
+        ),
+        patch("gza_server.cli.os.getpgid", side_effect=ProcessLookupError()),
+        patch("gza_server.cli.os.kill") as kill,
+    ):
+        assert stop_server(path) == "stopped"
+
+    assert kill.call_args_list == [call(1234, signal.SIGTERM)]
+
+
+def test_resolve_port_prefers_explicit_then_env_then_config(tmp_path, monkeypatch):
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: port-test\nproject_id: porttest\nproject_prefix: prt\nserver_port: 9100\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv(PORT_ENV_VAR, raising=False)
+    assert resolve_port(9200, tmp_path) == 9200
+    assert resolve_port(None, tmp_path) == 9100
+
+    monkeypatch.setenv(PORT_ENV_VAR, "9300")
+    assert resolve_port(None, tmp_path) == 9300
+    # An explicit flag still wins over the environment.
+    assert resolve_port(9200, tmp_path) == 9200
+
+
+def test_resolve_port_falls_back_to_the_default_outside_a_project(tmp_path, monkeypatch):
+    monkeypatch.delenv(PORT_ENV_VAR, raising=False)
+
+    assert resolve_port(None, tmp_path) == DEFAULT_SERVER_PORT
+
+
+def test_resolve_port_rejects_a_non_numeric_environment_value(tmp_path, monkeypatch):
+    monkeypatch.setenv(PORT_ENV_VAR, "not-a-port")
+
+    with pytest.raises(LifecycleError) as excinfo:
+        resolve_port(None, tmp_path)
+
+    assert PORT_ENV_VAR in str(excinfo.value)
+
+
+def test_claim_port_refuses_a_busy_port_rather_than_moving(tmp_path):
+    """Silently choosing another port would defeat configuring one."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        busy = taken.getsockname()[1]
+
+        with pytest.raises(LifecycleError) as excinfo:
+            claim_port(busy)
+
+    message = str(excinfo.value)
+    assert f"port {busy} is not available" in message
+    assert "--port" in message
+
+
+def test_claim_port_treats_zero_as_a_request_for_any_free_port():
+    port = claim_port(0)
+
+    assert port != 0
+    assert 1024 <= port <= 65535
+
+
+def test_start_uses_the_resolved_port(tmp_path, monkeypatch):
+    path = tmp_path / "gza-server.json"
+    process = MagicMock()
+    process.pid = 2468
+    process.poll.return_value = None
+    monkeypatch.setenv(PORT_ENV_VAR, "9411")
+    with (
+        patch("gza_server.cli.claim_port", side_effect=lambda port: port) as claim,
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
+        patch("gza_server.cli.subprocess.Popen", return_value=process) as popen,
+        patch("gza_server.cli.health_identity_matches", return_value=True),
+        patch("gza_server.cli.webbrowser.open"),
+    ):
+        url = start_server(path)
+
+    claim.assert_called_once_with(9411)
+    assert url == "http://127.0.0.1:9411/"
+    assert "9411" in popen.call_args.args[0]

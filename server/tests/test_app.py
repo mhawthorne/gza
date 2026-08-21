@@ -1,12 +1,11 @@
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from gza_server import __version__
+from gza_server.app import create_app
 
 from gza.db import SqliteTaskStore
 from gza.task_types import ALL_TASK_STATUSES
-
-from gza_server import __version__
-from gza_server.app import create_app
 
 _STYLESHEET = Path(__file__).resolve().parents[1] / "src" / "gza_server" / "static" / "app.css"
 
@@ -93,6 +92,14 @@ def test_stylesheet_is_served() -> None:
 
     assert response.status_code == 200
     assert "text/css" in response.headers["content-type"]
+
+
+def test_script_is_served() -> None:
+    client = TestClient(create_app(store_factory=lambda: None))
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "javascript" in response.headers["content-type"]
 
 
 def test_every_task_status_has_a_style_rule() -> None:

@@ -3,6 +3,13 @@
 {% block content %}
   <h1>Tasks</h1>
 
+  {% if notice %}
+    <p class="notice{% if notice.failed %} notice-warn{% endif %}" role="status">
+      Applied <strong>{{ notice.applied }}</strong>:
+      {{ notice.changed }} changed, {{ notice.unchanged }} already matched{% if notice.failed %}, {{ notice.failed }} failed{% endif %}.
+    </p>
+  {% endif %}
+
   {% macro pager(position) %}
     <nav class="pager pager-{{ position }}" aria-label="Task list pages">
       <p class="pager-count">
@@ -40,55 +47,64 @@
 
 
   <form method="get" action="/tasks" class="filters">
-    <label>
-      Prompt
-      <input type="search" name="q" value="{{ filters.prompt }}" placeholder="Search task prompts">
-    </label>
-    <label>
-      Tags
-      <select name="tag" multiple size="4" {% if filters.untagged %}disabled{% endif %}>
-        {% for tag in known_tags %}
-          <option value="{{ tag }}" {% if tag in filters.tags %}selected{% endif %}>{{ tag }}</option>
-        {% endfor %}
-      </select>
-    </label>
-    <label>
-      Status
-      <select name="status" multiple size="4">
-        {% for status in statuses %}
-          <option value="{{ status }}" {% if status in filters.statuses %}selected{% endif %}>{{ status }}</option>
-        {% endfor %}
-      </select>
-    </label>
-    <label>
-      Type
-      <select name="type" multiple size="4">
-        {% for task_type in task_types %}
-          <option value="{{ task_type }}" {% if task_type in filters.task_types %}selected{% endif %}>{{ task_type }}</option>
-        {% endfor %}
-      </select>
-    </label>
-    <label class="checkbox">
-      <input type="checkbox" name="untagged" value="true" {% if filters.untagged %}checked{% endif %}>
-      Untagged only
-    </label>
-    <label>
-      Sort
-      <select name="sort">
-        <option value="updated" {% if filters.sort == "updated" %}selected{% endif %}>Updated</option>
-        <option value="created" {% if filters.sort == "created" %}selected{% endif %}>Created</option>
-      </select>
-    </label>
-    <label>
-      Direction
-      <select name="direction">
-        <option value="desc" {% if filters.direction == "desc" %}selected{% endif %}>Newest first</option>
-        <option value="asc" {% if filters.direction == "asc" %}selected{% endif %}>Oldest first</option>
-      </select>
-    </label>
-    <div class="filter-actions">
-      <button type="submit">Apply filters</button>
-      <a href="/tasks">Clear</a>
+    <div class="filter-search">
+      <label>
+        Prompt
+        <input type="search" name="q" value="{{ filters.prompt }}" placeholder="Search task prompts">
+      </label>
+      <div class="filter-actions">
+        <button type="submit">Apply filters</button>
+        <a href="/tasks">Clear</a>
+      </div>
+    </div>
+    <div class="filter-grid">
+      <div class="filter-tags">
+        <span class="field-label">Tags</span>
+        <input type="search" class="option-filter" data-filters="filter-tag-select"
+               placeholder="Find a tag" aria-label="Filter the tag list"
+               {% if filters.untagged %}disabled{% endif %}>
+        <select id="filter-tag-select" name="tag" multiple size="12" {% if filters.untagged %}disabled{% endif %}>
+          {% for tag in known_tags %}
+            <option value="{{ tag }}" {% if tag in filters.tags %}selected{% endif %}>{{ tag }}</option>
+          {% endfor %}
+        </select>
+        <label class="checkbox">
+          <input type="checkbox" name="untagged" value="true" {% if filters.untagged %}checked{% endif %}>
+          Untagged only
+        </label>
+      </div>
+      <label>
+        Status
+        <select name="status" multiple size="{{ statuses|length }}">
+          {% for status in statuses %}
+            <option value="{{ status }}" {% if status in filters.statuses %}selected{% endif %}>{{ status }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        Type
+        <select name="type" multiple size="{{ task_types|length }}">
+          {% for task_type in task_types %}
+            <option value="{{ task_type }}" {% if task_type in filters.task_types %}selected{% endif %}>{{ task_type }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <div class="filter-order">
+        <label>
+          Sort
+          <select name="sort">
+            <option value="updated" {% if filters.sort == "updated" %}selected{% endif %}>Updated</option>
+            <option value="created" {% if filters.sort == "created" %}selected{% endif %}>Created</option>
+          </select>
+        </label>
+        <label>
+          Direction
+          <select name="direction">
+            <option value="desc" {% if filters.direction == "desc" %}selected{% endif %}>Newest first</option>
+            <option value="asc" {% if filters.direction == "asc" %}selected{% endif %}>Oldest first</option>
+          </select>
+        </label>
+      </div>
     </div>
   </form>
 
@@ -122,10 +138,46 @@
   </details>
 
   {{ pager("top") }}
+
+  <form method="post" action="/api/tasks/tags/selected" class="selection-form">
+    {% for key, value in filters.query_pairs() %}
+      <input type="hidden" name="{{ key }}" value="{{ value }}">
+    {% endfor %}
+    <input type="hidden" name="page" value="{{ result.page.page }}">
+    <input type="hidden" name="per_page" value="{{ result.page.per_page }}">
+
+    <div class="selection-bar">
+      <p class="selection-count" data-selection-count>
+        No tasks selected. Tick rows to tag a subset of this page.
+      </p>
+      <div class="selection-fields">
+        <label>
+          Tag
+          <input type="text" name="mutation_tag" list="known-tag-options" placeholder="e.g. v0.6.0">
+        </label>
+        <label>
+          Replace this tag
+          <input type="text" name="old_tag" list="known-tag-options" placeholder="only for Replace">
+        </label>
+      </div>
+      <div class="selection-actions">
+        <button type="submit" name="mutation" value="add">Add tag</button>
+        <button type="submit" name="mutation" value="remove">Remove tag</button>
+        <button type="submit" name="mutation" value="replace">Replace tag</button>
+      </div>
+    </div>
+
+    <datalist id="known-tag-options">
+      {% for tag in known_tags %}<option value="{{ tag }}">{% endfor %}
+    </datalist>
+
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
+          <th class="select-cell">
+            <input type="checkbox" data-select-all aria-label="Select every task on this page">
+          </th>
           <th>ID</th>
           <th>Type</th>
           <th>Status</th>
@@ -138,6 +190,10 @@
       <tbody>
         {% for row in rows %}
           <tr data-task-id="{{ row.id }}" data-project-id="{{ row.project_id }}">
+            <td class="select-cell">
+              <input type="checkbox" name="selected" value="{{ row.project_id }}:{{ row.id }}"
+                     data-select-row aria-label="Select task {{ row.id }}">
+            </td>
             <td><a href="{{ row.detail_url }}">{{ row.id }}</a></td>
             <td>{{ row.type }}</td>
             <td><span class="status status-{{ row.status }}">{{ row.status }}</span></td>
@@ -149,10 +205,11 @@
             <td><time class="updated" datetime="{{ row.updated_at.isoformat() if row.updated_at else '' }}">{{ row.age }}</time></td>
           </tr>
         {% else %}
-          <tr><td colspan="7" class="empty">No tasks match these filters.</td></tr>
+          <tr><td colspan="8" class="empty">No tasks match these filters.</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
+  </form>
   {{ pager("bottom") }}
 {% endblock %}

@@ -162,9 +162,33 @@ fieldset,
   background: var(--surface);
 }
 
-.filters { display: flex; flex-wrap: wrap; gap: var(--space-4); align-items: end; }
+.filters { display: grid; gap: var(--space-4); }
 .filters label { display: grid; gap: var(--space-1); font-size: var(--text-xs); color: var(--ink-dim); text-transform: uppercase; letter-spacing: 0.05em; }
-.filters .checkbox { display: flex; flex-direction: row; align-items: center; padding-bottom: var(--space-2); }
+.filters .checkbox { display: flex; flex-direction: row; align-items: center; gap: var(--space-2); text-transform: none; letter-spacing: 0; }
+
+/* Search leads on its own row: it is the widest-ranging filter and the one
+   most often typed into, so it gets the full width rather than a shared
+   column with the fixed-vocabulary selects below. */
+.filter-search { display: flex; gap: var(--space-4); align-items: end; }
+.filter-search > label { flex: 1; }
+.filter-search input[type="search"] { width: 100%; }
+
+.filter-grid {
+  display: grid;
+  grid-template-columns: minmax(14rem, 1.4fr) repeat(2, minmax(9rem, 1fr)) minmax(10rem, 0.9fr);
+  gap: var(--space-4);
+  align-items: start;
+}
+.filter-grid select[multiple] { width: 100%; }
+.filter-tags { display: grid; gap: var(--space-1); align-content: start; }
+.field-label { font-size: var(--text-xs); color: var(--ink-dim); text-transform: uppercase; letter-spacing: 0.05em; }
+.filter-tags .option-filter { width: 100%; }
+.filter-order { display: grid; gap: var(--space-3); align-content: start; }
+
+@media (max-width: 60rem) {
+  .filter-grid { grid-template-columns: 1fr; }
+}
+
 .filter-actions { display: flex; gap: var(--space-3); align-items: center; padding-bottom: 0.15rem; }
 fieldset label { display: block; margin: var(--space-2) 0; }
 
@@ -358,3 +382,45 @@ details.tag-editor > *:not(summary) { margin-inline: var(--space-3); }
   font-size: var(--text-xs);
   color: var(--ink-faint);
 }
+
+/* ---- Row selection ---- */
+
+.notice {
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  border: 1px solid var(--hairline-strong);
+  border-left: 3px solid var(--signal);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.notice-warn { border-left-color: var(--status-failed, var(--signal)); }
+
+.selection-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  align-items: end;
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-3);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+.selection-bar label {
+  display: grid;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--ink-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.selection-count { flex: 1 1 100%; margin: 0; color: var(--ink-dim); font-size: var(--text-sm); }
+/* Once rows are ticked the bar is actionable, so the count stops being an
+   instruction and starts being the thing you check before submitting. */
+.selection-count[data-active] { color: var(--signal); font-weight: 600; }
+.selection-fields { display: flex; gap: var(--space-3); flex-wrap: wrap; }
+.selection-actions { display: flex; gap: var(--space-2); }
+
+.select-cell { width: 1px; padding-right: 0; }
+.select-cell input { margin: 0; }
+tr:has(input[data-select-row]:checked) { background: var(--surface-raised, var(--surface)); }

@@ -3,15 +3,9 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterator
-from contextlib import contextmanager
 import fcntl
 import json
 import os
-from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
-from enum import Enum
-from pathlib import Path
 import secrets
 import signal
 import socket
@@ -19,14 +13,21 @@ import subprocess
 import sys
 import tempfile
 import time
+import webbrowser
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from enum import Enum
+from pathlib import Path
 from typing import BinaryIO
 from urllib.error import URLError
 from urllib.request import urlopen
-import webbrowser
 
-from gza.config import Config
+from gza.config import DEFAULT_SERVER_PORT, Config, ConfigError
 
 HOST = "127.0.0.1"
+PORT_ENV_VAR = "GZA_SERVER_PORT"
 STATE_FILENAME = "gza-server.json"
 LOCK_FILENAME = "gza-server.lock"
 STOP_TIMEOUT_SECONDS = 5.0
@@ -36,6 +37,10 @@ STARTUP_POLL_INTERVAL_SECONDS = 0.05
 STARTUP_DIAGNOSTIC_MAX_BYTES = 2000
 DARWIN_PROCESS_START_ENV = {"LC_ALL": "C", "TZ": "UTC"}
 PS_TIMEOUT_SECONDS = 5.0
+# Watch only this package. Uvicorn's default watches the whole working
+# directory, which here is a repository holding a task database and worktrees,
+# and every write to those would bounce the server.
+RELOAD_DIR = Path(__file__).resolve().parent
 
 
 class LifecycleError(RuntimeError):
@@ -60,7 +65,7 @@ class ServerState:
     process_start_id: str = ""
 
     @classmethod
-    def from_dict(cls, value: object) -> "ServerState":
+    def from_dict(cls, value: object) -> ServerState:
         if not isinstance(value, dict):
             raise ValueError("state must be a JSON object")
         state = cls(
@@ -197,6 +202,57 @@ def find_free_port() -> int:
         return int(listener.getsockname()[1])
 
 
+def resolve_port(explicit: int | None = None, project_dir: Path | None = None) -> int:
+    """Resolve the port to listen on, most specific source first.
+
+    A fixed port is the point: an address that changes on every restart cannot
+    be bookmarked or kept open in a tab. 0 stays available at every layer as an
+    explicit request for a throwaway ephemeral port.
+    """
+    if explicit is not None:
+        return explicit
+
+    from_env = os.environ.get(PORT_ENV_VAR)
+    if from_env:
+        try:
+            return int(from_env)
+        except ValueError as exc:
+            raise LifecycleError(
+                f"{PORT_ENV_VAR} must be an integer, got {from_env!r}"
+            ) from exc
+
+    try:
+        return int(Config.load(project_dir or Path.cwd(), discover=True).server_port)
+    except (ConfigError, OSError, ValueError):
+        # Running outside a configured project is normal for a local tool.
+        return DEFAULT_SERVER_PORT
+
+
+def claim_port(port: int) -> int:
+    """Return a bindable port, refusing to silently move to a different one.
+
+    Falling back to a free port would defeat the purpose of configuring one,
+    and would do it silently -- the server would come up somewhere the operator
+    is not looking.
+    """
+    if port == 0:
+        return find_free_port()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            # Match how uvicorn binds. Without this the probe is stricter than
+            # the server it speaks for: a socket left in TIME_WAIT by the
+            # previous instance reads as busy, so an immediate restart on a
+            # fixed port would fail even though the port is usable.
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((HOST, port))
+    except OSError as exc:
+        raise LifecycleError(
+            f"port {port} is not available ({exc.strerror or exc}). "
+            f"Free it, pass --port, or set {PORT_ENV_VAR} or server_port in gza.yaml."
+        ) from exc
+    return port
+
+
 def server_url(state: ServerState) -> str:
     return f"http://{HOST}:{state.port}/"
 
@@ -294,11 +350,14 @@ def _signaled_process_exit_status(
     state: ServerState,
     expected_start_id: str | None,
 ) -> IdentityStatus:
-    """Observe a previously signaled owned process during its shutdown window."""
-    identity = _owned_process_status(state, expected_start_id)
-    if identity is IdentityStatus.UNVERIFIABLE and expected_start_id is None:
-        return IdentityStatus.MATCH
-    return identity
+    """Observe a previously signaled owned process during its shutdown window.
+
+    This whole phase is post-signal, so it is terminating by definition: a
+    process that is alive but can no longer be identified is one on its way
+    out, not one that stopped being ours. A start marker that reads back
+    *different* is still a mismatch, so a recycled PID is caught.
+    """
+    return _owned_process_status(state, expected_start_id, terminating=True)
 
 
 def _signal_owned_process(
@@ -313,10 +372,27 @@ def _signal_owned_process(
     if identity is not IdentityStatus.MATCH:
         return identity
     try:
-        os.kill(state.pid, sig)
+        _kill_owned_group(state.pid, sig)
     except ProcessLookupError:
         return IdentityStatus.DEAD
     return IdentityStatus.MATCH
+
+
+def _kill_owned_group(pid: int, sig: signal.Signals) -> None:
+    """Signal the managed process and anything it spawned.
+
+    Under --reload uvicorn runs a supervisor that forks a worker, and the state
+    file only records the supervisor. Signalling the pid alone would leave the
+    worker holding the port after a SIGKILL escalation. The process is spawned
+    with start_new_session, so it leads its own group and the group is exactly
+    the server and its children.
+    """
+    try:
+        os.killpg(os.getpgid(pid), sig)
+    except (OSError, AttributeError):
+        # A process mid-exit can lose its group before its pid; fall back rather
+        # than reporting a live process as already dead.
+        os.kill(pid, sig)
 
 
 def _wait_for_owned_process_exit(
@@ -403,7 +479,7 @@ def _report_preserved_exception_failure(
     exc.add_note(diagnostic)
 
 
-def start_server(path: Path) -> str:
+def start_server(path: Path, *, reload: bool = True, port: int | None = None) -> str:
     with server_lock(path):
         current = read_state(path)
         if current:
@@ -416,24 +492,27 @@ def start_server(path: Path) -> str:
                 _raise_unverifiable(current, "start")
             path.unlink(missing_ok=True)
 
-        port = find_free_port()
+        port = claim_port(resolve_port(port))
         instance_id = secrets.token_urlsafe(32)
         environment = os.environ.copy()
         environment["GZA_SERVER_INSTANCE_ID"] = instance_id
         with tempfile.TemporaryFile(mode="w+b") as startup_output:
+            command = [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "gza_server.app:create_app",
+                "--no-access-log",
+                "--factory",
+                "--host",
+                HOST,
+                "--port",
+                str(port),
+            ]
+            if reload:
+                command += ["--reload", "--reload-dir", str(RELOAD_DIR)]
             process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "uvicorn",
-                    "gza_server.app:create_app",
-                    "--no-access-log",
-                    "--factory",
-                    "--host",
-                    HOST,
-                    "--port",
-                    str(port),
-                ],
+                command,
                 cwd=Path.cwd(),
                 env=environment,
                 stdin=subprocess.DEVNULL,
@@ -596,12 +675,27 @@ def open_server(path: Path) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gza-server", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser(
+    start = subparsers.add_parser(
         "start",
         help=(
             "start the server without routine access logging, wait until ready, "
             "open it, and print its URL"
         ),
+    )
+    start.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=(
+            "port to listen on; 0 picks a free one. "
+            f"Defaults to ${PORT_ENV_VAR}, then server_port in gza.yaml, then {DEFAULT_SERVER_PORT}."
+        ),
+    )
+    start.add_argument(
+        "--no-reload",
+        dest="reload",
+        action="store_false",
+        help="do not restart the server when its source changes",
     )
     subparsers.add_parser("stop", help="stop the running server")
     subparsers.add_parser(
@@ -617,7 +711,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         path = state_file_path()
         if args.command == "start":
-            message = start_server(path)
+            message = start_server(path, reload=args.reload, port=args.port)
         elif args.command == "stop":
             message = stop_server(path)
         elif args.command == "status":

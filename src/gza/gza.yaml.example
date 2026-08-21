@@ -526,3 +526,8 @@ provider: codex
 # (`watch.batch` if configured, otherwise `5`).
 # Default: effective watch batch or 5
 # max_concurrent: 5
+
+# Port the local gza server listens on. 0 picks any free port, at the cost of a URL that changes
+# on every restart.
+# Default: 8765
+# server_port: 8765
