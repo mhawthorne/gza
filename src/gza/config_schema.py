@@ -104,6 +104,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("docker_volumes", "list[str]", [], "Extra Docker volume mounts (`source:dest[:mode]`)."),
     ConfigKeySpec("db_path", "str", ".gza/gza.db", "SQLite database path."),
     ConfigKeySpec(
+        "server_port",
+        "int",
+        8765,
+        "Port the local gza server listens on. 0 picks any free port, at the cost of a URL that changes on every restart.",
+    ),
+    ConfigKeySpec(
         "docker_startup_timeout",
         "int",
         60,

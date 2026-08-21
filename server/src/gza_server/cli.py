@@ -24,9 +24,10 @@ from typing import BinaryIO
 from urllib.error import URLError
 from urllib.request import urlopen
 
-from gza.config import Config
+from gza.config import DEFAULT_SERVER_PORT, Config, ConfigError
 
 HOST = "127.0.0.1"
+PORT_ENV_VAR = "GZA_SERVER_PORT"
 STATE_FILENAME = "gza-server.json"
 LOCK_FILENAME = "gza-server.lock"
 STOP_TIMEOUT_SECONDS = 5.0
@@ -199,6 +200,57 @@ def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
         listener.bind((HOST, 0))
         return int(listener.getsockname()[1])
+
+
+def resolve_port(explicit: int | None = None, project_dir: Path | None = None) -> int:
+    """Resolve the port to listen on, most specific source first.
+
+    A fixed port is the point: an address that changes on every restart cannot
+    be bookmarked or kept open in a tab. 0 stays available at every layer as an
+    explicit request for a throwaway ephemeral port.
+    """
+    if explicit is not None:
+        return explicit
+
+    from_env = os.environ.get(PORT_ENV_VAR)
+    if from_env:
+        try:
+            return int(from_env)
+        except ValueError as exc:
+            raise LifecycleError(
+                f"{PORT_ENV_VAR} must be an integer, got {from_env!r}"
+            ) from exc
+
+    try:
+        return int(Config.load(project_dir or Path.cwd(), discover=True).server_port)
+    except (ConfigError, OSError, ValueError):
+        # Running outside a configured project is normal for a local tool.
+        return DEFAULT_SERVER_PORT
+
+
+def claim_port(port: int) -> int:
+    """Return a bindable port, refusing to silently move to a different one.
+
+    Falling back to a free port would defeat the purpose of configuring one,
+    and would do it silently -- the server would come up somewhere the operator
+    is not looking.
+    """
+    if port == 0:
+        return find_free_port()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            # Match how uvicorn binds. Without this the probe is stricter than
+            # the server it speaks for: a socket left in TIME_WAIT by the
+            # previous instance reads as busy, so an immediate restart on a
+            # fixed port would fail even though the port is usable.
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((HOST, port))
+    except OSError as exc:
+        raise LifecycleError(
+            f"port {port} is not available ({exc.strerror or exc}). "
+            f"Free it, pass --port, or set {PORT_ENV_VAR} or server_port in gza.yaml."
+        ) from exc
+    return port
 
 
 def server_url(state: ServerState) -> str:
@@ -427,7 +479,7 @@ def _report_preserved_exception_failure(
     exc.add_note(diagnostic)
 
 
-def start_server(path: Path, *, reload: bool = True) -> str:
+def start_server(path: Path, *, reload: bool = True, port: int | None = None) -> str:
     with server_lock(path):
         current = read_state(path)
         if current:
@@ -440,7 +492,7 @@ def start_server(path: Path, *, reload: bool = True) -> str:
                 _raise_unverifiable(current, "start")
             path.unlink(missing_ok=True)
 
-        port = find_free_port()
+        port = claim_port(resolve_port(port))
         instance_id = secrets.token_urlsafe(32)
         environment = os.environ.copy()
         environment["GZA_SERVER_INSTANCE_ID"] = instance_id
@@ -631,6 +683,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     start.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=(
+            "port to listen on; 0 picks a free one. "
+            f"Defaults to ${PORT_ENV_VAR}, then server_port in gza.yaml, then {DEFAULT_SERVER_PORT}."
+        ),
+    )
+    start.add_argument(
         "--no-reload",
         dest="reload",
         action="store_false",
@@ -650,7 +711,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         path = state_file_path()
         if args.command == "start":
-            message = start_server(path, reload=args.reload)
+            message = start_server(path, reload=args.reload, port=args.port)
         elif args.command == "stop":
             message = stop_server(path)
         elif args.command == "status":

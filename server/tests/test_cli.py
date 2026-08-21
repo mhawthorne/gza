@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import socket
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -12,19 +13,24 @@ from urllib.error import URLError
 import pytest
 from gza_server.cli import (
     DARWIN_PROCESS_START_ENV,
+    PORT_ENV_VAR,
     PS_TIMEOUT_SECONDS,
     RELOAD_DIR,
     IdentityStatus,
     LifecycleError,
     ServerState,
+    claim_port,
     open_server,
     process_start_id,
     read_state,
+    resolve_port,
     start_server,
     state_file_path,
     status_server,
     stop_server,
 )
+
+from gza.config import DEFAULT_SERVER_PORT
 
 
 def _write_state(
@@ -1145,3 +1151,76 @@ def test_stop_falls_back_to_the_pid_when_the_group_is_already_gone(tmp_path):
         assert stop_server(path) == "stopped"
 
     assert kill.call_args_list == [call(1234, signal.SIGTERM)]
+
+
+def test_resolve_port_prefers_explicit_then_env_then_config(tmp_path, monkeypatch):
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: port-test\nproject_id: porttest\nproject_prefix: prt\nserver_port: 9100\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv(PORT_ENV_VAR, raising=False)
+    assert resolve_port(9200, tmp_path) == 9200
+    assert resolve_port(None, tmp_path) == 9100
+
+    monkeypatch.setenv(PORT_ENV_VAR, "9300")
+    assert resolve_port(None, tmp_path) == 9300
+    # An explicit flag still wins over the environment.
+    assert resolve_port(9200, tmp_path) == 9200
+
+
+def test_resolve_port_falls_back_to_the_default_outside_a_project(tmp_path, monkeypatch):
+    monkeypatch.delenv(PORT_ENV_VAR, raising=False)
+
+    assert resolve_port(None, tmp_path) == DEFAULT_SERVER_PORT
+
+
+def test_resolve_port_rejects_a_non_numeric_environment_value(tmp_path, monkeypatch):
+    monkeypatch.setenv(PORT_ENV_VAR, "not-a-port")
+
+    with pytest.raises(LifecycleError) as excinfo:
+        resolve_port(None, tmp_path)
+
+    assert PORT_ENV_VAR in str(excinfo.value)
+
+
+def test_claim_port_refuses_a_busy_port_rather_than_moving(tmp_path):
+    """Silently choosing another port would defeat configuring one."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        busy = taken.getsockname()[1]
+
+        with pytest.raises(LifecycleError) as excinfo:
+            claim_port(busy)
+
+    message = str(excinfo.value)
+    assert f"port {busy} is not available" in message
+    assert "--port" in message
+
+
+def test_claim_port_treats_zero_as_a_request_for_any_free_port():
+    port = claim_port(0)
+
+    assert port != 0
+    assert 1024 <= port <= 65535
+
+
+def test_start_uses_the_resolved_port(tmp_path, monkeypatch):
+    path = tmp_path / "gza-server.json"
+    process = MagicMock()
+    process.pid = 2468
+    process.poll.return_value = None
+    monkeypatch.setenv(PORT_ENV_VAR, "9411")
+    with (
+        patch("gza_server.cli.claim_port", side_effect=lambda port: port) as claim,
+        patch("gza_server.cli.process_start_id", return_value="spawn-start"),
+        patch("gza_server.cli.subprocess.Popen", return_value=process) as popen,
+        patch("gza_server.cli.health_identity_matches", return_value=True),
+        patch("gza_server.cli.webbrowser.open"),
+    ):
+        url = start_server(path)
+
+    claim.assert_called_once_with(9411)
+    assert url == "http://127.0.0.1:9411/"
+    assert "9411" in popen.call_args.args[0]
