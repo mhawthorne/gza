@@ -1,18 +1,18 @@
 import json
-from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
 import os
-from pathlib import Path
 import signal
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, call, patch
 from urllib.error import URLError
 
 import pytest
-
 from gza_server.cli import (
     DARWIN_PROCESS_START_ENV,
+    PS_TIMEOUT_SECONDS,
     IdentityStatus,
     LifecycleError,
     ServerState,
@@ -20,8 +20,8 @@ from gza_server.cli import (
     process_start_id,
     read_state,
     start_server,
-    status_server,
     state_file_path,
+    status_server,
     stop_server,
 )
 
@@ -134,7 +134,7 @@ def test_process_start_id_reads_macos_lstart():
         check=False,
         env={**os.environ, **DARWIN_PROCESS_START_ENV},
         text=True,
-        timeout=0.5,
+        timeout=PS_TIMEOUT_SECONDS,
     )
 
 

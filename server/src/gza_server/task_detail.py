@@ -11,7 +11,6 @@ from markupsafe import Markup
 
 from gza.db import SqliteTaskStore, Task, task_updated_at
 from gza.runner import get_task_output
-from gza.task_query import TaskQuery, TaskQueryService, TaskRow
 
 _MARKDOWN = MarkdownIt("commonmark", {"html": False})
 
@@ -72,35 +71,46 @@ def query_task_detail(
     *,
     project_id: str | None = None,
 ) -> TaskDetail | None:
-    """Load a task and direct lineage through gza's all-project query API."""
-    query = TaskQuery(limit=None)
-    result = TaskQueryService(store).run(query, all_projects=True)
-    rows = [cast(TaskRow, row) for row in result.rows]
-    matches = [
-        row
-        for row in rows
-        if row.task.id == task_id and (project_id is None or row.project_id == project_id)
-    ]
+    """Load a task and its direct lineage with per-task queries.
+
+    Deliberately avoids :class:`TaskQueryService`: that path projects every row
+    it collects -- resolving lineage owner, merge unit and dependency readiness
+    with tens of SQL queries apiece -- and this page needs none of it. Asking it
+    for one task meant projecting the whole corpus, which took over a minute and
+    a half against a real database.
+    """
+    matches: list[tuple[SqliteTaskStore, Task]] = []
+    for project_store in store.project_query_stores():
+        if project_id is not None and project_store.project_id != project_id:
+            continue
+        found = project_store.get(task_id)
+        if found is not None:
+            matches.append((project_store, found))
+
     if not matches:
         return None
     if len(matches) > 1:
-        raise AmbiguousTaskIdError(task_id, tuple(row.project_id for row in matches))
+        raise AmbiguousTaskIdError(task_id, tuple(match[0].project_id for match in matches))
 
-    selected = matches[0]
-    task = selected.task
-    owning_rows = [row for row in rows if row.project_id == selected.project_id]
-    task_by_id = {row.task.id: row.task for row in owning_rows if row.task.id is not None}
-    detail_url = _detail_url(selected.project_id, task_id)
+    project_store, task = matches[0]
+    owning_project_id = project_store.project_id
+    detail_url = _detail_url(owning_project_id, task_id)
+
+    parent_ids = [parent for parent in (task.based_on, task.depends_on) if parent]
+    task_by_id = {
+        parent.id: parent
+        for parent in project_store.get_many(parent_ids)
+        if parent.id is not None
+    }
 
     parents: list[LineageLink] = []
     if task.based_on:
-        parents.append(_lineage_link(task.based_on, selected.project_id, task_by_id, "based on"))
+        parents.append(_lineage_link(task.based_on, owning_project_id, task_by_id, "based on"))
     if task.depends_on and task.depends_on != task.based_on:
-        parents.append(_lineage_link(task.depends_on, selected.project_id, task_by_id, "depends on"))
+        parents.append(_lineage_link(task.depends_on, owning_project_id, task_by_id, "depends on"))
 
     children: list[LineageLink] = []
-    for row in owning_rows:
-        child = row.task
+    for child in project_store.get_lineage_children(task_id):
         if child.id is None:
             continue
         relationships: list[str] = []
@@ -112,17 +122,19 @@ def query_task_detail(
             children.append(
                 LineageLink(
                     id=child.id,
-                    project_id=selected.project_id,
-                    detail_url=_detail_url(selected.project_id, child.id),
+                    project_id=owning_project_id,
+                    detail_url=_detail_url(owning_project_id, child.id),
                     task_type=child.task_type,
                     relationship="; ".join(relationships),
                 )
             )
 
-    plan_content = get_task_output(task, selected.project_root) if task.task_type == "plan" else None
+    plan_content = (
+        get_task_output(task, project_store.project_root) if task.task_type == "plan" else None
+    )
     return TaskDetail(
         task=task,
-        project_id=selected.project_id,
+        project_id=owning_project_id,
         detail_url=detail_url,
         parents=tuple(parents),
         children=tuple(children),
