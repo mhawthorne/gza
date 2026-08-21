@@ -73,7 +73,11 @@ def _write_project_config(
     project_prefix: str | None = None,
 ) -> None:
     project_dir.mkdir(parents=True, exist_ok=True)
-    lines = [f"project_name: {project_name}"]
+    lines = [
+        f"project_name: {project_name}",
+        "provider: codex",
+        "model: gpt-5.5",
+    ]
     if project_id is not None:
         lines.append(f"project_id: {project_id}")
     if project_prefix is not None:

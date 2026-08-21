@@ -40,6 +40,8 @@ def _write_project_config(
         "\n".join(
             [
                 f"project_name: {project_name}",
+                "provider: codex",
+                "model: gpt-5.5",
                 f"project_id: {project_id}",
                 f"project_prefix: {project_prefix}",
                 f"db_path: {db_path}",
