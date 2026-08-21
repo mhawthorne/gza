@@ -157,20 +157,45 @@ def fmt_tokens(value: float | None) -> str:
 
 
 def print_table(units: list[dict], detail: bool) -> None:
-    header = f"{'unit':<12} {'tasks':>5} {'run':>7} {'med':>6} {'p90':>6} {'tokens':>8} {'tok p90':>8} {'cost':>8} {'calendar':>9} {'eff':>5}"
+    """Render the per-unit table, sizing every column to its widest cell.
+
+    Unit ids carry a per-project prefix (``gza-mu-1`` vs ``gzaserver-mu-12``), so
+    a fixed width either truncates or wastes space once more than one project is
+    in the window.
+    """
+    columns = [
+        ("unit", "<", lambda u: u["unit_id"]),
+        ("tasks", ">", lambda u: str(u["task_count"])),
+        ("run", ">", lambda u: fmt_dur(u["runtime_total_s"])),
+        ("med", ">", lambda u: fmt_dur(u["runtime_median_s"])),
+        ("p90", ">", lambda u: fmt_dur(u["runtime_p90_s"])),
+        ("tokens", ">", lambda u: fmt_tokens(u["tokens_total"])),
+        ("tok p90", ">", lambda u: fmt_tokens(u["tokens_p90"])),
+        ("cost", ">", lambda u: f"${u['cost_usd']:,.2f}"),
+        ("calendar", ">", lambda u: fmt_dur(u["calendar_s"])),
+        ("eff", ">", lambda u: f"{u['efficiency'] * 100:.0f}%" if u["efficiency"] else "-"),
+    ]
+    table = [[cell(u) for _, _, cell in columns] for u in units]
+    widths = [
+        max(len(title), *(len(row[i]) for row in table)) if table else len(title)
+        for i, (title, _, _) in enumerate(columns)
+    ]
+
+    def render(cells: list[str]) -> str:
+        return " ".join(
+            f"{cell:{align}{width}}"
+            for cell, (_, align, _), width in zip(cells, columns, widths)
+        ).rstrip()
+
+    header = render([title for title, _, _ in columns])
     print(header)
     print("-" * len(header))
-    for u in units:
-        eff = f"{u['efficiency'] * 100:.0f}%" if u["efficiency"] else "-"
-        print(
-            f"{u['unit_id']:<12} {u['task_count']:>5} {fmt_dur(u['runtime_total_s']):>7} "
-            f"{fmt_dur(u['runtime_median_s']):>6} {fmt_dur(u['runtime_p90_s']):>6} "
-            f"{fmt_tokens(u['tokens_total']):>8} {fmt_tokens(u['tokens_p90']):>8} "
-            f"${u['cost_usd']:>7.2f} {fmt_dur(u['calendar_s']):>9} {eff:>5}"
-        )
+    indent = " " * (widths[0] + 1)
+    for u, cells in zip(units, table):
+        print(render(cells))
         if detail:
             types = ", ".join(f"{k}={fmt_dur(v)}" for k, v in u["task_types"].items())
-            print(f"{'':<12} {u['source_branch']} -> {u['target_branch']}  [{types}]")
+            print(f"{indent}{u['source_branch']} -> {u['target_branch']}  [{types}]")
 
 
 def print_fleet(units: list[dict]) -> None:
