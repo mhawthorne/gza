@@ -95,6 +95,14 @@ def test_stylesheet_is_served() -> None:
     assert "text/css" in response.headers["content-type"]
 
 
+def test_script_is_served() -> None:
+    client = TestClient(create_app(store_factory=lambda: None))
+    response = client.get("/static/app.js")
+
+    assert response.status_code == 200
+    assert "javascript" in response.headers["content-type"]
+
+
 def test_every_task_status_has_a_style_rule() -> None:
     """A status with no rule silently renders as the default grey pill."""
     stylesheet = _STYLESHEET.read_text()

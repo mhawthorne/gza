@@ -432,6 +432,8 @@ def test_tasks_per_page_is_clamped_to_supported_sizes(
 
     assert len(_html_task_ids(client.get("/tasks?per_page=25").text)) == 25
     assert len(_html_task_ids(client.get("/tasks?per_page=100").text)) == 100
+    # 200 is supported; the corpus is smaller than that, so it returns everything.
+    assert len(_html_task_ids(client.get("/tasks?per_page=200").text)) == 120
     # An unsupported size falls back to the default rather than rendering everything.
     assert len(_html_task_ids(client.get("/tasks?per_page=9000").text)) == 50
 

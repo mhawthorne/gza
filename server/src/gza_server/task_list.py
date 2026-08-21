@@ -22,7 +22,7 @@ SortDirection = Literal["asc", "desc"]
 
 TASK_STATUSES = ALL_TASK_STATUSES
 
-PAGE_SIZES = (25, 50, 100)
+PAGE_SIZES = (25, 50, 100, 200)
 DEFAULT_PAGE_SIZE = 50
 
 
