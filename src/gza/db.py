@@ -5642,25 +5642,40 @@ class SqliteTaskStore:
         self,
         *,
         active_only: bool = True,
+        all_projects: bool = False,
         now: datetime | None = None,
     ) -> list[WatchSession]:
         """Return recorded watch sessions, most recently seen first.
 
         ``active_only`` (the default) hides rows left behind by a crashed watch.
         Pass ``False`` to inspect the raw ledger, including the dead rows.
+
+        ``all_projects`` reads every project's sessions from the shared database.
+        Readers surveying "what watches are running?" need it, because a watch
+        can cover a project that has no task rows yet, and the project-derived
+        store list is built from tasks.
         """
         if not self.supports_watch_sessions():
             return []
         with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM watch_sessions
-                WHERE project_id = ?
-                ORDER BY heartbeat_at DESC, owner_pid DESC
-                """,
-                (self._project_id,),
-            ).fetchall()
+            if all_projects:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM watch_sessions
+                    ORDER BY heartbeat_at DESC, owner_pid DESC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM watch_sessions
+                    WHERE project_id = ?
+                    ORDER BY heartbeat_at DESC, owner_pid DESC
+                    """,
+                    (self._project_id,),
+                ).fetchall()
         sessions = [
             session for row in rows if (session := self._row_to_watch_session(row)) is not None
         ]
@@ -5671,10 +5686,15 @@ class SqliteTaskStore:
     def get_active_watch_session(
         self,
         *,
+        all_projects: bool = False,
         now: datetime | None = None,
     ) -> WatchSession | None:
-        """Return the most recently seen live watch for this project, if any."""
-        sessions = self.list_watch_sessions(active_only=True, now=now)
+        """Return the most recently seen live watch, if any."""
+        sessions = self.list_watch_sessions(
+            active_only=True,
+            all_projects=all_projects,
+            now=now,
+        )
         return sessions[0] if sessions else None
 
     def _row_to_watch_session(self, row: sqlite3.Row | None) -> WatchSession | None:
@@ -11452,6 +11472,38 @@ class SqliteTaskStore:
                 (self._project_id, merge_unit_id),
             ).fetchall()
             return self._rows_to_tasks(conn, rows)
+
+    def list_merge_units_merged_since(
+        self,
+        since: datetime,
+        *,
+        limit: int | None = None,
+    ) -> list[MergeUnit]:
+        """Return units merged at or after ``since``, most recently merged first.
+
+        Units with no ``merged_at`` are excluded even if their state says merged:
+        a merge we cannot place in time cannot be reported in a time window.
+        """
+        if not self.supports_merge_units():
+            return []
+        since_text = _format_db_timestamp(since)
+        if since_text is None:
+            return []
+        sql = """
+            SELECT *
+            FROM merge_units
+            WHERE project_id = ?
+              AND merged_at IS NOT NULL
+              AND merged_at >= ?
+            ORDER BY merged_at DESC, id DESC
+        """
+        params: list[object] = [self._project_id, since_text]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [unit for row in rows if (unit := self._row_to_merge_unit(row)) is not None]
 
     def list_merge_unit_memberships(self, merge_unit_id: str) -> list[tuple[Task, str]]:
         """Return ``(task, role)`` pairs for a merge unit, oldest attachment first.

@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Tags · gza{% endblock %}
+{% block content %}
+  <h1>Pick a tag</h1>
+  {% if watch_scopes %}
+    <p>A watch is running, but it reports no tag scope.</p>
+  {% else %}
+    <p class="muted">No watch is currently running, so there is no tag to default to.</p>
+  {% endif %}
+  <ul class="tag-list">
+    {% for tag in known_tags %}
+      <li><a href="/tags/{{ tag }}">{{ tag }}</a></li>
+    {% else %}
+      <li class="muted">No tags exist yet.</li>
+    {% endfor %}
+  </ul>
+{% endblock %}

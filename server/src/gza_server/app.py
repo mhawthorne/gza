@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any, Literal, Protocol, cast
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
@@ -25,6 +25,13 @@ from . import __version__
 from .merge_unit_detail import (
     MergeUnitDetail,
     query_merge_unit_detail,
+)
+from .tag_dashboard import (
+    WINDOWS,
+    active_watch_scopes,
+    default_dashboard_tag,
+    query_tag_dashboard,
+    resolve_window,
 )
 from .task_detail import AmbiguousTaskIdError, TaskDetail, query_task_detail
 from .task_edit import (
@@ -693,6 +700,58 @@ def create_app(
                 detail=f"Merge unit {merge_unit_id} not found",
             )
         return detail.json_record()
+
+    def build_tag_dashboard(tag: str, window_key: str | None):
+        return query_tag_dashboard(
+            cast(SqliteTaskStore, make_store()),
+            tag,
+            window=resolve_window(window_key),
+        )
+
+    @app.get("/tags")
+    def tags_index(request: Request, window: str | None = None):
+        """Send the operator straight to the tag their watch is covering.
+
+        Without a running watch there is nothing to guess from, so offer the
+        known tags rather than rendering an empty dashboard for an arbitrary one.
+        """
+        store = cast(SqliteTaskStore, make_store())
+        tag = default_dashboard_tag(store)
+        if tag is not None:
+            return RedirectResponse(
+                f"/tags/{tag}?{urlencode({'window': resolve_window(window).key})}",
+                status_code=303,
+            )
+        return _TEMPLATES.TemplateResponse(
+            request=request,
+            name="tag_picker.html",
+            context={
+                "known_tags": store.list_tags(all_projects=True),
+                "watch_scopes": active_watch_scopes(store),
+            },
+        )
+
+    @app.get("/tags/{tag}")
+    def tag_dashboard_page(request: Request, tag: str, window: str | None = None):
+        dashboard = build_tag_dashboard(tag, window)
+        return _TEMPLATES.TemplateResponse(
+            request=request,
+            name="tag_dashboard.html",
+            context={"dashboard": dashboard, "windows": WINDOWS},
+        )
+
+    @app.get("/api/tags/{tag}")
+    def tag_dashboard_api(tag: str, window: str | None = None) -> dict[str, object]:
+        return build_tag_dashboard(tag, window).json_record()
+
+    @app.get("/api/watch-scopes")
+    def watch_scopes_api() -> dict[str, object]:
+        store = cast(SqliteTaskStore, make_store())
+        scopes = active_watch_scopes(store)
+        return {
+            "scopes": [scope.json_record() for scope in scopes],
+            "default_tag": default_dashboard_tag(store),
+        }
 
     @app.get("/merge-units/{merge_unit_id}")
     def merge_unit_detail_page(request: Request, merge_unit_id: str):
