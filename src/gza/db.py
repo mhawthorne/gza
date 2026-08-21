@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from _thread import RLock as RLockType
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -1765,6 +1765,11 @@ def task_updated_at(task: Task) -> datetime | None:
         return timestamp.astimezone(UTC)
 
     return max(available, key=normalized)
+
+
+# SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999; leave room for the
+# non-list parameters that accompany a chunked IN clause.
+_SQL_VARIABLE_CHUNK = 900
 
 
 @dataclass
@@ -11208,6 +11213,79 @@ class SqliteTaskStore:
                 (self._project_id, merge_unit_id),
             ).fetchall()
             return self._rows_to_tasks(conn, rows)
+
+    def list_merge_unit_memberships(self, merge_unit_id: str) -> list[tuple[Task, str]]:
+        """Return ``(task, role)`` pairs for a merge unit, oldest attachment first.
+
+        :meth:`list_tasks_for_merge_unit` drops the membership role, which is the
+        one thing a reader rendering the unit as a whole needs in order to say why
+        each task is there. Ordering is chronological by task creation so the pairs
+        read as the unit's history.
+        """
+        if not self.supports_merge_units():
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.*, mut.role AS merge_unit_role
+                FROM merge_unit_tasks mut
+                JOIN tasks t
+                  ON t.project_id = mut.project_id
+                 AND t.id = mut.task_id
+                WHERE mut.project_id = ?
+                  AND mut.merge_unit_id = ?
+                ORDER BY t.created_at ASC, t.id ASC
+                """,
+                (self._project_id, merge_unit_id),
+            ).fetchall()
+            roles = [str(row["merge_unit_role"]) for row in rows]
+            tasks = self._rows_to_tasks(conn, rows)
+        return list(zip(tasks, roles, strict=True))
+
+    def resolve_merge_units_for_tasks(
+        self,
+        task_ids: Sequence[str],
+    ) -> dict[str, MergeUnit]:
+        """Resolve the active merge unit for many tasks in one query.
+
+        The per-task :meth:`resolve_merge_unit_for_task` is fine for a detail view
+        but turns a listing into one query per row. Callers rendering a page of
+        tasks should use this instead so the cost stays flat in the row count.
+        """
+        if not self.supports_merge_units():
+            return {}
+        unique_ids = list(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        if not unique_ids:
+            return {}
+        resolved: dict[str, MergeUnit] = {}
+        with self._connect() as conn:
+            for start in range(0, len(unique_ids), _SQL_VARIABLE_CHUNK):
+                chunk = unique_ids[start : start + _SQL_VARIABLE_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT mut.task_id AS attached_task_id, mu.*
+                    FROM merge_unit_tasks mut
+                    JOIN merge_units mu
+                      ON mu.project_id = mut.project_id
+                     AND mu.id = mut.merge_unit_id
+                    WHERE mut.project_id = ?
+                      AND mut.task_id IN ({placeholders})
+                      AND {active_merge_unit_where_sql("mu")}
+                    ORDER BY mu.updated_at DESC, mu.id DESC
+                    """,
+                    (self._project_id, *chunk),
+                ).fetchall()
+                for row in rows:
+                    task_id = str(row["attached_task_id"])
+                    # Newest-first ordering means the first row wins, matching the
+                    # single-task resolver's contract of one active unit per task.
+                    if task_id in resolved:
+                        continue
+                    unit = self._row_to_merge_unit(row)
+                    if unit is not None:
+                        resolved[task_id] = unit
+        return resolved
 
     def dual_write_legacy_merge_status(self, unit_id: str) -> None:
         """Project merge-unit state onto compatibility task fields."""

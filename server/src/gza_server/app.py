@@ -22,6 +22,10 @@ from gza.db import SqliteTaskStore
 from gza.task_query import normalize_tag_filters
 
 from . import __version__
+from .merge_unit_detail import (
+    MergeUnitDetail,
+    query_merge_unit_detail,
+)
 from .task_detail import AmbiguousTaskIdError, TaskDetail, query_task_detail
 from .task_edit import (
     TaskEditConflict,
@@ -648,6 +652,70 @@ def create_app(
         if detail is None:
             raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
         return detail.json_record()
+
+    def load_merge_unit_detail(
+        merge_unit_id: str,
+        project_id: str | None = None,
+    ) -> MergeUnitDetail | None:
+        return query_merge_unit_detail(
+            cast(SqliteTaskStore, make_store()),
+            merge_unit_id,
+            project_id=project_id,
+        )
+
+    def render_merge_unit_detail(
+        request: Request,
+        merge_unit_id: str,
+        project_id: str | None = None,
+    ):
+        detail = load_merge_unit_detail(merge_unit_id, project_id)
+        if detail is None:
+            return _TEMPLATES.TemplateResponse(
+                request=request,
+                name="merge_unit_404.html",
+                context={"merge_unit_id": merge_unit_id},
+                status_code=404,
+            )
+        return _TEMPLATES.TemplateResponse(
+            request=request,
+            name="merge_unit_detail.html",
+            context={"detail": detail, "unit": detail.unit},
+        )
+
+    def merge_unit_detail_record(
+        merge_unit_id: str,
+        project_id: str | None = None,
+    ) -> dict[str, object]:
+        detail = load_merge_unit_detail(merge_unit_id, project_id)
+        if detail is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Merge unit {merge_unit_id} not found",
+            )
+        return detail.json_record()
+
+    @app.get("/merge-units/{merge_unit_id}")
+    def merge_unit_detail_page(request: Request, merge_unit_id: str):
+        return render_merge_unit_detail(request, merge_unit_id)
+
+    @app.get("/projects/{project_id}/merge-units/{merge_unit_id}")
+    def qualified_merge_unit_detail_page(
+        request: Request,
+        project_id: str,
+        merge_unit_id: str,
+    ):
+        return render_merge_unit_detail(request, merge_unit_id, project_id)
+
+    @app.get("/api/merge-units/{merge_unit_id}")
+    def merge_unit_detail_api(merge_unit_id: str) -> dict[str, object]:
+        return merge_unit_detail_record(merge_unit_id)
+
+    @app.get("/api/projects/{project_id}/merge-units/{merge_unit_id}")
+    def qualified_merge_unit_detail_api(
+        project_id: str,
+        merge_unit_id: str,
+    ) -> dict[str, object]:
+        return merge_unit_detail_record(merge_unit_id, project_id)
 
     @app.get("/tasks/{task_id}")
     def task_detail_page(request: Request, task_id: str, edit: str | None = None):

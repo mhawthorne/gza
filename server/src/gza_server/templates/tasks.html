@@ -183,6 +183,7 @@
           <th>Status</th>
           <th>Tags</th>
           <th>Prompt</th>
+          <th>Merge unit</th>
           <th><a href="{{ created_sort_url }}">Created{% if filters.sort == "created" %} {{ "↑" if filters.direction == "asc" else "↓" }}{% endif %}</a></th>
           <th><a href="{{ updated_sort_url }}">Updated{% if filters.sort == "updated" %} {{ "↑" if filters.direction == "asc" else "↓" }}{% endif %}</a></th>
         </tr>
@@ -201,11 +202,18 @@
               {% for tag in row.tags %}<span class="tag">{{ tag }}</span>{% else %}<span class="muted">—</span>{% endfor %}
             </td>
             <td class="prompt"><a href="{{ row.detail_url }}">{{ row.prompt_excerpt }}</a></td>
+            <td class="merge-unit">
+              {% if row.merge_unit_url %}
+                <a href="{{ row.merge_unit_url }}" title="{{ row.merge_unit_state }}">{{ row.merge_unit_id }}</a>
+              {% else %}
+                <span class="muted">&mdash;</span>
+              {% endif %}
+            </td>
             <td><time class="created" datetime="{{ row.created_at.isoformat() if row.created_at else '' }}">{{ row.created_at.strftime('%Y-%m-%d') if row.created_at else '—' }}</time></td>
             <td><time class="updated" datetime="{{ row.updated_at.isoformat() if row.updated_at else '' }}">{{ row.age }}</time></td>
           </tr>
         {% else %}
-          <tr><td colspan="8" class="empty">No tasks match these filters.</td></tr>
+          <tr><td colspan="9" class="empty">No tasks match these filters.</td></tr>
         {% endfor %}
       </tbody>
     </table>

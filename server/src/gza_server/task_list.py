@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Literal, cast
 from urllib.parse import urlencode
 
-from gza.db import SqliteTaskStore, task_updated_at
+from gza.db import MergeUnit, SqliteTaskStore, task_updated_at
 from gza.task_query import (
     SortSpec,
     TaskQueryPresets,
@@ -16,6 +16,8 @@ from gza.task_query import (
     normalize_tag_filters,
 )
 from gza.task_types import ALL_TASK_STATUSES, ALL_TASK_TYPES
+
+from .merge_unit_detail import merge_unit_url
 
 SortField = Literal["created", "updated"]
 SortDirection = Literal["asc", "desc"]
@@ -165,7 +167,12 @@ def query_task_list(
                 all_projects=True,
             )
 
-    rows = [_task_row(cast(TaskRow, row), now=rendered_at) for row in result.rows]
+    task_rows = [cast(TaskRow, row) for row in result.rows]
+    units_by_task = _resolve_merge_units(store, task_rows)
+    rows = [
+        _task_row(row, now=rendered_at, unit=units_by_task.get((row.project_id, row.task.id)))
+        for row in task_rows
+    ]
     return TaskListResult(
         rows=rows,
         known_tags=store.list_tags(all_projects=True),
@@ -175,7 +182,35 @@ def query_task_list(
     )
 
 
-def _task_row(row: TaskRow, *, now: datetime) -> dict[str, object]:
+def _resolve_merge_units(
+    store: SqliteTaskStore,
+    rows: list[TaskRow],
+) -> dict[tuple[str, str], MergeUnit]:
+    """Resolve every visible row's merge unit in one query per project.
+
+    Resolving these one row at a time would make the listing cost scale with the
+    page size, which is exactly what the task-detail path was rewritten to avoid.
+    Rows are grouped by project because merge units are project-scoped and each
+    project has its own store.
+    """
+    ids_by_project: dict[str, list[str]] = {}
+    for row in rows:
+        if row.task.id is not None:
+            ids_by_project.setdefault(row.project_id, []).append(row.task.id)
+    if not ids_by_project:
+        return {}
+
+    resolved: dict[tuple[str, str], MergeUnit] = {}
+    for project_store in store.project_query_stores():
+        task_ids = ids_by_project.get(project_store.project_id)
+        if not task_ids:
+            continue
+        for task_id, unit in project_store.resolve_merge_units_for_tasks(task_ids).items():
+            resolved[(project_store.project_id, task_id)] = unit
+    return resolved
+
+
+def _task_row(row: TaskRow, *, now: datetime, unit: MergeUnit | None = None) -> dict[str, object]:
     task = row.task
     updated_at = task_updated_at(task)
     assert task.id is not None
@@ -193,6 +228,11 @@ def _task_row(row: TaskRow, *, now: datetime) -> dict[str, object]:
         "created_at": task.created_at,
         "updated_at": updated_at,
         "age": _format_age(updated_at, now=now),
+        "merge_unit_id": unit.id if unit is not None else None,
+        "merge_unit_state": unit.state if unit is not None else None,
+        "merge_unit_url": (
+            merge_unit_url(row.project_id, unit.id) if unit is not None else None
+        ),
     }
 
 
