@@ -3,6 +3,13 @@
 {% block content %}
   <h1>Tasks</h1>
 
+  {% if notice %}
+    <p class="notice{% if notice.failed %} notice-warn{% endif %}" role="status">
+      Applied <strong>{{ notice.applied }}</strong>:
+      {{ notice.changed }} changed, {{ notice.unchanged }} already matched{% if notice.failed %}, {{ notice.failed }} failed{% endif %}.
+    </p>
+  {% endif %}
+
   {% macro pager(position) %}
     <nav class="pager pager-{{ position }}" aria-label="Task list pages">
       <p class="pager-count">
@@ -131,10 +138,46 @@
   </details>
 
   {{ pager("top") }}
+
+  <form method="post" action="/api/tasks/tags/selected" class="selection-form">
+    {% for key, value in filters.query_pairs() %}
+      <input type="hidden" name="{{ key }}" value="{{ value }}">
+    {% endfor %}
+    <input type="hidden" name="page" value="{{ result.page.page }}">
+    <input type="hidden" name="per_page" value="{{ result.page.per_page }}">
+
+    <div class="selection-bar">
+      <p class="selection-count" data-selection-count>
+        No tasks selected. Tick rows to tag a subset of this page.
+      </p>
+      <div class="selection-fields">
+        <label>
+          Tag
+          <input type="text" name="mutation_tag" list="known-tag-options" placeholder="e.g. v0.6.0">
+        </label>
+        <label>
+          Replace this tag
+          <input type="text" name="old_tag" list="known-tag-options" placeholder="only for Replace">
+        </label>
+      </div>
+      <div class="selection-actions">
+        <button type="submit" name="mutation" value="add">Add tag</button>
+        <button type="submit" name="mutation" value="remove">Remove tag</button>
+        <button type="submit" name="mutation" value="replace">Replace tag</button>
+      </div>
+    </div>
+
+    <datalist id="known-tag-options">
+      {% for tag in known_tags %}<option value="{{ tag }}">{% endfor %}
+    </datalist>
+
   <div class="table-wrap">
     <table>
       <thead>
         <tr>
+          <th class="select-cell">
+            <input type="checkbox" data-select-all aria-label="Select every task on this page">
+          </th>
           <th>ID</th>
           <th>Type</th>
           <th>Status</th>
@@ -147,6 +190,10 @@
       <tbody>
         {% for row in rows %}
           <tr data-task-id="{{ row.id }}" data-project-id="{{ row.project_id }}">
+            <td class="select-cell">
+              <input type="checkbox" name="selected" value="{{ row.project_id }}:{{ row.id }}"
+                     data-select-row aria-label="Select task {{ row.id }}">
+            </td>
             <td><a href="{{ row.detail_url }}">{{ row.id }}</a></td>
             <td>{{ row.type }}</td>
             <td><span class="status status-{{ row.status }}">{{ row.status }}</span></td>
@@ -158,10 +205,11 @@
             <td><time class="updated" datetime="{{ row.updated_at.isoformat() if row.updated_at else '' }}">{{ row.age }}</time></td>
           </tr>
         {% else %}
-          <tr><td colspan="7" class="empty">No tasks match these filters.</td></tr>
+          <tr><td colspan="8" class="empty">No tasks match these filters.</td></tr>
         {% endfor %}
       </tbody>
     </table>
   </div>
+  </form>
   {{ pager("bottom") }}
 {% endblock %}

@@ -6,11 +6,11 @@ from urllib.parse import urlencode
 
 import pytest
 from fastapi.testclient import TestClient
+from gza_server.app import create_app
+from gza_server.task_tags import parse_tag_mutation, parse_task_tag_edit
 
 from gza.db import SqliteTaskStore
 from gza.task_query import TaskQuery, TaskQueryService, TaskRow, normalize_tag_filters
-from gza_server.app import create_app
-from gza_server.task_tags import parse_tag_mutation, parse_task_tag_edit
 
 
 def _client(
@@ -1148,3 +1148,157 @@ def test_bulk_retag_requires_exactly_one_mutation(tmp_path: Path) -> None:
     assert response.status_code == 422
     assert response.json()["detail"] == "exactly one tag mutation is required"
     assert _query_tags(store, task.id, project_id="server-test") == ("old",)
+
+
+def _selection_client(store: SqliteTaskStore) -> TestClient:
+    return TestClient(
+        create_app(
+            store_factory=lambda: store,
+            mutation_store_factory=lambda project_id: store,
+        ),
+        headers={"origin": "http://testserver"},
+    )
+
+
+def test_selected_tags_apply_to_exactly_the_chosen_tasks(tmp_path: Path) -> None:
+    """The primary flow: filter broadly, hand-pick a subset, tag only those."""
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    chosen = [store.add(f"Release candidate {index}", tags=("v0.6",)) for index in range(3)]
+    untouched = store.add("Not picked", tags=("v0.6",))
+
+    response = _selection_client(store).post(
+        "/api/tasks/tags/selected",
+        json={
+            "selected": [f"server-test:{task.id}" for task in chosen[:2]],
+            "mutation": "add",
+            "mutation_tag": "v0.6.0",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["changed_count"] == 2
+    for task in chosen[:2]:
+        assert _query_tags(store, task.id, project_id="server-test") == ("v0.6", "v0.6.0")
+    # The third selected-eligible task and the unpicked one keep their tags.
+    assert _query_tags(store, chosen[2].id, project_id="server-test") == ("v0.6",)
+    assert _query_tags(store, untouched.id, project_id="server-test") == ("v0.6",)
+
+
+def test_selected_tags_apply_without_a_preview_token(tmp_path: Path) -> None:
+    """Unlike the filter-scoped route, hand-picked rows need no confirmation."""
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Pick me", tags=("v0.6",))
+
+    response = _selection_client(store).post(
+        "/api/tasks/tags/selected",
+        json={
+            "selected": f"server-test:{task.id}",
+            "mutation": "add",
+            "mutation_tag": "v0.6.0",
+        },
+    )
+
+    assert response.status_code == 200
+    assert "preview_token" not in response.json()
+    assert _query_tags(store, task.id, project_id="server-test") == ("v0.6", "v0.6.0")
+
+
+def test_selected_remove_and_replace_use_the_single_tag_field(tmp_path: Path) -> None:
+    """Replace reads new_tag from the toolbar's one Tag box, with no script."""
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    removable = store.add("Drop a tag", tags=("keep", "v0.6"))
+    replaceable = store.add("Swap a tag", tags=("v0.6",))
+    client = _selection_client(store)
+
+    client.post(
+        "/api/tasks/tags/selected",
+        data={
+            "selected": f"server-test:{removable.id}",
+            "mutation": "remove",
+            "mutation_tag": "v0.6",
+        },
+        headers={"accept": "application/json"},
+    )
+    client.post(
+        "/api/tasks/tags/selected",
+        data={
+            "selected": f"server-test:{replaceable.id}",
+            "mutation": "replace",
+            "old_tag": "v0.6",
+            "mutation_tag": "v0.6.0",
+        },
+        headers={"accept": "application/json"},
+    )
+
+    assert _query_tags(store, removable.id, project_id="server-test") == ("keep",)
+    assert _query_tags(store, replaceable.id, project_id="server-test") == ("v0.6.0",)
+
+
+def test_selected_form_post_returns_to_the_filtered_page_with_an_outcome(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Pick me", tags=("v0.6",))
+
+    response = _selection_client(store).post(
+        "/api/tasks/tags/selected",
+        data={
+            "selected": f"server-test:{task.id}",
+            "mutation": "add",
+            "mutation_tag": "v0.6.0",
+            "tag": "v0.6",
+            "page": "2",
+            "per_page": "25",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    location = response.headers["location"]
+    # The operator lands back on the same slice of the same filtered list.
+    assert "tag=v0.6" in location
+    assert "page=2" in location
+    assert "per_page=25" in location
+    assert "changed=1" in location
+
+
+def test_selected_tags_reject_an_empty_or_malformed_selection(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Untouched", tags=("v0.6",))
+    client = _selection_client(store)
+
+    empty = client.post(
+        "/api/tasks/tags/selected",
+        json={"mutation": "add", "mutation_tag": "v0.6.0"},
+    )
+    malformed = client.post(
+        "/api/tasks/tags/selected",
+        json={"selected": task.id, "mutation": "add", "mutation_tag": "v0.6.0"},
+    )
+
+    assert empty.status_code == 422
+    assert empty.json()["detail"] == "select at least one task"
+    # A bare id has no project, and one id can exist in several projects.
+    assert malformed.status_code == 422
+    assert "malformed selection" in malformed.json()["detail"]
+    assert _query_tags(store, task.id, project_id="server-test") == ("v0.6",)
+
+
+def test_selected_tags_reject_cross_origin_writes(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Untouched", tags=("v0.6",))
+
+    response = TestClient(
+        create_app(store_factory=lambda: store, mutation_store_factory=lambda _pid: store),
+        headers={"origin": "http://evil.example"},
+    ).post(
+        "/api/tasks/tags/selected",
+        data={
+            "selected": f"server-test:{task.id}",
+            "mutation": "add",
+            "mutation_tag": "v0.6.0",
+        },
+    )
+
+    assert response.status_code == 403
+    assert _query_tags(store, task.id, project_id="server-test") == ("v0.6",)

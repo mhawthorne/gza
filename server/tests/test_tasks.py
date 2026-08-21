@@ -481,3 +481,41 @@ def test_pagination_does_not_narrow_bulk_retag_scope(
 
     assert response.status_code == 200
     assert str(len(tasks)) in response.text
+
+
+def test_task_rows_offer_project_qualified_selection_checkboxes(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Selectable", tags=("v0.6",))
+
+    html = _client(store).get("/tasks").text
+
+    assert 'action="/api/tasks/tags/selected"' in html
+    # The project travels with the id so a shared database cannot retag the
+    # same id in the wrong project.
+    assert f'name="selected" value="server-test:{task.id}"' in html
+    assert "data-select-all" in html
+    for mutation in ("add", "remove", "replace"):
+        assert f'name="mutation" value="{mutation}"' in html
+
+
+def test_selection_form_carries_the_current_filters_and_page(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    store.add("Selectable", tags=("v0.6",))
+
+    html = _client(store).get("/tasks?tag=v0.6&per_page=25").text
+
+    assert '<input type="hidden" name="tag" value="v0.6">' in html
+    assert '<input type="hidden" name="per_page" value="25">' in html
+
+
+def test_tasks_page_reports_a_completed_selection_mutation(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    store.add("Selectable", tags=("v0.6",))
+
+    html = _client(store).get("/tasks?applied=add+tag+%27v0.6.0%27&changed=3&unchanged=1").text
+
+    assert "add tag &#39;v0.6.0&#39;" in html
+    assert "3 changed" in html
+    assert "1 already matched" in html

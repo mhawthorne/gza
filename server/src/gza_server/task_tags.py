@@ -173,6 +173,39 @@ def edit_task_tags(
 QualifiedTaskId = tuple[str, str]
 
 
+SELECTION_FIELD = "selected"
+
+
+def parse_selected_task_ids(payload: Mapping[str, Any]) -> tuple[QualifiedTaskId, ...]:
+    """Parse hand-picked checkbox values of the form ``project_id:task_id``.
+
+    The project is carried in the value rather than inferred, because one task
+    id can exist in more than one project on a shared database and a mutation
+    must never land on the wrong project's task.
+    """
+    raw = payload.get(SELECTION_FIELD)
+    if raw is None:
+        raise ValueError("select at least one task")
+    values = raw if isinstance(raw, list) else [raw]
+
+    selected: list[QualifiedTaskId] = []
+    for item in values:
+        if not isinstance(item, str):
+            raise ValueError(f"{SELECTION_FIELD} must be a string")
+        candidate = item.strip()
+        if not candidate:
+            continue
+        project_id, separator, task_id = candidate.partition(":")
+        if not separator or not project_id.strip() or not task_id.strip():
+            raise ValueError(f"malformed selection: {item!r}")
+        selected.append((project_id.strip(), task_id.strip()))
+
+    if not selected:
+        raise ValueError("select at least one task")
+    # Deduplicate rather than mutating one task twice; order is not meaningful.
+    return tuple(dict.fromkeys(selected))
+
+
 @dataclass(frozen=True)
 class BulkTagMutationResult:
     """Explicit outcome for a potentially multi-project bulk mutation."""

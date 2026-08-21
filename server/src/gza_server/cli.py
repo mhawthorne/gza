@@ -3,15 +3,9 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Iterator
-from contextlib import contextmanager
 import fcntl
 import json
 import os
-from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
-from enum import Enum
-from pathlib import Path
 import secrets
 import signal
 import socket
@@ -19,10 +13,16 @@ import subprocess
 import sys
 import tempfile
 import time
+import webbrowser
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from enum import Enum
+from pathlib import Path
 from typing import BinaryIO
 from urllib.error import URLError
 from urllib.request import urlopen
-import webbrowser
 
 from gza.config import Config
 
@@ -60,7 +60,7 @@ class ServerState:
     process_start_id: str = ""
 
     @classmethod
-    def from_dict(cls, value: object) -> "ServerState":
+    def from_dict(cls, value: object) -> ServerState:
         if not isinstance(value, dict):
             raise ValueError("state must be a JSON object")
         state = cls(

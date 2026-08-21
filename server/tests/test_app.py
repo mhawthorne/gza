@@ -1,12 +1,11 @@
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from gza_server import __version__
+from gza_server.app import create_app
 
 from gza.db import SqliteTaskStore
 from gza.task_types import ALL_TASK_STATUSES
-
-from gza_server import __version__
-from gza_server.app import create_app
 
 _STYLESHEET = Path(__file__).resolve().parents[1] / "src" / "gza_server" / "static" / "app.css"
 

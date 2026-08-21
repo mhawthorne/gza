@@ -24,7 +24,51 @@
     });
   }
 
+  /**
+   * Wire the select-all box and the live selection count.
+   *
+   * Selection is deliberately page-local: the checkboxes are plain form fields,
+   * so what gets submitted is exactly what is visible and ticked. Carrying a
+   * selection across pages would mean acting on rows that are no longer on
+   * screen, which is what the filter-scoped bulk flow is for.
+   */
+  function wireSelection(form) {
+    const rowBoxes = Array.from(form.querySelectorAll("input[data-select-row]"));
+    if (!rowBoxes.length) return;
+
+    const selectAll = form.querySelector("input[data-select-all]");
+    const counter = form.querySelector("[data-selection-count]");
+
+    function refresh() {
+      const selected = rowBoxes.filter((box) => box.checked).length;
+      if (selectAll) {
+        selectAll.checked = selected === rowBoxes.length;
+        selectAll.indeterminate = selected > 0 && selected < rowBoxes.length;
+      }
+      if (!counter) return;
+      if (selected) {
+        counter.textContent = `${selected} of ${rowBoxes.length} task${selected === 1 ? "" : "s"} on this page selected.`;
+        counter.setAttribute("data-active", "");
+      } else {
+        counter.textContent = "No tasks selected. Tick rows to tag a subset of this page.";
+        counter.removeAttribute("data-active");
+      }
+    }
+
+    for (const box of rowBoxes) box.addEventListener("change", refresh);
+    if (selectAll) {
+      selectAll.addEventListener("change", () => {
+        for (const box of rowBoxes) box.checked = selectAll.checked;
+        refresh();
+      });
+    }
+    refresh();
+  }
+
   for (const input of document.querySelectorAll(".option-filter[data-filters]")) {
     wireOptionFilter(input);
+  }
+  for (const form of document.querySelectorAll(".selection-form")) {
+    wireSelection(form);
   }
 })();
