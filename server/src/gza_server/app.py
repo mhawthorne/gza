@@ -13,6 +13,7 @@ from urllib.parse import parse_qs
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, ValidationError
 
@@ -61,6 +62,7 @@ class TaskStore(Protocol):
 StoreFactory = Callable[[], TaskStore]
 MutationStoreFactory = Callable[[str], SqliteTaskStore]
 _TEMPLATES = Jinja2Templates(directory=Path(__file__).parent / "templates")
+_STATIC_DIR = Path(__file__).parent / "static"
 
 
 @dataclass(frozen=True)
@@ -277,6 +279,7 @@ def create_app(
     )
     server_instance_id = instance_id or os.environ.get("GZA_SERVER_INSTANCE_ID")
     app = FastAPI(title="gza-server", version=__version__)
+    app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
     bulk_previews: dict[str, _BulkPreviewState] = {}
     bulk_previews_lock = Lock()
 

@@ -2,8 +2,12 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from gza.task_types import ALL_TASK_STATUSES
+
 from gza_server import __version__
 from gza_server.app import create_app
+
+_STYLESHEET = Path(__file__).resolve().parents[1] / "src" / "gza_server" / "static" / "app.css"
 
 
 class FakeStore:
@@ -61,3 +65,21 @@ def test_index_renders_jinja_template():
     assert response.status_code == 200
     assert "<h1>gza server</h1>" in response.text
     assert f"Version {__version__}" in response.text
+
+
+def test_stylesheet_is_served() -> None:
+    client = TestClient(create_app(store_factory=lambda: None))
+    response = client.get("/static/app.css")
+
+    assert response.status_code == 200
+    assert "text/css" in response.headers["content-type"]
+
+
+def test_every_task_status_has_a_style_rule() -> None:
+    """A status with no rule silently renders as the default grey pill."""
+    stylesheet = _STYLESHEET.read_text()
+
+    missing = [
+        status for status in ALL_TASK_STATUSES if f".status-{status}" not in stylesheet
+    ]
+    assert not missing, f"statuses without a style rule: {missing}"
