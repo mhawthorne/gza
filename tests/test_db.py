@@ -10040,6 +10040,45 @@ class TestExecutionProjectResolver:
             ).fetchone()
         assert row == ("", "")
 
+    def test_store_opened_without_a_config_path_still_registers_its_root(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """A store that knows its root registers it even without an explicit config path.
+
+        Callers may construct a store directly from a root rather than through
+        Config.load. Registering an empty root for those leaves the project
+        unresolvable for later writes even though its root is known.
+        """
+        shared_db = tmp_path / "shared.db"
+        project_dir = tmp_path / "direct"
+        _write_project_config(
+            project_dir,
+            project_name="Direct",
+            project_id="direct",
+            project_prefix="dir",
+            db_path=shared_db,
+        )
+        (project_dir / ".git").mkdir()
+
+        SqliteTaskStore(
+            shared_db,
+            prefix="dir",
+            project_id="direct",
+            project_root=project_dir,
+            project_name="Direct",
+        )
+
+        with sqlite3.connect(shared_db) as conn:
+            row = conn.execute(
+                "SELECT root_path, config_path FROM projects WHERE id = ?",
+                ("direct",),
+            ).fetchone()
+        assert row == (
+            str(project_dir.resolve()),
+            str((project_dir / "gza.yaml").resolve()),
+        )
+
     def test_nested_project_under_unresolvable_git_marker_does_not_persist_canonical_paths(
         self,
         tmp_path: Path,

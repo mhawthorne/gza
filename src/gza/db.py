@@ -6099,13 +6099,22 @@ class SqliteTaskStore:
         )
 
     def _observed_project_paths_for_registration(self) -> tuple[str, str]:
-        """Return the concrete project paths observed on this store open."""
-        if self._project_root is None or self._config_path is None:
+        """Return the concrete project paths observed on this store open.
+
+        A store opened with an explicit project root but no config path still
+        names a real project, so fall back to that root's ``gza.yaml`` rather
+        than registering the project with an empty root. Leaving it empty makes
+        the project unresolvable for later writes even though the root is known.
+        """
+        from .config import CONFIG_FILENAME
+
+        if self._project_root is None:
             return "", ""
+        observed_config_path = self._config_path or self._project_root / CONFIG_FILENAME
 
         try:
             root_path = self._project_root.resolve()
-            config_path = self._config_path.resolve()
+            config_path = observed_config_path.resolve()
             if not root_path.is_dir() or not config_path.is_file():
                 return "", ""
         except (OSError, RuntimeError, ValueError):
