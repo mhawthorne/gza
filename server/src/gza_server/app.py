@@ -29,8 +29,11 @@ from .task_edit import (
     parse_content_edit,
 )
 from .task_list import (
+    DEFAULT_PAGE_SIZE,
+    PAGE_SIZES,
     TASK_STATUSES,
     TASK_TYPES,
+    PageSpec,
     TaskListFilters,
     query_task_list,
 )
@@ -313,13 +316,32 @@ def create_app(
     def tasks_page(
         request: Request,
         filters: Annotated[TaskListFilters, Depends(_task_list_filters)],
+        page: Annotated[int, Query(ge=1)] = 1,
+        per_page: Annotated[int, Query()] = DEFAULT_PAGE_SIZE,
     ):
-        result = query_task_list(cast(SqliteTaskStore, make_store()), filters)
+        page_spec = PageSpec.normalized(page, per_page)
+        result = query_task_list(
+            cast(SqliteTaskStore, make_store()),
+            filters,
+            page=page_spec,
+        )
         return _TEMPLATES.TemplateResponse(
             request=request,
             name="tasks.html",
             context={
                 "rows": result.rows,
+                "result": result,
+                "page_sizes": PAGE_SIZES,
+                "page_url": lambda number: filters.url(
+                    "/tasks",
+                    page=str(number),
+                    per_page=str(result.page.per_page),
+                ),
+                "per_page_url": lambda size: filters.url(
+                    "/tasks",
+                    page="1",
+                    per_page=str(size),
+                ),
                 "known_tags": result.known_tags,
                 "statuses": TASK_STATUSES,
                 "task_types": TASK_TYPES,

@@ -22,6 +22,28 @@ SortDirection = Literal["asc", "desc"]
 
 TASK_STATUSES = ALL_TASK_STATUSES
 
+PAGE_SIZES = (25, 50, 100)
+DEFAULT_PAGE_SIZE = 50
+
+
+@dataclass(frozen=True)
+class PageSpec:
+    """One page of the filtered task list.
+
+    Paging is deliberately not part of :class:`TaskListFilters`: the bulk retag
+    flow compares submitted filters against its stored preview, and that
+    comparison is about which tasks are selected, not which slice is on screen.
+    """
+
+    page: int = 1
+    per_page: int = DEFAULT_PAGE_SIZE
+
+    @classmethod
+    def normalized(cls, page: int | None, per_page: int | None) -> "PageSpec":
+        """Clamp untrusted query parameters to a supported page window."""
+        size = per_page if per_page in PAGE_SIZES else DEFAULT_PAGE_SIZE
+        return cls(page=max(1, page or 1), per_page=size)
+
 
 @dataclass(frozen=True)
 class TaskListFilters:
@@ -71,12 +93,36 @@ class TaskListResult:
     rows: list[dict[str, object]]
     known_tags: tuple[str, ...]
     filters: TaskListFilters
+    page: PageSpec = PageSpec()
+    total: int = 0
+
+    @property
+    def page_count(self) -> int:
+        return max(1, -(-self.total // self.page.per_page))
+
+    @property
+    def first_index(self) -> int:
+        """1-based index of the first row on this page, 0 when empty."""
+        return 0 if not self.rows else (self.page.page - 1) * self.page.per_page + 1
+
+    @property
+    def last_index(self) -> int:
+        return self.first_index + len(self.rows) - 1 if self.rows else 0
+
+    @property
+    def has_previous(self) -> bool:
+        return self.page.page > 1
+
+    @property
+    def has_next(self) -> bool:
+        return self.page.page < self.page_count
 
 
 def query_task_list(
     store: SqliteTaskStore,
     filters: TaskListFilters,
     *,
+    page: PageSpec | None = None,
     now: datetime | None = None,
 ) -> TaskListResult:
     """Run the same query service and filter semantics as ``gza search``."""
@@ -101,11 +147,28 @@ def query_task_list(
     )
     result = TaskQueryService(store).run(query, all_projects=True)
     rendered_at = now or datetime.now(UTC)
-    rows = [_task_row(cast(TaskRow, row), now=rendered_at) for row in result.rows]
+
+    # The query service collects and sorts every match in memory, so slice the
+    # window here and only project the rows this page actually renders.
+    matched = list(result.rows)
+    if page is None:
+        spec = PageSpec(page=1, per_page=len(matched) or DEFAULT_PAGE_SIZE)
+        window = matched
+    else:
+        # A stale or hand-edited ?page= past the end lands on the last page
+        # rather than an unexplained empty table.
+        last_page = max(1, -(-len(matched) // page.per_page))
+        spec = replace(page, page=min(page.page, last_page))
+        start = (spec.page - 1) * spec.per_page
+        window = matched[start : start + spec.per_page]
+
+    rows = [_task_row(cast(TaskRow, row), now=rendered_at) for row in window]
     return TaskListResult(
         rows=rows,
         known_tags=store.list_tags(all_projects=True),
         filters=filters,
+        page=spec,
+        total=len(matched),
     )
 
 
