@@ -14,6 +14,13 @@ verify_command: './bin/tests'
 autonomous_verify_timeout_seconds: 300
 docker_setup_command: 'uv sync'
 
+# server/ legitimately needs to change core gza code (shared models, CLI
+# wiring), so cross-project edits are the norm here, not an exception worth
+# tagging each task for. Scope safety is retained: paths outside every
+# discovered project root still fail closed, and verification fans out to
+# each affected project's own verify_command.
+default_cross_project: true
+
 branch_strategy: date_slug
 
 advance_mode: iterate
