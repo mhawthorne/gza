@@ -38,4 +38,4 @@ build-backend = "hatchling.build"
 packages = ["src/gza_server"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "tests_functional"]

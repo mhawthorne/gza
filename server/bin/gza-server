@@ -1,0 +1,5 @@
+#!/bin/bash
+# Launcher for the server CLI from any working directory.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+exec uv run gza-server "$@"

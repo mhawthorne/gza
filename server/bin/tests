@@ -2,4 +2,4 @@
 # Verify command for the server subproject only.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-exec uv run pytest tests/ "$@"
+exec uv run pytest tests/ tests_functional/ "$@"

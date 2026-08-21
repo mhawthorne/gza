@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -57,3 +58,47 @@ assert response.status_code == 422, response.text
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_launcher_runs_from_any_cwd_and_preserves_arguments(tmp_path: Path) -> None:
+    project_dir = Path(__file__).resolve().parents[1]
+    launcher = project_dir / "bin" / "gza-server"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    capture = tmp_path / "capture"
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "\n".join(
+            [
+                "#!/bin/bash",
+                "set -euo pipefail",
+                'printf "%s\\n" "$PWD" > "$GZA_CAPTURE"',
+                'printf "%s\\n" "$@" >> "$GZA_CAPTURE"',
+            ]
+        )
+        + "\n"
+    )
+    fake_uv.chmod(0o755)
+
+    result = subprocess.run(
+        [str(launcher), "status", "task name with spaces"],
+        cwd=project_dir.parent,
+        env={
+            **os.environ,
+            "GZA_CAPTURE": str(capture),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert capture.read_text().splitlines() == [
+        str(project_dir),
+        "run",
+        "gza-server",
+        "status",
+        "task name with spaces",
+    ]
