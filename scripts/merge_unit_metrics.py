@@ -83,7 +83,9 @@ def load_rows(db: Path, project_id: str | None, since: str | None, unit_ids: lis
                t.duration_seconds AS duration_seconds,
                t.input_tokens   AS input_tokens,
                t.output_tokens  AS output_tokens,
-               t.cost_usd       AS cost_usd
+               t.cost_usd       AS cost_usd,
+               t.recovery_origin AS recovery_origin,
+               t.failure_reason AS failure_reason
         FROM merge_units mu
         JOIN merge_unit_tasks mut
           ON mut.project_id = mu.project_id AND mut.merge_unit_id = mu.id
@@ -111,6 +113,7 @@ def summarize_unit(unit_id: str, rows: list[dict]) -> dict:
     by_type: dict[str, float] = defaultdict(float)
     for r in rows:
         by_type[r["task_type"] or "unknown"] += r["duration_seconds"] or 0.0
+    origins = [(r["recovery_origin"] or "").lower() for r in rows]
     return {
         "unit_id": unit_id,
         "owner_task_id": rows[0]["owner_task_id"],
@@ -121,6 +124,12 @@ def summarize_unit(unit_id: str, rows: list[dict]) -> dict:
         "lines_changed": (rows[0]["lines_added"] or 0) + (rows[0]["lines_removed"] or 0),
         "task_count": len(rows),
         "task_types": dict(sorted(by_type.items(), key=lambda kv: -kv[1])),
+        "review_count": sum(1 for r in rows if r["task_type"] == "review"),
+        "improve_count": sum(1 for r in rows if r["task_type"] == "improve"),
+        "failed_count": sum(1 for r in rows if r["task_status"] == "failed"),
+        "retry_count": origins.count("retry"),
+        "resume_count": origins.count("resume"),
+        "manual_count": origins.count("manual"),
         "runtime_total_s": sum(durations),
         "runtime_median_s": percentile(durations, 0.5),
         "runtime_p90_s": percentile(durations, 0.9),
@@ -166,6 +175,12 @@ def print_table(units: list[dict], detail: bool) -> None:
     columns = [
         ("unit", "<", lambda u: u["unit_id"]),
         ("tasks", ">", lambda u: str(u["task_count"])),
+        ("rev", ">", lambda u: str(u["review_count"])),
+        ("imp", ">", lambda u: str(u["improve_count"])),
+        ("fail", ">", lambda u: str(u["failed_count"])),
+        ("rtry", ">", lambda u: str(u["retry_count"])),
+        ("resm", ">", lambda u: str(u["resume_count"])),
+        ("man", ">", lambda u: str(u["manual_count"])),
         ("run", ">", lambda u: fmt_dur(u["runtime_total_s"])),
         ("med", ">", lambda u: fmt_dur(u["runtime_median_s"])),
         ("p90", ">", lambda u: fmt_dur(u["runtime_p90_s"])),
@@ -199,28 +214,51 @@ def print_table(units: list[dict], detail: bool) -> None:
 
 
 def print_fleet(units: list[dict]) -> None:
+    """Print distribution percentiles for the window, one row per metric."""
     if not units:
         print("no merged merge units in window")
         return
-    tasks = [float(u["task_count"]) for u in units]
-    runtimes = [u["runtime_total_s"] for u in units]
-    calendars = [u["calendar_s"] for u in units if u["calendar_s"] is not None]
-    tokens = [float(u["tokens_total"]) for u in units]
     print()
     print(f"merge units merged: {len(units)}")
-    print(f"total agent runtime: {fmt_dur(sum(runtimes))}   total tokens: {fmt_tokens(sum(tokens))}   total cost: ${sum(u['cost_usd'] for u in units):,.2f}")
-    for label, series, fmt in (
-        ("tasks per unit", tasks, lambda v: f"{v:.1f}"),
-        ("runtime per unit", runtimes, fmt_dur),
-        ("tokens per unit", tokens, fmt_tokens),
-        ("calendar per unit", calendars, fmt_dur),
-    ):
-        print(
-            f"  {label:<18} median {fmt(percentile(series, 0.5)):>8}"
-            f"  p90 {fmt(percentile(series, 0.9)):>8}"
-            f"  p99 {fmt(percentile(series, 0.99)):>8}"
-            f"  max {fmt(max(series)) if series else '-':>8}"
-        )
+    print(
+        f"total agent runtime: {fmt_dur(sum(u['runtime_total_s'] for u in units))}"
+        f"   total tokens: {fmt_tokens(sum(u['tokens_total'] for u in units))}"
+        f"   total cost: ${sum(u['cost_usd'] for u in units):,.2f}"
+    )
+    print()
+
+    metrics = [
+        ("tasks", [float(u["task_count"]) for u in units], lambda v: f"{v:.1f}"),
+        ("reviews", [float(u["review_count"]) for u in units], lambda v: f"{v:.1f}"),
+        ("improves", [float(u["improve_count"]) for u in units], lambda v: f"{v:.1f}"),
+        ("failures", [float(u["failed_count"]) for u in units], lambda v: f"{v:.1f}"),
+        ("retries", [float(u["retry_count"]) for u in units], lambda v: f"{v:.1f}"),
+        ("resumes", [float(u["resume_count"]) for u in units], lambda v: f"{v:.1f}"),
+        ("runtime", [u["runtime_total_s"] for u in units], fmt_dur),
+        ("tokens", [float(u["tokens_total"]) for u in units], fmt_tokens),
+        ("cost", [u["cost_usd"] for u in units], lambda v: f"${v:,.2f}"),
+        ("calendar", [u["calendar_s"] for u in units if u["calendar_s"] is not None], fmt_dur),
+    ]
+    pcts = [("min", 0.0), ("p10", 0.10), ("p25", 0.25), ("p50", 0.50), ("p90", 0.90), ("p99", 0.99), ("max", 1.0)]
+
+    header = ["per unit"] + [label for label, _ in pcts]
+    table = [
+        [name] + [fmt(percentile(series, pct)) if series else "-" for _, pct in pcts]
+        for name, series, fmt in metrics
+    ]
+    widths = [max(len(header[i]), *(len(row[i]) for row in table)) for i in range(len(header))]
+
+    def render(cells: list[str]) -> str:
+        aligned = [f"{cells[0]:<{widths[0]}}"] + [
+            f"{cell:>{width}}" for cell, width in zip(cells[1:], widths[1:])
+        ]
+        return " ".join(aligned).rstrip()
+
+    line = render(header)
+    print(line)
+    print("-" * len(line))
+    for row in table:
+        print(render(row))
 
 
 def main() -> int:
