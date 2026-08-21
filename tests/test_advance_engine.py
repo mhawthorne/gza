@@ -247,7 +247,11 @@ class _FakeGit:
 
 
 def _make_store(tmp_path: Path) -> SqliteTaskStore:
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
+    )
     config = Config.load(tmp_path)
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -266,7 +270,7 @@ def _set_subdir_project_boundary(config: Config, tmp_path: Path) -> None:
     repo_root = tmp_path
     project_dir = tmp_path / "services" / "foo"
     project_dir.mkdir(parents=True, exist_ok=True)
-    (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
     config.project_dir = project_dir
     config.enforce_project_scope = True
     setattr(
@@ -374,7 +378,7 @@ def _set_subdir_project_boundary_with_dependency(config: Config, tmp_path: Path)
     repo_root = tmp_path
     project_dir = tmp_path / "services" / "foo"
     project_dir.mkdir(parents=True, exist_ok=True)
-    (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
     dependency_path = tmp_path / "dre"
     dependency_path.mkdir(parents=True, exist_ok=True)
     config.project_dir = project_dir
@@ -6753,7 +6757,7 @@ def test_changed_rebase_completed_review_missing_resolution_metadata_readonly_re
 
 
 def test_evaluate_resumes_timeout_retry_descendant_once(tmp_path: Path):
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_resume_attempts: 1\n")
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nmax_resume_attempts: 1\n")
     config = Config.load(tmp_path)
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7572,7 +7576,7 @@ def test_cross_project_tag_allows_out_of_scope_change_to_advance(tmp_path: Path)
     _set_subdir_project_boundary(config, tmp_path)
     sibling_project_dir = tmp_path / "dre" / "web"
     sibling_project_dir.mkdir(parents=True, exist_ok=True)
-    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nverify_command: ./bin/web-verify\n")
+    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/web-verify\n")
 
     impl = _make_completed_unmerged_impl(
         store,
@@ -7602,7 +7606,7 @@ def test_default_cross_project_allows_out_of_scope_change_to_advance(tmp_path: P
     config.default_cross_project = True
     sibling_project_dir = tmp_path / "dre" / "web"
     sibling_project_dir.mkdir(parents=True, exist_ok=True)
-    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nverify_command: ./bin/web-verify\n")
+    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/web-verify\n")
 
     impl = _make_completed_unmerged_impl(
         store,
@@ -7630,7 +7634,7 @@ def test_cross_project_tag_still_parks_unknown_paths_outside_discovered_roots(tm
     (tmp_path / "gza.yaml").unlink()
     sibling_project_dir = tmp_path / "dre" / "web"
     sibling_project_dir.mkdir(parents=True, exist_ok=True)
-    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nverify_command: ./bin/web-verify\n")
+    (sibling_project_dir / "gza.yaml").write_text("project_name: dre-web\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/web-verify\n")
 
     impl = _make_completed_unmerged_impl(
         store,
@@ -13315,7 +13319,7 @@ def test_noop_improve_limit_preempts_max_review_cycles_when_thresholds_match(tmp
     from gza import advance_engine as advance_engine_module
 
     (tmp_path / "gza.yaml").write_text(
-        "project_name: test-project\nmax_review_cycles: 2\nmax_noop_improve_cycles: 2\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nmax_review_cycles: 2\nmax_noop_improve_cycles: 2\n"
     )
     config = Config.load(tmp_path)
     db_path = tmp_path / ".gza" / "gza.db"
@@ -13715,7 +13719,7 @@ def test_duplicate_blocker_backstop_preempts_max_review_cycles(
 ) -> None:
     from gza import advance_engine as advance_engine_module
 
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\nmax_review_cycles: 3\n")
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nmax_review_cycles: 3\n")
     config = Config.load(tmp_path)
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)

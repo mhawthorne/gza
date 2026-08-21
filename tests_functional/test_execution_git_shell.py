@@ -854,7 +854,9 @@ def test_cycle_dry_run(tmp_path) -> None:
 
 
 def test_cycle_uses_default_iterations_when_flag_omitted(tmp_path) -> None:
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\ndb_path: .gza/gza.db\n")
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n"
+    )
     _init_basic_repo(tmp_path)
     store = make_store(tmp_path)
     impl = _make_completed_impl(store)

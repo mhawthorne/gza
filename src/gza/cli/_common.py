@@ -38,7 +38,7 @@ from ..concurrency import (
     reserve_task_launch_permit,
     take_task_launch_permit,
 )
-from ..config import Config
+from ..config import Config, ConfigError
 from ..console import (
     MAX_PROMPT_DISPLAY,
     console,
@@ -101,6 +101,7 @@ from ..runner import (
     get_effective_config_for_task,
     prepare_task_startup_phase,
     remove_task_startup_artifacts,
+    require_execution_route_for_task,
     run,
     write_ops_entry,
 )
@@ -1689,6 +1690,21 @@ def _prepare_task_for_immediate_execution(
     return prepared
 
 
+def _require_model_for_task_creation(
+    config: Config,
+    task_type: str,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> None:
+    """Validate provider/model resolution before a new task row is persisted."""
+    config.require_model_for_task(
+        task_type,
+        provider_override=provider,
+        model_override=model,
+    )
+
+
 def _reserve_task_launch_after_prepare(
     task: DbTask | None,
     permit: LaunchPermit | None,
@@ -2069,6 +2085,11 @@ def _spawn_background_worker(
             return 0
 
     assert selected_task is not None
+    try:
+        require_execution_route_for_task(selected_task, config)
+    except ConfigError as exc:
+        _print_background_phase1_error(str(exc))
+        return 1
 
     permit: LaunchPermit | None = None
     if prepared_task is None:
@@ -2711,6 +2732,7 @@ def _create_rebase_task(
     branch: str,
     target_branch: str,
     *,
+    config: Config | None = None,
     trigger_source: str,
 ) -> DbTask:
     """Create a rebase task for resolving merge conflicts.
@@ -2719,6 +2741,8 @@ def _create_rebase_task(
     rebases always go through the standard runner.
     """
     parent_task = store.get(parent_task_id)
+    if config is not None:
+        _require_model_for_task_creation(config, "rebase")
     return store.add(
         prompt=(
             f"Rebase branch '{branch}' onto the local branch '{target_branch}' and resolve "
@@ -2938,6 +2962,7 @@ def _create_review_task(
     store: SqliteTaskStore,
     impl_task: DbTask,
     *,
+    config: Config | None = None,
     trigger_source: str,
     model: str | None = None,
     provider: str | None = None,
@@ -2950,6 +2975,7 @@ def _create_review_task(
     return create_review_task(
         store,
         impl_task,
+        config=config,
         trigger_source=trigger_source,
         prompt_mode="cli",
         model=model,
@@ -2963,12 +2989,14 @@ def _create_review_adjudication_task(
     review_task: DbTask,
     finding: ReviewFinding,
     *,
+    config: Config | None = None,
     dispute_metadata: dict[str, Any],
     trigger_source: str,
 ) -> DbTask:
     """Create or reuse an internal adjudication task for one disputed blocker."""
     task, _created_now = create_or_reuse_review_blocker_adjudication_task(
         store,
+        config=config,
         review_task=review_task,
         impl_task=impl_task,
         finding=finding,
@@ -2981,6 +3009,7 @@ def _create_review_adjudication_task(
 def _create_or_reuse_followup_tasks(
     store: SqliteTaskStore,
     *,
+    config: Config | None = None,
     review_task: DbTask,
     impl_task: DbTask,
     findings: tuple[ReviewFinding, ...],
@@ -2996,6 +3025,7 @@ def _create_or_reuse_followup_tasks(
     for finding in findings:
         task, created_now = create_or_reuse_followup_task(
             store,
+            config=config,
             review_task=review_task,
             impl_task=impl_task,
             finding=finding,
@@ -3011,6 +3041,7 @@ def _create_or_reuse_followup_tasks(
 def _create_or_reuse_deferred_blocker_tasks(
     store: SqliteTaskStore,
     *,
+    config: Config | None = None,
     review_task: DbTask,
     impl_task: DbTask,
     findings: tuple[ReviewFinding, ...],
@@ -3022,6 +3053,7 @@ def _create_or_reuse_deferred_blocker_tasks(
     for finding in findings:
         task, created_now = create_or_reuse_deferred_blocker_task(
             store,
+            config=config,
             review_task=review_task,
             impl_task=impl_task,
             finding=finding,
@@ -3158,6 +3190,7 @@ def _create_improve_task(
     impl_task: DbTask,
     review_task: DbTask | None,
     *,
+    config: Config | None = None,
     trigger_source: str,
     create_review: bool = False,
     create_pr: bool = False,
@@ -3201,6 +3234,8 @@ def _create_improve_task(
         review_task.id if review_task is not None else None,
         has_comments=has_comments,
     )
+    if config is not None:
+        _require_model_for_task_creation(config, "improve", provider=provider, model=model)
     return store.add(
         prompt=prompt,
         task_type="improve",
@@ -3223,6 +3258,7 @@ def _create_plan_review_task(
     store: SqliteTaskStore,
     plan_task: DbTask,
     *,
+    config: Config | None = None,
     trigger_source: str,
     model: str | None = None,
     provider: str | None = None,
@@ -3231,6 +3267,8 @@ def _create_plan_review_task(
     assert plan_task.id is not None
     if plan_task.task_type not in {"plan", "plan_improve"}:
         raise ValueError("plan_review source must be a plan or plan_improve task")
+    if config is not None:
+        _require_model_for_task_creation(config, "plan_review", provider=provider, model=model)
     return store.add(
         prompt=f"Review plan source {plan_task.id}",
         task_type="plan_review",
@@ -3248,6 +3286,7 @@ def _create_plan_improve_task(
     plan_task: DbTask,
     review_task: DbTask,
     *,
+    config: Config | None = None,
     trigger_source: str,
     model: str | None = None,
     provider: str | None = None,
@@ -3259,6 +3298,8 @@ def _create_plan_improve_task(
         raise ValueError("plan_improve source must be a plan or plan_improve task")
     if review_task.task_type != "plan_review":
         raise ValueError("plan_improve dependency must be a plan_review task")
+    if config is not None:
+        _require_model_for_task_creation(config, "plan_improve", provider=provider, model=model)
     return store.add(
         prompt=f"Revise plan source {plan_task.id} based on plan review {review_task.id}",
         task_type="plan_improve",
@@ -3295,6 +3336,7 @@ def _create_implementation_task_from_source(
     store: SqliteTaskStore,
     source_task: DbTask,
     *,
+    config: Config | None = None,
     prompt: str,
     trigger_source: str,
     tags: tuple[str, ...] | list[str] | None = None,
@@ -3311,6 +3353,8 @@ def _create_implementation_task_from_source(
 ) -> DbTask:
     """Create an implementation task using shared review-scope inheritance rules."""
     assert source_task.id is not None
+    if config is not None:
+        _require_model_for_task_creation(config, "implement", provider=provider, model=model)
     return store.add(
         prompt=prompt,
         task_type="implement",
@@ -3360,6 +3404,7 @@ def _materialize_plan_review_slices(
     if reused_tasks is not None:
         return PlanReviewMaterializationResult(tasks=reused_tasks, created=False)
 
+    config.require_model_for_task("implement")
     manifest_digest = plan_review_manifest_digest(manifest)
     task_specs = build_plan_review_slice_task_specs(
         plan_source_task=plan_source_task,
@@ -3460,6 +3505,8 @@ def _repair_plan_review_slice_materialization(
         trigger_source=trigger_source,
         require_review_before_merge=require_review_before_merge,
     )
+
+    config.require_model_for_task("implement")
 
     for partial_task in partial_tasks:
         apply_manual_task_status(
@@ -3858,6 +3905,7 @@ def _create_resume_task(
     store: SqliteTaskStore,
     original_task: DbTask,
     *,
+    config: Config | None = None,
     trigger_source: str,
 ) -> DbTask:
     """Create a new resume task pointing to the original failed task.
@@ -3881,6 +3929,13 @@ def _create_resume_task(
         if original_task.task_type == "rebase"
         else original_task.branch
     )
+    if config is not None:
+        _require_model_for_task_creation(
+            config,
+            original_task.task_type,
+            provider=original_task.provider if preserve_provider else None,
+            model=original_task.model if original_task.model_is_explicit else None,
+        )
     new_task = store.add(
         prompt=original_task.prompt,
         task_type=original_task.task_type,
@@ -3914,6 +3969,7 @@ def _create_retry_task(
     store: SqliteTaskStore,
     original_task: DbTask,
     *,
+    config: Config | None = None,
     trigger_source: str,
     automatic_recovery: bool = False,
 ) -> DbTask:
@@ -3940,6 +3996,13 @@ def _create_retry_task(
         retry_base_branch = resolve_rebase_base_branch(store, original_task)
         retry_branch = resolve_rebase_target_branch(store, original_task)
 
+    if config is not None:
+        _require_model_for_task_creation(
+            config,
+            original_task.task_type,
+            provider=original_task.provider if original_task.provider_is_explicit else None,
+            model=original_task.model if original_task.model_is_explicit else None,
+        )
     retry_task = store.add(
         prompt=original_task.prompt,
         task_type=original_task.task_type,
@@ -4083,6 +4146,7 @@ def _auto_rebase_before_resume(config: Config, task_id: str) -> int:
             task.id or task_id,
             task.branch,
             target_branch,
+            config=config,
             trigger_source="manual",
         )
     except DuplicateActiveChildError as exc:
@@ -4176,7 +4240,7 @@ def run_with_recovery(
                 resume_task = store.get(decision.recovery_task_id)
                 assert resume_task is not None
             else:
-                resume_task = _create_resume_task(store, refreshed, trigger_source="auto-recovery")
+                resume_task = _create_resume_task(store, refreshed, config=config, trigger_source="auto-recovery")
             if on_recovery is not None:
                 on_recovery(refreshed, resume_task, decision)
             current_task = resume_task
@@ -4220,6 +4284,7 @@ def run_with_recovery(
             retry_task = _create_retry_task(
                 store,
                 refreshed,
+                config=config,
                 trigger_source="auto-recovery",
                 automatic_recovery=True,
             )

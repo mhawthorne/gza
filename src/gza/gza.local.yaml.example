@@ -155,13 +155,13 @@
 #   Default: ""
 #   reasoning_effort: ""
 
-# Legacy global model fallback.
+# Default model fallback; required unless provider-scoped or task-type models cover created tasks.
 # Default: ""
-# model: ""
+model: gpt-5.5
 
-# Default provider when task-specific routing is absent.
-# Default: claude
-# provider: claude
+# Required provider for every project config.
+# Default: (required)
+provider: codex
 
 # providers:
 #   <provider>:

@@ -82,6 +82,21 @@ _VERIFY_FIX_PROMPT_RE = re.compile(
     r"timeout=(?P<timeout>\S+) grace=(?P<grace>\S+)\]$",
     re.DOTALL,
 )
+
+
+def _require_model_for_created_task(
+    config: Config | None,
+    task_type: str,
+    *,
+    provider: str | None = None,
+    model: str | None = None,
+) -> None:
+    if config is not None:
+        config.require_model_for_task(
+            task_type,
+            provider_override=provider,
+            model_override=model,
+        )
 VERIFY_FIX_EPOCH_ARTIFACT_KIND = "verify_fix_epoch"
 VERIFY_FIX_EPOCH_ARTIFACT_LABEL = "verify_fix_epoch"
 VERIFY_FIX_EPOCH_ARTIFACT_SCHEMA_VERSION = 1
@@ -775,6 +790,7 @@ def create_or_reuse_verify_fix_task(
     if existing is not None:
         return existing, False
 
+    _require_model_for_created_task(config, "verify_fix", provider=provider, model=model)
     resolve_verify_fix_context(
         store,
         config,
@@ -821,6 +837,7 @@ def create_review_task(
     store: SqliteTaskStore,
     impl_task: Task,
     *,
+    config: Config | None = None,
     trigger_source: str,
     model: str | None = None,
     provider: str | None = None,
@@ -858,6 +875,7 @@ def create_review_task(
     else:
         review_prompt = PromptBuilder().review_task_prompt(impl_task.id, impl_task.prompt)
     resolved_scope = resolve_review_scope_for_impl(store, impl_task)
+    _require_model_for_created_task(config, "review", provider=provider, model=model)
     review_task = store.add(
         prompt=review_prompt,
         task_type="review",
@@ -904,6 +922,7 @@ def create_spec_coherence_review_task(
     store: SqliteTaskStore,
     impl_task: Task,
     *,
+    config: Config | None = None,
     reviewed_head_sha: str,
     changed_paths: Iterable[str],
     trigger_source: str,
@@ -940,6 +959,7 @@ def create_spec_coherence_review_task(
     if active_reviews:
         raise DuplicateReviewError(active_reviews[0])
 
+    _require_model_for_created_task(config, "review", provider=provider, model=model)
     review_task = store.add(
         prompt=build_spec_coherence_review_prompt(impl_task, changed_paths=changed),
         task_type="review",
@@ -966,6 +986,7 @@ def create_resolution_review_task(
     store: SqliteTaskStore,
     impl_task: Task,
     *,
+    config: Config | None = None,
     rebase_task: Task,
     resolved_head_sha: str,
     resolved_target_sha: str,
@@ -974,6 +995,7 @@ def create_resolution_review_task(
     provider: str | None = None,
 ) -> Task:
     """Create a resolution-scoped review task for a changed/unknown rebase."""
+    _require_model_for_created_task(config, "review", provider=provider, model=model)
     if impl_task.id is None:
         raise ValueError("Cannot create resolution review for task without an ID.")
     if rebase_task.id is None:
@@ -1013,6 +1035,7 @@ def create_resolution_review_task(
     review_task = create_review_task(
         store,
         impl_task,
+        config=config,
         trigger_source=trigger_source,
         model=model,
         provider=provider,
@@ -1470,6 +1493,7 @@ def create_or_reuse_off_topic_verify_investigations(
             signature=signature,
             payload=payload,
         )
+        _require_model_for_created_task(config, "explore")
         created_task = store.add(
             prompt=prompt,
             task_type="explore",
@@ -1582,6 +1606,7 @@ def persist_off_topic_verify_clearance(
                 signature=signature,
                 payload=payload,
             )
+            _require_model_for_created_task(config, "explore")
             created_task_id = store._next_id(conn)
             created_task = store._add_task_conn(
                 conn,
@@ -2220,6 +2245,7 @@ def _is_reusable_review_blocker_adjudication_task(
 def create_or_reuse_followup_task(
     store: SqliteTaskStore,
     *,
+    config: Config | None = None,
     review_task: Task,
     impl_task: Task,
     finding: ReviewFinding,
@@ -2249,6 +2275,7 @@ def create_or_reuse_followup_task(
         impl_task.id,
         finding,
     )
+    _require_model_for_created_task(config, "implement")
     created = store.add(
         prompt=prompt,
         task_type="implement",
@@ -2264,6 +2291,7 @@ def create_or_reuse_followup_task(
 def create_or_reuse_deferred_blocker_task(
     store: SqliteTaskStore,
     *,
+    config: Config | None = None,
     review_task: Task,
     impl_task: Task,
     finding: ReviewFinding,
@@ -2289,6 +2317,7 @@ def create_or_reuse_deferred_blocker_task(
         impl_task.id,
         finding,
     )
+    _require_model_for_created_task(config, "implement")
     created = store.add(
         prompt=prompt,
         task_type="implement",
@@ -2306,6 +2335,7 @@ def create_or_reuse_deferred_blocker_task(
 def create_or_reuse_review_blocker_adjudication_task(
     store: SqliteTaskStore,
     *,
+    config: Config | None = None,
     review_task: Task,
     impl_task: Task,
     finding: ReviewFinding,
@@ -2334,6 +2364,7 @@ def create_or_reuse_review_blocker_adjudication_task(
         finding,
         dispute_metadata,
     )
+    _require_model_for_created_task(config, "internal")
     created = store.add(
         prompt=prompt,
         task_type="internal",

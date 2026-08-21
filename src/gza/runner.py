@@ -43,6 +43,7 @@ from .config import (
     DEFAULT_REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
     BranchStrategy,
     Config,
+    ConfigError,
     is_model_compatible_with_provider,
     provider_model_mismatch_error,
 )
@@ -2033,6 +2034,7 @@ def prepare_task_startup_phase(
     resume_mode: bool = False,
 ) -> Task:
     """Synchronously materialize task startup metadata before execution detaches."""
+    require_execution_route_for_task(task, config)
     _ensure_task_dispatchable_for_startup(task, store, resume_mode=resume_mode)
     if task.slug is None:
         git = Git(config.project_dir)
@@ -2570,6 +2572,22 @@ def get_effective_config_for_task(task: Task, config: Config) -> tuple[str | Non
     model_override = task.model if model_is_explicit and task.model else None
     model = model_override if model_override else config.get_model_for_task(task.task_type, provider)
     max_steps = config.get_max_steps_for_task(task.task_type, provider)
+    return model, provider, max_steps
+
+
+def require_execution_route_for_task(task: Task, config: Config) -> tuple[str, str, int]:
+    """Validate and return the final provider/model/max-steps route for an existing task."""
+    provider_is_explicit = bool(getattr(task, "provider_is_explicit", False))
+    model_is_explicit = bool(getattr(task, "model_is_explicit", False))
+    provider_override = task.provider if provider_is_explicit else None
+    config.require_model_for_task(
+        task.task_type,
+        provider_override=provider_override,
+        model_override=task.model if model_is_explicit else None,
+        model_override_is_explicit=model_is_explicit,
+    )
+    model, provider, max_steps = get_effective_config_for_task(task, config)
+    assert model is not None
     return model, provider, max_steps
 
 
@@ -7290,7 +7308,7 @@ def _create_and_run_review_task(
 
     try:
         review_task = create_review_task(
-            store, review_target, trigger_source="auto-recovery", prompt_mode="auto",
+            store, review_target, config=config, trigger_source="auto-recovery", prompt_mode="auto",
             project_prefix=config.project_prefix or None,
         )
     except DuplicateReviewError as e:
@@ -8045,6 +8063,12 @@ def run(
             error_message(f"Error: Task {task_id} not found")
             return 1
 
+        try:
+            effective_model, effective_provider, effective_max_steps = require_execution_route_for_task(task, config)
+        except ConfigError as exc:
+            error_message(f"Error: {exc}")
+            return 1
+
         # Resume mode validation
         if resume:
             if task.status not in ("failed", "pending"):
@@ -8147,6 +8171,14 @@ def run(
             if candidate is None:
                 break
             assert candidate.id is not None
+            try:
+                effective_model, effective_provider, effective_max_steps = require_execution_route_for_task(
+                    candidate,
+                    config,
+                )
+            except ConfigError as exc:
+                error_message(f"Error: {exc}")
+                return 1
             claim = store.try_mark_in_progress(candidate.id, os.getpid())
             claimed = claim.task if claim is not None else None
             if claimed is None:
@@ -8166,9 +8198,6 @@ def run(
         on_task_claimed(task)
     if pr_retry_mode:
         return _retry_pr_required_code_task_completion(task, config, store)
-
-    # Get effective model and provider for this task
-    effective_model, effective_provider, effective_max_steps = get_effective_config_for_task(task, config)
 
     # Persist resolved model/provider to the task DB row immediately so analytics
     # can track which configuration actually ran, even if it crashes before completion.
@@ -9284,7 +9313,7 @@ def _post_complete_code_task(
                     worktree_git,
                 )
             else:
-                _create_fix_follow_up_review_task(task, store)
+                _create_fix_follow_up_review_task(task, config, store)
         else:
             root_impl = _resolve_root_implementation_for_fix(task, store)
             review_task = store.get(task.depends_on) if task.depends_on else None
@@ -9446,14 +9475,20 @@ def _prepare_fix_follow_up_review(
     return True
 
 
-def _create_fix_follow_up_review_task(task: Task, store: SqliteTaskStore) -> None:
+def _create_fix_follow_up_review_task(task: Task, config: Config, store: SqliteTaskStore) -> None:
     """Create a pending follow-up review task for a completed fix run."""
     root_impl = _resolve_root_implementation_for_fix(task, store)
     if root_impl is None or root_impl.id is None:
         return
 
     try:
-        review_task = create_review_task(store, root_impl, trigger_source="auto-recovery", prompt_mode="auto")
+        review_task = create_review_task(
+            store,
+            root_impl,
+            config=config,
+            trigger_source="auto-recovery",
+            prompt_mode="auto",
+        )
     except DuplicateReviewError as exc:
         active = exc.active_review
         print(

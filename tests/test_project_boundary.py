@@ -190,8 +190,8 @@ def test_default_cross_project_allows_discovered_project_paths_only(tmp_path: Pa
     sibling_dir = repo_root / "libs" / "bar"
     project_dir.mkdir(parents=True)
     sibling_dir.mkdir(parents=True)
-    (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-    (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+    (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+    (sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
 
     config = Config(project_dir=project_dir, project_name="foo")
     setattr(
@@ -264,8 +264,8 @@ def test_resolve_affected_repo_projects_matches_known_roots_and_reports_unknown_
     sibling_dir = repo_root / "libs" / "bar"
     project_dir.mkdir(parents=True)
     sibling_dir.mkdir(parents=True)
-    (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-    (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+    (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+    (sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
 
     config = Config(project_dir=project_dir, project_name="foo")
     setattr(
@@ -297,8 +297,8 @@ def test_resolve_affected_repo_projects_attributes_parent_owned_paths_for_nested
     repo_root = tmp_path / "repo"
     project_dir = repo_root / "server"
     project_dir.mkdir(parents=True)
-    (repo_root / "gza.yaml").write_text("project_name: gza\nverify_command: ./bin/root-verify\n")
-    (project_dir / "gza.yaml").write_text("project_name: server\nverify_command: ./bin/server-verify\n")
+    (repo_root / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n")
+    (project_dir / "gza.yaml").write_text("project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n")
 
     config = Config(project_dir=project_dir, project_name="server")
     setattr(
@@ -330,8 +330,8 @@ def test_resolve_affected_repo_projects_keeps_no_verify_parent_for_nested_projec
     repo_root = tmp_path / "repo"
     project_dir = repo_root / "server"
     project_dir.mkdir(parents=True)
-    (repo_root / "gza.yaml").write_text("project_name: gza\n")
-    (project_dir / "gza.yaml").write_text("project_name: server\nverify_command: ./bin/server-verify\n")
+    (repo_root / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\n")
+    (project_dir / "gza.yaml").write_text("project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n")
 
     config = Config(project_dir=project_dir, project_name="server")
     setattr(
@@ -366,9 +366,9 @@ def test_resolve_affected_repo_projects_can_discover_branch_local_project_config
     project_dir.mkdir(parents=True)
     worktree_project_dir.mkdir(parents=True)
     worktree_new_project_dir.mkdir(parents=True)
-    (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-    (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-    (worktree_new_project_dir / "gza.yaml").write_text("project_name: new\nverify_command: ./bin/new-verify\n")
+    (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+    (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+    (worktree_new_project_dir / "gza.yaml").write_text("project_name: new\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/new-verify\n")
 
     config = Config(project_dir=project_dir, project_name="foo")
     setattr(
@@ -401,7 +401,7 @@ def test_resolve_affected_repo_projects_allows_branch_declared_project_roots_wit
     repo_root = tmp_path / "repo"
     project_dir = repo_root / "services" / "foo"
     project_dir.mkdir(parents=True)
-    (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+    (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
 
     config = Config(project_dir=project_dir, project_name="foo")
     setattr(

@@ -386,7 +386,7 @@ def test_incomplete_preset_projects_revised_plan_followup_when_context_available
 def test_incomplete_preset_projects_verify_only_noop_recovery_without_persisting_clearance(
     tmp_path: Path,
 ) -> None:
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\n", encoding="utf-8")
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n", encoding="utf-8")
     config = Config.load(tmp_path)
     store = SqliteTaskStore(tmp_path / "test.db", prefix=config.project_prefix)
 
@@ -1911,7 +1911,7 @@ def test_incomplete_preset_warns_and_falls_back_to_owner_for_missing_subject_tas
 def test_attention_subject_agrees_across_show_incomplete_and_watch_for_held_plan_lineage(
     tmp_path: Path,
 ) -> None:
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n")
     store = _store(tmp_path)
     config = Config.load(tmp_path)
 

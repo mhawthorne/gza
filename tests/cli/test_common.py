@@ -105,7 +105,7 @@ class TestRunWithResume:
     """Unit tests for shared run_with_resume execution helper."""
 
     def test_resumes_on_handled_timeout_failure_with_zero_exit(self, tmp_path):
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n")
         config = Config.load(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
 
@@ -143,7 +143,7 @@ class TestRunWithResume:
         assert len(store.get_all()) == 2  # original + 1 resume child
 
     def test_stops_after_resume_child_fails(self, tmp_path):
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n")
         config = Config.load(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
 
@@ -181,7 +181,7 @@ class TestRunWithResume:
         assert len(store.get_all()) == 2  # original + 1 resume child
 
     def test_respects_zero_max_resume_attempts(self, tmp_path):
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n")
         config = Config.load(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
 
@@ -209,7 +209,7 @@ class TestRunWithResume:
         assert len(store.get_all()) == 1
 
     def test_does_not_resume_on_test_failure(self, tmp_path):
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n")
         config = Config.load(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
 
@@ -241,7 +241,7 @@ class TestRunWithResume:
         assert len(store.get_all()) == 1
 
     def test_returns_nonzero_for_handled_failed_outcome_with_zero_exit(self, tmp_path):
-        (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+        (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n")
         config = Config.load(tmp_path)
         store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
 

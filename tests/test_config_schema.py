@@ -82,10 +82,510 @@ def test_code_task_diff_timeout_cap_registry_description_matches_hard_cap_docs()
     assert "explicit task-type overrides can still be higher" not in cap_spec.description
 
 
+def test_config_load_rejects_project_missing_provider(tmp_path) -> None:
+    """Projects must declare provider instead of inheriting a runtime default."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        Config.load(tmp_path)
+
+    message = str(exc_info.value)
+    assert "'provider' is required" in message
+    assert str(tmp_path / "gza.yaml") in message
+    assert "provider: codex" in message
+
+
+def test_config_load_rejects_project_missing_effective_model(tmp_path) -> None:
+    """Projects must declare a model source instead of delegating to provider CLI defaults."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        Config.load(tmp_path)
+
+    message = str(exc_info.value)
+    assert "'model' is required for provider 'codex'" in message
+    assert str(tmp_path / "gza.yaml") in message
+    assert "providers.codex.model" in message
+
+
+def test_config_load_and_validate_reject_project_task_provider_route_without_model(tmp_path: Path) -> None:
+    """Explicit task-provider routes must not borrow another provider's global model."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
+        "task_providers:\n"
+        "  implement: claude\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        Config.load(tmp_path)
+
+    load_message = str(exc_info.value)
+    assert str(tmp_path / "gza.yaml") in load_message
+    assert "implement" in load_message
+    assert "claude" in load_message
+
+    is_valid, errors, _warnings = Config.validate(tmp_path)
+    assert is_valid is False
+    assert any(
+        str(tmp_path / "gza.yaml") in error
+        and "implement" in error
+        and "claude" in error
+        for error in errors
+    )
+
+
+def test_config_load_and_validate_reject_local_task_provider_route_without_model(tmp_path: Path) -> None:
+    """Local task-provider redirects should blame the local routing key when no model resolves."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "gza.local.yaml").write_text(
+        "task_providers:\n"
+        "  implement: claude\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        Config.load(tmp_path)
+
+    load_message = str(exc_info.value)
+    assert str(tmp_path / "gza.local.yaml") in load_message
+    assert "task_providers.implement" in load_message
+    assert "claude" in load_message
+    assert "gza.yaml" not in load_message
+
+    is_valid, errors, _warnings = Config.validate(tmp_path)
+    assert is_valid is False
+    assert any(
+        str(tmp_path / "gza.local.yaml") in error
+        and "task_providers.implement" in error
+        and "claude" in error
+        for error in errors
+    )
+
+
+@pytest.mark.parametrize(
+    "claude_model_yaml",
+    [
+        pytest.param(
+            "providers:\n"
+            "  claude:\n"
+            "    model: claude-sonnet-4-6\n",
+            id="provider-default",
+        ),
+        pytest.param(
+            "providers:\n"
+            "  claude:\n"
+            "    task_types:\n"
+            "      implement:\n"
+            "        model: claude-sonnet-4-6\n",
+            id="provider-task-type",
+        ),
+    ],
+)
+def test_config_load_and_validate_accept_task_provider_route_with_routed_provider_model(
+    tmp_path: Path,
+    claude_model_yaml: str,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
+        "task_providers:\n"
+        "  implement: claude\n"
+        f"{claude_model_yaml}",
+        encoding="utf-8",
+    )
+
+    config = Config.load(tmp_path)
+    is_valid, errors, _warnings = Config.validate(tmp_path)
+
+    assert config.get_provider_for_task("implement") == "claude"
+    assert config.get_model_for_task("implement", "claude") == "claude-sonnet-4-6"
+    assert is_valid is True
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    "model_yaml",
+    [
+        pytest.param("model: '   '\n", id="top-level"),
+        pytest.param("defaults:\n  model: '   '\n", id="defaults"),
+        pytest.param("providers:\n  codex:\n    model: '   '\n", id="provider-default"),
+        pytest.param(
+            "providers:\n  codex:\n    task_types:\n      implement:\n        model: '   '\n",
+            id="provider-task-type",
+        ),
+        pytest.param("task_types:\n  implement:\n    model: '   '\n", id="legacy-task-type"),
+    ],
+)
+def test_config_load_rejects_project_whitespace_only_model_sources(tmp_path: Path, model_yaml: str) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n"
+        f"{model_yaml}",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        Config.load(tmp_path)
+
+    message = str(exc_info.value)
+    assert "'model' is required for provider 'codex'" in message
+    assert str(tmp_path / "gza.yaml") in message
+
+
+def test_config_load_rejects_provider_model_only_in_user_config(tmp_path, monkeypatch) -> None:
+    """User defaults may override but cannot satisfy the project provider/model contract."""
+    home = tmp_path / "home"
+    user_config_dir = home / ".gza"
+    user_config_dir.mkdir(parents=True)
+    (user_config_dir / "config.yaml").write_text(
+        "provider: codex\n"
+        "model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    (project_dir / "gza.yaml").write_text(
+        "project_name: demo\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    with pytest.raises(ConfigError) as exc_info:
+        Config.load(project_dir)
+
+    message = str(exc_info.value)
+    assert "'provider' is required" in message
+    assert str(project_dir / "gza.yaml") in message
+    assert str(user_config_dir / "config.yaml") not in message
+
+
+def test_config_load_accepts_explicit_provider_and_model(tmp_path) -> None:
+    """Explicit provider/model should validate and resolve exactly."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+
+    config = Config.load(tmp_path)
+
+    assert config.provider == "codex"
+    assert config.model == "gpt-5.5"
+    assert config.get_provider_for_task("implement") == "codex"
+    assert config.get_model_for_task("implement", "codex") == "gpt-5.5"
+
+
+@pytest.mark.parametrize(
+    ("local_override", "missing_provider"),
+    [
+        pytest.param("model: ''\n", "codex", id="clear-global-model"),
+        pytest.param("provider: claude\nmodel: ''\n", "claude", id="redirect-provider-and-clear-model"),
+    ],
+)
+def test_config_load_and_validate_reject_local_override_that_erases_effective_model(
+    tmp_path: Path,
+    local_override: str,
+    missing_provider: str,
+) -> None:
+    """Local overrides may tune declared models but cannot make the merged config model-less."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "gza.local.yaml").write_text(local_override, encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc_info:
+        Config.load(tmp_path)
+
+    load_message = str(exc_info.value)
+    assert f"'model' is required for provider '{missing_provider}'" in load_message
+    assert str(tmp_path / "gza.local.yaml") in load_message
+    assert "overriding" in load_message
+    assert "gza.yaml" not in load_message
+
+    is_valid, errors, _warnings = Config.validate(tmp_path)
+
+    assert is_valid is False
+    assert any(f"'model' is required for provider '{missing_provider}'" in error for error in errors)
+    assert any(str(tmp_path / "gza.local.yaml") in error for error in errors)
+
+    (tmp_path / "gza.local.yaml").write_text("model: gpt-5.6\n", encoding="utf-8")
+    assert Config.load(tmp_path).model == "gpt-5.6"
+    is_valid, errors, _warnings = Config.validate(tmp_path)
+    assert is_valid is True
+    assert errors == []
+
+
+@pytest.mark.parametrize(
+    ("project_model_yaml", "local_override", "expected_key"),
+    [
+        pytest.param(
+            "task_types:\n"
+            "  implement:\n"
+            "    model: gpt-5.5\n",
+            "task_types:\n"
+            "  implement:\n"
+            "    model: ''\n",
+            "task_types.implement.model",
+            id="legacy-task-type",
+        ),
+        pytest.param(
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      implement:\n"
+            "        model: gpt-5.5\n",
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      implement:\n"
+            "        model: ''\n",
+            "providers.codex.task_types.implement.model",
+            id="provider-task-type",
+        ),
+    ],
+)
+def test_config_load_and_validate_reject_local_task_model_blank_with_local_key(
+    tmp_path: Path,
+    project_model_yaml: str,
+    local_override: str,
+    expected_key: str,
+) -> None:
+    """Local blanks of the sole task-scoped model should blame the local scoped key."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n"
+        f"{project_model_yaml}",
+        encoding="utf-8",
+    )
+    (tmp_path / "gza.local.yaml").write_text(local_override, encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc_info:
+        Config.load(tmp_path)
+
+    load_message = str(exc_info.value)
+    assert "'model' is required for provider 'codex'" in load_message
+    assert str(tmp_path / "gza.local.yaml") in load_message
+    assert expected_key in load_message
+    assert "gza.yaml" not in load_message
+
+    is_valid, errors, _warnings = Config.validate(tmp_path)
+
+    assert is_valid is False
+    matching_errors = [error for error in errors if "'model' is required for provider 'codex'" in error]
+    assert matching_errors
+    assert any(str(tmp_path / "gza.local.yaml") in error for error in matching_errors)
+    assert any(expected_key in error for error in matching_errors)
+    assert not any("gza.yaml" in error for error in matching_errors)
+
+
+def test_config_load_and_validate_reject_local_provider_redirection_with_project_model(
+    tmp_path: Path,
+) -> None:
+    """Provider redirects from local config should identify the overriding provider key."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "gza.local.yaml").write_text("provider: claude\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError) as exc_info:
+        Config.load(tmp_path)
+
+    load_message = str(exc_info.value)
+    assert str(tmp_path / "gza.local.yaml") in load_message
+    assert "provider" in load_message
+    assert "claude" in load_message
+    assert "gpt-5.5" in load_message
+
+    is_valid, errors, _warnings = Config.validate(tmp_path)
+    assert is_valid is False
+    assert any(str(tmp_path / "gza.local.yaml") in error and "provider" in error for error in errors)
+
+    (tmp_path / "gza.local.yaml").write_text(
+        "provider: claude\nmodel: claude-sonnet-4-6\n",
+        encoding="utf-8",
+    )
+    assert Config.load(tmp_path).provider == "claude"
+
+
+def test_config_load_and_validate_reject_local_task_provider_redirect_with_inherited_model(
+    tmp_path: Path,
+) -> None:
+    """Task-provider redirects should blame the local routing key when the inherited model mismatches."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
+        "task_types:\n"
+        "  implement:\n"
+        "    model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "gza.local.yaml").write_text(
+        "task_providers:\n"
+        "  implement: claude\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        Config.load(tmp_path)
+
+    load_message = str(exc_info.value)
+    assert str(tmp_path / "gza.local.yaml") in load_message
+    assert "task_providers.implement" in load_message
+    assert "task_types.implement.model" in load_message
+    assert "claude" in load_message
+    assert "gpt-5.5" in load_message
+
+    is_valid, errors, _warnings = Config.validate(tmp_path)
+    assert is_valid is False
+    assert any(
+        str(tmp_path / "gza.local.yaml") in error
+        and "task_providers.implement" in error
+        and "task_types.implement.model" in error
+        for error in errors
+    )
+
+
+def test_config_load_and_validate_accept_local_task_provider_redirect_with_compatible_model(
+    tmp_path: Path,
+) -> None:
+    """A task-provider redirect with a compatible local model remains valid."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
+        "task_types:\n"
+        "  implement:\n"
+        "    model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "gza.local.yaml").write_text(
+        "task_providers:\n"
+        "  implement: claude\n"
+        "providers:\n"
+        "  claude:\n"
+        "    task_types:\n"
+        "      implement:\n"
+        "        model: claude-sonnet-4-6\n",
+        encoding="utf-8",
+    )
+
+    config = Config.load(tmp_path)
+    is_valid, errors, _warnings = Config.validate(tmp_path)
+
+    assert config.get_provider_for_task("implement") == "claude"
+    assert config.get_model_for_task("implement", "claude") == "claude-sonnet-4-6"
+    assert is_valid is True
+    assert errors == []
+
+
+def test_config_load_and_validate_local_provider_redirect_uses_provider_scoped_model(tmp_path: Path) -> None:
+    """Local provider redirects should validate the model selected by task resolution precedence."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "gza.local.yaml").write_text(
+        "provider: claude\n"
+        "providers:\n"
+        "  claude:\n"
+        "    model: claude-sonnet-4-6\n",
+        encoding="utf-8",
+    )
+
+    config = Config.load(tmp_path)
+    is_valid, errors, _warnings = Config.validate(tmp_path)
+
+    assert config.provider == "claude"
+    assert config.get_model_for_task("implement", "claude") == "claude-sonnet-4-6"
+    assert is_valid is True
+    assert errors == []
+
+
+def test_config_load_and_validate_user_provider_redirect_uses_provider_scoped_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """User provider redirects should validate the same effective provider-scoped model."""
+    home = tmp_path / "home"
+    user_config_dir = home / ".gza"
+    user_config_dir.mkdir(parents=True)
+    (user_config_dir / "config.yaml").write_text(
+        "task_providers:\n"
+        "  implement: claude\n"
+        "providers:\n"
+        "  claude:\n"
+        "    model: claude-sonnet-4-6\n",
+        encoding="utf-8",
+    )
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    (project_dir / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+
+    config = Config.load(project_dir)
+    is_valid, errors, _warnings = Config.validate(project_dir)
+
+    assert config.provider == "codex"
+    assert config.get_provider_for_task("implement") == "claude"
+    assert config.get_model_for_task("implement", "claude") == "claude-sonnet-4-6"
+    assert is_valid is True
+    assert errors == []
+
+
+def test_config_load_and_validate_accept_compatible_nonempty_local_model_override(tmp_path: Path) -> None:
+    """A compatible local model adjustment should preserve the project declaration contract."""
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "gza.local.yaml").write_text("model: gpt-5.6\n", encoding="utf-8")
+
+    config = Config.load(tmp_path)
+    is_valid, errors, _warnings = Config.validate(tmp_path)
+
+    assert config.model == "gpt-5.6"
+    assert is_valid is True
+    assert errors == []
+
+
 def test_config_load_parses_pr_integration_false(tmp_path) -> None:
     """Explicit project opt-out should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "pr_integration: false\n"
     )
 
@@ -97,7 +597,7 @@ def test_config_load_parses_pr_integration_false(tmp_path) -> None:
 def test_config_load_parses_plan_review_lifecycle_keys(tmp_path) -> None:
     """Plan-review lifecycle controls should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "advance_create_plan_reviews: false\n"
         "require_plan_review_before_implement: false\n"
         "max_plan_review_cycles: 4\n"
@@ -120,7 +620,7 @@ def test_config_load_parses_plan_review_lifecycle_keys(tmp_path) -> None:
 def test_config_load_parses_advance_off_topic_verify_unblock(tmp_path) -> None:
     """The off-topic verify unblock policy knob should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "advance_off_topic_verify_unblock: true\n"
     )
 
@@ -132,7 +632,7 @@ def test_config_load_parses_advance_off_topic_verify_unblock(tmp_path) -> None:
 def test_plan_slice_target_timeout_defaults_from_code_task_timeout_cap(tmp_path) -> None:
     """Unset plan slice timeout should derive from the code-task timeout cap."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "code_task_diff_timeout_cap_minutes: 62\n"
     )
 
@@ -145,7 +645,7 @@ def test_plan_slice_target_timeout_defaults_from_code_task_timeout_cap(tmp_path)
 def test_config_load_parses_docker_startup_timeout(tmp_path) -> None:
     """docker_startup_timeout should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "docker_startup_timeout: 60\n"
     )
 
@@ -156,7 +656,7 @@ def test_config_load_parses_docker_startup_timeout(tmp_path) -> None:
 
 def test_config_load_defaults_watch_slot_settle_seconds(tmp_path) -> None:
     """watch.slot_settle_seconds should default when omitted."""
-    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+    (tmp_path / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n")
 
     config = Config.load(tmp_path)
 
@@ -165,7 +665,7 @@ def test_config_load_defaults_watch_slot_settle_seconds(tmp_path) -> None:
 
 def test_config_load_defaults_watch_main_verify_remediation_max_attempts(tmp_path) -> None:
     """watch.main_verify_remediation_max_attempts should default when omitted."""
-    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+    (tmp_path / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n")
 
     config = Config.load(tmp_path)
 
@@ -178,7 +678,7 @@ def test_config_load_defaults_watch_main_verify_remediation_max_attempts(tmp_pat
 def test_config_load_parses_watch_main_verify_remediation_max_attempts(tmp_path) -> None:
     """watch.main_verify_remediation_max_attempts should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "watch:\n"
         "  main_verify_remediation_max_attempts: 4\n"
     )
@@ -191,7 +691,7 @@ def test_config_load_parses_watch_main_verify_remediation_max_attempts(tmp_path)
 def test_config_load_parses_watch_slot_settle_seconds(tmp_path) -> None:
     """watch.slot_settle_seconds should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "watch:\n"
         "  slot_settle_seconds: 7\n"
     )
@@ -203,7 +703,7 @@ def test_config_load_parses_watch_slot_settle_seconds(tmp_path) -> None:
 
 def test_config_load_defaults_watch_parked_auto_rearm(tmp_path) -> None:
     """watch.parked_auto_rearm should default to the conservative blind-policy settings."""
-    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+    (tmp_path / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n")
 
     config = Config.load(tmp_path)
 
@@ -216,7 +716,7 @@ def test_config_load_defaults_watch_parked_auto_rearm(tmp_path) -> None:
 def test_config_load_parses_watch_parked_auto_rearm(tmp_path) -> None:
     """watch.parked_auto_rearm should round-trip through Config.load."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "watch:\n"
         "  parked_auto_rearm:\n"
         "    enabled: true\n"
@@ -235,7 +735,7 @@ def test_config_load_parses_watch_parked_auto_rearm(tmp_path) -> None:
 
 def test_config_load_defaults_quiet_period_seconds(tmp_path) -> None:
     """quiet_period_seconds should default when omitted."""
-    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+    (tmp_path / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n")
 
     config = Config.load(tmp_path)
 
@@ -245,7 +745,7 @@ def test_config_load_defaults_quiet_period_seconds(tmp_path) -> None:
 def test_config_load_accepts_zero_quiet_period_seconds(tmp_path) -> None:
     """quiet_period_seconds should accept zero as the disable sentinel."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "quiet_period_seconds: 0\n"
     )
 
@@ -275,7 +775,7 @@ def test_config_validation_rejects_invalid_quiet_period_seconds(
 ) -> None:
     """Load and validate should reject invalid quiet_period_seconds values."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         f"quiet_period_seconds: {value}\n"
     )
 
@@ -293,7 +793,7 @@ def test_config_validation_rejects_invalid_quiet_period_seconds(
 def test_config_load_rejects_invalid_docker_startup_timeout(tmp_path, value: str) -> None:
     """Load should reject non-positive and non-integer docker_startup_timeout values."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         f"docker_startup_timeout: {value}\n"
     )
 
@@ -315,7 +815,7 @@ def test_config_load_rejects_invalid_docker_startup_timeout(tmp_path, value: str
 def test_config_validate_rejects_invalid_docker_startup_timeout(tmp_path, value: str, expected: str) -> None:
     """Validate should report shared positive-int wording for docker_startup_timeout."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         f"docker_startup_timeout: {value}\n"
     )
 
@@ -338,7 +838,7 @@ def test_config_validate_rejects_invalid_docker_startup_timeout(tmp_path, value:
 def test_config_watch_slot_settle_seconds_validation(tmp_path, value: str, expected: str) -> None:
     """Load and validate should reject invalid watch.slot_settle_seconds values."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "watch:\n"
         f"  slot_settle_seconds: {value}\n"
     )
@@ -357,7 +857,7 @@ def test_config_watch_slot_settle_seconds_validation(tmp_path, value: str, expec
 def test_config_watch_slot_settle_seconds_accepts_bounded_values(tmp_path, value: str) -> None:
     """The settle window should accept in-range strict integers only."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "watch:\n"
         f"  slot_settle_seconds: {value}\n"
     )
@@ -374,7 +874,7 @@ def test_config_watch_slot_settle_seconds_accepts_bounded_values(tmp_path, value
 def test_config_load_rejects_legacy_watch_dispatch_start_timeout_key(tmp_path) -> None:
     """The legacy watch.dispatch_start_timeout key should fail as unknown."""
     (tmp_path / "gza.yaml").write_text(
-        "project_name: demo\n"
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
         "watch:\n"
         "  dispatch_start_timeout: 7\n"
     )

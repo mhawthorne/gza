@@ -23,8 +23,9 @@ from gza.artifacts import store_command_output_artifact
 from gza.cli import _run_as_worker, _run_foreground, cmd_run_inline, query as query_cli_module
 from gza.cli.execution import _format_iterate_terminal_merge_state_message
 from gza.concurrency import launch_permit
-from gza.config import Config
+from gza.config import Config, ConfigError
 from gza.db import DuplicateActiveChildError, SqliteTaskStore, task_id_numeric_key
+from gza.extractions import ExtractionDraft, SourceSelection
 from gza.git import Git
 from gza.log_paths import ops_log_path_for
 from gza.query import build_lineage_tree
@@ -91,6 +92,29 @@ def _background_work_status_error(tmp_path: Path) -> tuple[list[str], str]:
         ["work", str(task.id), "--background", "--no-docker", "--project", str(tmp_path)],
         f"Error: Task {task.id} is not pending (status: completed)",
     )
+
+
+def _setup_plan_only_model_config(tmp_path: Path) -> Config:
+    config_path = tmp_path / "gza.yaml"
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    db_path = tmp_path / ".gza" / "gza.db"
+    config_path.write_text(
+        f"project_name: test-project\n"
+        f"worktree_dir: {worktree_dir}\n"
+        f"db_path: {db_path}\n"
+        "provider: codex\n"
+        "quiet_period_seconds: 0\n"
+        "providers:\n"
+        "  codex:\n"
+        "    task_types:\n"
+        "      plan:\n"
+        "        model: gpt-5.5\n"
+    )
+    return Config.load(tmp_path)
+
+
+def _assert_unresolved_route_error(output: str) -> None:
+    assert "'model' is required for task type 'implement'" in output
 
 
 
@@ -179,6 +203,226 @@ def test_format_iterate_terminal_merge_state_message_hides_pending_redundant_res
         )
         is None
     )
+
+
+def test_work_explicit_pending_task_requires_resolved_existing_route_before_foreground(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from gza.cli.execution import cmd_run
+
+    config = _setup_plan_only_model_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement uncovered row", task_type="implement")
+    original = task.__dict__.copy()
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        no_docker=True,
+        max_turns=None,
+        background=False,
+        worker_mode=False,
+        task_ids=[task.id],
+        count=1,
+        force=False,
+        resume=False,
+        create_pr=False,
+        tags=None,
+        any_tag=False,
+    )
+
+    with (
+        patch("gza.cli.execution.Config.load", return_value=config),
+        patch("gza.cli.execution.get_store", return_value=store),
+        patch("gza.cli.execution._run_foreground", side_effect=AssertionError("should not run")),
+    ):
+        rc = cmd_run(args)
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert rc == 1
+    _assert_unresolved_route_error(output)
+    run_task = store.get(task.id)
+    assert run_task is not None
+    assert run_task.__dict__ == original
+    assert len(store.get_all()) == 1
+    assert not config.worktree_path.exists()
+
+
+def test_run_inline_requires_resolved_existing_route_before_foreground(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _setup_plan_only_model_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Inline uncovered row", task_type="implement")
+    original = task.__dict__.copy()
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        no_docker=True,
+        max_turns=None,
+        task_id=task.id,
+        resume=False,
+        force=False,
+    )
+
+    with (
+        patch("gza.cli.execution.Config.load", return_value=config),
+        patch("gza.cli.execution.get_store", return_value=store),
+        patch("gza.cli.execution._run_foreground", side_effect=AssertionError("should not run")),
+    ):
+        rc = cmd_run_inline(args)
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert rc == 1
+    _assert_unresolved_route_error(output)
+    run_task = store.get(task.id)
+    assert run_task is not None
+    assert run_task.__dict__ == original
+    assert len(store.get_all()) == 1
+    assert not config.worktree_path.exists()
+
+
+def test_background_launch_requires_resolved_existing_route_before_startup_prepare(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from gza.cli.execution import cmd_run
+
+    config = _setup_plan_only_model_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Background uncovered row", task_type="implement")
+    original = task.__dict__.copy()
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        no_docker=True,
+        max_turns=None,
+        background=True,
+        worker_mode=False,
+        task_ids=[task.id],
+        count=1,
+        force=False,
+        resume=False,
+        create_pr=False,
+        tags=None,
+        any_tag=False,
+    )
+
+    with (
+        patch("gza.cli.execution.Config.load", return_value=config),
+        patch("gza.cli._common.get_store", return_value=store),
+        patch("gza.cli._common.prepare_task_startup_phase", side_effect=AssertionError("should not prepare")),
+    ):
+        rc = cmd_run(args)
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert rc == 1
+    _assert_unresolved_route_error(output)
+    run_task = store.get(task.id)
+    assert run_task is not None
+    assert run_task.__dict__ == original
+    assert len(store.get_all()) == 1
+    assert not config.worktree_path.exists()
+
+
+def test_worker_mode_requires_resolved_existing_route_before_claim_or_provider(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from gza.cli.execution import cmd_run
+
+    config = _setup_plan_only_model_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Worker uncovered row", task_type="implement")
+    original = task.__dict__.copy()
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        no_docker=True,
+        max_turns=None,
+        background=False,
+        worker_mode=True,
+        task_ids=[task.id],
+        count=1,
+        force=False,
+        resume=False,
+        create_pr=False,
+        tags=None,
+        any_tag=False,
+        worker_id="worker-test",
+        tmux_session=None,
+    )
+
+    with (
+        patch("gza.cli.execution.Config.load", return_value=config),
+        patch("gza.cli._common.get_store", return_value=store),
+        patch("gza.runner.get_provider", side_effect=AssertionError("provider should not start")),
+    ):
+        rc = cmd_run(args)
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert rc == 1
+    _assert_unresolved_route_error(output)
+    run_task = store.get(task.id)
+    assert run_task is not None
+    assert run_task.__dict__ == original
+    assert len(store.get_all()) == 1
+    assert not config.worktree_path.exists()
+
+
+def test_interactive_edit_requires_resolved_existing_route_before_pending_row_update(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from gza.cli.execution import cmd_edit
+
+    config = _setup_plan_only_model_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Original interactive prompt", task_type="implement")
+    original = task.__dict__.copy()
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        task_id=task.id,
+        prompt_file=None,
+        prompt=None,
+        based_on_flag=None,
+        depends_on_flag=None,
+        clear_depends_on=False,
+        explore=False,
+        task=False,
+        review=False,
+        create_pr=False,
+        model=None,
+        provider=None,
+        skip_learnings=False,
+        hold_for_review=None,
+        hold_for_review_flags=(),
+        clear_tags=False,
+        set_tags=None,
+        add_tags=None,
+        remove_tags=None,
+    )
+
+    def _write_edited_prompt(cmd: list[str]):
+        Path(cmd[1]).write_text("# edited by test\nEdited interactive prompt\n")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    with (
+        patch("gza.cli.execution.Config.load", return_value=config),
+        patch("gza.cli.execution.get_store", return_value=store),
+        patch("gza.db._launch_editor", side_effect=_write_edited_prompt),
+    ):
+        rc = cmd_edit(args)
+
+    captured = capsys.readouterr()
+    output = captured.out + captured.err
+    assert rc == 1
+    _assert_unresolved_route_error(output)
+    edited = store.get(task.id)
+    assert edited is not None
+    assert edited.__dict__ == original
+    assert len(store.get_all()) == 1
 
 
 def test_format_iterate_terminal_merge_state_message_relabels_legacy_empty_with_commits_as_redundant(
@@ -943,6 +1187,83 @@ class TestEditCommand:
         assert "Error: tag must not be empty" in result.stdout
         assert "Traceback" not in result.stdout
         assert "Traceback" not in result.stderr
+
+    def test_edit_provider_without_model_in_provider_scope_leaves_row_unchanged(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Implement validation", task_type="implement")
+
+        with patch("gza.providers.base.get_provider") as provider_factory:
+            result = invoke_gza("edit", str(task.id), "--provider", "claude", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "'model' is required for task type 'implement' with provider 'claude'" in result.stdout
+        provider_factory.assert_not_called()
+        unchanged = store.get(task.id)
+        assert unchanged is not None
+        assert unchanged.provider is None
+        assert unchanged.provider_is_explicit is False
+        assert unchanged.model is None
+        assert unchanged.model_is_explicit is False
+
+    def test_edit_model_incompatible_with_effective_provider_leaves_row_unchanged(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Implement validation", task_type="implement")
+
+        with patch("gza.providers.base.get_provider") as provider_factory:
+            result = invoke_gza(
+                "edit",
+                str(task.id),
+                "--model",
+                "claude-sonnet-4-6",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 1
+        assert "appears incompatible with provider 'codex'" in result.stdout
+        provider_factory.assert_not_called()
+        unchanged = store.get(task.id)
+        assert unchanged is not None
+        assert unchanged.model is None
+        assert unchanged.model_is_explicit is False
+        assert unchanged.task_type == "implement"
+
+    def test_edit_type_conversion_without_model_coverage_leaves_row_unchanged(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            "db_path: .gza/gza.db\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      implement:\n"
+            "        model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        store = make_store(tmp_path)
+        task = store.add("Implement validation", task_type="implement")
+
+        with patch("gza.providers.base.get_provider") as provider_factory:
+            result = invoke_gza("edit", str(task.id), "--explore", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "'model' is required for task type 'explore' with provider 'codex'" in result.stdout
+        provider_factory.assert_not_called()
+        unchanged = store.get(task.id)
+        assert unchanged is not None
+        assert unchanged.task_type == "implement"
+        assert unchanged.last_edited_at is None
 
     def test_edit_set_tags_allowed_for_completed_task(self, tmp_path: Path):
         """Completed tasks should still allow tag-only edits."""
@@ -1763,7 +2084,7 @@ class TestRetagCommand:
             str(task.id),
             "--pr",
             "--model",
-            "claude-3-5-haiku-latest",
+            "gpt-5.3-codex",
             "--project",
             str(tmp_path),
         )
@@ -1775,7 +2096,7 @@ class TestRetagCommand:
         updated = store.get(task.id)
         assert updated is not None
         assert updated.create_pr is True
-        assert updated.model == "claude-3-5-haiku-latest"
+        assert updated.model == "gpt-5.3-codex"
 
     def test_edit_pr_and_add_tag_apply_both_mutations(self, tmp_path: Path):
         """Edit command should not short-circuit tag edits ahead of other mutations."""
@@ -5544,7 +5865,7 @@ class TestBackgroundWorkerCommand:
         """Explicit background resume must refuse blocked failed code tasks before startup side effects."""
         setup_config(tmp_path)
         config = Config.load(tmp_path)
-        store = SqliteTaskStore(config.db_path)
+        store = make_store(tmp_path)
 
         dependency = store.add("Dependency", task_type="implement")
         dependency.status = "completed"
@@ -5869,6 +6190,11 @@ class TestBackgroundWorkerCommand:
             f"worktree_dir: {worktree_dir}\n"
             f"db_path: {db_path}\n"
             "provider: claude\n"
+            "providers:\n"
+            "  claude:\n"
+            "    model: claude-sonnet-4\n"
+            "  codex:\n"
+            "    model: gpt-5.5\n"
             "task_providers:\n"
             "  fix: codex\n"
         )
@@ -6191,7 +6517,7 @@ class TestReconciliation:
 
         setup_config(tmp_path)
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
             "watch:\n"
             "  no_activity_timeout: 120\n"
         )
@@ -8279,6 +8605,38 @@ class TestPlanReviewAndImproveCommands:
         assert expected_fragment in result.stdout
         assert [task for task in store.get_all() if task.task_type == "plan_improve"] == []
 
+    def test_plan_improve_uncovered_model_fails_cleanly_before_store_or_preflight(self, tmp_path: Path) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      plan:\n"
+            "        model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        store = make_store(tmp_path)
+        plan = store.add("Plan rollout", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+        review = store.add("Review rollout", task_type="plan_review", depends_on=plan.id)
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+        store.update(review)
+
+        with patch("gza.runner.get_provider") as mock_get_provider:
+            result = invoke_gza("plan-improve", str(review.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "task type 'plan_improve' with provider 'codex'" in result.stderr
+        assert "Traceback" not in result.stderr
+        mock_get_provider.assert_not_called()
+        assert [task for task in store.get_all() if task.task_type == "plan_improve"] == []
+
 
 class TestImproveCommand:
     """Tests for 'gza improve' command."""
@@ -8471,6 +8829,76 @@ class TestImproveCommand:
         reused = store.get(pending_improve.id)
         assert reused is not None
         assert reused.create_pr is True
+
+    @pytest.mark.parametrize(
+        ("existing_status", "failure_reason", "session_id", "expected_action"),
+        [
+            ("pending", None, None, "reuse_pending"),
+            ("failed", "TIMEOUT", "improve-session-1", "resume"),
+            ("failed", "INFRASTRUCTURE_ERROR", None, "retry"),
+        ],
+    )
+    def test_improve_comments_only_invalid_provider_override_does_not_mutate_or_create(
+        self,
+        tmp_path: Path,
+        existing_status: str,
+        failure_reason: str | None,
+        session_id: str | None,
+        expected_action: str,
+    ) -> None:
+        """Invalid comments-only invocation overrides fail before reuse/resume/retry mutation."""
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+
+        impl_task = store.add("Add feature", task_type="implement")
+        impl_task.status = "completed"
+        impl_task.completed_at = datetime.now(UTC)
+        store.update(impl_task)
+        assert impl_task.id is not None
+
+        store.add_comment(impl_task.id, "Address validation gaps.")
+        first = invoke_gza("improve", str(impl_task.id), "--queue", "--project", str(tmp_path))
+        assert first.returncode == 0, first.stdout
+
+        existing_improve = next(task for task in store.get_all() if task.task_type == "improve")
+        assert existing_improve.id is not None
+        existing_improve.status = existing_status
+        existing_improve.failure_reason = failure_reason
+        existing_improve.session_id = session_id
+        store.update(existing_improve)
+
+        with (
+            patch("gza.cli.execution._reserve_immediate_execution_permit") as reserve,
+            patch("gza.cli.execution._run_foreground") as foreground,
+            patch("gza.providers.base.get_provider") as provider_factory,
+        ):
+            result = invoke_gza(
+                "improve",
+                str(impl_task.id),
+                "--queue",
+                "--provider",
+                "claude",
+                "--project",
+                str(tmp_path),
+            )
+
+        assert result.returncode == 1
+        assert "'model' is required for task type 'improve' with provider 'claude'" in result.stdout
+        reserve.assert_not_called()
+        foreground.assert_not_called()
+        provider_factory.assert_not_called()
+
+        improves_after = [task for task in store.get_all() if task.task_type == "improve"]
+        assert len(improves_after) == 1, expected_action
+        unchanged = store.get(existing_improve.id)
+        assert unchanged is not None
+        assert unchanged.provider is None
+        assert unchanged.provider_is_explicit is False
+        assert unchanged.model is None
+        assert unchanged.model_is_explicit is False
+        assert unchanged.status == existing_status
+        assert unchanged.failure_reason == failure_reason
+        assert unchanged.session_id == session_id
 
     def test_improve_comments_only_pending_task_with_newer_comment_creates_fresh_task(self, tmp_path: Path):
         """Pending comments-only improve is not reused when newer unresolved comments were added."""
@@ -8763,7 +9191,7 @@ class TestImproveCommand:
             "--queue",
             "--review",
             "--model",
-            "gpt-5.4",
+            "claude-sonnet-4-6",
             "--provider",
             "claude",
             "--project",
@@ -8779,7 +9207,7 @@ class TestImproveCommand:
         assert retry_task.id != failed_improve.id
         assert retry_task.based_on == failed_improve.id
         assert retry_task.create_review is True
-        assert retry_task.model == "gpt-5.4"
+        assert retry_task.model == "claude-sonnet-4-6"
         assert retry_task.model_is_explicit is True
         assert retry_task.provider == "claude"
         assert retry_task.provider_is_explicit is True
@@ -9103,18 +9531,24 @@ class TestImproveCommand:
         review_task.completed_at = datetime.now(UTC)
         store.update(review_task)
 
-        result = invoke_gza("improve", str(impl_task.id), "--model", "claude-opus-4-5", "--queue", "--project", str(tmp_path))
+        result = invoke_gza("improve", str(impl_task.id), "--model", "gpt-5.4", "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         all_tasks = store.get_all()
         improve_task = [t for t in all_tasks if t.task_type == "improve"][0]
         assert improve_task is not None
-        assert improve_task.model == "claude-opus-4-5"
+        assert improve_task.model == "gpt-5.4"
 
     def test_improve_with_provider_flag(self, tmp_path: Path):
         """Improve command with --provider sets the provider on the created task."""
 
         setup_config(tmp_path)
+        with (tmp_path / "gza.yaml").open("a", encoding="utf-8") as f:
+            f.write(
+                "providers:\n"
+                "  gemini:\n"
+                "    model: gemini-2.5-pro\n"
+            )
         store = make_store(tmp_path)
 
         impl_task = store.add("Add feature", task_type="implement")
@@ -10579,18 +11013,26 @@ class TestReviewCommand:
         impl_task.completed_at = datetime.now(UTC)
         store.update(impl_task)
 
-        result = invoke_gza("review", str(impl_task.id), "--model", "claude-opus-4-5", "--queue", "--project", str(tmp_path))
+        result = invoke_gza("review", str(impl_task.id), "--model", "gpt-5.6", "--queue", "--project", str(tmp_path))
 
         assert result.returncode == 0
         all_tasks = store.get_all()
         review_task = [t for t in all_tasks if t.task_type == "review"][0]
         assert review_task is not None
-        assert review_task.model == "claude-opus-4-5"
+        assert review_task.model == "gpt-5.6"
 
     def test_review_with_provider_flag(self, tmp_path: Path):
         """Review command with --provider sets the provider on the created review task."""
 
         setup_config(tmp_path)
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8")
+            + "providers:\n"
+            + "  gemini:\n"
+            + "    model: gemini-2.5-pro\n",
+            encoding="utf-8",
+        )
         store = make_store(tmp_path)
 
         impl_task = store.add("Add user authentication", task_type="implement")
@@ -25827,7 +26269,7 @@ class TestMaxTurnsFlag:
         import argparse
 
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: test\nmax_steps: 50\n")
+        config_path.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\nmax_steps: 50\n")
 
         config = Config.load(tmp_path)
         assert config.max_turns == 50
@@ -26589,6 +27031,9 @@ class TestRunInlineCommand:
     def test_cmd_run_inline_passes_foreground_inline_auto_invocation(self, tmp_path: Path):
         setup_config(tmp_path)
         config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Run inline task", task_type="implement")
+        assert task.id == "testproject-1"
 
         args = argparse.Namespace(
             project_dir=tmp_path,
@@ -28735,7 +29180,7 @@ class TestAddCommandWithModelAndProvider:
         """Add command with --model flag stores model override."""
 
         setup_config(tmp_path)
-        result = invoke_gza("add", "--model", "claude-3-5-haiku-latest", "Test task with model", "--project", str(tmp_path))
+        result = invoke_gza("add", "--model", "gpt-5.4", "Test task with model", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Added task" in result.stdout
@@ -28746,13 +29191,19 @@ class TestAddCommandWithModelAndProvider:
         tasks = store.get_pending()
         task = next((t for t in tasks if t.prompt == "Test task with model"), None)
         assert task is not None
-        assert task.model == "claude-3-5-haiku-latest"
+        assert task.model == "gpt-5.4"
         assert task.model_is_explicit is True
 
     def test_add_with_provider_flag(self, tmp_path: Path):
         """Add command with --provider flag stores provider override."""
 
         setup_config(tmp_path)
+        with (tmp_path / "gza.yaml").open("a", encoding="utf-8") as f:
+            f.write(
+                "providers:\n"
+                "  gemini:\n"
+                "    model: gemini-2.5-pro\n"
+            )
         result = invoke_gza("add", "--provider", "gemini", "Test task with provider", "--project", str(tmp_path))
 
         assert result.returncode == 0
@@ -28843,20 +29294,422 @@ class TestAddCommandWithModelAndProvider:
         assert task.model == "my-custom-model-v2"
         assert task.model_is_explicit is True
 
-    def test_add_allows_provider_without_model(self, tmp_path: Path):
-        """gza add with only --provider (no --model) must not trigger the parity gate."""
+    def test_add_rejects_provider_without_compatible_model_before_store(self, tmp_path: Path):
+        """Provider-only override cannot borrow another provider's global model."""
         setup_config(tmp_path)
+        with patch("gza.cli.execution.get_store") as mock_get_store, patch("gza.runner.get_provider") as mock_get_provider:
+            result = invoke_gza(
+                "add",
+                "--provider", "claude",
+                "Provider only task",
+                "--project", str(tmp_path),
+            )
+
+        assert result.returncode == 1
+        assert "task type 'implement' with provider 'claude'" in result.stdout
+        mock_get_store.assert_not_called()
+        mock_get_provider.assert_not_called()
+        assert not (tmp_path / ".gza" / "gza.db").exists()
+
+    def test_add_provider_without_model_uses_provider_scoped_model(self, tmp_path: Path):
+        """Provider-only override resolves the matching provider-scoped fallback model."""
+        setup_config(tmp_path)
+        with (tmp_path / "gza.yaml").open("a", encoding="utf-8") as f:
+            f.write(
+                "providers:\n"
+                "  claude:\n"
+                "    model: claude-sonnet-4-6\n"
+            )
         result = invoke_gza(
             "add",
             "--provider", "claude",
-            "Provider only task",
+            "Provider scoped task",
             "--project", str(tmp_path),
         )
 
         assert result.returncode == 0
         store = make_store(tmp_path)
-        tasks = store.get_pending()
-        assert any(t.prompt == "Provider only task" for t in tasks)
+        task = next((t for t in store.get_pending() if t.prompt == "Provider scoped task"), None)
+        assert task is not None
+        assert task.provider == "claude"
+        assert task.provider_is_explicit is True
+        assert Config.load(tmp_path).get_model_for_task(task.task_type, task.provider) == "claude-sonnet-4-6"
+
+    def test_task_provider_route_does_not_borrow_other_provider_global_model(self, tmp_path: Path):
+        """Task-provider routes need a model in the routed provider scope."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "task_providers:\n"
+            "  implement: claude\n",
+            encoding="utf-8",
+        )
+
+        with patch("gza.cli.execution.get_store") as mock_get_store, patch("gza.runner.get_provider") as mock_get_provider:
+            result = invoke_gza("add", "Routed task", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "task type 'implement' with provider 'claude'" in result.stderr
+        mock_get_store.assert_not_called()
+        mock_get_provider.assert_not_called()
+
+    def test_work_existing_task_with_invalid_task_provider_route_fails_before_provider_construction(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Existing queued tasks should not reach provider setup when config route lacks a model."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        store = make_store(tmp_path)
+        task = store.add("Existing routed task", task_type="implement")
+
+        with (tmp_path / "gza.yaml").open("a", encoding="utf-8") as f:
+            f.write(
+                "task_providers:\n"
+                "  implement: claude\n"
+            )
+
+        with patch("gza.runner.get_provider") as mock_get_provider:
+            result = invoke_gza("work", str(task.id), "--no-docker", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "task type 'implement' with provider 'claude'" in result.stderr
+        mock_get_provider.assert_not_called()
+
+    def test_add_missing_project_model_fails_before_store_or_runner(self, tmp_path: Path):
+        """Missing model config should fail task creation before DB access or runner preflight."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n",
+            encoding="utf-8",
+        )
+
+        with patch("gza.cli.execution.get_store") as mock_get_store, patch("gza.runner.get_provider") as mock_get_provider:
+            result = invoke_gza("add", "Misconfigured task", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "'model' is required for provider 'codex'" in result.stderr
+        mock_get_store.assert_not_called()
+        mock_get_provider.assert_not_called()
+        assert not (tmp_path / ".gza" / "gza.db").exists()
+
+    @pytest.mark.parametrize(
+        "model_yaml",
+        [
+            pytest.param("model: '   '\n", id="top-level"),
+            pytest.param("defaults:\n  model: '   '\n", id="defaults"),
+            pytest.param("providers:\n  codex:\n    model: '   '\n", id="provider-default"),
+            pytest.param(
+                "providers:\n  codex:\n    task_types:\n      implement:\n        model: '   '\n",
+                id="provider-task-type",
+            ),
+            pytest.param("task_types:\n  implement:\n    model: '   '\n", id="legacy-task-type"),
+        ],
+    )
+    def test_add_rejects_whitespace_only_model_sources_before_store_or_preflight(
+        self,
+        tmp_path: Path,
+        model_yaml: str,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            f"{model_yaml}",
+            encoding="utf-8",
+        )
+
+        with patch("gza.cli.execution.get_store") as mock_get_store, patch("gza.runner.get_provider") as mock_get_provider:
+            result = invoke_gza("add", "Whitespace model task", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "'model' is required for provider 'codex'" in result.stderr
+        mock_get_store.assert_not_called()
+        mock_get_provider.assert_not_called()
+        assert not (tmp_path / ".gza" / "gza.db").exists()
+
+    @pytest.mark.parametrize(
+        ("project_extra", "local_override", "expected_key"),
+        [
+            pytest.param(
+                "",
+                "task_providers:\n  implement: claude\n",
+                "task_providers.implement",
+                id="task-provider-redirection",
+            ),
+            pytest.param(
+                "providers:\n"
+                "  claude:\n"
+                "    model: claude-sonnet-4-6\n",
+                "task_providers:\n  implement: claude\nproviders:\n  claude:\n    model: ''\n",
+                "providers.claude.model",
+                id="provider-default-clear",
+            ),
+            pytest.param(
+                "providers:\n"
+                "  claude:\n"
+                "    task_types:\n"
+                "      implement:\n"
+                "        model: claude-haiku-4-6\n",
+                "task_providers:\n  implement: claude\nproviders:\n  claude:\n    task_types:\n      implement:\n        model: ''\n",
+                "providers.claude.task_types.implement.model",
+                id="provider-task-type-clear",
+            ),
+        ],
+    )
+    def test_add_local_override_model_gaps_name_local_file_and_overriding_key(
+        self,
+        tmp_path: Path,
+        project_extra: str,
+        local_override: str,
+        expected_key: str,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            f"{project_extra}",
+            encoding="utf-8",
+        )
+        (tmp_path / "gza.local.yaml").write_text(local_override, encoding="utf-8")
+
+        with patch("gza.cli.execution.get_store") as mock_get_store, patch("gza.runner.get_provider") as mock_get_provider:
+            result = invoke_gza("add", "Local override task", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        error_output = result.stdout + result.stderr
+        assert "gza.local.yaml" in error_output
+        assert expected_key in error_output
+        assert "gza.yaml" not in error_output.replace("gza.local.yaml", "")
+        mock_get_store.assert_not_called()
+        mock_get_provider.assert_not_called()
+        assert not (tmp_path / ".gza" / "gza.db").exists()
+
+    def test_task_type_scoped_plan_model_only_covers_plan_creation(self, tmp_path: Path):
+        """A task-type model covers only that concrete task type at creation time."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      plan:\n"
+            "        model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+
+        plan_result = invoke_gza("add", "--type", "plan", "Plan only", "--project", str(tmp_path))
+        assert plan_result.returncode == 0
+
+        with patch("gza.cli.execution.get_store") as mock_get_store, patch("gza.runner.get_provider") as mock_get_provider:
+            impl_result = invoke_gza("add", "--type", "implement", "Uncovered impl", "--project", str(tmp_path))
+
+        assert impl_result.returncode == 1
+        assert "task type 'implement' with provider 'codex'" in impl_result.stdout
+        mock_get_store.assert_not_called()
+        mock_get_provider.assert_not_called()
+
+        store = make_store(tmp_path)
+        plan = next(task for task in store.get_all() if task.prompt == "Plan only")
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        with patch("gza.runner.get_provider") as mock_get_provider:
+            review_result = invoke_gza("plan-review", str(plan.id), "--queue", "--project", str(tmp_path))
+
+        assert review_result.returncode == 1
+        assert "task type 'plan_review' with provider 'codex'" in review_result.stderr
+        mock_get_provider.assert_not_called()
+        assert not any(task.task_type == "plan_review" for task in make_store(tmp_path).get_all())
+
+    def test_implement_uncovered_model_fails_cleanly_before_store_or_preflight(self, tmp_path: Path) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      plan:\n"
+            "        model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        store = make_store(tmp_path)
+        plan = store.add("Plan only", task_type="plan")
+        assert plan.id is not None
+        plan.status = "completed"
+        plan.completed_at = datetime.now(UTC)
+        store.update(plan)
+
+        with patch("gza.runner.get_provider") as mock_get_provider:
+            result = invoke_gza("implement", str(plan.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "task type 'implement' with provider 'codex'" in result.stderr
+        assert "Traceback" not in result.stderr
+        mock_get_provider.assert_not_called()
+        assert not any(task.task_type == "implement" for task in store.get_all())
+
+    @pytest.mark.parametrize("command", ["retry", "resume"])
+    def test_recovery_creation_uncovered_model_releases_permit_and_fails_cleanly(
+        self,
+        tmp_path: Path,
+        command: str,
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            "max_concurrent: 1\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      plan:\n"
+            "        model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        original = store.add("Failed implementation", task_type="implement")
+        assert original.id is not None
+        original.status = "failed"
+        original.failure_reason = "WORKER_DIED"
+        original.completed_at = datetime.now(UTC)
+        if command == "resume":
+            original.session_id = "session-123"
+        store.update(original)
+
+        with patch("gza.runner.get_provider") as mock_get_provider:
+            result = invoke_gza(command, str(original.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "task type 'implement' with provider 'codex'" in result.stdout
+        assert "Traceback" not in result.stderr
+        mock_get_provider.assert_not_called()
+        assert not any(task.based_on == original.id for task in store.get_all())
+        permit = launch_permit(config, store)
+        permit.release()
+
+    def test_extract_creation_rejects_uncovered_implement_before_store_add(self, tmp_path: Path):
+        """Extraction cannot persist an implement task when implement has no model."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      plan:\n"
+            "        model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        config = Config.load(tmp_path)
+        store = MagicMock()
+        draft = ExtractionDraft(
+            source=SourceSelection(source_task_id=None, source_branch="feature/source"),
+            selected_paths=("src/app.py",),
+            touched_paths=("src/app.py",),
+            file_summaries=(),
+            patch="diff --git a/src/app.py b/src/app.py\n",
+            prompt="Extract implementation",
+        )
+
+        with pytest.raises(Exception) as exc_info, patch("gza.runner.get_provider") as mock_get_provider:
+            _execution_module._create_extract_task(
+                config=config,
+                store=store,
+                git=MagicMock(),
+                draft=draft,
+                tags=(),
+                create_review=False,
+                create_pr=False,
+                branch_type=None,
+                model=None,
+                provider=None,
+                skip_learnings=False,
+                base_branch=None,
+            )
+
+        assert "task type 'implement' with provider 'codex'" in str(exc_info.value)
+        store.add.assert_not_called()
+        mock_get_provider.assert_not_called()
+
+    def test_fix_creation_rejects_uncovered_fix_before_provider_preflight(self, tmp_path: Path):
+        """gza fix cannot persist a fix task when fix has no model."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      plan:\n"
+            "        model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        store = make_store(tmp_path)
+        impl = store.add("Completed implementation", task_type="implement")
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        store.update(impl)
+
+        with patch("gza.runner.get_provider") as mock_get_provider:
+            result = invoke_gza("fix", str(impl.id), "--queue", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "task type 'fix' with provider 'codex'" in result.stdout
+        mock_get_provider.assert_not_called()
+        assert not any(task.task_type == "fix" for task in make_store(tmp_path).get_all())
+
+    def test_add_missing_project_provider_fails_before_store_or_runner(self, tmp_path: Path):
+        """Missing provider config should fail task creation before DB access or runner preflight."""
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+
+        with patch("gza.cli.execution.get_store") as mock_get_store, patch("gza.runner.get_provider") as mock_get_provider:
+            result = invoke_gza("add", "Misconfigured task", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        assert "'provider' is required" in result.stderr
+        assert "provider: codex" in result.stderr
+        mock_get_store.assert_not_called()
+        mock_get_provider.assert_not_called()
+        assert not (tmp_path / ".gza" / "gza.db").exists()
+
+    def test_add_routed_task_still_requires_project_provider_before_store_or_runner(self, tmp_path: Path):
+        """Task routes and scoped models do not replace the required project provider."""
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            "project_name: test-project\n"
+            "task_providers:\n"
+            "  implement: claude\n"
+            "providers:\n"
+            "  claude:\n"
+            "    task_types:\n"
+            "      implement:\n"
+            "        model: claude-sonnet-4-6\n",
+            encoding="utf-8",
+        )
+
+        with pytest.raises(ConfigError) as exc_info:
+            Config.load(tmp_path)
+        assert "'provider' is required" in str(exc_info.value)
+        assert str(config_path) in str(exc_info.value)
+
+        with patch("gza.cli.execution.get_store") as mock_get_store, patch("gza.runner.get_provider") as mock_get_provider:
+            result = invoke_gza("add", "Routed without provider", "--project", str(tmp_path))
+
+        assert result.returncode == 1
+        error_output = result.stdout + result.stderr
+        assert "'provider' is required" in error_output
+        assert str(config_path) in error_output
+        mock_get_store.assert_not_called()
+        mock_get_provider.assert_not_called()
+        assert not (tmp_path / ".gza" / "gza.db").exists()
 
 
 class TestRecoveryTaskScopeCloning:
@@ -29134,7 +29987,7 @@ class TestEditCommandWithModelAndProvider:
         assert task.model is None
 
         # Edit to add model
-        result = invoke_gza("edit", str(task.id), "--model", "claude-3-5-haiku-latest", "--project", str(tmp_path))
+        result = invoke_gza("edit", str(task.id), "--model", "gpt-5.3-codex", "--project", str(tmp_path))
 
         assert result.returncode == 0
         assert "Set model override" in result.stdout
@@ -29142,13 +29995,20 @@ class TestEditCommandWithModelAndProvider:
         # Verify model was set
         task = store.get(task.id)
         assert task is not None
-        assert task.model == "claude-3-5-haiku-latest"
+        assert task.model == "gpt-5.3-codex"
         assert task.model_is_explicit is True
 
     def test_edit_with_provider_flag(self, tmp_path: Path):
         """Edit command can set provider override."""
 
         setup_config(tmp_path)
+        (tmp_path / "gza.yaml").write_text(
+            (tmp_path / "gza.yaml").read_text(encoding="utf-8")
+            + "providers:\n"
+            + "  gemini:\n"
+            + "    model: gemini-2.5-pro\n",
+            encoding="utf-8",
+        )
         store = make_store(tmp_path)
 
         # Create a task

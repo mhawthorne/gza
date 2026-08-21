@@ -5668,6 +5668,8 @@ class TestClaudeConfigIntegration:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "claude:\n"
             "  fetch_auth_token_from_keychain: true\n"
             "  args:\n"
@@ -5682,6 +5684,8 @@ class TestClaudeConfigIntegration:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "claude_args:\n"
             "  - --verbose\n"
         )
@@ -5697,6 +5701,8 @@ class TestClaudeConfigIntegration:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "claude_args:\n"
             "  - --old\n"
             "claude:\n"
@@ -5715,6 +5721,8 @@ class TestClaudeConfigIntegration:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "claude:\n"
             "  fetch_auth_token_from_keychain: true\n"
             "  args:\n"
@@ -5729,6 +5737,8 @@ class TestClaudeConfigIntegration:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "claude: not-a-dict\n"
         )
         is_valid, errors, warnings = Config.validate(tmp_path)
@@ -5740,6 +5750,8 @@ class TestClaudeConfigIntegration:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "claude_args:\n"
             "  - --verbose\n"
         )
@@ -5827,9 +5839,15 @@ class TestProviderScopedConfig:
         config_path.write_text(
             "project_name: test\n"
             "provider: codex\n"
+            "model: gpt-5.5\n"
             "task_providers:\n"
             "  review: claude\n"
             "  plan: gemini\n"
+            "providers:\n"
+            "  claude:\n"
+            "    model: claude-sonnet-4-6\n"
+            "  gemini:\n"
+            "    model: gemini-2.5-pro\n"
         )
         config = Config.load(tmp_path)
 
@@ -5842,6 +5860,8 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "task_providers:\n"
             "  review: unknown\n"
         )
@@ -5856,6 +5876,7 @@ class TestProviderScopedConfig:
         config_path.write_text(
             "project_name: test\n"
             "provider: codex\n"
+            "model: gpt-5.5\n"
             "task_providers:\n"
             "  review: claude\n"
             "task_types:\n"
@@ -5892,6 +5913,8 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "providers:\n"
             "  unknown:\n"
             "    model: x\n"
@@ -5907,6 +5930,8 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "providers:\n"
             "  claude:\n"
             "    reasoning_effort: 123\n"
@@ -5959,6 +5984,7 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
             "model: legacy-model\n"
             "task_types:\n"
             "  review:\n"
@@ -5984,6 +6010,7 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
             "max_steps: 60\n"
             "max_turns: 50\n"
             "model: legacy-model\n"
@@ -6026,6 +6053,8 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "timeout_minutes: 10\n"
             "task_types:\n"
             "  review:\n"
@@ -6055,6 +6084,8 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "timeout_minutes: 10\n"
             "task_types:\n"
             "  implement:\n"
@@ -6069,6 +6100,8 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "reasoning_effort: 1\n"
             "defaults:\n"
             "  reasoning_effort: 2\n"
@@ -6087,6 +6120,8 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "max_turns: 77\n"
         )
         with pytest.warns(DeprecationWarning, match="max_turns"):
@@ -6100,6 +6135,8 @@ class TestProviderScopedConfig:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
             "project_name: test\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "max_steps: 50\n"
             "max_turns: 40\n"
             "task_types:\n"

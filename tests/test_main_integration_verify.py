@@ -11,14 +11,22 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from gza.artifacts import store_command_output_artifact
-from gza.cli.watch import _main_verify_remediation_prompt
-from gza.config import Config
+from gza.cli.watch import (
+    _candidate_rework_identity,
+    _main_verify_remediation_prompt,
+    _queue_candidate_rework_task,
+    _queue_main_verify_remediation_task,
+)
+from gza.config import Config, ConfigError
 from gza.db import SqliteTaskStore
 from gza.git import GitError
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
+    CandidateIntegrationVerifyCheck,
+    CandidateIntegrationVerifyEvidence,
     MainIntegrationVerifyEnvironmentIdentity,
+    MainIntegrationVerifyRemediation,
     MainIntegrationVerifyTargetProof,
     _build_main_integration_verify_remediation,
     check_candidate_integration_verify,
@@ -35,6 +43,25 @@ from gza.main_integration_verify import (
 )
 from gza.runner import _compute_tree_fingerprint, _make_review_verify_result
 from tests.cli.conftest import make_store, setup_config
+
+
+def _setup_plan_only_model_config(tmp_path) -> Config:
+    config_path = tmp_path / "gza.yaml"
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    db_path = tmp_path / ".gza" / "gza.db"
+    config_path.write_text(
+        "project_name: test-project\n"
+        f"worktree_dir: {worktree_dir}\n"
+        f"db_path: {db_path}\n"
+        "provider: codex\n"
+        "quiet_period_seconds: 0\n"
+        "providers:\n"
+        "  codex:\n"
+        "    task_types:\n"
+        "      plan:\n"
+        "        model: gpt-5.5\n"
+    )
+    return Config.load(tmp_path)
 
 
 def _linux_container_identity() -> MainIntegrationVerifyEnvironmentIdentity:
@@ -64,6 +91,123 @@ def _current_identity(
         python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
         python_executable_family=python_executable_family,
     )
+
+
+def test_main_verify_remediation_requeue_requires_resolved_existing_route_before_attempt_mutation(tmp_path) -> None:
+    config = _setup_plan_only_model_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Existing main verify remediation", task_type="implement")
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "MAX_TURNS"
+    task.completed_at = datetime(2026, 8, 18, 1, 0, tzinfo=UTC)
+    store.update(task)
+    original = task.__dict__.copy()
+    remediation = MainIntegrationVerifyRemediation(
+        kind="fix",
+        signature="phase:unit",
+        tree_fingerprint="fp-verified",
+        failing_phase="unit",
+        failure="unit failed",
+        observed_environment_identity=None,
+        artifact_path=None,
+        failing_test_ids=(),
+        verify_excerpt=None,
+    )
+
+    with pytest.raises(ConfigError, match="'model' is required for task type 'implement'"):
+        _queue_main_verify_remediation_task(
+            config=config,
+            store=store,
+            task=task,
+            remediation=remediation,
+            head_sha="abc123",
+            desired_tags=("system", "main-verify"),
+            tags=None,
+            any_tag=False,
+        )
+
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.__dict__ == original
+    assert len(store.get_all()) == 1
+    assert (
+        store.get_main_verify_remediation_attempt_state(
+            signature="phase:unit",
+            tree_fingerprint="fp-verified",
+        )
+        is None
+    )
+
+
+def test_candidate_rework_reuse_requires_resolved_existing_route_before_pending_mutation(tmp_path) -> None:
+    config = _setup_plan_only_model_config(tmp_path)
+    store = make_store(tmp_path)
+    owner = store.add("Owner implementation", task_type="implement")
+    assert owner.id is not None
+    owner.branch = "feature/owner"
+    store.update(owner)
+    remediation = MainIntegrationVerifyRemediation(
+        kind="fix",
+        signature="phase:functional",
+        tree_fingerprint="fp-candidate",
+        failing_phase="functional",
+        failure="functional failed",
+        observed_environment_identity=None,
+        artifact_path=None,
+        failing_test_ids=(),
+        verify_excerpt=None,
+    )
+    evidence = CandidateIntegrationVerifyEvidence(
+        gate_enabled=True,
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        environment_identity=None,
+        tree_fingerprint="fp-candidate",
+        head_sha="abc123",
+        verify_status="failed",
+        verify_exit_status="1",
+        failure="functional failed",
+        failing_phase="functional",
+        reviewed_branch="feature/owner",
+        working_directory=str(tmp_path),
+        captured_at=datetime(2026, 8, 18, 1, 5, tzinfo=UTC),
+    )
+    check = CandidateIntegrationVerifyCheck(
+        evidence=evidence,
+        classification="red",
+        merges_halted=True,
+        remediation=remediation,
+        verify_runs=1,
+    )
+    identity = _candidate_rework_identity(owner, check)
+    existing = store.add(
+        f"Existing candidate rework\n\nIdentity: {identity}\n",
+        task_type="fix",
+        based_on=owner.id,
+        trigger_source="watch-pre-merge-integration-verify-rework",
+    )
+    existing.status = "failed"
+    existing.failure_reason = "MAX_TURNS"
+    existing.completed_at = datetime(2026, 8, 18, 1, 10, tzinfo=UTC)
+    store.update(existing)
+    original_existing = existing.__dict__.copy()
+
+    with pytest.raises(ConfigError, match="'model' is required for task type 'fix'"):
+        _queue_candidate_rework_task(
+            config=config,
+            store=store,
+            owner_task=owner,
+            check=check,
+            tags=None,
+            any_tag=False,
+        )
+
+    refreshed = store.get(existing.id)
+    assert refreshed is not None
+    assert refreshed.__dict__ == original_existing
+    assert len(store.get_all()) == 2
 
 
 def _seed_main_verify_task(

@@ -39,6 +39,7 @@ from ..config import (
     DEFAULT_MAX_FAILED_CLOSING_REVIEW_RETRIES,
     DEFAULT_MAX_RESUME_ATTEMPTS,
     Config,
+    ConfigError,
     is_model_compatible_with_provider,
     provider_model_mismatch_error,
 )
@@ -114,6 +115,7 @@ from ..runner import (
     RunInvocationContext,
     generate_slug,
     remove_task_startup_artifacts,
+    require_execution_route_for_task,
 )
 from ..status_ops import apply_manual_task_status
 from ..task_query import TaskQuery, TaskQueryService, TaskRow, parse_csv
@@ -423,6 +425,7 @@ def _print_iterate_failed_recovery_attention(
 def _resolve_failed_iterate_resume_start(
     *,
     args: argparse.Namespace,
+    config: Config,
     store: SqliteTaskStore,
     failed_task: DbTask,
     max_resume_attempts: int,
@@ -444,7 +447,7 @@ def _resolve_failed_iterate_resume_start(
             )
             return None, None
         return (existing_resume, decision), None
-    return (_create_resume_task(store, failed_task, trigger_source="manual"), decision), None
+    return (_create_resume_task(store, failed_task, config=config, trigger_source="manual"), decision), None
 
 
 def _resolve_plan_materialization_action_inputs(
@@ -1091,6 +1094,7 @@ def _create_extract_task(
     skip_learnings: bool,
     base_branch: str | None,
 ) -> tuple[DbTask, Path]:
+    config.require_model_for_task("implement", provider_override=provider, model_override=model)
     impl_task = store.add(
         draft.prompt,
         task_type="implement",
@@ -1203,6 +1207,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             if is_blocked:
                 del blocking_id, blocking_status
                 return phase1_error(args, blocked_dependency_error_message(store, task))
+            try:
+                require_execution_route_for_task(task, config)
+            except ConfigError as exc:
+                return phase1_error(args, str(exc))
     else:
         git = Git(config.project_dir)
         target_branch = git.default_branch()
@@ -1291,6 +1299,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                             )
                         )
                     break
+                try:
+                    require_execution_route_for_task(next_task, config)
+                except ConfigError as exc:
+                    print(f"Error: {exc}")
+                    return 1
                 result = _run_foreground(
                     config,
                     task_id=next_task.id,
@@ -1299,6 +1312,15 @@ def cmd_run(args: argparse.Namespace) -> int:
                     phase1_args=args,
                 )
             else:
+                next_task = session_store.get_next_pending(
+                    quiet_seconds=config.quiet_period_seconds,
+                )
+                if next_task is not None:
+                    try:
+                        require_execution_route_for_task(next_task, config)
+                    except ConfigError as exc:
+                        print(f"Error: {exc}")
+                        return 1
                 result = _run_foreground(
                     config,
                     task_id=None,
@@ -1363,6 +1385,14 @@ def cmd_run_inline(args: argparse.Namespace) -> int:
         config.max_turns = args.max_turns
 
     task_id = resolve_id(config, args.task_id)
+    store = get_store(config)
+    task = store.get(task_id)
+    if not task:
+        return phase1_error(args, f"Task {task_id} not found")
+    try:
+        require_execution_route_for_task(task, config)
+    except ConfigError as exc:
+        return phase1_error(args, str(exc))
     invocation = RunInvocationContext(
         command="run-inline",
         execution_mode="foreground_inline",
@@ -1432,13 +1462,17 @@ def cmd_plan_review(args: argparse.Namespace) -> int:
         else:
             model = args.model if hasattr(args, "model") and args.model else None
             provider = args.provider if hasattr(args, "provider") and args.provider else None
-            plan_review_task = _create_plan_review_task(
-                store,
-                plan_source_task,
-                trigger_source="manual",
-                model=model,
-                provider=provider,
-            )
+            try:
+                plan_review_task = _create_plan_review_task(
+                    store,
+                    plan_source_task,
+                    config=config,
+                    trigger_source="manual",
+                    model=model,
+                    provider=provider,
+                )
+            except ValueError as exc:
+                return phase1_error(args, str(exc))
             created_new_review = True
             action_message = None
         assert plan_review_task.id is not None
@@ -1723,6 +1757,7 @@ def cmd_plan_improve(args: argparse.Namespace) -> int:
                 store,
                 plan_source_task,
                 review_task,
+                config=config,
                 trigger_source="manual",
                 model=model,
                 provider=provider,
@@ -1955,6 +1990,7 @@ def cmd_implement(args: argparse.Namespace) -> int:
         impl_task = _create_implementation_task_from_source(
             store,
             plan_task,
+            config=config,
             prompt=prompt,
             trigger_source="manual",
             tags=tags,
@@ -2327,7 +2363,6 @@ def cmd_extract(args: argparse.Namespace) -> int:
 def cmd_add(args: argparse.Namespace) -> int:
     """Add a new task."""
     config = Config.load(args.project_dir)
-    store = get_store(config)
 
     # Determine task type
     if args.type:
@@ -2371,6 +2406,15 @@ def cmd_add(args: argparse.Namespace) -> int:
     if provider and model and not is_model_compatible_with_provider(provider, model):
         print(f"Error: {provider_model_mismatch_error('--model', provider, model)}")
         return 1
+    try:
+        config.require_model_for_task(
+            task_type,
+            provider_override=provider,
+            model_override=model,
+        )
+    except ConfigError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     # Validation: --spec must reference an existing file
     if spec:
@@ -2390,6 +2434,8 @@ def cmd_add(args: argparse.Namespace) -> int:
     if review_scope and task_type != "implement":
         print("Error: --review-scope is only valid for implement tasks")
         return 1
+
+    store = get_store(config)
 
     # Validation: --based-on must reference an existing task
     if based_on:
@@ -2956,6 +3002,12 @@ def cmd_edit(args: argparse.Namespace) -> int:
         tag_message = f"✓ Updated tags for task {task_row_id}: {', '.join(final_tags) if final_tags else '(none)'}"
 
     if not prompt_requested and (changed or tag_action is not None):
+        if changed:
+            try:
+                _validate_task_execution_route(config, task)
+            except ConfigError as exc:
+                print(f"Error: {exc}")
+                return 1
         store.update(task)
         if tag_message is not None:
             update_messages.append(tag_message)
@@ -2971,6 +3023,10 @@ def cmd_edit(args: argparse.Namespace) -> int:
                 field_updates=field_updates,
                 tag_action=tag_action,
                 tag_values=tag_values,
+                validate_before_update=lambda edited_task: _validate_task_execution_route(
+                    config,
+                    edited_task,
+                ),
             )
         except (TaskPromptEditConflict, TaskPromptValidationError) as exc:
             print(f"Error: {exc}")
@@ -3092,7 +3148,16 @@ def cmd_edit(args: argparse.Namespace) -> int:
             print(message)
         return 0
 
-    if edit_task_interactive(store, task):
+    try:
+        edited = edit_task_interactive(
+            store,
+            task,
+            validate_before_update=lambda edited_task: _validate_task_execution_route(config, edited_task),
+        )
+    except ConfigError as exc:
+        print(f"Error: {exc}")
+        return 1
+    if edited:
         print(f"✓ Updated task {task.id}")
         return 0
     return 1
@@ -3116,6 +3181,11 @@ def _parse_retag_mutation(args: argparse.Namespace) -> _RetagMutation:
     old_tag = _normalize_tags((replace_tag[0],))[0]
     new_tag = _normalize_tags((replace_tag[1],))[0]
     return _RetagMutation(kind="replace", old_tag=old_tag, new_tag=new_tag)
+
+
+def _validate_task_execution_route(config: Config, task: DbTask) -> None:
+    """Validate the final execution route represented by a task row."""
+    require_execution_route_for_task(task, config)
 
 
 def _build_retag_selection_query(args: argparse.Namespace) -> TaskQuery:
@@ -3233,7 +3303,7 @@ def cmd_retry(args: argparse.Namespace) -> int:
     if reserved_launch is False:
         return 1
     try:
-        new_task = _create_retry_task(store, task, trigger_source="manual")
+        new_task = _create_retry_task(store, task, config=config, trigger_source="manual")
     except DuplicateActiveChildError as exc:
         if isinstance(reserved_launch, LaunchPermit):
             reserved_launch.release()
@@ -3241,6 +3311,10 @@ def cmd_retry(args: argparse.Namespace) -> int:
             args,
             format_duplicate_active_child_message(exc, parent_task_id=task_id, task=task),
         )
+    except ConfigError as exc:
+        if isinstance(reserved_launch, LaunchPermit):
+            reserved_launch.release()
+        return phase1_error(args, str(exc))
     assert new_task.id is not None
 
     def _emit_retry_created() -> None:
@@ -3738,6 +3812,10 @@ def cmd_improve(args: argparse.Namespace) -> int:
     create_pr = bool(getattr(args, "create_pr", False))
     model = args.model if hasattr(args, 'model') and args.model else None
     provider = args.provider if hasattr(args, 'provider') and args.provider else None
+    try:
+        config.require_model_for_task("improve", provider_override=provider, model_override=model)
+    except ConfigError as exc:
+        return phase1_error(args, str(exc))
     reserved_launch = _reserve_immediate_execution_permit(args=args, config=config, store=store)
     if reserved_launch is False:
         return 1
@@ -3793,7 +3871,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
             elif comments_action == "resume":
                 assert existing_comments_improve is not None and existing_comments_improve.id is not None
                 improve_task = _apply_comments_only_invocation_overrides(
-                    _create_resume_task(store, existing_comments_improve, trigger_source="manual")
+                    _create_resume_task(store, existing_comments_improve, config=config, trigger_source="manual")
                 )
                 action_message = f"Created improve task {improve_task.id} (resume of {existing_comments_improve.id})"
             elif comments_action == "retry":
@@ -3803,7 +3881,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
                 # reset to the current invocation defaults instead of inheriting
                 # stale values from the failed improve task.
                 improve_task = _apply_comments_only_invocation_overrides(
-                    _create_retry_task(store, existing_comments_improve, trigger_source="manual")
+                    _create_retry_task(store, existing_comments_improve, config=config, trigger_source="manual")
                 )
                 action_message = f"Created improve task {improve_task.id} (retry of {existing_comments_improve.id})"
             else:
@@ -3812,6 +3890,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
                         store,
                         impl_task,
                         None,
+                        config=config,
                         trigger_source="manual",
                         create_review=create_review,
                         create_pr=create_pr,
@@ -3827,6 +3906,7 @@ def cmd_improve(args: argparse.Namespace) -> int:
                     store,
                     impl_task,
                     review_task,
+                    config=config,
                     trigger_source="manual",
                     create_review=create_review,
                     create_pr=create_pr,
@@ -3933,6 +4013,14 @@ def cmd_fix(args: argparse.Namespace) -> int:
     review_id = latest_review.id if latest_review is not None else None
     fix_prompt = PromptBuilder().fix_task_prompt(impl_task.id, review_id)
     create_review = args.review if hasattr(args, "review") and args.review else False
+    fix_model = args.model if hasattr(args, "model") and args.model else None
+    fix_provider = args.provider if hasattr(args, "provider") and args.provider else None
+    try:
+        config.require_model_for_task("fix", provider_override=fix_provider, model_override=fix_model)
+    except ConfigError as exc:
+        if isinstance(reserved_launch, LaunchPermit):
+            reserved_launch.release()
+        return phase1_error(args, str(exc))
     fix_task = store.add(
         fix_prompt,
         task_type="fix",
@@ -3942,8 +4030,8 @@ def cmd_fix(args: argparse.Namespace) -> int:
         review_scope=_resolved_review_scope_metadata(impl_task),
         create_review=create_review,
         tags=resolve_derived_task_tags(impl_task),
-        model=args.model if hasattr(args, "model") and args.model else None,
-        provider=args.provider if hasattr(args, "provider") and args.provider else None,
+        model=fix_model,
+        provider=fix_provider,
         trigger_source="manual",
     )
     assert fix_task.id is not None
@@ -4048,6 +4136,7 @@ def cmd_review(args: argparse.Namespace) -> int:
             review_task = _create_review_task(
                 store,
                 impl_task,
+                config=config,
                 trigger_source="manual",
                 model=model,
                 provider=provider,
@@ -5231,11 +5320,11 @@ def _cmd_iterate_impl(
         try:
             if recovery_action == "resume":
                 return (
-                    _create_resume_task(store, failed_task, trigger_source=trigger_source),
+                    _create_resume_task(store, failed_task, config=config, trigger_source=trigger_source),
                     None,
                 )
             return (
-                _create_retry_task(store, failed_task, trigger_source=trigger_source),
+                _create_retry_task(store, failed_task, config=config, trigger_source=trigger_source),
                 None,
             )
         except DuplicateActiveChildError as exc:
@@ -5324,7 +5413,7 @@ def _cmd_iterate_impl(
                 if permit is False:
                     return None, 1
                 try:
-                    action_task = _create_review_task(store, iterate_task, trigger_source="auto-recovery")
+                    action_task = _create_review_task(store, iterate_task, config=config, trigger_source="auto-recovery")
                 except DuplicateReviewError as exc:
                     action_task = exc.active_review
                     if action_task.status != "pending":
@@ -5387,6 +5476,7 @@ def _cmd_iterate_impl(
                     iterate_task,
                     review_task,
                     candidate.finding,
+                    config=config,
                     dispute_metadata=dict(candidate.dispute_metadata),
                     trigger_source="auto-recovery",
                 )
@@ -5451,6 +5541,7 @@ def _cmd_iterate_impl(
                         iterate_task.id,
                         iterate_task.branch,
                         preflight_context.target_branch,
+                        config=config,
                         trigger_source="auto-recovery",
                     )
                 except DuplicateActiveChildError:
@@ -5547,6 +5638,7 @@ def _cmd_iterate_impl(
                             store,
                             iterate_task,
                             review_task,
+                            config=config,
                             trigger_source="auto-recovery",
                         )
                     except ValueError as exc:
@@ -6076,6 +6168,7 @@ def _cmd_iterate_impl(
         assert impl_task is not None
         created_tasks, reused_tasks = _create_or_reuse_followup_tasks(
             store,
+            config=config,
             review_task=review_task,
             impl_task=impl_task,
             findings=followup_findings,
@@ -6199,7 +6292,7 @@ def _cmd_iterate_impl(
         action_task: DbTask | None = None
         if action_type == "create_review":
             try:
-                action_task = _create_review_task(store, current_impl_task, trigger_source="auto-recovery")
+                action_task = _create_review_task(store, current_impl_task, config=config, trigger_source="auto-recovery")
             except DuplicateReviewError as e:
                 action_task = e.active_review
                 assert action_task.id is not None
@@ -6614,7 +6707,7 @@ def _cmd_iterate_impl(
         prepared_review_task_id = action.get("_prepared_review_task_id")
 
         if action_type == "resume":
-            action_task = _create_resume_task(store, impl_task, trigger_source="manual")
+            action_task = _create_resume_task(store, impl_task, config=config, trigger_source="manual")
             assert action_task.id is not None
             initial_resume = True
             print(f"  Resuming implementation as {action_task.id}...")
@@ -6655,6 +6748,7 @@ def _cmd_iterate_impl(
                         impl_task.id,
                         impl_task.branch,
                         target_branch,
+                        config=config,
                         trigger_source="manual",
                     )
                 except DuplicateActiveChildError as exc:
@@ -6706,6 +6800,7 @@ def _cmd_iterate_impl(
                         created_review_task = create_spec_coherence_review_task(
                             store,
                             impl_task,
+                            config=config,
                             reviewed_head_sha=raw_head_sha.strip(),
                             changed_paths=changed_paths,
                             trigger_source="manual",
@@ -6714,6 +6809,7 @@ def _cmd_iterate_impl(
                         created_review_task = _create_review_task(
                             store,
                             impl_task,
+                            config=config,
                             trigger_source="manual",
                         )
                 except DuplicateReviewError as e:
@@ -6802,6 +6898,7 @@ def _cmd_iterate_impl(
                     impl_task,
                     maybe_review_task,
                     finding,
+                    config=config,
                     dispute_metadata=build_review_blocker_dispute_metadata(
                         dispute_artifact
                     ),
@@ -7065,6 +7162,7 @@ def _cmd_iterate_impl(
                             store,
                             impl_task,
                             review_task,
+                            config=config,
                             trigger_source="manual",
                         )
                     except ValueError as e:
@@ -7423,6 +7521,7 @@ def _cmd_iterate_plan(
                 return 0
             resume_start, resume_blocked = _resolve_failed_iterate_resume_start(
                 args=args,
+                config=config,
                 store=store,
                 failed_task=plan_task,
                 max_resume_attempts=effective_max_resume_attempts,
@@ -7472,7 +7571,7 @@ def _cmd_iterate_plan(
                     f"then iterate (max {max_iterations} improve cycles)"
                 )
                 return 0
-            run_start_task = _create_retry_task(store, plan_task, trigger_source="manual")
+            run_start_task = _create_retry_task(store, plan_task, config=config, trigger_source="manual")
             print(f"Retrying failed plan source {plan_task.id} as {run_start_task.id}...")
             plan_task, rc, terminal_skip_decision = _run_iterate_task_with_recovery(
                 args=args,
@@ -7586,7 +7685,7 @@ def _cmd_iterate_plan(
             break
 
         if action_type == "create_plan_review":
-            plan_review_task = _create_plan_review_task(store, source_task, trigger_source="manual")
+            plan_review_task = _create_plan_review_task(store, source_task, config=config, trigger_source="manual")
             print(f"  Created plan review task {plan_review_task.id}")
             print(f"  Running plan review {plan_review_task.id}...")
             plan_review_task, rc, _terminal_skip_decision = _run_iterate_task_with_recovery(
@@ -7668,6 +7767,7 @@ def _cmd_iterate_plan(
                 store,
                 source_task,
                 review_task,
+                config=config,
                 trigger_source="manual",
             )
             print(f"  Created plan improve task {plan_improve_task.id}")
@@ -7913,6 +8013,7 @@ def _cmd_iterate_plan(
             implement_task = _create_implementation_task_from_source(
                 store,
                 source_task,
+                config=config,
                 prompt=prompt,
                 trigger_source="manual",
                 create_review=getattr(config, "require_review_before_merge", True),
@@ -8034,7 +8135,7 @@ def cmd_resume(args: argparse.Namespace) -> int:
     if reserved_launch is False:
         return 1
     try:
-        new_task = _create_resume_task(store, task, trigger_source="manual")
+        new_task = _create_resume_task(store, task, config=config, trigger_source="manual")
     except DuplicateActiveChildError as exc:
         if isinstance(reserved_launch, LaunchPermit):
             reserved_launch.release()
@@ -8042,6 +8143,10 @@ def cmd_resume(args: argparse.Namespace) -> int:
             args,
             format_duplicate_active_child_message(exc, parent_task_id=task_id, task=task),
         )
+    except ConfigError as exc:
+        if isinstance(reserved_launch, LaunchPermit):
+            reserved_launch.release()
+        return phase1_error(args, str(exc))
     assert new_task.id is not None
 
     def _emit_resume_created() -> None:

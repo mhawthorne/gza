@@ -15,7 +15,7 @@ def setup_config(tmp_path: Path) -> None:
     """Set up a minimal gza config file."""
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
     )
 
@@ -25,7 +25,7 @@ def setup_shared_db_config(tmp_path: Path) -> Path:
     shared_db = tmp_path / "shared" / "gza.db"
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "project_id: testproject\n"
         "project_prefix: testproject\n"
         f"db_path: {shared_db}\n"

@@ -30,7 +30,7 @@ from ..concurrency import (
     launch_permit,
     reserve_task_launch_permit,
 )
-from ..config import Config
+from ..config import Config, ConfigError
 from ..console import (
     console,
     prompt_available_width,
@@ -318,6 +318,7 @@ def _materialize_merge_followups(
         return ([], [])
     return _create_or_reuse_followup_tasks(
         store,
+        config=config,
         review_task=review_task,
         impl_task=merge_subject,
         findings=findings,
@@ -430,6 +431,7 @@ def _materialize_merge_deferred_blockers(
         return ([], [])
     return _create_or_reuse_deferred_blocker_tasks(
         store,
+        config=config,
         review_task=decision.review_task,
         impl_task=merge_subject,
         findings=decision.blockers,
@@ -2530,11 +2532,15 @@ def cmd_rebase(args: argparse.Namespace) -> int:
                 task_id,
                 task.branch,
                 task_target,
+                config=config,
                 trigger_source="manual",
             )
         except DuplicateActiveChildError as exc:
             permit.release()
             return phase1_error(args, format_duplicate_rebase_message(exc, parent_task_id=task_id))
+        except ConfigError as exc:
+            permit.release()
+            return phase1_error(args, str(exc))
         prepared_rebase_task = _prepare_task_for_immediate_execution(
             config,
             rebase_task,
@@ -2563,10 +2569,13 @@ def cmd_rebase(args: argparse.Namespace) -> int:
             task_id,
             task.branch,
             task_target,
+            config=config,
             trigger_source="manual",
         )
     except DuplicateActiveChildError as exc:
         return phase1_error(args, format_duplicate_rebase_message(exc, parent_task_id=task_id))
+    except ConfigError as exc:
+        return phase1_error(args, str(exc))
     assert rebase_task.id is not None
     rebase_task.branch = task.branch
     store.update(rebase_task)
@@ -3105,6 +3114,7 @@ def _cmd_advance_unimplemented(
         if dry_run:
             print(f"[dry-run] Would create implement task for {task.task_type} {task.id}")
             continue
+        config.require_model_for_task("implement")
         prompt_text = _unimplemented_implement_prompt(task)
         impl_task = store.add(
             prompt=prompt_text,
@@ -3157,6 +3167,7 @@ def _prepare_create_review_action(
     store: SqliteTaskStore,
     task: DbTask,
     *,
+    config: Config | None = None,
     trigger_source: str,
 ) -> _CreateReviewActionResult:
     """Create or resolve the review task for an advance-style create_review action."""
@@ -3175,7 +3186,16 @@ def _prepare_create_review_action(
             review_target = resolved_impl
 
     try:
-        review_task = _create_review_task(store, review_target, trigger_source=trigger_source)
+        if config is not None:
+            config.require_model_for_task("review")
+            review_task = _create_review_task(
+                store,
+                review_target,
+                config=config,
+                trigger_source=trigger_source,
+            )
+        else:
+            review_task = _create_review_task(store, review_target, trigger_source=trigger_source)
     except DuplicateReviewError as exc:
         review_task = exc.active_review
         return _CreateReviewActionResult(
@@ -3244,6 +3264,7 @@ def _isolated_merge_checkout_unavailable_result() -> _MergeActionResult:
 def _materialize_merge_followup_side_effects(
     store: SqliteTaskStore,
     *,
+    config: Config,
     merge_subject: DbTask,
     review_task: DbTask | None,
     followup_findings: tuple[ReviewFinding, ...],
@@ -3252,6 +3273,7 @@ def _materialize_merge_followup_side_effects(
         return [], []
     return _create_or_reuse_followup_tasks(
         store,
+        config=config,
         review_task=review_task,
         impl_task=merge_subject,
         findings=followup_findings,
@@ -3271,6 +3293,7 @@ def _finalize_staged_isolated_merge_action(
     assert staged.merge_subject.id is not None
     created_followups, reused_followups = _materialize_merge_followup_side_effects(
         store,
+        config=config,
         merge_subject=staged.merge_subject,
         review_task=staged.review_task,
         followup_findings=staged.followup_findings,
@@ -3674,6 +3697,7 @@ def _execute_merge_action(
     elif rc == 0:
         created_followups, reused_followups = _materialize_merge_followup_side_effects(
             store,
+            config=config,
             merge_subject=merge_subject,
             review_task=review_task,
             followup_findings=followup_findings,
@@ -4082,6 +4106,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             def _create_rebase_from_task(parent_task: DbTask) -> DbTask:
                 assert parent_task.id is not None
                 assert parent_task.branch is not None
+                config.require_model_for_task("rebase")
                 return _create_rebase_task(
                     store,
                     parent_task.id,
@@ -4093,6 +4118,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             def _create_targeted_rebase_from_task(parent_task: DbTask, rebase_target: str) -> DbTask:
                 assert parent_task.id is not None
                 assert parent_task.branch is not None
+                config.require_model_for_task("rebase")
                 return _create_rebase_task(
                     store,
                     parent_task.id,
@@ -4105,15 +4131,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 return _create_implementation_task_from_source(
                     store,
                     parent_task,
+                    config=config,
                     prompt=_unimplemented_implement_prompt(parent_task),
                     trigger_source="manual",
                 )
 
             def _create_plan_review_from_task(parent_task: DbTask) -> DbTask:
-                return _create_plan_review_task(store, parent_task, trigger_source="manual")
+                return _create_plan_review_task(store, parent_task, config=config, trigger_source="manual")
 
             def _create_plan_improve_from_task(parent_task: DbTask, review_task: DbTask) -> DbTask:
-                return _create_plan_improve_task(store, parent_task, review_task, trigger_source="manual")
+                return _create_plan_improve_task(store, parent_task, review_task, config=config, trigger_source="manual")
 
             def _create_review_adjudication_from_task(
                 impl_task: DbTask,
@@ -4126,6 +4153,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     impl_task,
                     review_task,
                     finding,
+                    config=config,
                     dispute_metadata=dispute_metadata,
                     trigger_source="manual",
                 )
@@ -4148,9 +4176,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     task,
                     rollback_on_failure=rollback_on_failure,
                 ),
-                prepare_create_review=lambda t: _prepare_create_review_action(store, t, trigger_source="manual"),
-                create_resume_task=lambda t: _create_resume_task(store, t, trigger_source="manual"),
-                create_retry_task=lambda t: _create_retry_task(store, t, trigger_source="manual"),
+                prepare_create_review=lambda t: _prepare_create_review_action(
+                    store,
+                    t,
+                    config=config,
+                    trigger_source="manual",
+                ),
+                create_resume_task=lambda t: _create_resume_task(store, t, config=config, trigger_source="manual"),
+                create_retry_task=lambda t: _create_retry_task(store, t, config=config, trigger_source="manual"),
                 create_rebase_task=_create_rebase_from_task,
                 create_implement_task=_create_implement_from_task,
                 create_plan_review_task=_create_plan_review_from_task,

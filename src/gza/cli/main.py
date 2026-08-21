@@ -1703,7 +1703,7 @@ def main() -> int:
     # preflight command
     preflight_parser = subparsers.add_parser(
         "preflight",
-        help="Live sanity-check: send a trivial prompt to each resolved provider/model and report pass/fail",
+        help="Live sanity-check concrete provider/model routes; missing models fail before provider setup",
     )
     preflight_parser.add_argument(
         "--provider",

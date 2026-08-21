@@ -294,6 +294,8 @@ def _run_learnings_task(
     try:
         permit = launch_permit(config, store, current_pid=os.getpid())
         try:
+            if config.provider:
+                config.require_model_for_task("internal")
             learn_task = store.add(
                 prompt=prompt,
                 task_type="internal",

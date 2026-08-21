@@ -334,6 +334,7 @@ def _followup_task_blueprint(
 
 
 def _create_followup_task(
+    config: Config,
     store: SqliteTaskStore,
     finding: BehaviorMonitorFinding,
     *,
@@ -347,6 +348,7 @@ def _create_followup_task(
         recurrence_prior_task_id=recurrence_prior_task_id,
         recurrence_generation=recurrence_generation,
     )
+    config.require_model_for_task(task_type)
     return store.add(
         prompt=prompt,
         task_type=task_type,
@@ -364,6 +366,7 @@ def _run_behavior_check_task(
 ) -> tuple[str, str, str]:
     from . import runner as runner_mod
 
+    config.require_model_for_task("internal")
     check_task = store.add(
         prompt=_build_monitor_task_prompt(check_timeout_seconds=check_timeout_seconds),
         task_type="internal",
@@ -496,6 +499,7 @@ def run_behavior_monitor_cycle(
                 new_task_ids.append(f"dry-run:{finding.assertion_id}")
                 continue
             task = _create_followup_task(
+                config,
                 store,
                 finding,
                 filing_tag=filing_tag,

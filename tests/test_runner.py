@@ -2008,12 +2008,12 @@ class TestReviewContextFromChain:
         worktree_project_dir.mkdir(parents=True)
         worktree_sibling_dir.mkdir(parents=True)
         worktree_skipped_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-        (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
-        (skipped_dir / "gza.yaml").write_text("project_name: baz\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-        (worktree_sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
-        (worktree_skipped_dir / "gza.yaml").write_text("project_name: baz\n")
+        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
+        (skipped_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (worktree_sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
+        (worktree_skipped_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\n")
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -2091,11 +2091,11 @@ class TestReviewContextFromChain:
         worktree_project_dir = worktree_path / "server"
         project_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
-        (repo_root / "gza.yaml").write_text("project_name: gza\nverify_command: ./bin/root-verify\n")
-        (project_dir / "gza.yaml").write_text("project_name: server\nverify_command: ./bin/server-verify\n")
-        (worktree_path / "gza.yaml").write_text("project_name: gza\nverify_command: ./bin/root-verify\n")
+        (repo_root / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n")
+        (project_dir / "gza.yaml").write_text("project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n")
+        (worktree_path / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/root-verify\n")
         (worktree_project_dir / "gza.yaml").write_text(
-            "project_name: server\nverify_command: ./bin/server-verify\n"
+            "project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n"
         )
 
         config = Config(
@@ -2158,10 +2158,10 @@ class TestReviewContextFromChain:
         worktree_project_dir = worktree_path / "server"
         project_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
-        (repo_root / "gza.yaml").write_text("project_name: gza\n")
-        (project_dir / "gza.yaml").write_text("project_name: server\nverify_command: ./bin/server-verify\n")
-        (worktree_path / "gza.yaml").write_text("project_name: gza\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: server\nverify_command: ./bin/server-verify\n")
+        (repo_root / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\n")
+        (project_dir / "gza.yaml").write_text("project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n")
+        (worktree_path / "gza.yaml").write_text("project_name: gza\nprovider: codex\nmodel: gpt-5.5\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: server\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/server-verify\n")
 
         config = Config(
             project_dir=project_dir,
@@ -2225,12 +2225,12 @@ class TestReviewContextFromChain:
         worktree_project_dir.mkdir(parents=True)
         worktree_sibling_dir.mkdir(parents=True)
         worktree_unavailable_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-        (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
-        (unavailable_dir / "gza.yaml").write_text("project_name: baz\nverify_command: ./bin/baz-verify\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-        (worktree_sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
-        (worktree_unavailable_dir / "gza.yaml").write_text("project_name: baz\nverify_command: ./bin/baz-verify\n")
+        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
+        (unavailable_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/baz-verify\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (worktree_sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
+        (worktree_unavailable_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/baz-verify\n")
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -2309,10 +2309,10 @@ class TestReviewContextFromChain:
         skipped_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
         worktree_skipped_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-        (skipped_dir / "gza.yaml").write_text("project_name: baz\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-        (worktree_skipped_dir / "gza.yaml").write_text("project_name: baz\n")
+        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (skipped_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (worktree_skipped_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\n")
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -2371,8 +2371,8 @@ class TestReviewContextFromChain:
         worktree_project_dir = worktree_path / "services" / "foo"
         project_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
+        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -2435,10 +2435,10 @@ class TestReviewContextFromChain:
         sibling_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
         worktree_sibling_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-        (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify-old\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-        (worktree_sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify-new\n")
+        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify-old\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (worktree_sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify-new\n")
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -2488,9 +2488,9 @@ class TestReviewContextFromChain:
         project_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
         worktree_branch_local_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-        (worktree_branch_local_dir / "gza.yaml").write_text("project_name: dre-web\nverify_command: ./bin/web-verify\n")
+        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (worktree_branch_local_dir / "gza.yaml").write_text("project_name: dre-web\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/web-verify\n")
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="")
         config._project_boundary_cache = ProjectBoundary(
@@ -2544,11 +2544,11 @@ class TestReviewContextFromChain:
         old_dir.mkdir(parents=True)
         renamed_dir.mkdir(parents=True)
         worktree_project_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-        (copied_dir / "gza.yaml").write_text("project_name: copied\nverify_command: ./bin/copied-verify\n")
-        (old_dir / "gza.yaml").write_text("project_name: old\nverify_command: ./bin/old-verify\n")
-        (renamed_dir / "gza.yaml").write_text("project_name: renamed\nverify_command: ./bin/renamed-verify\n")
+        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+        (copied_dir / "gza.yaml").write_text("project_name: copied\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/copied-verify\n")
+        (old_dir / "gza.yaml").write_text("project_name: old\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/old-verify\n")
+        (renamed_dir / "gza.yaml").write_text("project_name: renamed\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/renamed-verify\n")
 
         config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
         config._project_boundary_cache = ProjectBoundary(
@@ -6770,6 +6770,7 @@ class TestFailureReasonGroundTruth:
         (tmp_path / "gza.yaml").write_text(
             "project_name: test\n"
             "provider: claude\n"
+            "model: claude-sonnet-4\n"
             "timeout_minutes: 10\n"
             "task_types:\n"
             "  implement:\n"
@@ -7537,7 +7538,7 @@ class TestResumeVerificationPrompt:
         config.branch_strategy.pattern = "{project}/{task_id}"
         config.branch_strategy.default_type = "feature"
         config.get_provider_for_task.return_value = "claude"
-        config.get_model_for_task.return_value = None
+        config.get_model_for_task.return_value = "claude-sonnet-4-6"
         config.get_max_steps_for_task.return_value = 50
         config.learnings_interval = 0
         config.learnings_window = 25
@@ -8713,7 +8714,7 @@ class TestNoChangesWithExistingCommits:
         config.branch_strategy.pattern = "{project}/{task_id}"
         config.branch_strategy.default_type = "feature"
         config.get_provider_for_task.return_value = "claude"
-        config.get_model_for_task.return_value = None
+        config.get_model_for_task.return_value = "claude-sonnet-4-6"
         config.get_max_steps_for_task.return_value = 50
         config.learnings_interval = 0
         config.learnings_window = 25
@@ -8883,7 +8884,7 @@ class TestTaskClaimSafety:
         config.branch_strategy.pattern = "{project}/{task_id}"
         config.branch_strategy.default_type = "feature"
         config.get_provider_for_task.return_value = "claude"
-        config.get_model_for_task.return_value = None
+        config.get_model_for_task.return_value = "claude-sonnet-4-6"
         config.get_max_steps_for_task.return_value = 50
         return config
 
@@ -9477,7 +9478,7 @@ class TestSameBranchLineageWalk:
         config.branch_strategy.pattern = "{project}/{task_id}"
         config.branch_strategy.default_type = "feature"
         config.get_provider_for_task.return_value = "claude"
-        config.get_model_for_task.return_value = None
+        config.get_model_for_task.return_value = "claude-sonnet-4-6"
         config.get_max_steps_for_task.return_value = 50
         config.learnings_interval = 0
         config.learnings_window = 25
@@ -14044,7 +14045,7 @@ class TestExtractedRunInnerHelpers:
         store.update(improve)
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
             "verify_command: uv run pytest tests/ -q\n",
             encoding="utf-8",
         )
@@ -14202,7 +14203,7 @@ class TestExtractedRunInnerHelpers:
         store.update(improve)
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
             "verify_command: uv run pytest tests/ -q\n",
             encoding="utf-8",
         )
@@ -14321,7 +14322,7 @@ class TestExtractedRunInnerHelpers:
         store.update(improve)
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
             "verify_command: uv run pytest tests/ -q\n",
             encoding="utf-8",
         )
@@ -14430,7 +14431,7 @@ class TestExtractedRunInnerHelpers:
         store.update(improve)
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
             "verify_command: uv run pytest tests/ -q\n",
             encoding="utf-8",
         )
@@ -14897,7 +14898,7 @@ class TestExtractedRunInnerHelpers:
         store.update(improve)
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
             "verify_command: uv run pytest tests/ -q\n",
             encoding="utf-8",
         )
@@ -15203,7 +15204,7 @@ class TestExtractedRunInnerHelpers:
 
     def test_run_uses_persisted_create_pr_intent_without_work_flag(self, tmp_path: Path):
         """Stored task create_pr intent should drive the runner even without `work --pr`."""
-        (tmp_path / "gza.yaml").write_text("project_name: testproject\n")
+        (tmp_path / "gza.yaml").write_text("project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n")
         config = Config.load(tmp_path)
         store = SqliteTaskStore(config.db_path)
         task = store.add(prompt="Implement with persisted PR intent", task_type="implement", create_pr=True)
@@ -16347,7 +16348,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_can_retry_pr_required_failure_via_work_pr(self, tmp_path: Path):
         """`gza work <task> --pr` should recover failed PR_REQUIRED tasks without rerunning provider."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
         )
@@ -16380,7 +16381,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_work_pr_branchless_pr_required_does_not_rewrite_fresh_pr_required(self, tmp_path: Path):
         """Legacy branchless PR_REQUIRED rows should not be re-failed through the compatibility retry path."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
         )
@@ -16407,7 +16408,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_can_retry_pr_required_failure_via_persisted_create_pr(self, tmp_path: Path):
         """Stored create_pr intent should recover failed PR_REQUIRED tasks without needing `work --pr`."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
         )
@@ -16450,7 +16451,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_pr_required_retry_for_improve_resolves_parent_comments(self, tmp_path: Path):
         """Improve completion should resolve only unresolved feedback comments on the root implementation task."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
         )
@@ -16501,7 +16502,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_pr_required_retry_for_improve_only_resolves_comments_in_snapshot(self, tmp_path: Path):
         """Improve completion should leave comments added after improve creation unresolved."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
         )
@@ -16552,7 +16553,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_pr_required_retry_for_chained_improve_updates_root_implementation_state(self, tmp_path: Path):
         """PR-required improve retries should apply completion side effects to the implementation root."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
         )
@@ -16623,7 +16624,7 @@ class TestExtractedRunInnerHelpers:
     def test_run_pr_required_retry_for_rebase_treats_published_head_as_pr_only_retry(self, tmp_path: Path):
         """A published rebase PR retry should skip the stale non-advancing baseline path."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
         )
@@ -16915,7 +16916,7 @@ class TestExtractedRunInnerHelpers:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n"
@@ -17023,7 +17024,7 @@ class TestExtractedRunInnerHelpers:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n"
@@ -17136,7 +17137,7 @@ class TestExtractedRunInnerHelpers:
     ) -> None:
         """Rebase PR retries must fail before completion-side state if publication fails."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
         )
@@ -17231,7 +17232,7 @@ class TestExtractedRunInnerHelpers:
     ) -> None:
         """PR-required rebase retries should publish before re-running PR setup."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
         )
@@ -17315,7 +17316,7 @@ class TestExtractedRunInnerHelpers:
     ) -> None:
         """Rebase PR retries must fail before completion-side state if publication lookup fails."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
         )
@@ -17419,7 +17420,7 @@ class TestExtractedRunInnerHelpers:
     ) -> None:
         """Resumed runner rebases must capture a recovered baseline for fail-closed diff classification."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n"
@@ -17507,7 +17508,7 @@ class TestExtractedRunInnerHelpers:
     ) -> None:
         """Automatic retry recovery rebase children must also fail closed."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n"
@@ -17605,7 +17606,7 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n"
@@ -17686,7 +17687,7 @@ class TestExtractedRunInnerHelpers:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n"
@@ -17732,7 +17733,7 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -17862,7 +17863,7 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -17962,7 +17963,7 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -18065,7 +18066,7 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -18135,7 +18136,7 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -18225,7 +18226,7 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -18290,7 +18291,7 @@ class TestExtractedRunInnerHelpers:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -18404,7 +18405,7 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -18556,7 +18557,7 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -18672,7 +18673,7 @@ class TestExtractedRunInnerHelpers:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -18782,7 +18783,7 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -18905,7 +18906,7 @@ class TestExtractedRunInnerHelpers:
         tmp_path: Path,
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -19024,7 +19025,7 @@ class TestExtractedRunInnerHelpers:
         import_error: GitError,
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -19458,7 +19459,7 @@ class TestExtractedRunInnerHelpers:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: true\n"
@@ -19987,7 +19988,7 @@ class TestExceptionHandlerMarkFailed:
     def test_code_task_worktree_setup_failure_writes_ops_outcome(self, tmp_path: Path):
         """Code-task worktree setup failures should leave a canonical ops outcome."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n"
@@ -20044,7 +20045,7 @@ class TestExceptionHandlerMarkFailed:
     def test_code_task_empty_workspace_fails_before_provider_run_and_is_retryable_infra(self, tmp_path: Path) -> None:
         """An unpopulated prepared workspace must abort before any provider turn."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n",
@@ -20116,7 +20117,7 @@ class TestExceptionHandlerMarkFailed:
     def test_code_task_workspace_probe_ignores_extra_source_marker_candidates(self, tmp_path: Path) -> None:
         """Extra marker-looking files in the source checkout must not fail a populated worktree."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n",
@@ -20169,7 +20170,7 @@ class TestExceptionHandlerMarkFailed:
     def test_non_code_empty_workspace_fails_before_provider_run_and_is_retryable_infra(self, tmp_path: Path) -> None:
         """A non-code detached worktree must abort before prompt staging or provider execution."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n",
@@ -20242,7 +20243,7 @@ class TestExceptionHandlerMarkFailed:
     def test_non_code_workspace_probe_ignores_extra_source_marker_candidates(self, tmp_path: Path) -> None:
         """Detached worktrees should continue when stable root markers prove population."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n",
@@ -20294,7 +20295,7 @@ class TestExceptionHandlerMarkFailed:
     def test_non_code_detached_worktree_git_error_writes_ops_outcome(self, tmp_path: Path):
         """Non-code setup GitError should be persisted before the task is marked failed."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n"
@@ -20338,7 +20339,7 @@ class TestExceptionHandlerMarkFailed:
     def test_run_records_structured_runner_startup_failure_before_execution(self, tmp_path: Path) -> None:
         """Direct runner startup failures should persist a structured startup_failure record."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n",
@@ -20407,7 +20408,7 @@ class TestExceptionHandlerMarkFailed:
     def test_run_records_structured_workspace_setup_failure_before_execution(self, tmp_path: Path) -> None:
         """Workspace setup GitErrors should preserve structured startup-failure fields."""
         (tmp_path / "gza.yaml").write_text(
-            "project_name: testproject\n"
+            "project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "use_docker: false\n",
@@ -20762,7 +20763,7 @@ class TestDependencyMergePrecondition:
         config.branch_strategy.pattern = "{project}/{task_id}"
         config.branch_strategy.default_type = "feature"
         config.get_provider_for_task.return_value = "claude"
-        config.get_model_for_task.return_value = None
+        config.get_model_for_task.return_value = "claude-sonnet-4-6"
         config.get_max_steps_for_task.return_value = 50
         config.learnings_interval = 0
         config.learnings_window = 25
@@ -21352,7 +21353,7 @@ class TestRunnerStoreMetadata:
         project_dir.mkdir(parents=True, exist_ok=True)
         db_path = project_dir / "shared.db"
         (project_dir / "gza.yaml").write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: alphaproject01\n"
             "project_prefix: gza\n"
             f"db_path: {db_path}\n",
@@ -24221,7 +24222,7 @@ class TestProviderPromptSanitization:
         config.branch_strategy.pattern = "{project}/{task_id}"
         config.branch_strategy.default_type = "feature"
         config.get_provider_for_task.return_value = "claude"
-        config.get_model_for_task.return_value = None
+        config.get_model_for_task.return_value = "claude-sonnet-4-6"
         config.get_max_steps_for_task.return_value = 50
         config.learnings_interval = 0
         config.learnings_window = 25
@@ -24317,7 +24318,7 @@ class TestProviderPromptSanitization:
         config.branch_strategy.pattern = "{project}/{task_id}"
         config.branch_strategy.default_type = "feature"
         config.get_provider_for_task.return_value = "claude"
-        config.get_model_for_task.return_value = None
+        config.get_model_for_task.return_value = "claude-sonnet-4-6"
         config.get_max_steps_for_task.return_value = 50
         config.learnings_interval = 0
         config.learnings_window = 25
@@ -24424,7 +24425,7 @@ class TestProviderModelParityGate:
         config.branch_strategy.pattern = "{project}/{task_id}"
         config.branch_strategy.default_type = "feature"
         config.get_provider_for_task.return_value = "claude"
-        config.get_model_for_task.return_value = None
+        config.get_model_for_task.return_value = "claude-sonnet-4-6"
         config.get_max_steps_for_task.return_value = 50
         return config
 
@@ -24792,14 +24793,14 @@ def test_publication_recovery_cross_project_diff_scope_comes_from_worktree_head(
 ) -> None:
     (tmp_path / "services" / "foo").mkdir(parents=True)
     (tmp_path / "libs" / "bar").mkdir(parents=True)
-    (tmp_path / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-    (tmp_path / "libs" / "bar" / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+    (tmp_path / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+    (tmp_path / "libs" / "bar" / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
     store, config, impl, verify_fix, verify_epoch = _timeout_verify_fix_fixture(tmp_path, cross_project=True)
     worktree_path = config.worktree_path / verify_fix.slug
     (worktree_path / "services" / "foo").mkdir(parents=True, exist_ok=True)
     (worktree_path / "libs" / "bar").mkdir(parents=True, exist_ok=True)
-    (worktree_path / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nverify_command: ./bin/foo-verify\n")
-    (worktree_path / "libs" / "bar" / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
+    (worktree_path / "services" / "foo" / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
+    (worktree_path / "libs" / "bar" / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
 
     canonical_git = Mock(spec=Git)
     canonical_git.default_branch.return_value = "main"

@@ -114,7 +114,7 @@ class TestHelpOutput:
         user_config.write_text(f"db_path: {shared_db}\n", encoding="utf-8")
 
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: demo\n", encoding="utf-8")
+        config_path.write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n", encoding="utf-8")
         legacy_store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix="demo")
         legacy_store.add("legacy task")
 
@@ -137,7 +137,7 @@ class TestHelpOutput:
         user_config.write_text(f"db_path: {shared_db}\n", encoding="utf-8")
 
         config_path = tmp_path / "gza.yaml"
-        config_path.write_text("project_name: demo\n", encoding="utf-8")
+        config_path.write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n", encoding="utf-8")
         legacy_store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix="demo")
         legacy_store.add("legacy task")
 
@@ -160,7 +160,7 @@ class TestHelpOutput:
         shared_db = tmp_path / "shared" / "gza.db"
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             f"db_path: {shared_db}\n",
             encoding="utf-8",
         )
@@ -188,7 +188,7 @@ class TestHelpOutput:
         shared_db = tmp_path / "shared" / "gza.db"
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(
-            "project_name: demo\n"
+            "project_name: demo\nprovider: codex\nmodel: gpt-5.5\n"
             f"db_path: {shared_db}\n",
             encoding="utf-8",
         )
@@ -2241,7 +2241,7 @@ class TestIterateBackgroundForceDispatch:
         from gza.cli.main import main
 
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
             "project_id: default\n"
             "db_path: .gza/gza.db\n"
             "iterate_max_iterations: 6\n"

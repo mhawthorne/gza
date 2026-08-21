@@ -224,6 +224,8 @@ class TestPromptBuilderBuild:
         config = Config(
             project_dir=tmp_path,
             project_name="test-project",
+            provider="codex",
+            model="gpt-5.5",
             verify_command="./bin/tests",
             autonomous_verify_timeout_seconds=120,
             review_verify_timeout_grace_seconds=5.0,
@@ -309,6 +311,8 @@ class TestPromptBuilderBuild:
         config = Config(
             project_dir=tmp_path,
             project_name="test-project",
+            provider="codex",
+            model="gpt-5.5",
             verify_command="set -e\n./bin/tests",
             autonomous_verify_timeout_seconds=300,
             review_verify_timeout_grace_seconds=5.0,
@@ -389,6 +393,8 @@ class TestPromptBuilderBuild:
         config = Config(
             project_dir=tmp_path,
             project_name="test-project",
+            provider="codex",
+            model="gpt-5.5",
             verify_command="./bin/tests",
             autonomous_verify_timeout_seconds=120,
             review_verify_timeout_grace_seconds=5.0,
@@ -1517,6 +1523,8 @@ class TestVerifyCommandConfig:
         config_file = tmp_path / "gza.yaml"
         config_file.write_text(
             "project_name: testproject\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "verify_command: 'uv run pytest tests/'\n"
         )
 
@@ -1528,7 +1536,7 @@ class TestVerifyCommandConfig:
         from gza.config import Config
 
         config_file = tmp_path / "gza.yaml"
-        config_file.write_text("project_name: testproject\n")
+        config_file.write_text("project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n")
 
         config = Config.load(tmp_path)
         assert config.verify_command == ""
@@ -1540,6 +1548,8 @@ class TestVerifyCommandConfig:
         config_file = tmp_path / "gza.yaml"
         config_file.write_text(
             "project_name: testproject\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "verify_command: 42\n"
         )
 
@@ -1554,6 +1564,8 @@ class TestVerifyCommandConfig:
         config_file = tmp_path / "gza.yaml"
         config_file.write_text(
             "project_name: testproject\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "verify_command: 42\n"
         )
 
@@ -1567,6 +1579,8 @@ class TestVerifyCommandConfig:
         config_file = tmp_path / "gza.yaml"
         config_file.write_text(
             "project_name: testproject\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "verify_command: 'uv run mypy src/'\n"
         )
 
@@ -1581,6 +1595,8 @@ class TestVerifyCommandConfig:
         config_file = tmp_path / "gza.yaml"
         config_file.write_text(
             "project_name: testproject\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "inner_verify_command: './bin/tests --quick'\n"
         )
 
@@ -1594,6 +1610,8 @@ class TestVerifyCommandConfig:
         config_file = tmp_path / "gza.yaml"
         config_file.write_text(
             "project_name: testproject\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "unit_verify_command: './bin/test-unit --summary -- tests/ -n 2 --dist loadscope'\n"
         )
 
@@ -1607,6 +1625,8 @@ class TestVerifyCommandConfig:
         config_file = tmp_path / "gza.yaml"
         config_file.write_text(
             "project_name: testproject\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "unit_verify_command:\n"
             "  - bad\n"
         )
@@ -1621,6 +1641,8 @@ class TestVerifyCommandConfig:
         config_file = tmp_path / "gza.yaml"
         config_file.write_text(
             "project_name: testproject\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "inner_verify_command:\n"
             "  - bad\n"
         )
@@ -1639,6 +1661,8 @@ class TestReviewDiffThresholdConfig:
         config_file = tmp_path / "gza.yaml"
         config_file.write_text(
             "project_name: testproject\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "review_diff_small_threshold: 111\n"
             "review_diff_medium_threshold: 222\n"
             "review_context_file_limit: 7\n"
@@ -1659,7 +1683,7 @@ class TestReviewDiffThresholdConfig:
         )
 
         config_file = tmp_path / "gza.yaml"
-        config_file.write_text("project_name: testproject\n")
+        config_file.write_text("project_name: testproject\nprovider: codex\nmodel: gpt-5.5\n")
 
         config = Config.load(tmp_path)
         assert config.review_diff_small_threshold == DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
@@ -1753,10 +1777,10 @@ class TestVerifyCommandInjection:
         sibling_dir.mkdir(parents=True)
         skipped_dir.mkdir(parents=True)
         (project_dir / "gza.yaml").write_text(
-            "project_name: foo\nverify_command: ./bin/foo-verify\nunit_verify_command: ./bin/foo-unit\ninner_verify_command: ./bin/foo-quick\n"
+            "project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\nunit_verify_command: ./bin/foo-unit\ninner_verify_command: ./bin/foo-quick\n"
         )
-        (sibling_dir / "gza.yaml").write_text("project_name: bar\nverify_command: ./bin/bar-verify\n")
-        (skipped_dir / "gza.yaml").write_text("project_name: baz\n")
+        (sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
+        (skipped_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\n")
 
         config = Config(
             project_dir=project_dir,
@@ -1949,6 +1973,8 @@ class TestVerifyCommandInjection:
 
         (tmp_path / "gza.yaml").write_text(
             "project_name: testproject\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
             "verify_command: './bin/tests'\n"
             "unit_verify_command: './bin/test-unit --summary -- tests/ -n 2 --dist loadscope'\n"
         )

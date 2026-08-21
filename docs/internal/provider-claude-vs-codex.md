@@ -22,8 +22,9 @@ divergence is hidden behind the `Provider` interface.
 ## Provider selection
 
 - Config field: `provider` (top-level in `gza.yaml`)
-  - Default: `"claude"` (`DEFAULT_PROVIDER` at `src/gza/config.py:55`)
+  - Required per project; `DEFAULT_PROVIDER` is empty so missing declarations fail at config load
   - Allowed: `claude`, `codex`, `gemini`
+- Config field: `model` or `providers.<provider>.model` must also be declared for the active project provider. See [configuration.md](../configuration.md) for precedence and local/user override rules.
 - Per-task-type override: `task_providers.*` — looked up via
   `config.get_provider_for_task(task.task_type)` at `src/gza/runner.py:1060`
 - Per-invocation CLI flag: `--provider {claude|codex|gemini}` on `add`, `edit`,

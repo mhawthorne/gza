@@ -39,7 +39,7 @@ from ..concurrency import (
     release_task_launch_permit,
     reserve_task_launch_permit,
 )
-from ..config import DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS, Config
+from ..config import DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS, Config, ConfigError
 from ..console import console, prompt_available_width, shorten_prompt
 from ..db import (
     MERGE_SOURCE_WATCH,
@@ -125,6 +125,7 @@ from ..recovery_transients import (
     classify_transient_recovery_terminal,
     compute_transient_recovery_backoff_seconds,
 )
+from ..runner import require_execution_route_for_task
 from ..source_followup import collect_non_dropped_implement_source_ids
 from ..status_ops import apply_manual_task_status
 from ..sync_ops import reconcile_task_branch_merge_truth
@@ -995,6 +996,7 @@ def _queue_main_verify_remediation_task(
         return "queued"
     if task.status == "in_progress":
         return "live_untouched"
+    require_execution_route_for_task(task, config)
     attempt_limit = config.watch.main_verify_remediation_max_attempts
     previous_tags = tuple(task.tags or ())
     task.tags = desired_tags
@@ -1159,6 +1161,8 @@ def _ensure_main_verify_remediation_task(
         )
         desired_tags = _merge_main_verify_remediation_tags([merged_legacy_tags], tags)
         should_refresh_existing_metadata = existing.status != "in_progress"
+        if should_refresh_existing_metadata:
+            require_execution_route_for_task(existing, config)
         if should_refresh_existing_metadata and _main_verify_remediation_attempt_state_exhausted(
             attempt_state,
             attempt_limit=attempt_limit,
@@ -1220,6 +1224,7 @@ def _ensure_main_verify_remediation_task(
         )
         return _MainVerifyRemediationEnsureResult(task=None, outcome="exhausted")
 
+    config.require_model_for_task("implement")
     task = store.add(
         _main_verify_remediation_prompt(
             remediation,
@@ -3561,6 +3566,7 @@ def _queue_candidate_rework_task(
         break
     task = existing_match
     if task is None:
+        config.require_model_for_task("fix")
         task = store.add(
             desired_prompt,
             task_type="fix",
@@ -3571,6 +3577,7 @@ def _queue_candidate_rework_task(
             urgent=True,
         )
     else:
+        require_execution_route_for_task(task, config)
         task.prompt = desired_prompt
         task.tags = desired_tags
         if task.status != "in_progress":
@@ -7527,6 +7534,7 @@ def _run_cycle(
             parent_task.id,
             parent_task.branch,
             target_branch,
+            config=config,
             trigger_source="watch",
         )
 
@@ -7538,6 +7546,7 @@ def _run_cycle(
             parent_task.id,
             parent_task.branch,
             rebase_target,
+            config=config,
             trigger_source="watch",
         )
 
@@ -7545,15 +7554,16 @@ def _run_cycle(
         return _create_implementation_task_from_source(
             store,
             parent_task,
+            config=config,
             prompt=_unimplemented_implement_prompt(parent_task),
             trigger_source="watch",
         )
 
     def _create_plan_review_from_task(parent_task: DbTask) -> DbTask:
-        return _create_plan_review_task(store, parent_task, trigger_source="watch")
+        return _create_plan_review_task(store, parent_task, config=config, trigger_source="watch")
 
     def _create_plan_improve_from_task(parent_task: DbTask, review_task: DbTask) -> DbTask:
-        return _create_plan_improve_task(store, parent_task, review_task, trigger_source="watch")
+        return _create_plan_improve_task(store, parent_task, review_task, config=config, trigger_source="watch")
 
     def _create_review_adjudication_from_task(
         impl_task: DbTask,
@@ -7566,6 +7576,7 @@ def _run_cycle(
             impl_task,
             review_task,
             finding,
+            config=config,
             dispute_metadata=dispute_metadata,
             trigger_source="watch",
         )
@@ -7584,9 +7595,14 @@ def _run_cycle(
             task,
             rollback_on_failure=rollback_on_failure,
         ),
-        prepare_create_review=lambda t: _prepare_create_review_action(store, t, trigger_source="watch"),
-        create_resume_task=lambda t: _create_resume_task(store, t, trigger_source="watch"),
-        create_retry_task=lambda t: _create_retry_task(store, t, trigger_source="watch"),
+        prepare_create_review=lambda t: _prepare_create_review_action(
+            store,
+            t,
+            config=config,
+            trigger_source="watch",
+        ),
+        create_resume_task=lambda t: _create_resume_task(store, t, config=config, trigger_source="watch"),
+        create_retry_task=lambda t: _create_retry_task(store, t, config=config, trigger_source="watch"),
         create_rebase_task=_create_rebase_from_task,
         create_implement_task=_create_implement_from_task,
         create_plan_review_task=_create_plan_review_from_task,
@@ -9224,7 +9240,7 @@ def _run_cycle(
                         assert recovered_task is not None
                     else:
                         try:
-                            recovered_task = _create_resume_task(store, failed, trigger_source="watch")
+                            recovered_task = _create_resume_task(store, failed, config=config, trigger_source="watch")
                         except DuplicateActiveChildError as exc:
                             reserved_launch.release()
                             detail = format_duplicate_active_child_message(
@@ -9237,6 +9253,16 @@ def _run_cycle(
                                 "SKIP",
                                 f"{failed.id}: {detail}",
                                 dedupe_key=f"recovery-resume-duplicate:{failed.id}:{exc.active_child.id}",
+                            )
+                            continue
+                        except ConfigError as exc:
+                            reserved_launch.release()
+                            detail = str(exc)
+                            _observe_dispatch(row.owner_task.id, "launch_blocked", recovery_action_type, detail)
+                            log.emit(
+                                "SKIP",
+                                f"{failed.id}: {detail}",
+                                dedupe_key=f"recovery-resume-config:{failed.id}",
                             )
                             continue
                         except Exception:
@@ -9289,7 +9315,7 @@ def _run_cycle(
                         assert recovered_task is not None
                     else:
                         try:
-                            recovered_task = _create_resume_task(store, failed, trigger_source="watch")
+                            recovered_task = _create_resume_task(store, failed, config=config, trigger_source="watch")
                         except DuplicateActiveChildError as exc:
                             reserved_launch.release()
                             detail = format_duplicate_active_child_message(
@@ -9302,6 +9328,16 @@ def _run_cycle(
                                 "SKIP",
                                 f"{failed.id}: {detail}",
                                 dedupe_key=f"recovery-resume-duplicate:{failed.id}:{exc.active_child.id}:iterate",
+                            )
+                            continue
+                        except ConfigError as exc:
+                            reserved_launch.release()
+                            detail = str(exc)
+                            _observe_dispatch(row.owner_task.id, "launch_blocked", recovery_action_type, detail)
+                            log.emit(
+                                "SKIP",
+                                f"{failed.id}: {detail}",
+                                dedupe_key=f"recovery-resume-config:{failed.id}:iterate",
                             )
                             continue
                         except Exception:
@@ -9382,6 +9418,7 @@ def _run_cycle(
                         recovered_task = _create_retry_task(
                             store,
                             failed,
+                            config=config,
                             trigger_source="watch",
                             automatic_recovery=True,
                         )
@@ -9397,6 +9434,16 @@ def _run_cycle(
                             "SKIP",
                             f"{failed.id}: {detail}",
                             dedupe_key=f"recovery-retry-duplicate:{failed.id}:{exc.active_child.id}",
+                        )
+                        continue
+                    except ConfigError as exc:
+                        reserved_launch.release()
+                        detail = str(exc)
+                        _observe_dispatch(row.owner_task.id, "launch_blocked", recovery_action_type, detail)
+                        log.emit(
+                            "SKIP",
+                            f"{failed.id}: {detail}",
+                            dedupe_key=f"recovery-retry-config:{failed.id}",
                         )
                         continue
                     except Exception:

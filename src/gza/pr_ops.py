@@ -132,6 +132,8 @@ def _generate_pr_content(
 
         permit = launch_permit(config, store, current_pid=os.getpid())
         try:
+            if config.provider:
+                config.require_model_for_task("internal")
             internal_task = store.add(
                 prompt=prompt,
                 task_type="internal",

@@ -42,10 +42,10 @@ Gza reads configuration from three YAML layers:
 | `max_turns` | Integer | `50` | Legacy alias for `max_steps` |
 | `worktree_dir` | String | `/tmp/gza-worktrees` | Directory for git worktrees |
 | `work_count` | Integer | `1` | Number of tasks to run in a single work session |
-| `provider` | String | `claude` | AI provider: `claude` or `codex` |
+| `provider` | String | *(required)* | AI provider: `claude`, `codex`, or `gemini` |
 | `task_providers` | Dict | `{}` | Route task types to providers (e.g., `review: claude`) |
 | `providers` | Dict | `{}` | Provider-scoped model/task-type config (preferred) |
-| `model` | String | *(empty)* | Default model fallback (compatible) |
+| `model` | String | *(required unless provider/task-type scoped)* | Default model fallback (compatible) |
 | `reasoning_effort` | String | *(empty)* | Default reasoning effort fallback (Codex) |
 | `task_types` | Dict | `{}` | Task-type fallback configuration (compatible) |
 | `claude` | Dict | *(see below)* | Claude-specific configuration (see [Claude Configuration](#claude-configuration)) |
@@ -105,18 +105,21 @@ Use `gza.local.yaml` for machine-specific settings that should not be committed.
 - Merge behavior: deep merge for dictionaries, replace for scalars/lists
 - Precedence: `~/.gza/config.yaml` < `gza.yaml` < `gza.local.yaml` < `GZA_DB_PATH` (for `db_path`) < other env vars
 - Guardrails: only approved keys can be overridden in `gza.local.yaml`
+- Provider/model rule: project `gza.yaml` must declare `provider` and at least one nonblank project-side model source. Local overrides may refine an already-valid project declaration, but they do not make a project valid by themselves and must not erase the effective model for the active provider or a routed task provider.
+- Diagnostics: if `gza.local.yaml` clears the effective model or redirects `provider`/`task_providers.<type>` to a family without a compatible model, the error names `gza.local.yaml` and the overriding key to remove or correct, including scoped keys such as `providers.<provider>.model` or `providers.<provider>.task_types.<type>.model`. Missing project declarations still point to `gza.yaml`.
 
 ### User Defaults (`~/.gza/config.yaml`)
 
 Use `~/.gza/config.yaml` for per-user defaults that should apply to every Gza project on the machine.
 
 - Merge behavior: deep merge for dictionaries, replace for scalars/lists
-- Purpose: machine-wide defaults such as shared DB location, provider/model defaults, Docker settings, watch/tmux defaults, and UI preferences
+- Purpose: machine-wide defaults such as shared DB location, Docker settings, watch/tmux defaults, UI preferences, and provider/model overrides for projects that already declare provider/model in `gza.yaml`
 - Project discovery: unsupported. `~/.gza/config.yaml` does not replace `gza.yaml`, and it cannot supply `project_name`.
+- Provider/model rule: `~/.gza/config.yaml` cannot satisfy the required project provider/model declaration. Put `provider` and a model source (`model`, `providers.<provider>.model`, or a covered task-type model) in project `gza.yaml`; user defaults may only override that already-valid project contract.
 - Validation: invalid or unknown keys are hard errors because this file affects every project on the machine
 
 Allowed keys:
-`db_path`, `use_docker`, `docker_startup_timeout`, `enforce_project_scope`, `default_cross_project`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `unit_verify_command`, `inner_verify_command`, `watch`, `behavior_monitor`, `spec_coherence`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_failed_plan_review_retries`, `max_noop_improve_cycles`, `advance_off_topic_verify_unblock`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `quiet_period_seconds`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `autonomous_verify_timeout_seconds`, `review_verify_timeout_grace_seconds`, `main_integration_verify_red_ttl_minutes`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`
+`db_path`, `use_docker`, `docker_startup_timeout`, `enforce_project_scope`, `default_cross_project`, `docker_image`, `docker_volumes`, `docker_setup_command`, `timeout_minutes`, `max_steps`, `max_turns`, `worktree_dir`, `work_count`, `interactive_worktree_dir`, `provider`, `task_providers`, `model`, `reasoning_effort`, `defaults`, `task_types`, `providers`, `claude`, `tmux`, `chat_text_display_length`, `verify_command`, `unit_verify_command`, `inner_verify_command`, `watch`, `behavior_monitor`, `spec_coherence`, `iterate_max_iterations`, `advance_create_reviews`, `advance_create_plan_reviews`, `require_review_before_merge`, `require_plan_review_before_implement`, `pr_integration`, `max_resume_attempts`, `max_review_cycles`, `max_plan_review_cycles`, `max_failed_plan_review_retries`, `max_noop_improve_cycles`, `advance_off_topic_verify_unblock`, `max_plan_slices`, `plan_slice_target_timeout_minutes`, `main_checkout_isolate`, `merge_squash_threshold`, `cleanup_days`, `quiet_period_seconds`, `review_diff_small_threshold`, `review_diff_medium_threshold`, `review_context_file_limit`, `autonomous_verify_timeout_seconds`, `review_verify_timeout_grace_seconds`, `main_integration_verify_red_ttl_minutes`, `code_task_diff_timeout_medium_threshold`, `code_task_diff_timeout_large_threshold`, `code_task_diff_timeout_medium_minutes`, `code_task_diff_timeout_large_minutes`, `code_task_diff_timeout_cap_minutes`, `recommend_rebase_behind_commits` (deprecated no-op), `learnings_window`, `learnings_interval`, `learnings_max_items`, `theme`, `no_color`, `colors`. Provider/model keys are allowed here only as overrides for projects that already satisfy the project `gza.yaml` provider/model requirement.
 
 Disallowed keys:
 `project_name`, `project_id`, `project_prefix`, `tasks_file`, `log_dir`, `branch_strategy`, `branch_mode`
@@ -462,7 +465,7 @@ Model selection:
 3. `providers.<effective_provider>.model`
 4. `task_types.<task_type>.model` (legacy fallback)
 5. `model` / `defaults.model` (legacy fallback)
-6. Provider runtime default (if no model resolved)
+6. Missing model is a configuration error; gza does not delegate to provider runtime defaults
 
 Reasoning effort selection:
 1. `providers.<effective_provider>.task_types.<task_type>.reasoning_effort`
@@ -519,14 +522,15 @@ Gza supports multiple AI providers for task execution:
 
 | Provider | Status | Description |
 |----------|--------|-------------|
-| `claude` | **Supported** | Claude Code CLI (default) |
+| `claude` | **Supported** | Claude Code CLI |
 | `codex` | **Supported** | OpenAI Codex CLI |
+| `gemini` | **Supported** | Gemini CLI |
 
-Set your provider in `gza.yaml`:
+Set your provider and model in `gza.yaml`:
 
 ```yaml
 provider: claude
-model: claude-sonnet-4-5  # optional: override the default model
+model: claude-sonnet-4-5
 reasoning_effort: medium  # optional: Codex reasoning effort override
 ```
 

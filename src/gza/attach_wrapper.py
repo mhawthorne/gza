@@ -19,7 +19,7 @@ from .cli._common import (
     get_store,
 )
 from .cli.execution import _spawn_background_iterate
-from .config import Config
+from .config import Config, ConfigError
 from .providers.base import build_docker_cmd, ensure_docker_image
 from .providers.claude import _get_docker_config, sync_keychain_credentials
 from .recovery_engine import decide_failed_task_recovery
@@ -141,7 +141,13 @@ class _AttachHandoffTarget:
     recovery_task_freshly_created: bool = False
 
 
-def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget | None:
+@dataclass(frozen=True)
+class _AttachHandoffError:
+    message: str
+    resume_mode: bool
+
+
+def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget | _AttachHandoffError | None:
     """Resolve the task/flags to relaunch after interactive attach exits."""
     if task.id is None:
         return None
@@ -168,7 +174,10 @@ def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget
                 resume_task_id = decision.recovery_task_id
                 freshly_created = False
             else:
-                resume_task = _create_resume_task(store, task, trigger_source="auto-recovery")
+                try:
+                    resume_task = _create_resume_task(store, task, config=config, trigger_source="auto-recovery")
+                except ConfigError as exc:
+                    return _AttachHandoffError(str(exc), resume_mode=True)
                 assert resume_task.id is not None
                 resume_task_id = str(resume_task.id)
                 freshly_created = True
@@ -186,7 +195,10 @@ def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget
                 resume_mode=True,
                 launch_mode="worker",
             )
-        resume_task = _create_resume_task(store, task, trigger_source="auto-recovery")
+        try:
+            resume_task = _create_resume_task(store, task, config=config, trigger_source="auto-recovery")
+        except ConfigError as exc:
+            return _AttachHandoffError(str(exc), resume_mode=True)
         assert resume_task.id is not None
         return _AttachHandoffTarget(
             task_id=str(resume_task.id),
@@ -201,12 +213,16 @@ def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget
             retry_task_id = decision.recovery_task_id
             freshly_created = False
         else:
-            retry_task = _create_retry_task(
-                store,
-                task,
-                trigger_source="auto-recovery",
-                automatic_recovery=True,
-            )
+            try:
+                retry_task = _create_retry_task(
+                    store,
+                    task,
+                    config=config,
+                    trigger_source="auto-recovery",
+                    automatic_recovery=True,
+                )
+            except ConfigError as exc:
+                return _AttachHandoffError(str(exc), resume_mode=False)
             assert retry_task.id is not None
             retry_task_id = str(retry_task.id)
             freshly_created = True
@@ -225,12 +241,16 @@ def _resolve_handoff_target(config: Config, store, task) -> _AttachHandoffTarget
             resume_mode=False,
             launch_mode="worker",
         )
-    retry_task = _create_retry_task(
-        store,
-        task,
-        trigger_source="auto-recovery",
-        automatic_recovery=True,
-    )
+    try:
+        retry_task = _create_retry_task(
+            store,
+            task,
+            config=config,
+            trigger_source="auto-recovery",
+            automatic_recovery=True,
+        )
+    except ConfigError as exc:
+        return _AttachHandoffError(str(exc), resume_mode=False)
     assert retry_task.id is not None
     return _AttachHandoffTarget(
         task_id=str(retry_task.id),
@@ -325,6 +345,24 @@ def main() -> int:
 
             should_handoff = detach_signal in (signal.SIGTERM, signal.SIGHUP) or exit_code == 0
             handoff = _resolve_handoff_target(config, store, refreshed) if should_handoff else None
+            if isinstance(handoff, _AttachHandoffError):
+                action_label = "resume" if handoff.resume_mode else "retry"
+                print(f"Error: failed to create {action_label} handoff after interactive session: {handoff.message}")
+                if log_file is not None:
+                    write_log_entry(
+                        log_file,
+                        {
+                            "type": "gza",
+                            "subtype": "worker_lifecycle",
+                            "event": f"{action_label}_failed",
+                            "message": (
+                                f"Background worker {action_label} handoff failed after interactive session: "
+                                f"{handoff.message}"
+                            ),
+                            "handoff_exit_code": 1,
+                        },
+                    )
+                return 1
             if handoff is not None:
                 handoff_task_id = handoff.task_id
                 handoff_resume_mode = handoff.resume_mode

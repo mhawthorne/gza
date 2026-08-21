@@ -14,6 +14,8 @@ from typing import cast
 
 import yaml
 
+from .task_types import ALL_TASK_TYPES
+
 APP_NAME = "gza"
 CONFIG_FILENAME = f"{APP_NAME}.yaml"
 LOCAL_CONFIG_FILENAME = f"{APP_NAME}.local.yaml"
@@ -61,7 +63,7 @@ DEFAULT_MAX_STEPS = 50
 DEFAULT_MAX_TURNS = 50
 DEFAULT_WORKTREE_DIR = f"/tmp/{APP_NAME}-worktrees"
 DEFAULT_WORK_COUNT = 1  # Number of tasks to run in a work session
-DEFAULT_PROVIDER = "claude"  # "claude", "codex", or "gemini"
+DEFAULT_PROVIDER = ""  # Projects must set provider explicitly.
 KNOWN_PROVIDERS = ("claude", "codex", "gemini")
 DEFAULT_CHAT_TEXT_DISPLAY_LENGTH = 0  # 0 means unlimited (show all)
 DEFAULT_BRANCH_STRATEGY = "monorepo"  # Default branch naming strategy
@@ -503,6 +505,11 @@ def _detect_model_provider_family(model: str) -> str | None:
     return None
 
 
+def _is_nonblank_model(value: object) -> bool:
+    """Return True when a config value is an explicit, nonblank model string."""
+    return isinstance(value, str) and bool(value.strip())
+
+
 def _validate_optional_string_field(value: object, field_name: str, *, default: str = "") -> str:
     """Return a string config field or raise when an explicit value has the wrong type."""
     if value is None:
@@ -514,8 +521,9 @@ def _validate_optional_string_field(value: object, field_name: str, *, default: 
 
 def _is_model_compatible_with_provider(provider: str, model: str | None) -> bool:
     """Return True if model appears compatible with provider."""
-    if not model or not isinstance(model, str):
+    if not _is_nonblank_model(model):
         return True
+    model = cast(str, model)
     family = _detect_model_provider_family(model)
     if family is None:
         return True
@@ -527,6 +535,388 @@ def _provider_model_mismatch_error(path: str, provider: str, model: str) -> str:
         f"'{path}' model '{model}' appears incompatible with provider '{provider}'. "
         f"Use a model for '{provider}' or change provider."
     )
+
+
+def _missing_project_provider_error(config_path: Path) -> str:
+    return (
+        f"'provider' is required in {config_path}\n"
+        "Add 'provider: codex', 'provider: claude', or 'provider: gemini' to the project config file."
+    )
+
+
+def _missing_project_model_error(config_path: Path, provider: str) -> str:
+    return (
+        f"'model' is required for provider '{provider}' in {config_path}\n"
+        f"Add 'model: <model-name>' or 'providers.{provider}.model: <model-name>' "
+        "to the project config file."
+    )
+
+
+def _missing_local_override_model_error(local_path: Path, provider: str, keys: tuple[str, ...]) -> str:
+    key_text = ", ".join(f"'{key}'" for key in keys) if keys else "'model'"
+    return (
+        f"'model' is required for provider '{provider}' after local overrides from {local_path}\n"
+        f"Remove or correct the overriding {key_text} in {local_path.name}."
+    )
+
+
+def _missing_user_override_model_error(provider: str, keys: tuple[str, ...]) -> str:
+    key_text = ", ".join(f"'{key}'" for key in keys) if keys else "'model'"
+    user_path = Config.user_config_display_path()
+    return (
+        f"'model' is required for provider '{provider}' after user defaults from {user_path}\n"
+        f"Remove or correct the overriding {key_text} in {user_path}."
+    )
+
+
+def _local_provider_model_mismatch_error(
+    local_path: Path,
+    *,
+    provider: str,
+    model: str,
+    provider_key: str,
+    model_key: str,
+) -> str:
+    return (
+        f"Local override '{provider_key}' in {local_path} redirects provider to '{provider}', "
+        f"but '{model_key}' model '{model}' is incompatible. "
+        f"Remove or correct the overriding '{provider_key}' in {local_path.name}, "
+        "or set a compatible local model."
+    )
+
+
+def _local_model_provider_mismatch_error(
+    local_path: Path,
+    *,
+    provider: str,
+    model: str,
+    model_key: str,
+) -> str:
+    return (
+        f"Local override '{model_key}' in {local_path} sets model '{model}', "
+        f"but it is incompatible with provider '{provider}'. "
+        f"Remove or correct the overriding '{model_key}' in {local_path.name}, "
+        "or change provider."
+    )
+
+
+def _missing_project_model_for_task_error(config_path: Path, provider: str, task_type: str) -> str:
+    return (
+        f"'model' is required for task type '{task_type}' with provider '{provider}' in {config_path}\n"
+        f"Add 'providers.{provider}.task_types.{task_type}.model: <model-name>', "
+        f"'providers.{provider}.model: <model-name>', or route the task to a provider "
+        "with a project-declared compatible model in the project config file."
+    )
+
+
+def _candidate_model_source_keys(task_type: str, provider: str) -> tuple[str, ...]:
+    return (
+        f"providers.{provider}.task_types.{task_type}.model",
+        f"providers.{provider}.model",
+        f"task_types.{task_type}.model",
+        "model",
+        "defaults.model",
+    )
+
+
+def _candidate_model_source_keys_for_provider(data: dict, provider: str, *, task_type: str | None = None) -> tuple[str, ...]:
+    keys: list[str] = [f"providers.{provider}.model", "model", "defaults.model"]
+    task_types: list[str] = []
+
+    if task_type is not None:
+        task_types.append(task_type)
+    else:
+        provider_data = _value_at_path(data, f"providers.{provider}")
+        if isinstance(provider_data, dict):
+            provider_task_types = provider_data.get("task_types")
+            if isinstance(provider_task_types, dict):
+                task_types.extend(str(candidate) for candidate in provider_task_types.keys())
+
+        legacy_task_types = data.get("task_types")
+        task_providers = data.get("task_providers")
+        if not isinstance(task_providers, dict):
+            task_providers = {}
+        if isinstance(legacy_task_types, dict):
+            for candidate in legacy_task_types.keys():
+                if task_providers.get(candidate, provider) == provider:
+                    task_types.append(str(candidate))
+
+    for candidate in dict.fromkeys(task_types):
+        keys.insert(0, f"providers.{provider}.task_types.{candidate}.model")
+        keys.insert(1, f"task_types.{candidate}.model")
+
+    return tuple(dict.fromkeys(keys))
+
+
+def _value_at_path(data: dict, path: str) -> object:
+    current: object = data
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def _source_aware_missing_project_model_error(
+    data: dict,
+    source_map: dict[str, str],
+    *,
+    config_path: Path,
+    local_override_path: Path | None,
+    provider: str,
+) -> str:
+    local_keys: list[str] = []
+    if source_map.get("provider") == "local":
+        local_keys.append("provider")
+    task_providers = data.get("task_providers")
+    task_types = data.get("task_types")
+    if isinstance(task_providers, dict) and isinstance(task_types, dict):
+        for task_type, task_provider in task_providers.items():
+            task_provider_key = f"task_providers.{task_type}"
+            if source_map.get(task_provider_key) != "local" or task_provider == provider:
+                continue
+            task_type_model_key = f"task_types.{task_type}.model"
+            task_type_model = _value_at_path(data, task_type_model_key)
+            if _is_nonblank_model(task_type_model):
+                local_keys.append(task_provider_key)
+    for key in _candidate_model_source_keys_for_provider(data, provider):
+        if source_map.get(key) == "local":
+            value = _value_at_path(data, key)
+            if not _is_nonblank_model(value):
+                local_keys.append(key)
+    if local_override_path is not None and local_keys:
+        return _missing_local_override_model_error(local_override_path, provider, tuple(local_keys))
+    return _missing_project_model_error(config_path, provider)
+
+
+def _source_aware_missing_task_model_error(
+    config: "Config",
+    *,
+    provider: str,
+    task_type: str,
+    user_config_path: Path | None = None,
+) -> str:
+    local_path = config.local_override_path
+    local_keys: list[str] = []
+    user_keys: list[str] = []
+    task_provider_key = f"task_providers.{task_type}"
+    if config.source_map.get(task_provider_key) == "local":
+        local_keys.append(task_provider_key)
+    elif config.source_map.get(task_provider_key) == "user":
+        user_keys.append(task_provider_key)
+    for key in _candidate_model_source_keys(task_type, provider):
+        if config.source_map.get(key) == "local":
+            value = _value_at_path(_config_to_source_data(config), key)
+            if not _is_nonblank_model(value):
+                local_keys.append(key)
+        elif config.source_map.get(key) == "user":
+            value = _value_at_path(_config_to_source_data(config), key)
+            if not _is_nonblank_model(value):
+                user_keys.append(key)
+    if local_path is not None and local_keys:
+        return _missing_local_override_model_error(local_path, provider, tuple(local_keys))
+    if user_config_path is not None and user_keys:
+        return _missing_user_override_model_error(provider, tuple(user_keys))
+    return _missing_project_model_for_task_error(
+        config.config_path(config.project_dir),
+        provider,
+        task_type,
+    )
+
+
+def _local_provider_source_key_for_task(config: "Config", task_type: str, provider: str) -> str | None:
+    task_provider_key = f"task_providers.{task_type}"
+    if config.source_map.get(task_provider_key) == "local" and config.task_providers.get(task_type) == provider:
+        return task_provider_key
+    if config.source_map.get("provider") == "local" and config.provider == provider:
+        return "provider"
+    return None
+
+
+def _source_aware_provider_model_mismatch_error(
+    config: "Config",
+    *,
+    task_type: str,
+    provider: str,
+    model: str,
+    model_key: str,
+) -> str:
+    provider_key = _local_provider_source_key_for_task(config, task_type, provider)
+    if config.local_override_path is not None:
+        if provider_key is not None and config.source_map.get(model_key) != "local":
+            return _local_provider_model_mismatch_error(
+                config.local_override_path,
+                provider=provider,
+                model=model,
+                provider_key=provider_key,
+                model_key=model_key,
+            )
+        if config.source_map.get(model_key) == "local":
+            return _local_model_provider_mismatch_error(
+                config.local_override_path,
+                provider=provider,
+                model=model,
+                model_key=model_key,
+            )
+    return _provider_model_mismatch_error(model_key, provider, model)
+
+
+def _config_to_source_data(config: "Config") -> dict[str, object]:
+    provider_data: dict[str, object] = {}
+    for provider_name, provider_config in config.providers.items():
+        task_types_data = {
+            task_type: {"model": task_config.model}
+            for task_type, task_config in provider_config.task_types.items()
+        }
+        provider_data[provider_name] = {
+            "model": provider_config.model,
+            "task_types": task_types_data,
+        }
+    return {
+        "provider": config.provider,
+        "task_providers": dict(config.task_providers),
+        "model": config.model,
+        "defaults": {"model": config.model},
+        "task_types": {
+            task_type: {"model": task_config.model}
+            for task_type, task_config in config.task_types.items()
+        },
+        "providers": provider_data,
+    }
+
+
+def _effective_model_for_task_with_source(
+    config: "Config",
+    task_type: str,
+    provider: str,
+) -> tuple[str | None, str | None]:
+    provider_config = config.providers.get(provider)
+    if provider_config:
+        provider_task_type = provider_config.task_types.get(task_type)
+        if provider_task_type and _is_nonblank_model(provider_task_type.model):
+            return provider_task_type.model, f"providers.{provider}.task_types.{task_type}.model"
+        if _is_nonblank_model(provider_config.model):
+            return provider_config.model, f"providers.{provider}.model"
+
+    if provider == config.get_provider_for_task(task_type):
+        legacy_task_type = config.task_types.get(task_type)
+        if legacy_task_type and _is_nonblank_model(legacy_task_type.model):
+            return legacy_task_type.model, f"task_types.{task_type}.model"
+
+    if provider == config.provider and _is_nonblank_model(config.model):
+        return config.model, "model"
+    return None, None
+
+
+def _effective_model_task_types(config: "Config") -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            (
+                "implement",
+                *ALL_TASK_TYPES,
+                *config.task_providers.keys(),
+                *config.task_types.keys(),
+                *(
+                    task_type
+                    for provider_config in config.providers.values()
+                    for task_type in provider_config.task_types.keys()
+                ),
+            )
+        )
+    )
+
+
+def _collect_effective_model_compat_errors(config: "Config") -> list[str]:
+    errors: list[str] = []
+    for task_type in _effective_model_task_types(config):
+        provider = config.get_provider_for_task(task_type)
+        model, source_key = _effective_model_for_task_with_source(config, task_type, provider)
+        if not _is_nonblank_model(model) or _is_model_compatible_with_provider(provider, model):
+            continue
+        model_text = cast(str, model)
+        errors.append(
+            _source_aware_provider_model_mismatch_error(
+                config,
+                task_type=task_type,
+                provider=provider,
+                model=model_text,
+                model_key=source_key or "model",
+            )
+        )
+    return list(dict.fromkeys(errors))
+
+
+def _collect_explicit_task_provider_model_errors(
+    config: "Config",
+    *,
+    user_config_path: Path | None = None,
+) -> list[str]:
+    errors: list[str] = []
+    for task_type, provider in config.task_providers.items():
+        model, _source_key = _effective_model_for_task_with_source(config, task_type, provider)
+        if _is_nonblank_model(model):
+            continue
+        errors.append(
+            _source_aware_missing_task_model_error(
+                config,
+                provider=provider,
+                task_type=task_type,
+                user_config_path=user_config_path,
+            )
+        )
+    return list(dict.fromkeys(errors))
+
+
+def _project_data_has_model_for_provider(data: dict, provider: str, *, task_type: str | None = None) -> bool:
+    model = data.get("model")
+    if _is_nonblank_model(model):
+        return True
+
+    defaults = data.get("defaults")
+    if isinstance(defaults, dict):
+        defaults_model = defaults.get("model")
+        if _is_nonblank_model(defaults_model):
+            return True
+
+    providers = data.get("providers")
+    if isinstance(providers, dict):
+        provider_data = providers.get(provider)
+        if isinstance(provider_data, dict):
+            provider_model = provider_data.get("model")
+            if _is_nonblank_model(provider_model):
+                return True
+            provider_task_types = provider_data.get("task_types")
+            if isinstance(provider_task_types, dict):
+                if task_type is None:
+                    if any(
+                        isinstance(task_cfg, dict)
+                        and _is_nonblank_model(task_cfg.get("model"))
+                        for task_cfg in provider_task_types.values()
+                    ):
+                        return True
+                else:
+                    provider_task_cfg = provider_task_types.get(task_type)
+                    if (
+                        isinstance(provider_task_cfg, dict)
+                        and _is_nonblank_model(provider_task_cfg.get("model"))
+                    ):
+                        return True
+
+    task_types = data.get("task_types")
+    if isinstance(task_types, dict):
+        task_providers = data.get("task_providers")
+        if not isinstance(task_providers, dict):
+            task_providers = {}
+        for configured_task_type, task_cfg in task_types.items():
+            if task_type is not None and configured_task_type != task_type:
+                continue
+            task_provider = task_providers.get(configured_task_type, provider)
+            if task_provider != provider:
+                continue
+            if isinstance(task_cfg, dict) and _is_nonblank_model(task_cfg.get("model")):
+                return True
+
+    return False
 
 
 def is_model_compatible_with_provider(provider: str, model: str | None) -> bool:
@@ -1247,23 +1637,26 @@ class Config:
         Precedence:
         1. providers.<provider>.task_types.<task_type>.model
         2. providers.<provider>.model
-        3. task_types.<task_type>.model (legacy)
-        4. model (legacy)
+        3. task_types.<task_type>.model (legacy, only for the task's configured provider)
+        4. model (legacy, only for the project default provider)
         5. None (provider runtime default)
         """
         provider_config = self.providers.get(provider)
         if provider_config:
             provider_task_type = provider_config.task_types.get(task_type)
-            if provider_task_type and provider_task_type.model:
+            if provider_task_type and _is_nonblank_model(provider_task_type.model):
                 return provider_task_type.model
-            if provider_config.model:
+            if _is_nonblank_model(provider_config.model):
                 return provider_config.model
 
-        legacy_task_type = self.task_types.get(task_type)
-        if legacy_task_type and legacy_task_type.model:
-            return legacy_task_type.model
+        if provider == self.get_provider_for_task(task_type):
+            legacy_task_type = self.task_types.get(task_type)
+            if legacy_task_type and _is_nonblank_model(legacy_task_type.model):
+                return legacy_task_type.model
 
-        return self.model or None
+        if provider == self.provider and _is_nonblank_model(self.model):
+            return self.model or None
+        return None
 
     def get_provider_for_task(self, task_type: str) -> str:
         """Get effective provider for a task type.
@@ -1284,6 +1677,25 @@ class Config:
             The model name to use for this task type
         """
         return self.get_model_for_task(task_type, self.provider)
+
+    def require_model_for_task(
+        self,
+        task_type: str,
+        *,
+        provider_override: str | None = None,
+        model_override: str | None = None,
+        model_override_is_explicit: bool = False,
+    ) -> None:
+        """Raise ConfigError if the concrete task cannot resolve an execution model."""
+        provider = provider_override or self.get_provider_for_task(task_type)
+        model_is_override = model_override_is_explicit or model_override is not None
+        model = model_override if model_is_override else self.get_model_for_task(task_type, provider)
+        if not _is_nonblank_model(model):
+            raise ConfigError(_source_aware_missing_task_model_error(self, provider=provider, task_type=task_type))
+        if not _is_model_compatible_with_provider(provider, model):
+            model_source = "--model" if model_is_override else f"model for task type '{task_type}'"
+            model = cast(str, model)
+            raise ConfigError(_provider_model_mismatch_error(model_source, provider, model))
 
     def get_reasoning_effort_for_task(self, task_type: str, provider: str) -> str | None:
         """Get reasoning effort for task type within provider scope.
@@ -1555,6 +1967,7 @@ class Config:
         local_override_path: Path | None,
         local_overrides_active: bool,
         allow_derived_shared_project_id: bool = False,
+        enforce_project_provider_model: bool = True,
     ) -> "Config":
         """Build a Config from already-merged config data."""
         config_path = cls.config_path(project_dir)
@@ -1591,6 +2004,17 @@ class Config:
                 f"Add 'project_name: your-project-name' to the config file."
             )
 
+        if enforce_project_provider_model:
+            project_data = _read_yaml_dict(config_path) if config_path.exists() else data
+            project_provider = project_data.get("provider")
+            if project_provider is None:
+                raise ConfigError(_missing_project_provider_error(config_path))
+            if not isinstance(project_provider, str):
+                raise ConfigError("'provider' must be a string")
+            if project_provider not in KNOWN_PROVIDERS:
+                raise ConfigError(f"'provider' must be one of: {', '.join(KNOWN_PROVIDERS)}")
+            if not _project_data_has_model_for_provider(project_data, project_provider):
+                raise ConfigError(_missing_project_model_error(config_path, project_provider))
         db_path_raw = os.environ.get("GZA_DB_PATH")
         if db_path_raw:
             source_map["db_path"] = "env"
@@ -1693,7 +2117,11 @@ class Config:
         worktree_dir = data.get("worktree_dir", DEFAULT_WORKTREE_DIR)
         work_count = data.get("work_count", DEFAULT_WORK_COUNT)
         chat_text_display_length = data.get("chat_text_display_length", DEFAULT_CHAT_TEXT_DISPLAY_LENGTH)
-        provider = data.get("provider", DEFAULT_PROVIDER)
+        provider = data.get("provider")
+        if not isinstance(provider, str):
+            raise ConfigError("'provider' must be a string")
+        if provider not in KNOWN_PROVIDERS:
+            raise ConfigError(f"'provider' must be one of: {', '.join(KNOWN_PROVIDERS)}")
 
         # task_providers routing
         task_providers: dict[str, str] = {}
@@ -1867,7 +2295,7 @@ class Config:
         legacy_model_set = "model" in data or ("defaults" in data and isinstance(defaults, dict) and "model" in defaults)
         if legacy_model_set:
             for provider_name, provider_config in providers.items():
-                if provider_config.model:
+                if _is_nonblank_model(provider_config.model):
                     warnings.warn(
                         f"Both provider-scoped model ('providers.{provider_name}.model') and default model "
                         f"('model'/'defaults.model') are set. Using provider-scoped value for provider '{provider_name}'.",
@@ -1953,34 +2381,55 @@ class Config:
                             stacklevel=2,
                         )
 
+        if enforce_project_provider_model and not _project_data_has_model_for_provider(data, provider):
+            raise ConfigError(
+                _source_aware_missing_project_model_error(
+                    data,
+                    source_map,
+                    config_path=config_path,
+                    local_override_path=local_override_path,
+                    provider=provider,
+                )
+            )
+
         # Validate provider/model compatibility with effective loaded settings.
         model_compat_errors: list[str] = []
-        if not _is_model_compatible_with_provider(provider, model):
-            model_compat_errors.append(_provider_model_mismatch_error("model", provider, model))
-        for task_type, task_cfg in task_types.items():
-            task_provider = task_providers.get(task_type, provider)
-            if task_cfg.model and not _is_model_compatible_with_provider(task_provider, task_cfg.model):
-                model_compat_errors.append(
-                    _provider_model_mismatch_error(f"task_types.{task_type}.model", task_provider, task_cfg.model)
-                )
         for provider_name, provider_cfg in providers.items():
-            if provider_cfg.model and not _is_model_compatible_with_provider(provider_name, provider_cfg.model):
+            if _is_nonblank_model(provider_cfg.model) and not _is_model_compatible_with_provider(provider_name, provider_cfg.model):
                 model_compat_errors.append(
                     _provider_model_mismatch_error(
                         f"providers.{provider_name}.model",
                         provider_name,
-                        provider_cfg.model,
+                        cast(str, provider_cfg.model),
                     )
                 )
             for task_type, task_cfg in provider_cfg.task_types.items():
-                if task_cfg.model and not _is_model_compatible_with_provider(provider_name, task_cfg.model):
+                if _is_nonblank_model(task_cfg.model) and not _is_model_compatible_with_provider(provider_name, task_cfg.model):
                     model_compat_errors.append(
                         _provider_model_mismatch_error(
                             f"providers.{provider_name}.task_types.{task_type}.model",
                             provider_name,
-                            task_cfg.model,
+                            cast(str, task_cfg.model),
                         )
                     )
+        effective_config = cls(
+            project_dir=project_dir,
+            project_name=str(project_name_raw),
+            provider=provider,
+            model=model,
+            task_providers=task_providers,
+            task_types=task_types,
+            providers=providers,
+            source_map=source_map,
+            local_override_path=local_override_path,
+        )
+        model_compat_errors.extend(
+            _collect_explicit_task_provider_model_errors(
+                effective_config,
+                user_config_path=user_config_path,
+            )
+        )
+        model_compat_errors.extend(_collect_effective_model_compat_errors(effective_config))
         if model_compat_errors:
             raise ConfigError("Invalid provider/model configuration:\n- " + "\n- ".join(model_compat_errors))
 
@@ -2727,8 +3176,12 @@ class Config:
         candidate_data = copy.deepcopy(user_data)
         candidate_data["project_name"] = project_name
         candidate_data["project_id"] = project_id
+        candidate_data["provider"] = "codex"
+        candidate_data["model"] = "gpt-5.5"
         source_map["project_name"] = "base"
         source_map["project_id"] = "base"
+        source_map["provider"] = "base"
+        source_map["model"] = "base"
 
         try:
             cls._build_config_from_merged_data(
@@ -2739,6 +3192,7 @@ class Config:
                 user_config_active=user_active,
                 local_override_path=None,
                 local_overrides_active=False,
+                enforce_project_provider_model=False,
             )
         except ConfigError as exc:
             raise ConfigError(
@@ -2765,7 +3219,7 @@ class Config:
         try:
             (
                 data,
-                _source_map,
+                source_map,
                 user_config_path,
                 user_config_active,
                 local_override_path,
@@ -2810,6 +3264,21 @@ class Config:
             errors.append("'project_name' is required")
         elif not isinstance(data["project_name"], str):
             errors.append("'project_name' must be a string")
+
+        try:
+            project_data = _read_yaml_dict(config_path)
+        except (yaml.YAMLError, ConfigError):
+            project_data = {}
+        project_provider = project_data.get("provider")
+        if project_provider is None:
+            errors.append(_missing_project_provider_error(config_path))
+        elif not isinstance(project_provider, str):
+            errors.append("'provider' must be a string")
+        elif project_provider not in KNOWN_PROVIDERS:
+            provider_list = ", ".join("'" + p + "'" for p in KNOWN_PROVIDERS)
+            errors.append(f"'provider' must be one of: {provider_list}")
+        elif not _project_data_has_model_for_provider(project_data, project_provider):
+            errors.append(_missing_project_model_error(config_path, project_provider))
 
         if "project_id" in data and data["project_id"]:
             project_id = data["project_id"]
@@ -3335,46 +3804,19 @@ class Config:
                             if key not in valid_task_type_keys:
                                 warnings.append(f"Unknown field in 'task_types.{task_type}': '{key}'")
 
-        # Validate provider/model compatibility to fail early on mixed-provider configs.
+        # Validate missing project-side model declarations before validating concrete model families.
         provider_for_models = data.get("provider", DEFAULT_PROVIDER)
-        task_providers_for_models = data.get("task_providers", {})
-        if not isinstance(task_providers_for_models, dict):
-            task_providers_for_models = {}
-        if isinstance(provider_for_models, str) and provider_for_models in ("claude", "codex", "gemini"):
-            top_model = data.get("model")
-            if isinstance(top_model, str) and top_model and not _is_model_compatible_with_provider(provider_for_models, top_model):
-                errors.append(_provider_model_mismatch_error("model", provider_for_models, top_model))
-
-            defaults_cfg = data.get("defaults")
-            if isinstance(defaults_cfg, dict):
-                defaults_model = defaults_cfg.get("model")
-                if (
-                    isinstance(defaults_model, str)
-                    and defaults_model
-                    and not _is_model_compatible_with_provider(provider_for_models, defaults_model)
-                ):
-                    errors.append(_provider_model_mismatch_error("defaults.model", provider_for_models, defaults_model))
-
-            task_types_cfg = data.get("task_types")
-            if isinstance(task_types_cfg, dict):
-                for task_type, task_cfg in task_types_cfg.items():
-                    if isinstance(task_cfg, dict):
-                        task_provider = task_providers_for_models.get(task_type, provider_for_models)
-                        if not isinstance(task_provider, str) or task_provider not in KNOWN_PROVIDERS:
-                            task_provider = provider_for_models
-                        task_model = task_cfg.get("model")
-                        if (
-                            isinstance(task_model, str)
-                            and task_model
-                            and not _is_model_compatible_with_provider(task_provider, task_model)
-                        ):
-                            errors.append(
-                                _provider_model_mismatch_error(
-                                    f"task_types.{task_type}.model",
-                                    task_provider,
-                                    task_model,
-                                )
-                            )
+        if isinstance(provider_for_models, str) and provider_for_models in KNOWN_PROVIDERS:
+            if not _project_data_has_model_for_provider(data, provider_for_models):
+                errors.append(
+                    _source_aware_missing_project_model_error(
+                        data,
+                        source_map,
+                        config_path=config_path,
+                        local_override_path=local_override_path,
+                        provider=provider_for_models,
+                    )
+                )
 
         # Validate provider-scoped configuration
         if "providers" in data:
@@ -3397,8 +3839,7 @@ class Config:
                     if "model" in provider_data and not isinstance(provider_data["model"], str):
                         errors.append(f"'providers.{provider_name}.model' must be a string")
                     elif (
-                        isinstance(provider_data.get("model"), str)
-                        and provider_data["model"]
+                        _is_nonblank_model(provider_data.get("model"))
                         and not _is_model_compatible_with_provider(provider_name, provider_data["model"])
                     ):
                         errors.append(
@@ -3428,8 +3869,7 @@ class Config:
                                         f"'providers.{provider_name}.task_types.{task_type}.model' must be a string"
                                     )
                                 elif (
-                                    isinstance(task_type_config.get("model"), str)
-                                    and task_type_config["model"]
+                                    _is_nonblank_model(task_type_config.get("model"))
                                     and not _is_model_compatible_with_provider(provider_name, task_type_config["model"])
                                 ):
                                     errors.append(
@@ -3584,5 +4024,22 @@ class Config:
                         warnings.append(f"Unknown field in 'branch_strategy': '{key}'")
             else:
                 errors.append("'branch_strategy' must be a string (preset name) or dict (custom pattern)")
+
+        if not errors:
+            try:
+                with sys.modules["warnings"].catch_warnings():
+                    sys.modules["warnings"].simplefilter("ignore")
+                    cls._build_config_from_merged_data(
+                        project_dir,
+                        data,
+                        source_map,
+                        user_config_path=user_config_path,
+                        user_config_active=user_config_active,
+                        local_override_path=local_override_path,
+                        local_overrides_active=local_overrides_active,
+                        enforce_project_provider_model=False,
+                    )
+            except ConfigError as exc:
+                errors.append(str(exc))
 
         return len(errors) == 0, errors, warnings

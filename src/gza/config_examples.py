@@ -32,6 +32,10 @@ class ConfigExampleRenderOptions:
     flavor: str = "full"
     project_name: str = "my-project"
     project_name_enabled: bool = True
+    provider: str = "codex"
+    provider_enabled: bool = True
+    model: str = "gpt-5.5"
+    model_enabled: bool = True
     project_id: str = "myproject01"
     project_id_enabled: bool = False
     db_path: str | None = None
@@ -272,6 +276,10 @@ def _render_node(
 ) -> list[str]:
     if full_path == "project_name":
         return _render_simple_setting(node.spec, key, indent, enabled=options.project_name_enabled, value=options.project_name)
+    if full_path == "provider":
+        return _render_simple_setting(node.spec, key, indent, enabled=options.provider_enabled, value=options.provider)
+    if full_path == "model":
+        return _render_simple_setting(node.spec, key, indent, enabled=options.model_enabled, value=options.model)
     if full_path == "project_id":
         extra = [
             "gza init writes this automatically for new projects.",

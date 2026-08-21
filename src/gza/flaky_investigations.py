@@ -412,6 +412,9 @@ def create_or_reuse_flaky_investigations(
             impl_task=impl_task,
             evidence=evidence,
         )
+        require_model_for_task = getattr(config, "require_model_for_task", None)
+        if callable(require_model_for_task):
+            require_model_for_task("explore")
         artifact_path, artifact_bytes, artifact_digest = _write_flaky_investigation_artifact_file(
             project_dir=Path(config.project_dir),
             dedup_key=evidence.dedup_key,

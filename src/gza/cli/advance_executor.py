@@ -28,6 +28,7 @@ from ..concurrency import (
     release_task_launch_permit,
     reserve_task_launch_permit,
 )
+from ..config import Config, ConfigError
 from ..cross_project import task_is_cross_project
 from ..db import DuplicateActiveChildError, SqliteTaskStore, Task as DbTask
 from ..flaky_investigations import create_or_reuse_flaky_investigations
@@ -258,6 +259,7 @@ def _prepare_resolution_review_action(
     task: DbTask,
     action: dict[str, Any],
     *,
+    config: Config | None = None,
     trigger_source: str,
 ) -> CreateReviewActionResult:
     rebase_task_id = action.get("resolution_rebase_task_id")
@@ -276,6 +278,7 @@ def _prepare_resolution_review_action(
         review_task = create_resolution_review_task(
             store,
             task,
+            config=config,
             rebase_task=rebase_task,
             resolved_head_sha=resolved_head_sha,
             resolved_target_sha=resolved_target_sha,
@@ -301,6 +304,7 @@ def _prepare_spec_coherence_review_action(
     task: DbTask,
     action: dict[str, Any],
     *,
+    config: Config | None = None,
     trigger_source: str,
 ) -> CreateReviewActionResult:
     raw_head_sha = action.get("review_head_sha")
@@ -328,6 +332,7 @@ def _prepare_spec_coherence_review_action(
         review_task = create_spec_coherence_review_task(
             store,
             task,
+            config=config,
             reviewed_head_sha=raw_head_sha.strip(),
             changed_paths=changed_paths,
             trigger_source=trigger_source,
@@ -895,6 +900,24 @@ def _skip_duplicate_recovery_creation(
     )
 
 
+def _task_creation_config_error_result(
+    *,
+    action_type: str,
+    permit: LaunchPermit | None,
+    exc: ConfigError,
+) -> AdvanceActionExecutionResult:
+    if permit is not None:
+        permit.release()
+    return AdvanceActionExecutionResult(
+        action_type=action_type,
+        status="error",
+        execution_phase="worker_launch",
+        message=str(exc),
+        worker_consuming=False,
+        work_done=False,
+    )
+
+
 def _worker_capacity_blocked_result(
     *,
     action_type: str,
@@ -1427,6 +1450,12 @@ def _execute_create_verify_fix(
             based_on_task=based_on_task,
             verify_epoch=verify_epoch,
             trigger_source=context.trigger_source,
+        )
+    except ConfigError as exc:
+        return _task_creation_config_error_result(
+            action_type=action_type,
+            permit=permit,
+            exc=exc,
         )
     except (ValueError, VerifyFixContextError) as exc:
         if permit is not None:
@@ -2230,7 +2259,14 @@ def execute_advance_action(
             if permit is not None:
                 permit.release()
             return AdvanceActionExecutionResult(action_type=action_type, status="error", message="plan review creation is unavailable")
-        plan_review_task = context.create_plan_review_task(task)
+        try:
+            plan_review_task = context.create_plan_review_task(task)
+        except ConfigError as exc:
+            return _task_creation_config_error_result(
+                action_type=action_type,
+                permit=permit,
+                exc=exc,
+            )
         prepared_plan_review_task, prepare_error = _prepare_background_start(
             context=context,
             action_type=action_type,
@@ -2332,7 +2368,14 @@ def execute_advance_action(
             if permit is not None:
                 permit.release()
             return AdvanceActionExecutionResult(action_type=action_type, status="error", message="plan improve creation is unavailable")
-        plan_improve_task = context.create_plan_improve_task(plan_source_task, review_task)
+        try:
+            plan_improve_task = context.create_plan_improve_task(plan_source_task, review_task)
+        except ConfigError as exc:
+            return _task_creation_config_error_result(
+                action_type=action_type,
+                permit=permit,
+                exc=exc,
+            )
         prepared_plan_improve_task, prepare_error = _prepare_background_start(
             context=context,
             action_type=action_type,
@@ -2426,7 +2469,18 @@ def execute_advance_action(
 
         if context.materialize_plan_slices is None:
             return AdvanceActionExecutionResult(action_type=action_type, status="error", message="plan slice materialization is unavailable")
-        materialization = context.materialize_plan_slices(plan_source_task, review_task, manifest)
+        try:
+            materialization = context.materialize_plan_slices(plan_source_task, review_task, manifest)
+        except ConfigError as exc:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="error",
+                execution_phase="worker_launch",
+                message=str(exc),
+                worker_consuming=False,
+                work_done=False,
+                handled_task_id=review_task.id,
+            )
         created_tasks = materialization.tasks
         created_ids = ", ".join(task.id or "unknown" for task in created_tasks)
         return AdvanceActionExecutionResult(
@@ -2524,6 +2578,16 @@ def execute_advance_action(
                 partial_task_ids,
                 repair_trigger_source,
             )
+        except ConfigError as exc:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="error",
+                execution_phase="worker_launch",
+                message=str(exc),
+                worker_consuming=False,
+                work_done=False,
+                handled_task_id=review_task.id,
+            )
         except PlanReviewMaterializationRepairBlocked as exc:
             return AdvanceActionExecutionResult(
                 action_type=action_type,
@@ -2579,22 +2643,31 @@ def execute_advance_action(
         )
         if blocked is not None:
             return blocked
-        if action.get("review_mode") == "resolution":
-            create_result = _prepare_resolution_review_action(
-                context.store,
-                task,
-                action,
-                trigger_source=context.trigger_source,
+        try:
+            if action.get("review_mode") == "resolution":
+                create_result = _prepare_resolution_review_action(
+                    context.store,
+                    task,
+                    action,
+                    config=context.config,
+                    trigger_source=context.trigger_source,
+                )
+            elif action.get("review_mode") == "spec_coherence":
+                create_result = _prepare_spec_coherence_review_action(
+                    context.store,
+                    task,
+                    action,
+                    config=context.config,
+                    trigger_source=context.trigger_source,
+                )
+            else:
+                create_result = context.prepare_create_review(task)
+        except ConfigError as exc:
+            return _task_creation_config_error_result(
+                action_type=action_type,
+                permit=permit,
+                exc=exc,
             )
-        elif action.get("review_mode") == "spec_coherence":
-            create_result = _prepare_spec_coherence_review_action(
-                context.store,
-                task,
-                action,
-                trigger_source=context.trigger_source,
-            )
-        else:
-            create_result = context.prepare_create_review(task)
         if create_result.status == "skip":
             if permit is not None:
                 permit.release()
@@ -2726,12 +2799,19 @@ def execute_advance_action(
             if hasattr(candidate, "dispute_metadata")
             else build_review_blocker_dispute_metadata(candidate.dispute_artifact)
         )
-        adjudication_task = context.create_review_adjudication_task(
-            task,
-            review_task,
-            candidate.finding,
-            dispute_metadata,
-        )
+        try:
+            adjudication_task = context.create_review_adjudication_task(
+                task,
+                review_task,
+                candidate.finding,
+                dispute_metadata,
+            )
+        except ConfigError as exc:
+            return _task_creation_config_error_result(
+                action_type=action_type,
+                permit=permit,
+                exc=exc,
+            )
         prepared_adjudication_task, prepare_error = _prepare_background_start(
             context=context,
             action_type=action_type,
@@ -2944,6 +3024,12 @@ def execute_advance_action(
                     exc=exc,
                     task=failed_improve,
                 )
+            except ConfigError as exc:
+                return _task_creation_config_error_result(
+                    action_type=action_type,
+                    permit=permit,
+                    exc=exc,
+                )
         elif improve_mode == "retry" and failed_improve is not None:
             assert failed_improve.id is not None
             try:
@@ -2953,6 +3039,7 @@ def execute_advance_action(
                     improve_task = _create_retry_task(
                         context.store,
                         failed_improve,
+                        config=context.config,
                         trigger_source=context.trigger_source,
                     )
             except DuplicateActiveChildError as exc:
@@ -2962,12 +3049,19 @@ def execute_advance_action(
                     exc=exc,
                     task=failed_improve,
                 )
+            except ConfigError as exc:
+                return _task_creation_config_error_result(
+                    action_type=action_type,
+                    permit=permit,
+                    exc=exc,
+                )
         else:
             try:
                 improve_task = _create_improve_task(
                     context.store,
                     task,
                     review_task,
+                    config=context.config,
                     trigger_source=context.trigger_source,
                 )
             except ValueError as exc:
@@ -2979,6 +3073,12 @@ def execute_advance_action(
                     message=str(exc),
                     improve_mode=improve_mode,
                     failed_improve=failed_improve,
+                )
+            except ConfigError as exc:
+                return _task_creation_config_error_result(
+                    action_type=action_type,
+                    permit=permit,
+                    exc=exc,
                 )
 
         prepared_improve_task, prepare_error = _prepare_background_start(
@@ -3106,6 +3206,12 @@ def execute_advance_action(
                         exc=exc,
                         task=task,
                     )
+                except ConfigError as exc:
+                    return _task_creation_config_error_result(
+                        action_type=action_type,
+                        permit=permit,
+                        exc=exc,
+                    )
             prepared_resume_task, prepare_error = _prepare_background_start(
                 context=context,
                 action_type=action_type,
@@ -3160,6 +3266,12 @@ def execute_advance_action(
                     permit=permit,
                     exc=exc,
                     task=task,
+                )
+            except ConfigError as exc:
+                return _task_creation_config_error_result(
+                    action_type=action_type,
+                    permit=permit,
+                    exc=exc,
                 )
         prepared_resume_task, prepare_error = _prepare_background_start(
             context=context,
@@ -3239,6 +3351,12 @@ def execute_advance_action(
                     exc=exc,
                     task=task,
                 )
+            except ConfigError as exc:
+                return _task_creation_config_error_result(
+                    action_type=action_type,
+                    permit=permit,
+                    exc=exc,
+                )
         if launch_mode == "iterate":
             if context.spawn_iterate_recovery is None:
                 if permit is not None:
@@ -3313,7 +3431,14 @@ def execute_advance_action(
         )
         if blocked is not None:
             return blocked
-        impl_task = context.create_implement_task(task)
+        try:
+            impl_task = context.create_implement_task(task)
+        except ConfigError as exc:
+            return _task_creation_config_error_result(
+                action_type=action_type,
+                permit=permit,
+                exc=exc,
+            )
         prepared_impl_task, prepare_error = _prepare_background_start(
             context=context,
             action_type=action_type,
@@ -3407,6 +3532,12 @@ def execute_advance_action(
                 exc=exc,
                 parent_task_id=rebase_parent_task.id,
                 source_branch=rebase_parent_task.branch,
+            )
+        except ConfigError as exc:
+            return _task_creation_config_error_result(
+                action_type=action_type,
+                permit=permit,
+                exc=exc,
             )
         prepared_rebase_task, prepare_error = _prepare_background_start(
             context=context,
@@ -3552,6 +3683,12 @@ def execute_advance_action(
                 exc=exc,
                 parent_task_id=task.id,
                 source_branch=task.branch,
+            )
+        except ConfigError as exc:
+            return _task_creation_config_error_result(
+                action_type=action_type,
+                permit=permit,
+                exc=exc,
             )
         prepared_rebase_task, prepare_error = _prepare_background_start(
             context=context,

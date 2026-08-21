@@ -329,7 +329,7 @@ class TestLogCommand:
 
         setup_config(tmp_path)
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
             "db_path: .gza/gza.db\n"
             "verify_command: uv run pytest tests/ -q\n"
         )
@@ -447,7 +447,7 @@ class TestLogCommand:
 
         setup_config(tmp_path)
         (tmp_path / "gza.yaml").write_text(
-            "project_name: test-project\n"
+            "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
             "db_path: .gza/gza.db\n"
             "verify_command: uv run pytest tests/ -q\n"
         )

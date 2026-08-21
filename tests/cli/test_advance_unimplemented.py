@@ -5,8 +5,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from gza.cli.git_ops import _cmd_advance_unimplemented, cmd_advance
-from gza.config import Config
+from gza.config import Config, ConfigError
 from gza.db import SqliteTaskStore
 from tests.cli.conftest import make_store, setup_config
 
@@ -146,6 +148,39 @@ class TestAdvanceUnimplementedCommand:
         assert len(implement_tasks) == 1
         assert implement_tasks[0].depends_on == explore.id
         assert implement_tasks[0].tags == explore.tags
+
+    def test_advance_unimplemented_create_requires_implement_model_before_mutation(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      plan:\n"
+            "        model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+        explore = store.add("Explore recovery rollout", task_type="explore")
+        _set_task_times(
+            store,
+            explore,
+            created_at=datetime(2026, 3, 1, tzinfo=UTC),
+            completed_at=datetime(2026, 3, 2, tzinfo=UTC),
+            status="completed",
+        )
+        task_count = len(store.get_all())
+
+        with pytest.raises(ConfigError) as exc_info:
+            _run_unimplemented(tmp_path, store, create=True, task_types=("explore",))
+
+        output = capsys.readouterr().out
+        assert "task type 'implement' with provider 'codex'" in str(exc_info.value)
+        assert len(store.get_all()) == task_count
+        assert "Created implement task" not in output
 
     def test_advance_unimplemented_skips_explore_lineage_handed_off_to_pending_plan_descendant(
         self, tmp_path: Path, capsys

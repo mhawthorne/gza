@@ -8,14 +8,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gza.artifacts import store_command_output_artifact
-from gza.config import Config
+from gza.config import Config, ConfigError
 from gza.db import SqliteTaskStore, Task
 from gza.git import Git
-from gza.rebase_diff import parse_rebase_diff_provenance
+from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance, parse_rebase_diff_provenance
 from gza.review_scope import parse_resolution_review_scope, parse_spec_coherence_review_scope
 from gza.review_tasks import (
     OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
     DuplicateReviewError,
+    OffTopicVerifyPersistenceError,
     VerifyFixContextError,
     backfill_changed_diff_rebase_review_scope_provenance,
     backfill_resolution_review_scope_provenance,
@@ -29,6 +30,7 @@ from gza.review_tasks import (
     build_verify_fix_prompt,
     create_or_reuse_deferred_blocker_task,
     create_or_reuse_followup_task,
+    create_or_reuse_off_topic_verify_investigations,
     create_or_reuse_review_blocker_adjudication_task,
     create_or_reuse_verify_fix_task,
     create_resolution_review_task,
@@ -72,11 +74,250 @@ def _task(**overrides) -> Task:
 
 
 def _make_store(tmp_path: Path) -> tuple[Config, SqliteTaskStore]:
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n")
     config = Config.load(tmp_path)
     db_path = tmp_path / ".gza" / "gza.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return config, SqliteTaskStore(db_path, prefix=config.project_prefix)
+
+
+def _write_task_type_config(tmp_path: Path, task_types: tuple[str, ...]) -> Config:
+    lines = [
+        "project_name: test-project",
+        "provider: codex",
+        "providers:",
+        "  codex:",
+        "    task_types:",
+    ]
+    for task_type in task_types:
+        lines.extend(
+            [
+                f"      {task_type}:",
+                "        model: gpt-5.5",
+            ]
+        )
+    (tmp_path / "gza.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    (tmp_path / ".gza").mkdir(parents=True, exist_ok=True)
+    return Config.load(tmp_path)
+
+
+def _completed_impl(store: SqliteTaskStore) -> Task:
+    impl = store.add("Implement feature", task_type="implement")
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    store.update(impl)
+    return impl
+
+
+def _completed_review(store: SqliteTaskStore, impl: Task) -> Task:
+    review = store.add("Review feature", task_type="review", depends_on=impl.id, based_on=impl.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+    return review
+
+
+def _finding(finding_id: str = "F1", severity: str = "FOLLOWUP") -> ReviewFinding:
+    return ReviewFinding(
+        id=finding_id,
+        severity=severity,
+        title="Finding",
+        body="Body",
+        evidence="Evidence",
+        impact="Impact",
+        fix_or_followup="Fix it",
+        tests="Tests",
+    )
+
+
+def test_review_task_creation_rejects_uncovered_review_before_store_add(tmp_path: Path) -> None:
+    config = _write_task_type_config(tmp_path, ("plan",))
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+    impl = _completed_impl(store)
+
+    with patch.object(store, "add", wraps=store.add) as add_spy, pytest.raises(Exception) as exc_info:
+        create_review_task(store, impl, config=config, trigger_source="manual")
+
+    assert "task type 'review' with provider 'codex'" in str(exc_info.value)
+    add_spy.assert_not_called()
+
+
+def test_resolution_review_rejects_missing_review_model_before_rebase_scope_repair(tmp_path: Path) -> None:
+    config = _write_task_type_config(tmp_path, ("rebase",))
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+    impl = _completed_impl(store)
+    rebase = store.add("Rebase feature", task_type="rebase", based_on=impl.id)
+    rebase.status = "completed"
+    rebase.review_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip="pre-head",
+            target_at_start="pre-target",
+            merge_base_at_start="pre-merge-base",
+        ),
+        resolved_head_sha=None,
+        resolved_target_sha=None,
+    )
+    original_scope = rebase.review_scope
+    store.update(rebase)
+
+    with patch.object(store, "add", wraps=store.add) as add_spy, patch.object(
+        store,
+        "update",
+        wraps=store.update,
+    ) as update_spy, pytest.raises(ConfigError) as exc_info:
+        create_resolution_review_task(
+            store,
+            impl,
+            config=config,
+            rebase_task=rebase,
+            resolved_head_sha="resolved-head",
+            resolved_target_sha="resolved-target",
+            trigger_source="manual",
+        )
+
+    assert "task type 'review' with provider 'codex'" in str(exc_info.value)
+    add_spy.assert_not_called()
+    update_spy.assert_not_called()
+    assert not any(task.task_type == "review" for task in store.get_all())
+    assert store.get(rebase.id).review_scope == original_scope
+
+
+def test_review_followup_explore_and_internal_creators_require_covered_models(tmp_path: Path) -> None:
+    config = _write_task_type_config(tmp_path, ("plan",))
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+    impl = _completed_impl(store)
+    review = _completed_review(store, impl)
+
+    with patch("gza.runner.get_provider") as mock_get_provider:
+        with pytest.raises(Exception, match="task type 'implement' with provider 'codex'"):
+            create_or_reuse_followup_task(
+                store,
+                config=config,
+                review_task=review,
+                impl_task=impl,
+                finding=_finding(),
+                trigger_source="manual",
+            )
+        with pytest.raises(Exception, match="task type 'explore' with provider 'codex'"):
+            create_or_reuse_off_topic_verify_investigations(
+                store,
+                config=config,
+                review_task=review,
+                impl_task=impl,
+                payload={
+                    "failing_nodes": [
+                        {
+                            "nodeid": "tests/test_example.py::test_example",
+                            "assertion_signature": "assert False",
+                        }
+                    ]
+                },
+                trigger_source="manual",
+            )
+        with pytest.raises(Exception, match="task type 'internal' with provider 'codex'"):
+            create_or_reuse_review_blocker_adjudication_task(
+                store,
+                config=config,
+                review_task=review,
+                impl_task=impl,
+                finding=_finding(severity="BLOCKER"),
+                dispute_metadata={"source_task_id": "gza-1", "reason": "stale"},
+                trigger_source="manual",
+            )
+
+    mock_get_provider.assert_not_called()
+    assert not any(task.task_type in {"explore", "internal"} for task in store.get_all())
+    assert not any(task.task_type == "implement" and task.based_on == review.id for task in store.get_all())
+
+
+def test_off_topic_investigation_reuse_bypasses_explore_model(tmp_path: Path) -> None:
+    full_config = _write_task_type_config(tmp_path, ("explore",))
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=full_config.project_prefix)
+    impl = _completed_impl(store)
+    review = _completed_review(store, impl)
+    payload = {
+        "failing_nodes": [
+            {
+                "nodeid": "tests/test_example.py::test_example",
+                "assertion_signature": "assert False",
+            }
+        ]
+    }
+    created, reused = create_or_reuse_off_topic_verify_investigations(
+        store,
+        config=full_config,
+        review_task=review,
+        impl_task=impl,
+        payload=payload,
+        trigger_source="manual",
+    )
+    assert len(created) == 1
+    assert reused == ()
+    task_count = len(store.get_all())
+
+    missing_explore_config = _write_task_type_config(tmp_path, ("plan",))
+    created_again, reused_again = create_or_reuse_off_topic_verify_investigations(
+        store,
+        config=missing_explore_config,
+        review_task=review,
+        impl_task=impl,
+        payload=payload,
+        trigger_source="manual",
+    )
+
+    assert created_again == ()
+    assert [task.id for task in reused_again] == [created[0].id]
+    assert len(store.get_all()) == task_count
+
+
+def test_covered_review_followup_explore_and_internal_creators_succeed(tmp_path: Path) -> None:
+    config = _write_task_type_config(tmp_path, ("implement", "review", "explore", "internal"))
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+    impl = _completed_impl(store)
+
+    review = create_review_task(store, impl, config=config, trigger_source="manual")
+    review.status = "completed"
+    store.update(review)
+    followup, followup_created = create_or_reuse_followup_task(
+        store,
+        config=config,
+        review_task=review,
+        impl_task=impl,
+        finding=_finding(),
+        trigger_source="manual",
+    )
+    explore_created, _ = create_or_reuse_off_topic_verify_investigations(
+        store,
+        config=config,
+        review_task=review,
+        impl_task=impl,
+        payload={
+            "failing_nodes": [
+                {
+                    "nodeid": "tests/test_example.py::test_example",
+                    "assertion_signature": "assert False",
+                }
+            ]
+        },
+        trigger_source="manual",
+    )
+    adjudication, adjudication_created = create_or_reuse_review_blocker_adjudication_task(
+        store,
+        config=config,
+        review_task=review,
+        impl_task=impl,
+        finding=_finding(severity="BLOCKER"),
+        dispute_metadata={"source_task_id": "gza-1", "reason": "stale"},
+        trigger_source="manual",
+    )
+
+    assert review.task_type == "review"
+    assert followup_created is True
+    assert followup.task_type == "implement"
+    assert len(explore_created) == 1
+    assert explore_created[0].task_type == "explore"
+    assert adjudication_created is True
+    assert adjudication.task_type == "internal"
 
 
 def _seed_failed_verify_evidence(
@@ -546,6 +787,43 @@ class TestVerifyFixTasks:
                 verify_epoch=epoch,
                 trigger_source="advance",
             )
+
+    def test_create_or_reuse_verify_fix_task_requires_verify_fix_model_before_mutation(
+        self, tmp_path: Path
+    ) -> None:
+        config = _write_task_type_config(tmp_path, ("implement",))
+        store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+        impl = store.add("Implement feature", task_type="implement")
+        improve = store.add("Improve feature", task_type="improve", based_on=impl.id, same_branch=True)
+        epoch = VerifyEpoch(
+            reviewed_branch="feature/test",
+            reviewed_head_sha="deadbeef",
+            verify_command="./bin/tests",
+            verify_timeout_seconds=1800,
+            verify_timeout_grace_seconds=5.0,
+        )
+        _seed_failed_verify_evidence(
+            config=config,
+            store=store,
+            impl=impl,
+            source_task=improve,
+            epoch=epoch,
+        )
+        task_count = len(store.get_all())
+
+        with pytest.raises(ConfigError) as exc_info:
+            create_or_reuse_verify_fix_task(
+                store,
+                config,
+                impl_task=impl,
+                based_on_task=improve,
+                verify_epoch=epoch,
+                trigger_source="advance",
+            )
+
+        assert "task type 'verify_fix' with provider 'codex'" in str(exc_info.value)
+        assert len(store.get_all()) == task_count
+        assert store.list_artifacts(impl.id, kind="verify_fix_epoch") == []
 
     def test_resolve_latest_failed_verify_epoch_requires_current_owner_epoch(self, tmp_path: Path) -> None:
         config, store = _make_store(tmp_path)
@@ -2011,6 +2289,61 @@ def test_persist_off_topic_verify_clearance_creates_new_investigation_when_only_
     assert len(clearance_artifacts) == 1
     assert clearance_artifacts[0].metadata["created_investigation_task_ids"] == [result.created_tasks[0].id]
     assert clearance_artifacts[0].metadata["reused_investigation_task_ids"] == []
+
+
+def test_persist_off_topic_verify_clearance_requires_explore_model_before_transaction(
+    tmp_path: Path,
+) -> None:
+    config = _write_task_type_config(tmp_path, ("plan",))
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    impl = store.add("Implement feature", task_type="implement")
+    review = store.add("Review feature", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert impl.id is not None
+    assert review.id is not None
+    task_count = len(store.get_all())
+    payload = {
+        "reason": "off_topic_verify_failure",
+        "implementation_task_id": impl.id,
+        "review_task_id": review.id,
+        "green_task_id": "gza-100",
+        "red_task_id": "gza-101",
+        "head_sha": "same-head-sha",
+        "tree_fingerprint": "f" * 64,
+        "verify_command": "uv run pytest tests/ -q --maxfail=0",
+        "target_branch": "main",
+        "target_head_sha": "main-head-sha",
+        "target_tree_fingerprint": "a" * 64,
+        "baseline_mode": "single",
+        "failing_nodes": [
+            {
+                "nodeid": "tests/cli/test_query.py::test_worker_registry",
+                "assertion_signature": "AssertionError: assert 'running' == 'completed'",
+                "path": "tests/cli/test_query.py",
+                "failure_path": "tests/cli/test_query.py",
+                "failure_line": 42,
+                "traceback_paths": ["tests/cli/test_query.py"],
+            }
+        ],
+    }
+
+    with pytest.raises(OffTopicVerifyPersistenceError) as exc_info:
+        persist_off_topic_verify_clearance(
+            store,
+            config=config,
+            review_task=review,
+            impl_task=impl,
+            payload=payload,
+            trigger_source="advance_off_topic_verify_unblock",
+            review_clearance_artifact_kind="review_clearance",
+            review_clearance_artifact_label="review_clearance",
+            review_clearance_artifact_producer="advance_off_topic_verify_unblock",
+        )
+
+    assert "task type 'explore' with provider 'codex'" in str(exc_info.value)
+    assert len(store.get_all()) == task_count
+    assert store.list_artifacts(impl.id, kind="review_clearance") == []
+    assert list((tmp_path / ".gza" / "artifacts").glob("**/*")) == []
 
 
 class TestFollowupTasks:

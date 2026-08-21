@@ -26,5 +26,6 @@ branch_strategy: date_slug
 advance_mode: iterate
 
 provider: codex
+model: gpt-5.5
 
 learnings_interval: 20

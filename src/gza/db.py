@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
@@ -12840,6 +12840,7 @@ def edit_task_prompt(
     prompt: str,
     *,
     edited_at: datetime | None = None,
+    validate_before_update: Callable[[Task], None] | None = None,
 ) -> Task:
     """Atomically edit only the prompt fields of a pending task."""
     current = store.get(task_id)
@@ -12852,6 +12853,8 @@ def edit_task_prompt(
         )
 
     normalized = normalize_task_prompt(prompt)
+    if validate_before_update is not None:
+        validate_before_update(replace(current, prompt=normalized))
     updated = store.update_pending_prompt(
         task_id,
         normalized,
@@ -12878,6 +12881,7 @@ def edit_task_prompt_with_mutations(
     tag_action: Literal["clear", "set", "add", "remove"] | None = None,
     tag_values: Iterable[str] = (),
     edited_at: datetime | None = None,
+    validate_before_update: Callable[[Task], None] | None = None,
 ) -> PendingTaskEditResult:
     """Atomically edit a pending prompt and all companion field/tag mutations."""
     current = store.get(task_id)
@@ -12890,6 +12894,23 @@ def edit_task_prompt_with_mutations(
         )
 
     normalized = normalize_task_prompt(prompt)
+    if validate_before_update is not None:
+        candidate = replace(current, prompt=normalized)
+        for field, value in dict(field_updates or {}).items():
+            setattr(candidate, field, value)
+        if tag_action is not None:
+            normalized_tags = _normalize_tags(tag_values)
+            if tag_action == "clear":
+                candidate.tags = ()
+            elif tag_action == "set":
+                candidate.tags = normalized_tags
+            elif tag_action == "add":
+                candidate.tags = _normalize_tags((*candidate.tags, *normalized_tags))
+            else:
+                removed_tags = set(normalized_tags)
+                candidate.tags = tuple(tag for tag in candidate.tags if tag not in removed_tags)
+            candidate.group = candidate.tags[0] if len(candidate.tags) == 1 else None
+        validate_before_update(candidate)
     updated = store.update_pending_task_edit(
         task_id,
         normalized,
@@ -13083,7 +13104,12 @@ def add_task_interactive(
         # Otherwise loop back to editor
 
 
-def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
+def edit_task_interactive(
+    store: SqliteTaskStore,
+    task: Task,
+    *,
+    validate_before_update: Callable[[Task], None] | None = None,
+) -> bool:
     """Interactively edit a task's prompt using $EDITOR.
 
     Returns True if edited successfully, False if cancelled.
@@ -13110,7 +13136,12 @@ def edit_task_interactive(store: SqliteTaskStore, task: Task) -> bool:
             return False
 
         try:
-            edit_task_prompt(store, task.id, prompt)
+            edit_task_prompt(
+                store,
+                task.id,
+                prompt,
+                validate_before_update=validate_before_update,
+            )
             return True
         except TaskPromptValidationError as exc:
             errors = exc.errors

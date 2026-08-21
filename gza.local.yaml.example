@@ -5,10 +5,10 @@
 # use_docker: false
 # timeout_minutes: 30
 # worktree_dir: /tmp/gza-worktrees
-# provider: codex
+provider: codex
 # task_providers:
 #   review: claude
-# model: o4-mini
+model: o4-mini
 # reasoning_effort: medium
 # docker_volumes:
 #   - ~/datasets:/datasets:ro

@@ -1,11 +1,18 @@
 """Tests for the host-side behavior conformance monitor."""
 
+import os
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
-from gza.behavior_monitor import parse_behavior_check_report, run_behavior_monitor_cycle
-from gza.config import Config
+import pytest
+
+from gza.behavior_monitor import (
+    BEHAVIOR_MONITOR_LEASE_NAME,
+    parse_behavior_check_report,
+    run_behavior_monitor_cycle,
+)
+from gza.config import Config, ConfigError
 from gza.db import SqliteTaskStore
 
 from .conftest import invoke_gza, make_store, setup_config
@@ -101,6 +108,95 @@ _TRUNCATED_REPORT = """# Behavior conformance check
 def _config_and_store(tmp_path: Path) -> tuple[Config, SqliteTaskStore]:
     setup_config(tmp_path)
     return Config.load(tmp_path), make_store(tmp_path)
+
+
+def _task_scoped_config_and_store(tmp_path: Path, task_types: tuple[str, ...]) -> tuple[Config, SqliteTaskStore]:
+    lines = [
+        "project_name: test-project",
+        "provider: codex",
+        "db_path: .gza/gza.db",
+        "providers:",
+        "  codex:",
+        "    task_types:",
+    ]
+    for task_type in task_types:
+        lines.extend(
+            [
+                f"      {task_type}:",
+                "        model: gpt-5.5",
+            ]
+        )
+    (tmp_path / "gza.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    config = Config.load(tmp_path)
+    return config, SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+
+def test_behavior_monitor_check_task_requires_internal_model_before_mutation(tmp_path: Path) -> None:
+    config, store = _task_scoped_config_and_store(tmp_path, ("plan",))
+
+    result = run_behavior_monitor_cycle(
+        config,
+        store,
+        filing_tag=config.behavior_monitor.tag,
+        max_new_tasks=config.behavior_monitor.max_new_tasks_per_cycle,
+        check_timeout_seconds=config.behavior_monitor.check_timeout_seconds,
+        dry_run=False,
+        file_undetermined=False,
+    )
+
+    assert result.successful is False
+    assert "task type 'internal' with provider 'codex'" in (result.error or "")
+    assert store.get_all() == []
+
+
+def test_behavior_monitor_held_lease_bypasses_internal_model_validation(tmp_path: Path) -> None:
+    config, store = _task_scoped_config_and_store(tmp_path, ("plan",))
+    lease = store.try_acquire_project_lease(
+        lease_name=BEHAVIOR_MONITOR_LEASE_NAME,
+        owner_pid=os.getpid(),
+        owner_token="held-by-test",
+    )
+    assert lease is not None
+
+    result = run_behavior_monitor_cycle(
+        config,
+        store,
+        filing_tag=config.behavior_monitor.tag,
+        max_new_tasks=config.behavior_monitor.max_new_tasks_per_cycle,
+        check_timeout_seconds=config.behavior_monitor.check_timeout_seconds,
+        dry_run=False,
+        file_undetermined=False,
+    )
+
+    assert result.successful is False
+    assert result.error == "another behavior monitor check is already running for this project"
+    assert store.get_all() == []
+
+
+def test_behavior_monitor_followup_requires_created_task_model_before_filing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config, store = _task_scoped_config_and_store(tmp_path, ("internal",))
+
+    monkeypatch.setattr(
+        "gza.behavior_monitor._run_behavior_check_task",
+        lambda *_args, **_kwargs: ("gza-1", "reviews/20260629080000-behavior-check.md", _REPORT),
+    )
+
+    with pytest.raises(ConfigError) as exc_info:
+        run_behavior_monitor_cycle(
+            config,
+            store,
+            filing_tag=config.behavior_monitor.tag,
+            max_new_tasks=config.behavior_monitor.max_new_tasks_per_cycle,
+            check_timeout_seconds=config.behavior_monitor.check_timeout_seconds,
+            dry_run=False,
+            file_undetermined=False,
+        )
+
+    assert "task type 'implement' with provider 'codex'" in str(exc_info.value)
+    assert store.get_all() == []
 
 
 def test_behavior_monitor_disabled_config_exits_without_creating_state(

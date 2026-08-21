@@ -6,6 +6,8 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from gza.attach_wrapper import main
 from gza.config import Config
 from gza.db import SqliteTaskStore
@@ -15,7 +17,7 @@ from gza.recovery_engine import decide_failed_task_recovery
 
 def _setup_task_with_log(project_dir: Path, *, task_type: str = "implement") -> tuple[str, Path]:
     (project_dir / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
         "use_docker: false\n"
     )
@@ -279,6 +281,105 @@ def test_attach_wrapper_timeout_failed_implement_handoff_launches_iterate_resume
     assert spawned_kwargs.get("prepared_task_id") == resume_child.id
     assert spawned_kwargs.get("prepared_resume") is True
     assert spawned_kwargs.get("prepared_phase") == "preloop"
+
+
+@pytest.mark.parametrize(
+    ("task_type", "failure_reason", "session_id", "expected_event"),
+    [
+        pytest.param("review", "MAX_TURNS", "sess-123", "resume_failed", id="resume-worker"),
+        pytest.param("implement", "MAX_TURNS", "sess-123", "resume_failed", id="resume-iterate"),
+        pytest.param("review", "INFRASTRUCTURE_ERROR", None, "retry_failed", id="retry-worker"),
+        pytest.param("implement", "INFRASTRUCTURE_ERROR", None, "retry_failed", id="retry-iterate"),
+    ],
+)
+def test_attach_wrapper_auto_recovery_config_error_reports_failure_without_child(
+    tmp_path: Path,
+    capsys,
+    task_type: str,
+    failure_reason: str,
+    session_id: str | None,
+    expected_event: str,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "provider: codex\n"
+        "db_path: .gza/gza.db\n"
+        "use_docker: false\n"
+        "providers:\n"
+        "  codex:\n"
+        "    task_types:\n"
+        "      plan:\n"
+        "        model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".gza" / "logs").mkdir(parents=True, exist_ok=True)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+    failed = store.add("Failed attach wrapper", task_type=task_type)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = failure_reason
+    failed.session_id = session_id
+    failed.log_file = ".gza/logs/task.log"
+    store.update(failed)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", failed.id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
+        patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
+    ):
+        rc = main()
+
+    output = capsys.readouterr()
+    assert rc == 1
+    assert "failed to create" in output.out
+    assert f"task type '{task_type}' with provider 'codex'" in output.out
+    mock_spawn_worker.assert_not_called()
+    mock_spawn_iterate.assert_not_called()
+    assert store.get_based_on_children(failed.id) == []
+    events = _read_log_events(tmp_path / failed.log_file)
+    lifecycle_events = [event for event in events if event.get("subtype") == "worker_lifecycle"]
+    assert expected_event in [event["event"] for event in lifecycle_events]
+    assert any(f"task type '{task_type}' with provider 'codex'" in event["message"] for event in lifecycle_events)
+
+
+def test_attach_wrapper_legitimate_skip_recovery_stays_quiet(tmp_path: Path, capsys) -> None:
+    task_id, log_path = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+    failed = store.get(task_id)
+    assert failed is not None
+    failed.status = "failed"
+    failed.failure_reason = "TEST_FAILURE"
+    store.update(failed)
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", return_value=0),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn_worker,
+        patch("gza.attach_wrapper._spawn_background_iterate", return_value=0) as mock_spawn_iterate,
+    ):
+        rc = main()
+
+    output = capsys.readouterr()
+    assert rc == 0
+    assert "failed to create" not in output.out
+    mock_spawn_worker.assert_not_called()
+    mock_spawn_iterate.assert_not_called()
+    lifecycle_events = [event for event in _read_log_events(log_path) if event.get("subtype") == "worker_lifecycle"]
+    assert "resume_failed" not in [event["event"] for event in lifecycle_events]
+    assert "retry_failed" not in [event["event"] for event in lifecycle_events]
 
 
 def test_attach_wrapper_retryable_failed_implement_handoff_launches_iterate_retry(tmp_path: Path) -> None:
@@ -634,7 +735,7 @@ def test_attach_wrapper_calls_load_dotenv_before_interactive_claude(tmp_path: Pa
 
 def _setup_docker_task(project_dir: Path) -> tuple[str, Path]:
     (project_dir / "gza.yaml").write_text(
-        "project_name: test-project\n"
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
         "db_path: .gza/gza.db\n"
         "use_docker: true\n"
         "docker_image: test-project-gza\n"

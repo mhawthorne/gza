@@ -6,7 +6,7 @@ from tests_functional.helpers.cli import run_gza_subprocess
 
 
 def _setup_config(tmp_path: Path) -> None:
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\n")
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n")
 
 
 class TestCliPageFlag:

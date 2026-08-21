@@ -5,6 +5,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from gza.config import Config, ConfigError
 from gza.db import SqliteTaskStore
 from gza.flaky_investigations import (
     DEFAULT_FLAKY_REPRO_RUNS,
@@ -20,6 +23,25 @@ from gza.flaky_investigations import (
 )
 from gza.off_topic_verify import FailingNode, PytestPassFailCounts, PytestXdistMetadata
 from gza.runner import _make_review_verify_result
+
+
+def _task_scoped_config(tmp_path: Path, task_types: tuple[str, ...]) -> Config:
+    lines = [
+        "project_name: test-project",
+        "provider: codex",
+        "providers:",
+        "  codex:",
+        "    task_types:",
+    ]
+    for task_type in task_types:
+        lines.extend(
+            [
+                f"      {task_type}:",
+                "        model: gpt-5.5",
+            ]
+        )
+    (tmp_path / "gza.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return Config.load(tmp_path)
 
 
 def _make_evidence(
@@ -115,6 +137,100 @@ def test_create_or_reuse_flaky_investigation_dedups_open_task_and_keeps_structur
     assert second.created == ()
     assert [task.id for task in second.reused] == [created.id]
     assert len(store.list_artifacts(created.id, kind=FLAKY_VERIFY_INVESTIGATION_ARTIFACT_KIND)) == 2
+
+
+def test_create_or_reuse_flaky_investigation_requires_explore_model_before_mutation(
+    tmp_path: Path,
+) -> None:
+    config = _task_scoped_config(tmp_path, ("plan",))
+    store = SqliteTaskStore(tmp_path / "test.db", prefix=config.project_prefix)
+    impl = store.add("Implement slice", task_type="implement")
+    review = store.add("Review slice", task_type="review", depends_on=impl.id)
+    assert impl.id is not None
+    assert review.id is not None
+    task_count = len(store.get_all())
+
+    with pytest.raises(ConfigError) as exc_info:
+        create_or_reuse_flaky_investigations(
+            store,
+            config=config,
+            review_task=review,
+            impl_task=impl,
+            evidences=(
+                _make_evidence(
+                    review_id=review.id,
+                    impl_id=impl.id,
+                    assertion_signature="assert running == completed",
+                ),
+            ),
+            trigger_source="advance",
+        )
+
+    assert "task type 'explore' with provider 'codex'" in str(exc_info.value)
+    assert len(store.get_all()) == task_count
+    assert not list((tmp_path / ".gza").glob("artifacts/**/*.json"))
+
+
+def test_create_or_reuse_flaky_investigation_empty_input_bypasses_explore_model(
+    tmp_path: Path,
+) -> None:
+    config = _task_scoped_config(tmp_path, ("plan",))
+    store = SqliteTaskStore(tmp_path / "test.db", prefix=config.project_prefix)
+    impl = store.add("Implement slice", task_type="implement")
+    review = store.add("Review slice", task_type="review", depends_on=impl.id)
+
+    result = create_or_reuse_flaky_investigations(
+        store,
+        config=config,
+        review_task=review,
+        impl_task=impl,
+        evidences=(),
+        trigger_source="advance",
+    )
+
+    assert result.created == ()
+    assert result.reused == ()
+    assert {task.task_type for task in store.get_all()} == {"implement", "review"}
+
+
+def test_create_or_reuse_flaky_investigation_reuse_bypasses_explore_model(
+    tmp_path: Path,
+) -> None:
+    full_config = _task_scoped_config(tmp_path, ("explore",))
+    store = SqliteTaskStore(tmp_path / "test.db", prefix=full_config.project_prefix)
+    impl = store.add("Implement slice", task_type="implement")
+    review = store.add("Review slice", task_type="review", depends_on=impl.id)
+    assert impl.id is not None
+    assert review.id is not None
+    evidence = _make_evidence(
+        review_id=review.id,
+        impl_id=impl.id,
+        assertion_signature="assert running == completed",
+    )
+    first = create_or_reuse_flaky_investigations(
+        store,
+        config=full_config,
+        review_task=review,
+        impl_task=impl,
+        evidences=(evidence,),
+        trigger_source="advance",
+    )
+    assert len(first.created) == 1
+    task_count = len(store.get_all())
+
+    missing_explore_config = _task_scoped_config(tmp_path, ("plan",))
+    second = create_or_reuse_flaky_investigations(
+        store,
+        config=missing_explore_config,
+        review_task=review,
+        impl_task=impl,
+        evidences=(evidence,),
+        trigger_source="advance",
+    )
+
+    assert second.created == ()
+    assert [task.id for task in second.reused] == [first.created[0].id]
+    assert len(store.get_all()) == task_count
 
 
 def test_create_or_reuse_flaky_investigation_distinguishes_same_node_different_assertion(

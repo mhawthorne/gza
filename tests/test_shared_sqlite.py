@@ -8,16 +8,16 @@ def test_discover_project_dir_uses_nearest_ancestor(tmp_path: Path) -> None:
     project = tmp_path / "project"
     nested = project / "a" / "b" / "c"
     nested.mkdir(parents=True)
-    (project / "gza.yaml").write_text("project_name: root\n")
+    (project / "gza.yaml").write_text("project_name: root\nprovider: codex\nmodel: gpt-5.5\n")
 
     inner = project / "a" / "gza.yaml"
-    inner.write_text("project_name: nested\n")
+    inner.write_text("project_name: nested\nprovider: codex\nmodel: gpt-5.5\n")
 
     assert discover_project_dir(nested) == project / "a"
 
 
 def test_config_db_path_defaults_to_local_even_when_legacy_local_db_exists(tmp_path: Path) -> None:
-    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+    (tmp_path / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n")
     legacy_db = tmp_path / ".gza" / "gza.db"
     legacy_db.parent.mkdir(parents=True, exist_ok=True)
     legacy_db.write_text("")
@@ -27,13 +27,15 @@ def test_config_db_path_defaults_to_local_even_when_legacy_local_db_exists(tmp_p
 
 
 def test_config_db_path_defaults_to_local_when_no_local_db(tmp_path: Path) -> None:
-    (tmp_path / "gza.yaml").write_text("project_name: demo\n")
+    (tmp_path / "gza.yaml").write_text("project_name: demo\nprovider: codex\nmodel: gpt-5.5\n")
     config = Config.load(tmp_path)
     assert config.db_path == tmp_path / ".gza" / "gza.db"
 
 
 def test_config_db_path_respects_explicit_db_path(tmp_path: Path) -> None:
-    (tmp_path / "gza.yaml").write_text("project_name: demo\nproject_id: demo\ndb_path: custom.db\n")
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: demo\nprovider: codex\nmodel: gpt-5.5\nproject_id: demo\ndb_path: custom.db\n"
+    )
     config = Config.load(tmp_path)
     assert config.db_path == tmp_path / "custom.db"
 
@@ -42,7 +44,7 @@ def test_config_load_discover_true_uses_nearest_project(tmp_path: Path) -> None:
     project = tmp_path / "project"
     nested = project / "a" / "b"
     nested.mkdir(parents=True)
-    (project / "gza.yaml").write_text("project_name: project-root\n")
+    (project / "gza.yaml").write_text("project_name: project-root\nprovider: codex\nmodel: gpt-5.5\n")
 
     config = Config.load(nested, discover=True)
     assert config.project_dir == project
@@ -54,7 +56,9 @@ def test_store_default_uses_discovered_project_dir(tmp_path: Path) -> None:
     nested = project / "a" / "b"
     nested.mkdir(parents=True)
     db_path = project / "shared.db"
-    (project / "gza.yaml").write_text(f"project_name: demo\nproject_id: demo\ndb_path: {db_path}\n")
+    (project / "gza.yaml").write_text(
+        f"project_name: demo\nprovider: codex\nmodel: gpt-5.5\nproject_id: demo\ndb_path: {db_path}\n"
+    )
 
     store = SqliteTaskStore.default(nested)
     created = store.add("hello")

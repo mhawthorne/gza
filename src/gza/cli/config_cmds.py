@@ -1479,6 +1479,20 @@ def _default_preflight_model(config: Config, provider: str) -> str | None:
     return config.get_model_for_task("", provider)
 
 
+def _validate_explicit_preflight_route(
+    config: Config,
+    *,
+    provider: str | None,
+    model: str | None,
+    task_type: str | None,
+) -> None:
+    if task_type is not None:
+        config.require_model_for_task(task_type, provider_override=provider, model_override=model)
+        return
+    if provider is not None or model is not None:
+        config.require_model_for_task("implement", provider_override=provider, model_override=model)
+
+
 def resolve_preflight_targets(
     config: Config,
     *,
@@ -1488,6 +1502,12 @@ def resolve_preflight_targets(
 ) -> list[CheckTarget]:
     """Resolve distinct provider/model pairs that preflight should exercise."""
     if task_type is not None or provider is not None or model is not None:
+        _validate_explicit_preflight_route(
+            config,
+            provider=provider,
+            model=model,
+            task_type=task_type,
+        )
         if task_type is not None:
             resolved_provider = provider or config.get_provider_for_task(task_type)
             resolved_model = config.get_model_for_task(task_type, resolved_provider)
@@ -1507,6 +1527,8 @@ def resolve_preflight_targets(
     targets: dict[tuple[str, str | None], CheckTarget] = {}
 
     def add_target(target_provider: str, target_model: str | None, source: str) -> None:
+        if target_model is None:
+            return
         key = (target_provider, target_model)
         existing = targets.get(key)
         if existing is None:
@@ -1519,9 +1541,13 @@ def resolve_preflight_targets(
         if source not in existing.sources:
             existing.sources.append(source)
 
-    add_target(config.provider, _default_preflight_model(config, config.provider), "default")
+    default_model = _default_preflight_model(config, config.provider)
+    if default_model is not None:
+        add_target(config.provider, default_model, "default")
     for resolved_task_type in sorted(task_types):
         resolved_provider = config.get_provider_for_task(resolved_task_type)
+        if resolved_task_type in config.task_providers:
+            config.require_model_for_task(resolved_task_type)
         resolved_model = config.get_model_for_task(resolved_task_type, resolved_provider)
         add_target(
             resolved_provider,
@@ -1689,7 +1715,13 @@ def run_preflight_target(
 ) -> CheckResult:
     cfg = copy.copy(config)
     cfg.provider = target.provider
-    cfg.model = target.model or ""
+    if target.model is None:
+        return CheckResult(
+            status="FAIL",
+            detail="configuration does not resolve a model for this target",
+            duration_s=0.0,
+        )
+    cfg.model = target.model
     cfg.use_docker = use_docker
     cfg.timeout_minutes = 2
     cfg.max_steps = 3
@@ -1752,19 +1784,23 @@ def cmd_preflight(args: argparse.Namespace) -> int:
         return 1
 
     use_docker = config.use_docker if args.preflight_docker is None else args.preflight_docker
-    targets = resolve_preflight_targets(
-        config,
-        provider=args.provider,
-        model=args.model,
-        task_type=args.task_type,
-    )
+    try:
+        targets = resolve_preflight_targets(
+            config,
+            provider=args.provider,
+            model=args.model,
+            task_type=args.task_type,
+        )
+    except ConfigError as exc:
+        print(f"Error: {exc}")
+        return 1
     mode = "docker" if use_docker else "direct"
     results: list[tuple[CheckTarget, CheckResult]] = []
 
     with tempfile.TemporaryDirectory(prefix="gza-preflight-") as temp_dir:
         temp_path = Path(temp_dir)
         for index, target in enumerate(targets, start=1):
-            model_display = target.model or "(default)"
+            model_display = target.model
             print(f"Checking {target.provider} / {model_display} ...")
             result = run_preflight_target(
                 config,
@@ -1793,7 +1829,7 @@ def cmd_preflight(args: argparse.Namespace) -> int:
             result_cell = f"[{_colors.red_error}]FAIL[/{_colors.red_error}]"
         table.add_row(
             target.provider,
-            target.model or "(default)",
+            target.model or "(missing; creation blocked)",
             result_cell,
             result.detail,
             ", ".join(target.sources),
@@ -2017,17 +2053,17 @@ def cmd_config(args: argparse.Namespace) -> int:
     task_types = ["explore", "plan", "implement", "review", "improve", "internal"]
     model_rows = []
     for task_type in task_types:
-        provider = config.get_provider_for_task(task_type)
-        model = config.get_model_for_task(task_type, provider)
-        reasoning_effort = config.get_reasoning_effort_for_task(task_type, provider)
-        model_rows.append(
-            (
-                task_type,
-                provider,
-                model or "(provider default)",
-                reasoning_effort or "(provider default)",
+            provider = config.get_provider_for_task(task_type)
+            model = config.get_model_for_task(task_type, provider)
+            reasoning_effort = config.get_reasoning_effort_for_task(task_type, provider)
+            model_rows.append(
+                (
+                    task_type,
+                    provider,
+                    model or "(missing; creation blocked)",
+                    reasoning_effort or "(provider default)",
+                )
             )
-        )
     type_width = max(len(r[0]) for r in model_rows)
     prov_width = max(len(r[1]) for r in model_rows)
     for task_type, provider, model_display, reasoning_effort_display in model_rows:

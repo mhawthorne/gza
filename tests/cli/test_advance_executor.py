@@ -45,7 +45,7 @@ from gza.cli.advance_executor import (
     resolve_execution_needs_attention,
 )
 from gza.concurrency import launch_permit
-from gza.config import Config
+from gza.config import Config, ConfigError
 from gza.db import DuplicateActiveChildError, SqliteTaskStore, Task as DbTask
 from gza.flaky_investigations import (
     FlakyInvestigationEvidence,
@@ -253,6 +253,255 @@ def _mutate_materialized_task_tags(
 ) -> None:
     task.tags = ("mutated-tag",)
     store.update(task)
+
+
+def _base_executor_context(
+    *,
+    store: SqliteTaskStore,
+    config: Config,
+    **overrides: Any,
+) -> AdvanceActionExecutionContext:
+    values: dict[str, Any] = {
+        "store": store,
+        "trigger_source": "manual",
+        "dry_run": False,
+        "max_resume_attempts": 3,
+        "use_iterate_for_create_implement": False,
+        "use_iterate_for_needs_rebase": False,
+        "prepare_task_for_background_start": lambda task, _rollback: task,
+        "prepare_create_review": lambda _task: pytest.fail("unused"),
+        "create_resume_task": lambda _task: pytest.fail("unused"),
+        "create_rebase_task": lambda _task: pytest.fail("unused"),
+        "create_implement_task": lambda _task: pytest.fail("unused"),
+        "spawn_worker": lambda _task, _kind: pytest.fail("unused"),
+        "spawn_resume_worker": lambda _task, _kind: pytest.fail("unused"),
+        "spawn_iterate_worker": lambda _task, _kind: pytest.fail("unused"),
+        "config": config,
+    }
+    values.update(overrides)
+    return AdvanceActionExecutionContext(**values)
+
+
+def _assert_permit_released(config: Config, store: SqliteTaskStore) -> None:
+    permit = launch_permit(config, store)
+    permit.release()
+
+
+@pytest.mark.parametrize(
+    ("action_type", "context_overrides", "action_extra", "patch_target"),
+    [
+        pytest.param("create_verify_fix", {}, {}, "gza.cli.advance_executor.create_or_reuse_verify_fix_task", id="verify-fix"),
+        pytest.param("create_review", {}, {}, None, id="ordinary-review"),
+        pytest.param(
+            "create_review",
+            {},
+            {"review_mode": "resolution"},
+            "gza.cli.advance_executor._prepare_resolution_review_action",
+            id="resolution-review",
+        ),
+        pytest.param(
+            "create_review",
+            {},
+            {"review_mode": "spec_coherence"},
+            "gza.cli.advance_executor._prepare_spec_coherence_review_action",
+            id="spec-coherence-review",
+        ),
+        pytest.param("create_review_adjudication", {}, {}, None, id="adjudication"),
+        pytest.param("improve", {}, {"improve_mode": "new"}, "gza.cli.advance_executor._create_improve_task", id="improve-new"),
+        pytest.param("improve", {}, {"improve_mode": "resume"}, None, id="improve-resume"),
+        pytest.param("improve", {}, {"improve_mode": "retry"}, None, id="improve-retry"),
+    ],
+)
+def test_creation_time_config_errors_return_executor_error_and_release_permit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action_type: str,
+    context_overrides: dict[str, Any],
+    action_extra: dict[str, Any],
+    patch_target: str | None,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\nmax_concurrent: 1\n",
+        encoding="utf-8",
+    )
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    impl = store.add("Implementation", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/config-error")
+    store.update(impl)
+    review = store.add("Review", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    store.update(review)
+    before_ids = {task.id for task in store.get_all()}
+    exc = ConfigError("task type 'implement' with provider 'codex' has no model")
+
+    failed_improve: DbTask | None = None
+    if action_extra.get("improve_mode") in {"resume", "retry"}:
+        failed_improve = store.add("Improve failed", task_type="improve", depends_on=review.id, based_on=impl.id)
+        assert failed_improve.id is not None
+        failed_improve.status = "failed"
+        failed_improve.failure_reason = "MAX_TURNS" if action_extra["improve_mode"] == "resume" else "INFRASTRUCTURE_ERROR"
+        failed_improve.session_id = "sess-1" if action_extra["improve_mode"] == "resume" else None
+        failed_improve.completed_at = datetime.now(UTC)
+        store.update(failed_improve)
+        before_ids.add(failed_improve.id)
+
+    def _raise_config_error(*_args: Any, **_kwargs: Any) -> Any:
+        raise exc
+
+    context_kwargs: dict[str, Any] = dict(context_overrides)
+    if action_type == "create_review":
+        context_kwargs["prepare_create_review"] = _raise_config_error
+    elif action_type == "create_review_adjudication":
+        context_kwargs["create_review_adjudication_task"] = _raise_config_error
+    elif action_type == "improve":
+        context_kwargs["create_resume_task"] = _raise_config_error
+        context_kwargs["create_retry_task"] = _raise_config_error
+
+    context = _base_executor_context(store=store, config=config, **context_kwargs)
+    action: dict[str, Any] = {"type": action_type, "review_task": review, **action_extra}
+    if action_type == "create_verify_fix":
+        action.update(
+            {
+                "impl_task": impl,
+                "based_on_task": impl,
+                "verify_epoch": VerifyEpoch(
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="abc123",
+                    verify_command="./bin/tests",
+                    verify_timeout_seconds=300,
+                    verify_timeout_grace_seconds=5.0,
+                ),
+            }
+        )
+    if action_type == "create_review_adjudication":
+        action["review_blocker_adjudication_candidate"] = SimpleNamespace(
+            finding=ReviewFinding(
+                id="B1",
+                severity="BLOCKER",
+                title="Missing guard",
+                body="Evidence",
+                evidence="Evidence",
+                impact="Impact",
+                fix_or_followup="Fix",
+                tests="Tests",
+            ),
+            dispute_artifact=SimpleNamespace(id=1, metadata={}),
+        )
+
+    if patch_target is None:
+        result = execute_advance_action(task=impl, action=action, context=context)
+    else:
+        monkeypatch.setattr(patch_target, _raise_config_error)
+        result = execute_advance_action(task=impl, action=action, context=context)
+
+    assert result.status == "error"
+    assert "task type 'implement' with provider 'codex'" in result.message
+    assert {task.id for task in store.get_all()} == before_ids
+    _assert_permit_released(config, store)
+
+
+@pytest.mark.parametrize("action_type", ["materialize_plan_slices", "repair_plan_slice_materialization"])
+def test_plan_materialization_config_errors_return_executor_error_without_mutation(
+    tmp_path: Path,
+    action_type: str,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "provider: codex\n"
+        "providers:\n"
+        "  codex:\n"
+        "    task_types:\n"
+        "      plan:\n"
+        "        model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    plan = store.add("Plan lifecycle slices", task_type="plan")
+    assert plan.id is not None
+    _mark_completed(plan)
+    store.update(plan)
+    review = store.add("Review plan lifecycle slices", task_type="plan_review", depends_on=plan.id)
+    assert review.id is not None
+    _mark_completed(review)
+    manifest_payload = _build_plan_review_manifest_payload(plan.id)
+    review.output_content = (
+        "## Verdict\nVerdict: APPROVED\n\n## Slice Manifest\n```json\n"
+        + json.dumps(manifest_payload)
+        + "\n```\n"
+    )
+    store.update(review)
+    manifest = validate_plan_review_manifest(
+        manifest_payload,
+        markdown_verdict="APPROVED",
+        source_task_id=plan.id,
+        source_task_type="plan",
+        max_slice_timeout_minutes=30,
+    )
+    task_specs = build_plan_review_slice_task_specs(
+        plan_source_task=plan,
+        review_task=review,
+        manifest=manifest,
+        trigger_source="plan-review",
+        require_review_before_merge=True,
+    )
+    partial = store.add(
+        task_specs[0].prompt,
+        task_type="implement",
+        based_on=plan.id,
+        trigger_source="plan-review",
+        tags=task_specs[0].tags,
+        review_scope=task_specs[0].review_scope,
+        create_review=task_specs[0].create_review,
+    )
+    assert partial.id is not None
+    partial.status = "pending"
+    store.update(partial)
+    before_status = store.get(partial.id).status
+
+    context = _base_executor_context(
+        store=store,
+        config=config,
+        materialize_plan_slices=lambda source, review_task, materialization_manifest: _materialize_plan_review_slices(
+            config,
+            store,
+            source,
+            review_task,
+            materialization_manifest,
+            trigger_source="plan-review",
+            require_review_before_merge=True,
+        ),
+        repair_plan_slice_materialization=lambda source, review_task, repair_manifest, partial_ids, repair_trigger_source: (
+            _repair_plan_review_slice_materialization(
+                config,
+                store,
+                source,
+                review_task,
+                repair_manifest,
+                partial_task_ids=partial_ids,
+                trigger_source=repair_trigger_source,
+                require_review_before_merge=True,
+            )
+        ),
+    )
+    action: dict[str, Any] = {
+        "type": action_type,
+        "plan_source_task": plan,
+        "plan_review_task": review,
+        "manifest": manifest,
+    }
+    if action_type == "repair_plan_slice_materialization":
+        action.update({"partial_task_ids": (partial.id,), "repair_trigger_source": "plan-review"})
+
+    result = execute_advance_action(task=plan, action=action, context=context)
+
+    assert result.status == "error"
+    assert "task type 'implement' with provider 'codex'" in result.message
+    assert not any(task.id != partial.id and task.task_type == "implement" for task in store.get_all())
+    assert store.get(partial.id).status == before_status
 
 
 @pytest.mark.parametrize(
@@ -1493,6 +1742,77 @@ def test_materialize_plan_review_slices_includes_slice_prompt_and_provenance(tmp
     assert "Scope:\n- Keep provenance" in created_task.prompt
     assert "Out of scope:\n- CLI changes" in created_task.prompt
     assert "Acceptance criteria:\n- Prompt preserved exactly" in created_task.prompt
+
+
+def test_materialize_plan_review_slices_requires_implement_model_before_mutation(tmp_path: Path) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "provider: codex\n"
+        "providers:\n"
+        "  codex:\n"
+        "    task_types:\n"
+        "      plan:\n"
+        "        model: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore(tmp_path / ".gza" / "gza.db", prefix=config.project_prefix)
+
+    plan = store.add("Plan lifecycle slices", task_type="plan")
+    review = store.add("Review plan lifecycle slices", task_type="plan_review", depends_on=plan.id)
+    assert plan.id is not None
+    assert review.id is not None
+    manifest = validate_plan_review_manifest(
+        {
+            "schema_version": 1,
+            "source_task_id": plan.id,
+            "source_task_type": "plan",
+            "verdict": "APPROVED",
+            "slice_quality": {
+                "fits_single_task_budget": True,
+                "timeout_budget_minutes": 30,
+                "max_expected_files_changed_per_slice": 8,
+                "rationale": "Bounded slices.",
+            },
+            "slices": [
+                {
+                    "slice_id": "S1",
+                    "title": "Foundation",
+                    "prompt": "Create the slice.",
+                    "scope": ["One"],
+                    "out_of_scope": [],
+                    "acceptance_criteria": ["Slice exists"],
+                    "depends_on_slices": [],
+                    "based_on_slice": None,
+                    "review_scope": "Foundation only.",
+                    "estimated_complexity": "small",
+                    "expected_timeout_minutes": 30,
+                    "requires_code_review": True,
+                    "tags": [],
+                }
+            ],
+        },
+        markdown_verdict="APPROVED",
+        source_task_id=plan.id,
+        source_task_type="plan",
+        max_slice_timeout_minutes=30,
+    )
+    task_count = len(store.get_all())
+
+    with pytest.raises(ConfigError) as exc_info:
+        _materialize_plan_review_slices(
+            config,
+            store,
+            plan,
+            review,
+            manifest,
+            trigger_source="manual",
+            require_review_before_merge=True,
+        )
+
+    assert "task type 'implement' with provider 'codex'" in str(exc_info.value)
+    assert len(store.get_all()) == task_count
+    assert store.list_artifacts(review.id, kind=PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND) == []
 
 
 def test_materialize_plan_review_slices_revalidates_manifest_before_creating_tasks(tmp_path: Path) -> None:
@@ -7301,6 +7621,85 @@ def test_needs_rebase_skips_at_max_concurrent_without_creating_task(tmp_path: Pa
     assert result.message == "SKIP: already at max concurrent tasks: 1 running, limit is 1"
     assert len(store.get_all()) == before_count
     assert [task for task in store.get_all() if task.task_type == "rebase"] == []
+
+
+@pytest.mark.parametrize(
+    ("action", "worker_label"),
+    [
+        ({"type": "create_plan_review"}, "plan_review"),
+        ({"type": "create_plan_improve"}, "plan_improve"),
+        ({"type": "create_implement", "plan_review_cycle_limit_reached": True}, "implement"),
+        ({"type": "needs_rebase"}, "rebase"),
+        ({"type": "resume", "launch_mode": "worker"}, "resume"),
+        ({"type": "retry", "launch_mode": "worker"}, "retry"),
+    ],
+)
+def test_advance_creation_config_error_is_structured_and_releases_permit(
+    tmp_path: Path,
+    action: dict[str, object],
+    worker_label: str,
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(config_path.read_text(encoding="utf-8") + "max_concurrent: 1\n", encoding="utf-8")
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Source", task_type="plan" if action["type"] in {"create_plan_review", "create_plan_improve", "create_implement"} else "implement")
+    assert task.id is not None
+    _mark_completed(task, branch="feature/source")
+    if action["type"] in {"resume", "retry"}:
+        task.status = "failed"
+        task.failure_reason = "WORKER_DIED"
+        task.completed_at = datetime.now(UTC)
+        if action["type"] == "resume":
+            task.session_id = "session-123"
+    store.update(task)
+
+    review = store.add("Plan review", task_type="plan_review", depends_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+    if action["type"] == "create_plan_improve":
+        action = {**action, "plan_review_task": review, "plan_source_task": task}
+
+    config_error = ConfigError(f"task type '{worker_label}' with provider 'codex' is uncovered")
+
+    def _raise_config_error(*_args: object, **_kwargs: object) -> DbTask:
+        raise config_error
+
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda _task, _rollback: pytest.fail("prepare must not run"),
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=_raise_config_error,
+        create_retry_task=_raise_config_error,
+        create_rebase_task=_raise_config_error,
+        create_implement_task=_raise_config_error,
+        create_plan_review_task=_raise_config_error,
+        create_plan_improve_task=_raise_config_error,
+        spawn_worker=lambda _task, _kind: pytest.fail("worker spawn must not run"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("resume spawn must not run"),
+        spawn_iterate_worker=lambda *_args, **_kwargs: pytest.fail("iterate spawn must not run"),
+        config=config,
+    )
+
+    before_ids = {existing.id for existing in store.get_all()}
+    result = execute_advance_action(task=task, action=action, context=context)
+
+    assert result.status == "error"
+    assert result.execution_phase == "worker_launch"
+    assert result.worker_consuming is False
+    assert "with provider 'codex'" in result.message
+    assert {existing.id for existing in store.get_all()} == before_ids
+    permit = launch_permit(config, store)
+    permit.release()
 
 
 def test_needs_rebase_iterate_hands_prepared_metadata_to_spawn(tmp_path: Path) -> None:

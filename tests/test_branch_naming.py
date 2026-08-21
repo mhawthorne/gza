@@ -275,6 +275,8 @@ class TestConfigBranchStrategy:
         config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
+provider: codex
+model: gpt-5.5
 branch_strategy: monorepo
 """)
         with pytest.raises(ConfigError, match="'monorepo' was removed"):
@@ -285,6 +287,8 @@ branch_strategy: monorepo
         config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
+provider: codex
+model: gpt-5.5
 branch_strategy: project_date_slug
 """)
         config = Config.load(tmp_path)
@@ -296,6 +300,8 @@ branch_strategy: project_date_slug
         config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
+provider: codex
+model: gpt-5.5
 branch_strategy: conventional
 """)
         config = Config.load(tmp_path)
@@ -307,6 +313,8 @@ branch_strategy: conventional
         config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
+provider: codex
+model: gpt-5.5
 branch_strategy: simple
 """)
         config = Config.load(tmp_path)
@@ -318,6 +326,8 @@ branch_strategy: simple
         config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
+provider: codex
+model: gpt-5.5
 branch_strategy: date_slug
 """)
         config = Config.load(tmp_path)
@@ -330,6 +340,8 @@ branch_strategy: date_slug
         config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
+provider: codex
+model: gpt-5.5
 branch_strategy: date_slug
 """)
         config = Config.load(tmp_path)
@@ -347,6 +359,8 @@ branch_strategy: date_slug
         config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
+provider: codex
+model: gpt-5.5
 branch_strategy:
   pattern: "{type}/{date}-{slug}"
   default_type: feat
@@ -360,6 +374,8 @@ branch_strategy:
         config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
+provider: codex
+model: gpt-5.5
 """)
         config = Config.load(tmp_path)
         # Default is project_date_slug
@@ -371,6 +387,8 @@ project_name: test
         config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
+provider: codex
+model: gpt-5.5
 branch_strategy: invalid_preset
 """)
         with pytest.raises(ConfigError, match="Unknown branch_strategy preset"):
@@ -381,6 +399,8 @@ branch_strategy: invalid_preset
         config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
+provider: codex
+model: gpt-5.5
 branch_strategy: date_slug
 """)
         is_valid, errors, warnings = Config.validate(tmp_path)
@@ -390,7 +410,7 @@ branch_strategy: date_slug
     def test_validate_logs_unexpected_load_error(self, tmp_path, monkeypatch, caplog):
         """validate() logs unexpected config load failures with context."""
         config_file = tmp_path / "gza.yaml"
-        config_file.write_text("project_name: test\n")
+        config_file.write_text("project_name: test\nprovider: codex\nmodel: gpt-5.5\n")
 
         def _boom(_project_dir):
             raise RuntimeError("boom")
@@ -409,6 +429,8 @@ branch_strategy: date_slug
         config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
+provider: codex
+model: gpt-5.5
 branch_strategy:
   default_type: feat
 """)
@@ -420,6 +442,8 @@ branch_strategy:
         config_file = tmp_path / "gza.yaml"
         config_file.write_text("""
 project_name: test
+provider: codex
+model: gpt-5.5
 branch_strategy:
   pattern: "{type} {slug}"
 """)
