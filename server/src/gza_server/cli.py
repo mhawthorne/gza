@@ -36,6 +36,10 @@ STARTUP_POLL_INTERVAL_SECONDS = 0.05
 STARTUP_DIAGNOSTIC_MAX_BYTES = 2000
 DARWIN_PROCESS_START_ENV = {"LC_ALL": "C", "TZ": "UTC"}
 PS_TIMEOUT_SECONDS = 5.0
+# Watch only this package. Uvicorn's default watches the whole working
+# directory, which here is a repository holding a task database and worktrees,
+# and every write to those would bounce the server.
+RELOAD_DIR = Path(__file__).resolve().parent
 
 
 class LifecycleError(RuntimeError):
@@ -294,11 +298,14 @@ def _signaled_process_exit_status(
     state: ServerState,
     expected_start_id: str | None,
 ) -> IdentityStatus:
-    """Observe a previously signaled owned process during its shutdown window."""
-    identity = _owned_process_status(state, expected_start_id)
-    if identity is IdentityStatus.UNVERIFIABLE and expected_start_id is None:
-        return IdentityStatus.MATCH
-    return identity
+    """Observe a previously signaled owned process during its shutdown window.
+
+    This whole phase is post-signal, so it is terminating by definition: a
+    process that is alive but can no longer be identified is one on its way
+    out, not one that stopped being ours. A start marker that reads back
+    *different* is still a mismatch, so a recycled PID is caught.
+    """
+    return _owned_process_status(state, expected_start_id, terminating=True)
 
 
 def _signal_owned_process(
@@ -313,10 +320,27 @@ def _signal_owned_process(
     if identity is not IdentityStatus.MATCH:
         return identity
     try:
-        os.kill(state.pid, sig)
+        _kill_owned_group(state.pid, sig)
     except ProcessLookupError:
         return IdentityStatus.DEAD
     return IdentityStatus.MATCH
+
+
+def _kill_owned_group(pid: int, sig: signal.Signals) -> None:
+    """Signal the managed process and anything it spawned.
+
+    Under --reload uvicorn runs a supervisor that forks a worker, and the state
+    file only records the supervisor. Signalling the pid alone would leave the
+    worker holding the port after a SIGKILL escalation. The process is spawned
+    with start_new_session, so it leads its own group and the group is exactly
+    the server and its children.
+    """
+    try:
+        os.killpg(os.getpgid(pid), sig)
+    except (OSError, AttributeError):
+        # A process mid-exit can lose its group before its pid; fall back rather
+        # than reporting a live process as already dead.
+        os.kill(pid, sig)
 
 
 def _wait_for_owned_process_exit(
@@ -403,7 +427,7 @@ def _report_preserved_exception_failure(
     exc.add_note(diagnostic)
 
 
-def start_server(path: Path) -> str:
+def start_server(path: Path, *, reload: bool = True) -> str:
     with server_lock(path):
         current = read_state(path)
         if current:
@@ -421,19 +445,22 @@ def start_server(path: Path) -> str:
         environment = os.environ.copy()
         environment["GZA_SERVER_INSTANCE_ID"] = instance_id
         with tempfile.TemporaryFile(mode="w+b") as startup_output:
+            command = [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "gza_server.app:create_app",
+                "--no-access-log",
+                "--factory",
+                "--host",
+                HOST,
+                "--port",
+                str(port),
+            ]
+            if reload:
+                command += ["--reload", "--reload-dir", str(RELOAD_DIR)]
             process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "uvicorn",
-                    "gza_server.app:create_app",
-                    "--no-access-log",
-                    "--factory",
-                    "--host",
-                    HOST,
-                    "--port",
-                    str(port),
-                ],
+                command,
                 cwd=Path.cwd(),
                 env=environment,
                 stdin=subprocess.DEVNULL,
@@ -596,12 +623,18 @@ def open_server(path: Path) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gza-server", description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser(
+    start = subparsers.add_parser(
         "start",
         help=(
             "start the server without routine access logging, wait until ready, "
             "open it, and print its URL"
         ),
+    )
+    start.add_argument(
+        "--no-reload",
+        dest="reload",
+        action="store_false",
+        help="do not restart the server when its source changes",
     )
     subparsers.add_parser("stop", help="stop the running server")
     subparsers.add_parser(
@@ -617,7 +650,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         path = state_file_path()
         if args.command == "start":
-            message = start_server(path)
+            message = start_server(path, reload=args.reload)
         elif args.command == "stop":
             message = stop_server(path)
         elif args.command == "status":
