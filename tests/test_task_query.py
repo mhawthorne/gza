@@ -3175,3 +3175,57 @@ def test_lineages_incomplete_exclude_task_types_filters_shared_rollup_path(tmp_p
     )
     positive_owners = [row.owner_task.prompt for row in positive.rows if hasattr(row, "owner_task")]
     assert positive_owners == ["Implement failed"]
+
+
+def _offset_store(tmp_path: Path) -> tuple[SqliteTaskStore, list[str]]:
+    store = _store(tmp_path)
+    ids = [store.add(f"Offset task {index:02d}").id for index in range(25)]
+    return store, ids
+
+
+def test_offset_and_limit_form_a_contiguous_window(tmp_path: Path) -> None:
+    store, ids = _offset_store(tmp_path)
+    service = TaskQueryService(store)
+    query = TaskQueryPresets.search("", limit=10)
+
+    first = service.run(query)
+    second = service.run(replace(query, offset=10))
+    third = service.run(replace(query, offset=20))
+
+    assert [row.task.id for row in first.rows] + [row.task.id for row in second.rows] + [
+        row.task.id for row in third.rows
+    ] == [row.task.id for row in service.run(replace(query, limit=None)).rows]
+    assert len(third.rows) == 5
+    assert set(ids) == {
+        row.task.id for result in (first, second, third) for row in result.rows
+    }
+
+
+def test_offset_does_not_change_total_count(tmp_path: Path) -> None:
+    store, ids = _offset_store(tmp_path)
+    service = TaskQueryService(store)
+    query = TaskQueryPresets.search("", limit=10)
+
+    assert service.run(query).total_count == len(ids)
+    assert service.run(replace(query, offset=20)).total_count == len(ids)
+
+
+def test_offset_past_the_end_returns_no_rows(tmp_path: Path) -> None:
+    store, ids = _offset_store(tmp_path)
+    service = TaskQueryService(store)
+
+    result = service.run(replace(TaskQueryPresets.search("", limit=10), offset=500))
+
+    assert result.rows == ()
+    assert result.total_count == len(ids)
+
+
+def test_offset_defaults_to_zero_and_preserves_existing_behaviour(tmp_path: Path) -> None:
+    store, _ = _offset_store(tmp_path)
+    service = TaskQueryService(store)
+    query = TaskQueryPresets.search("", limit=10)
+
+    assert query.offset == 0
+    assert [row.task.id for row in service.run(query).rows] == [
+        row.task.id for row in service.run(replace(query, offset=0)).rows
+    ]

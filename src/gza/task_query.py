@@ -86,6 +86,7 @@ class TaskQuery:
 
     scope: QueryScope = "tasks"
     limit: int | None = 10
+    offset: int = 0
     text: TextFilter | None = None
     statuses: tuple[str, ...] | None = None
     exclude_statuses: tuple[str, ...] | None = None
@@ -478,7 +479,7 @@ class TaskQueryService:
                     git=git,
                     target_branch=target_branch,
                 )
-                lineages = self._apply_limit(all_lineages, query.limit)
+                lineages = self._apply_window(all_lineages, query)
                 lineage_rows = tuple(
                     self._project_lineage_row(
                         row,
@@ -492,7 +493,7 @@ class TaskQueryService:
                 return TaskQueryResult(query=query, rows=lineage_rows, total_count=len(all_lineages))
 
             all_tasks = self._collect_tasks_unlimited(query)
-            tasks = self._apply_limit(all_tasks, query.limit)
+            tasks = self._apply_window(all_tasks, query)
             task_rows = tuple(
                 self._project_task_row(
                     task,
@@ -520,22 +521,37 @@ class TaskQueryService:
         if query.sort.field == "pickup_order":
             raise ValueError("all-project queries do not support pickup-order sorting")
 
-        unlimited = replace(query, limit=None)
-        rows: list[TaskRow] = []
+        unlimited = replace(query, limit=None, offset=0)
+        projection_now = datetime.now(UTC)
+
+        # Collect raw tasks first and project only the rows this window actually
+        # returns. Projection resolves lineage owner, merge unit and dependency
+        # readiness per row -- tens of SQL queries each -- so projecting the whole
+        # corpus to hand back a single page dominated the cost of this call.
+        collected: list[tuple[TaskQueryService, DbTask]] = []
         for project_store in self._store.project_query_stores():
-            result = TaskQueryService(project_store).run(
-                unlimited,
+            service = TaskQueryService(project_store)
+            collected.extend(
+                (service, task) for task in service._collect_tasks_unlimited(unlimited)
+            )
+        collected.sort(
+            key=lambda pair: self._sort_key(pair[1], query.sort),
+            reverse=query.sort.descending,
+        )
+        total_count = len(collected)
+        window = self._apply_window(collected, query)
+        rows = tuple(
+            service._project_task_row(
+                task,
+                query,
                 config=config,
                 git=git,
                 target_branch=target_branch,
+                now=projection_now,
             )
-            rows.extend(row for row in result.rows if isinstance(row, TaskRow))
-        rows.sort(
-            key=lambda row: self._sort_key(row.task, query.sort),
-            reverse=query.sort.descending,
+            for service, task in window
         )
-        limited_rows = tuple(self._apply_limit(rows, query.limit))
-        return TaskQueryResult(query=query, rows=limited_rows, total_count=len(rows))
+        return TaskQueryResult(query=query, rows=rows, total_count=total_count)
 
     def _collect_tasks(self, query: TaskQuery) -> list[DbTask]:
         return self._apply_limit(self._collect_tasks_unlimited(query), query.limit)
@@ -773,6 +789,11 @@ class TaskQueryService:
                 members=members,
                 tree=full_tree,
             )
+
+    def _apply_window(self, rows: list[_T], query: TaskQuery) -> list[_T]:
+        """Apply ``offset`` then ``limit`` as one page window."""
+        windowed = rows[query.offset :] if query.offset else rows
+        return self._apply_limit(windowed, query.limit)
 
     def _apply_limit(self, rows: list[_T], limit: int | None) -> list[_T]:
         if limit is None:

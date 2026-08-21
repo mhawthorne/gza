@@ -129,14 +129,16 @@ def query_task_list(
     if filters.tags and filters.untagged:
         raise ValueError("tag and untagged filters cannot be combined")
 
+    spec = page
     query = TaskQueryPresets.search(
         filters.prompt,
-        limit=None,
+        limit=None if spec is None else spec.per_page,
         statuses=filters.statuses or None,
         task_types=filters.task_types or None,
     )
     query = replace(
         query,
+        offset=0 if spec is None else (spec.page - 1) * spec.per_page,
         tag_filters=normalize_tag_filters(filters.tags or None),
         untagged_only=filters.untagged,
         any_tag=True,
@@ -147,28 +149,29 @@ def query_task_list(
     )
     result = TaskQueryService(store).run(query, all_projects=True)
     rendered_at = now or datetime.now(UTC)
+    total = result.total_count
 
-    # The query service collects and sorts every match in memory, so slice the
-    # window here and only project the rows this page actually renders.
-    matched = list(result.rows)
-    if page is None:
-        spec = PageSpec(page=1, per_page=len(matched) or DEFAULT_PAGE_SIZE)
-        window = matched
+    if spec is None:
+        spec = PageSpec(page=1, per_page=total or DEFAULT_PAGE_SIZE)
     else:
         # A stale or hand-edited ?page= past the end lands on the last page
-        # rather than an unexplained empty table.
-        last_page = max(1, -(-len(matched) // page.per_page))
-        spec = replace(page, page=min(page.page, last_page))
-        start = (spec.page - 1) * spec.per_page
-        window = matched[start : start + spec.per_page]
+        # rather than an unexplained empty table. Re-run only when the first
+        # attempt overshot, which is the rare case.
+        last_page = max(1, -(-total // spec.per_page))
+        if spec.page > last_page:
+            spec = replace(spec, page=last_page)
+            result = TaskQueryService(store).run(
+                replace(query, offset=(spec.page - 1) * spec.per_page),
+                all_projects=True,
+            )
 
-    rows = [_task_row(cast(TaskRow, row), now=rendered_at) for row in window]
+    rows = [_task_row(cast(TaskRow, row), now=rendered_at) for row in result.rows]
     return TaskListResult(
         rows=rows,
         known_tags=store.list_tags(all_projects=True),
         filters=filters,
         page=spec,
-        total=len(matched),
+        total=total,
     )
 
 
