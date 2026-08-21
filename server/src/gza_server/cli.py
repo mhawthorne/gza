@@ -34,6 +34,7 @@ STARTUP_TIMEOUT_SECONDS = 10.0
 HEALTH_REQUEST_TIMEOUT_SECONDS = 0.25
 STARTUP_POLL_INTERVAL_SECONDS = 0.05
 STARTUP_DIAGNOSTIC_MAX_BYTES = 2000
+DARWIN_PROCESS_START_ENV = {"LC_ALL": "C", "TZ": "UTC"}
 
 
 class LifecycleError(RuntimeError):
@@ -139,6 +140,15 @@ def process_is_alive(pid: int) -> bool:
 
 
 def process_start_id(pid: int) -> str | None:
+    """Return the platform's stable start marker for a PID, when it can be read."""
+    if sys.platform == "linux":
+        return _linux_process_start_id(pid)
+    if sys.platform == "darwin":
+        return _darwin_process_start_id(pid)
+    return None
+
+
+def _linux_process_start_id(pid: int) -> str | None:
     """Return Linux's stable start marker for a PID, when it can be read."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
@@ -149,6 +159,26 @@ def process_start_id(pid: int) -> str | None:
         return stat.rsplit(")", 1)[1].split()[19]
     except (IndexError, ValueError):
         return None
+
+
+def _darwin_process_start_id(pid: int) -> str | None:
+    """Return macOS's stable process start time for a PID, when it can be read."""
+    try:
+        environment = {**os.environ, **DARWIN_PROCESS_START_ENV}
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            check=False,
+            env=environment,
+            text=True,
+            timeout=0.5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    start_time = result.stdout.strip()
+    return start_time or None
 
 
 def find_free_port() -> int:
@@ -229,6 +259,17 @@ def _owned_process_status(
     return IdentityStatus.MATCH
 
 
+def _signaled_process_exit_status(
+    state: ServerState,
+    expected_start_id: str | None,
+) -> IdentityStatus:
+    """Observe a previously signaled owned process during its shutdown window."""
+    identity = _owned_process_status(state, expected_start_id)
+    if identity is IdentityStatus.UNVERIFIABLE and expected_start_id is None:
+        return IdentityStatus.MATCH
+    return identity
+
+
 def _signal_owned_process(
     state: ServerState,
     expected_start_id: str | None,
@@ -252,7 +293,7 @@ def _wait_for_owned_process_exit(
     """Wait until the managed process dies or ownership is no longer verified."""
     deadline = time.monotonic() + STOP_TIMEOUT_SECONDS
     while True:
-        identity = _owned_process_status(state, expected_start_id)
+        identity = _signaled_process_exit_status(state, expected_start_id)
         if identity is not IdentityStatus.MATCH:
             return identity
         if time.monotonic() >= deadline:

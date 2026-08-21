@@ -1,6 +1,7 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+import os
 from pathlib import Path
 import signal
 import subprocess
@@ -11,10 +12,12 @@ from urllib.error import URLError
 import pytest
 
 from gza_server.cli import (
+    DARWIN_PROCESS_START_ENV,
     IdentityStatus,
     LifecycleError,
     ServerState,
     open_server,
+    process_start_id,
     read_state,
     start_server,
     status_server,
@@ -116,6 +119,52 @@ def test_start_spawns_uvicorn_records_state_opens_browser_and_returns_url(tmp_pa
     browser_open.assert_called_once_with(url)
 
 
+def test_process_start_id_reads_macos_lstart():
+    result = Mock(returncode=0, stdout="Mon Aug 17 05:01:02 2026\n")
+
+    with (
+        patch("gza_server.cli.sys.platform", "darwin"),
+        patch("gza_server.cli.subprocess.run", return_value=result) as run,
+    ):
+        assert process_start_id(2468) == "Mon Aug 17 05:01:02 2026"
+
+    run.assert_called_once_with(
+        ["ps", "-o", "lstart=", "-p", "2468"],
+        capture_output=True,
+        check=False,
+        env={**os.environ, **DARWIN_PROCESS_START_ENV},
+        text=True,
+        timeout=0.5,
+    )
+
+
+def test_darwin_process_start_id_is_stable_across_caller_locale_environment():
+    def ps_lstart(*_args, **kwargs):
+        env = kwargs["env"]
+        assert env["LC_ALL"] == "C"
+        assert env["TZ"] == "UTC"
+        return Mock(
+            returncode=0,
+            stdout=f"{env['LC_ALL']} {env['TZ']} Mon Aug 17 05:01:02 2026\n",
+        )
+
+    with (
+        patch("gza_server.cli.sys.platform", "darwin"),
+        patch("gza_server.cli.subprocess.run", side_effect=ps_lstart),
+        patch.dict(os.environ, {"LC_ALL": "en_US.UTF-8", "TZ": "America/Los_Angeles"}),
+    ):
+        first = process_start_id(2468)
+
+    with (
+        patch("gza_server.cli.sys.platform", "darwin"),
+        patch("gza_server.cli.subprocess.run", side_effect=ps_lstart),
+        patch.dict(os.environ, {"LC_ALL": "de_DE.UTF-8", "TZ": "Asia/Tokyo"}),
+    ):
+        second = process_start_id(2468)
+
+    assert first == second == "C UTC Mon Aug 17 05:01:02 2026"
+
+
 def test_start_rejects_an_existing_live_server(tmp_path):
     path = tmp_path / "gza-server.json"
     _write_state(path)
@@ -192,6 +241,43 @@ def test_stop_terminates_live_process_and_removes_state(tmp_path):
     assert not path.exists()
 
 
+def test_stop_darwin_owned_pid_survives_caller_locale_environment_change(tmp_path):
+    path = tmp_path / "gza-server.json"
+
+    def ps_lstart(*_args, **kwargs):
+        env = kwargs["env"]
+        assert env["LC_ALL"] == "C"
+        assert env["TZ"] == "UTC"
+        return Mock(returncode=0, stdout="Mon Aug 17 05:01:02 2026\n")
+
+    with (
+        patch("gza_server.cli.sys.platform", "darwin"),
+        patch("gza_server.cli.subprocess.run", side_effect=ps_lstart),
+        patch.dict(os.environ, {"LC_ALL": "en_US.UTF-8", "TZ": "America/Los_Angeles"}),
+    ):
+        start_id = process_start_id(1234)
+
+    assert start_id is not None
+    _write_state(path, process_start_id=start_id)
+
+    with (
+        patch("gza_server.cli.sys.platform", "darwin"),
+        patch("gza_server.cli.subprocess.run", side_effect=ps_lstart),
+        patch.dict(os.environ, {"LC_ALL": "de_DE.UTF-8", "TZ": "Asia/Tokyo"}),
+        patch("gza_server.cli.process_is_alive", return_value=True),
+        patch("gza_server.cli.urlopen", return_value=_health_response()),
+        patch(
+            "gza_server.cli._wait_for_owned_process_exit",
+            return_value=IdentityStatus.DEAD,
+        ),
+        patch("gza_server.cli.os.kill") as kill,
+    ):
+        assert stop_server(path) == "stopped"
+
+    kill.assert_called_once_with(1234, signal.SIGTERM)
+    assert not path.exists()
+
+
 def test_stop_removes_stale_state_without_signalling(tmp_path):
     path = tmp_path / "gza-server.json"
     _write_state(path)
@@ -239,6 +325,32 @@ def test_stop_handles_process_exiting_before_sigterm(tmp_path):
     assert not path.exists()
 
 
+def test_stop_with_no_start_marker_waits_through_refused_health_after_sigterm(tmp_path):
+    path = tmp_path / "gza-server.json"
+    _write_state(path)
+    with (
+        patch(
+            "gza_server.cli.process_is_alive",
+            side_effect=[True, True, True, False],
+        ),
+        patch(
+            "gza_server.cli.urlopen",
+            side_effect=[
+                _health_response(),
+                _health_response(),
+                URLError("refused"),
+            ],
+        ),
+        patch("gza_server.cli.time.sleep") as sleep,
+        patch("gza_server.cli.os.kill") as kill,
+    ):
+        assert stop_server(path) == "stopped"
+
+    kill.assert_called_once_with(1234, signal.SIGTERM)
+    sleep.assert_called_once_with(0.05)
+    assert not path.exists()
+
+
 def test_stop_force_terminates_verified_process_after_endpoint_disappears(tmp_path):
     path = tmp_path / "gza-server.json"
     _write_state(path, process_start_id="stable-start")
@@ -263,6 +375,26 @@ def test_stop_force_terminates_verified_process_after_endpoint_disappears(tmp_pa
     ]
     urlopen_mock.assert_called_once()
     assert not path.exists()
+
+
+def test_stop_with_no_start_marker_preserves_state_when_health_unverifiable_before_signal(
+    tmp_path,
+):
+    path = tmp_path / "gza-server.json"
+    _write_state(path)
+    with (
+        patch("gza_server.cli.process_is_alive", return_value=True),
+        patch(
+            "gza_server.cli.urlopen",
+            side_effect=[_health_response(), URLError("refused")],
+        ),
+        patch("gza_server.cli.os.kill") as kill,
+    ):
+        with pytest.raises(LifecycleError, match="cannot stop.*state was preserved"):
+            stop_server(path)
+
+    kill.assert_not_called()
+    assert path.exists()
 
 
 def test_stop_does_not_sigterm_pid_whose_start_marker_changed(tmp_path):
