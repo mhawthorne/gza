@@ -63,6 +63,7 @@ StoreFactory = Callable[[], TaskStore]
 MutationStoreFactory = Callable[[str], SqliteTaskStore]
 _TEMPLATES = Jinja2Templates(directory=Path(__file__).parent / "templates")
 _STATIC_DIR = Path(__file__).parent / "static"
+_DASHBOARD_RECENT_ROWS = 10
 
 
 @dataclass(frozen=True)
@@ -309,10 +310,28 @@ def create_app(
 
     @app.get("/")
     def index(request: Request):
+        store = cast(SqliteTaskStore, make_store())
+        counts = store.get_status_counts(all_projects=True)
+        # Show every status in its canonical order, including the empty ones:
+        # a zero is information, and a disappearing cell moves its neighbours.
+        status_counts = [
+            {"status": status, "count": counts.get(status, 0)} for status in TASK_STATUSES
+        ]
+        recent = query_task_list(
+            store,
+            TaskListFilters(),
+            page=PageSpec(page=1, per_page=_DASHBOARD_RECENT_ROWS),
+        )
         return _TEMPLATES.TemplateResponse(
             request=request,
             name="index.html",
-            context={"version": __version__},
+            context={
+                "version": __version__,
+                "status_counts": status_counts,
+                "total_tasks": sum(counts.values()),
+                "project_count": len(store.project_query_stores()),
+                "recent": recent.rows,
+            },
         )
 
     @app.get("/tasks")

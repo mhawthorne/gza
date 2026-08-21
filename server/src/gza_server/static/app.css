@@ -268,6 +268,29 @@ section { margin-top: var(--space-8); }
 .markdown > :last-child { margin-bottom: 0; }
 .markdown pre { overflow-x: auto; padding: var(--space-3); background: var(--surface-raised); border-radius: var(--radius); }
 
+details.tag-editor {
+  max-width: 44rem;
+  margin-top: var(--space-4);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+details.tag-editor > summary {
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  color: var(--ink-dim);
+  list-style-position: inside;
+}
+details.tag-editor > summary:hover { color: var(--signal); }
+/* Keep the heading semantic but let it sit inline in the disclosure row. */
+details.tag-editor > summary h2 {
+  display: inline;
+  font-size: var(--text-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+details.tag-editor[open] > summary { border-bottom: 1px solid var(--hairline); }
+details.tag-editor > *:not(summary) { margin-inline: var(--space-3); }
 .tag-editor { max-width: 44rem; }
 .tag-editor .tag-choice { display: inline-flex; gap: var(--space-1); align-items: center; margin-right: var(--space-3); }
 
@@ -278,3 +301,60 @@ section { margin-top: var(--space-8); }
 .content-editor { max-width: 52rem; }
 .content-editor label { display: block; margin-bottom: var(--space-1); font-weight: 600; }
 .content-editor textarea { box-sizing: border-box; width: 100%; resize: vertical; }
+
+/* ---- Dashboard ---- */
+
+.status-board {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr));
+  gap: 1px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  background: var(--hairline);
+  border: 1px solid var(--hairline);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+.status-cell { background: var(--surface); }
+
+.status-cell a {
+  display: block;
+  padding: var(--space-3);
+  text-decoration: none;
+  /* The status hue is carried by a left rule, so the count stays legible. */
+  border-left: 2px solid var(--status-pending);
+}
+.status-cell a:hover { background: var(--surface-raised); }
+
+.status-cell-count {
+  display: block;
+  font-size: var(--text-xl);
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.1;
+}
+.status-cell-label {
+  display: block;
+  margin-top: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--ink-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.status-cell-pending a { border-left-color: var(--status-pending); }
+.status-cell-in_progress a { border-left-color: var(--status-in-progress); }
+.status-cell-completed a { border-left-color: var(--status-completed); }
+.status-cell-failed a { border-left-color: var(--status-failed); }
+.status-cell-unmerged a { border-left-color: var(--status-unmerged); }
+.status-cell-dropped a { border-left-color: var(--status-dropped); }
+
+.build {
+  margin-top: var(--space-8);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--hairline);
+  font-size: var(--text-xs);
+  color: var(--ink-faint);
+}

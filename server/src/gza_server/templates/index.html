@@ -1,7 +1,49 @@
 {% extends "base.html" %}
 {% block title %}gza server{% endblock %}
 {% block content %}
-  <h1>gza server</h1>
-  <p>The local gza API and web UI are running.</p>
-  <p>Version {{ version }}</p>
+  <h1>Console</h1>
+
+  <section class="board">
+    <h2>Tasks by status</h2>
+    <ul class="status-board">
+      {% for entry in status_counts %}
+        <li class="status-cell status-cell-{{ entry.status }}">
+          <a href="/tasks?status={{ entry.status }}">
+            <span class="status-cell-count">{{ entry.count }}</span>
+            <span class="status-cell-label">{{ entry.status.replace("_", " ") }}</span>
+          </a>
+        </li>
+      {% endfor %}
+    </ul>
+    <p class="muted">
+      <a href="/tasks">{{ total_tasks }} task{% if total_tasks != 1 %}s{% endif %}</a>
+      across {{ project_count }} project{% if project_count != 1 %}s{% endif %}
+    </p>
+  </section>
+
+  <section>
+    <h2>Recently updated</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Type</th><th>Status</th><th>Prompt</th><th>Updated</th></tr>
+        </thead>
+        <tbody>
+          {% for row in recent %}
+            <tr data-task-id="{{ row.id }}">
+              <td><a href="{{ row.detail_url }}">{{ row.id }}</a></td>
+              <td>{{ row.type }}</td>
+              <td><span class="status status-{{ row.status }}">{{ row.status }}</span></td>
+              <td class="prompt"><a href="{{ row.detail_url }}">{{ row.prompt_excerpt }}</a></td>
+              <td>{{ row.age }}</td>
+            </tr>
+          {% else %}
+            <tr><td colspan="5" class="empty">No tasks yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="build">gza-server {{ version }}</footer>
 {% endblock %}
