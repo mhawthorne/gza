@@ -22,9 +22,9 @@ Gza reads configuration from three YAML layers:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `project_id` | String | *(local DB: `default`; shared DB: required)* | Project identity used to scope rows in shared DB mode. In shared mode, `project_id: default` is invalid and omitting `project_id` is an error. `gza init` persists a stable readable `project_id` for new projects. Older shared-DB configs that never persisted one must add the legacy derived ID explicitly, or run `gza migrate --import-local-db` to persist that identity while importing a legacy local DB, even when shared mode is inherited from `~/.gza/config.yaml`, `gza.local.yaml`, or `GZA_DB_PATH`. |
+| `project_id` | String | *(local DB: `default`; shared DB: required)* | Project identity used to scope rows in shared DB mode. In shared mode, `project_id: default` is invalid and omitting `project_id` is an error. `gza init` persists a stable readable `project_id` for new projects. Older shared-DB configs that never persisted one must add the legacy derived ID explicitly, or run `uv run gza migrate --import-local-db` to persist that identity while importing a legacy local DB, even when shared mode is inherited from `~/.gza/config.yaml`, `gza.local.yaml`, or `GZA_DB_PATH`. |
 | `project_prefix` | String | *(project_name)* | Short prefix for task IDs (1–12 chars, lowercase alphanumeric only — no hyphens, since hyphen is the separator in task IDs like `gza-1234`). Defaults to `project_name`. |
-| `db_path` | String | `.gza/gza.db` | Task DB path. Shared DB mode is opt-in via an explicit path (for example `~/.gza/gza.db`). `gza init` now asks you to choose local vs shared DB mode; in non-interactive runs you must pass `--db local` or `--db shared` (optionally with `--db-path PATH`). If a legacy local `.gza/gza.db` exists when using shared mode, either import it with `gza migrate --import-local-db` or pin the project back to local with `db_path: .gza/gza.db`. `GZA_DB_PATH` overrides this value at runtime. |
+| `db_path` | String | `.gza/gza.db` | Task DB path. Shared DB mode is opt-in via an explicit path (for example `~/.gza/gza.db`). `gza init` now asks you to choose local vs shared DB mode; in non-interactive runs you must pass `--db local` or `--db shared` (optionally with `--db-path PATH`). If a legacy local `.gza/gza.db` exists when using shared mode, either import it with `uv run gza migrate --import-local-db` or pin the project back to local with `db_path: .gza/gza.db`. `GZA_DB_PATH` overrides this value at runtime. |
 | `tasks_file` | String | `tasks.yaml` | Path to legacy tasks file |
 | `log_dir` | String | `.gza/logs` | Directory for log files |
 | `use_docker` | Boolean | `true` | Whether to run Claude in Docker container |
@@ -937,6 +937,37 @@ By default the execution path follows `use_docker` from config. Use `--docker`
 or `--no-docker` to override that for the check. Docker preflights require API
 keys in the container environment; OAuth or keychain-backed credentials do not
 propagate into containers.
+
+### projects
+
+Inspect and repair project registry rows used by shared-DB project resolution.
+
+```bash
+uv run gza projects diagnose
+uv run gza projects register --project /work/moved-project --replace
+uv run gza projects register --project /work/anchor --path /work/anchor/server --replace
+uv run gza projects deactivate old-alias --project /work/anchor
+```
+
+Run these commands from the project root. `uv run gza projects register`
+validates the target root, `gza.yaml`, `Config.load()`
+result, project identity, and resolved DB path before writing the registry row.
+If a row already has non-empty canonical paths, relocation is refused unless
+`--replace` is supplied. `--project-id ID` can be used as an extra assertion
+that the target config resolves to the intended project.
+For an existing DB, registry writes require the current schema and do not run
+automatic migrations or task/artifact backfills; upgrade the DB intentionally
+before retrying a refused registry repair. A missing DB is initialized only for
+first registration.
+
+`uv run gza projects diagnose` is non-destructive. It reports executable rows and
+invalid rows such as empty paths, missing roots/configs, project-ID mismatches,
+DB-path mismatches, and duplicate canonical path pairs.
+
+`uv run gza projects deactivate PROJECT_ID` blanks a named non-current row's
+canonical root/config paths without deleting the row or its tasks. The currently
+selected project row cannot be deactivated, even with `--force`; repair it with
+`uv run gza projects register --project PATH --replace` instead.
 
 ### flaky
 
@@ -2199,7 +2230,7 @@ Each task panel title includes the task ID, type, status, and, when known, the f
 Run pending manual database migrations. This includes v25 (INTEGER primary keys to project-prefixed base36 TEXT IDs) and v26 (base36 TEXT IDs to project-prefixed decimal IDs like `gza-1234`).
 
 ```bash
-gza migrate [--status] [--dry-run] [--yes/-y] [--import-local-db]
+uv run gza migrate [--status] [--dry-run] [--yes/-y] [--import-local-db]
 ```
 
 | Option | Description |
@@ -2209,7 +2240,7 @@ gza migrate [--status] [--dry-run] [--yes/-y] [--import-local-db]
 | `--yes`, `-y` | Skip the confirmation prompt and run migrations immediately |
 | `--import-local-db` | Import legacy project-local `.gza/gza.db` rows into active shared `db_path`; if shared mode still omits `project_id`, persist the legacy derived identity once before import and record an idempotent marker |
 
-When run without flags, `gza migrate` prompts for confirmation before applying migrations. Each migration is atomic (wrapped in BEGIN/COMMIT/ROLLBACK) and creates a pre-migration backup (for example, `<db_path>.backup.pre-v25.db` and `<db_path>.backup.pre-v26.db`). It is safe to re-run: calling it on an already-migrated database is a no-op.
+When run without flags, `uv run gza migrate` prompts for confirmation before applying migrations. Each migration is atomic (wrapped in BEGIN/COMMIT/ROLLBACK) and creates a pre-migration backup (for example, `<db_path>.backup.pre-v25.db` and `<db_path>.backup.pre-v26.db`). It is safe to re-run: calling it on an already-migrated database is a no-op.
 
 On successful migration, the backup path is printed to stdout so you can locate it for rollback if needed.
 
@@ -2217,9 +2248,9 @@ Task IDs start at `{prefix}-1` for new databases (there is no `{prefix}-0`) and 
 
 Task ID validation is format-based (`{prefix}-{decimal}`) and does not require the prefix to match your current `project_prefix`. A mismatched but valid full ID is accepted by parsing and then fails later as "not found" if it does not exist in the current project database.
 
-If a `ManualMigrationRequired` error appears when running any other command, run `gza migrate` to upgrade the database schema.
+If a `ManualMigrationRequired` error appears when running any other command, run `uv run gza migrate` to upgrade the database schema.
 
-When shared DB mode is active (explicit `db_path`) and a legacy local `.gza/gza.db` is detected, task commands stop with an explicit message until you either run `gza migrate --import-local-db` or pin the project back to local with `db_path: .gza/gza.db`.
+When shared DB mode is active (explicit `db_path`) and a legacy local `.gza/gza.db` is detected, task commands stop with an explicit message until you either run `uv run gza migrate --import-local-db` or pin the project back to local with `db_path: .gza/gza.db`.
 
 ### set-status
 

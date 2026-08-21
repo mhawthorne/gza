@@ -653,5 +653,5 @@ class TestSharedDbImportCli:
 
         assert result.returncode == 1
         assert "Database requires manual migration(s): v25" in result.stderr
-        assert "Run 'gza migrate' to upgrade the database." in result.stderr
+        assert "Run 'uv run gza migrate' to upgrade the database." in result.stderr
         assert "Traceback" not in result.stderr

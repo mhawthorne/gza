@@ -10454,6 +10454,8 @@ class TestExecutionProjectResolver:
         assert "Project registry path conflict for shared" in linked_warning
         assert str(linked.resolve()) in linked_warning
         assert canonical_root in linked_warning
+        assert f"projects register --project {linked.resolve()}" not in linked_warning
+        assert "observed path is a linked or task worktree and cannot be registered as canonical" in linked_warning
 
     def test_execution_resolution_does_not_apply_repairable_startup_writes(self, tmp_path: Path) -> None:
         from gza.config import Config

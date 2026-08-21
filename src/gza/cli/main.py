@@ -3,6 +3,7 @@
 import argparse
 import atexit
 import importlib.metadata
+import stat
 import sys
 import time
 from collections.abc import Sequence
@@ -53,6 +54,7 @@ from .config_cmds import (
     cmd_init,
     cmd_learnings,
     cmd_preflight,
+    cmd_projects,
     cmd_skills_install,
     cmd_stats,
     cmd_sync_report,
@@ -1774,6 +1776,46 @@ def main() -> int:
     )
     add_common_args(config_parser)
 
+    # projects command
+    projects_parser = subparsers.add_parser("projects", help="Inspect and repair project registry rows")
+    projects_subparsers = projects_parser.add_subparsers(dest="projects_action")
+    projects_register_parser = projects_subparsers.add_parser(
+        "register",
+        help="Register or intentionally replace a project's canonical registry path",
+    )
+    projects_register_parser.add_argument(
+        "--path",
+        type=Path,
+        help="Project root to register; defaults to the selected --project root",
+    )
+    projects_register_parser.add_argument(
+        "--project-id",
+        help="Assert that the target config resolves to this project_id before registering",
+    )
+    projects_register_parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Intentionally replace an existing non-empty canonical path for this project_id",
+    )
+    add_common_args(projects_register_parser)
+    projects_diagnose_parser = projects_subparsers.add_parser(
+        "diagnose",
+        help="Report invalid, missing, mismatched, and duplicate project registry rows",
+    )
+    add_common_args(projects_diagnose_parser)
+    projects_deactivate_parser = projects_subparsers.add_parser(
+        "deactivate",
+        help="Blank a named registry row's canonical paths without deleting tasks",
+    )
+    projects_deactivate_parser.add_argument("project_id", help="Project registry row ID to deactivate")
+    projects_deactivate_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Accepted for compatibility; the currently selected project row is still refused",
+    )
+    add_common_args(projects_deactivate_parser)
+    projects_parser.set_defaults(func=cmd_projects)
+
     # clean command
     clean_parser = subparsers.add_parser(
         "clean",
@@ -3243,7 +3285,18 @@ def main() -> int:
             project_explicit = raw_project is not None
             args.project_dir = Path(raw_project or ".").resolve()
             setattr(args, "project_explicit", project_explicit)
-            if not args.project_dir.is_dir():
+            try:
+                project_stat = args.project_dir.stat()
+            except FileNotFoundError:
+                print(f"Error: {args.project_dir} is not a directory")
+                return 1
+            except OSError as exc:
+                print(
+                    f"Error: project path is invalid or inaccessible: {raw_project or '.'} ({exc})",
+                    file=sys.stderr,
+                )
+                return 1
+            if not stat.S_ISDIR(project_stat.st_mode):
                 print(f"Error: {args.project_dir} is not a directory")
                 return 1
             if not project_explicit:
@@ -3252,6 +3305,9 @@ def main() -> int:
                 except ConfigError:
                     # Let the command-specific config load surface the normal error path.
                     pass
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Error: project path is invalid or inaccessible: {raw_project or '.'} ({exc})", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         return _keyboard_interrupt_exit()
 
@@ -3337,6 +3393,8 @@ def main() -> int:
             return cmd_validate(args)
         elif args.command == "preflight":
             return cmd_preflight(args)
+        elif args.command == "projects":
+            return cmd_projects(args)
         elif args.command == "config":
             if getattr(args, "config_action", None) == "keys":
                 return cmd_config_keys(args)
@@ -3407,7 +3465,7 @@ def main() -> int:
         return _keyboard_interrupt_exit()
     except ManualMigrationRequired as e:
         print(f"Error: {e}", file=sys.stderr)
-        print("Run 'gza migrate' to upgrade the database.", file=sys.stderr)
+        print("Run 'uv run gza migrate' to upgrade the database.", file=sys.stderr)
         return 1
     except ConfigError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -3421,7 +3479,7 @@ def main() -> int:
     except SchemaIntegrityError as e:
         print(f"Error: {e}", file=sys.stderr)
         print(
-            "Run 'gza migrate' with a writable database (or restore schema artifacts), then retry.",
+            "Run 'uv run gza migrate' with a writable database (or restore schema artifacts), then retry.",
             file=sys.stderr,
         )
         return 1

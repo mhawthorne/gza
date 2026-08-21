@@ -1148,6 +1148,8 @@ def _read_yaml_dict(path: Path) -> dict:
             data = yaml.safe_load(f) or {}
     except UnicodeError as exc:
         raise ConfigError(f"Configuration in {path} could not be decoded as text: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"Configuration in {path} is not valid YAML: {exc}") from exc
     if not isinstance(data, dict):
         raise ConfigError(f"Configuration in {path} must be a YAML dictionary/object")
     return data
@@ -1869,6 +1871,12 @@ class Config:
 
         try:
             user_data = _read_yaml_dict(user_path)
+        except ConfigError as exc:
+            if isinstance(exc.__cause__, yaml.YAMLError):
+                raise ConfigError(
+                    f"Invalid YAML syntax in {cls.user_config_display_path()}: {exc.__cause__}"
+                ) from exc.__cause__
+            raise
         except yaml.YAMLError as exc:
             raise ConfigError(
                 f"Invalid YAML syntax in {cls.user_config_display_path()}: {exc}"

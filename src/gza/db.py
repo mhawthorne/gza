@@ -4,11 +4,13 @@ import json
 import logging
 import os
 import re
+import shlex
 import sqlite3
 import subprocess
 import tempfile
 import threading
 import time
+from _thread import RLock as RLockType
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -59,6 +61,7 @@ __all__ = [
     "ManualMigrationRequired",
     "MergeTargetResolutionError",
     "NewTaskParams",
+    "ProjectRegistryEntry",
     "RebaseBranchResolutionError",
     "SchemaIntegrityError",
     "Task",
@@ -72,6 +75,8 @@ __all__ = [
     "TaskStats",
     "SqliteTaskStore",
     "extract_failure_reason",
+    "classify_existing_execution_db",
+    "is_canonical_project_checkout",
     "run_v25_migration",
     "run_v26_migration",
     "run_v27_migration",
@@ -87,8 +92,9 @@ __all__ = [
     "behavior_check_finding_fingerprint",
 ]
 
-StoreOpenMode = Literal["readwrite", "query_only"]
+StoreOpenMode = Literal["readwrite", "query_only", "registry_mutation", "registry_mutation_existing"]
 SqliteIsolationLevel = Literal["DEFERRED", "EXCLUSIVE", "IMMEDIATE"] | None
+_DbFileIdentity = tuple[int, int]
 ExecutionProjectSelectorKind = Literal["path", "registry_id"]
 ExecutionProjectDisableReason = Literal[
     "empty_root_path",
@@ -115,7 +121,7 @@ TASK_COMMENT_KINDS: frozenset[str] = frozenset(
     }
 )
 
-_SCHEMA_BOOTSTRAP_LOCKS: dict[Path, threading.Lock] = {}
+_SCHEMA_BOOTSTRAP_LOCKS: dict[Path, RLockType] = {}
 _SCHEMA_BOOTSTRAP_LOCKS_GUARD = threading.Lock()
 
 
@@ -341,6 +347,17 @@ class ExecutionProjectDisabled:
 
 
 @dataclass(frozen=True)
+class ProjectRegistryEntry:
+    """One raw project registry row for diagnostics and repair commands."""
+
+    project_id: str
+    root_path: str
+    config_path: str
+    project_name: str
+    project_prefix: str
+
+
+@dataclass(frozen=True)
 class _ExecutionProjectCandidate:
     selector: ExecutionProjectSelector
     selected_project_id: str
@@ -550,6 +567,13 @@ def _classify_existing_execution_db(
     return None
 
 
+def classify_existing_execution_db(
+    db_path: Path,
+) -> tuple[ExecutionProjectDisableReason, str] | None:
+    """Classify whether an execution DB can be safely activated for writes."""
+    return _classify_existing_execution_db(db_path)
+
+
 def _pending_manual_migration_versions(db_path: Path) -> list[int]:
     if not db_path.exists():
         return []
@@ -573,12 +597,12 @@ def _pending_manual_migration_versions(db_path: Path) -> list[int]:
     ]
 
 
-def _schema_bootstrap_lock(db_path: Path) -> threading.Lock:
+def _schema_bootstrap_lock(db_path: Path) -> RLockType:
     resolved = db_path.resolve()
     with _SCHEMA_BOOTSTRAP_LOCKS_GUARD:
         lock = _SCHEMA_BOOTSTRAP_LOCKS.get(resolved)
         if lock is None:
-            lock = threading.Lock()
+            lock = threading.RLock()
             _SCHEMA_BOOTSTRAP_LOCKS[resolved] = lock
         return lock
 
@@ -701,6 +725,11 @@ def _is_canonical_project_checkout(path: Path) -> bool:
     except (OSError, RuntimeError, ValueError):
         return False
     return False
+
+
+def is_canonical_project_checkout(path: Path) -> bool:
+    """Return whether ``path`` is safe to persist as a canonical registry root."""
+    return _is_canonical_project_checkout(path)
 
 
 def _execution_project_registry_row(
@@ -1167,6 +1196,7 @@ def _timed_sqlite_connect(
     isolation_level: SqliteIsolationLevel,
     timeout: float,
     factory: type[sqlite3.Connection],
+    uri: bool = False,
 ) -> sqlite3.Connection:
     """Open a sqlite connection and record one aggregate connect observation."""
     if not metrics.enabled():
@@ -1175,6 +1205,7 @@ def _timed_sqlite_connect(
             isolation_level=isolation_level,
             timeout=timeout,
             factory=factory,
+            uri=uri,
         )
     started = time.perf_counter()
     try:
@@ -1183,6 +1214,7 @@ def _timed_sqlite_connect(
             isolation_level=isolation_level,
             timeout=timeout,
             factory=factory,
+            uri=uri,
         )
     finally:
         _observe_sqlite_latency(time.perf_counter() - started, labels=_SQLITE_CONNECT_LABELS)
@@ -1552,14 +1584,14 @@ def _coalesce_task_timestamp(*timestamps: datetime | None) -> datetime:
 class ManualMigrationRequired(Exception):
     """Raised when the DB needs a manual schema migration (e.g. v25/v26).
 
-    Callers should run ``gza migrate`` (or call the relevant manual migration)
+    Callers should run ``uv run gza migrate`` (or call the relevant manual migration)
     and then re-open the store.
     """
 
     def __init__(self, pending_versions: list[int]) -> None:
         self.pending_versions = pending_versions
         versions_str = ", ".join(f"v{v}" for v in pending_versions)
-        super().__init__(f"Database requires manual migration(s): {versions_str}. Run 'gza migrate' to upgrade.")
+        super().__init__(f"Database requires manual migration(s): {versions_str}. Run 'uv run gza migrate' to upgrade.")
 
 
 def _compute_percentiles(values: list[float]) -> dict | None:
@@ -3504,6 +3536,18 @@ def _missing_required_columns(conn: sqlite3.Connection, table: str, required_col
     return [column for column in required_columns if not _table_has_column(conn, table, column)]
 
 
+_REGISTRY_MUTATION_REQUIRED_PROJECT_COLUMNS = (
+    "id",
+    "root_path",
+    "config_path",
+    "project_name",
+    "project_prefix",
+    "db_layout_version",
+    "created_at",
+    "last_seen_at",
+)
+
+
 def _supports_main_verify_remediation_attempts_table(conn: sqlite3.Connection) -> bool:
     """Return True when the remediation ledger exists with the full required schema."""
     return (
@@ -5263,6 +5307,8 @@ class SqliteTaskStore:
         self._open_mode = open_mode
         self._startup_warnings: list[str] = []
         self._query_only_empty_db = False
+        self._existing_db_uri_mode: Literal["ro", "rw"] | None = None
+        self._registry_mutation_validated_identity: _DbFileIdentity | None = None
         self._query_only_table_exists: dict[str, bool] = {}
         self._query_only_columns: dict[str, set[str]] = {}
         self._write_pragmas_applied = False
@@ -5275,6 +5321,10 @@ class SqliteTaskStore:
         self._read_session_index_lock = threading.RLock()
         if self._open_mode == "query_only":
             self._ensure_db_query_only()
+        elif self._open_mode == "registry_mutation":
+            self._ensure_db_registry_mutation_bootstrap()
+        elif self._open_mode == "registry_mutation_existing":
+            self._ensure_db_registry_mutation_existing()
         else:
             self._ensure_db()
             self.repair_inconsistent_unmerged_merge_units()
@@ -5445,14 +5495,16 @@ class SqliteTaskStore:
         self._default_merge_target_cache = "main"
         return "main"
 
-    def _ensure_db(self) -> None:
+    def _ensure_db(self, *, allow_bootstrap: bool = True) -> None:
         """Ensure database exists and schema is current.
 
         Raises:
             ManualMigrationRequired: When the DB needs a manual migration (e.g. v25/v26).
-                The caller should run ``gza migrate`` then re-open the store.
+                The caller should run ``uv run gza migrate`` then re-open the store.
         """
         with _schema_bootstrap_lock(self.db_path):
+            if not allow_bootstrap and not self.db_path.exists():
+                raise SchemaIntegrityError(f"Registry DB disappeared before mutation: {self.db_path}")
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             with self._connect() as conn:
                 cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
@@ -5561,6 +5613,139 @@ class SqliteTaskStore:
                 # or partial migrations removed them.
                 _ensure_required_auto_migration_artifacts(conn, target_version=SCHEMA_VERSION)
 
+    def _db_file_identity(self) -> _DbFileIdentity:
+        stat_result = self.db_path.stat()
+        return (stat_result.st_dev, stat_result.st_ino)
+
+    def _validate_registry_mutation_schema(self, conn: sqlite3.Connection) -> None:
+        if not _table_exists(conn, "schema_version"):
+            raise SchemaIntegrityError(
+                "Database is missing schema_version; existing databases are not initialized implicitly."
+            )
+
+        row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
+        current_version, schema_version_error = _parse_schema_version_value(
+            self.db_path,
+            row["version"] if row else None,
+        )
+        if schema_version_error is not None or current_version is None:
+            raise SchemaIntegrityError(schema_version_error or f"Database {self.db_path} has no schema_version row.")
+        if current_version > SCHEMA_VERSION:
+            raise SchemaIntegrityError(
+                f"Database schema v{current_version} is newer than supported v{SCHEMA_VERSION}."
+            )
+
+        pending_manual = [
+            target_version
+            for target_version, _migration_sql in _MIGRATIONS
+            if current_version < target_version and target_version in _MANUAL_MIGRATION_VERSIONS
+        ]
+        if pending_manual:
+            raise ManualMigrationRequired(pending_manual)
+
+        if current_version != SCHEMA_VERSION:
+            raise SchemaIntegrityError(
+                f"Registry mutation requires database schema v{SCHEMA_VERSION}; "
+                f"{self.db_path} is at v{current_version}. "
+                "Run 'uv run gza migrate' from the project root to upgrade the database, "
+                "then retry the registry command."
+            )
+
+        if not _table_exists(conn, "projects"):
+            raise SchemaIntegrityError(
+                f"Registry mutation requires table projects in schema v{SCHEMA_VERSION}; "
+                "run 'uv run gza migrate' from the project root, then retry."
+            )
+        missing_project_columns = _missing_required_columns(
+            conn,
+            "projects",
+            _REGISTRY_MUTATION_REQUIRED_PROJECT_COLUMNS,
+        )
+        if missing_project_columns:
+            raise SchemaIntegrityError(
+                "Registry mutation requires current projects schema; missing column "
+                f"projects.{missing_project_columns[0]}. "
+                "Run 'uv run gza migrate' from the project root, then retry."
+            )
+
+    def _ensure_db_registry_mutation_bootstrap(self) -> None:
+        """Create a first registry DB without writing bootstrap state at the public path."""
+        with _schema_bootstrap_lock(self.db_path):
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{self.db_path.name}.",
+                suffix=".tmp",
+                dir=self.db_path.parent,
+            )
+            os.close(fd)
+            public_path = self.db_path
+            temp_path = Path(temp_name)
+            try:
+                self.db_path = temp_path
+                created_identity = self._db_file_identity()
+                self._registry_mutation_validated_identity = created_identity
+                self._ensure_db(allow_bootstrap=False)
+
+                self._checkpoint_private_registry_bootstrap(temp_path)
+                self._registry_mutation_validated_identity = None
+                self.db_path = public_path
+                try:
+                    os.link(temp_path, public_path)
+                except FileExistsError as exc:
+                    raise SchemaIntegrityError(
+                        f"Registry DB appeared before mutation: {public_path}. "
+                        "Retry the registry command after inspecting the database."
+                    ) from exc
+                self._registry_mutation_validated_identity = self._db_file_identity()
+            except Exception:
+                self._registry_mutation_validated_identity = None
+                raise
+            finally:
+                self.db_path = public_path
+                self._cleanup_private_registry_bootstrap(temp_path)
+
+    def _checkpoint_private_registry_bootstrap(self, temp_path: Path) -> None:
+        """Flush private bootstrap WAL state before publishing only the main DB file."""
+        uri = temp_path.resolve().as_uri() + "?mode=rw"
+        with sqlite3.connect(
+            uri,
+            uri=True,
+            isolation_level=None,
+            timeout=30,
+            factory=_ClosingSqliteConnection,
+        ) as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def _cleanup_private_registry_bootstrap(self, temp_path: Path) -> None:
+        """Remove only private bootstrap artifacts created for one registry attempt."""
+        paths = [temp_path, *(Path(f"{temp_path}{suffix}") for suffix in ("-wal", "-shm", "-journal"))]
+        for path in paths:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                continue
+
+    def _ensure_db_registry_mutation_existing(self) -> None:
+        """Validate an existing DB for registry-only writes without startup repairs."""
+        with _schema_bootstrap_lock(self.db_path):
+            if not self.db_path.exists():
+                raise SchemaIntegrityError(f"Registry DB disappeared before mutation: {self.db_path}")
+            validated_identity = self._db_file_identity()
+
+            uri = self.db_path.resolve().as_uri() + "?mode=ro"
+            with sqlite3.connect(
+                uri,
+                uri=True,
+                isolation_level=None,
+                timeout=30,
+                factory=_ClosingSqliteConnection,
+            ) as conn:
+                conn.row_factory = sqlite3.Row
+                self._validate_registry_mutation_schema(conn)
+            if self._db_file_identity() != validated_identity:
+                raise SchemaIntegrityError(f"Registry DB changed during validation: {self.db_path}")
+            self._registry_mutation_validated_identity = validated_identity
+            self._existing_db_uri_mode = "rw"
 
     def _ensure_db_query_only(self) -> None:
         """Open a store for best-effort reads without any startup writes."""
@@ -5568,6 +5753,7 @@ class SqliteTaskStore:
             self._query_only_empty_db = True
             return
 
+        self._existing_db_uri_mode = "ro"
         with self._connect() as conn:
             cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
             if cur.fetchone() is None:
@@ -5979,15 +6165,178 @@ class SqliteTaskStore:
     ) -> None:
         if not observed_root_path or not observed_config_path:
             return
+        if _is_canonical_project_checkout(Path(observed_root_path)):
+            guidance = (
+                "Keeping stored canonical paths; from the intended canonical checkout run "
+                f"`uv run gza projects register --project {shlex.quote(observed_root_path)} --replace` "
+                "to intentionally replace them."
+            )
+        else:
+            guidance = (
+                "Keeping stored canonical paths; the observed path is a linked or task worktree and cannot be "
+                "registered as canonical. Run `uv run gza projects register --project <canonical-checkout> --replace` "
+                "from or against the intended canonical checkout to intentionally replace them."
+            )
         warning = (
             f"Project registry path conflict for {self._project_id}: "
             f"stored root_path={stored_root_path!r}, config_path={stored_config_path!r}; "
             f"observed root_path={observed_root_path!r}, config_path={observed_config_path!r}. "
-            "Keeping stored canonical paths; canonical replacement is not yet available. "
+            f"{guidance} "
             "Use an explicit project path selector for this run if you need to bypass the registry row."
         )
         if warning not in self._startup_warnings:
             self._startup_warnings.append(warning)
+
+    def register_project_paths(
+        self,
+        *,
+        root_path: Path,
+        config_path: Path,
+        replace: bool = False,
+    ) -> Literal["inserted", "updated", "unchanged"]:
+        """Explicitly register or replace this project's canonical registry paths."""
+        return self.register_project_paths_for_identity(
+            project_id=self._project_id,
+            project_name=self._project_name or self._prefix,
+            project_prefix=self._prefix,
+            root_path=root_path,
+            config_path=config_path,
+            replace=replace,
+        )
+
+    def register_project_paths_for_identity(
+        self,
+        *,
+        project_id: str,
+        project_name: str,
+        project_prefix: str,
+        root_path: Path,
+        config_path: Path,
+        replace: bool = False,
+    ) -> Literal["inserted", "updated", "unchanged"]:
+        """Explicitly register or replace a project's canonical registry paths."""
+        now = _format_db_timestamp(datetime.now(UTC))
+        assert now is not None
+        root_text = str(root_path.resolve())
+        config_text = str(config_path.resolve())
+        with self._write_transaction() as conn:
+            existing = conn.execute(
+                "SELECT root_path, config_path FROM projects WHERE id = ?",
+                (project_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO projects (
+                        id, root_path, config_path, project_name, project_prefix,
+                        db_layout_version, created_at, last_seen_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project_id,
+                        root_text,
+                        config_text,
+                        project_name,
+                        project_prefix,
+                        SCHEMA_VERSION,
+                        now,
+                        now,
+                    ),
+                )
+                return "inserted"
+
+            stored_root = str(existing["root_path"] or "")
+            stored_config = str(existing["config_path"] or "")
+            stored_has_paths = bool(stored_root.strip() or stored_config.strip())
+            unchanged = (stored_root, stored_config) == (root_text, config_text)
+            if stored_has_paths and not unchanged and not replace:
+                raise ValueError(
+                    "Project registry already has canonical paths for "
+                    f"{project_id}: root_path={stored_root!r}, config_path={stored_config!r}. "
+                    "Use --replace to intentionally relocate this project."
+                )
+
+            conn.execute(
+                """
+                UPDATE projects
+                SET root_path = ?,
+                    config_path = ?,
+                    project_name = ?,
+                    project_prefix = ?,
+                    db_layout_version = ?,
+                    last_seen_at = ?
+                WHERE id = ?
+                """,
+                (
+                    root_text,
+                    config_text,
+                    project_name,
+                    project_prefix,
+                    SCHEMA_VERSION,
+                    now,
+                    project_id,
+                ),
+            )
+            return "unchanged" if unchanged else "updated"
+
+    def get_project_registry_entry(self, project_id: str) -> ProjectRegistryEntry | None:
+        """Return one raw project registry row without applying startup repairs."""
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, root_path, config_path, project_name, project_prefix
+                FROM projects
+                WHERE id = ?
+                """,
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ProjectRegistryEntry(
+            project_id=str(row["id"]),
+            root_path=str(row["root_path"] or ""),
+            config_path=str(row["config_path"] or ""),
+            project_name=str(row["project_name"] or ""),
+            project_prefix=str(row["project_prefix"] or ""),
+        )
+
+    def deactivate_project_registry_row(self, project_id: str) -> bool:
+        """Make a registry row non-executable without deleting its task/history data."""
+        now = _format_db_timestamp(datetime.now(UTC))
+        assert now is not None
+        with self._write_transaction() as conn:
+            cur = conn.execute(
+                """
+                UPDATE projects
+                SET root_path = '',
+                    config_path = '',
+                    last_seen_at = ?
+                WHERE id = ?
+                """,
+                (now, project_id),
+            )
+        return cur.rowcount > 0
+
+    def list_project_registry_entries(self) -> tuple[ProjectRegistryEntry, ...]:
+        """Return raw project registry rows ordered by project ID for diagnostics."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, root_path, config_path, project_name, project_prefix
+                FROM projects
+                ORDER BY id ASC
+                """
+            ).fetchall()
+        return tuple(
+            ProjectRegistryEntry(
+                project_id=str(row["id"]),
+                root_path=str(row["root_path"] or ""),
+                config_path=str(row["config_path"] or ""),
+                project_name=str(row["project_name"] or ""),
+                project_prefix=str(row["project_prefix"] or ""),
+            )
+            for row in rows
+        )
 
     def _project_registry_path_update(
         self,
@@ -6161,29 +6510,42 @@ class SqliteTaskStore:
             conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
             return conn
 
+        database: str | Path = self.db_path
+        uri = False
+        if self._existing_db_uri_mode is not None:
+            database = self.db_path.resolve().as_uri() + f"?mode={self._existing_db_uri_mode}"
+            uri = True
+
         conn = _timed_sqlite_connect(
-            self.db_path,
+            database,
             isolation_level=None,
             timeout=15,
             factory=factory,
+            uri=uri,
         )
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout=15000")
-        if self._open_mode == "query_only":
-            try:
-                conn.execute("PRAGMA query_only=ON")
-            except sqlite3.OperationalError:
-                pass
-            return conn
-        if not self._write_pragmas_applied:
-            for pragma in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"):
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=15000")
+            if self._open_mode == "query_only":
                 try:
-                    conn.execute(pragma)
-                except sqlite3.OperationalError as exc:
-                    if "readonly" not in str(exc).lower() and "read-only" not in str(exc).lower():
-                        raise
-            self._write_pragmas_applied = True
-        return conn
+                    conn.execute("PRAGMA query_only=ON")
+                except sqlite3.OperationalError:
+                    pass
+                return conn
+            if self._open_mode in {"registry_mutation", "registry_mutation_existing"}:
+                self._validate_registry_mutation_identity()
+            if not self._write_pragmas_applied:
+                for pragma in ("PRAGMA journal_mode=WAL", "PRAGMA synchronous=NORMAL"):
+                    try:
+                        conn.execute(pragma)
+                    except sqlite3.OperationalError as exc:
+                        if "readonly" not in str(exc).lower() and "read-only" not in str(exc).lower():
+                            raise
+                self._write_pragmas_applied = True
+            return conn
+        except Exception:
+            conn.close()
+            raise
 
     def _connect(self) -> sqlite3.Connection | _SessionSqliteConnectionProxy:
         """Create a database connection with auto-commit."""
@@ -6197,13 +6559,34 @@ class SqliteTaskStore:
             raise RuntimeError("write methods must not run inside an active read_session")
         return cast(sqlite3.Connection, self._connect())
 
+    def _validate_registry_mutation_identity(self) -> None:
+        if self._open_mode not in {"registry_mutation", "registry_mutation_existing"}:
+            return
+        validated_identity = self._registry_mutation_validated_identity
+        if validated_identity is None:
+            raise SchemaIntegrityError(f"Registry DB was not validated before mutation: {self.db_path}")
+        try:
+            current_identity = self._db_file_identity()
+        except FileNotFoundError as exc:
+            raise SchemaIntegrityError(f"Registry DB disappeared before mutation: {self.db_path}") from exc
+        if current_identity != validated_identity:
+            raise SchemaIntegrityError(f"Registry DB changed after validation: {self.db_path}")
+
+    def _validate_registry_mutation_transaction(self, conn: sqlite3.Connection) -> None:
+        if self._open_mode not in {"registry_mutation", "registry_mutation_existing"}:
+            return
+        self._validate_registry_mutation_identity()
+        self._validate_registry_mutation_schema(conn)
+
     @contextmanager
     def _write_transaction(self) -> Iterator[sqlite3.Connection]:
         """Open one immediate transaction for a mutation and its bookkeeping."""
         conn = self._require_write_connection()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            self._validate_registry_mutation_transaction(conn)
             yield conn
+            self._validate_registry_mutation_transaction(conn)
             conn.execute("COMMIT")
         except Exception:
             if conn.in_transaction:

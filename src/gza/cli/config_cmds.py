@@ -6,6 +6,9 @@ import json
 import logging
 import os
 import re
+import shlex
+import sqlite3
+import stat
 import sys
 import tempfile
 from collections import Counter, defaultdict
@@ -13,7 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from statistics import median
-from typing import Any, assert_never, cast
+from typing import Any, Literal, assert_never, cast
 
 from rich.table import Table
 
@@ -33,7 +36,21 @@ from ..config_examples import (
 )
 from ..config_schema import CONFIG_KEY_REGISTRY
 from ..console import console
-from ..db import SqliteTaskStore, Task, TaskArtifact, task_id_numeric_key
+from ..db import (
+    ExecutionProjectDisabled,
+    ExecutionProjectResolved,
+    ExecutionProjectSelector,
+    ManualMigrationRequired,
+    ProjectRegistryEntry,
+    SchemaIntegrityError,
+    SqliteTaskStore,
+    Task,
+    TaskArtifact,
+    classify_existing_execution_db,
+    is_canonical_project_checkout,
+    resolve_execution_projects,
+    task_id_numeric_key,
+)
 from ..git import Git
 from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..log_paths import paired_log_paths, slug_from_log_path
@@ -57,8 +74,394 @@ class _UnmergedCleanupSets:
     warnings: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class _RegistryConfigIntent:
+    root_path: Path
+    config_path: Path
+    db_path: Path
+    project_id: str
+    project_name: str
+    project_prefix: str
+
+
 class _UnmergedCleanupCollectionError(RuntimeError):
     """Raised when keep-unmerged preservation evidence cannot be collected safely."""
+
+
+def _validate_register_target(project_dir: Path, *, expected_project_id: str | None = None) -> Config:
+    try:
+        root_path = project_dir.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError(f"Project root path is invalid or inaccessible: {project_dir} ({exc})") from exc
+    try:
+        root_stat = root_path.stat()
+    except FileNotFoundError:
+        raise ConfigError(f"Project root does not exist or is not a directory: {root_path}") from None
+    except OSError as exc:
+        raise ConfigError(f"Project root path is invalid or inaccessible: {root_path} ({exc})") from exc
+    if not stat.S_ISDIR(root_stat.st_mode):
+        raise ConfigError(f"Project root does not exist or is not a directory: {root_path}")
+    config_path = Config.config_path(root_path)
+    if not config_path.is_file():
+        raise ConfigError(f"Project config does not exist or is not a file: {config_path}")
+    if not is_canonical_project_checkout(root_path):
+        raise ConfigError(f"Project root is not a canonical checkout: {root_path}")
+    try:
+        config = Config.load(root_path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError(f"Project config or DB path is invalid or inaccessible: {exc}") from exc
+    try:
+        loaded_config_path = Config.config_path(config.project_dir).resolve()
+        expected_config_path = config_path.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError(f"Project config path is invalid or inaccessible: {config_path} ({exc})") from exc
+    if loaded_config_path != expected_config_path:
+        raise ConfigError(f"Loaded config path {loaded_config_path} does not match expected {expected_config_path}")
+    if expected_project_id is not None and config.project_id != expected_project_id:
+        raise ConfigError(f"Loaded project_id {config.project_id!r} does not match expected {expected_project_id!r}")
+    try:
+        config.db_path.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError(f"Project DB path is invalid or inaccessible: {config.db_path} ({exc})") from exc
+    return config
+
+
+def _resolve_cli_project_path(path: Path, *, label: str) -> Path:
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError(f"{label} path is invalid or inaccessible: {path} ({exc})") from exc
+
+
+def _registry_config_intent(config: Config) -> _RegistryConfigIntent:
+    return _RegistryConfigIntent(
+        root_path=config.project_dir.resolve(),
+        config_path=Config.config_path(config.project_dir).resolve(),
+        db_path=_resolved_db_path(config),
+        project_id=config.project_id,
+        project_name=config.project_name,
+        project_prefix=config.project_prefix,
+    )
+
+
+def _reload_registry_intent(
+    intent: _RegistryConfigIntent,
+    *,
+    role: str,
+    expected_project_id: str | None = None,
+) -> tuple[Config, _RegistryConfigIntent]:
+    current_config = _validate_register_target(intent.root_path, expected_project_id=expected_project_id)
+    current_intent = _registry_config_intent(current_config)
+    if current_intent.config_path != intent.config_path:
+        raise ConfigError(
+            f"{role} config path changed before registry mutation: {current_intent.config_path}, "
+            f"expected {intent.config_path}."
+        )
+    if current_intent.root_path != intent.root_path:
+        raise ConfigError(
+            f"{role} project root changed before registry mutation: {current_intent.root_path}, "
+            f"expected {intent.root_path}."
+        )
+    if current_intent.project_id != intent.project_id:
+        raise ConfigError(
+            f"{role} project_id changed before registry mutation: {current_intent.project_id!r}, "
+            f"expected {intent.project_id!r}."
+        )
+    if current_intent.project_prefix != intent.project_prefix:
+        raise ConfigError(
+            f"{role} project_prefix changed before registry mutation: {current_intent.project_prefix!r}, "
+            f"expected {intent.project_prefix!r}."
+        )
+    if current_intent.db_path != intent.db_path:
+        raise ConfigError(
+            f"{role} DB path changed before registry mutation: {current_intent.db_path}, "
+            f"expected {intent.db_path}."
+        )
+    return current_config, current_intent
+
+
+def _activate_registry_mutation_store(
+    *,
+    anchor_intent: _RegistryConfigIntent,
+    target_intent: _RegistryConfigIntent | None = None,
+    allow_bootstrap: bool,
+) -> tuple[SqliteTaskStore, Config, _RegistryConfigIntent, _RegistryConfigIntent | None]:
+    anchor_existed = anchor_intent.db_path.exists()
+    if not allow_bootstrap and not anchor_existed:
+        raise ConfigError(f"Registry DB disappeared before mutation: {anchor_intent.db_path}")
+
+    current_anchor_config, current_anchor_intent = _reload_registry_intent(anchor_intent, role="Anchor")
+    current_target_intent: _RegistryConfigIntent | None = None
+    if target_intent is not None:
+        _current_target_config, current_target_intent = _reload_registry_intent(
+            target_intent,
+            role="Target",
+            expected_project_id=target_intent.project_id,
+        )
+        if current_target_intent.db_path != current_anchor_intent.db_path:
+            raise ConfigError(
+                "Target project DB path does not match the selected registry anchor DB path before mutation: "
+                f"target {current_target_intent.db_path}, anchor {current_anchor_intent.db_path}."
+            )
+
+    issue = classify_existing_execution_db(current_anchor_intent.db_path)
+    if issue is not None:
+        _reason, message = issue
+        raise ConfigError(message)
+    if not allow_bootstrap and not current_anchor_intent.db_path.exists():
+        raise ConfigError(f"Registry DB disappeared before mutation: {current_anchor_intent.db_path}")
+    store = _registry_mutation_store(current_anchor_config, allow_bootstrap=allow_bootstrap)
+    return store, current_anchor_config, current_anchor_intent, current_target_intent
+
+
+def _resolved_db_path(config: Config) -> Path:
+    try:
+        return config.db_path.resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ConfigError(f"Project DB path is invalid or inaccessible: {config.db_path} ({exc})") from exc
+
+
+def _validate_register_db_available(config: Config) -> None:
+    issue = classify_existing_execution_db(_resolved_db_path(config))
+    if issue is None:
+        return
+    _reason, message = issue
+    raise ConfigError(message)
+
+
+def _registry_query_store(config: Config) -> SqliteTaskStore:
+    return SqliteTaskStore.from_config(config, open_mode="query_only")
+
+
+def _registry_mutation_store(config: Config, *, allow_bootstrap: bool = True) -> SqliteTaskStore:
+    open_mode: Literal["registry_mutation", "registry_mutation_existing"] = (
+        "registry_mutation" if allow_bootstrap else "registry_mutation_existing"
+    )
+    return SqliteTaskStore.from_config(config, open_mode=open_mode)
+
+
+def _precheck_register_conflict(
+    store: SqliteTaskStore,
+    *,
+    project_id: str,
+    root_path: Path,
+    config_path: Path,
+    replace: bool,
+) -> None:
+    existing = store.get_project_registry_entry(project_id)
+    if existing is None:
+        return
+    stored_root = existing.root_path
+    stored_config = existing.config_path
+    stored_has_paths = bool(stored_root.strip() or stored_config.strip())
+    unchanged = (stored_root, stored_config) == (str(root_path.resolve()), str(config_path.resolve()))
+    if stored_has_paths and not unchanged and not replace:
+        raise ValueError(
+            "Project registry already has canonical paths for "
+            f"{project_id}: root_path={stored_root!r}, config_path={stored_config!r}. "
+            "Use --replace to intentionally relocate this project."
+        )
+
+
+_GENERIC_MIGRATE_GUIDANCE_RE = re.compile(r"\s*(?:Run|run) 'uv run gza migrate'[^.]*\.", re.IGNORECASE)
+
+
+def _shell_path(path: Path) -> str:
+    return shlex.quote(str(path))
+
+
+def _registry_migrate_command(project_dir: Path | None) -> str:
+    if project_dir is None:
+        return "uv run gza migrate"
+    return f"uv run gza migrate --project {_shell_path(project_dir)}"
+
+
+def _registry_register_replace_command(project_dir: Path) -> str:
+    return f"uv run gza projects register --project {_shell_path(project_dir)} --replace"
+
+
+def _registry_cli_error(exc: Exception, *, project_dir: Path | None = None) -> str:
+    message = str(exc)
+    migrate_command = _registry_migrate_command(project_dir)
+    if isinstance(exc, ManualMigrationRequired):
+        versions_str = ", ".join(f"v{version}" for version in exc.pending_versions)
+        return f"Database requires manual migration(s): {versions_str}. Run '{migrate_command}' to upgrade."
+    if "requires manual migration" in message.lower():
+        cleaned_message = _GENERIC_MIGRATE_GUIDANCE_RE.sub("", message).strip()
+        return f"{cleaned_message} Run '{migrate_command}' to upgrade."
+    if isinstance(exc, SchemaIntegrityError) and "uv run gza migrate" in message:
+        cleaned_message = _GENERIC_MIGRATE_GUIDANCE_RE.sub("", message).strip()
+        return f"{cleaned_message} Run '{migrate_command}' to upgrade the selected registry database, then retry."
+    if isinstance(exc, SchemaIntegrityError) and (
+        "automatic migrations" in message.lower()
+        or "requires database schema" in message.lower()
+        or "requires current" in message.lower()
+    ):
+        return f"{message} Run '{migrate_command}' to upgrade the selected registry database, then retry."
+    if isinstance(exc, OSError):
+        return f"Project registry path is invalid or inaccessible: {exc}"
+    return message
+
+
+def _current_project_deactivation_error(project_dir: Path) -> str:
+    register_command = _registry_register_replace_command(project_dir)
+    return (
+        "Error: refusing to deactivate the currently selected project registry row. "
+        "Run 'uv run gza projects diagnose' first if this row is invalid, "
+        f"or run '{register_command}' to intentionally replace it with the canonical path."
+    )
+
+
+def cmd_projects(args: argparse.Namespace) -> int:
+    action = getattr(args, "projects_action", None)
+    if action == "register":
+        return _cmd_projects_register(args)
+    if action == "diagnose":
+        return _cmd_projects_diagnose(args)
+    if action == "deactivate":
+        return _cmd_projects_deactivate(args)
+    print("Error: projects requires a subcommand")
+    return 1
+
+
+def _cmd_projects_register(args: argparse.Namespace) -> int:
+    try:
+        anchor_config = _validate_register_target(args.project_dir)
+        target_dir = (
+            _resolve_cli_project_path(Path(args.path), label="Target project")
+            if args.path is not None
+            else args.project_dir
+        )
+        target_config = _validate_register_target(target_dir, expected_project_id=args.project_id)
+        anchor_intent = _registry_config_intent(anchor_config)
+        target_intent = _registry_config_intent(target_config)
+        if target_intent.db_path != anchor_intent.db_path:
+            raise ConfigError(
+                "Target project DB path does not match the selected registry anchor DB path: "
+                f"target {target_intent.db_path}, anchor {anchor_intent.db_path}."
+            )
+        _validate_register_db_available(anchor_config)
+        allow_bootstrap = not anchor_intent.db_path.exists()
+
+        query_store = _registry_query_store(anchor_config)
+        _precheck_register_conflict(
+            query_store,
+            project_id=target_intent.project_id,
+            root_path=target_intent.root_path,
+            config_path=target_intent.config_path,
+            replace=bool(args.replace),
+        )
+
+        store, _anchor_config, _anchor_intent, activated_target_intent = _activate_registry_mutation_store(
+            anchor_intent=anchor_intent,
+            target_intent=target_intent,
+            allow_bootstrap=allow_bootstrap,
+        )
+        if activated_target_intent is None:
+            raise ConfigError("Target project could not be revalidated before registry mutation.")
+        result = store.register_project_paths_for_identity(
+            project_id=activated_target_intent.project_id,
+            project_name=activated_target_intent.project_name,
+            project_prefix=activated_target_intent.project_prefix,
+            root_path=activated_target_intent.root_path,
+            config_path=activated_target_intent.config_path,
+            replace=bool(args.replace),
+        )
+    except (ConfigError, ManualMigrationRequired, SchemaIntegrityError, ValueError, sqlite3.Error, OSError) as exc:
+        print(f"Error: {_registry_cli_error(exc, project_dir=args.project_dir)}")
+        return 1
+
+    action = {
+        "inserted": "registered",
+        "updated": "updated",
+        "unchanged": "already registered",
+    }[result]
+    print(f"Project {activated_target_intent.project_id} {action}")
+    print(f"  root_path: {activated_target_intent.root_path}")
+    print(f"  config_path: {activated_target_intent.config_path}")
+    print(f"  db_path: {activated_target_intent.db_path}")
+    return 0
+
+
+def _cmd_projects_diagnose(args: argparse.Namespace) -> int:
+    try:
+        config = Config.load(args.project_dir, discover=not getattr(args, "project_explicit", False))
+        store = _registry_query_store(config)
+        rows: tuple[ProjectRegistryEntry, ...] = store.list_project_registry_entries()
+        row_results_by_id: dict[str, ExecutionProjectResolved | ExecutionProjectDisabled] = {}
+        for row in rows:
+            (result,) = resolve_execution_projects(
+                store,
+                (ExecutionProjectSelector(row.project_id, "registry_id", row.project_id),),
+            )
+            row_results_by_id[row.project_id] = result
+    except (ConfigError, ManualMigrationRequired, SchemaIntegrityError, sqlite3.Error, OSError, ValueError) as exc:
+        print(f"Error: {_registry_cli_error(exc, project_dir=args.project_dir)}")
+        return 1
+
+    if not rows:
+        print(f"No project registry rows in {store.db_path.resolve()}")
+        return 0
+
+    path_counts: Counter[tuple[str, str]] = Counter(
+        (row.root_path, row.config_path)
+        for row in rows
+        if row.root_path.strip() and row.config_path.strip()
+    )
+
+    print(f"Project registry diagnostics for {store.db_path.resolve()}")
+    for row in rows:
+        result = row_results_by_id[row.project_id]
+        duplicate_path = bool(
+            row.root_path.strip()
+            and row.config_path.strip()
+            and path_counts[(row.root_path, row.config_path)] > 1
+        )
+        if isinstance(result, ExecutionProjectResolved):
+            status = "ok"
+            detail = f"{result.root_path}"
+        else:
+            if isinstance(result, ExecutionProjectDisabled):
+                status = result.reason
+                detail = result.message
+            else:
+                assert_never(result)
+        if duplicate_path:
+            detail = f"{detail}; duplicate registry path pair also appears on another row"
+        print(f"{row.project_id}: {status}")
+        print(f"  root_path: {row.root_path or '<empty>'}")
+        print(f"  config_path: {row.config_path or '<empty>'}")
+        print(f"  detail: {detail}")
+    return 0
+
+
+def _cmd_projects_deactivate(args: argparse.Namespace) -> int:
+    try:
+        config = Config.load(args.project_dir, discover=not getattr(args, "project_explicit", False))
+        intent = _registry_config_intent(config)
+        allow_bootstrap = not intent.db_path.exists()
+        query_store = _registry_query_store(config)
+        if args.project_id == config.project_id:
+            print(_current_project_deactivation_error(args.project_dir.resolve()))
+            return 1
+        if query_store.get_project_registry_entry(args.project_id) is None:
+            print(f"Error: project registry row not found: {args.project_id}")
+            return 1
+        store, activated_config, _activated_intent, _target_intent = _activate_registry_mutation_store(
+            anchor_intent=intent,
+            allow_bootstrap=allow_bootstrap,
+        )
+        if args.project_id == activated_config.project_id:
+            print(_current_project_deactivation_error(activated_config.project_dir.resolve()))
+            return 1
+        if not store.deactivate_project_registry_row(args.project_id):
+            print(f"Error: project registry row not found: {args.project_id}")
+            return 1
+    except (ConfigError, ManualMigrationRequired, SchemaIntegrityError, sqlite3.Error, OSError, ValueError) as exc:
+        print(f"Error: {_registry_cli_error(exc, project_dir=args.project_dir)}")
+        return 1
+    print(f"Project registry row deactivated: {args.project_id}")
+    return 0
 
 
 def _normalize_unmerged_cleanup_sets(

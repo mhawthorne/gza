@@ -70,6 +70,7 @@ def test_get_store_warns_for_readwrite_canonical_registry_conflict(
     assert "Warning: Project registry path conflict for shared" in captured.err
     assert str(canonical_a.resolve()) in captured.err
     assert str(canonical_b.resolve()) in captured.err
+    assert f"uv run gza projects register --project {canonical_b.resolve()} --replace" in captured.err
     with sqlite3.connect(shared_db) as conn:
         row = conn.execute("SELECT root_path, config_path FROM projects WHERE id = ?", ("shared",)).fetchone()
     assert row == (str(canonical_a.resolve()), str((canonical_a / "gza.yaml").resolve()))
@@ -95,9 +96,33 @@ def test_get_store_warns_for_readwrite_linked_registry_conflict_without_promotin
     assert "Warning: Project registry path conflict for shared" in captured.err
     assert str(canonical.resolve()) in captured.err
     assert str(linked.resolve()) in captured.err
+    assert f"projects register --project {linked.resolve()}" not in captured.err
+    assert "observed path is a linked or task worktree and cannot be registered as canonical" in captured.err
+    assert "uv run gza projects register --project <canonical-checkout> --replace" in captured.err
     with sqlite3.connect(shared_db) as conn:
         row = conn.execute("SELECT root_path, config_path FROM projects WHERE id = ?", ("shared",)).fetchone()
     assert row == (str(canonical.resolve()), str((canonical / "gza.yaml").resolve()))
+
+
+def test_get_store_warns_for_canonical_registry_conflict_with_shell_quoted_path(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    shared_db = tmp_path / "shared.db"
+    canonical_a = tmp_path / "canonical-a"
+    canonical_b = tmp_path / "canonical b"
+    _write_project_config(canonical_a, project_name="CanonicalA", project_id="shared", db_path=shared_db)
+    _write_project_config(canonical_b, project_name="CanonicalB", project_id="shared", db_path=shared_db)
+    (canonical_a / ".git").mkdir()
+    (canonical_b / ".git").mkdir()
+
+    get_store(Config.load(canonical_a))
+    capsys.readouterr()
+    get_store(Config.load(canonical_b))
+
+    captured = capsys.readouterr()
+    assert "Warning: Project registry path conflict for shared" in captured.err
+    assert f"uv run gza projects register --project '{canonical_b.resolve()}' --replace" in captured.err
 
 
 class TestHelpOutput:
