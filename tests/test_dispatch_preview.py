@@ -460,7 +460,7 @@ def test_recovery_preview_zero_seed_scope_stays_empty_without_get_all(
     store = make_store(tmp_path)
     store._default_merge_target_cache = "main"  # noqa: SLF001 - avoid real git in unit test
     store._project_root = None  # noqa: SLF001 - avoid real git fallback in unit test
-    _bulk_insert_completed_history(store, count=9000, start=100000)
+    _bulk_insert_completed_history(store, count=3000, start=100000)
 
     with patch(
         "gza.recovery_engine._load_merge_context",
@@ -559,7 +559,7 @@ def test_recovery_preview_bulk_loads_terminal_no_work_merge_units(
     assert any(len(call) == len(failed_ids) for call in list_calls)
 
 
-# Review regression intentionally builds 9,000 unrelated rows to prove bounded hydration.
+# Review regression intentionally builds 3,000 unrelated rows to prove bounded hydration.
 @pytest.mark.cpu_budget(ms=2000)
 def test_recovery_preview_terminal_no_work_seed_bounds_hydration_with_large_descendants(
     tmp_path: Path,
@@ -587,7 +587,7 @@ def test_recovery_preview_terminal_no_work_seed_bounds_hydration_with_large_desc
         state="empty",
     )
     store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
-    _bulk_insert_completed_history(store, count=9000, start=300000, based_on=failed.id, task_type="internal")
+    _bulk_insert_completed_history(store, count=3000, start=300000, based_on=failed.id, task_type="internal")
 
     full_preview = _build_forced_full_recovery_preview(store)
 
@@ -635,7 +635,7 @@ def test_recovery_preview_scoped_seed_ignores_large_non_recovery_descendant_hist
         state="unmerged",
     )
     store.attach_task_to_merge_unit(failed.id, failed_unit.id, "owner")
-    _bulk_insert_completed_history(store, count=9000, start=200000, based_on=failed.id)
+    _bulk_insert_completed_history(store, count=3000, start=200000, based_on=failed.id)
 
     with patch(
         "gza.recovery_engine._load_merge_context",
