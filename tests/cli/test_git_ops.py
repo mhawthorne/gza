@@ -507,7 +507,7 @@ def test_merge_single_task_does_not_classify_generic_merge_failure_as_conflict(t
     git.merge.assert_called_once()
     git.merge_abort.assert_called_once()
     output = capsys.readouterr().out
-    assert "Error during merge: merge exploded" in output
+    assert "Error during merge for testproject-1 (branch feature/generic-merge-failure): merge exploded" in output
     assert "has conflicts against" not in output
 
 
@@ -805,6 +805,105 @@ def test_merge_single_task_default_keeps_merge_mechanics_output(tmp_path: Path, 
     output = capsys.readouterr().out
     assert "Merging 'feature/default-merge-output' into 'main'..." in output
     assert "✓ Successfully merged feature/default-merge-output" in output
+
+
+def test_merge_single_task_merge_failure_output_names_subject_task(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement merge failure output", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/merge-failure-output"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git_error = "git merge --squash feature/merge-failure-output failed: conflict"
+    abort_error = "git merge --abort failed: no merge to abort"
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        rev_parse_if_exists=MagicMock(return_value=None),
+        merge=MagicMock(side_effect=GitError(git_error)),
+        merge_abort=MagicMock(side_effect=GitError(abort_error)),
+        reset_hard_head=MagicMock(side_effect=GitError(abort_error)),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=True,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+    )
+    config = Config.load(tmp_path)
+
+    with _force_merge_planner_action():
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    output = capsys.readouterr().out
+    subject = f"for {task.id} (branch feature/merge-failure-output)"
+    assert f"Error during merge {subject}: {git_error}" in output
+    assert f"Aborting merge {subject} and restoring clean state..." in output
+    assert f"Warning: Could not abort merge {subject}: {abort_error}" in output
+
+
+def test_merge_single_task_rebase_failure_output_names_subject_task(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement rebase failure output", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/rebase-failure-output"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git_error = "git rebase main failed: conflict"
+    abort_error = "git rebase --abort failed: no rebase in progress"
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        rebase=MagicMock(side_effect=GitError(git_error)),
+        rebase_abort=MagicMock(side_effect=GitError(abort_error)),
+        checkout=MagicMock(),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=True,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+    )
+    config = Config.load(tmp_path)
+
+    with _force_merge_planner_action():
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    output = capsys.readouterr().out
+    subject = f"for {task.id} (branch feature/rebase-failure-output)"
+    assert f"Error during rebase {subject}: {git_error}" in output
+    assert f"Aborting rebase {subject} and restoring clean state..." in output
+    assert f"Warning: Could not abort rebase {subject}: {abort_error}" in output
 
 
 def test_merge_single_task_quiet_mechanics_suppresses_default_success_output(

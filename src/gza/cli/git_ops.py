@@ -1871,8 +1871,8 @@ def _merge_single_task(
                         print(f"FOLLOW {followup_task.id} reused from {merge_subject.id}")
             return _MergeSingleTaskResult(rc=0)
 
-        print(f"Error during {operation}: {e}")
-        print(f"\nAborting {operation} and restoring clean state...")
+        print(f"Error during {operation} for {merge_subject.id} (branch {merge_branch}): {e}")
+        print(f"\nAborting {operation} for {merge_subject.id} (branch {merge_branch}) and restoring clean state...")
         try:
             if args.rebase:
                 git.rebase_abort()
@@ -1891,7 +1891,7 @@ def _merge_single_task(
                     git.reset_hard_head()
                     print("✓ Merge cleanup reset tracked files to HEAD")
         except GitError as abort_error:
-            print(f"Warning: Could not abort {operation}: {abort_error}")
+            print(f"Warning: Could not abort {operation} for {merge_subject.id} (branch {merge_branch}): {abort_error}")
         return _MergeSingleTaskResult(rc=1)
 
 
