@@ -110,51 +110,104 @@ configured. Works under **both** auth modes. This is the only supported path to
 per-session Claude numbers on a subscription — but it is a push pipeline needing
 a collector, not a query, and it reports consumption, never remaining quota.
 
-**C2 — gza's own accounting (recommended first step).** gza *already* parses
-`total_cost_usd` and per-turn `input_tokens` / `output_tokens` /
-`cache_creation_input_tokens` / `cache_read_input_tokens` out of every Claude
-run (`src/gza/providers/claude.py`). We are already holding the raw material for
-"what has gza spent on Claude", per task and per model, with zero new
-credentials, zero new endpoints, and no boundary problem. It answers a genuinely
-useful question the Codex integration cannot answer at all: *which tasks cost
-the most.* It cannot answer "how close am I to my limit."
+**C2 — gza's own token accounting.** gza already parses per-turn
+`input_tokens` / `output_tokens` / `cache_creation_input_tokens` /
+`cache_read_input_tokens` and `total_cost_usd` out of every run, and persists
+`input_tokens`, `output_tokens`, `cost_usd`, `provider`, and `model` on the
+`tasks` row. This is provider-agnostic — Codex has the same accounting
+(`get_pricing_for_model` / `calculate_cost` in `providers/codex.py`) — so cost
+and token totals are already answerable for *both* providers today, and are
+visible in `gza stats`. Nothing new is needed to report spend.
 
 ## The shape problem
 
 `UsageWindow` assumes `used_percent` + `resets_at` + `window_duration_minutes`.
-That fits Codex exactly and fits nothing on the Claude side:
+That fits Codex exactly and fits nothing Claude reports:
 
 - Admin API → cumulative tokens and dollars over a chosen range; no window, no
   percentage.
 - Rate-limit headers → a percentage, but of a per-minute throughput bucket.
-- gza's own accounting → dollars and tokens spent; no denominator at all.
 
-Forcing these into `UsageWindow` would produce a homepage card that reads
-"claude 3% used · 1m window" — technically true, operationally meaningless next
-to "codex 45% used · 7d window."
+Cost and token totals we already compute for every provider are consumption
+figures with no denominator, so they cannot fill a quota meter either. The next
+section supplies the missing denominator by configuration.
 
-The honest modelling is a second result kind alongside the quota window — a
-*consumption* record (tokens, cost, period) with no denominator — and a renderer
-that shows a meter only when a real denominator exists and a bare figure
-otherwise.
+## Derived quota: a configured budget as the denominator
+
+Cost is already solved. The unanswered question is **"how much of my quota is
+left"**, and for a subscription harness that publishes no quota, the only way to
+answer it is to supply the denominator ourselves: configure a token budget per
+window, sum our own consumption over that window, and divide.
+
+```yaml
+usage_budgets:
+  claude:
+    window: 7d           # rolling
+    input_tokens: 2_000_000_000
+```
+
+`used_percent = tokens_in_window / budget`, `resets_at` = end of the rolling
+window. That produces a genuine `UsageWindow` — same shape, same renderer, same
+homepage meter as Codex — with `source: "derived"` instead of `"provider"`.
+
+The query is already available from the data we keep:
+
+```sql
+SELECT SUM(COALESCE(input_tokens,0)), SUM(COALESCE(output_tokens,0))
+FROM tasks
+WHERE provider = ?
+  AND COALESCE(completed_at, updated_at, created_at) >= :window_start
+```
+
+Measured on the live DB, a 7-day window returns 4.7B input tokens across 894
+tasks, 795 of which carry token counts — the signal is dense enough to meter.
+
+### Four things that decide whether the number means anything
+
+1. **Cache reads are conflated.** gza sums `input_tokens`,
+   `cache_creation_input_tokens`, and `cache_read_input_tokens` into one
+   `input_tokens` column. Anthropic's own limits exclude cache reads from ITPM,
+   and cache reads dominate an agentic workload — they are most of that 4.7B. A
+   budget denominated in "input tokens" therefore measures mostly cache traffic
+   and will not track a real subscription window. **Fix first:** persist the
+   breakdown in separate columns so the budget can be denominated in
+   non-cached input tokens. Without this the meter is decorative.
+
+2. **It only sees gza's traffic.** Interactive Claude Code, claude.ai, and other
+   machines share the same subscription window and are invisible here. On a
+   shared subscription the derived number is a floor, not a measure.
+
+3. **Rolling ≠ the real window.** Subscription windows reset on a fixed schedule
+   we cannot observe. A rolling 7-day sum is a defensible approximation and
+   arguably more useful for pacing, but it will not agree with what `/usage`
+   shows.
+
+4. **The budget has to be calibrated, not guessed.** A number pulled from the
+   air produces a confident-looking meter with no meaning. The honest path is to
+   let the operator set it and refine it — and, better, to record the timestamp
+   whenever a run fails on a rate/usage limit, so observed limit events
+   calibrate the budget against reality over time.
+
+### Labelling
+
+A derived window must never render identically to a provider-reported one.
+Same meter, explicit provenance:
+
+```
+usage  codex  45% used · 7d window · resets in 4d20h        (cached 4m ago)
+usage  claude 62% used · 7d rolling · budget 2.0B tok       (derived, gza traffic only)
+```
 
 ## Recommendation
 
-1. **Ship C2 first.** Surface gza's already-captured Claude spend (cost and
-   tokens, by model, over a rolling window) through the same store and the same
-   `gza usage` command. No credentials, no new failure modes, immediately useful.
-2. **Add Option A behind config** if and when a Console org with an Admin key is
-   in play — `usage_admin_key` or similar, absent by default, feature-off when
-   unset. It is the only path to authoritative billing numbers.
-3. **Do not pursue Option C's undocumented endpoint.** Revisit if Anthropic
-   ships the requested public subscription usage API.
-4. **Treat Option B as optional telemetry**, not a headline number: worth
-   capturing opportunistically if we ever call the Messages API directly, never
-   worth a synthetic request.
-
-## Open question for the operator
-
-Codex answers "how much of my quota is left." For Claude on a subscription, that
-question has no supported answer today. Is the useful substitute *"what has gza
-spent on Claude"* (C2 — buildable now), or should the Claude card simply be
-absent until a real quota API exists?
+1. **Split the cached-token columns first.** Everything else is unreliable
+   until the denominator can exclude cache reads.
+2. **Then implement derived windows** as a `source: "derived"` variant of
+   `UsageWindow`, config-driven, off unless a budget is set. It is
+   provider-agnostic by construction — it would work for any harness that
+   reports tokens but not quota.
+3. **Record limit-hit events** so the configured budget can be calibrated
+   against observed reality rather than left at a guess.
+4. **Add the Admin API (Option A) only if a Console org with an Admin key
+   appears.** Not applicable to this machine's subscription auth.
+5. **Do not pursue the undocumented `/usage` endpoint.**
