@@ -2,10 +2,12 @@
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import gza.recovery_engine as recovery_engine
+from gza.cli.query import _ps_merge_unit_display
 from gza.db import MergeUnit, SqliteTaskStore, Task
 from gza.lineage_query import LineageOwnerSnapshot, is_lineage_resolved
 from gza.query import (
@@ -1447,3 +1449,48 @@ class TestIsLineageResolved:
 
         assert resolution.resolved is False
         assert resolution.reasons == ()
+
+
+class TestPsMergeUnitDisplay:
+    """Unit tests for the `gza ps` MERGE UNIT cell."""
+
+    class _FakeStore:
+        def __init__(self, attached=None, planned=None):
+            self._attached = attached
+            self._planned = planned
+
+        def resolve_merge_unit_for_task(self, task_id):  # noqa: ARG002
+            return self._attached
+
+        def resolve_merge_unit_plan_for_task(self, task):  # noqa: ARG002
+            if self._planned is None:
+                return None
+            return SimpleNamespace(unit=self._planned)
+
+    @staticmethod
+    def _unit() -> MergeUnit:
+        return MergeUnit(
+            id="gza-mu-1",
+            source_branch="feature",
+            target_branch="main",
+            owner_task_id="gza-1",
+            state="unmerged",
+        )
+
+    def test_attached_unit_renders_without_marker(self):
+        task = _make_task(id="gza-1", branch="feature")
+        display = _ps_merge_unit_display(task, self._FakeStore(attached=self._unit()))
+        assert display == "gza-mu-1 / gza-1"
+
+    def test_unattached_task_on_unit_branch_renders_projected_unit(self):
+        task = _make_task(id="gza-2", task_type="improve", status="in_progress", branch="feature")
+        display = _ps_merge_unit_display(task, self._FakeStore(planned=self._unit()))
+        assert display == "~gza-mu-1 / gza-1"
+
+    def test_no_unit_and_no_plan_renders_nothing(self):
+        task = _make_task(id="gza-3", branch="feature")
+        assert _ps_merge_unit_display(task, self._FakeStore()) is None
+
+    def test_branchless_task_does_not_consult_plan(self):
+        task = _make_task(id="gza-4", branch=None)
+        assert _ps_merge_unit_display(task, self._FakeStore(planned=self._unit())) is None

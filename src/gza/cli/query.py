@@ -4036,6 +4036,29 @@ def _get_ps_steps(task: "DbTask | None", store: "SqliteTaskStore | None") -> str
     return "-"
 
 
+def _ps_merge_unit_display(task: "DbTask | None", store: "SqliteTaskStore | None") -> str | None:
+    """Render the merge unit a task belongs to, or would belong to once attached.
+
+    Membership rows are only written when a task completes, so an in-progress
+    improve/rebase/implement on an existing unit's branch has no attachment yet.
+    Fall back to the read-only resolution plan so the unit is still visible,
+    marked with a leading ``~`` because membership is projected, not materialized.
+    """
+    if store is None or task is None or task.id is None:
+        return None
+    merge_unit = store.resolve_merge_unit_for_task(task.id)
+    projected = False
+    if merge_unit is None and task.branch:
+        plan = store.resolve_merge_unit_plan_for_task(task)
+        if plan is not None and plan.unit is not None:
+            merge_unit = plan.unit
+            projected = True
+    if merge_unit is None:
+        return None
+    display = f"{merge_unit.id} / {merge_unit.owner_task_id}" if merge_unit.owner_task_id else merge_unit.id
+    return f"~{display}" if projected else display
+
+
 def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "SqliteTaskStore | None" = None) -> dict:
     """Convert a reconciled worker/task pair into display data."""
     source = "both" if worker and task else "worker" if worker else "db"
@@ -4078,15 +4101,7 @@ def _to_ps_row(worker: WorkerMetadata | None, task: DbTask | None, store: "Sqlit
         task_type_display = "-"
 
     task_id = task.id if task and task.id is not None else worker.task_id if worker else None
-    merge_unit_display = None
-    if store is not None and task is not None and task.id is not None:
-        merge_unit = store.resolve_merge_unit_for_task(task.id)
-        if merge_unit is not None:
-            merge_unit_display = (
-                f"{merge_unit.id} / {merge_unit.owner_task_id}"
-                if merge_unit.owner_task_id
-                else merge_unit.id
-            )
+    merge_unit_display = _ps_merge_unit_display(task, store)
     task_display = ""
     if task and task.slug:
         task_display = task.slug
