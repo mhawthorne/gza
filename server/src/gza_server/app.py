@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 import secrets
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any, Literal, Protocol, cast
@@ -304,6 +306,94 @@ def _selection_return_url(
     )
 
 
+@dataclass(frozen=True)
+class UsageCard:
+    """Homepage view of the primary provider limit."""
+
+    provider: str
+    used_percent: float
+    remaining_percent: float
+    duration_label: str
+    resets_in: str
+    age_label: str
+    stale: bool
+    warning: str
+
+
+def resolve_usage_card(project_dir: Path | None = None) -> UsageCard | None:
+    """Read the cached usage reading for the homepage.
+
+    Always cache-only: a page render must never spawn a provider process. A
+    background tick keeps the value warm.
+    """
+    try:
+        from gza.usage import format_duration_short
+        from gza.usage_service import get_primary_usage
+
+        config = Config.load(project_dir or Path.cwd(), discover=True)
+        if not config.usage:
+            return None
+        store = SqliteTaskStore.from_config(config, open_mode="query_only")
+        snapshot = get_primary_usage(store, config, refresh=False)
+    except Exception:  # noqa: BLE001 - the console must render without usage
+        return None
+    if snapshot is None or not snapshot.available:
+        return None
+
+    window = snapshot.primary_window
+    assert window is not None
+    usage = snapshot.usage
+    warning = ""
+    if usage is not None:
+        if usage.rate_limit_reached_type:
+            warning = f"rate limited: {usage.rate_limit_reached_type}"
+        elif usage.spend_control_reached:
+            warning = "spend control reached"
+
+    now = datetime.now(UTC)
+    return UsageCard(
+        provider=snapshot.provider,
+        used_percent=round(window.used_percent, 1),
+        remaining_percent=round(window.remaining_percent, 1),
+        duration_label=window.duration_label,
+        resets_in=format_duration_short(window.resets_at - now),
+        age_label=(format_duration_short(snapshot.age) if snapshot.age else "just now"),
+        stale=snapshot.stale,
+        warning=warning,
+    )
+
+
+def _refresh_usage_once(project_dir: Path | None = None) -> None:
+    """Warm the usage cache out of band, so no request ever pays for a fetch."""
+    try:
+        from gza.usage_service import get_primary_usage
+
+        config = Config.load(project_dir or Path.cwd(), discover=True)
+        if not config.usage:
+            return
+        store = SqliteTaskStore.from_config(config)
+        get_primary_usage(store, config, refresh=True)
+    except Exception:  # noqa: BLE001 - never let a usage failure surface here
+        return
+
+
+def _start_usage_refresh_thread(project_dir: Path | None = None) -> threading.Event:
+    """Background tick that keeps usage warm even when watch is not running."""
+    stop = threading.Event()
+
+    def _loop() -> None:
+        while not stop.is_set():
+            _refresh_usage_once(project_dir)
+            try:
+                interval = Config.load(project_dir or Path.cwd(), discover=True).usage_ttl_seconds
+            except Exception:  # noqa: BLE001
+                interval = 900
+            stop.wait(max(60, interval))
+
+    threading.Thread(target=_loop, name="gza-usage-refresh", daemon=True).start()
+    return stop
+
+
 def create_app(
     *,
     project_dir: Path | None = None,
@@ -324,6 +414,10 @@ def create_app(
         )
     )
     server_instance_id = instance_id or os.environ.get("GZA_SERVER_INSTANCE_ID")
+    # Only the real (non-seam) app warms usage: tests inject a store factory and
+    # must not spawn provider processes.
+    if store_factory is None:
+        _start_usage_refresh_thread(project_dir)
     app = FastAPI(title="gza-server", version=__version__)
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
     bulk_previews: dict[str, _BulkPreviewState] = {}
@@ -376,6 +470,7 @@ def create_app(
                 "total_tasks": sum(counts.values()),
                 "project_count": len(store.project_query_stores()),
                 "recent": recent.rows,
+                "usage": resolve_usage_card(project_dir),
             },
         )
 

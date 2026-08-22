@@ -58,6 +58,7 @@ from .config_cmds import (
     cmd_skills_install,
     cmd_stats,
     cmd_sync_report,
+    cmd_usage,
     cmd_validate,
     schema_integrity_error_description,
     selected_project_migrate_command,
@@ -1639,6 +1640,34 @@ def main() -> int:
         help="Create as draft PR",
     )
     add_common_args(pr_parser)
+
+    # usage command
+    usage_parser = subparsers.add_parser(
+        "usage",
+        help="Show provider quota usage",
+    )
+    add_common_args(usage_parser)
+    usage_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Show every limit bucket and window, not just the primary limit",
+    )
+    usage_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON (always includes every window)",
+    )
+    usage_refresh_group = usage_parser.add_mutually_exclusive_group()
+    usage_refresh_group.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Force a fetch even when the cached reading is still fresh",
+    )
+    usage_refresh_group.add_argument(
+        "--no-refresh",
+        action="store_true",
+        help="Read the cache only; never start a provider process",
+    )
 
     # stats command
     stats_parser = subparsers.add_parser(
@@ -3431,6 +3460,8 @@ def main() -> int:
             return cmd_pr(args)
         elif args.command == "stats":
             return cmd_stats(args)
+        elif args.command == "usage":
+            return cmd_usage(args)
         elif args.command == "validate":
             return cmd_validate(args)
         elif args.command == "preflight":

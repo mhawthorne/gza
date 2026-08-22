@@ -432,3 +432,40 @@ tr:has(input[data-select-row]:checked) { background: var(--surface-raised, var(-
 .tag-list li { display: inline-block; margin: 0 0.5rem 0.5rem 0; }
 td.merge-unit { white-space: nowrap; }
 tr.merge-unit-owner { font-weight: 600; }
+
+/* Provider usage card (homepage) */
+.usage-card {
+  max-width: 22rem;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--border, #d0d7de);
+  border-radius: 8px;
+}
+.usage-card-stale { opacity: 0.7; }
+.usage-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.usage-provider { font-weight: 600; }
+.usage-pct {
+  font-size: 1.6rem;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+.usage-meter {
+  margin: 0.6rem 0 0.5rem;
+  height: 0.5rem;
+  border-radius: 999px;
+  background: var(--meter-track, rgba(127, 127, 127, 0.25));
+  overflow: hidden;
+}
+.usage-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent, #2f81f7);
+}
+.usage-detail { margin: 0; font-size: 0.9rem; }
+.usage-warning { margin: 0.35rem 0 0; font-weight: 600; }
+.usage-age { margin: 0.35rem 0 0; font-size: 0.8rem; }

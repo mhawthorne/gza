@@ -26,6 +26,10 @@ Gza reads configuration from three YAML layers:
 | `project_prefix` | String | *(project_name)* | Short prefix for task IDs (1–12 chars, lowercase alphanumeric only — no hyphens, since hyphen is the separator in task IDs like `gza-1234`). Defaults to `project_name`. |
 | `db_path` | String | `.gza/gza.db` | Task DB path. Shared DB mode is opt-in via an explicit path (for example `~/.gza/gza.db`). `gza init` now asks you to choose local vs shared DB mode; in non-interactive runs you must pass `--db local` or `--db shared` (optionally with `--db-path PATH`). If a legacy local `.gza/gza.db` exists when using shared mode, either import it with `uv run gza migrate --import-local-db` or pin the project back to local with `db_path: .gza/gza.db`. `GZA_DB_PATH` overrides this value at runtime. |
 | `server_port` | Integer | `8765` | Port the local `gza-server` listens on. `0` picks any free port, at the cost of a URL that changes on every restart. Overridden by `GZA_SERVER_PORT` and by `gza-server start --port`. Startup fails if the port is busy rather than quietly moving to another one. |
+| `usage` | Boolean | `true` | Collect provider quota usage stats. When enabled, `gza usage`, the watch cycle header, and the server homepage all read from a shared cache. Set to `false` to never query a provider for usage. |
+| `usage_ttl_seconds` | Integer | `900` | How long a cached usage reading stays fresh. Reads inside this window never start a provider process; the first read after it triggers a refresh. |
+| `usage_timeout_seconds` | Float | `10.0` | Wall-clock budget for one provider usage query, covering process startup and the response read. |
+| `usage_retention_days` | Integer | `30` | Days of provider usage history to keep. Older samples are pruned on write. History is retained so usage burn rate can be analyzed over time. |
 | `tasks_file` | String | `tasks.yaml` | Path to legacy tasks file |
 | `log_dir` | String | `.gza/logs` | Directory for log files |
 | `use_docker` | Boolean | `true` | Whether to run Claude in Docker container |

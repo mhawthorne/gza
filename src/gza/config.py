@@ -59,6 +59,10 @@ DEFAULT_DOCKER_STARTUP_TIMEOUT = 60
 # The local server binds a fixed port so its URL is stable across restarts.
 # 0 means "let the OS pick", which is only useful for throwaway instances.
 DEFAULT_SERVER_PORT = 8765
+DEFAULT_USAGE_ENABLED = True
+DEFAULT_USAGE_TTL_SECONDS = 900  # 15 minutes; usage moves slower than a watch cycle
+DEFAULT_USAGE_TIMEOUT_SECONDS = 10.0
+DEFAULT_USAGE_RETENTION_DAYS = 30
 DEFAULT_ENFORCE_PROJECT_SCOPE = True
 DEFAULT_DEFAULT_CROSS_PROJECT = False
 DEFAULT_BRANCH_MODE = "multi"  # "single" or "multi"
@@ -168,6 +172,7 @@ VALID_CONFIG_FIELDS = {
     "recommend_rebase_behind_commits", "tmux", "learnings_window",
     "learnings_interval", "learnings_max_items", "behavior_monitor", "spec_coherence", "theme", "colors", "no_color",
     "server_port",
+    "usage", "usage_ttl_seconds", "usage_timeout_seconds", "usage_retention_days",
 }
 LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "db_path": None,
@@ -1547,6 +1552,10 @@ class Config:
     use_docker: bool = DEFAULT_USE_DOCKER
     docker_startup_timeout: int = DEFAULT_DOCKER_STARTUP_TIMEOUT
     server_port: int = DEFAULT_SERVER_PORT
+    usage: bool = DEFAULT_USAGE_ENABLED
+    usage_ttl_seconds: int = DEFAULT_USAGE_TTL_SECONDS
+    usage_timeout_seconds: float = DEFAULT_USAGE_TIMEOUT_SECONDS
+    usage_retention_days: int = DEFAULT_USAGE_RETENTION_DAYS
     enforce_project_scope: bool = DEFAULT_ENFORCE_PROJECT_SCOPE
     default_cross_project: bool = DEFAULT_DEFAULT_CROSS_PROJECT
     docker_image: str = ""
@@ -2100,6 +2109,22 @@ class Config:
         )
         assert docker_startup_timeout is not None
         server_port = _validate_server_port(data.get("server_port", DEFAULT_SERVER_PORT))
+        usage_enabled = bool(data.get("usage", DEFAULT_USAGE_ENABLED))
+        usage_ttl_seconds = _validate_optional_positive_int_field(
+            data.get("usage_ttl_seconds", DEFAULT_USAGE_TTL_SECONDS),
+            "usage_ttl_seconds",
+        )
+        usage_retention_days = _validate_optional_positive_int_field(
+            data.get("usage_retention_days", DEFAULT_USAGE_RETENTION_DAYS),
+            "usage_retention_days",
+        )
+        usage_timeout_raw = data.get("usage_timeout_seconds", DEFAULT_USAGE_TIMEOUT_SECONDS)
+        try:
+            usage_timeout_seconds = float(usage_timeout_raw)
+        except (TypeError, ValueError):
+            raise ConfigError("'usage_timeout_seconds' must be a number") from None
+        if usage_timeout_seconds <= 0:
+            raise ConfigError("'usage_timeout_seconds' must be greater than 0")
         timeout_minutes = _validate_optional_positive_int_field(
             data.get("timeout_minutes", DEFAULT_TIMEOUT_MINUTES),
             "timeout_minutes",
@@ -3120,6 +3145,10 @@ class Config:
             use_docker=use_docker,
             docker_startup_timeout=docker_startup_timeout,
             server_port=server_port,
+            usage=usage_enabled,
+            usage_ttl_seconds=usage_ttl_seconds or DEFAULT_USAGE_TTL_SECONDS,
+            usage_timeout_seconds=usage_timeout_seconds,
+            usage_retention_days=usage_retention_days or DEFAULT_USAGE_RETENTION_DAYS,
             enforce_project_scope=enforce_project_scope,
             default_cross_project=default_cross_project,
             docker_image=data.get("docker_image", ""),

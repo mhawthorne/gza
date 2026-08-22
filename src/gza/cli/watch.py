@@ -10,6 +10,7 @@ import re
 import signal
 import sqlite3
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -3682,6 +3683,54 @@ def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
     for task_id in getattr(args, "task_ids", None) or ():
         argv.append(str(task_id))
     return argv
+
+
+def start_usage_warmer(config: Config, store: SqliteTaskStore) -> threading.Event:
+    """Refresh provider usage out of band for the duration of a watch run.
+
+    Kept off the cycle path deliberately: the header renders from cache, so a
+    slow or hanging provider query can never delay scheduling.
+    """
+    stop = threading.Event()
+    if not config.usage:
+        return stop
+
+    def _loop() -> None:
+        from ..usage_service import get_primary_usage
+
+        while not stop.is_set():
+            try:
+                get_primary_usage(store, config, refresh=True)
+            except Exception:  # noqa: BLE001 - usage never breaks watch
+                pass
+            stop.wait(max(60, config.usage_ttl_seconds))
+
+    threading.Thread(target=_loop, name="gza-usage-warmer", daemon=True).start()
+    return stop
+
+
+def _format_watch_usage_message(config: Config, store: SqliteTaskStore) -> str | None:
+    """Usage line for the cycle header, refreshed through the TTL cache.
+
+    Usage is decoration: any failure here degrades to a stale reading or to no
+    line at all, and never interrupts a watch cycle.
+    """
+    if not config.usage:
+        return None
+    try:
+        from ..usage import format_usage_line
+        from ..usage_service import get_primary_usage
+
+        # Cache-only: a cycle header must never block on a provider
+        # subprocess. `start_usage_warmer` keeps the value fresh out of band.
+        snapshot = get_primary_usage(store, config, refresh=False)
+    except Exception:  # noqa: BLE001 - a usage bug must not stop watch
+        return None
+    if snapshot is None:
+        return None
+    if snapshot.usage is None and snapshot.error is None:
+        return None
+    return f"usage  {format_usage_line(snapshot)}"
 
 
 def _format_scope_message(
@@ -8359,6 +8408,9 @@ def _run_cycle(
         scope_message = _format_scope_message(tags, any_tag=any_tag, scoped_owner_ids=effective_scoped_owner_ids)
         if scope_message is not None:
             log.emit("INFO", scope_message)
+        usage_message = _format_watch_usage_message(config, store)
+        if usage_message is not None:
+            log.emit("INFO", usage_message)
 
     def _reserve_watch_launch(worker_label: str, subject_task_id: str) -> LaunchPermit | None:
         try:
@@ -11523,6 +11575,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     store = get_store(config, open_mode="watch_lease_activation")
     log = _WatchLog(config.project_dir / ".gza" / "watch.log", quiet=quiet)
+    # Warms the usage cache for the whole run; the cycle header only reads it.
+    start_usage_warmer(config, store)
     if startup_cap_warning is not None:
         log.emit("WARN", startup_cap_warning)
     installed_package_drift = _InstalledPackageDriftState(startup_fingerprint=_installed_gza_package_fingerprint())
