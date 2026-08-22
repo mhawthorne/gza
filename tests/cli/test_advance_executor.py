@@ -287,6 +287,41 @@ def _assert_permit_released(config: Config, store: SqliteTaskStore) -> None:
     permit.release()
 
 
+def test_run_review_rejects_selected_head_mismatch(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.branch = "feature/live-head-review"
+    store.update(impl)
+    review = store.add("Review feature", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    review.status = "pending"
+    review.review_verify_head_sha = "stale-head"
+    store.update(review)
+
+    context = _base_executor_context(
+        store=store,
+        config=config,
+        spawn_worker=lambda _task, _kind: pytest.fail("stale selected review must not launch"),
+    )
+
+    result = execute_advance_action(
+        task=impl,
+        action={"type": "run_review", "review_task": review, "review_head_sha": "live-head"},
+        context=context,
+    )
+
+    assert result.status == "error"
+    assert "pending review head does not match selected live head" in result.message
+    reloaded_review = store.get(review.id)
+    assert reloaded_review is not None
+    assert reloaded_review.review_verify_head_sha == "stale-head"
+
+
 @pytest.mark.parametrize(
     ("action_type", "context_overrides", "action_extra", "patch_target"),
     [

@@ -409,6 +409,7 @@ class AdvanceContext:
     resolution_review_metadata_invalid: bool = False
     current_review_head_sha: str | None = None
     current_review_head_probe_warning: str | None = None
+    current_review_head_is_live: bool = False
     latest_reviewed_head_sha: str | None = None
     verify_gate_decision: VerifyGateDecision | None = None
 
@@ -2084,6 +2085,8 @@ def _rebase_wait_review_description(review_task: DbTask | None, rebase_task: DbT
 def _stale_review_create_review_description(ctx: AdvanceContext) -> str:
     if ctx.review_invalidation_reason == "branch_head_advanced":
         return "Create review (branch head advanced after latest review)"
+    if ctx.review_invalidation_reason == "resolution_metadata_unavailable":
+        return "Create full review (resolution-review metadata unavailable)"
     return _rebase_create_review_description(ctx.review_invalidated_by_rebase)
 
 
@@ -2093,6 +2096,11 @@ def _stale_review_pending_review_description(ctx: AdvanceContext) -> str:
             f"Run pending review {_task_id(ctx.active_review)} "
             "(branch head advanced after latest review)"
         )
+    if ctx.review_invalidation_reason == "resolution_metadata_unavailable":
+        return (
+            f"Run pending full review {_task_id(ctx.active_review)} "
+            "(resolution-review metadata unavailable)"
+        )
     return _rebase_pending_review_description(ctx.active_review, ctx.review_invalidated_by_rebase)
 
 
@@ -2101,6 +2109,11 @@ def _stale_review_wait_review_description(ctx: AdvanceContext) -> str:
         return (
             f"SKIP: review {_task_id(ctx.active_review)} in progress "
             "(branch head advanced after latest review)"
+        )
+    if ctx.review_invalidation_reason == "resolution_metadata_unavailable":
+        return (
+            f"SKIP: full review {_task_id(ctx.active_review)} in progress "
+            "(resolution-review metadata unavailable)"
         )
     return _rebase_wait_review_description(ctx.active_review, ctx.review_invalidated_by_rebase)
 
@@ -2178,6 +2191,60 @@ def _planned_resolution_review_metadata_is_valid(ctx: AdvanceContext) -> bool:
     )
 
 
+def _review_is_plain_full_review(review_task: DbTask | None) -> bool:
+    return _review_mode(review_task) == "plain_full"
+
+
+def _review_mode(review_task: DbTask | None) -> str | None:
+    if review_task is None:
+        return None
+    scope_text = review_task.review_scope
+    if declares_resolution_review_mode(scope_text):
+        return "resolution"
+    if declares_spec_coherence_review_mode(scope_text):
+        return "spec_coherence"
+    return "plain_full"
+
+
+def _review_covers_live_head(
+    review_task: DbTask | None,
+    *,
+    current_review_head_sha: str | None,
+    current_review_head_probe_warning: str | None,
+    current_review_head_is_live: bool,
+) -> bool:
+    if (
+        review_task is None
+        or current_review_head_probe_warning is not None
+        or not current_review_head_is_live
+    ):
+        return False
+    reviewed_head_sha = _normalize_review_state_head_sha(review_task.review_verify_head_sha)
+    return bool(
+        reviewed_head_sha
+        and current_review_head_sha
+        and reviewed_head_sha == current_review_head_sha
+    )
+
+
+def _review_is_fallback_full_review_evidence(
+    review_task: DbTask | None,
+    *,
+    current_review_head_sha: str | None,
+    current_review_head_probe_warning: str | None,
+    current_review_head_is_live: bool,
+) -> bool:
+    return (
+        _review_is_plain_full_review(review_task)
+        and _review_covers_live_head(
+            review_task,
+            current_review_head_sha=current_review_head_sha,
+            current_review_head_probe_warning=current_review_head_probe_warning,
+            current_review_head_is_live=current_review_head_is_live,
+        )
+    )
+
+
 def _stale_review_create_review_action(ctx: AdvanceContext) -> dict[str, Any]:
     action: dict[str, Any] = {
         "type": "create_review",
@@ -2198,7 +2265,24 @@ def _stale_review_create_review_action(ctx: AdvanceContext) -> dict[str, Any]:
                 "resolution_target_sha": resolved_target_sha,
             }
         )
-    elif ctx.review_invalidation_reason == "branch_head_advanced" and ctx.current_review_head_sha:
+    elif ctx.review_invalidation_reason in {
+        "branch_head_advanced",
+        "resolution_metadata_unavailable",
+    } and ctx.current_review_head_sha:
+        action["review_head_sha"] = ctx.current_review_head_sha
+    return action
+
+
+def _stale_review_run_pending_action(ctx: AdvanceContext) -> dict[str, Any]:
+    action: dict[str, Any] = {
+        "type": "run_review",
+        "description": _stale_review_pending_review_description(ctx),
+        "review_task": ctx.active_review,
+    }
+    if ctx.review_invalidation_reason in {
+        "branch_head_advanced",
+        "resolution_metadata_unavailable",
+    } and ctx.current_review_head_sha:
         action["review_head_sha"] = ctx.current_review_head_sha
     return action
 
@@ -2307,6 +2391,14 @@ def _resolve_valid_resolution_review_metadata(
     impl_task: DbTask,
     rebase_task: DbTask | None,
 ) -> ResolutionReviewScope | None:
+    original_scope_text = review_task.review_scope
+    if declares_resolution_review_mode(original_scope_text):
+        try:
+            original_metadata = parse_resolution_review_scope(original_scope_text)
+        except ValueError:
+            return None
+        if original_metadata is None:
+            return None
     repair_result = repair_resolution_review_scope_provenance(
         store,
         review_task=review_task,
@@ -2331,6 +2423,10 @@ def _resolve_valid_resolution_review_metadata(
         rebase_task=rebase_task,
     ):
         return metadata
+    if metadata is None and declares_resolution_review_mode(scope_text):
+        return None
+    if _review_is_plain_full_review(review_task):
+        return None
     if not _resolution_review_can_be_repaired_from_context(
         review_task=review_task,
         rebase_task=rebase_task,
@@ -4694,6 +4790,8 @@ def has_valid_review_for_merge(ctx: AdvanceContext) -> bool:
         return False
     if ctx.review_cleared:
         return _review_cleared_is_merge_ready(ctx)
+    if _review_mode(ctx.latest_completed_review) == "spec_coherence":
+        return False
     return ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
 
 
@@ -5183,9 +5281,7 @@ def _active_review_requires_automation(ctx: AdvanceContext) -> bool:
 
 def _review_freshness_probe_failed(ctx: AdvanceContext) -> bool:
     """Whether review freshness must fail closed because live branch-head probing failed."""
-    if ctx.current_review_head_probe_warning is None:
-        return False
-    if ctx.latest_reviewed_head_sha is None:
+    if ctx.current_review_head_is_live:
         return False
     if not _is_implementation_owned_lineage(ctx):
         return False
@@ -5195,7 +5291,55 @@ def _review_freshness_probe_failed(ctx: AdvanceContext) -> bool:
         return False
     if ctx.active_review is not None:
         return False
+    if (
+        ctx.review_invalidated_by_progress
+        and ctx.review_invalidation_reason == "resolution_metadata_unavailable"
+    ):
+        return True
+    if ctx.latest_reviewed_head_sha is None:
+        return False
+    if ctx.review_invalidated_by_progress:
+        return True
+    if (
+        ctx.review_verdict == "CHANGES_REQUESTED"
+        and not ctx.review_cleared
+        and (
+            _review_has_unresolved_non_verify_blockers(ctx.review_report)
+            or _review_output_mentions_timeout_only(ctx.latest_completed_review)
+        )
+    ):
+        return False
     return True
+
+
+def _review_output_mentions_timeout_only(review_task: DbTask | None) -> bool:
+    if review_task is None or not review_task.output_content:
+        return False
+    content = review_task.output_content.lower()
+    return "timed out" in content or "timeout" in content
+
+
+def _review_has_unresolved_non_verify_blockers(report: ParsedReviewReport | None) -> bool:
+    if report is None:
+        return False
+    for finding in report.findings:
+        if finding.severity != "BLOCKER":
+            continue
+        searchable = " ".join(
+            value
+            for value in (
+                finding.title,
+                finding.body,
+                finding.evidence,
+                finding.impact,
+                finding.fix_or_followup,
+                finding.tests,
+            )
+            if value
+        ).lower()
+        if "verify_command" not in searchable:
+            return True
+    return False
 
 
 def _spec_coherence_gate_required(ctx: AdvanceContext) -> bool:
@@ -5426,18 +5570,18 @@ def _resolve_pre_closing_review_git_context(
     if review_root_task is None:
         raise AssertionError("git phase requires review_root_task")
 
-    def _resolve_current_review_head_state() -> tuple[str | None, str | None]:
+    def _resolve_current_review_head_state() -> tuple[str | None, str | None, bool]:
         branch_name = review_root_task.branch or task.branch
         branch_head = _resolve_branch_head_sha(git, branch_name)
         if branch_head.warning is not None:
-            return None, branch_head.warning
+            return None, branch_head.warning, False
         if isinstance(branch_head.head_sha, str) and branch_head.head_sha:
-            return branch_head.head_sha, None
+            return branch_head.head_sha, None, True
         if review_root_task.id is not None:
             merge_unit = store.resolve_merge_unit_for_task(review_root_task.id)
             if merge_unit is not None and isinstance(merge_unit.head_sha, str) and merge_unit.head_sha:
-                return merge_unit.head_sha, None
-        return None, None
+                return merge_unit.head_sha, None, False
+        return None, None, False
 
     merge_source = _resolve_current_merge_source(git, task.branch or "")
     if persist_post_merge_rebase_state:
@@ -5480,6 +5624,7 @@ def _resolve_pre_closing_review_git_context(
     )
     current_impl_head_sha: str | None = None
     current_impl_head_probe_warning: str | None = None
+    current_impl_head_is_live = False
     if (
         strict_scope_inspection.inspection_error is not None
         or strict_scope_inspection.violation_paths
@@ -5490,7 +5635,11 @@ def _resolve_pre_closing_review_git_context(
         spec_coherence_inspection = SpecCoherenceInspection()
     else:
         if getattr(getattr(config, "spec_coherence", None), "enabled", False):
-            current_impl_head_sha, current_impl_head_probe_warning = _resolve_current_review_head_state()
+            (
+                current_impl_head_sha,
+                current_impl_head_probe_warning,
+                current_impl_head_is_live,
+            ) = _resolve_current_review_head_state()
         spec_coherence_inspection = _resolve_spec_coherence_inspection(
             config,
             git,
@@ -5503,6 +5652,11 @@ def _resolve_pre_closing_review_git_context(
                 spec_coherence_inspection = replace(
                     spec_coherence_inspection,
                     inspection_error=current_impl_head_probe_warning,
+                )
+            elif not current_impl_head_is_live:
+                spec_coherence_inspection = replace(
+                    spec_coherence_inspection,
+                    inspection_error="could not resolve current implementation head for spec coherence gate",
                 )
             elif current_impl_head_sha is None:
                 spec_coherence_inspection = replace(
@@ -5542,8 +5696,16 @@ def _resolve_pre_closing_review_git_context(
     )
     current_review_head_sha: str | None = None
     current_review_head_probe_warning: str | None = None
-    if ctx.latest_completed_review is not None and latest_reviewed_head_sha is not None:
-        current_review_head_sha, current_review_head_probe_warning = _resolve_current_review_head_state()
+    current_review_head_is_live = False
+    if (
+        (ctx.latest_completed_review is not None and latest_reviewed_head_sha is not None)
+        or latest_completed_rebase is not None
+    ):
+        (
+            current_review_head_sha,
+            current_review_head_probe_warning,
+            current_review_head_is_live,
+        ) = _resolve_current_review_head_state()
 
     spec_coherence_active_review = _active_spec_coherence_review(ctx.reviews)
     spec_coherence_latest_completed_review = _latest_completed_spec_coherence_review(ctx.reviews)
@@ -5643,6 +5805,86 @@ def _resolve_pre_closing_review_git_context(
         if resolution_review_metadata is None:
             resolution_review_metadata_invalid = True
 
+    if resolution_review_metadata_invalid:
+        active_review = ctx.active_review
+        active_review_mode = _review_mode(active_review)
+        active_reviewed_head_sha = _normalize_review_state_head_sha(
+            active_review.review_verify_head_sha if active_review is not None else None
+        )
+        fallback_invalidation_reason = "resolution_metadata_unavailable"
+        if current_review_head_is_live and current_review_head_sha is not None:
+            if (
+                active_review_mode == "plain_full"
+                and active_reviewed_head_sha is not None
+                and active_reviewed_head_sha != current_review_head_sha
+            ):
+                fallback_invalidation_reason = "branch_head_advanced"
+            elif (
+                active_review is None
+                and _review_is_plain_full_review(ctx.latest_completed_review)
+                and latest_reviewed_head_sha is not None
+                and latest_reviewed_head_sha != current_review_head_sha
+            ):
+                fallback_invalidation_reason = "branch_head_advanced"
+        latest_review_is_fallback_full_review_evidence = _review_is_fallback_full_review_evidence(
+            ctx.latest_completed_review,
+            current_review_head_sha=current_review_head_sha,
+            current_review_head_probe_warning=current_review_head_probe_warning,
+            current_review_head_is_live=current_review_head_is_live,
+        )
+        active_review_is_fallback_full_review_evidence = _review_is_fallback_full_review_evidence(
+            active_review,
+            current_review_head_sha=current_review_head_sha,
+            current_review_head_probe_warning=current_review_head_probe_warning,
+            current_review_head_is_live=current_review_head_is_live,
+        )
+
+        if active_review is not None and active_review.status == "in_progress":
+            resolution_review_metadata_invalid = False
+            resolution_review_metadata = None
+            review_invalidated_by_progress = True
+            review_invalidation_reason = fallback_invalidation_reason
+            review_invalidated_by_rebase = None
+        elif current_review_head_is_live and current_review_head_sha is not None:
+            resolution_review_metadata_invalid = False
+            resolution_review_metadata = None
+            review_invalidated_by_progress = True
+            review_invalidation_reason = fallback_invalidation_reason
+            review_invalidated_by_rebase = None
+
+            if active_review is None and latest_review_is_fallback_full_review_evidence:
+                review_invalidated_by_progress = False
+                review_invalidation_reason = None
+            elif active_review is not None:
+                if active_review_is_fallback_full_review_evidence:
+                    pass
+                elif active_review.status == "pending" and active_review_mode == "resolution" and ctx.create_reviews:
+                    if ctx.persist_derived_state:
+                        active_review.status = "dropped"
+                        active_review.drop_reason = "invalid resolution-review metadata superseded by full review"
+                        store.update(active_review)
+                    ctx = replace(ctx, active_review=None)
+                elif active_review.status == "pending" and active_review_mode == "plain_full" and ctx.create_reviews:
+                    if ctx.persist_derived_state:
+                        active_review.status = "dropped"
+                        active_review.drop_reason = "stale full review superseded by live-head fallback"
+                        store.update(active_review)
+                    ctx = replace(ctx, active_review=None)
+                elif active_review_mode == "spec_coherence":
+                    resolution_review_metadata_invalid = False
+                    resolution_review_metadata = None
+                    review_invalidated_by_progress = False
+                    review_invalidation_reason = None
+                    review_invalidated_by_rebase = None
+        else:
+            resolution_review_metadata_invalid = False
+            resolution_review_metadata = None
+            review_invalidated_by_progress = True
+            review_invalidation_reason = "resolution_metadata_unavailable"
+            review_invalidated_by_rebase = None
+            if active_review is not None and active_review.status == "pending":
+                ctx = replace(ctx, active_review=None)
+
     if (
         ctx.review_verdict == "CHANGES_REQUESTED"
         and review_root_task.id is not None
@@ -5721,6 +5963,7 @@ def _resolve_pre_closing_review_git_context(
         resolution_review_metadata_invalid=resolution_review_metadata_invalid,
         current_review_head_sha=current_review_head_sha,
         current_review_head_probe_warning=current_review_head_probe_warning,
+        current_review_head_is_live=current_review_head_is_live,
         latest_reviewed_head_sha=latest_reviewed_head_sha,
         completed_review_cycles=completed_review_cycles,
         review_cycle_boundary_task_id=review_cycle_boundary.boundary_task_id,
@@ -6938,11 +7181,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
             and ctx.active_review is not None
             and ctx.active_review.status == "pending"
         ),
-        action=lambda ctx: {
-            "type": "run_review",
-            "description": _stale_review_pending_review_description(ctx),
-            "review_task": ctx.active_review,
-        },
+        action=_stale_review_run_pending_action,
     ),
     AdvanceRule(
         name="review_freshness_probe_failed",

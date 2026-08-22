@@ -24250,11 +24250,11 @@ def test_watch_dry_run_surfaces_resolution_review_metadata_attention(
         patch("gza.cli.watch.Git", return_value=git),
         patch(
             "gza.cli.watch._spawn_background_iterate",
-            side_effect=AssertionError("needs-attention dry-run should not spawn iterate"),
+            side_effect=AssertionError("dry-run should not spawn iterate"),
         ),
         patch(
             "gza.cli.watch._spawn_background_worker",
-            side_effect=AssertionError("needs-attention dry-run should not spawn workers"),
+            side_effect=AssertionError("dry-run should not spawn workers"),
         ),
     ):
         result = _run_cycle(
@@ -24266,10 +24266,10 @@ def test_watch_dry_run_surfaces_resolution_review_metadata_attention(
             log=log,
         )
 
-    assert result.work_done is False
+    assert result.work_done is True
     text = log_path.read_text()
-    assert "ATTENTION" in text
-    assert "resolution-review-metadata-invalid" in text
+    assert f"{impl.id}->verify_gate" in text.replace("→", "->")
+    assert "resolution-review-metadata-invalid" not in text
     assert str(impl.id) in text
     assert "START" not in text
 

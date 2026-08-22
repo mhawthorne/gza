@@ -915,8 +915,12 @@ def test_advance_explicit_impl_remote_only_fresh_ref_no_longer_proves_merged(
 
     captured = capsys.readouterr()
     assert rc == 0
-    assert f'{impl.id} implement "Implement feature" reason=resolution-review-metadata-invalid required resolution-review metadata is missing or malformed' in captured.out
-    assert "Would advance" not in captured.out
+    assert "Needs attention (1 task):" in captured.out
+    assert f'{impl.id} implement "Implement feature"' in captured.out
+    assert "reason=review-freshness-unverified" in captured.out
+    assert "latest review freshness could not be verified" in captured.out
+    assert "Run verify gate before review" not in captured.out
+    assert "resolution-review-metadata-invalid" not in captured.out
 
 
 def test_advance_explicit_impl_conflict_plan_skips_orphan_rebase_branch_for_non_merge_action(

@@ -2752,6 +2752,27 @@ def execute_advance_action(
         if not isinstance(review_task, DbTask) or review_task.id is None:
             return AdvanceActionExecutionResult(action_type=action_type, status="skip", message="missing review task")
 
+        selected_head_sha = action.get("review_head_sha")
+        if isinstance(selected_head_sha, str) and selected_head_sha.strip():
+            selected_head_sha = selected_head_sha.strip()
+            persisted_head_sha = (
+                review_task.review_verify_head_sha.strip()
+                if isinstance(review_task.review_verify_head_sha, str)
+                else None
+            )
+            if persisted_head_sha != selected_head_sha:
+                return AdvanceActionExecutionResult(
+                    action_type=action_type,
+                    status="error",
+                    message=(
+                        "pending review head does not match selected live head "
+                        f"({persisted_head_sha or 'missing'} != {selected_head_sha})"
+                    ),
+                )
+            if review_task.review_verify_head_sha != selected_head_sha:
+                review_task.review_verify_head_sha = selected_head_sha
+                context.store.update(review_task)
+
         if context.dry_run:
             return AdvanceActionExecutionResult(
                 action_type=action_type,

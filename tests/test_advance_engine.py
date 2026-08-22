@@ -2944,7 +2944,13 @@ def test_completed_impl_without_review_and_auto_review_disabled_needs_manual_cre
         when=datetime(2026, 5, 18, 10, 0, tzinfo=UTC),
     )
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "reviewed-sha"}),
+        impl,
+        "main",
+    )
 
     assert action["type"] == "needs_discussion"
     assert action["description"] == "SKIP: no review exists and advance_create_reviews=false (run gza review manually)"
@@ -3338,7 +3344,7 @@ def test_stale_refresh_review_with_auto_review_disabled_needs_manual_refresh(
 
     repaired_review = store.get(refresh_review.id)
     assert repaired_review is not None
-    _assert_resolution_review_scope_matches_context(repaired_review.review_scope, impl=impl, rebase=rebase)
+    assert repaired_review.review_scope is None
     assert action["type"] == expected_action_type
     if expected_action_type == "verify_gate":
         assert action["verify_gate_phase"] == "pre_review"
@@ -4984,7 +4990,16 @@ def test_preserved_noop_rebase_only_refreshes_when_head_advances_independently(
     assert action["verify_gate_phase"] == "pre_merge"
 
 
-def test_changed_rebase_requires_resolution_review_metadata(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("refresh_review_status", "expected_action_type"),
+    [("pending", "create_review"), ("in_progress", "wait_review")],
+)
+def test_changed_rebase_active_invalid_resolution_review_degrades_to_full_review(
+    tmp_path: Path,
+    monkeypatch,
+    refresh_review_status: str,
+    expected_action_type: str,
+) -> None:
     from gza import advance_engine as advance_engine_module
 
     store = _make_store(tmp_path)
@@ -5012,7 +5027,7 @@ def test_changed_rebase_requires_resolution_review_metadata(tmp_path: Path, monk
         based_on=impl.id,
     )
     assert refresh_review.id is not None
-    refresh_review.status = "pending"
+    refresh_review.status = refresh_review_status
     refresh_review.review_scope = "Review mode: resolution\nImplementation task: wrong\n"
     store.update(refresh_review)
 
@@ -5031,18 +5046,708 @@ def test_changed_rebase_requires_resolution_review_metadata(tmp_path: Path, monk
         existing_branches={impl.branch},
         ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
     )
-    action = evaluate_advance_rules(config, store, git, impl, "main")
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert rebase.id is not None
+    assert action["type"] == expected_action_type
+    if action["type"] == "create_review":
+        assert action["description"] == "Create full review (resolution-review metadata unavailable)"
+        assert action["review_head_sha"] == "rebased-sha"
+    else:
+        assert action["review_task"].id == refresh_review.id
+        assert "resolution-review metadata unavailable" in action["description"]
+    assert action.get("review_mode") != "resolution"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+    dropped_review = store.get(refresh_review.id)
+    assert dropped_review is not None
+    if refresh_review_status == "pending":
+        assert dropped_review.status == "dropped"
+        assert dropped_review.drop_reason == "invalid resolution-review metadata superseded by full review"
+    else:
+        assert dropped_review.status == "in_progress"
+        assert dropped_review.drop_reason is None
+
+
+def _changes_requested_non_verify_report() -> ParsedReviewReport:
+    return ParsedReviewReport(
+        verdict="CHANGES_REQUESTED",
+        findings=(
+            ReviewFinding(
+                id="B1",
+                severity="BLOCKER",
+                title="Provider result handling is still inconsistent",
+                body="The implementation still returns a raw provider result.",
+                evidence="src/gza/provider.py:12 returns raw provider state.",
+                impact="Callers see inconsistent lifecycle outcomes.",
+                fix_or_followup="Normalize provider results before returning.",
+                tests="Add a provider-result regression.",
+            ),
+        ),
+        format_version="v2",
+    )
+
+
+def _changes_requested_timeout_report() -> ParsedReviewReport:
+    return ParsedReviewReport(
+        verdict="CHANGES_REQUESTED",
+        findings=(),
+        format_version="v2",
+    )
+
+
+@pytest.mark.parametrize(
+    ("review_output", "parsed_report"),
+    [
+        (
+            "## Blockers\n\n"
+            "### B1 Provider result handling is still inconsistent\n\n"
+            "Evidence: `src/gza/provider.py:12` returns raw provider state.\n\n"
+            "Required fix: normalize provider results before returning.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n",
+            _changes_requested_non_verify_report(),
+        ),
+        (
+            "## Summary\n\n- The review timed out before reaching a complete verdict.\n\n"
+            "## Verdict\n\nVerdict: CHANGES_REQUESTED\n",
+            _changes_requested_timeout_report(),
+        ),
+    ],
+    ids=("non_verify_blocker", "timeout_output"),
+)
+def test_changed_rebase_invalid_resolution_fallback_without_live_head_preempts_changes_requested_exemptions(
+    tmp_path: Path,
+    monkeypatch,
+    review_output: str,
+    parsed_report: ParsedReviewReport,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    branch = "feature/rebase-fallback-changes-requested-missing-head"
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=branch,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "reviewed-sha"
+    review.output_content = review_output
+    store.update(review)
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    refresh_review = store.add(
+        "Malformed refresh review",
+        task_type="review",
+        depends_on=impl.id,
+        based_on=impl.id,
+    )
+    assert refresh_review.id is not None
+    refresh_review.status = "pending"
+    refresh_review.review_scope = "Review mode: resolution\nImplementation task: wrong\n"
+    store.update(refresh_review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: parsed_report,
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={branch},
+        ref_shas={branch: None, "main": "target-sha"},
+    )
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        ctx = resolve_advance_context(config, store, git, impl, "main")
+        action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.current_review_head_sha is None
+    assert ctx.current_review_head_is_live is False
+    assert ctx.review_invalidated_by_progress is True
+    assert ctx.review_invalidation_reason == "resolution_metadata_unavailable"
     assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["needs_attention_reason"] == "review-freshness-unverified"
+    assert action.get("verify_gate_phase") is None
+    assert action.get("review_head_sha") is None
+    assert action.get("review_mode") is None
+    assert action["type"] not in {"verify_gate", "create_review", "improve"}
+
+
+def test_changed_rebase_in_progress_invalid_resolution_review_without_live_head_waits_before_replacement(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    branch = "feature/rebase-fallback-running-review-missing-head"
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=branch,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "reviewed-sha"
+    review.output_content = (
+        "## Blockers\n\n"
+        "### B1 Provider result handling is still inconsistent\n\n"
+        "Evidence: `src/gza/provider.py:12` returns raw provider state.\n\n"
+        "Required fix: normalize provider results before returning.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review)
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    running_review = store.add(
+        "Malformed refresh review",
+        task_type="review",
+        depends_on=impl.id,
+        based_on=impl.id,
+    )
+    assert running_review.id is not None
+    running_review.status = "in_progress"
+    running_review.review_scope = "Review mode: resolution\nImplementation task: wrong\n"
+    store.update(running_review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: _changes_requested_non_verify_report(),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={branch},
+        ref_shas={branch: None, "main": "target-sha"},
+    )
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        ctx = resolve_advance_context(config, store, git, impl, "main")
+        action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.current_review_head_sha is None
+    assert ctx.current_review_head_is_live is False
+    assert ctx.review_invalidated_by_progress is True
+    assert ctx.active_review is not None
+    assert ctx.active_review.id == running_review.id
+    assert action["type"] == "wait_review"
+    assert action["review_task"].id == running_review.id
+    assert action.get("review_head_sha") is None
+    assert action.get("needs_attention_reason") != "review-freshness-unverified"
+    assert action["type"] not in {"create_review", "improve", "verify_gate"}
+    reloaded_running_review = store.get(running_review.id)
+    assert reloaded_running_review is not None
+    assert reloaded_running_review.status == "in_progress"
+    assert reloaded_running_review.drop_reason is None
+
+
+def test_non_stale_changes_requested_non_verify_review_keeps_legacy_freshness_exemption(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/non-stale-changes-requested-head-unavailable",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "reviewed-sha"
+    review.output_content = (
+        "## Blockers\n\n"
+        "### B1 Provider result handling is still inconsistent\n\n"
+        "Evidence: `src/gza/provider.py:12` returns raw provider state.\n\n"
+        "Required fix: normalize provider results before returning.\n\n"
+        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+    )
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: _changes_requested_non_verify_report(),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        rev_parse_errors={impl.branch: GitError("probe blew up")},
+    )
+
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.review_invalidated_by_progress is False
+    assert ctx.current_review_head_sha is None
+    assert action["type"] == "improve"
+    assert action.get("needs_attention_reason") != "review-freshness-unverified"
+
+
+@pytest.mark.parametrize(
+    ("git_kwargs", "reviewed_head_sha", "expected_current_head_sha", "expected_warning"),
+    [
+        (
+            {
+                "existing_branches": {"feature/rebase-active-invalid-missing-head"},
+                "ref_shas": {
+                    "feature/rebase-active-invalid-missing-head": None,
+                    "main": "target-sha",
+                },
+            },
+            "reviewed-sha",
+            None,
+            None,
+        ),
+        (
+            {
+                "existing_branches": {"feature/rebase-active-invalid-probe-error"},
+                "ref_shas": {"main": "target-sha"},
+                "rev_parse_errors": {
+                    "feature/rebase-active-invalid-probe-error": GitError("probe failed")
+                },
+            },
+            "reviewed-sha",
+            None,
+            "branch-head probe failed for feature/rebase-active-invalid-probe-error: probe failed",
+        ),
+        (
+            {
+                "existing_branches": {"feature/rebase-active-invalid-legacy-missing-head-cache"},
+                "ref_shas": {
+                    "feature/rebase-active-invalid-legacy-missing-head-cache": None,
+                    "main": "target-sha",
+                },
+            },
+            None,
+            "rebased-sha",
+            None,
+        ),
+        (
+            {
+                "existing_branches": {"feature/rebase-active-invalid-legacy-missing-head-probe"},
+                "ref_shas": {"main": "target-sha"},
+                "rev_parse_errors": {
+                    "feature/rebase-active-invalid-legacy-missing-head-probe": GitError("probe failed")
+                },
+            },
+            None,
+            None,
+            "branch-head probe failed for feature/rebase-active-invalid-legacy-missing-head-probe: probe failed",
+        ),
+    ],
+)
+def test_changed_rebase_active_invalid_resolution_review_without_live_head_fails_freshness(
+    tmp_path: Path,
+    monkeypatch,
+    git_kwargs: dict[str, object],
+    reviewed_head_sha: str | None,
+    expected_current_head_sha: str | None,
+    expected_warning: str | None,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    branch_names = git_kwargs["existing_branches"]
+    assert isinstance(branch_names, set)
+    branch = next(iter(branch_names))
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=branch,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.review_verify_head_sha = reviewed_head_sha
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    refresh_review = store.add(
+        "Malformed refresh review",
+        task_type="review",
+        depends_on=impl.id,
+        based_on=impl.id,
+    )
+    assert refresh_review.id is not None
+    refresh_review.status = "pending"
+    refresh_review.review_scope = "Review mode: resolution\nImplementation task: wrong\n"
+    store.update(refresh_review)
+    if reviewed_head_sha is None:
+        unit = store.get_or_create_merge_unit_for_task(impl)
+        store.refresh_merge_unit_head(unit.id, head_sha="rebased-sha")
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    ctx = resolve_advance_context(config, store, _FakeGit(can_merge=True, **git_kwargs), impl, "main")
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True, **git_kwargs), impl, "main")
+
+    assert ctx.current_review_head_sha == expected_current_head_sha
+    assert ctx.current_review_head_is_live is False
+    assert ctx.current_review_head_probe_warning == expected_warning
+    assert ctx.resolution_review_metadata_invalid is False
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "review-freshness-unverified"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+    assert action.get("verify_gate_phase") is None
+    assert action["type"] not in {"verify_gate", "create_review", "run_review"}
+    dropped_review = store.get(refresh_review.id)
+    assert dropped_review is not None
+    assert dropped_review.status == "pending"
+
+
+@pytest.mark.parametrize(
+    ("git_kwargs", "expected_warning"),
+    [
+        (
+            {
+                "existing_branches": {"feature/rebase-plain-pending-missing-head"},
+                "ref_shas": {"feature/rebase-plain-pending-missing-head": None, "main": "target-sha"},
+            },
+            None,
+        ),
+        (
+            {
+                "existing_branches": {"feature/rebase-plain-pending-probe-error"},
+                "ref_shas": {"main": "target-sha"},
+                "rev_parse_errors": {"feature/rebase-plain-pending-probe-error": GitError("probe failed")},
+            },
+            "branch-head probe failed for feature/rebase-plain-pending-probe-error: probe failed",
+        ),
+        (
+            {
+                "existing_branches": {"feature/rebase-plain-pending-cache-only"},
+                "ref_shas": {"main": "target-sha"},
+            },
+            None,
+        ),
+    ],
+)
+def test_changed_rebase_pending_plain_review_without_live_head_fails_freshness(
+    tmp_path: Path,
+    monkeypatch,
+    git_kwargs: dict[str, object],
+    expected_warning: str | None,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    branch_names = git_kwargs["existing_branches"]
+    assert isinstance(branch_names, set)
+    branch = next(iter(branch_names))
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=branch,
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "old-reviewed-sha"
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    pending_review = store.add("Pending full review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert pending_review.id is not None
+    pending_review.status = "pending"
+    pending_review.review_verify_head_sha = "rebased-sha"
+    store.update(pending_review)
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    store.refresh_merge_unit_head(unit.id, head_sha="rebased-sha")
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True, **git_kwargs), impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "review-freshness-unverified"
+    assert action.get("probe_warning") == expected_warning
+    assert action["type"] != "run_review"
+    reloaded_review = store.get(pending_review.id)
+    assert reloaded_review is not None
+    assert reloaded_review.status == "pending"
+
+
+def test_changed_rebase_pending_plain_review_at_stale_head_creates_live_head_replacement(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-plain-pending-stale-head",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "old-reviewed-sha"
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    pending_review = store.add("Pending stale full review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert pending_review.id is not None
+    pending_review.status = "pending"
+    pending_review.review_verify_head_sha = "old-reviewed-sha"
+    store.update(pending_review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        action = evaluate_advance_rules(
+            config,
+            store,
+            _FakeGit(
+                can_merge=True,
+                existing_branches={impl.branch},
+                ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+            ),
+            impl,
+            "main",
+        )
+
+    assert action["type"] == "create_review"
+    assert action["review_head_sha"] == "rebased-sha"
+    assert action["description"] == "Create review (branch head advanced after latest review)"
+    reloaded_review = store.get(pending_review.id)
+    assert reloaded_review is not None
+    assert reloaded_review.status == "dropped"
+    assert reloaded_review.drop_reason == "stale full review superseded by live-head fallback"
+
+
+def test_changed_rebase_pending_plain_review_at_live_head_is_reused_with_selected_head(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-plain-pending-live-head",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "old-reviewed-sha"
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    pending_review = store.add("Pending current full review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert pending_review.id is not None
+    pending_review.status = "pending"
+    pending_review.review_verify_head_sha = "rebased-sha"
+    store.update(pending_review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "run_review"
+    assert action["review_task"].id == pending_review.id
+    assert action["review_head_sha"] == "rebased-sha"
+    assert "resolution-review metadata unavailable" in action["description"]
+    reloaded_review = store.get(pending_review.id)
+    assert reloaded_review is not None
+    assert reloaded_review.status == "pending"
+
+
+def test_changed_rebase_in_progress_invalid_resolution_review_waits_before_full_review_replacement(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-in-progress-invalid-review",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "reviewed-sha"
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    running_review = store.add(
+        "Malformed refresh review",
+        task_type="review",
+        depends_on=impl.id,
+        based_on=impl.id,
+    )
+    assert running_review.id is not None
+    running_review.status = "in_progress"
+    running_review.review_scope = "Review mode: resolution\nImplementation task: wrong\n"
+    store.update(running_review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "rebased-live-head", "main": "target-sha"},
+    )
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        first_action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert first_action["type"] == "wait_review"
+    assert first_action["review_task"].id == running_review.id
+    assert first_action.get("review_mode") != "resolution"
+    assert first_action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+    review_ids_after_wait = {review.id for review in store.get_reviews_for_task(impl.id)}
+    assert review_ids_after_wait == {review.id, running_review.id}
+    reloaded_running_review = store.get(running_review.id)
+    assert reloaded_running_review is not None
+    assert reloaded_running_review.status == "in_progress"
+
+    store.mark_completed(
+        reloaded_running_review,
+        output_content="## Verdict\n\nVerdict: APPROVED\n",
+        has_commits=False,
+    )
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        second_action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert second_action["type"] == "create_review"
+    assert second_action["description"] == "Create full review (resolution-review metadata unavailable)"
+    assert second_action["review_head_sha"] == "rebased-live-head"
+    assert second_action.get("review_mode") != "resolution"
+    assert second_action.get("review_task") is None
+    assert second_action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+
+    full_review = _add_completed_review(store, impl, when=datetime.now(UTC) + timedelta(seconds=1))
+    full_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    full_review.review_scope = None
+    full_review.review_verify_head_sha = "rebased-live-head"
+    store.update(full_review)
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        final_action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert final_action["type"] == "merge"
+    assert final_action["review_task"].id == full_review.id
 
 
 @pytest.mark.parametrize(
     ("refresh_review_status", "expected_action_type"),
-    [("pending", "run_review"), ("in_progress", "wait_review")],
+    [("pending", "create_review"), ("in_progress", "wait_review")],
 )
-def test_changed_rebase_active_review_after_rebase_with_empty_scope_is_repaired(
+def test_changed_rebase_active_plain_review_without_selected_head_is_not_reused(
     tmp_path: Path,
     monkeypatch,
     refresh_review_status: str,
@@ -5103,9 +5808,16 @@ def test_changed_rebase_active_review_after_rebase_with_empty_scope_is_repaired(
 
     repaired_review = store.get(refresh_review.id)
     assert repaired_review is not None
-    _assert_resolution_review_scope_matches_context(repaired_review.review_scope, impl=impl, rebase=rebase)
+    assert repaired_review.review_scope is None
     assert action["type"] == expected_action_type
-    assert action["review_task"].id == refresh_review.id
+    if expected_action_type == "create_review":
+        assert action["review_head_sha"] == "rebased-sha"
+        assert action["description"] == "Create full review (resolution-review metadata unavailable)"
+        assert repaired_review.status == "dropped"
+        assert repaired_review.drop_reason == "stale full review superseded by live-head fallback"
+    else:
+        assert action["review_task"].id == refresh_review.id
+        assert "resolution-review metadata unavailable" in action["description"]
     assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
@@ -5259,7 +5971,7 @@ def test_changed_rebase_active_resolution_review_metadata_matching_provenance_is
 
 
 @pytest.mark.parametrize("review_scope", ["ordinary full review", None])
-def test_changed_rebase_completed_passing_review_after_rebase_repairs_missing_resolution_metadata(
+def test_changed_rebase_completed_plain_review_after_rebase_degrades_to_full_review(
     tmp_path: Path,
     monkeypatch,
     review_scope: str | None,
@@ -5296,23 +6008,29 @@ def test_changed_rebase_completed_passing_review_after_rebase_repairs_missing_re
         ),
     )
 
-    action = evaluate_advance_rules(
-        config,
-        store,
-        _FakeGit(
-            can_merge=True,
-            existing_branches={impl.branch},
-            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
-        ),
-        impl,
-        "main",
-    )
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        action = evaluate_advance_rules(
+            config,
+            store,
+            _FakeGit(
+                can_merge=True,
+                existing_branches={impl.branch},
+                ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+            ),
+            impl,
+            "main",
+        )
 
-    repaired_review = store.get(review.id)
-    assert repaired_review is not None
-    _assert_resolution_review_scope_matches_context(repaired_review.review_scope, impl=impl, rebase=rebase)
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_merge"
+    persisted_review = store.get(review.id)
+    assert persisted_review is not None
+    assert persisted_review.review_scope == review_scope
+    assert action["type"] == "create_review"
+    assert action.get("review_mode") != "resolution"
+    assert action["description"] == "Create full review (resolution-review metadata unavailable)"
+    assert action["review_head_sha"] == "rebased-sha"
     assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
@@ -5472,7 +6190,7 @@ def test_read_only_advance_evaluation_uses_repaired_resolution_scope_without_per
     assert repaired_review.review_scope != original_scope
 
 
-def test_changed_rebase_completed_resolution_review_missing_pre_rebase_target_still_parks(
+def test_changed_rebase_completed_resolution_review_missing_pre_rebase_target_degrades_to_full_review(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -5547,9 +6265,11 @@ def test_changed_rebase_completed_resolution_review_missing_pre_rebase_target_st
     persisted_review = store.get(review.id)
     assert persisted_review is not None
     assert persisted_review.review_scope == original_scope
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
-    assert action["subject_task_id"] == impl.id
+    assert action["type"] == "create_review"
+    assert action.get("review_mode") != "resolution"
+    assert action["description"] == "Create full review (resolution-review metadata unavailable)"
+    assert action["review_head_sha"] == "rebased-sha"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
 @pytest.mark.parametrize(
@@ -5622,7 +6342,7 @@ def test_changed_rebase_completed_resolution_review_metadata_must_match_provenan
     assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
-def test_changed_rebase_completed_review_with_malformed_resolution_header_still_parks(
+def test_changed_rebase_completed_review_with_malformed_resolution_header_degrades_to_full_review(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -5630,6 +6350,9 @@ def test_changed_rebase_completed_review_with_malformed_resolution_header_still_
 
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
 
     impl = _make_completed_unmerged_impl(
         store,
@@ -5646,7 +6369,28 @@ def test_changed_rebase_completed_review_with_malformed_resolution_header_still_
     review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
     review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
     review.review_scope = "Review mode: resolution\nImplementation task: gza-1\n"
+    review.review_verify_head_sha = "rebased-sha"
     store.update(review)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 5, 10, 13, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="rebased-sha",
+            reviewed_base_sha="target-sha",
+            working_directory="/tmp/worktree",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
 
     monkeypatch.setattr(
         advance_engine_module,
@@ -5673,9 +6417,11 @@ def test_changed_rebase_completed_review_with_malformed_resolution_header_still_
     persisted_review = store.get(review.id)
     assert persisted_review is not None
     assert persisted_review.review_scope == "Review mode: resolution\nImplementation task: gza-1\n"
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
-    assert action["subject_task_id"] == impl.id
+    assert action["type"] == "create_review"
+    assert action.get("review_mode") != "resolution"
+    assert action["description"] == "Create full review (resolution-review metadata unavailable)"
+    assert action["review_head_sha"] == "rebased-sha"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
 def test_changed_rebase_completed_resolution_review_matching_provenance_can_merge(
@@ -5731,18 +6477,354 @@ def test_changed_rebase_completed_resolution_review_matching_provenance_can_merg
     assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
+def test_changed_rebase_plain_review_at_live_head_can_merge(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-full-review-current",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_verify_head_sha = "rebased-sha"
+    review.review_scope = None
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        git = _FakeGit(
+            can_merge=True,
+            existing_branches={impl.branch},
+            ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+        )
+        ctx = resolve_advance_context(config, store, git, impl, "main")
+        action = evaluate_advance_rules(
+            config,
+            store,
+            git,
+            impl,
+            "main",
+        )
+
+    assert ctx.current_review_head_is_live is True
+    assert action["type"] == "merge"
+    assert action["review_task"].id == review.id
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+
+
 @pytest.mark.parametrize(
-    ("ref_shas", "branch_name"),
+    ("git_kwargs", "expected_warning"),
     [
-        ({"feature/rebase-missing-resolution-target": "rebased-sha", "main": None}, "feature/rebase-missing-resolution-target"),
-        ({"feature/rebase-missing-resolution-head": None, "main": "target-sha"}, "feature/rebase-missing-resolution-head"),
+        (
+            {"existing_branches": {"feature/rebase-full-review-cache-only"}, "ref_shas": {"main": "target-sha"}},
+            None,
+        ),
+        (
+            {"rev_parse_errors": {"feature/rebase-full-review-cache-only": GitError("probe blew up")}},
+            "branch-head probe failed for feature/rebase-full-review-cache-only: probe blew up",
+        ),
     ],
 )
-def test_changed_rebase_missing_planned_resolution_metadata_fails_closed(
+def test_changed_rebase_plain_review_requires_live_head_not_merge_unit_cache(
+    tmp_path: Path,
+    monkeypatch,
+    git_kwargs: dict[str, object],
+    expected_warning: str | None,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-full-review-cache-only",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_verify_head_sha = "rebased-sha"
+    review.review_scope = None
+    store.update(review)
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    store.refresh_merge_unit_head(unit.id, head_sha="rebased-sha")
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        git = _FakeGit(can_merge=True, **git_kwargs)
+        ctx = resolve_advance_context(config, store, git, impl, "main")
+        action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.current_review_head_sha == ("rebased-sha" if expected_warning is None else None)
+    assert ctx.current_review_head_is_live is False
+    assert ctx.current_review_head_probe_warning == expected_warning
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "review-freshness-unverified"
+    assert action["type"] != "merge"
+
+
+def test_changed_rebase_plain_review_at_stale_head_degrades_to_full_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-full-review-stale",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    _add_rebase_diff_provenance(store, rebase)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    review.review_verify_head_sha = "pre-rebase-head"
+    review.review_scope = None
+    store.update(review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        action = evaluate_advance_rules(
+            config,
+            store,
+            _FakeGit(
+                can_merge=True,
+                existing_branches={impl.branch},
+                ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+            ),
+            impl,
+            "main",
+        )
+
+    assert action["type"] == "create_review"
+    assert action.get("review_mode") != "resolution"
+    assert action["description"] == "Create review (branch head advanced after latest review)"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+
+
+def test_changed_rebase_unrecoverable_provenance_full_review_progresses_to_merge(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-unrecoverable-provenance-full-review",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    old_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    old_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    old_review.review_verify_head_sha = "pre-rebase-head"
+    store.update(old_review)
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    assert rebase.review_scope is None
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        existing_branches={impl.branch},
+        ref_shas={impl.branch: "rebased-live-head", "main": "target-sha"},
+    )
+
+    first_action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert first_action["type"] == "verify_gate"
+    assert first_action["verify_gate_phase"] == "pre_review"
+    assert first_action.get("review_mode") != "resolution"
+    assert first_action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+
+    full_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 13, 0, tzinfo=UTC))
+    full_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    full_review.review_scope = None
+    full_review.review_verify_head_sha = "rebased-live-head"
+    store.update(full_review)
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        ctx = resolve_advance_context(config, store, git, impl, "main")
+        second_action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert ctx.current_review_head_is_live is True
+    assert full_review.review_verify_head_sha == ctx.current_review_head_sha
+    assert second_action["type"] == "merge"
+    assert second_action["review_task"].id == full_review.id
+
+
+def test_changed_rebase_recovered_complete_provenance_creates_resolution_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/rebase-recovered-provenance",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    rebase = _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    rebase.review_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip="pre-rebase-head",
+            target_at_start="pre-rebase-target",
+            merge_base_at_start="pre-rebase-merge-base",
+            recovered=True,
+        ),
+        resolved_head_sha="rebased-sha",
+        resolved_target_sha="target-sha",
+    )
+    store.update(rebase)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        action = evaluate_advance_rules(
+            config,
+            store,
+            _FakeGit(
+                can_merge=True,
+                existing_branches={impl.branch},
+                ref_shas={impl.branch: "rebased-sha", "main": "target-sha"},
+            ),
+            impl,
+            "main",
+        )
+
+    assert action["type"] == "create_review"
+    assert action["review_mode"] == "resolution"
+    assert action["resolution_rebase_task_id"] == rebase.id
+    assert action["resolution_head_sha"] == "rebased-sha"
+    assert action["resolution_target_sha"] == "target-sha"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
+
+
+@pytest.mark.parametrize(
+    ("ref_shas", "branch_name", "expected_action_type"),
+    [
+        (
+            {"feature/rebase-missing-resolution-target": "rebased-sha", "main": None},
+            "feature/rebase-missing-resolution-target",
+            "verify_gate",
+        ),
+        (
+            {"feature/rebase-missing-resolution-head": None, "main": "target-sha"},
+            "feature/rebase-missing-resolution-head",
+            "needs_discussion",
+        ),
+    ],
+)
+def test_changed_rebase_missing_planned_resolution_metadata_degrades_to_full_review(
     tmp_path: Path,
     monkeypatch,
     ref_shas: dict[str, str | None],
     branch_name: str,
+    expected_action_type: str,
 ) -> None:
     from gza import advance_engine as advance_engine_module
 
@@ -5783,11 +6865,12 @@ def test_changed_rebase_missing_planned_resolution_metadata_fails_closed(
 
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
-    assert action["description"] == "SKIP: required resolution-review metadata is missing or malformed"
-    assert action["subject_task_id"] == impl.id
-    assert action["type"] != "create_review"
+    assert action["type"] == expected_action_type
+    if expected_action_type == "verify_gate":
+        assert action["verify_gate_phase"] == "pre_review"
+    else:
+        assert action["needs_attention_reason"] == "review-freshness-unverified"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
 def test_live_branch_head_blocks_merge_when_merge_unit_head_is_stale(
@@ -6176,14 +7259,21 @@ def test_changed_rebase_with_missing_persisted_provenance_rederives_resolution_r
     )
     git.repo_dir = tmp_path
 
-    action = evaluate_advance_rules(config, store, git, rebase, "main")
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        action = evaluate_advance_rules(config, store, git, rebase, "main")
 
     repaired_rebase = store.get(rebase.id)
     assert repaired_rebase is not None
     assert repaired_rebase.review_scope is not None
     assert f"Pre-rebase head SHA: {pre_head}" in repaired_rebase.review_scope
-    assert action["type"] == "verify_gate"
-    assert action["verify_gate_phase"] == "pre_review"
+    assert action["type"] == "create_review"
+    assert action["review_mode"] == "resolution"
+    assert action["resolution_rebase_task_id"] == rebase.id
+    assert action["resolution_head_sha"] == "rebased-head"
+    assert action["resolution_target_sha"] == target_now
     assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
@@ -6384,7 +7474,7 @@ def test_collect_scoped_tag_scope_gaps_uses_readonly_resolution_repairs(
     assert stored_review.review_scope == original_review_scope
 
 
-def test_changed_rebase_with_missing_persisted_provenance_stays_parked_without_rebase_reflog_proof(
+def test_changed_rebase_with_missing_persisted_provenance_without_reflog_proof_degrades_to_full_review(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -6447,16 +7537,44 @@ def test_changed_rebase_with_missing_persisted_provenance_stays_parked_without_r
     )
     git.repo_dir = tmp_path
 
-    action = evaluate_advance_rules(config, store, git, rebase, "main")
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 5, 10, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha=rebased_head,
+            reviewed_base_sha=target_now,
+            working_directory="/tmp/worktree",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        action = evaluate_advance_rules(config, store, git, rebase, "main")
 
     persisted_rebase = store.get(rebase.id)
     assert persisted_rebase is not None
     assert persisted_rebase.review_scope == original_scope
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["type"] == "create_review"
+    assert action.get("review_mode") != "resolution"
+    assert action["description"] == "Create full review (resolution-review metadata unavailable)"
+    assert action["review_head_sha"] == rebased_head
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
-def test_changed_rebase_with_missing_persisted_provenance_readonly_repair_fails_closed(
+def test_changed_rebase_with_missing_persisted_provenance_readonly_repair_degrades_to_full_review(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -6529,17 +7647,44 @@ def test_changed_rebase_with_missing_persisted_provenance_readonly_repair_fails_
     )
     git.repo_dir = tmp_path
 
-    action = evaluate_advance_rules(config, store, git, impl, "main")
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 5, 10, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha=rebased_head,
+            reviewed_base_sha=target_now,
+            working_directory="/tmp/worktree",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    with patch(
+        "gza.advance_engine.resolve_verify_gate_decision",
+        lambda *args, **kwargs: SimpleNamespace(state="passed"),
+    ):
+        action = evaluate_advance_rules(config, store, git, impl, "main")
 
     persisted_rebase = store.get(rebase.id)
     assert persisted_rebase is not None
     assert persisted_rebase.review_scope == original_scope
     assert rebase.review_scope == original_scope
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["type"] == "create_review"
+    assert action.get("review_mode") != "resolution"
+    assert action["description"] == "Create review (branch head advanced after latest review)"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
-def test_changed_rebase_completed_resolution_review_with_missing_resolved_shas_stays_parked(
+def test_changed_rebase_completed_resolution_review_with_missing_resolved_shas_degrades_to_full_review(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -6603,8 +7748,11 @@ def test_changed_rebase_completed_resolution_review_with_missing_resolved_shas_s
     persisted_review = store.get(review.id)
     assert persisted_review is not None
     assert persisted_review.review_scope == original_scope
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["type"] == "create_review"
+    assert action.get("review_mode") != "resolution"
+    assert action["description"] == "Create full review (resolution-review metadata unavailable)"
+    assert action["review_head_sha"] == "rebased-head"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
 def test_changed_rebase_completed_approved_review_with_missing_persisted_provenance_repairs_and_unparks(
@@ -6690,7 +7838,7 @@ def test_changed_rebase_completed_approved_review_with_missing_persisted_provena
     assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
-def test_changed_rebase_completed_review_missing_resolution_metadata_readonly_repair_fails_closed(
+def test_changed_rebase_completed_review_missing_resolution_metadata_readonly_repair_degrades_to_full_review(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -6751,8 +7899,11 @@ def test_changed_rebase_completed_review_missing_resolution_metadata_readonly_re
     assert persisted_review is not None
     assert persisted_review.review_scope is None
     assert review.review_scope is None
-    assert action["type"] == "needs_discussion"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["type"] == "create_review"
+    assert action.get("review_mode") != "resolution"
+    assert action["description"] == "Create full review (resolution-review metadata unavailable)"
+    assert action["review_head_sha"] == "rebased-sha"
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
 def test_evaluate_resumes_timeout_retry_descendant_once(tmp_path: Path):
@@ -7302,7 +8453,13 @@ def test_completed_fix_after_changes_requested_requires_fresh_review(tmp_path: P
         ),
     )
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "reviewed-sha"}),
+        impl,
+        "main",
+    )
     assert action["type"] == "verify_gate", action
     assert action["verify_gate_phase"] == "pre_review"
 
@@ -13966,7 +15123,13 @@ def test_invalid_duplicate_blocker_adjudication_clears_review_and_merges(
         completed_task=adjudication,
     )
 
-    action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), impl, "main")
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "reviewed-sha"}),
+        impl,
+        "main",
+    )
 
     assert action["type"] == "verify_gate"
     assert action["verify_gate_phase"] == "pre_merge"
@@ -16001,8 +17164,9 @@ def test_remote_only_merged_post_rebase_branch_keeps_resolution_review_requireme
     )
 
     assert action["type"] == "needs_discussion"
-    assert action["description"] == "SKIP: required resolution-review metadata is missing or malformed"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["needs_attention_reason"] == "review-freshness-unverified"
+    assert action["type"] not in {"verify_gate", "create_review", "run_review"}
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
 def test_remote_only_fresh_remote_tip_no_longer_overrides_stale_local_merge_truth(
@@ -16067,8 +17231,9 @@ def test_remote_only_fresh_remote_tip_no_longer_overrides_stale_local_merge_trut
     )
 
     assert action["type"] == "needs_discussion"
-    assert action["description"] == "SKIP: required resolution-review metadata is missing or malformed"
-    assert action["needs_attention_reason"] == "resolution-review-metadata-invalid"
+    assert action["needs_attention_reason"] == "review-freshness-unverified"
+    assert action["type"] not in {"verify_gate", "create_review", "run_review"}
+    assert action.get("needs_attention_reason") != "resolution-review-metadata-invalid"
 
 
 def test_redundant_branch_skips_with_commits_already_present_text(tmp_path: Path) -> None:
@@ -18612,6 +19777,184 @@ def test_spec_coherence_touch_reuses_pending_coherence_review(tmp_path: Path) ->
 
     assert action["type"] == "run_review"
     assert action["review_task"].id == review.id
+
+
+@pytest.mark.parametrize(
+    ("review_status", "expected_action_type"),
+    [("pending", "run_review"), ("in_progress", "wait_review")],
+)
+def test_changed_rebase_preserves_active_spec_coherence_review(
+    tmp_path: Path,
+    monkeypatch,
+    review_status: str,
+    expected_action_type: str,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/spec-coherence-changed-rebase-{review_status}",
+        when=datetime(2026, 6, 2, 10, 0, tzinfo=UTC),
+    )
+    ordinary_review = _add_completed_review(store, impl, when=datetime(2026, 6, 2, 10, 30, tzinfo=UTC))
+    ordinary_review.review_verify_head_sha = "old-reviewed-sha"
+    ordinary_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(ordinary_review)
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 6, 2, 11, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    coherence_review = store.add("Run /gza-spec-coherence", task_type="review", depends_on=impl.id)
+    assert coherence_review.id is not None
+    coherence_review.review_scope = build_spec_coherence_review_scope(
+        implementation_task_id=impl.id,
+        reviewed_head_sha="coherence-head",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+    )
+    coherence_review.review_verify_head_sha = "coherence-head"
+    coherence_review.status = review_status
+    store.update(coherence_review)
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "coherence-head", "main": "target-sha"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == expected_action_type
+    assert action["review_task"].id == coherence_review.id
+    assert "behavior-spec coherence review" in action["description"]
+    reloaded_review = store.get(coherence_review.id)
+    assert reloaded_review is not None
+    assert reloaded_review.status == review_status
+    assert reloaded_review.drop_reason is None
+
+
+def test_changed_rebase_current_spec_coherence_approval_still_requires_plain_full_review(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-rebase-full-review",
+        when=datetime(2026, 6, 2, 10, 0, tzinfo=UTC),
+    )
+    ordinary_review = _add_completed_review(store, impl, when=datetime(2026, 6, 2, 10, 30, tzinfo=UTC))
+    ordinary_review.review_verify_head_sha = "old-reviewed-sha"
+    ordinary_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(ordinary_review)
+    _add_completed_rebase(
+        store,
+        impl,
+        when=datetime(2026, 6, 2, 11, 0, tzinfo=UTC),
+        changed_diff=True,
+    )
+    coherence_review = _add_completed_review(store, impl, when=datetime(2026, 6, 2, 12, 0, tzinfo=UTC))
+    coherence_review.review_scope = build_spec_coherence_review_scope(
+        implementation_task_id=impl.id,
+        reviewed_head_sha="coherence-head",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+    )
+    coherence_review.review_verify_head_sha = "coherence-head"
+    coherence_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(coherence_review)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=coherence_review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 6, 2, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="coherence-head",
+            reviewed_base_sha="target-sha",
+            working_directory="/tmp/worktree",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={impl.branch: "coherence-head", "main": "target-sha"},
+        name_status_by_range={f"main...{impl.branch}": "M\tspecs/behavior/lifecycle-engine.md\n"},
+    )
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_review"
+    assert action.get("review_mode") != "resolution"
+    assert action["description"] == "Create full review (resolution-review metadata unavailable)"
+    assert action["review_head_sha"] == "coherence-head"
+
+    plain_review = _add_completed_review(store, impl, when=datetime(2026, 6, 2, 13, 0, tzinfo=UTC))
+    plain_review.review_verify_head_sha = "coherence-head"
+    plain_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(plain_review)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=plain_review,
+        result=SimpleNamespace(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 6, 2, 13, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="coherence-head",
+            reviewed_base_sha="target-sha",
+            working_directory="/tmp/worktree",
+            failure=None,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="review_verify",
+    )
+
+    action_after_plain_review = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action_after_plain_review["type"] == "merge"
+    assert action_after_plain_review["review_task"].id == plain_review.id
 
 
 def test_spec_coherence_stale_approval_after_later_spec_edit_creates_refresh_review(

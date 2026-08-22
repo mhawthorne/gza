@@ -70,8 +70,6 @@ _REFLOG_REBASE_TARGET_RE = re.compile(r"onto (?P<target>[0-9a-f]{40})$")
 
 def resolution_delta_provenance_is_complete(provenance: RebaseDiffProvenance) -> bool:
     """Return whether persisted provenance retains the irrecoverable pre-rebase proof."""
-    if provenance.recovered:
-        return False
     return all(
         (
             provenance.old_tip,

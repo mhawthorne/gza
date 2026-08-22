@@ -328,11 +328,35 @@ closed and be treated as changed.
   context before evaluating merge eligibility. Read-only/query lifecycle paths MAY apply
   the proven review-scope repair in memory for that evaluation, MUST NOT write it, and
   MUST leave durable repair for the next write-capable lifecycle path.
-- If lifecycle still cannot resolve or validate the metadata that defines a required
-  resolution review after that re-derivation-and-repair attempt, it MUST fail closed and
-  park the lineage with `resolution-review-metadata-invalid`. It MUST NOT silently preserve
-  the old approval, and it MUST NOT silently widen that refresh into a generic whole-task
-  review.
+- Recovered rebase-diff provenance is usable for a narrow resolution review when all
+  three pre-rebase SHAs and the resolved post-rebase head/target SHAs are populated.
+  `Recovered baseline: yes` records how the baseline was obtained; it MUST NOT by itself
+  make otherwise complete provenance invalid.
+- Provenance is an optimization for a narrow resolution review, not the correctness
+  floor for merge. If lifecycle still cannot resolve or validate the metadata that
+  defines a required resolution review after the re-derivation-and-repair attempt, it
+  MUST NOT silently preserve the old approval and MUST NOT park permanently only because
+  resolution-review metadata is unavailable. Instead, when the live implementation head
+  is known, lifecycle MUST degrade to the coarser head-SHA freshness rule: require a
+  plain full review whose stored `review_verify_head_sha` equals the current live branch
+  head, plus current green verify evidence. Until such a full review exists, lifecycle
+  MUST select the normal pre-review verify / `create_review` path for a full review at
+  the current head, and operator-facing descriptions MUST distinguish unavailable
+  resolution-review metadata from actual reviewed-head/live-head advancement. A pending
+  plain full-review row MAY be reused only when its stored `review_verify_head_sha`
+  already equals the proven live head and the executor enforces that selected head before
+  launch. A full-review approval or pending full-review row recorded against an older
+  head MUST NOT satisfy the merge gate. Pending malformed resolution-review refresh rows
+  MAY be dropped before that fallback is selected, but valid spec-coherence reviews MUST
+  remain governed by the spec-coherence gate and an `in_progress` malformed refresh row
+  MUST terminalize before lifecycle selects a replacement review that could race it.
+  When the live implementation head cannot be proven, lifecycle MUST fail closed with
+  `review-freshness-unverified`; cached merge-unit head metadata is not live proof.
+- When valid resolution-review metadata exists for a real resolution review, lifecycle
+  MUST keep the narrow resolution-review path and precise rebase-delta match. Plain
+  non-resolution reviews MUST NOT be repaired into resolution reviews merely because
+  they completed after a changed-diff rebase; they are eligible only through the full
+  live-head fallback above.
 - Stale-review refresh rules MUST run before `review_max_cycles` evaluation.
 - `max_review_cycles` MUST count only completed review/improve cycles inside the current
   durable-progress epoch. The epoch resets only when persisted evidence shows a new
