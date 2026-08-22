@@ -8,11 +8,17 @@ Run the server CLI through the project launcher:
 server/bin/gza-server start
 server/bin/gza-server status
 server/bin/gza-server open
+server/bin/gza-server logs
+server/bin/gza-server restart
 server/bin/gza-server stop
 ```
 
 The launcher works from any working directory and runs the server with the
 server subproject environment.
+
+`restart` stops a running server and starts it again, taking the same
+`--port` and `--no-reload` flags as `start`. A server that is not running is
+not an error: restarting is how you ask for the server to be up.
 
 ## Logs
 

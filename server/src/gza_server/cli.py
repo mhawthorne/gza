@@ -668,6 +668,22 @@ def stop_server(path: Path) -> str:
         return "stopped"
 
 
+def restart_server(
+    path: Path, *, reload: bool = True, port: int | None = None
+) -> str:
+    """Stop the server if it is running, then start it again.
+
+    A server that is not running is not an error here: restarting is how an
+    operator asks for a server to be up, and refusing because it is already
+    down would just mean running `start` by hand.
+    """
+    stopped = stop_server(path)
+    started = start_server(path, reload=reload, port=port)
+    if stopped == "stopped":
+        return started
+    return f"{stopped}; started {started}"
+
+
 def status_server(path: Path, *, now: datetime | None = None) -> str:
     with server_lock(path):
         state = read_state(path)
@@ -747,6 +763,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not restart the server when its source changes",
     )
     subparsers.add_parser("stop", help="stop the running server")
+    restart = subparsers.add_parser(
+        "restart",
+        help="stop the server if it is running, then start it again",
+    )
+    restart.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=(
+            "port to listen on; 0 picks a free one. "
+            f"Defaults to ${PORT_ENV_VAR}, then server_port in gza.yaml, then {DEFAULT_SERVER_PORT}."
+        ),
+    )
+    restart.add_argument(
+        "--no-reload",
+        dest="reload",
+        action="store_false",
+        help="do not restart the server when its source changes",
+    )
     subparsers.add_parser(
         "status",
         help="show the running server's pid, port, and uptime",
@@ -773,6 +808,8 @@ def main(argv: list[str] | None = None) -> int:
             message = start_server(path, reload=args.reload, port=args.port)
         elif args.command == "stop":
             message = stop_server(path)
+        elif args.command == "restart":
+            message = restart_server(path, reload=args.reload, port=args.port)
         elif args.command == "status":
             message = status_server(path)
         elif args.command == "logs":
