@@ -8,11 +8,15 @@ from typing import Any
 from gza.db import (
     SqliteTaskStore,
     Task,
+    TaskPromptEditConflict,
     edit_task_prompt as _edit_task_prompt,
 )
 from gza.report_sync import synchronize_task_report
 
 edit_task_prompt = _edit_task_prompt
+# The server reports every rejected content edit as one conflict kind, whatever
+# the core called it, so routes and tests have a single name to catch.
+TaskEditConflict = TaskPromptEditConflict
 
 
 @dataclass(frozen=True)

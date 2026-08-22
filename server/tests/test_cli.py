@@ -19,11 +19,13 @@ from gza_server.cli import (
     IdentityStatus,
     LifecycleError,
     ServerState,
+    build_parser,
     claim_port,
     open_server,
     process_start_id,
     read_state,
     resolve_port,
+    restart_server,
     start_server,
     state_file_path,
     status_server,
@@ -561,7 +563,9 @@ def test_status_reports_pid_port_and_uptime(tmp_path):
     ):
         result = status_server(path, now=datetime(2026, 8, 17, 5, 1, 30, tzinfo=UTC))
 
-    assert result == "pid: 1234\nport: 4321\nuptime: 90s"
+    assert result == (
+        f"pid: 1234\nport: 4321\nuptime: 90s\nlog: {tmp_path / 'gza-server.log'}"
+    )
 
 
 def test_status_clears_stale_state(tmp_path):
@@ -1224,3 +1228,64 @@ def test_start_uses_the_resolved_port(tmp_path, monkeypatch):
     claim.assert_called_once_with(9411)
     assert url == "http://127.0.0.1:9411/"
     assert "9411" in popen.call_args.args[0]
+
+
+def test_restart_stops_then_starts_and_returns_the_new_url(tmp_path):
+    path = tmp_path / "gza-server.json"
+    calls = []
+
+    def fake_stop(stop_path):
+        calls.append(("stop", stop_path))
+        return "stopped"
+
+    def fake_start(start_path, *, reload, port):
+        calls.append(("start", start_path, reload, port))
+        return "http://127.0.0.1:8765/"
+
+    with (
+        patch("gza_server.cli.stop_server", side_effect=fake_stop),
+        patch("gza_server.cli.start_server", side_effect=fake_start),
+    ):
+        result = restart_server(path, reload=False, port=9100)
+
+    assert [call[0] for call in calls] == ["stop", "start"]
+    assert calls[1] == ("start", path, False, 9100)
+    assert result == "http://127.0.0.1:8765/"
+
+
+def test_restart_starts_a_server_that_was_not_running(tmp_path):
+    """Restarting is how an operator asks for the server to be up."""
+    path = tmp_path / "gza-server.json"
+
+    with (
+        patch("gza_server.cli.stop_server", return_value="not running"),
+        patch(
+            "gza_server.cli.start_server", return_value="http://127.0.0.1:8765/"
+        ) as start,
+    ):
+        result = restart_server(path)
+
+    start.assert_called_once()
+    assert "not running" in result
+    assert "http://127.0.0.1:8765/" in result
+
+
+def test_restart_does_not_start_when_the_stop_fails(tmp_path):
+    """A server that could not be stopped must not be duplicated."""
+    path = tmp_path / "gza-server.json"
+
+    with (
+        patch("gza_server.cli.stop_server", side_effect=LifecycleError("stuck")),
+        patch("gza_server.cli.start_server") as start,
+        pytest.raises(LifecycleError, match="stuck"),
+    ):
+        restart_server(path)
+
+    start.assert_not_called()
+
+
+def test_restart_parser_accepts_start_flags():
+    args = build_parser().parse_args(["restart", "--port", "9100", "--no-reload"])
+    assert args.command == "restart"
+    assert args.port == 9100
+    assert args.reload is False
