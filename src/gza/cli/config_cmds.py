@@ -57,6 +57,7 @@ from ..log_paths import paired_log_paths, slug_from_log_path
 from ..merge_state import resolve_task_merge_state_for_target
 from ..report_sync import ReportSyncResult, synchronize_task_report
 from ..task_slug import get_slug_display_text
+from ..task_types import EXECUTABLE_TASK_TYPES
 from ..workers import WorkerMetadata, WorkerRegistry
 from ._common import get_review_verdict, get_store, resolve_id
 
@@ -2405,9 +2406,8 @@ def cmd_config(args: argparse.Namespace) -> int:
     effective_sources = _project_effective_source_map(effective, config.source_map)
 
     if args.json:
-        task_types = ["explore", "plan", "implement", "review", "improve", "internal"]
         model_resolution = {}
-        for task_type in task_types:
+        for task_type in EXECUTABLE_TASK_TYPES:
             provider = config.get_provider_for_task(task_type)
             model = config.get_model_for_task(task_type, provider)
             reasoning_effort = config.get_reasoning_effort_for_task(task_type, provider)
@@ -2471,20 +2471,19 @@ def cmd_config(args: argparse.Namespace) -> int:
     print()
     print("Model/Reasoning Resolution by Task Type")
     print("=" * 50)
-    task_types = ["explore", "plan", "implement", "review", "improve", "internal"]
     model_rows = []
-    for task_type in task_types:
-            provider = config.get_provider_for_task(task_type)
-            model = config.get_model_for_task(task_type, provider)
-            reasoning_effort = config.get_reasoning_effort_for_task(task_type, provider)
-            model_rows.append(
-                (
-                    task_type,
-                    provider,
-                    model or "(missing; creation blocked)",
-                    reasoning_effort or "(provider default)",
-                )
+    for task_type in EXECUTABLE_TASK_TYPES:
+        provider = config.get_provider_for_task(task_type)
+        model = config.get_model_for_task(task_type, provider)
+        reasoning_effort = config.get_reasoning_effort_for_task(task_type, provider)
+        model_rows.append(
+            (
+                task_type,
+                provider,
+                model or "(missing; creation blocked)",
+                reasoning_effort or "(provider default)",
             )
+        )
     type_width = max(len(r[0]) for r in model_rows)
     prov_width = max(len(r[1]) for r in model_rows)
     for task_type, provider, model_display, reasoning_effort_display in model_rows:

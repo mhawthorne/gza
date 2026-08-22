@@ -448,6 +448,26 @@ class TestPreflightTargetResolution:
         review_line = next(line for line in result.stdout.splitlines() if line.startswith("review"))
         assert "(missing; creation blocked)" in review_line
         assert "(provider default)" not in review_line.split("  codex", 1)[1].split("  ", 2)[1]
+
+    def test_config_show_includes_uncovered_executable_task_types(self, tmp_path: Path) -> None:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test\n"
+            "provider: codex\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      implement:\n"
+            "        model: gpt-5.5\n",
+            encoding="utf-8",
+        )
+
+        result = invoke_gza("config", "--project", str(tmp_path))
+
+        assert result.returncode == 0
+        rebase_line = next(line for line in result.stdout.splitlines() if line.startswith("rebase"))
+        assert "(missing; creation blocked)" in rebase_line
+
+
 class TestPreflightCommand:
     def test_cmd_preflight_reporting_and_exit_code(self, tmp_path: Path, monkeypatch, capsys) -> None:
         (tmp_path / "gza.yaml").write_text(

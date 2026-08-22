@@ -62,6 +62,8 @@ CLI_FILTER_TASK_TYPES: Final[tuple[str, ...]] = (
     TASK_TYPE_INTERNAL,
 )
 
+EXECUTABLE_TASK_TYPES: Final[tuple[str, ...]] = CLI_FILTER_TASK_TYPES
+
 CLI_ADD_TASK_TYPES: Final[tuple[str, ...]] = (
     TASK_TYPE_EXPLORE,
     TASK_TYPE_PLAN,
