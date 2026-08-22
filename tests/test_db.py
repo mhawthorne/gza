@@ -15,6 +15,8 @@ import pytest
 
 from gza.db import (
     DB_UNSET,
+    MERGE_SOURCE_MAX_CYCLES_DEFERRED,
+    MERGE_SOURCE_VALUES,
     SCHEMA_VERSION,
     BehaviorCheckRun,
     DuplicateActiveChildError,
@@ -4658,6 +4660,9 @@ class TestMergeStatus:
         with pytest.raises(ValueError, match="cannot retain merge_source provenance"):
             store.set_merge_unit_state(impl_unit.id, "unmerged", merge_source="manual")
 
+    def test_max_cycles_deferred_is_valid_merge_source(self) -> None:
+        assert MERGE_SOURCE_MAX_CYCLES_DEFERRED in MERGE_SOURCE_VALUES
+
     def test_set_merge_unit_state_sets_merged_state_and_provenance_together(self, tmp_path: Path) -> None:
         """Merged writes should stamp owner provenance and merged_at in one state change."""
         db_path = tmp_path / "test.db"
@@ -4682,6 +4687,55 @@ class TestMergeStatus:
         assert merged_impl is not None
         assert merged_impl.merge_status == "merged"
         assert merged_impl.merged_at == merged_unit.merged_at
+
+    def test_set_merge_unit_state_round_trips_max_cycles_deferred_source(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement capped review feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/max-cycles")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        store.set_merge_unit_state(
+            impl_unit.id,
+            "merged",
+            merge_source=MERGE_SOURCE_MAX_CYCLES_DEFERRED,
+        )
+
+        reopened = SqliteTaskStore(db_path)
+        merged_unit = reopened.get_merge_unit(impl_unit.id)
+        assert merged_unit is not None
+        assert merged_unit.merge_source == MERGE_SOURCE_MAX_CYCLES_DEFERRED
+
+        filtered_units = reopened.list_merged_units(source=MERGE_SOURCE_MAX_CYCLES_DEFERRED)
+        assert [unit.id for unit in filtered_units] == [impl_unit.id]
+
+    def test_set_merge_unit_state_clears_max_cycles_deferred_source_for_non_merged_state(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement capped review feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/max-cycles-clear")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+
+        store.set_merge_unit_state(
+            impl_unit.id,
+            "merged",
+            merge_source=MERGE_SOURCE_MAX_CYCLES_DEFERRED,
+        )
+        store.set_merge_unit_state(impl_unit.id, "unmerged")
+
+        unmerged_unit = store.get_merge_unit(impl_unit.id)
+        assert unmerged_unit is not None
+        assert unmerged_unit.state == "unmerged"
+        assert unmerged_unit.merge_source is None
 
     def test_list_merged_units_filters_by_source_and_window(self, tmp_path: Path) -> None:
         db_path = tmp_path / "test.db"

@@ -5392,6 +5392,7 @@ MERGE_SOURCE_ADVANCE = "advance"
 MERGE_SOURCE_WATCH = "watch"
 MERGE_SOURCE_GITHUB_PR = "github_pr"
 MERGE_SOURCE_EXTERNAL = "external"
+MERGE_SOURCE_MAX_CYCLES_DEFERRED = "max_cycles_deferred"
 MERGE_SOURCE_VALUES: frozenset[str] = frozenset(
     {
         MERGE_SOURCE_MANUAL,
@@ -5400,6 +5401,7 @@ MERGE_SOURCE_VALUES: frozenset[str] = frozenset(
         MERGE_SOURCE_WATCH,
         MERGE_SOURCE_GITHUB_PR,
         MERGE_SOURCE_EXTERNAL,
+        MERGE_SOURCE_MAX_CYCLES_DEFERRED,
     }
 )
 
