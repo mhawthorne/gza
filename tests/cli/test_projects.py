@@ -25,6 +25,8 @@ def _write_project_config(
     project_id: str,
     db_path: Path,
     project_prefix: str = "gza",
+    provider: str = "codex",
+    model: str = "gpt-5.5",
 ) -> None:
     project_dir.mkdir(parents=True, exist_ok=True)
     (project_dir / "gza.yaml").write_text(
@@ -36,6 +38,8 @@ def _write_project_config(
                 f"project_id: {project_id}",
                 f"project_prefix: {project_prefix}",
                 f"db_path: {db_path}",
+                f"provider: {provider}",
+                f"model: {model}",
             ]
         )
         + "\n",

@@ -7657,12 +7657,15 @@ class SqliteTaskStore:
         prompt: str,
         *,
         edited_at: datetime,
+        validate_before_update: Callable[[Task], None] | None = None,
     ) -> Task | None:
         """Atomically update only the prompt fields of a pending task.
 
         ``None`` means the task is missing or no longer pending.  The status
         predicate and field-scoped update share one immediate transaction so a
-        worker claim cannot be overwritten by a stale editor snapshot.
+        worker claim cannot be overwritten by a stale editor snapshot. Optional
+        validation runs against the transaction-observed row with the requested
+        prompt applied before any write is performed.
         """
         with self._write_transaction() as conn:
             row = conn.execute(
@@ -7673,6 +7676,8 @@ class SqliteTaskStore:
                 return None
 
             current = self._rows_to_tasks(conn, [row])[0]
+            if validate_before_update is not None:
+                validate_before_update(replace(current, prompt=prompt))
             if current.prompt == prompt:
                 return current
 
@@ -7708,6 +7713,7 @@ class SqliteTaskStore:
         tag_action: Literal["clear", "set", "add", "remove"] | None = None,
         tag_values: Iterable[str] = (),
         edited_at: datetime,
+        validate_before_update: Callable[[Task], None] | None = None,
     ) -> PendingTaskEditResult | None:
         """Atomically apply a prompt edit and its requested companion mutations.
 
@@ -7716,7 +7722,10 @@ class SqliteTaskStore:
         values differ are updated, so a stale CLI snapshot cannot overwrite
         lifecycle fields after a worker claim. The result contains the row as
         observed inside the transaction so callers can report real changes and
-        no-ops. ``None`` means the task is missing or no longer pending.
+        no-ops. Optional validation runs against the transaction-observed row
+        with every requested prompt, field, and tag mutation applied before any
+        write is performed. ``None`` means the task is missing or no longer
+        pending.
         """
         updates = dict(field_updates or {})
         allowed_fields = {
@@ -7757,6 +7766,28 @@ class SqliteTaskStore:
                 return None
 
             before = self._rows_to_tasks(conn, [row])[0]
+            current_tags = before.tags
+            final_tags: tuple[str, ...] | None = None
+            if tag_action is not None:
+                if tag_action == "clear":
+                    final_tags = ()
+                elif tag_action == "set":
+                    final_tags = normalized_tag_values
+                elif tag_action == "add":
+                    final_tags = _normalize_tags((*current_tags, *normalized_tag_values))
+                else:
+                    removed_tags = set(normalized_tag_values)
+                    final_tags = tuple(tag for tag in current_tags if tag not in removed_tags)
+
+            if validate_before_update is not None:
+                candidate = replace(before, prompt=prompt)
+                for field, value in updates.items():
+                    setattr(candidate, field, value)
+                if final_tags is not None:
+                    candidate.tags = final_tags
+                    candidate.group = final_tags[0] if len(final_tags) == 1 else None
+                validate_before_update(candidate)
+
             assignments: list[str] = []
             values: list[object] = []
             changed_fields: set[str] = set()
@@ -7793,16 +7824,7 @@ class SqliteTaskStore:
                     return None
 
             if tag_action is not None:
-                current_tags = self._fetch_tags_for_task_ids(conn, (task_id,)).get(task_id, ())
-                if tag_action == "clear":
-                    final_tags: tuple[str, ...] = ()
-                elif tag_action == "set":
-                    final_tags = normalized_tag_values
-                elif tag_action == "add":
-                    final_tags = _normalize_tags((*current_tags, *normalized_tag_values))
-                else:
-                    removed_tags = set(normalized_tag_values)
-                    final_tags = tuple(tag for tag in current_tags if tag not in removed_tags)
+                assert final_tags is not None
 
                 if final_tags != current_tags:
                     changed_fields.add("tags")
@@ -13608,22 +13630,12 @@ def edit_task_prompt(
     validate_before_update: Callable[[Task], None] | None = None,
 ) -> Task:
     """Atomically edit only the prompt fields of a pending task."""
-    current = store.get(task_id)
-    if current is None:
-        raise TaskPromptEditConflict(f"Task {task_id} no longer exists")
-    if current.status != "pending":
-        raise TaskPromptEditConflict(
-            f"Task {task_id} is {current.status}; "
-            "prompt edits are only allowed for pending tasks."
-        )
-
     normalized = normalize_task_prompt(prompt)
-    if validate_before_update is not None:
-        validate_before_update(replace(current, prompt=normalized))
     updated = store.update_pending_prompt(
         task_id,
         normalized,
         edited_at=edited_at or datetime.now(UTC),
+        validate_before_update=validate_before_update,
     )
     if updated is not None:
         return updated
@@ -13649,33 +13661,7 @@ def edit_task_prompt_with_mutations(
     validate_before_update: Callable[[Task], None] | None = None,
 ) -> PendingTaskEditResult:
     """Atomically edit a pending prompt and all companion field/tag mutations."""
-    current = store.get(task_id)
-    if current is None:
-        raise TaskPromptEditConflict(f"Task {task_id} no longer exists")
-    if current.status != "pending":
-        raise TaskPromptEditConflict(
-            f"Task {task_id} is {current.status}; "
-            "prompt edits are only allowed for pending tasks."
-        )
-
     normalized = normalize_task_prompt(prompt)
-    if validate_before_update is not None:
-        candidate = replace(current, prompt=normalized)
-        for field, value in dict(field_updates or {}).items():
-            setattr(candidate, field, value)
-        if tag_action is not None:
-            normalized_tags = _normalize_tags(tag_values)
-            if tag_action == "clear":
-                candidate.tags = ()
-            elif tag_action == "set":
-                candidate.tags = normalized_tags
-            elif tag_action == "add":
-                candidate.tags = _normalize_tags((*candidate.tags, *normalized_tags))
-            else:
-                removed_tags = set(normalized_tags)
-                candidate.tags = tuple(tag for tag in candidate.tags if tag not in removed_tags)
-            candidate.group = candidate.tags[0] if len(candidate.tags) == 1 else None
-        validate_before_update(candidate)
     updated = store.update_pending_task_edit(
         task_id,
         normalized,
@@ -13683,6 +13669,7 @@ def edit_task_prompt_with_mutations(
         tag_action=tag_action,
         tag_values=tag_values,
         edited_at=edited_at or datetime.now(UTC),
+        validate_before_update=validate_before_update,
     )
     if updated is not None:
         return updated

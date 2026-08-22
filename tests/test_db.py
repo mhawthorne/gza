@@ -71,6 +71,8 @@ def _write_project_config(
     project_id: str | None = None,
     db_path: Path | None = None,
     project_prefix: str | None = None,
+    provider: str = "codex",
+    model: str = "gpt-5.5",
 ) -> None:
     project_dir.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -84,6 +86,8 @@ def _write_project_config(
         lines.append(f"project_prefix: {project_prefix}")
     if db_path is not None:
         lines.append(f"db_path: {db_path}")
+    lines.append(f"provider: {provider}")
+    lines.append(f"model: {model}")
     (project_dir / "gza.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -5396,6 +5400,155 @@ class TestEditPromptDefaultContent:
         assert persisted.status == "in_progress"
         assert persisted.started_at == claim.task.started_at
         assert persisted.running_pid == 2468
+
+    def test_edit_task_prompt_with_route_mutations_validates_transaction_observed_candidate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gza.config import Config, ConfigError, ProviderConfig
+        from gza.db import SqliteTaskStore, Task, edit_task_prompt_with_mutations
+        from gza.runner import require_execution_route_for_task
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        concurrent_store = SqliteTaskStore(db_path)
+        config = Config(
+            project_dir=tmp_path,
+            project_name="demo",
+            provider="codex",
+            model="gpt-5.5",
+            providers={"claude": ProviderConfig(model="claude-sonnet-4-6")},
+        )
+        task = store.add(prompt="Original pending prompt")
+        assert task.id is not None
+
+        real_update = store.update_pending_task_edit
+
+        def validate_route(candidate: Task) -> None:
+            require_execution_route_for_task(candidate, config)
+
+        def interleave_provider_edit(*args, **kwargs):
+            provider_result = edit_task_prompt_with_mutations(
+                concurrent_store,
+                task.id,
+                "Provider edit prompt",
+                field_updates={"provider": "claude", "provider_is_explicit": True},
+                validate_before_update=validate_route,
+            )
+            assert provider_result.after.provider == "claude"
+            return real_update(*args, **kwargs)
+
+        monkeypatch.setattr(store, "update_pending_task_edit", interleave_provider_edit)
+
+        with pytest.raises(ConfigError, match="incompatible with provider 'claude'"):
+            edit_task_prompt_with_mutations(
+                store,
+                task.id,
+                "Model edit prompt",
+                field_updates={"model": "gpt-5.5", "model_is_explicit": True},
+                validate_before_update=validate_route,
+            )
+
+        persisted = concurrent_store.get(task.id)
+        assert persisted is not None
+        assert persisted.prompt == "Provider edit prompt"
+        assert persisted.provider == "claude"
+        assert persisted.provider_is_explicit is True
+        assert persisted.model is None
+        assert persisted.model_is_explicit is False
+
+    def test_edit_task_prompt_validates_transaction_observed_route_before_prompt_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from gza.config import Config, ConfigError, ProviderConfig
+        from gza.db import SqliteTaskStore, Task, edit_task_prompt
+        from gza.runner import require_execution_route_for_task
+
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        concurrent_store = SqliteTaskStore(db_path)
+        config = Config(
+            project_dir=tmp_path,
+            project_name="demo",
+            provider="codex",
+            model="gpt-5.5",
+            providers={"claude": ProviderConfig(model="claude-sonnet-4-6")},
+        )
+        task = store.add(prompt="Original pending prompt")
+        assert task.id is not None
+
+        real_update = store.update_pending_prompt
+
+        def validate_route(candidate: Task) -> None:
+            require_execution_route_for_task(candidate, config)
+
+        def interleave_invalid_route(*args, **kwargs):
+            concurrent = concurrent_store.get(task.id)
+            assert concurrent is not None
+            concurrent.provider = "claude"
+            concurrent.provider_is_explicit = True
+            concurrent.model = "gpt-5.5"
+            concurrent.model_is_explicit = True
+            concurrent_store.update(concurrent)
+            return real_update(*args, **kwargs)
+
+        monkeypatch.setattr(store, "update_pending_prompt", interleave_invalid_route)
+
+        with pytest.raises(ConfigError, match="incompatible with provider 'claude'"):
+            edit_task_prompt(
+                store,
+                task.id,
+                "Prompt-only edit that must not persist",
+                validate_before_update=validate_route,
+            )
+
+        persisted = concurrent_store.get(task.id)
+        assert persisted is not None
+        assert persisted.prompt == "Original pending prompt"
+        assert persisted.provider == "claude"
+        assert persisted.provider_is_explicit is True
+        assert persisted.model == "gpt-5.5"
+        assert persisted.model_is_explicit is True
+
+    def test_edit_task_prompt_with_valid_route_mutations_commits_atomically(self, tmp_path: Path) -> None:
+        from gza.config import Config, ProviderConfig
+        from gza.db import SqliteTaskStore, Task, edit_task_prompt_with_mutations
+        from gza.runner import require_execution_route_for_task
+
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="demo",
+            provider="codex",
+            model="gpt-5.5",
+            providers={"claude": ProviderConfig(model="claude-sonnet-4-6")},
+        )
+        task = store.add(prompt="Original pending prompt")
+        assert task.id is not None
+
+        def validate_route(candidate: Task) -> None:
+            require_execution_route_for_task(candidate, config)
+
+        result = edit_task_prompt_with_mutations(
+            store,
+            task.id,
+            "Valid combined route prompt",
+            field_updates={
+                "provider": "claude",
+                "provider_is_explicit": True,
+                "model": "claude-sonnet-4-6",
+                "model_is_explicit": True,
+            },
+            validate_before_update=validate_route,
+        )
+
+        assert result.changed_fields == frozenset(
+            {"prompt", "provider", "provider_is_explicit", "model", "model_is_explicit"}
+        )
+        assert result.after.prompt == "Valid combined route prompt"
+        assert result.after.provider == "claude"
+        assert result.after.provider_is_explicit is True
+        assert result.after.model == "claude-sonnet-4-6"
+        assert result.after.model_is_explicit is True
 
     def test_edit_task_interactive_rejects_claimed_task_without_overwriting_lifecycle(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

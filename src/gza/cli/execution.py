@@ -3030,7 +3030,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
                     edited_task,
                 ),
             )
-        except (TaskPromptEditConflict, TaskPromptValidationError) as exc:
+        except (ConfigError, TaskPromptEditConflict, TaskPromptValidationError) as exc:
             print(f"Error: {exc}")
             return 1
 
