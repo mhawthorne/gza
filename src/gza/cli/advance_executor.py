@@ -131,6 +131,7 @@ class AdvanceActionExecutionContext:
     spawn_iterate_worker: Callable[..., int]
     can_spawn_worker: Callable[[str], bool] | None = None
     no_worker_capacity_message: Callable[[str], str] | None = None
+    same_process_launch_pid: int | None = None
     is_rebase_target_already_merged: Callable[[DbTask], bool] | None = None
     prefer_iterate_for_action: Callable[
         [DbTask, dict[str, Any]],
@@ -623,7 +624,7 @@ def _reserve_background_launch(
     if context.config is None:
         return None, None
     try:
-        return launch_permit(context.config, context.store), None
+        return launch_permit(context.config, context.store, current_pid=context.same_process_launch_pid), None
     except MaxConcurrentTasksError as exc:
         return None, AdvanceActionExecutionResult(
             action_type=action_type,

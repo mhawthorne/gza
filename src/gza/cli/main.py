@@ -962,6 +962,18 @@ def main() -> int:
         help="Limit the number of tasks to advance",
     )
     advance_parser.add_argument(
+        "--repeat",
+        action="store_true",
+        help="With an explicit task_id, keep resolving and executing that task's lifecycle until it merges, parks, skips, or hits a repeat bound",
+    )
+    advance_parser.add_argument(
+        "--max-iterations",
+        type=int,
+        metavar="N",
+        dest="max_iterations",
+        help="With --repeat, stop after N lifecycle cycles (default: iterate_max_iterations or 3)",
+    )
+    advance_parser.add_argument(
         "--no-docker",
         action="store_true",
         help="Run workers directly instead of in Docker",

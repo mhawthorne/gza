@@ -46,6 +46,26 @@ The engine MUST distinguish *task created/selected* from *worker failed to start
 output: a creation success followed by a launch failure MUST NOT be reported as a plain
 failure to create.
 
+`gza advance <task-id> --repeat` MUST remain a thin task-scoped loop over the same
+engine and executor: resolve the named task's current lifecycle action, execute that
+action through the shared advance execution path, re-resolve, and repeat until the task
+is merged, parked for human attention, skipped with no further progress, stopped by a
+bounded iteration cap, or stopped by a no-progress backstop. It MUST be rejected without
+an explicit task ID. It MUST perform merge actions instead of stopping at merge-ready,
+honor `--dry-run`, `--auto`/`-y`, and existing `--force` semantics, and acquire capacity
+through the same launch-permit system used by advance/watch before any live cycle
+executes so task-scoped draining does not exceed the configured concurrency cap. Each
+numbered repeat cycle MUST execute at most one selected lifecycle action and emit at
+most one outcome line; when a failed merge changes the next action to `needs_rebase`,
+that rebase dispatch MUST happen only after the next cycle re-resolves lifecycle state.
+That single live repeat registration MUST remain visible for the drain lifetime and cover
+direct actions such as `merge` and `verify_gate`; same-process foreground child workers
+MUST reuse that slot rather than requiring or counting a second one. `--dry-run` repeat
+MUST NOT run verification, merge, create tasks or artifacts, update worker registry
+state, or mutate Git state; merge previews may inspect only the persisted
+main-integration checkpoint and MUST stop at the execution boundary when proving
+freshness would require running the gate.
+
 ## Shared model
 
 Shared vocabulary and system-wide invariants are defined in

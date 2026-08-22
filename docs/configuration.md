@@ -1903,6 +1903,8 @@ gza advance [task_id] [options]
 | `task_id` | Specific full prefixed task ID to advance (e.g. `gza-1234`; omit to advance all eligible) |
 | `--dry-run` | Preview actions without executing them |
 | `--max N` | Limit the number of tasks to advance |
+| `--repeat` | With an explicit `task_id`, repeatedly drain that task's lifecycle in the foreground until it merges, parks, skips, hits no-progress protection, or reaches `--max-iterations` |
+| `--max-iterations N` | With `--repeat`, cap repeat cycles; defaults to `iterate_max_iterations` and must be positive |
 | `--no-docker` | Run workers directly instead of in Docker |
 | `--force` | Bypass numeric retry/review caps; dependency-blocked tasks still will not run |
 | `--unimplemented` | List completed plan/explore source rows that still need an implementation path |
@@ -1919,7 +1921,11 @@ gza advance [task_id] [options]
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
 | `--any-tag` | With repeated `--tag` values, match any requested tag explicitly (default) |
 
-`gza advance` is the explicit non-looping lifecycle command. It evaluates recovery and existing lineage lifecycle work first. It does not start fresh pending work unless you opt into `--new`, and when `--new` is present the pending lane only fills whatever `--batch` capacity remains after recovery/lifecycle actions.
+By default, `gza advance` is a single-pass lifecycle command. It evaluates recovery and existing lineage lifecycle work first, executes the selected pass, and exits. It does not start fresh pending work unless you opt into `--new`, and when `--new` is present the pending lane only fills whatever `--batch` capacity remains after recovery/lifecycle actions.
+
+`gza advance <task-id> --repeat` is the task-scoped drain form. It requires an explicit task ID and cannot be combined with queue-wide selectors such as `--max`, `--new`, or `--unimplemented`. Each cycle re-resolves the named task's durable lifecycle state, applies the same main-integration verify and candidate-verify merge gates as single-pass advance, executes at most one selected lifecycle action, and then re-resolves from fresh Git/task state. Merge-conflict handling therefore reports the failed merge as one cycle and dispatches any resulting rebase only after the next cycle re-resolves. It stops when the task is merged, when shared attention handling parks it for a human, when the selected action skips, after two consecutive unchanged cycles of the same action type, or when `--max-iterations` is reached. `--dry-run` prints engine-selected cycle actions without mutating task rows, artifacts, worker registry state, or Git state; when the next lifecycle state cannot be known without executing the current action, it reports that boundary instead of inventing later actions.
+
+Repeat uses the same shared launch-permit and `max_concurrent` accounting as `advance` and `watch`. A live foreground repeat session consumes one shared slot before the first cycle executes and keeps that slot visible for the drain lifetime, including direct merge and `verify_gate` actions. Foreground child workers launched by the repeat session reuse that same process slot, so they do not require or count a second free slot.
 
 `--unimplemented` stays restricted to `plan` and `explore` lineages and only lists completed
 source rows that still need an implementation path. Completed `explore` roots with an active

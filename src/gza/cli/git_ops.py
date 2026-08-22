@@ -1,6 +1,7 @@
 """Git-related CLI commands: merge, rebase, checkout, diff, PR, advance."""
 
 import argparse
+import json
 import logging
 import os
 import shutil
@@ -23,6 +24,7 @@ from ..advance_engine import (
     IMPROVE_ACTION_REASON_REVIEW_CHANGES_REQUESTED,
     _resolve_and_persist_post_merge_rebase_state,
     _resolve_current_merge_source,
+    resolve_post_merge_rebase_state,
 )
 from ..branch_publication import load_branch_publication_state
 from ..colors import pink
@@ -81,6 +83,7 @@ from ..main_integration_verify import (
     CandidateIntegrationVerifyCheck,
     check_candidate_integration_verify,
     check_main_integration_verify,
+    inspect_main_integration_verify_checkpoint,
     promote_candidate_integration_verify_evidence,
     verify_gate_enabled,
 )
@@ -146,8 +149,13 @@ from ..sync_ops import (
     sync_branch_cohorts,
 )
 from ..task_query import normalize_tag_filters
+from ..workers import WorkerMetadata, WorkerRegistry
 from ..worktree_roots import managed_worktree_root_paths
 from ._common import (
+    _REUSE_WORKER_OWNER_ENV,
+    _REUSE_WORKER_OWNER_OUTER,
+    _REUSE_WORKER_REENTRY_ENV,
+    _REUSE_WORKER_SESSION_ENV,
     DuplicateReviewError,
     _create_implementation_task_from_source,
     _create_or_reuse_deferred_blocker_tasks,
@@ -164,6 +172,7 @@ from ._common import (
     _materialize_plan_review_slices,
     _prepare_task_for_immediate_execution,
     _repair_plan_review_slice_materialization,
+    _run_foreground,
     _spawn_background_iterate_worker,
     _spawn_background_resume_worker,
     _spawn_background_worker,
@@ -193,6 +202,7 @@ from .advance_engine import (
 )
 from .advance_executor import (
     AdvanceActionExecutionContext,
+    AdvanceActionExecutionResult,
     BranchDivergenceReconcileResult,
     execute_advance_action,
     resolve_execution_needs_attention,
@@ -3927,6 +3937,8 @@ def _advance_action_color(action_type: str) -> str:
 def _run_advance_owner_row_read_session(
     store: SqliteTaskStore,
     query_fn: Callable[[], _T],
+    *,
+    apply_deferred_reconciliations: bool = True,
 ) -> _T:
     """Run one or more advance owner-row queries in one read snapshot.
 
@@ -3939,7 +3951,8 @@ def _run_advance_owner_row_read_session(
 
     with store.read_session():
         result = query_fn()
-    apply_deferred_lineage_query_reconciliations(store)
+    if apply_deferred_reconciliations:
+        apply_deferred_lineage_query_reconciliations(store)
     return result
 
 
@@ -3992,6 +4005,23 @@ def cmd_advance(args: argparse.Namespace) -> int:
     if squash_threshold_override is not None:
         config.merge_squash_threshold = squash_threshold_override
 
+    repeat_mode: bool = getattr(args, "repeat", False)
+    repeat_max_iterations_arg: int | None = getattr(args, "max_iterations", None)
+
+    if repeat_mode and task_id is None:
+        return phase1_error(args, "--repeat requires an explicit task_id")
+    if repeat_mode and max_tasks is not None:
+        return phase1_error(args, "--repeat cannot be combined with --max")
+    if repeat_mode and new_mode:
+        return phase1_error(args, "--repeat cannot be combined with --new")
+    if repeat_mode and (unimplemented_mode or plans_mode):
+        return phase1_error(args, "--repeat cannot be combined with --unimplemented")
+    repeat_max_iterations = (
+        repeat_max_iterations_arg if repeat_max_iterations_arg is not None else config.iterate_max_iterations
+    )
+    if repeat_mode and repeat_max_iterations < 1:
+        return phase1_error(args, "--max-iterations must be a positive integer")
+
     if new_mode and batch_limit is None:
         return phase1_error(args, "--new requires --batch")
 
@@ -4031,6 +4061,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
         candidate = cached()
         if hasattr(candidate, "__enter__") and hasattr(candidate, "__exit__"):
             planning_cache = candidate
+    if repeat_mode:
+        planning_cache = nullcontext()
 
     def _print_needs_attention_section(items: list[tuple[DbTask, dict]]) -> None:
         if not items:
@@ -4120,7 +4152,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 target_branch=target_branch,
                 warning_logger=logger,
             )
-            if task.status != "failed" and target_branch is not None:
+            if target_branch is not None:
                 if resolve_task_merge_state_for_target(
                     store=store,
                     task=task,
@@ -4146,6 +4178,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         config=config,
                         git=git,
                         target_branch=target_branch,
+                        persist_post_merge_rebase_state=not (repeat_mode and dry_run),
+                        persist_review_clearance=not (repeat_mode and dry_run),
                         reuse_recovery_merge_context=True,
                     )
                 )
@@ -4167,6 +4201,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                             config=config,
                             git=git,
                             target_branch=target_branch,
+                            persist_post_merge_rebase_state=not (repeat_mode and dry_run),
+                            persist_review_clearance=not (repeat_mode and dry_run),
                             reuse_recovery_merge_context=True,
                         )
                         if row.owner_task.status == "dropped"
@@ -4178,6 +4214,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             owner_rows, dropped_owner_lineage = _run_advance_owner_row_read_session(
                 store,
                 _load_explicit_owner_rows,
+                apply_deferred_reconciliations=not (repeat_mode and dry_run),
             )
             if not owner_rows and task.status != "dropped" and not dropped_owner_lineage:
                 if advance_type is not None or tag_filters is not None:
@@ -4406,13 +4443,23 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 spawn_resume_worker=lambda task_obj, _kind: _spawn_background_resume_worker(
                     _worker_args(), config, str(task_obj.id), quiet=True, prepared_task=task_obj
                 ),
-                is_rebase_target_already_merged=lambda t: _resolve_and_persist_post_merge_rebase_state(
-                    store,
-                    git,
-                    t,
-                    target_branch,
-                    merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
-                ).already_merged,
+                is_rebase_target_already_merged=(
+                    lambda t: resolve_post_merge_rebase_state(
+                        store,
+                        git,
+                        t,
+                        target_branch,
+                        merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
+                    ).already_merged
+                    if dry_run_mode
+                    else _resolve_and_persist_post_merge_rebase_state(
+                        store,
+                        git,
+                        t,
+                        target_branch,
+                        merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
+                    ).already_merged
+                ),
                 config=config,
                 git=git,
                 spawn_iterate_worker=lambda task_obj, _kind, *, prepared_task=None, prepared_phase=None, prepared_action_type=None: _spawn_background_iterate_worker(
@@ -4452,6 +4499,608 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     target_branch=target_branch,
                 ),
             )
+
+        def _build_repeat_action_context(*, dry_run_mode: bool) -> AdvanceActionExecutionContext:
+            context = _build_action_context(dry_run_mode=dry_run_mode)
+            if dry_run_mode:
+                return context
+
+            def _run_task_foreground(task_obj: DbTask, _kind: str) -> int:
+                assert task_obj.id is not None
+                return _run_foreground(
+                    config,
+                    str(task_obj.id),
+                    force=force,
+                    phase1_args=args,
+                    prepared_task=task_obj,
+                )
+
+            def _resume_task_foreground(task_obj: DbTask, _kind: str) -> int:
+                assert task_obj.id is not None
+                return _run_foreground(
+                    config,
+                    str(task_obj.id),
+                    resume=True,
+                    force=force,
+                    phase1_args=args,
+                    prepared_task=task_obj,
+                )
+
+            return replace(
+                context,
+                use_iterate_for_create_implement=False,
+                use_iterate_for_needs_rebase=False,
+                can_spawn_worker=lambda _kind: effective_start_budget > 0,
+                no_worker_capacity_message=lambda worker_label: (
+                    f"SKIP: {capacity_message}"
+                    if effective_start_budget <= 0
+                    else f"SKIP: {capacity_message}"
+                ),
+                spawn_worker=_run_task_foreground,
+                spawn_resume_worker=_resume_task_foreground,
+                spawn_iterate_worker=lambda *_args, **_kwargs: 1,
+                spawn_iterate_recovery=lambda *_args, **_kwargs: 1,
+                same_process_launch_pid=os.getpid(),
+            )
+
+        def _repeat_lineage_ids(subject_task_id: str) -> set[str]:
+            all_tasks = [candidate for candidate in store.get_all() if candidate.id is not None]
+            lineage_ids: set[str] = {subject_task_id}
+            subject_unit = store.resolve_merge_unit_for_task(subject_task_id)
+            subject_unit_id = subject_unit.id if subject_unit is not None else None
+            if subject_unit_id is not None:
+                for member in store.list_tasks_for_merge_unit(subject_unit_id):
+                    if member.id is not None:
+                        lineage_ids.add(str(member.id))
+
+            def _belongs_to_other_merge_unit(candidate_id: str) -> bool:
+                if subject_unit_id is None:
+                    return False
+                candidate_unit = store.resolve_merge_unit_for_task(candidate_id)
+                return candidate_unit is not None and candidate_unit.id != subject_unit_id
+
+            changed = True
+            while changed:
+                changed = False
+                for candidate in all_tasks:
+                    assert candidate.id is not None
+                    candidate_id = str(candidate.id)
+                    if candidate_id in lineage_ids or _belongs_to_other_merge_unit(candidate_id):
+                        continue
+                    linked_ids = {candidate.based_on, candidate.depends_on}
+                    if any(linked_id in lineage_ids for linked_id in linked_ids if linked_id):
+                        lineage_ids.add(candidate_id)
+                        changed = True
+            return lineage_ids
+
+        def _repeat_state_signature(subject_task_id: str) -> tuple[Any, ...]:
+            rows: list[tuple[Any, ...]] = []
+            for task_id_for_sig in sorted(_repeat_lineage_ids(subject_task_id), key=task_id_numeric_key):
+                signature_task = store.get(task_id_for_sig)
+                if signature_task is None:
+                    continue
+                artifact_rows = tuple(
+                    (
+                        artifact.id,
+                        artifact.kind,
+                        artifact.label,
+                        artifact.status,
+                        artifact.exit_status,
+                        artifact.head_sha,
+                        artifact.sha256,
+                        json.dumps(artifact.metadata or {}, sort_keys=True, default=str),
+                    )
+                    for artifact in store.list_artifacts(str(signature_task.id))
+                )
+                rows.append(
+                    (
+                        str(signature_task.id),
+                        signature_task.status,
+                        signature_task.task_type,
+                        signature_task.branch,
+                        signature_task.based_on,
+                        signature_task.depends_on,
+                        signature_task.merge_status,
+                        signature_task.merged_at,
+                        signature_task.completed_at,
+                        signature_task.updated_at,
+                        signature_task.report_file,
+                        signature_task.output_content,
+                        signature_task.review_scope,
+                        signature_task.review_cleared_at,
+                        signature_task.review_score,
+                        signature_task.review_verify_status,
+                        signature_task.review_verify_head_sha,
+                        signature_task.review_verify_base_sha,
+                        signature_task.review_verify_artifact_file,
+                        signature_task.verify_fix_completion_outcome_json,
+                        artifact_rows,
+                    )
+                )
+            merge_unit_values_by_id = {}
+            for task_id_for_sig in _repeat_lineage_ids(subject_task_id):
+                unit = store.resolve_merge_unit_for_task(task_id_for_sig)
+                if unit is not None and unit.id is not None:
+                    merge_unit_values_by_id[unit.id] = unit
+            merge_units = tuple(
+                (
+                    unit.id,
+                    unit.owner_task_id,
+                    unit.source_branch,
+                    unit.target_branch,
+                    unit.state,
+                    unit.merged_at,
+                    unit.updated_at,
+                )
+                for unit in sorted(merge_unit_values_by_id.values(), key=lambda unit: unit.id or "")
+            )
+            return (tuple(rows), merge_units)
+
+        def _repeat_main_verify_attention(
+            action: dict[str, Any],
+            *,
+            dry_run_mode: bool,
+        ) -> tuple[DbTask, dict[str, Any]] | None:
+            if str(action.get("type")) not in {"merge", "merge_with_followups"}:
+                return None
+            if target_branch != actual_current_branch:
+                return None
+            if dry_run_mode:
+                main_verify_inspection = inspect_main_integration_verify_checkpoint(config, store, git)
+                merges_halted = main_verify_inspection.merges_halted
+                state = main_verify_inspection.state
+            else:
+                main_verify_check = check_main_integration_verify(
+                    config,
+                    store,
+                    git,
+                    reason="advance-repeat-pre-merge",
+                )
+                merges_halted = main_verify_check.merges_halted
+                state = main_verify_check.state
+            if not merges_halted or state is None or state.task.id is None:
+                return None
+            return (
+                state.task,
+                {
+                    "type": "needs_discussion",
+                    "description": f"SKIP: {state.alert_message or 'main verify is red; merges halted'}",
+                    "needs_attention_reason": MAIN_INTEGRATION_VERIFY_REASON,
+                    "subject_task_id": state.task.id,
+                },
+            )
+
+        def _repeat_execution_attention(action_task: DbTask, exec_result: Any):
+            if not hasattr(exec_result, "attention_type") or not hasattr(exec_result, "attention_reason"):
+                return None
+            return resolve_execution_needs_attention(action_task, exec_result)
+
+        def _resolve_repeat_cycle() -> tuple[LineageOwnerRow | None, DbTask | None, dict[str, Any]]:
+            assert task_id is not None
+            task = store.get(task_id)
+            if task is None:
+                return None, None, {"type": "needs_discussion", "description": f"SKIP: Task {task_id} disappeared"}
+            if target_branch is not None:
+                if resolve_task_merge_state_for_target(
+                    store=store,
+                    task=task,
+                    git=git,
+                    target_branch=target_branch,
+                ) == "merged":
+                    return None, task, {"type": "merged", "description": "Merged"}
+
+            def _load_rows() -> list[LineageOwnerRow]:
+                return list(
+                    query_lineage_owner_rows(
+                        store,
+                        LineageOwnerQuery(
+                            limit=None,
+                            task_types=(advance_type,) if advance_type else None,
+                            tags=tag_filters,
+                            any_tag=any_tag,
+                            include_skipped=True,
+                            exclude_dropped_from_planning=True,
+                            max_recovery_attempts=max_resume_attempts,
+                            task_ids=(task.id,) if task.id is not None else None,
+                        ),
+                        config=config,
+                        git=git,
+                        target_branch=target_branch,
+                        persist_post_merge_rebase_state=not dry_run,
+                        persist_review_clearance=not dry_run,
+                        reuse_recovery_merge_context=True,
+                    )
+                )
+
+            rows = _run_advance_owner_row_read_session(
+                store,
+                _load_rows,
+                apply_deferred_reconciliations=not dry_run,
+            )
+            if not rows and target_branch is not None:
+                if resolve_task_merge_state_for_target(
+                    store=store,
+                    task=task,
+                    git=git,
+                    target_branch=target_branch,
+                ) == "merged":
+                    return None, task, {"type": "merged", "description": "Merged"}
+            if not rows:
+                return None, task, {"type": "skip", "description": "SKIP: no eligible owner row remains"}
+            row = rows[0]
+            action_task = row.lifecycle_action_task or row.recovery_action_task or row.owner_task
+            action = (
+                row.next_action
+                if (
+                    row.next_action is not None
+                    and str(row.next_action.get("type", "")) != "unknown"
+                    and row.lifecycle_action_task is None
+                    and row.recovery_action_task is None
+                )
+                else determine_next_action(
+                    config,
+                    store,
+                    git,
+                    action_task,
+                    target_branch,
+                    max_resume_attempts=max_resume_attempts,
+                    persist_post_merge_rebase_state=not dry_run,
+                    persist_review_clearance=not dry_run,
+                )
+            )
+            decision = plan_lifecycle_execution(
+                [(row, action_task, action)],
+                free_worker_slots=repeat_worker_budget,
+                get_action=lambda item: item[2],
+            )[0]
+            decision = reproject_selected_merge_actions(
+                [decision],
+                reproject_action=lambda item: determine_next_action(
+                    config,
+                    store,
+                    git,
+                    item[1],
+                    target_branch,
+                    max_resume_attempts=max_resume_attempts,
+                    persist_post_merge_rebase_state=not dry_run,
+                    persist_review_clearance=not dry_run,
+                    selected_for_merge=True,
+                ),
+            )[0]
+            if classify_advance_action(decision.action) == "actionable" and not decision.selected:
+                selected_workers = max(0, effective_start_budget - decision.free_worker_slots)
+                if batch_limit is not None and effective_start_budget == batch_limit and selected_workers >= batch_limit:
+                    gated_description = f"batch limit reached ({selected_workers}/{batch_limit}), skipping"
+                else:
+                    gated_description = f"{capacity_message}, skipping"
+                action = {
+                    "type": "skip",
+                    "description": gated_description,
+                }
+            else:
+                action = dict(decision.action)
+            return row, action_task, action
+
+        def _execute_repeat_merge(
+            task: DbTask,
+            action: dict[str, Any],
+        ) -> tuple[str, str, dict[str, Any] | None, AdvanceActionExecutionResult | None]:
+            prepared_merge_git = None
+            prepared_merge_branch = None
+            if isolated_merge_enabled:
+                prepared_merge_git = _prepare_repeat_advance_isolated_merge_checkout()
+                prepared_merge_branch = target_branch if prepared_merge_git is not None else None
+            if isolated_merge_enabled and prepared_merge_git is None:
+                merge_result = _isolated_merge_checkout_unavailable_result()
+            else:
+                merge_result = _execute_merge_action(
+                    config,
+                    store,
+                    git,
+                    task,
+                    action,
+                    target_branch=target_branch,
+                    current_branch=actual_current_branch,
+                    merge_git=prepared_merge_git,
+                    merge_current_branch=prepared_merge_branch,
+                    merge_source=MERGE_SOURCE_ADVANCE,
+                    quiet_mechanics=True,
+            )
+            if merge_result.rc == 0:
+                if target_branch == actual_current_branch:
+                    main_verify = check_main_integration_verify(
+                        config,
+                        store,
+                        git,
+                        reason="advance-post-merge",
+                    )
+                    if main_verify.merges_halted and main_verify.state.task.id is not None:
+                        message = main_verify.state.alert_message or "main verify is red; merges halted"
+                        return "parked", f"merged; {message}", {
+                            "type": "needs_discussion",
+                            "description": f"SKIP: {message}",
+                            "needs_attention_reason": MAIN_INTEGRATION_VERIFY_REASON,
+                            "subject_task_id": main_verify.state.task.id,
+                        }, None
+                return "success", "merged", None, None
+            if getattr(merge_result, "status", None) in {
+                "blocked_candidate_verify",
+                "blocked_candidate_verify_unavailable",
+            }:
+                candidate_message = format_blocked_candidate_verify_message(str(task.id), merge_result)
+                return "parked", candidate_message, {
+                    "type": "needs_discussion",
+                    "description": f"SKIP: {candidate_message}",
+                    "needs_attention_reason": "blocked-candidate-verify",
+                    "subject_task_id": task.id,
+                }, None
+            resolved_subject = (
+                _resolve_merge_subject(store, git, task.id, target_branch=target_branch)
+                if task.id is not None
+                else None
+            )
+            conflict_ref = resolved_subject.merge_source_ref if resolved_subject is not None else task.branch
+            conflict_detected = conflict_ref is not None and not git.can_merge(conflict_ref, target_branch)
+            if conflict_detected:
+                try:
+                    if prepared_merge_git is not None:
+                        cleanup_failed_merge_checkout(prepared_merge_git)
+                    else:
+                        git.reset_hard_head()
+                except GitError as cleanup_error:
+                    return "error", (
+                        f"cleanup failed after merge conflict: {cleanup_error}. Manual intervention required."
+                    ), None, None
+                return "needs_rebase", "merge conflict routed to rebase", None, None
+            return "error", getattr(merge_result, "block_reason", None) or "merge failed", None, None
+
+        def _cmd_advance_repeat() -> int:
+            assert task_id is not None
+            print(f"Repeating advance for {task_id} (max {repeat_max_iterations} cycles)...")
+            if not auto and not dry_run:
+                try:
+                    answer = input("Proceed? [Y/n] ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return 0
+                if answer not in ("", "y", "yes"):
+                    print("Aborted.")
+                    return 0
+            last_action_type: str | None = None
+            unchanged_streak = 0
+            for cycle in range(1, repeat_max_iterations + 1):
+                row, action_task, action = _resolve_repeat_cycle()
+                action_type = str(action.get("type", "skip"))
+                description = str(action.get("description", "")).strip()
+                classification = classify_advance_action(action)
+                signature_before = _repeat_state_signature(task_id)
+
+                if action_type == "merged":
+                    print(f"cycle {cycle}: merged -> success")
+                    print(f"Advance repeat completed: {task_id} merged")
+                    return 0
+                if classification == "needs_attention":
+                    print(f"cycle {cycle}: {action_type} -> parked: {description}")
+                    print(f"Advance repeat parked: {description}")
+                    return 0
+                if classification == "skip":
+                    print(f"cycle {cycle}: {action_type} -> skip: {description}")
+                    print(f"Advance repeat stopped on skip: {description}")
+                    return 0
+                if action_task is None:
+                    print(f"cycle {cycle}: {action_type} -> error: missing action task")
+                    return 1
+                if dry_run:
+                    if action_type in {"merge", "merge_with_followups"}:
+                        attention = _repeat_main_verify_attention(action, dry_run_mode=True)
+                        if attention is not None:
+                            _, attention_action = attention
+                            message = attention_action["description"]
+                            print(f"cycle {cycle}: {action_type} -> parked: {message}")
+                            print(f"Advance repeat parked: {message}")
+                            return 0
+                    else:
+                        preview_result = execute_advance_action(
+                            task=action_task,
+                            action=action,
+                            context=_build_repeat_action_context(dry_run_mode=True),
+                        )
+                        attention = _repeat_execution_attention(action_task, preview_result)
+                        if attention is not None:
+                            message = attention.action["description"]
+                            print(f"cycle {cycle}: {action_type} -> parked: {message}")
+                            print(f"Advance repeat parked: {message}")
+                            return 0
+                    print(f"cycle {cycle}: {action_type} -> dry-run: {description}")
+                    print(f"Advance repeat dry-run stopped: next action requires executing {action_type}")
+                    return 0
+                elif action_type in {"merge", "merge_with_followups"}:
+                    attention = _repeat_main_verify_attention(action, dry_run_mode=False)
+                    if attention is not None:
+                        _, attention_action = attention
+                        message = attention_action["description"]
+                        print(f"cycle {cycle}: {action_type} -> parked: {message}")
+                        print(f"Advance repeat parked: {message}")
+                        return 0
+                    outcome, message, merge_attention_action, routed_exec_result = _execute_repeat_merge(action_task, action)
+                    print(f"cycle {cycle}: {action_type} -> {outcome}: {message}")
+                    if merge_attention_action is not None:
+                        print(f"Advance repeat parked: {merge_attention_action['description']}")
+                        return 0
+                    if outcome == "error":
+                        return 1
+                    signature_after = _repeat_state_signature(task_id)
+                    refreshed_subject = store.get(task_id)
+                    if refreshed_subject is not None and target_branch is not None:
+                        if resolve_task_merge_state_for_target(
+                            store=store,
+                            task=refreshed_subject,
+                            git=git,
+                            target_branch=target_branch,
+                        ) == "merged":
+                            print(f"Advance repeat completed: {task_id} merged")
+                            return 0
+                else:
+                    exec_result = execute_advance_action(
+                        task=action_task,
+                        action=action,
+                        context=_build_repeat_action_context(dry_run_mode=False),
+                    )
+                    outcome = exec_result.status
+                    message = exec_result.success_message or exec_result.message or exec_result.error_message
+                    print(f"cycle {cycle}: {action_type} -> {outcome}: {message}")
+                    attention = _repeat_execution_attention(action_task, exec_result)
+                    if attention is not None:
+                        print(f"Advance repeat parked: {attention.action['description']}")
+                        return 0
+                    if exec_result.status == "error":
+                        return 1
+                    signature_after = _repeat_state_signature(task_id)
+                    if exec_result.status == "skip" and signature_after == signature_before:
+                        print(f"Advance repeat stopped on skip: {message}")
+                        return 0
+                    refreshed_subject = store.get(task_id)
+                    if refreshed_subject is not None and target_branch is not None:
+                        if resolve_task_merge_state_for_target(
+                            store=store,
+                            task=refreshed_subject,
+                            git=git,
+                            target_branch=target_branch,
+                        ) == "merged":
+                            print(f"Advance repeat completed: {task_id} merged")
+                            return 0
+
+                cycle_unchanged = signature_after == signature_before
+                if cycle_unchanged and last_action_type == action_type:
+                    unchanged_streak += 1
+                else:
+                    unchanged_streak = 1 if cycle_unchanged else 0
+                if unchanged_streak >= 2:
+                    print(f"Advance repeat stopped: no progress after repeated {action_type}")
+                    return 0
+                last_action_type = action_type
+            print(f"Advance repeat stopped: max iterations ({repeat_max_iterations}) reached")
+            return 0
+
+        if repeat_mode:
+            repeat_worker_budget = 1 if effective_start_budget > 0 or dry_run else 0
+            isolated_merge_enabled = bool(config.main_checkout_isolate)
+            repeat_advance_merge_git: Git | None = None
+
+            def _prepare_repeat_advance_isolated_merge_checkout() -> Git | None:
+                nonlocal repeat_advance_merge_git
+                try:
+                    repeat_advance_merge_git = ensure_watch_main_checkout(config, git, target_branch)
+                    return repeat_advance_merge_git
+                except GitError:
+                    try:
+                        repeat_advance_merge_git = ensure_watch_main_checkout(config, git, target_branch, rebuild=True)
+                        return repeat_advance_merge_git
+                    except GitError:
+                        repeat_advance_merge_git = None
+                        return None
+
+            if dry_run:
+                return _cmd_advance_repeat()
+
+            try:
+                repeat_permit = launch_permit(config, store)
+            except MaxConcurrentTasksError as exc:
+                print(f"Repeating advance for {task_id} (max {repeat_max_iterations} cycles)...")
+                print(f"cycle 1: skip -> skip: {exc}")
+                print(f"Advance repeat stopped on skip: {exc}")
+                return 0
+
+            repeat_registry = WorkerRegistry(config.workers_path)
+            repeat_worker_id = repeat_registry.generate_worker_id()
+            repeat_task = store.add(
+                f"Internal advance repeat session for {task_id}",
+                task_type="internal",
+                depends_on=task_id,
+                tags=("system-advance-repeat",),
+                skip_learnings=True,
+            )
+            assert repeat_task.id is not None
+            repeat_task.status = "in_progress"
+            repeat_task.running_pid = os.getpid()
+            repeat_task.started_at = datetime.now(UTC)
+            store.update(repeat_task)
+            try:
+                repeat_registry.register(
+                    WorkerMetadata(
+                        worker_id=repeat_worker_id,
+                        task_id=str(repeat_task.id),
+                        pid=os.getpid(),
+                        started_at=datetime.now(UTC).isoformat(),
+                        status="running",
+                        is_background=False,
+                    )
+                )
+            except BaseException:
+                repeat_permit.release()
+                repeat_task.status = "failed"
+                repeat_task.completed_at = datetime.now(UTC)
+                repeat_task.running_pid = None
+                repeat_task.completion_reason = "advance repeat failed before worker registration"
+                store.update(repeat_task)
+                raise
+            repeat_permit.release()
+
+            previous_worker_id = os.environ.get("GZA_WORKER_ID")
+            previous_worker_mode = os.environ.get("GZA_WORKER_MODE")
+            previous_reuse_worker_owner = os.environ.get(_REUSE_WORKER_OWNER_ENV)
+            previous_reuse_worker_reentry = os.environ.get(_REUSE_WORKER_REENTRY_ENV)
+            previous_reuse_worker_session = os.environ.get(_REUSE_WORKER_SESSION_ENV)
+            os.environ["GZA_WORKER_ID"] = repeat_worker_id
+            os.environ["GZA_WORKER_MODE"] = "1"
+            os.environ[_REUSE_WORKER_OWNER_ENV] = _REUSE_WORKER_OWNER_OUTER
+            os.environ[_REUSE_WORKER_REENTRY_ENV] = "1"
+            os.environ[_REUSE_WORKER_SESSION_ENV] = "1"
+            try:
+                rc = _cmd_advance_repeat()
+            except BaseException:
+                repeat_registry.mark_completed(repeat_worker_id, exit_code=1, status="failed")
+                refreshed_repeat = store.get(str(repeat_task.id))
+                if refreshed_repeat is not None:
+                    refreshed_repeat.status = "failed"
+                    refreshed_repeat.completed_at = datetime.now(UTC)
+                    refreshed_repeat.running_pid = None
+                    refreshed_repeat.completion_reason = "advance repeat interrupted before cleanup"
+                    store.update(refreshed_repeat)
+                raise
+            finally:
+                if previous_worker_id is None:
+                    os.environ.pop("GZA_WORKER_ID", None)
+                else:
+                    os.environ["GZA_WORKER_ID"] = previous_worker_id
+                if previous_worker_mode is None:
+                    os.environ.pop("GZA_WORKER_MODE", None)
+                else:
+                    os.environ["GZA_WORKER_MODE"] = previous_worker_mode
+                if previous_reuse_worker_owner is None:
+                    os.environ.pop(_REUSE_WORKER_OWNER_ENV, None)
+                else:
+                    os.environ[_REUSE_WORKER_OWNER_ENV] = previous_reuse_worker_owner
+                if previous_reuse_worker_reentry is None:
+                    os.environ.pop(_REUSE_WORKER_REENTRY_ENV, None)
+                else:
+                    os.environ[_REUSE_WORKER_REENTRY_ENV] = previous_reuse_worker_reentry
+                if previous_reuse_worker_session is None:
+                    os.environ.pop(_REUSE_WORKER_SESSION_ENV, None)
+                else:
+                    os.environ[_REUSE_WORKER_SESSION_ENV] = previous_reuse_worker_session
+            repeat_registry.mark_completed(
+                repeat_worker_id,
+                exit_code=rc,
+                status="completed" if rc == 0 else "failed",
+            )
+            refreshed_repeat = store.get(str(repeat_task.id))
+            if refreshed_repeat is not None:
+                refreshed_repeat.status = "completed" if rc == 0 else "failed"
+                refreshed_repeat.completed_at = datetime.now(UTC)
+                refreshed_repeat.running_pid = None
+                store.update(refreshed_repeat)
+            return rc
 
         for row in owner_rows:
             if (

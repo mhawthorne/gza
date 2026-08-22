@@ -37,6 +37,7 @@ uv run gza advance --batch N --new        # Fill remaining batch slots with pend
 uv run gza advance --type plan            # Only advance plan tasks
 uv run gza advance --type implement       # Only advance implement tasks
 uv run gza advance --dry-run              # Show plan without executing
+uv run gza advance <task-id> --repeat     # Foreground-drain one task lifecycle
 uv run gza advance --no-resume-failed     # Skip recovery-only failed work; keep lifecycle merges/reviews
 uv run gza advance --max-resume-attempts N
 uv run gza advance --max-review-cycles N
@@ -57,6 +58,8 @@ Advance collects owner rows from one shared source:
 `--no-resume-failed` only suppresses rows whose actionable work is failed-task recovery. Owner rows that also carry a non-failed `lifecycle_action_task` remain eligible for merge/review/rebase planning even when they surface a failed recovery descendant.
 
 Optional filters: `--type plan|implement`, `--max N`, or a specific task ID.
+
+Task-scoped `advance <task-id> --repeat` runs the same lifecycle engine in a foreground drain loop. A live repeat session acquires one shared launch permit before any cycle executes and publishes one same-process worker registration for the duration of the drain, so direct actions such as merge and `verify_gate` are still counted against `max_concurrent`. Worker-style foreground children reuse that session slot instead of acquiring a second concurrent slot. Dry-run repeat stays preview-only: merge previews inspect only already-persisted main-integration checkpoints and stop at the execution boundary when freshness cannot be proven without running the gate.
 
 ## Configuration
 
@@ -443,6 +446,21 @@ In interactive mode, the same `Needs attention` section is part of the plan prev
 - Running workers cause `wait_review`/`wait_improve` skips
 - Pending rebase/review/improve tasks are detected and reused (not duplicated)
 - Batch limits prevent runaway worker spawning
+
+`gza advance <task-id> --repeat` is the task-scoped foreground drain form. It
+re-resolves the named task after each cycle, executes the selected action through the
+shared advance executor, and continues until the task merges, parks for human attention,
+hits a skip/no-progress backstop, or reaches `--max-iterations` (defaulting to
+`iterate_max_iterations`). Worker-style lifecycle actions run foreground so the next
+cycle observes their completed state; merge actions use the same advance merge executor
+and main-integration/candidate verification gates as the single-pass command. Each
+foreground worker-style action acquires and transfers a shared launch permit through the
+existing worker startup path, then releases the launch lock once the action is visible;
+the complete repeat drain does not hold the launch flock for its whole lifetime. Use
+`--dry-run` to print engine-selected cycle actions without side effects. If a later
+cycle cannot be established without executing the current action, dry-run reports that
+boundary instead of synthesizing follow-on actions. Use `--auto`/`-y` to skip the
+initial prompt.
 
 ## Relationship to other commands
 

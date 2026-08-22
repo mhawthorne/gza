@@ -480,6 +480,23 @@ def _task_is_silent_past_timeout(
     return mtime_age > threshold
 
 
+def _is_supervised_advance_repeat_session(
+    task: DbTask,
+    worker: WorkerMetadata | None,
+    registry: WorkerRegistry,
+) -> bool:
+    """Return whether an internal repeat session is live under foreground supervision."""
+    if task.task_type != "internal" or "system-advance-repeat" not in set(task.tags or ()):
+        return False
+    if task.running_pid is None or task.running_pid <= 0:
+        return False
+    if worker is None or worker.status != "running":
+        return False
+    if worker.pid != task.running_pid:
+        return False
+    return registry.is_running(worker.worker_id)
+
+
 def _running_workers_by_task_id(registry: WorkerRegistry) -> dict[str, WorkerMetadata]:
     """Index running-status worker entries by task ID."""
     workers_by_task_id: dict[str, WorkerMetadata] = {}
@@ -1164,6 +1181,8 @@ def reconcile_in_progress_tasks(config: Config) -> None:
                 continue
 
             # PID is alive — check for a stuck worker that hasn't logged anything.
+            if _is_supervised_advance_repeat_session(task, running_worker, registry):
+                continue
             if _task_looks_stuck(config, task):
                 # Attempt to stop the wedged worker before marking failed so it
                 # cannot later overwrite the outcome.

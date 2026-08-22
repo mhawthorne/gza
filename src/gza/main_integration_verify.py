@@ -103,6 +103,17 @@ class MainIntegrationVerifyCheck:
 
 
 @dataclass(frozen=True)
+class MainIntegrationVerifyCheckpointInspection:
+    """Read-only view of the persisted local-main verify checkpoint."""
+
+    state: MainIntegrationVerifyState | None
+    current_tree_fingerprint: str | None
+    is_current: bool
+    merges_halted: bool
+    needs_attention: bool
+
+
+@dataclass(frozen=True)
 class MainIntegrationVerifyTargetProof:
     """Proof that a persisted verify state describes the caller's current target."""
 
@@ -1597,6 +1608,56 @@ def check_main_integration_verify(
         remediation=remediation,
         verify_runs=verify_runs,
         resolved_signature=resolved_signature,
+    )
+
+
+def inspect_main_integration_verify_checkpoint(
+    config: Config,
+    store: SqliteTaskStore,
+    git: Git,
+    *,
+    runner_class: Literal["host", "container"] = "host",
+    resolved_head_sha: str | None | object = _HEAD_SHA_UNSET,
+) -> MainIntegrationVerifyCheckpointInspection:
+    """Inspect local-main verify freshness without running or persisting verify state."""
+    if resolved_head_sha is _HEAD_SHA_UNSET:
+        resolved_head_sha = git.rev_parse_if_exists("HEAD")
+    current_head_sha = _coerce_optional_str(resolved_head_sha)
+    current_tree_fingerprint = _compute_tree_fingerprint(git, head_sha=current_head_sha)
+    current_gate = _current_gate_identity(config, runner_class=runner_class)
+    state = load_main_integration_verify_state(store)
+    checkpoint_is_current = state is not None and _checkpoint_is_current(
+        state,
+        config=config,
+        current_gate=current_gate,
+        current_tree_fingerprint=current_tree_fingerprint,
+        current_head_sha=current_head_sha,
+    )
+    merges_halted = bool(
+        checkpoint_is_current
+        and state is not None
+        and _verify_result_halts_merges(
+            status=state.verify_status,
+            gate_enabled=state.gate_enabled,
+            exit_status=state.verify_exit_status,
+        )
+    )
+    needs_attention = bool(
+        checkpoint_is_current
+        and state is not None
+        and _verify_result_needs_attention(
+            status=state.verify_status,
+            gate_enabled=state.gate_enabled,
+            exit_status=state.verify_exit_status,
+            alert_message=state.alert_message,
+        )
+    )
+    return MainIntegrationVerifyCheckpointInspection(
+        state=state,
+        current_tree_fingerprint=current_tree_fingerprint,
+        is_current=bool(checkpoint_is_current),
+        merges_halted=merges_halted,
+        needs_attention=needs_attention,
     )
 
 
