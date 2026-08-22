@@ -273,6 +273,7 @@ def _build_recovery_preview_entries(
                 include_skipped=True,
                 exclude_dropped_from_planning=True,
                 max_recovery_attempts=max_recovery_attempts,
+                recovery_unit_scope=True,
             ),
             config=config,
             git=git,
@@ -312,11 +313,12 @@ def _build_recovery_preview_entries(
             if isinstance(decision.recovery_task_id, str) and decision.recovery_task_id
             else None
         )
-        has_active_recovery_child = active_recovery_task is not None and active_recovery_task.status in {"pending", "in_progress"}
+        has_active_recovery_child = active_recovery_task is not None and active_recovery_task.status in {
+            "pending",
+            "in_progress",
+        }
         active_recovery_mode = (
-            resolve_pending_recovery_execution_mode(active_recovery_task)
-            if active_recovery_task is not None
-            else None
+            resolve_pending_recovery_execution_mode(active_recovery_task) if active_recovery_task is not None else None
         )
         advance_action = (
             determine_next_action(
@@ -393,9 +395,7 @@ def _build_pending_preview_entries(
     pending_limit: int | None,
     quiet_seconds: int = 0,
 ) -> tuple[DispatchPreviewEntry, ...]:
-    pending_tasks = list(
-        get_runnable_pending_tasks(store, tags=tags, any_tag=any_tag, quiet_seconds=quiet_seconds)
-    )
+    pending_tasks = list(get_runnable_pending_tasks(store, tags=tags, any_tag=any_tag, quiet_seconds=quiet_seconds))
     if selection_mode == "recovery_first_explicit":
         pending_tasks = [task for task in pending_tasks if task.queue_position is not None]
     if pending_limit is not None:

@@ -1131,7 +1131,9 @@ def resolve_execution_projects(
 
     results: list[ExecutionProjectResolved | ExecutionProjectDisabled] = []
     for result in preflighted:
-        selector_key = result.selector.selector_key if isinstance(result, _ExecutionProjectCandidate) else result.selector_key
+        selector_key = (
+            result.selector.selector_key if isinstance(result, _ExecutionProjectCandidate) else result.selector_key
+        )
         if isinstance(result, ExecutionProjectDisabled):
             if selector_key in duplicate_selector_keys:
                 results.append(
@@ -1431,6 +1433,11 @@ def merge_unit_is_active(unit: "MergeUnit | None") -> bool:
 def active_merge_unit_where_sql(alias: str) -> str:
     """Return the shared SQL predicate for active merge-unit reads."""
     return f"{alias}.superseded_by_unit_id IS NULL AND {alias}.state NOT IN ('dropped', 'superseded')"
+
+
+def inactive_tombstone_merge_unit_where_sql(alias: str) -> str:
+    """Return the shared SQL predicate for inactive tombstoned merge-unit history."""
+    return f"({alias}.superseded_by_unit_id IS NOT NULL OR {alias}.state IN ('dropped', 'superseded'))"
 
 
 def merge_unit_legacy_state(state: str | None) -> str | None:
@@ -5685,9 +5692,7 @@ class SqliteTaskStore:
                     """,
                     (self._project_id,),
                 ).fetchall()
-        sessions = [
-            session for row in rows if (session := self._row_to_watch_session(row)) is not None
-        ]
+        sessions = [session for row in rows if (session := self._row_to_watch_session(row)) is not None]
         if not active_only:
             return sessions
         return [session for session in sessions if session.is_active(now=now)]
@@ -5903,9 +5908,7 @@ class SqliteTaskStore:
         if schema_version_error is not None or current_version is None:
             raise SchemaIntegrityError(schema_version_error or f"Database {self.db_path} has no schema_version row.")
         if current_version > SCHEMA_VERSION:
-            raise SchemaIntegrityError(
-                f"Database schema v{current_version} is newer than supported v{SCHEMA_VERSION}."
-            )
+            raise SchemaIntegrityError(f"Database schema v{current_version} is newer than supported v{SCHEMA_VERSION}.")
 
         pending_manual = [
             target_version
@@ -6694,7 +6697,9 @@ class SqliteTaskStore:
                 stored_has_no_paths = not stored_root_path.strip() and not stored_config_path.strip()
                 if stored_has_no_paths:
                     updated_root_path, updated_config_path = (
-                        (root_path, config_path) if root_path and config_path else (stored_root_path, stored_config_path)
+                        (root_path, config_path)
+                        if root_path and config_path
+                        else (stored_root_path, stored_config_path)
                     )
                 else:
                     updated_root_path, updated_config_path = self._project_registry_path_update(
@@ -7346,8 +7351,7 @@ class SqliteTaskStore:
             branch_key = self._resolve_new_rebase_target_branch_conn(conn, params)
             if branch_key is None:
                 raise RebaseBranchResolutionError(
-                    "guarded rebase requires a resolvable source branch from "
-                    "params.branch or its based_on lineage"
+                    "guarded rebase requires a resolvable source branch from params.branch or its based_on lineage"
                 )
             active_children = self.get_active_rebase_tasks_resolving_to_branch(
                 branch_key,
@@ -7830,7 +7834,7 @@ class SqliteTaskStore:
                 cur = conn.execute(
                     f"""
                     UPDATE tasks
-                    SET {', '.join(assignments)}
+                    SET {", ".join(assignments)}
                     WHERE project_id = ? AND id = ? AND status = 'pending'
                     """,
                     (*values, self._project_id, task_id),
@@ -7933,8 +7937,7 @@ class SqliteTaskStore:
                 values.append(expected_report_file)
 
             cur = conn.execute(
-                f"UPDATE tasks SET {', '.join(assignments)} "
-                f"WHERE {' AND '.join(predicates)}",
+                f"UPDATE tasks SET {', '.join(assignments)} WHERE {' AND '.join(predicates)}",
                 values,
             )
             if cur.rowcount == 0:
@@ -8531,6 +8534,35 @@ class SqliteTaskStore:
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
+    def get_based_on_children_for_parents_by_types(
+        self,
+        parent_type_pairs: Iterable[tuple[str, str]],
+    ) -> list[Task]:
+        """Return same-parent children for many ``(based_on, task_type)`` pairs."""
+        ordered_pairs = tuple(dict.fromkeys((parent_id, task_type) for parent_id, task_type in parent_type_pairs if parent_id and task_type))
+        if not ordered_pairs:
+            return []
+        children: list[Task] = []
+        with self._connect() as conn:
+            for start in range(0, len(ordered_pairs), _SQL_VARIABLE_CHUNK // 2):
+                chunk = ordered_pairs[start : start + (_SQL_VARIABLE_CHUNK // 2)]
+                pair_predicates = " OR ".join("(based_on = ? AND task_type = ?)" for _ in chunk)
+                params: list[object] = [self._project_id]
+                for parent_id, task_type in chunk:
+                    params.extend((parent_id, task_type))
+                cur = conn.execute(
+                    f"""
+                    SELECT *
+                    FROM tasks
+                    WHERE project_id = ?
+                      AND ({pair_predicates})
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    tuple(params),
+                )
+                children.extend(self._rows_to_tasks(conn, cur.fetchall()))
+        return children
+
     def get_active_children_of_type(
         self,
         task_id: str,
@@ -8637,11 +8669,7 @@ class SqliteTaskStore:
             cur = open_conn.execute(query, query_params)
             candidates = self._rows_to_tasks(open_conn, cur.fetchall())
 
-            return [
-                task
-                for task in candidates
-                if self._resolve_rebase_target_branch_conn(open_conn, task) == branch
-            ]
+            return [task for task in candidates if self._resolve_rebase_target_branch_conn(open_conn, task) == branch]
 
         if conn is not None:
             return _query(conn)
@@ -8653,10 +8681,14 @@ class SqliteTaskStore:
 
         if task.task_type == "rebase" and task.branch:
             parent_task_type: str | None = None
-            parent_cur = conn.execute(
-                "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
-                (self._project_id, task.based_on),
-            ) if task.based_on is not None else None
+            parent_cur = (
+                conn.execute(
+                    "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                    (self._project_id, task.based_on),
+                )
+                if task.based_on is not None
+                else None
+            )
             if parent_cur is not None:
                 parent_rows = self._rows_to_tasks(conn, parent_cur.fetchall())
                 parent_task_type = parent_rows[0].task_type if parent_rows else None
@@ -8729,6 +8761,383 @@ class SqliteTaskStore:
                 (self._project_id, *ordered_ids, *ordered_ids),
             )
             return self._rows_to_tasks(conn, cur.fetchall())
+
+    def list_landed_lineage_tasks_for_roots(
+        self,
+        root_ids: Iterable[str],
+        *,
+        branch_keys_by_root_id: Mapping[str, Iterable[str]] | None = None,
+    ) -> dict[str, list[Task]]:
+        """Return merged completed/unmerged lineage evidence grouped by requested root."""
+        ordered_ids = tuple(dict.fromkeys(task_id for task_id in root_ids if task_id))
+        if not ordered_ids:
+            return {}
+        grouped: dict[str, list[Task]] = {task_id: [] for task_id in ordered_ids}
+        branch_filter_pairs: tuple[tuple[str, str], ...] | None = None
+        if branch_keys_by_root_id is not None:
+            branch_filter_pairs = tuple(
+                dict.fromkeys(
+                    (root_id, branch_key)
+                    for root_id in ordered_ids
+                    for branch_key in branch_keys_by_root_id.get(root_id, ())
+                    if branch_key
+                )
+            )
+            if not branch_filter_pairs:
+                return grouped
+        with self._connect() as conn:
+            if branch_filter_pairs is not None:
+                max_pairs_per_chunk = max(1, (_SQL_VARIABLE_CHUNK - 2) // 2)
+                for start in range(0, len(branch_filter_pairs), max_pairs_per_chunk):
+                    chunk = branch_filter_pairs[start : start + max_pairs_per_chunk]
+                    requested_values = ",".join("(?, ?)" for _ in chunk)
+                    params: list[object] = []
+                    for root_id, branch_key in chunk:
+                        params.extend((root_id, branch_key))
+                    rows = conn.execute(
+                        f"""
+                        WITH RECURSIVE
+                        requested(root_id, branch_key) AS (
+                            VALUES {requested_values}
+                        ),
+                        requested_roots(root_id) AS (
+                            SELECT DISTINCT root_id
+                            FROM requested
+                        ),
+                        lineage(root_id, task_id) AS (
+                            SELECT root_id, root_id
+                            FROM requested_roots
+                            UNION
+                            SELECT lineage.root_id, child.id
+                            FROM lineage
+                            JOIN requested
+                              ON requested.root_id = lineage.root_id
+                            JOIN tasks child
+                              ON child.project_id = ?
+                             AND (
+                               child.based_on = lineage.task_id
+                               OR child.depends_on = lineage.task_id
+                             )
+                             AND child.task_type != 'internal'
+                             AND (
+                               child.branch = requested.branch_key
+                               OR child.recovery_origin IS NOT NULL
+                             )
+                        )
+                        SELECT
+                            lineage.root_id AS lineage_root_id,
+                            t.*
+                        FROM lineage
+                        JOIN requested
+                          ON requested.root_id = lineage.root_id
+                        JOIN tasks t
+                          ON t.project_id = ?
+                         AND t.id = lineage.task_id
+                         AND t.id != lineage.root_id
+                         AND t.branch = requested.branch_key
+                        WHERE 1 = 1
+                          AND t.status IN ('completed', 'unmerged')
+                          AND (
+                            EXISTS (
+                                SELECT 1
+                                FROM merge_unit_tasks mut
+                                JOIN merge_units mu
+                                  ON mu.project_id = mut.project_id
+                                 AND mu.id = mut.merge_unit_id
+                                WHERE mut.project_id = t.project_id
+                                  AND mut.task_id = t.id
+                                  AND {active_merge_unit_where_sql("mu")}
+                                  AND mu.state = 'merged'
+                            )
+                            OR (
+                                t.merge_status = 'merged'
+                                AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM merge_unit_tasks mut
+                                    JOIN merge_units mu
+                                      ON mu.project_id = mut.project_id
+                                     AND mu.id = mut.merge_unit_id
+                                    WHERE mut.project_id = t.project_id
+                                      AND mut.task_id = t.id
+                                      AND {inactive_tombstone_merge_unit_where_sql("mu")}
+                                )
+                            )
+                          )
+                        ORDER BY lineage_root_id ASC, t.created_at ASC, t.id ASC
+                        """,
+                        (*params, self._project_id, self._project_id),
+                    ).fetchall()
+                    tasks = self._rows_to_tasks(conn, rows)
+                    for row, task in zip(rows, tasks, strict=True):
+                        grouped.setdefault(str(row["lineage_root_id"]), []).append(task)
+                return grouped
+
+            max_roots_per_chunk = max(1, (_SQL_VARIABLE_CHUNK - 1) // 3)
+            for start in range(0, len(ordered_ids), max_roots_per_chunk):
+                root_chunk = ordered_ids[start : start + max_roots_per_chunk]
+                root_values = ",".join("(?)" for _ in root_chunk)
+                rows = conn.execute(
+                    f"""
+                    WITH RECURSIVE
+                    requested(root_id) AS (
+                        VALUES {root_values}
+                    ),
+                    lineage(root_id, task_id) AS (
+                        SELECT root_id, root_id
+                        FROM requested
+                        UNION
+                        SELECT lineage.root_id, child.id
+                        FROM lineage
+                        JOIN tasks child
+                          ON child.project_id = ?
+                         AND (
+                           child.based_on = lineage.task_id
+                           OR child.depends_on = lineage.task_id
+                         )
+                    )
+                    SELECT
+                        lineage.root_id AS lineage_root_id,
+                        t.*
+                    FROM lineage
+                    JOIN tasks t
+                      ON t.project_id = ?
+                     AND t.id = lineage.task_id
+                     AND t.id != lineage.root_id
+                    WHERE 1 = 1
+                      AND t.status IN ('completed', 'unmerged')
+                      AND t.branch IS NOT NULL
+                      AND (
+                        EXISTS (
+                            SELECT 1
+                            FROM merge_unit_tasks mut
+                            JOIN merge_units mu
+                              ON mu.project_id = mut.project_id
+                             AND mu.id = mut.merge_unit_id
+                            WHERE mut.project_id = t.project_id
+                              AND mut.task_id = t.id
+                              AND {active_merge_unit_where_sql("mu")}
+                              AND mu.state = 'merged'
+                        )
+                        OR (
+                            t.merge_status = 'merged'
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM merge_unit_tasks mut
+                                JOIN merge_units mu
+                                  ON mu.project_id = mut.project_id
+                                 AND mu.id = mut.merge_unit_id
+                                WHERE mut.project_id = t.project_id
+                                  AND mut.task_id = t.id
+                                  AND {inactive_tombstone_merge_unit_where_sql("mu")}
+                            )
+                        )
+                      )
+                    ORDER BY lineage_root_id ASC, t.created_at ASC, t.id ASC
+                    """,
+                    (*root_chunk, self._project_id, self._project_id),
+                ).fetchall()
+                tasks = self._rows_to_tasks(conn, rows)
+                for row, task in zip(rows, tasks, strict=True):
+                    grouped.setdefault(str(row["lineage_root_id"]), []).append(task)
+        return grouped
+
+    def get_recovery_or_same_slice_sibling_candidates_for_failed_tasks(self, task_ids: Iterable[str]) -> list[Task]:
+        """Return plausible sibling evidence for failed seeds without hydrating all siblings."""
+        ordered_ids = tuple(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        if not ordered_ids:
+            return []
+
+        from .review_scope import resolve_implement_slice_identity
+
+        def implement_slice_identity_key(prompt: str | None, review_scope: str | None) -> str | None:
+            identity = resolve_implement_slice_identity(prompt=prompt, review_scope=review_scope)
+            if identity is None:
+                return None
+            return json.dumps(identity.__dict__, sort_keys=True, separators=(",", ":"))
+
+        candidates: list[Task] = []
+        with self._connect() as conn:
+            conn.create_function("_gza_implement_slice_identity_key", 2, implement_slice_identity_key)
+            for start in range(0, len(ordered_ids), _SQL_VARIABLE_CHUNK):
+                chunk = ordered_ids[start : start + _SQL_VARIABLE_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                cur = conn.execute(
+                    f"""
+                    SELECT DISTINCT c.*
+                    FROM tasks f
+                    JOIN tasks p
+                      ON p.project_id = f.project_id
+                     AND p.id = f.based_on
+                    JOIN tasks c
+                      ON c.project_id = f.project_id
+                     AND c.based_on = p.id
+                     AND c.task_type = f.task_type
+                     AND c.id != f.id
+                    WHERE f.project_id = ?
+                      AND f.id IN ({placeholders})
+                      AND f.status = 'failed'
+                      AND (
+                        (
+                          COALESCE(c.recovery_origin, '') != 'manual'
+                          AND (
+                            c.recovery_origin IN ('resume', 'retry')
+                            OR (
+                              p.session_id IS NOT NULL
+                              AND c.session_id = p.session_id
+                              AND c.depends_on IS p.depends_on
+                              AND (
+                                (p.branch IS NULL AND c.branch IS NULL)
+                                OR c.branch = p.branch
+                              )
+                            )
+                            OR (
+                              c.prompt = p.prompt
+                              AND c.depends_on IS p.depends_on
+                              AND c.spec IS p.spec
+                              AND c.create_review = p.create_review
+                              AND c.create_pr = p.create_pr
+                              AND c.task_type_hint IS p.task_type_hint
+                              AND (
+                                c.same_branch = p.same_branch
+                                OR (
+                                  p.same_branch = 1
+                                  AND p.branch IS NOT NULL
+                                  AND c.same_branch = 0
+                                  AND c.base_branch = p.branch
+                                )
+                              )
+                              AND NOT EXISTS (
+                                SELECT 1
+                                FROM task_tags pt
+                                WHERE pt.project_id = p.project_id
+                                  AND pt.task_id = p.id
+                                  AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM task_tags ct
+                                    WHERE ct.project_id = c.project_id
+                                      AND ct.task_id = c.id
+                                      AND ct.tag = pt.tag
+                                  )
+                              )
+                              AND NOT EXISTS (
+                                SELECT 1
+                                FROM task_tags ct
+                                WHERE ct.project_id = c.project_id
+                                  AND ct.task_id = c.id
+                                  AND NOT EXISTS (
+                                    SELECT 1
+                                    FROM task_tags pt
+                                    WHERE pt.project_id = p.project_id
+                                      AND pt.task_id = p.id
+                                      AND pt.tag = ct.tag
+                                  )
+                              )
+                            )
+                          )
+                        )
+                        OR (
+                          f.task_type = 'implement'
+                          AND c.status != 'dropped'
+                          AND _gza_implement_slice_identity_key(c.prompt, c.review_scope)
+                              IS _gza_implement_slice_identity_key(f.prompt, f.review_scope)
+                          AND _gza_implement_slice_identity_key(f.prompt, f.review_scope) IS NOT NULL
+                        )
+                      )
+                    ORDER BY c.created_at ASC, c.id ASC
+                    """,
+                    (self._project_id, *chunk),
+                )
+                candidates.extend(self._rows_to_tasks(conn, cur.fetchall()))
+        return candidates
+
+    def get_recovery_children_for_parents(self, task_ids: Iterable[str]) -> list[Task]:
+        """Return likely recovery-chain children for multiple parents.
+
+        This mirrors the durable recovery-edge shape in SQL so recovery preview
+        can hydrate recovery context without scanning every historical lineage
+        descendant attached to an actionable seed.
+        """
+        ordered_ids = tuple(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        if not ordered_ids:
+            return []
+
+        children: list[Task] = []
+        with self._connect() as conn:
+            for start in range(0, len(ordered_ids), _SQL_VARIABLE_CHUNK):
+                chunk = ordered_ids[start : start + _SQL_VARIABLE_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                cur = conn.execute(
+                    f"""
+                    SELECT c.*
+                    FROM tasks p
+                    JOIN tasks c
+                      ON c.project_id = p.project_id
+                     AND c.based_on = p.id
+                     AND c.task_type = p.task_type
+                    WHERE p.project_id = ?
+                      AND p.id IN ({placeholders})
+                      AND COALESCE(c.recovery_origin, '') != 'manual'
+                      AND (
+                        c.recovery_origin IN ('resume', 'retry')
+                        OR (
+                          p.session_id IS NOT NULL
+                          AND c.session_id = p.session_id
+                          AND c.depends_on IS p.depends_on
+                          AND (
+                            (p.branch IS NULL AND c.branch IS NULL)
+                            OR c.branch = p.branch
+                          )
+                        )
+                        OR (
+                          c.prompt = p.prompt
+                          AND c.depends_on IS p.depends_on
+                          AND c.spec IS p.spec
+                          AND c.create_review = p.create_review
+                          AND c.create_pr = p.create_pr
+                          AND c.task_type_hint IS p.task_type_hint
+                          AND (
+                            c.same_branch = p.same_branch
+                            OR (
+                              p.same_branch = 1
+                              AND p.branch IS NOT NULL
+                              AND c.same_branch = 0
+                              AND c.base_branch = p.branch
+                            )
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM task_tags pt
+                            WHERE pt.project_id = p.project_id
+                              AND pt.task_id = p.id
+                              AND NOT EXISTS (
+                                SELECT 1
+                                FROM task_tags ct
+                                WHERE ct.project_id = c.project_id
+                                  AND ct.task_id = c.id
+                                  AND ct.tag = pt.tag
+                              )
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1
+                            FROM task_tags ct
+                            WHERE ct.project_id = c.project_id
+                              AND ct.task_id = c.id
+                              AND NOT EXISTS (
+                                SELECT 1
+                                FROM task_tags pt
+                                WHERE pt.project_id = p.project_id
+                                  AND pt.task_id = p.id
+                                  AND pt.tag = ct.tag
+                              )
+                          )
+                        )
+                      )
+                    ORDER BY c.created_at ASC, c.id ASC
+                    """,
+                    (self._project_id, *chunk),
+                )
+                children.extend(self._rows_to_tasks(conn, cur.fetchall()))
+        return children
 
     def get_resumable_failed_tasks(self) -> list[Task]:
         """Return failed tasks that can be auto-resumed.
@@ -9825,9 +10234,7 @@ class SqliteTaskStore:
                 (self._project_id, lease_name),
             ).fetchone()
             if existing is not None and _pid_is_alive(int(existing["owner_pid"])):
-                same_owner = (
-                    int(existing["owner_pid"]) == owner_pid and str(existing["owner_token"]) == owner_token
-                )
+                same_owner = int(existing["owner_pid"]) == owner_pid and str(existing["owner_token"]) == owner_token
                 if not same_owner:
                     conn.rollback()
                     return None
@@ -11490,6 +11897,219 @@ class SqliteTaskStore:
             ).fetchall()
         return [unit for row in rows if (unit := self._row_to_merge_unit(row)) is not None]
 
+    def list_active_merge_units_for_recovery_scope(
+        self,
+        *,
+        states: tuple[str, ...],
+        tags: tuple[str, ...] | None = None,
+        any_tag: bool = False,
+    ) -> list[MergeUnit]:
+        """List active merge units that can seed recovery planning.
+
+        Tag filtering is intentionally applied in SQL through attached member
+        tasks so tag-scoped watch cycles do not hydrate unrelated lineages.
+        """
+        if not self.supports_merge_units():
+            return []
+        normalized_tags = _normalize_tags(tags)
+        if normalized_tags and not self._query_only_supports_tags():
+            return []
+        params: list[object] = [self._project_id]
+        state_filter = ""
+        if states:
+            state_filter = f"AND mu.state IN ({','.join('?' for _ in states)})"
+            params.extend(states)
+        tag_filter = ""
+        if normalized_tags:
+            tag_placeholders = ",".join("?" for _ in normalized_tags)
+            if any_tag:
+                tag_filter = f"""
+                  AND EXISTS (
+                      SELECT 1
+                      FROM merge_unit_tasks mut_scope
+                      JOIN task_tags tt
+                        ON tt.project_id = mut_scope.project_id
+                       AND tt.task_id = mut_scope.task_id
+                      WHERE mut_scope.project_id = mu.project_id
+                        AND mut_scope.merge_unit_id = mu.id
+                        AND tt.tag IN ({tag_placeholders})
+                  )
+                """
+                params.extend(normalized_tags)
+            else:
+                tag_filter = f"""
+                  AND EXISTS (
+                      SELECT 1
+                      FROM merge_unit_tasks mut_scope
+                      WHERE mut_scope.project_id = mu.project_id
+                        AND mut_scope.merge_unit_id = mu.id
+                        AND (
+                            SELECT COUNT(DISTINCT tt.tag)
+                            FROM task_tags tt
+                            WHERE tt.project_id = mut_scope.project_id
+                              AND tt.task_id = mut_scope.task_id
+                              AND tt.tag IN ({tag_placeholders})
+                        ) = ?
+                  )
+                """
+                params.extend(normalized_tags)
+                params.append(len(normalized_tags))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT mu.*
+                FROM merge_units mu
+                WHERE mu.project_id = ?
+                  AND {active_merge_unit_where_sql("mu")}
+                  {state_filter}
+                  {tag_filter}
+                ORDER BY mu.updated_at DESC, mu.id DESC
+                """,
+                tuple(params),
+            ).fetchall()
+        return [unit for row in rows if (unit := self._row_to_merge_unit(row)) is not None]
+
+    def list_failed_terminal_no_work_tasks_for_recovery_scope(
+        self,
+        *,
+        states: tuple[str, ...],
+        tags: tuple[str, ...] | None = None,
+        any_tag: bool = False,
+    ) -> list[Task]:
+        """Return failed tasks attached to active terminal no-work units.
+
+        The caller applies the shared no-work recovery policy after hydration;
+        SQL only provides a conservative, tag-scoped candidate set.
+        """
+        if not self.supports_merge_units():
+            return []
+        normalized_tags = _normalize_tags(tags)
+        if normalized_tags and not self._query_only_supports_tags():
+            return []
+        params: list[object] = [self._project_id]
+        state_filter = ""
+        if states:
+            state_filter = f"AND mu.state IN ({','.join('?' for _ in states)})"
+            params.extend(states)
+        tag_filter = ""
+        if normalized_tags:
+            tag_placeholders = ",".join("?" for _ in normalized_tags)
+            if any_tag:
+                tag_filter = f"""
+                  AND EXISTS (
+                      SELECT 1
+                      FROM task_tags tt
+                      WHERE tt.project_id = t.project_id
+                        AND tt.task_id = t.id
+                        AND tt.tag IN ({tag_placeholders})
+                  )
+                """
+                params.extend(normalized_tags)
+            else:
+                tag_filter = f"""
+                  AND (
+                      SELECT COUNT(DISTINCT tt.tag)
+                      FROM task_tags tt
+                      WHERE tt.project_id = t.project_id
+                        AND tt.task_id = t.id
+                        AND tt.tag IN ({tag_placeholders})
+                  ) = ?
+                """
+                params.extend(normalized_tags)
+                params.append(len(normalized_tags))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT DISTINCT t.*
+                FROM merge_unit_tasks mut
+                JOIN merge_units mu
+                  ON mu.project_id = mut.project_id
+                 AND mu.id = mut.merge_unit_id
+                JOIN tasks t
+                  ON t.project_id = mut.project_id
+                 AND t.id = mut.task_id
+                WHERE mut.project_id = ?
+                  AND t.status = 'failed'
+                  AND {active_merge_unit_where_sql("mu")}
+                  {state_filter}
+                  {tag_filter}
+                ORDER BY t.created_at ASC, t.id ASC
+                """,
+                tuple(params),
+            ).fetchall()
+            return self._rows_to_tasks(conn, rows)
+
+    def list_legacy_failed_tasks_for_recovery_scope(
+        self,
+        *,
+        tags: tuple[str, ...] | None = None,
+        any_tag: bool = False,
+    ) -> list[Task]:
+        """Return failed tasks that are not attached to any active merge unit."""
+        normalized_tags = _normalize_tags(tags)
+        if normalized_tags and not self._query_only_supports_tags():
+            return []
+        params: list[object] = [self._project_id]
+        tag_filter = ""
+        if normalized_tags:
+            tag_placeholders = ",".join("?" for _ in normalized_tags)
+            if any_tag:
+                tag_filter = f"""
+                  AND EXISTS (
+                      SELECT 1
+                      FROM task_tags tt
+                      WHERE tt.project_id = t.project_id
+                        AND tt.task_id = t.id
+                        AND tt.tag IN ({tag_placeholders})
+                  )
+                """
+                params.extend(normalized_tags)
+            else:
+                tag_filter = f"""
+                  AND (
+                      SELECT COUNT(DISTINCT tt.tag)
+                      FROM task_tags tt
+                      WHERE tt.project_id = t.project_id
+                        AND tt.task_id = t.id
+                        AND tt.tag IN ({tag_placeholders})
+                  ) = ?
+                """
+                params.extend(normalized_tags)
+                params.append(len(normalized_tags))
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT t.*
+                FROM tasks t
+                WHERE t.project_id = ?
+                  AND t.status = 'failed'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM merge_unit_tasks mut
+                      JOIN merge_units mu
+                        ON mu.project_id = mut.project_id
+                       AND mu.id = mut.merge_unit_id
+                      WHERE mut.project_id = t.project_id
+                        AND mut.task_id = t.id
+                        AND {active_merge_unit_where_sql("mu")}
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM merge_unit_tasks mut
+                      JOIN merge_units mu
+                        ON mu.project_id = mut.project_id
+                       AND mu.id = mut.merge_unit_id
+                      WHERE mut.project_id = t.project_id
+                        AND mut.task_id = t.id
+                        AND {inactive_tombstone_merge_unit_where_sql("mu")}
+                  )
+                  {tag_filter}
+                ORDER BY t.created_at ASC, t.id ASC
+                """,
+                tuple(params),
+            ).fetchall()
+            return self._rows_to_tasks(conn, rows)
+
     def list_tasks_for_merge_unit(self, merge_unit_id: str) -> list[Task]:
         """Return attached tasks for a merge unit."""
         if not self.supports_merge_units():
@@ -11509,6 +12129,36 @@ class SqliteTaskStore:
                 (self._project_id, merge_unit_id),
             ).fetchall()
             return self._rows_to_tasks(conn, rows)
+
+    def list_tasks_for_merge_units(self, merge_unit_ids: Iterable[str]) -> dict[str, list[Task]]:
+        """Return attached tasks grouped by merge-unit id in bulk."""
+        if not self.supports_merge_units():
+            return {}
+        ordered_ids = tuple(dict.fromkeys(unit_id for unit_id in merge_unit_ids if unit_id))
+        if not ordered_ids:
+            return {}
+        grouped: dict[str, list[Task]] = {unit_id: [] for unit_id in ordered_ids}
+        with self._connect() as conn:
+            for start in range(0, len(ordered_ids), _SQL_VARIABLE_CHUNK):
+                chunk = ordered_ids[start : start + _SQL_VARIABLE_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT mut.merge_unit_id AS attached_merge_unit_id, t.*
+                    FROM merge_unit_tasks mut
+                    JOIN tasks t
+                      ON t.project_id = mut.project_id
+                     AND t.id = mut.task_id
+                    WHERE mut.project_id = ?
+                      AND mut.merge_unit_id IN ({placeholders})
+                    ORDER BY mut.merge_unit_id ASC, t.created_at ASC, t.id ASC
+                    """,
+                    (self._project_id, *chunk),
+                ).fetchall()
+                tasks = self._rows_to_tasks(conn, rows)
+                for row, task in zip(rows, tasks, strict=True):
+                    grouped.setdefault(str(row["attached_merge_unit_id"]), []).append(task)
+        return grouped
 
     def list_merge_units_merged_since(
         self,
@@ -11614,6 +12264,44 @@ class SqliteTaskStore:
                     if unit is not None:
                         resolved[task_id] = unit
         return resolved
+
+    def list_merge_units_for_tasks(
+        self,
+        task_ids: Sequence[str],
+        *,
+        active_only: bool = False,
+    ) -> dict[str, tuple[MergeUnit, ...]]:
+        """Return historical merge units grouped by task id in bulk."""
+        if not self.supports_merge_units():
+            return {}
+        unique_ids = list(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        if not unique_ids:
+            return {}
+        grouped: dict[str, list[MergeUnit]] = {task_id: [] for task_id in unique_ids}
+        where_active = f" AND {active_merge_unit_where_sql('mu')}" if active_only else ""
+        with self._connect() as conn:
+            for start in range(0, len(unique_ids), _SQL_VARIABLE_CHUNK):
+                chunk = unique_ids[start : start + _SQL_VARIABLE_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT mut.task_id AS attached_task_id, mu.*
+                    FROM merge_unit_tasks mut
+                    JOIN merge_units mu
+                      ON mu.project_id = mut.project_id
+                     AND mu.id = mut.merge_unit_id
+                    WHERE mut.project_id = ?
+                      AND mut.task_id IN ({placeholders})
+                      {where_active}
+                    ORDER BY mut.task_id ASC, mu.updated_at DESC, mu.id DESC
+                    """,
+                    (self._project_id, *chunk),
+                ).fetchall()
+                for row in rows:
+                    unit = self._row_to_merge_unit(row)
+                    if unit is not None:
+                        grouped.setdefault(str(row["attached_task_id"]), []).append(unit)
+        return {task_id: tuple(units) for task_id, units in grouped.items() if units}
 
     def dual_write_legacy_merge_status(self, unit_id: str) -> None:
         """Project merge-unit state onto compatibility task fields."""
@@ -13042,9 +13730,7 @@ class SqliteTaskStore:
         """
         with self._connect() as conn:
             if all_projects:
-                cur = conn.execute(
-                    "SELECT status, COUNT(*) AS count FROM tasks GROUP BY status"
-                )
+                cur = conn.execute("SELECT status, COUNT(*) AS count FROM tasks GROUP BY status")
             else:
                 cur = conn.execute(
                     "SELECT status, COUNT(*) AS count FROM tasks WHERE project_id = ? GROUP BY status",
@@ -13659,8 +14345,7 @@ def edit_task_prompt(
     if current is None:
         raise TaskPromptEditConflict(f"Task {task_id} no longer exists")
     raise TaskPromptEditConflict(
-        f"Task {task_id} is {current.status}; "
-        "prompt edits are only allowed for pending tasks."
+        f"Task {task_id} is {current.status}; prompt edits are only allowed for pending tasks."
     )
 
 
@@ -13693,8 +14378,7 @@ def edit_task_prompt_with_mutations(
     if current is None:
         raise TaskPromptEditConflict(f"Task {task_id} no longer exists")
     raise TaskPromptEditConflict(
-        f"Task {task_id} is {current.status}; "
-        "prompt edits are only allowed for pending tasks."
+        f"Task {task_id} is {current.status}; prompt edits are only allowed for pending tasks."
     )
 
 

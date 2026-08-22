@@ -20,6 +20,7 @@ class RecoveryReadContext:
     root_by_task_id: Mapping[str, DbTask] = field(default_factory=dict)
     merge_units_by_task_id: Mapping[str, MergeUnit] = field(default_factory=dict)
     historical_merge_units_by_task_id: Mapping[str, Sequence[MergeUnit]] = field(default_factory=dict)
+    landed_lineage_tasks_by_root_id: Mapping[str, Sequence[DbTask]] = field(default_factory=dict)
     merge_context: object | None = None
     recovery_snapshots: dict[str, object] = field(default_factory=dict)
     lineage_tree_by_root_task_id: dict[str, object] = field(default_factory=dict)
@@ -159,6 +160,11 @@ class RecoveryReadContext:
         flattened = tuple(flatten_lineage_tree(self.build_lineage_tree(root_task)))
         self.lineage_by_root_task_id[root_task.id] = flattened
         return flattened
+
+    def get_landed_lineage_tasks(self, root_task_id: str | None) -> tuple[DbTask, ...]:
+        if root_task_id is None:
+            return ()
+        return tuple(self.landed_lineage_tasks_by_root_id.get(root_task_id, ()))
 
     def resolve_dependency_completion(self, task: DbTask) -> DbTask | None:
         if task.id is None:

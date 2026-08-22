@@ -9,7 +9,14 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Literal
 
-from .db import MergeUnit, SqliteTaskStore, Task as DbTask, merge_unit_is_active, task_id_numeric_key
+from .db import (
+    MERGE_UNIT_ACTIONABLE_STATES,
+    MergeUnit,
+    SqliteTaskStore,
+    Task as DbTask,
+    merge_unit_is_active,
+    task_id_numeric_key,
+)
 from .git import Git, prime_advance_planning_refs
 from .lifecycle_completion import (
     merge_state_is_terminal_for_lifecycle,
@@ -118,6 +125,7 @@ class LineageOwnerQuery:
     owner_task_ids: tuple[str, ...] | None = None
     task_ids: tuple[str, ...] | None = None
     selector_filter_mode: Literal["intersection", "union"] = "intersection"
+    recovery_unit_scope: bool = False
 
 
 @dataclass(frozen=True)
@@ -132,6 +140,7 @@ class _LineageIndexes:
     skipped_same_branch_members_by_root_id: dict[str, list[DbTask]]
     merge_units_by_task_id: dict[str, MergeUnit]
     historical_merge_units_by_task_id: dict[str, tuple[MergeUnit, ...]]
+    landed_lineage_tasks_by_root_id: dict[str, tuple[DbTask, ...]]
     impl_based_on_ids: set[str]
     non_dropped_impl_source_ids: set[str]
 
@@ -492,9 +501,18 @@ def _matches_date_filter(task: DbTask, date_filter: DateFilter) -> bool:
 
 
 def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
+    return _build_lineage_indexes(store, tuple(store.get_all()))
+
+
+def _build_lineage_indexes(
+    store: SqliteTaskStore,
+    tasks: Sequence[DbTask],
+    *,
+    landed_lineage_tasks_by_root_id: Mapping[str, Sequence[DbTask]] | None = None,
+) -> _LineageIndexes:
     from .recovery_engine import get_recovery_chain_root_task_id
 
-    tasks = tuple(store.get_all())
+    tasks = tuple(tasks)
     task_by_id = {task.id: task for task in tasks if task.id is not None}
     based_on_children: dict[str, list[DbTask]] = defaultdict(list)
     depends_on_children: dict[str, list[DbTask]] = defaultdict(list)
@@ -513,16 +531,14 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
     merge_units_by_task_id: dict[str, MergeUnit] = {}
     historical_merge_units_by_task_id: dict[str, tuple[MergeUnit, ...]] = {}
     if store.supports_merge_units():
-        for task in tasks:
-            if task.id is None:
-                continue
-            units = tuple(store.list_merge_units_for_task(task.id))
+        units_by_task_id = store.list_merge_units_for_tasks([task.id for task in tasks if task.id is not None])
+        for task_id, units in units_by_task_id.items():
             if not units:
                 continue
-            historical_merge_units_by_task_id[task.id] = units
+            historical_merge_units_by_task_id[task_id] = units
             active_unit = next((unit for unit in units if merge_unit_is_active(unit)), None)
             if active_unit is not None:
-                merge_units_by_task_id[task.id] = active_unit
+                merge_units_by_task_id[task_id] = active_unit
 
     recovery_read_context = RecoveryReadContext(
         tasks=tasks,
@@ -531,6 +547,7 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
         depends_on_children=depends_on_children,
         merge_units_by_task_id=merge_units_by_task_id,
         historical_merge_units_by_task_id=historical_merge_units_by_task_id,
+        landed_lineage_tasks_by_root_id=landed_lineage_tasks_by_root_id or {},
         allow_reconcile_mutation=False,
     )
 
@@ -640,8 +657,219 @@ def _load_indexes(store: SqliteTaskStore) -> _LineageIndexes:
         skipped_same_branch_members_by_root_id=skipped_same_branch_members_by_root_id,
         merge_units_by_task_id=merge_units_by_task_id,
         historical_merge_units_by_task_id=historical_merge_units_by_task_id,
+        landed_lineage_tasks_by_root_id={
+            root_id: tuple(tasks)
+            for root_id, tasks in (landed_lineage_tasks_by_root_id or {}).items()
+        },
         impl_based_on_ids=store.get_impl_based_on_ids(),
         non_dropped_impl_source_ids=collect_non_dropped_implement_source_ids(tasks),
+    )
+
+
+def _query_can_use_recovery_unit_indexes(query: LineageOwnerQuery) -> bool:
+    """Return whether query shape matches watch's global recovery-lane preview."""
+    return (
+        query.recovery_unit_scope
+        and query.limit is None
+        and query.statuses is None
+        and query.exclude_statuses is None
+        and query.merge_chain_state is None
+        and query.exclude_merge_chain_state is None
+        and query.task_types is None
+        and query.exclude_task_types is None
+        and not query.untagged_only
+        and query.date_filter is None
+        and query.include_skipped
+        and query.exclude_dropped_from_planning
+        and query.max_recovery_attempts is not None
+        and query.owner_task_ids is None
+        and query.task_ids is None
+        and query.selector_filter_mode == "intersection"
+        and query.exclude_tags is None
+    )
+
+
+def _resolve_loaded_root(task: DbTask, task_by_id: Mapping[str, DbTask]) -> DbTask:
+    root_by_task_id: dict[str, DbTask] = {}
+
+    def resolve_root(current: DbTask, seen: set[str] | None = None) -> DbTask:
+        if current.id is None:
+            return current
+        cached = root_by_task_id.get(current.id)
+        if cached is not None:
+            return cached
+        if seen is None:
+            seen = set()
+        if current.id in seen:
+            return current
+        seen.add(current.id)
+        parents: list[DbTask] = []
+        if current.based_on and current.based_on in task_by_id:
+            parents.append(resolve_root(task_by_id[current.based_on], seen))
+        if current.depends_on and current.depends_on in task_by_id:
+            parents.append(resolve_root(task_by_id[current.depends_on], seen))
+        if not parents:
+            root_by_task_id[current.id] = current
+            return current
+        root = min(parents, key=lambda item: (_task_event_time(item), task_id_numeric_key(item.id)))
+        root_by_task_id[current.id] = root
+        return root
+
+    return resolve_root(task)
+
+
+def _load_recovery_unit_indexes(store: SqliteTaskStore, query: LineageOwnerQuery) -> _LineageIndexes | None:
+    """Build lineage indexes from actionable merge units instead of every task.
+
+    Returns ``None`` for legacy/no-unit databases so callers can fall back to the
+    broad loader without changing old recovery behavior.
+    """
+    if not store.supports_merge_units() or not _query_can_use_recovery_unit_indexes(query):
+        return None
+    from .recovery_engine import (
+        _classify_recovery_edge,
+        _task_has_executed_resumable_session,
+        _task_lineage_branch_keys,
+    )
+
+    units = tuple(
+        store.list_active_merge_units_for_recovery_scope(
+            states=tuple(sorted(MERGE_UNIT_ACTIONABLE_STATES)),
+            tags=query.tags,
+            any_tag=query.any_tag,
+        )
+    )
+    legacy_failed_tasks = tuple(
+        store.list_legacy_failed_tasks_for_recovery_scope(
+            tags=query.tags,
+            any_tag=query.any_tag,
+        )
+    )
+    terminal_no_work_failed_tasks = tuple(
+        store.list_failed_terminal_no_work_tasks_for_recovery_scope(
+            states=("empty", "redundant"),
+            tags=query.tags,
+            any_tag=query.any_tag,
+        )
+    )
+
+    tasks_by_id: dict[str, DbTask] = {}
+
+    def get_many_chunked(task_ids: set[str]) -> tuple[DbTask, ...]:
+        ordered_ids = tuple(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        tasks: list[DbTask] = []
+        for start in range(0, len(ordered_ids), 900):
+            tasks.extend(store.get_many(ordered_ids[start : start + 900]))
+        return tuple(tasks)
+
+    def get_recovery_children_chunked(task_ids: set[str]) -> tuple[DbTask, ...]:
+        ordered_ids = tuple(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        tasks: list[DbTask] = []
+        for start in range(0, len(ordered_ids), 450):
+            tasks.extend(store.get_recovery_children_for_parents(ordered_ids[start : start + 450]))
+        return tuple(tasks)
+
+    def add_tasks(tasks: Sequence[DbTask]) -> set[str]:
+        added: set[str] = set()
+        for task in tasks:
+            if task.id is None or task.id in tasks_by_id:
+                continue
+            tasks_by_id[task.id] = task
+            added.add(task.id)
+        return added
+
+    unit_tasks_by_id = store.list_tasks_for_merge_units(unit.id for unit in units)
+    seed_ids: set[str] = set()
+    for unit in units:
+        seed_ids.update(add_tasks(unit_tasks_by_id.get(unit.id, ())))
+        if unit.owner_task_id is not None:
+            seed_ids.add(unit.owner_task_id)
+    seed_ids.update(add_tasks(legacy_failed_tasks))
+    terminal_candidate_ids = add_tasks(terminal_no_work_failed_tasks)
+    terminal_units_by_task_id = store.list_merge_units_for_tasks(tuple(terminal_candidate_ids), active_only=True)
+    for task_id in terminal_candidate_ids:
+        task = tasks_by_id.get(task_id)
+        active_no_work_unit = next((unit for unit in terminal_units_by_task_id.get(task_id, ()) if unit.state in {"empty", "redundant"}), None)
+        if task is not None and active_no_work_unit is not None and _task_has_executed_resumable_session(task):
+            seed_ids.add(task_id)
+        else:
+            tasks_by_id.pop(task_id, None)
+    if not seed_ids:
+        return _build_lineage_indexes(store, ())
+    missing_owner_ids = [task_id for task_id in seed_ids if task_id not in tasks_by_id]
+    seed_ids.update(add_tasks(store.get_many(missing_owner_ids)))
+
+    frontier = set(seed_ids)
+    seen_parent_frontier: set[str] = set()
+    while frontier:
+        current_ids = frontier - seen_parent_frontier
+        if not current_ids:
+            break
+        seen_parent_frontier.update(current_ids)
+        parent_ids = {
+            parent_id
+            for task_id in current_ids
+            if (task := tasks_by_id.get(task_id)) is not None
+            for parent_id in (task.based_on, task.depends_on)
+            if parent_id is not None and parent_id not in tasks_by_id
+        }
+        frontier = add_tasks(get_many_chunked(parent_ids))
+
+    resolution_frontier = set(seed_ids)
+    failed_seed_ids = {
+        task_id
+        for task_id in seed_ids
+        if (task := tasks_by_id.get(task_id)) is not None and task.status == "failed"
+    }
+    if failed_seed_ids:
+        resolution_frontier.update(add_tasks(store.get_recovery_or_same_slice_sibling_candidates_for_failed_tasks(failed_seed_ids)))
+
+    frontier = {task_id for task_id in resolution_frontier if task_id in tasks_by_id}
+    seen_child_frontier: set[str] = set()
+    while frontier:
+        current_ids = frontier - seen_child_frontier
+        if not current_ids:
+            break
+        seen_child_frontier.update(current_ids)
+        children = get_recovery_children_chunked(current_ids)
+        frontier = add_tasks(
+            tuple(
+                child
+                for child in children
+                if child.id is not None
+                and (parent := tasks_by_id.get(child.based_on or "")) is not None
+                and _classify_recovery_edge(parent, child) is not None
+            )
+        )
+
+    root_ids: set[str] = set()
+    branch_keys_by_root_id: dict[str, set[str]] = defaultdict(set)
+    for task_id in seed_ids:
+        task = tasks_by_id.get(task_id)
+        if task is None:
+            continue
+        root_task = _resolve_loaded_root(task, tasks_by_id)
+        if root_task.id is None:
+            continue
+        root_ids.add(root_task.id)
+        if task.status == "failed":
+            branch_keys_by_root_id[root_task.id].update(_task_lineage_branch_keys(store, task))
+    landed_lineage_by_root_id = store.list_landed_lineage_tasks_for_roots(
+        root_ids,
+        branch_keys_by_root_id=branch_keys_by_root_id,
+    )
+    add_tasks(tuple(task for tasks in landed_lineage_by_root_id.values() for task in tasks))
+
+    ordered_tasks = tuple(
+        sorted(
+            tasks_by_id.values(),
+            key=lambda task: (_task_event_time(task), task_id_numeric_key(task.id)),
+        )
+    )
+    return _build_lineage_indexes(
+        store,
+        ordered_tasks,
+        landed_lineage_tasks_by_root_id=landed_lineage_by_root_id,
     )
 
 
@@ -1478,7 +1706,7 @@ def _query_lineage_owner_rows_with_context(
     )
     from .task_query import task_matches_tag_filters
 
-    indexes = _load_indexes(store)
+    indexes = _load_recovery_unit_indexes(store, query) or _load_indexes(store)
     read_context = RecoveryReadContext(
         tasks=indexes.tasks,
         task_by_id=indexes.task_by_id,
@@ -1487,6 +1715,7 @@ def _query_lineage_owner_rows_with_context(
         root_by_task_id=indexes.root_by_task_id,
         merge_units_by_task_id=indexes.merge_units_by_task_id,
         historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
+        landed_lineage_tasks_by_root_id=indexes.landed_lineage_tasks_by_root_id,
         allow_reconcile_mutation=store._read_session_depth == 0,
         recovery_scope_task_ids=_build_tag_recovery_scope(
             indexes,
@@ -1864,11 +2093,7 @@ def _query_lineage_owner_rows_with_context(
                 [
                     task
                     for task in matching_failed_leaves
-                    if not (
-                        query.owner_task_ids is not None
-                        and query.task_ids is None
-                        and not task.same_branch
-                    )
+                    if not (query.owner_task_ids is not None and query.task_ids is None and not task.same_branch)
                     and _failed_leaf_should_surface_apart_from_completed_owner(
                         store=store,
                         failed_task=task,
@@ -1912,9 +2137,7 @@ def _query_lineage_owner_rows_with_context(
                         )
                     continue
                 terminal_owner_id = owner.id
-                rerootable_failed_leaf_ids = {
-                    task.id for task in rerootable_failed_leaves if task.id is not None
-                }
+                rerootable_failed_leaf_ids = {task.id for task in rerootable_failed_leaves if task.id is not None}
                 unresolved_tasks = [
                     task
                     for task in unresolved_tasks
@@ -1923,17 +2146,14 @@ def _query_lineage_owner_rows_with_context(
                 matching_failed_leaves = [
                     task for task in matching_failed_leaves if task.id in rerootable_failed_leaf_ids
                 ]
-            resolved_in_query = any(
-                reason == "recovery_chain_completed"
-                for reason in resolution.reasons
-            ) or (
-                "branch_merged" in resolution.reasons
-                and (not failed_leaves or (terminal_owner_resolution and not rerootable_failed_leaves))
-                and (owner_merge_state != "merged" or terminal_owner_resolution)
-            ) or (
-                "lineage_complete" in resolution.reasons
-                and not has_unimplemented_source
-                and not unresolved_tasks
+            resolved_in_query = (
+                any(reason == "recovery_chain_completed" for reason in resolution.reasons)
+                or (
+                    "branch_merged" in resolution.reasons
+                    and (not failed_leaves or (terminal_owner_resolution and not rerootable_failed_leaves))
+                    and (owner_merge_state != "merged" or terminal_owner_resolution)
+                )
+                or ("lineage_complete" in resolution.reasons and not has_unimplemented_source and not unresolved_tasks)
             )
             if resolved_in_query:
                 continue

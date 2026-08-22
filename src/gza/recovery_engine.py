@@ -549,6 +549,13 @@ def _task_has_explicit_terminal_merge_proof_for_same_slice_helper(
         )
         if unit is not None and merge_unit_is_active(unit):
             return effective_no_work_merge_state(task, unit.state) in {"merged", "empty", "redundant"}
+        historical_units = (
+            read_context.list_merge_units_for_task(task.id)
+            if read_context is not None
+            else tuple(store.list_merge_units_for_task(task.id))
+        )
+        if historical_units and all(not merge_unit_is_active(historical_unit) for historical_unit in historical_units):
+            return False
     return merge_state_is_terminal_for_lifecycle(task.merge_status)
 
 
@@ -1660,7 +1667,11 @@ def _is_resolved_by_landed_lineage(
     )
 
     if read_context is not None:
-        lineage = read_context.build_lineage(read_context.resolve_lineage_root(task))
+        root_task = read_context.resolve_lineage_root(task)
+        lineage = (
+            *read_context.build_lineage(root_task),
+            *read_context.get_landed_lineage_tasks(root_task.id),
+        )
     else:
         from .query import build_lineage, resolve_lineage_root
 
@@ -1677,6 +1688,16 @@ def _is_resolved_by_landed_lineage(
             )
             if unit is not None:
                 merge_state = unit.state
+            else:
+                historical_units = (
+                    read_context.list_merge_units_for_task(lineage_task.id)
+                    if read_context is not None
+                    else tuple(store.list_merge_units_for_task(lineage_task.id))
+                )
+                if historical_units and all(
+                    not merge_unit_is_active(historical_unit) for historical_unit in historical_units
+                ):
+                    continue
         if merge_state != "merged":
             continue
         if lineage_task.id == independent_follow_up_root_id:

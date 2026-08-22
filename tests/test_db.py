@@ -16093,3 +16093,44 @@ class TestTaskUpdatedAt:
         assert stored is not None
         assert stored.updated_at is None
         assert task_updated_at(stored) == edited
+
+
+def test_list_landed_lineage_tasks_for_roots_chunks_under_sqlite_variable_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gza.db as db_module
+
+    store = SqliteTaskStore(tmp_path / "test.db")
+    root_ids: list[str] = []
+    expected_by_root: dict[str, str] = {}
+    monkeypatch.setattr(db_module, "_SQL_VARIABLE_CHUNK", 6)
+    for idx in range(4):
+        root = store.add(f"Root {idx}", task_type="implement")
+        assert root.id is not None
+        root_ids.append(root.id)
+        landed = store.add(f"Landed {idx}", task_type="implement", based_on=root.id)
+        assert landed.id is not None
+        landed.status = "completed"
+        landed.branch = f"feature/landed-{idx}"
+        landed.has_commits = True
+        landed.merge_status = "merged"
+        landed.completed_at = datetime(2026, 7, 1, 8, idx % 60, tzinfo=UTC)
+        store.update(landed)
+        expected_by_root[root.id] = landed.id
+
+    original_connect = sqlite3.connect
+
+    def limited_connect(*args, **kwargs):
+        conn = original_connect(*args, **kwargs)
+        conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 6)
+        return conn
+
+    monkeypatch.setattr("gza.db.sqlite3.connect", limited_connect)
+
+    grouped = store.list_landed_lineage_tasks_for_roots(root_ids)
+
+    assert set(grouped) == set(root_ids)
+    assert {root_id: [task.id for task in tasks] for root_id, tasks in grouped.items()} == {
+        root_id: [landed_id] for root_id, landed_id in expected_by_root.items()
+    }
