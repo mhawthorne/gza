@@ -68,6 +68,8 @@ __all__ = [
     "TaskArtifact",
     "MergeUnit",
     "MergeUnitResolutionPlan",
+    "MergeUnitResolutionDiagnostic",
+    "MergeUnitResolutionResult",
     "WatchProgressObservation",
     "WatchRecoveryBackoff",
     "MainVerifyRemediationAttemptState",
@@ -1823,6 +1825,23 @@ class MergeUnitResolutionPlan:
     representative_task: "Task"
     related_branch_tasks: tuple["Task", ...]
     effective_member_tasks: tuple["Task", ...]
+
+
+@dataclass(frozen=True)
+class MergeUnitResolutionDiagnostic:
+    """Diagnostic for a merge-unit plan that cannot be resolved safely."""
+
+    reason: Literal["lineage_cycle"]
+    message: str
+    task_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MergeUnitResolutionResult:
+    """Read-only merge-unit planning result, including fail-closed diagnostics."""
+
+    plan: MergeUnitResolutionPlan | None
+    diagnostic: MergeUnitResolutionDiagnostic | None = None
 
 
 @dataclass(frozen=True)
@@ -11633,20 +11652,28 @@ class SqliteTaskStore:
         task: Task,
         *,
         target_branch: str | None,
-    ) -> MergeUnitResolutionPlan | None:
+        visited_task_ids: tuple[str, ...],
+    ) -> MergeUnitResolutionResult:
         """Preview branchless review attachment through its linked implementation."""
         if task.task_type != "review":
-            return None
+            return MergeUnitResolutionResult(plan=None)
         task_id = task.id
         if task_id is None:
-            return None
+            return MergeUnitResolutionResult(plan=None)
         for linked_id in (task.based_on, task.depends_on):
             if linked_id is None:
                 continue
             linked_task = self.get(linked_id)
             if linked_task is None or linked_task.id is None:
                 continue
-            linked_plan = self.resolve_merge_unit_plan_for_task(linked_task, target_branch=target_branch)
+            linked_result = self._resolve_merge_unit_plan_for_task(
+                linked_task,
+                target_branch=target_branch,
+                visited_task_ids=visited_task_ids,
+            )
+            if linked_result.diagnostic is not None:
+                return linked_result
+            linked_plan = linked_result.plan
             if linked_plan is None:
                 continue
             effective_tasks_by_id = {
@@ -11668,16 +11695,18 @@ class SqliteTaskStore:
                 owner=linked_plan.owner_task,
                 require_actionable=True,
             )
-            return MergeUnitResolutionPlan(
-                unit=linked_plan.unit,
-                source_branch=linked_plan.source_branch,
-                target_branch=linked_plan.target_branch,
-                owner_task=linked_plan.owner_task,
-                representative_task=representative or linked_plan.representative_task,
-                related_branch_tasks=linked_plan.related_branch_tasks,
-                effective_member_tasks=effective_member_tasks,
+            return MergeUnitResolutionResult(
+                plan=MergeUnitResolutionPlan(
+                    unit=linked_plan.unit,
+                    source_branch=linked_plan.source_branch,
+                    target_branch=linked_plan.target_branch,
+                    owner_task=linked_plan.owner_task,
+                    representative_task=representative or linked_plan.representative_task,
+                    related_branch_tasks=linked_plan.related_branch_tasks,
+                    effective_member_tasks=effective_member_tasks,
+                )
             )
-        return None
+        return MergeUnitResolutionResult(plan=None)
 
     def resolve_merge_unit_plan_for_task(
         self,
@@ -11685,6 +11714,15 @@ class SqliteTaskStore:
         *,
         target_branch: str | None = None,
     ) -> MergeUnitResolutionPlan | None:
+        """Resolve the merge unit membership a task has or would get, without writing."""
+        return self.resolve_merge_unit_plan_result_for_task(task, target_branch=target_branch).plan
+
+    def resolve_merge_unit_plan_result_for_task(
+        self,
+        task: Task,
+        *,
+        target_branch: str | None = None,
+    ) -> MergeUnitResolutionResult:
         """Resolve the merge unit membership a task has or would get, without writing.
 
         This mirrors ``get_or_create_merge_unit_for_task`` up to the materialization
@@ -11693,8 +11731,32 @@ class SqliteTaskStore:
         same hypothetical member set. It never creates units, attaches tasks,
         synchronizes owners, or dual-writes legacy task fields.
         """
+        return self._resolve_merge_unit_plan_for_task(task, target_branch=target_branch, visited_task_ids=())
+
+    def _resolve_merge_unit_plan_for_task(
+        self,
+        task: Task,
+        *,
+        target_branch: str | None,
+        visited_task_ids: tuple[str, ...],
+    ) -> MergeUnitResolutionResult:
         if not self.supports_merge_units() or task.id is None:
-            return None
+            return MergeUnitResolutionResult(plan=None)
+        if task.id in visited_task_ids:
+            cycle_start = visited_task_ids.index(task.id)
+            cycle_path = visited_task_ids[cycle_start:] + (task.id,)
+            return MergeUnitResolutionResult(
+                plan=None,
+                diagnostic=MergeUnitResolutionDiagnostic(
+                    reason="lineage_cycle",
+                    message=(
+                        "lineage cycle while resolving merge-unit plan: "
+                        + " -> ".join(cycle_path)
+                    ),
+                    task_ids=cycle_path,
+                ),
+            )
+        next_visited_task_ids = visited_task_ids + (task.id,)
         existing = self.resolve_merge_unit_for_task(task.id)
         if existing is not None:
             member_tasks = tuple(self.list_tasks_for_merge_unit(existing.id))
@@ -11712,17 +11774,23 @@ class SqliteTaskStore:
             )
             if representative is None:
                 representative = task if task.branch == existing.source_branch else owner
-            return MergeUnitResolutionPlan(
-                unit=existing,
-                source_branch=existing.source_branch,
-                target_branch=existing.target_branch,
-                owner_task=owner,
-                representative_task=representative,
-                related_branch_tasks=member_tasks,
-                effective_member_tasks=member_tasks,
+            return MergeUnitResolutionResult(
+                plan=MergeUnitResolutionPlan(
+                    unit=existing,
+                    source_branch=existing.source_branch,
+                    target_branch=existing.target_branch,
+                    owner_task=owner,
+                    representative_task=representative,
+                    related_branch_tasks=member_tasks,
+                    effective_member_tasks=member_tasks,
+                )
             )
         if not task.branch:
-            return self._branchless_review_merge_unit_plan(task, target_branch=target_branch)
+            return self._branchless_review_merge_unit_plan(
+                task,
+                target_branch=target_branch,
+                visited_task_ids=next_visited_task_ids,
+            )
 
         resolved_target_branch = target_branch or self.default_merge_target(strict=True)
         same_branch_tasks = self.get_tasks_for_branch(task.branch)
@@ -11745,14 +11813,16 @@ class SqliteTaskStore:
                 require_actionable=True,
             )
             effective_member_tasks = self._merge_unit_materialization_preview_tasks(related_branch_tasks)
-            return MergeUnitResolutionPlan(
-                unit=None,
-                source_branch=task.branch,
-                target_branch=resolved_target_branch,
-                owner_task=owner,
-                representative_task=representative or task,
-                related_branch_tasks=tuple(related_branch_tasks),
-                effective_member_tasks=tuple(effective_member_tasks),
+            return MergeUnitResolutionResult(
+                plan=MergeUnitResolutionPlan(
+                    unit=None,
+                    source_branch=task.branch,
+                    target_branch=resolved_target_branch,
+                    owner_task=owner,
+                    representative_task=representative or task,
+                    related_branch_tasks=tuple(related_branch_tasks),
+                    effective_member_tasks=tuple(effective_member_tasks),
+                )
             )
 
         owner = self.resolve_merge_unit_owner_task(active_unit) or next(
@@ -11773,14 +11843,16 @@ class SqliteTaskStore:
             owner=owner,
             require_actionable=True,
         )
-        return MergeUnitResolutionPlan(
-            unit=active_unit,
-            source_branch=active_unit.source_branch,
-            target_branch=active_unit.target_branch,
-            owner_task=owner,
-            representative_task=representative or (task if task.branch == active_unit.source_branch else owner),
-            related_branch_tasks=tuple(related_branch_tasks),
-            effective_member_tasks=tuple(preview_tasks),
+        return MergeUnitResolutionResult(
+            plan=MergeUnitResolutionPlan(
+                unit=active_unit,
+                source_branch=active_unit.source_branch,
+                target_branch=active_unit.target_branch,
+                owner_task=owner,
+                representative_task=representative or (task if task.branch == active_unit.source_branch else owner),
+                related_branch_tasks=tuple(related_branch_tasks),
+                effective_member_tasks=tuple(preview_tasks),
+            )
         )
 
     def resolve_merge_unit_owner_tip_task(self, unit: MergeUnit) -> Task | None:

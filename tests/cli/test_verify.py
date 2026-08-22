@@ -160,6 +160,16 @@ def _snapshot_db_bytes(store):
     return store.db_path.read_bytes()
 
 
+def _completed_branchless_review(store, prompt="Branchless review"):
+    review = store.add(prompt, task_type="review")
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.branch = None
+    store.update(review)
+    return review
+
+
 def _verify_decision_summary(owner, decision):
     result = decision.lookup.result
     evidence_source = None
@@ -1310,6 +1320,70 @@ def test_verify_dry_run_branchless_review_trigger_matches_writable_resolution_wi
 
     writable_summary = _writable_resolution_verify_summary(store, config, git, review)
     assert writable_summary == dry_summary
+
+
+def test_verify_branchless_self_linked_review_cycle_refuses_without_mutation(
+    tmp_path,
+    capsys,
+):
+    _setup_verify_config(tmp_path)
+    store = make_store(tmp_path)
+    review = _completed_branchless_review(store, "Self-linked review")
+    review.based_on = review.id
+    review.depends_on = review.id
+    store.update(review)
+    before_tables = _snapshot_verify_dry_run_state(store)
+    git = _fake_git(tmp_path)
+
+    for dry_run in (True, False):
+        with (
+            patch("gza.cli.verify.Git", return_value=git),
+            patch("gza.cli.verify.execute_advance_action") as execute_action,
+            patch("gza.cli.verify._resolve_merge_subject") as writable_resolve,
+        ):
+            rc = cmd_verify(_args(tmp_path, review.id, dry_run=dry_run))
+
+        output = capsys.readouterr().out
+        assert rc == 1
+        execute_action.assert_not_called()
+        writable_resolve.assert_not_called()
+        assert "Error: lineage cycle while resolving merge-unit plan" in output
+        assert f"{review.id} -> {review.id}" in output
+        assert "Traceback" not in output
+        assert _snapshot_verify_dry_run_state(store) == before_tables
+
+
+def test_verify_branchless_two_review_cycle_refuses_without_mutation(
+    tmp_path,
+    capsys,
+):
+    _setup_verify_config(tmp_path)
+    store = make_store(tmp_path)
+    first = _completed_branchless_review(store, "First branchless review")
+    second = _completed_branchless_review(store, "Second branchless review")
+    first.based_on = second.id
+    second.based_on = first.id
+    store.update(first)
+    store.update(second)
+    before_tables = _snapshot_verify_dry_run_state(store)
+    git = _fake_git(tmp_path)
+
+    for dry_run in (True, False):
+        with (
+            patch("gza.cli.verify.Git", return_value=git),
+            patch("gza.cli.verify.execute_advance_action") as execute_action,
+            patch("gza.cli.verify._resolve_merge_subject") as writable_resolve,
+        ):
+            rc = cmd_verify(_args(tmp_path, first.id, dry_run=dry_run))
+
+        output = capsys.readouterr().out
+        assert rc == 1
+        execute_action.assert_not_called()
+        writable_resolve.assert_not_called()
+        assert "Error: lineage cycle while resolving merge-unit plan" in output
+        assert f"{first.id} -> {second.id} -> {first.id}" in output
+        assert "Traceback" not in output
+        assert _snapshot_verify_dry_run_state(store) == before_tables
 
 
 def test_verify_dry_run_attached_successful_implementation_previews_owner_tip_sync_without_mutation(

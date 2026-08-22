@@ -160,6 +160,12 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if resolved is None:
         print(f"Error: Task {task_id} not found")
         return 1
+    if resolved.merge_resolution_warning:
+        print(f"Error: {resolved.merge_resolution_warning}")
+        return 1
+    if resolved.merge_source_warning:
+        print(f"Error: {resolved.merge_source_warning}")
+        return 1
     if not args.dry_run and _resolve_merge_subject(store, git, task_id, target_branch=target_branch) is None:
         print(f"Error: Task {task_id} not found")
         return 1
@@ -173,10 +179,6 @@ def cmd_verify(args: argparse.Namespace) -> int:
     if status_error is not None:
         print(f"Error: {status_error}")
         return 1
-    if resolved.merge_source_warning:
-        print(f"Error: {resolved.merge_source_warning}")
-        return 1
-
     owner_current_decision = resolve_verify_gate_decision(store, owner_task, config=config, git=git)
     resolved_members = resolved.merge_member_tasks or None
     current_decision = _effective_verify_gate_decision(

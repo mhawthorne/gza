@@ -287,6 +287,7 @@ class _ResolvedMergeSubject:
     merge_source_ref: str | None
     merge_source_warning: str | None
     merge_member_tasks: tuple[DbTask, ...] = ()
+    merge_resolution_warning: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1587,7 +1588,19 @@ def _resolve_merge_subject_query_only(
         )
 
     unit = store.resolve_merge_unit_for_task(trigger_task.id)
-    plan = store.resolve_merge_unit_plan_for_task(trigger_task, target_branch=target_branch)
+    plan_result = store.resolve_merge_unit_plan_result_for_task(trigger_task, target_branch=target_branch)
+    if plan_result.diagnostic is not None:
+        return _ResolvedMergeSubject(
+            trigger_task=trigger_task,
+            execution_task=trigger_task,
+            merge_subject=trigger_task,
+            merge_unit_id=None,
+            merge_branch=trigger_task.branch,
+            merge_source_ref=trigger_source.ref,
+            merge_source_warning=trigger_source.warning,
+            merge_resolution_warning=plan_result.diagnostic.message,
+        )
+    plan = plan_result.plan
     if unit is None and plan is None:
         return _ResolvedMergeSubject(
             trigger_task=trigger_task,

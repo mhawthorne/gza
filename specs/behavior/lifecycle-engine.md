@@ -449,7 +449,10 @@ epoch.
   `verify_gate` action and report that fresh outcome. It MUST NOT hide newer red
   contributor evidence behind older owner green evidence. `--dry-run` MUST report
   that effective epoch and verdict without creating, attaching, synchronizing,
-  dual-writing, or otherwise mutating merge-unit or verify evidence. A forced
+  dual-writing, or otherwise mutating merge-unit or verify evidence. If query-only
+  merge-unit planning encounters cyclic branchless-review lineage, dry-run and writable
+  invocations MUST return non-zero with a concise diagnostic before mutating merge-unit
+  or verify evidence. A forced
   rerun MUST return success only when the invoked verify action succeeds and produces fresh current
   green evidence; setup, execution, unsupported-action, or persistence failures MUST
   return non-zero and label any old verdict as pre-existing evidence.
