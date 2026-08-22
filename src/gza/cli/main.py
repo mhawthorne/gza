@@ -111,6 +111,7 @@ from .query import (
 )
 from .tv import cmd_tv
 from .unstick import cmd_unstick
+from .verify import cmd_verify
 from .watch import cmd_main_verify, cmd_queue, cmd_watch
 
 
@@ -1550,6 +1551,25 @@ def main() -> int:
         help="Auto-resolve conflicts using AI when rebasing (requires --rebase)",
     )
     add_common_args(merge_parser)
+
+    # verify command
+    verify_parser = subparsers.add_parser("verify", help="Rerun or inspect a task's lifecycle verify gate")
+    verify_parser.add_argument(
+        "task_id",
+        type=str,
+        help="Full prefixed task ID whose merge-unit verify gate should be checked",
+    )
+    verify_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report the effective current merge-unit verify epoch and verdict without writes or reruns",
+    )
+    verify_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Require a fresh verify rerun even when the current epoch is already green",
+    )
+    add_common_args(verify_parser)
 
     # rebase command
     rebase_parser = subparsers.add_parser("rebase", help="Rebase a task's branch onto a target branch")
@@ -3399,6 +3419,8 @@ def main() -> int:
             return cmd_sync(args)
         elif args.command == "merge":
             return cmd_merge(args)
+        elif args.command == "verify":
+            return cmd_verify(args)
         elif args.command == "rebase":
             return cmd_rebase(args)
         elif args.command == "checkout":

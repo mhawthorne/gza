@@ -435,6 +435,24 @@ epoch.
   verify is still red, cannot be executed, or cannot be persisted, lifecycle MUST remain
   blocked and surface an actionable direct diagnostic rather than continuing to review or
   merge.
+- `gza verify <task_id>` is a manual verify-gate refresh surface for a resolved
+  merge unit. It MUST run the same lifecycle verify executor and persist the same
+  `verify_gate_result` evidence for the current epoch; it MUST NOT bypass,
+  suppress, or fake green evidence. If the current epoch is already green, it MUST
+  avoid rerunning unless `--force` is supplied. The command MUST select the same
+  effective newest current same-epoch merge-unit evidence as lifecycle before
+  reporting `--dry-run`, no-op, or refresh outcomes. A writable no-force invocation
+  MUST recredit non-owner current merge-unit evidence to the canonical owner. After
+  that reconciliation, it MAY return without rerunning only when the refreshed
+  effective state is green; if the refreshed effective state is red, unavailable,
+  stale, or missing, it MUST continue through the shared explicit-refresh
+  `verify_gate` action and report that fresh outcome. It MUST NOT hide newer red
+  contributor evidence behind older owner green evidence. `--dry-run` MUST report
+  that effective epoch and verdict without creating, attaching, synchronizing,
+  dual-writing, or otherwise mutating merge-unit or verify evidence. A forced
+  rerun MUST return success only when the invoked verify action succeeds and produces fresh current
+  green evidence; setup, execution, unsupported-action, or persistence failures MUST
+  return non-zero and label any old verdict as pre-existing evidence.
 - If the current pre-review verify gate is unavailable and lifecycle cannot safely route
   through `verify_fix`, it MUST park with `verify-unavailable`. If that same unavailable
   state persists after one completed same-epoch `verify_fix`, it MUST park with

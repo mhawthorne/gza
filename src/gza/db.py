@@ -67,6 +67,7 @@ __all__ = [
     "Task",
     "TaskArtifact",
     "MergeUnit",
+    "MergeUnitResolutionPlan",
     "WatchProgressObservation",
     "WatchRecoveryBackoff",
     "MainVerifyRemediationAttemptState",
@@ -1809,6 +1810,19 @@ class MergeUnit:
     diff_lines_added: int | None = None
     diff_lines_removed: int | None = None
     superseded_by_unit_id: str | None = None
+
+
+@dataclass(frozen=True)
+class MergeUnitResolutionPlan:
+    """Read-only resolution of the merge unit a task would materialize into."""
+
+    unit: MergeUnit | None
+    source_branch: str
+    target_branch: str
+    owner_task: "Task"
+    representative_task: "Task"
+    related_branch_tasks: tuple["Task", ...]
+    effective_member_tasks: tuple["Task", ...]
 
 
 @dataclass(frozen=True)
@@ -11530,6 +11544,245 @@ class SqliteTaskStore:
             return next((task for task in tasks if task.id == preferred_task_id), None)
         return tasks[0] if tasks else None
 
+    def _select_merge_unit_representative_task(
+        self,
+        unit: MergeUnit,
+        tasks: list[Task],
+        *,
+        preferred_task_id: str | None = None,
+        owner: Task | None = None,
+        require_actionable: bool = False,
+    ) -> Task | None:
+        """Return the representative from an already-resolved task set."""
+        actionable_members = [task for task in tasks if _task_is_actionable_merge_unit_member(task, unit)]
+        if preferred_task_id is not None:
+            preferred = next((task for task in actionable_members if task.id == preferred_task_id), None)
+            if preferred is not None:
+                return preferred
+        if owner is not None and _task_is_actionable_merge_unit_member(owner, unit):
+            return owner
+        if actionable_members:
+            return max(
+                actionable_members,
+                key=lambda task: (
+                    task.completed_at or task.created_at or datetime.min.replace(tzinfo=UTC),
+                    task_id_numeric_key(task.id),
+                ),
+            )
+        if require_actionable:
+            return None
+        if owner is not None:
+            return owner
+        if preferred_task_id is not None:
+            return next((task for task in tasks if task.id == preferred_task_id), None)
+        return tasks[0] if tasks else None
+
+    def _merge_unit_membership_preview_tasks(self, unit: MergeUnit, related_branch_tasks: list[Task]) -> list[Task]:
+        """Return tasks that writable legacy materialization would attach or already has attached."""
+        tasks_by_id: dict[str, Task] = {}
+        for task in self.list_tasks_for_merge_unit(unit.id):
+            if task.id is not None:
+                tasks_by_id[task.id] = task
+        for task in related_branch_tasks:
+            if task.id is not None:
+                tasks_by_id.setdefault(task.id, task)
+        for task in self._related_review_tasks_for_merge_unit(related_branch_tasks):
+            if task.id is not None:
+                tasks_by_id.setdefault(task.id, task)
+        return list(tasks_by_id.values())
+
+    def _merge_unit_materialization_preview_tasks(self, related_branch_tasks: list[Task]) -> list[Task]:
+        """Return tasks a new writable merge unit would attach, without writing."""
+        tasks_by_id: dict[str, Task] = {}
+        for task in related_branch_tasks:
+            if task.id is not None:
+                tasks_by_id.setdefault(task.id, task)
+        for task in self._related_review_tasks_for_merge_unit(related_branch_tasks):
+            if task.id is not None:
+                tasks_by_id.setdefault(task.id, task)
+        return list(tasks_by_id.values())
+
+    def _merge_unit_owner_tip_from_tasks(self, unit: MergeUnit, tasks: Iterable[Task]) -> Task | None:
+        """Return the latest successful implementation tip from a resolved task set."""
+        tip_candidates = [task for task in tasks if _task_is_successful_merge_unit_implement(task, unit)]
+        if not tip_candidates:
+            return None
+        return max(
+            tip_candidates,
+            key=lambda task: (
+                task.completed_at or task.created_at or datetime.min.replace(tzinfo=UTC),
+                task_id_numeric_key(task.id),
+            ),
+        )
+
+    def _preview_synced_merge_unit_owner(
+        self,
+        *,
+        task: Task,
+        unit: MergeUnit,
+        fallback_owner: Task,
+        effective_member_tasks: Iterable[Task],
+    ) -> Task:
+        """Preview writable owner-to-tip sync when this task would trigger it."""
+        if not _task_is_successful_merge_unit_implement(task, unit):
+            return fallback_owner
+        return self._merge_unit_owner_tip_from_tasks(unit, effective_member_tasks) or fallback_owner
+
+    def _branchless_review_merge_unit_plan(
+        self,
+        task: Task,
+        *,
+        target_branch: str | None,
+    ) -> MergeUnitResolutionPlan | None:
+        """Preview branchless review attachment through its linked implementation."""
+        if task.task_type != "review":
+            return None
+        task_id = task.id
+        if task_id is None:
+            return None
+        for linked_id in (task.based_on, task.depends_on):
+            if linked_id is None:
+                continue
+            linked_task = self.get(linked_id)
+            if linked_task is None or linked_task.id is None:
+                continue
+            linked_plan = self.resolve_merge_unit_plan_for_task(linked_task, target_branch=target_branch)
+            if linked_plan is None:
+                continue
+            effective_tasks_by_id = {
+                member.id: member for member in linked_plan.effective_member_tasks if member.id is not None
+            }
+            effective_tasks_by_id[task_id] = task
+            effective_member_tasks = tuple(effective_tasks_by_id.values())
+            representative = self._select_merge_unit_representative_task(
+                linked_plan.unit
+                or MergeUnit(
+                    id="",
+                    source_branch=linked_plan.source_branch,
+                    target_branch=linked_plan.target_branch,
+                    owner_task_id=linked_plan.owner_task.id,
+                    state=merge_unit_legacy_state(linked_plan.owner_task.merge_status) or "unmerged",
+                ),
+                list(effective_member_tasks),
+                preferred_task_id=task.id,
+                owner=linked_plan.owner_task,
+                require_actionable=True,
+            )
+            return MergeUnitResolutionPlan(
+                unit=linked_plan.unit,
+                source_branch=linked_plan.source_branch,
+                target_branch=linked_plan.target_branch,
+                owner_task=linked_plan.owner_task,
+                representative_task=representative or linked_plan.representative_task,
+                related_branch_tasks=linked_plan.related_branch_tasks,
+                effective_member_tasks=effective_member_tasks,
+            )
+        return None
+
+    def resolve_merge_unit_plan_for_task(
+        self,
+        task: Task,
+        *,
+        target_branch: str | None = None,
+    ) -> MergeUnitResolutionPlan | None:
+        """Resolve the merge unit membership a task has or would get, without writing.
+
+        This mirrors ``get_or_create_merge_unit_for_task`` up to the materialization
+        boundary: existing related active units are discovered, legacy same-branch
+        membership is inferred, and the owner/representative are selected from the
+        same hypothetical member set. It never creates units, attaches tasks,
+        synchronizes owners, or dual-writes legacy task fields.
+        """
+        if not self.supports_merge_units() or task.id is None:
+            return None
+        existing = self.resolve_merge_unit_for_task(task.id)
+        if existing is not None:
+            member_tasks = tuple(self.list_tasks_for_merge_unit(existing.id))
+            current_owner = self.resolve_merge_unit_owner_task(existing) or task
+            owner = self._preview_synced_merge_unit_owner(
+                task=task,
+                unit=existing,
+                fallback_owner=current_owner,
+                effective_member_tasks=member_tasks,
+            )
+            representative = self.resolve_merge_unit_representative_task(
+                existing,
+                preferred_task_id=task.id,
+                require_actionable=True,
+            )
+            if representative is None:
+                representative = task if task.branch == existing.source_branch else owner
+            return MergeUnitResolutionPlan(
+                unit=existing,
+                source_branch=existing.source_branch,
+                target_branch=existing.target_branch,
+                owner_task=owner,
+                representative_task=representative,
+                related_branch_tasks=member_tasks,
+                effective_member_tasks=member_tasks,
+            )
+        if not task.branch:
+            return self._branchless_review_merge_unit_plan(task, target_branch=target_branch)
+
+        resolved_target_branch = target_branch or self.default_merge_target(strict=True)
+        same_branch_tasks = self.get_tasks_for_branch(task.branch)
+        related_branch_tasks = self._related_branch_tasks_for_merge_unit(task, same_branch_tasks)
+        active_unit = self._resolve_related_merge_unit(related_branch_tasks)
+        if active_unit is None:
+            owner = next((branch_task for branch_task in related_branch_tasks if task_owns_merge_status(branch_task)), task)
+            preview_unit = MergeUnit(
+                id="",
+                source_branch=task.branch,
+                target_branch=resolved_target_branch,
+                owner_task_id=owner.id,
+                state=merge_unit_legacy_state(owner.merge_status) or "unmerged",
+            )
+            representative = self._select_merge_unit_representative_task(
+                preview_unit,
+                related_branch_tasks,
+                preferred_task_id=task.id,
+                owner=owner,
+                require_actionable=True,
+            )
+            effective_member_tasks = self._merge_unit_materialization_preview_tasks(related_branch_tasks)
+            return MergeUnitResolutionPlan(
+                unit=None,
+                source_branch=task.branch,
+                target_branch=resolved_target_branch,
+                owner_task=owner,
+                representative_task=representative or task,
+                related_branch_tasks=tuple(related_branch_tasks),
+                effective_member_tasks=tuple(effective_member_tasks),
+            )
+
+        owner = self.resolve_merge_unit_owner_task(active_unit) or next(
+            (branch_task for branch_task in related_branch_tasks if branch_task.id == active_unit.owner_task_id),
+            task,
+        )
+        preview_tasks = self._merge_unit_membership_preview_tasks(active_unit, related_branch_tasks)
+        owner = self._preview_synced_merge_unit_owner(
+            task=task,
+            unit=active_unit,
+            fallback_owner=owner,
+            effective_member_tasks=preview_tasks,
+        )
+        representative = self._select_merge_unit_representative_task(
+            active_unit,
+            preview_tasks,
+            preferred_task_id=task.id,
+            owner=owner,
+            require_actionable=True,
+        )
+        return MergeUnitResolutionPlan(
+            unit=active_unit,
+            source_branch=active_unit.source_branch,
+            target_branch=active_unit.target_branch,
+            owner_task=owner,
+            representative_task=representative or (task if task.branch == active_unit.source_branch else owner),
+            related_branch_tasks=tuple(related_branch_tasks),
+            effective_member_tasks=tuple(preview_tasks),
+        )
+
     def resolve_merge_unit_owner_tip_task(self, unit: MergeUnit) -> Task | None:
         """Return the latest successful implementation tip for ``unit``."""
         tip_candidates = [
@@ -11838,17 +12091,16 @@ class SqliteTaskStore:
         if not task.branch:
             return self._attach_branchless_review_to_merge_unit(task)
 
-        target_branch = self.default_merge_target(strict=True)
-        same_branch_tasks = self.get_tasks_for_branch(task.branch)
-        related_branch_tasks = self._related_branch_tasks_for_merge_unit(task, same_branch_tasks)
-        active_unit = self._resolve_related_merge_unit(related_branch_tasks)
+        plan = self.resolve_merge_unit_plan_for_task(task)
+        if plan is None:
+            return None
+        related_branch_tasks = list(plan.related_branch_tasks)
+        active_unit = plan.unit
         if active_unit is None:
-            owner_task = next(
-                (branch_task for branch_task in related_branch_tasks if task_owns_merge_status(branch_task)), task
-            )
+            owner_task = plan.owner_task
             active_unit = self.create_merge_unit(
-                source_branch=task.branch,
-                target_branch=target_branch,
+                source_branch=plan.source_branch,
+                target_branch=plan.target_branch,
                 owner_task_id=owner_task.id,
                 state=merge_unit_legacy_state(owner_task.merge_status) or "unmerged",
                 merged_at=owner_task.merged_at if owner_task.merge_status == "merged" else None,

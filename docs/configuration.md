@@ -1928,6 +1928,16 @@ for listed explore rows.
 When the shared advance/recovery engine decides a task must be skipped for human intervention, `gza advance` prints a dedicated `Needs attention` section. Each entry includes the task id, task type, short prompt, a stable `reason=...` policy slug, and the underlying skip text. This section is shown in the normal pre-confirmation preview and in `--dry-run` output, including when there is otherwise no actionable work to advance.
 Held completed plans use `next_action = awaiting_human` with `reason=awaiting-human-review`, plus guidance to review the plan and then either run `gza implement <plan-id>` for a one-off approval or `gza edit <plan-id> --no-hold-for-review` to restore the normal automatic follow-up path (`--auto-implement` remains a compatibility alias).
 
+### verify
+
+Rerun or inspect the lifecycle verify gate for a task's resolved merge unit.
+
+```bash
+gza verify <task_id> [--dry-run] [--force]
+```
+
+`gza verify` records normal `verify_gate_result` evidence for the current verify epoch using the same executor as lifecycle automation. It exits `0` when current evidence is green and `1` when it remains red, unavailable, stale, or missing, and prints the captured verify output artifact path when one exists. The command uses the same newest current same-epoch merge-unit evidence as lifecycle. Without `--force`, owner-held green evidence is an inspect-only no-op; non-owner current evidence is first recredited to the canonical owner. If that refreshed effective state is green, reconciliation is also a no-run success. If it is red, unavailable, stale, or missing, the command continues through the shared explicit-refresh `verify_gate` action and reports the fresh outcome. `--dry-run` reports the effective epoch and verdict through a query-only path without rerunning verify or mutating merge-unit state, legacy merge fields, or artifacts. `--force` exits `0` only when the invoked rerun succeeds and produces fresh current green evidence; old green evidence is labeled as pre-existing if the forced rerun cannot run or persist.
+
 ### unstick
 
 Manually clear currently parked owner state for eligible backstop, retry-limit, reconcile, or verify-fix-failed rows. Optionally dispatch the cleared owners through the shared scoped watch path.

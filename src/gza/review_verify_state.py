@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
@@ -63,6 +64,7 @@ class VerifyGateLookup:
     source: Literal["owner_artifact", "legacy_review"] | None
     is_current: bool
     has_owner_artifact: bool
+    artifact_id: int | None = None
     artifact_metadata: dict[str, Any] | None = None
 
 
@@ -312,6 +314,7 @@ def latest_verify_result_for_epoch(
                     source="owner_artifact",
                     is_current=True,
                     has_owner_artifact=True,
+                    artifact_id=artifact.id,
                     artifact_metadata=metadata,
                 )
         return VerifyGateLookup(
@@ -464,19 +467,27 @@ def select_current_merge_unit_verify_evidence(
     owner_task: Task,
     *,
     current_epoch: VerifyEpoch | None,
+    member_tasks: Iterable[Task] | None = None,
 ) -> MergeUnitVerifyEvidenceSelection | None:
     """Return the newest current same-epoch verify evidence across a merge unit."""
     if owner_task.id is None or current_epoch is None:
         return None
-    unit = store.resolve_merge_unit_for_task(owner_task.id)
-    if unit is None:
+    members: Iterable[Task]
+    if member_tasks is None:
+        unit = store.resolve_merge_unit_for_task(owner_task.id)
+        if unit is None:
+            return None
+        members = store.list_tasks_for_merge_unit(unit.id)
+    else:
+        members = member_tasks
+    if members is None:
         return None
 
     candidates: list[tuple[datetime, Task, VerifyGateLookup]] = []
     owner_lookup = latest_verify_result_for_epoch(store, owner_task, current_epoch=current_epoch)
     if owner_lookup.is_current and owner_lookup.result is not None:
         candidates.append((owner_lookup.result.captured_at, owner_task, owner_lookup))
-    for member in store.list_tasks_for_merge_unit(unit.id):
+    for member in members:
         if member.id is None or member.id == owner_task.id:
             continue
         lookup = latest_verify_result_for_epoch(store, member, current_epoch=current_epoch)

@@ -415,6 +415,8 @@ class AdvanceContext:
     current_review_head_is_live: bool = False
     latest_reviewed_head_sha: str | None = None
     verify_gate_decision: VerifyGateDecision | None = None
+    manual_verify_owner_task: DbTask | None = None
+    manual_verify_member_tasks: tuple[DbTask, ...] | None = None
 
     reviews: list[DbTask] | None = None
     review_root_task: DbTask | None = None
@@ -4807,6 +4809,9 @@ def has_current_passing_verify_for_merge(ctx: AdvanceContext) -> bool:
 
 
 def _verify_gate_owner_task(ctx: AdvanceContext) -> DbTask | None:
+    manual_owner = getattr(ctx, "manual_verify_owner_task", None)
+    if manual_owner is not None:
+        return manual_owner
     if not _is_implementation_owned_lineage(ctx):
         return None
     return resolve_lineage_owner_task(ctx.store, getattr(ctx, "review_root_task", None) or ctx.task)
@@ -4868,6 +4873,7 @@ def _merge_unit_verify_evidence_reconciliation_candidate(
         ctx.store,
         owner_task,
         current_epoch=current_epoch,
+        member_tasks=getattr(ctx, "manual_verify_member_tasks", None),
     )
     if selection is None or selection.source_task.id == owner_task.id:
         return None
@@ -5227,7 +5233,7 @@ def _verify_gate_action(ctx: AdvanceContext, *, phase: str, explicit_refresh: bo
             "type": "skip",
             "description": "SKIP: verify gate context unavailable",
         }
-    if phase == "pre_merge" and decision.state == "failed":
+    if phase == "pre_merge" and decision.state == "failed" and not explicit_refresh:
         return _pre_review_verify_fix_action(ctx)
     owner_task = _verify_gate_owner_task(ctx)
     description_suffix = "review" if phase == "pre_review" else "merge"
@@ -5245,6 +5251,64 @@ def _verify_gate_action(ctx: AdvanceContext, *, phase: str, explicit_refresh: bo
         "verify_gate_explicit_refresh": explicit_refresh,
         "verify_owner_task": owner_task,
     }
+
+
+def plan_manual_verify_gate_action(
+    config: Any,
+    store: SqliteTaskStore,
+    git: Any,
+    task: DbTask,
+    target_branch: str,
+    *,
+    verify_owner_task: DbTask,
+    member_tasks: tuple[DbTask, ...] | None = None,
+    selected_for_merge: bool = True,
+) -> dict[str, Any]:
+    """Build the shared lifecycle action for an explicit manual verify refresh."""
+    ctx = resolve_advance_context(
+        config,
+        store,
+        git,
+        task,
+        target_branch,
+        persist_post_merge_rebase_state=False,
+        persist_review_clearance=False,
+        selected_for_merge=selected_for_merge,
+    )
+    ctx = replace(
+        ctx,
+        manual_verify_owner_task=verify_owner_task,
+        manual_verify_member_tasks=member_tasks,
+        verify_gate_decision=resolve_verify_gate_decision(
+            store,
+            verify_owner_task,
+            config=config,
+            git=git,
+        ),
+    )
+
+    reconcile_action = _reconcile_verify_gate_evidence_action(ctx)
+    if reconcile_action.get("type") == "reconcile_verify_gate_evidence":
+        return reconcile_action
+
+    for rule in ADVANCE_RULES:
+        if rule.matches(ctx):
+            planned_action = rule.action(ctx)
+            require_needs_attention_subject(planned_action)
+            break
+    else:
+        planned_action = {"type": "skip", "description": "SKIP: no matching rule (unexpected)"}
+
+    if planned_action.get("type") == "reconcile_verify_gate_evidence":
+        return planned_action
+    if planned_action.get("type") == "verify_gate":
+        action = dict(planned_action)
+        action["verify_gate_explicit_refresh"] = True
+        action["verify_owner_task"] = verify_owner_task
+        return action
+
+    phase = "pre_merge" if _verify_gate_in_merge_scope(ctx) else "pre_review"
+    return _verify_gate_action(ctx, phase=phase, explicit_refresh=True)
 
 
 def _closing_review_requires_automation(ctx: AdvanceContext) -> bool:

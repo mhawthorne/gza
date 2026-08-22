@@ -286,6 +286,7 @@ class _ResolvedMergeSubject:
     merge_branch: str | None
     merge_source_ref: str | None
     merge_source_warning: str | None
+    merge_member_tasks: tuple[DbTask, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1545,6 +1546,77 @@ def _resolve_merge_subject(
         merge_branch=unit.source_branch,
         merge_source_ref=merge_source.ref,
         merge_source_warning=merge_source.warning,
+    )
+
+
+def _resolve_merge_subject_query_only(
+    store: SqliteTaskStore,
+    git: Git,
+    task_id: str,
+    *,
+    target_branch: str,
+) -> _ResolvedMergeSubject | None:
+    """Resolve a merge subject without creating or backfilling merge-unit state."""
+    trigger_task = store.get(task_id)
+    if trigger_task is None:
+        return None
+    trigger_source = _resolve_fresh_merge_source(git, trigger_task.branch)
+    if trigger_task.id is None:
+        return _ResolvedMergeSubject(
+            trigger_task=trigger_task,
+            execution_task=trigger_task,
+            merge_subject=trigger_task,
+            merge_unit_id=None,
+            merge_branch=trigger_task.branch,
+            merge_source_ref=trigger_source.ref,
+            merge_source_warning=trigger_source.warning,
+        )
+
+    unit = store.resolve_merge_unit_for_task(trigger_task.id)
+    plan = store.resolve_merge_unit_plan_for_task(trigger_task, target_branch=target_branch)
+    if unit is None and plan is None:
+        return _ResolvedMergeSubject(
+            trigger_task=trigger_task,
+            execution_task=trigger_task,
+            merge_subject=trigger_task,
+            merge_unit_id=None,
+            merge_branch=trigger_task.branch,
+            merge_source_ref=trigger_source.ref,
+            merge_source_warning=trigger_source.warning,
+        )
+
+    if plan is not None:
+        merge_subject = plan.owner_task
+        execution_task = plan.representative_task
+        merge_unit_id = plan.unit.id if plan.unit is not None else None
+        merge_branch = plan.source_branch
+        merge_member_tasks = plan.effective_member_tasks
+    else:
+        assert unit is not None
+        merge_subject = store.resolve_merge_unit_owner_task(unit) or trigger_task
+        execution_task_candidate = store.resolve_merge_unit_representative_task(
+            unit,
+            preferred_task_id=trigger_task.id,
+            require_actionable=True,
+        )
+        execution_task = (
+            execution_task_candidate
+            if execution_task_candidate is not None
+            else trigger_task if trigger_task.branch == unit.source_branch else merge_subject
+        )
+        merge_unit_id = unit.id
+        merge_branch = unit.source_branch
+        merge_member_tasks = ()
+    merge_source = _resolve_fresh_merge_source(git, merge_branch)
+    return _ResolvedMergeSubject(
+        trigger_task=trigger_task,
+        execution_task=execution_task,
+        merge_subject=merge_subject,
+        merge_unit_id=merge_unit_id,
+        merge_branch=merge_branch,
+        merge_source_ref=merge_source.ref,
+        merge_source_warning=merge_source.warning,
+        merge_member_tasks=tuple(merge_member_tasks),
     )
 
 
