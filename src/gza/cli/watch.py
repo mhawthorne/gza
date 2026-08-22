@@ -151,9 +151,12 @@ from ..watch_progress import (
     WatchProgressCandidate,
     WatchProgressScope,
     build_watch_progress_candidate,
+    clear_watch_progress_subject,
     finalize_background_watch_execution,
     finalize_watch_progress_after_execution,
     get_active_watch_no_progress_attention,
+    mark_selected_create_review_action_epoch,
+    materialized_create_review_action_task,
     observe_selected_watch_action_without_dispatch,
     reconcile_stale_watch_no_progress_parks,
     record_background_watch_execution_start,
@@ -2256,6 +2259,8 @@ def _maybe_park_watch_no_progress(
     """Return an existing parked no-progress attention action for the current evidence."""
     if subject_task.id is None:
         return None
+    if action.get("type") == "create_review":
+        mark_selected_create_review_action_epoch(store, subject_task_id=subject_task.id, action=action)
     if no_progress_cycles is not None:
         deferred_attention = _maybe_finalize_deferred_watch_no_progress(
             config=config,
@@ -2268,11 +2273,17 @@ def _maybe_park_watch_no_progress(
         )
         if deferred_attention is not None:
             return deferred_attention
+    resolved_action_task = _resolve_watch_progress_action_task(
+        store=store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task,
+    )
     candidate = build_watch_progress_candidate(
         store,
         subject_task=subject_task,
         action=action,
-        action_task=action_task,
+        action_task=resolved_action_task,
         failed_task=failed_task,
     )
     active_attention = get_active_watch_no_progress_attention(store, candidate=candidate)
@@ -2301,6 +2312,69 @@ def _watch_no_progress_result_deferred_for_transient_backoff(result: dict[str, A
     return result is not None and result.get("defer_launch_reason") == _WATCH_TRANSIENT_RECOVERY_BACKOFF_DEFER_REASON
 
 
+def _materialized_create_review_action_task(
+    *,
+    store: SqliteTaskStore,
+    subject_task: DbTask,
+    action: dict[str, Any],
+    action_task: DbTask | None,
+) -> DbTask | None:
+    if action.get("type") != "create_review" or subject_task.id is None:
+        return None
+    mark_selected_create_review_action_epoch(store, subject_task_id=subject_task.id, action=action)
+    if action_task is None or action_task.id != subject_task.id:
+        return None
+    return materialized_create_review_action_task(
+        store,
+        subject_task_id=subject_task.id,
+        action=action,
+    )
+
+
+def _resolve_watch_progress_action_task(
+    *,
+    store: SqliteTaskStore,
+    subject_task: DbTask,
+    action: dict[str, Any],
+    action_task: DbTask | None,
+) -> DbTask | None:
+    if action.get("type") == "create_review" and subject_task.id is not None:
+        mark_selected_create_review_action_epoch(store, subject_task_id=subject_task.id, action=action)
+    return (
+        _materialized_create_review_action_task(
+            store=store,
+            subject_task=subject_task,
+            action=action,
+            action_task=action_task,
+        )
+        or action_task
+    )
+
+
+def _create_review_action_task_unmaterialized(
+    *,
+    store: SqliteTaskStore,
+    subject_task: DbTask,
+    action: dict[str, Any],
+    action_task: DbTask | None,
+) -> bool:
+    if action.get("type") == "create_review" and subject_task.id is not None:
+        mark_selected_create_review_action_epoch(store, subject_task_id=subject_task.id, action=action)
+    return (
+        action.get("type") == "create_review"
+        and subject_task.id is not None
+        and action_task is not None
+        and action_task.id == subject_task.id
+        and _materialized_create_review_action_task(
+            store=store,
+            subject_task=subject_task,
+            action=action,
+            action_task=action_task,
+        )
+        is None
+    )
+
+
 def _maybe_finalize_deferred_watch_no_progress(
     *,
     config: Config | None,
@@ -2312,11 +2386,25 @@ def _maybe_finalize_deferred_watch_no_progress(
     no_progress_cycles: int,
 ) -> dict[str, Any] | None:
     """Finalize a previously launched detached action once watch can observe its terminal outcome."""
+    if _create_review_action_task_unmaterialized(
+        store=store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task,
+    ):
+        clear_watch_progress_subject(store, subject_task=subject_task)
+        return None
+    resolved_action_task = _resolve_watch_progress_action_task(
+        store=store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task,
+    )
     candidate = build_watch_progress_candidate(
         store,
         subject_task=subject_task,
         action=action,
-        action_task=action_task,
+        action_task=resolved_action_task,
         failed_task=failed_task,
     )
     observation = store.get_watch_progress_observation(
@@ -2372,18 +2460,38 @@ def _finalize_watch_no_progress_after_execution(
     """Record one executed watch action after it finishes."""
     if subject_task.id is None:
         return None
+    if _create_review_action_task_unmaterialized(
+        store=store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task_after,
+    ):
+        clear_watch_progress_subject(store, subject_task=subject_task)
+        return None
+    resolved_action_task_before = _resolve_watch_progress_action_task(
+        store=store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task_before,
+    )
+    resolved_action_task_after = _resolve_watch_progress_action_task(
+        store=store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task_after,
+    )
     previous_candidate = build_watch_progress_candidate(
         store,
         subject_task=subject_task,
         action=action,
-        action_task=action_task_before,
+        action_task=resolved_action_task_before,
         failed_task=failed_task,
     )
     refreshed_candidate = build_watch_progress_candidate(
         store,
         subject_task=subject_task,
         action=action,
-        action_task=action_task_after,
+        action_task=resolved_action_task_after,
         failed_task=failed_task,
     )
     if _maybe_skip_watch_no_progress_for_transient_terminal(
@@ -2391,7 +2499,7 @@ def _finalize_watch_no_progress_after_execution(
         store=store,
         subject_task=subject_task,
         action=action,
-        action_task=action_task_after,
+        action_task=resolved_action_task_after,
         failed_task=failed_task,
         candidate=refreshed_candidate,
     ):
@@ -2419,11 +2527,25 @@ def _observe_selected_watch_no_progress_without_dispatch(
         return None
     if subject_task.id is None:
         return None
+    if _create_review_action_task_unmaterialized(
+        store=store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task,
+    ):
+        clear_watch_progress_subject(store, subject_task=subject_task)
+        return None
+    resolved_action_task = _resolve_watch_progress_action_task(
+        store=store,
+        subject_task=subject_task,
+        action=action,
+        action_task=action_task,
+    )
     candidate = build_watch_progress_candidate(
         store,
         subject_task=subject_task,
         action=action,
-        action_task=action_task,
+        action_task=resolved_action_task,
         failed_task=failed_task,
     )
     return observe_selected_watch_action_without_dispatch(

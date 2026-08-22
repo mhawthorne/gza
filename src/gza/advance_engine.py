@@ -2198,6 +2198,8 @@ def _stale_review_create_review_action(ctx: AdvanceContext) -> dict[str, Any]:
                 "resolution_target_sha": resolved_target_sha,
             }
         )
+    elif ctx.review_invalidation_reason == "branch_head_advanced" and ctx.current_review_head_sha:
+        action["review_head_sha"] = ctx.current_review_head_sha
     return action
 
 
@@ -4127,6 +4129,7 @@ def resolve_closing_review_action(
     reviews: list[DbTask],
     latest_completed_review: DbTask | None,
     latest_completed_code_change: DbTask | None,
+    current_review_head_sha: str | None = None,
     max_failed_closing_review_retries: int = 3,
 ) -> dict[str, Any] | None:
     """Return the invariant-enforcing closing review action for a lineage, if any.
@@ -4202,20 +4205,26 @@ def resolve_closing_review_action(
                         reason="closing-review-failed-max-retries",
                         subject_task_id=task.id,
                     )
-                return {
+                action = {
                     "type": "create_review",
                     "description": "Create closing review (previous attempt failed)",
                 }
+                if current_review_head_sha:
+                    action["review_head_sha"] = current_review_head_sha
+                return action
         return None
 
     if latest_completed_code_change.id == task.id:
         description = "Create closing review (latest implementation has no review yet)"
     else:
         description = "Create closing review (code changed since the last review)"
-    return {
+    action = {
         "type": "create_review",
         "description": description,
     }
+    if current_review_head_sha:
+        action["review_head_sha"] = current_review_head_sha
+    return action
 
 
 def _select_active_review(reviews: list[DbTask]) -> DbTask | None:
@@ -4502,6 +4511,7 @@ def _resolve_review_state(
         reviews=reviews,
         latest_completed_review=latest_completed_review,
         latest_completed_code_change=latest_completed_code_change,
+        current_review_head_sha=None,
         max_failed_closing_review_retries=max_failed_closing_review_retries,
     )
 
@@ -5665,6 +5675,16 @@ def _resolve_pre_closing_review_git_context(
         latest_completed_code_change=ctx.latest_completed_code_change,
         review_cleared_at=ctx.effective_review_cleared_at,
     )
+    closing_review_action = resolve_closing_review_action(
+        task=review_root_task,
+        reviews=ctx.reviews or [],
+        latest_completed_review=ctx.latest_completed_review,
+        latest_completed_code_change=ctx.latest_completed_code_change,
+        current_review_head_sha=current_review_head_sha,
+        max_failed_closing_review_retries=int(
+            getattr(config, "max_failed_closing_review_retries", 3)
+        ),
+    )
 
     return replace(
         ctx,
@@ -5705,6 +5725,7 @@ def _resolve_pre_closing_review_git_context(
         completed_review_cycles=completed_review_cycles,
         review_cycle_boundary_task_id=review_cycle_boundary.boundary_task_id,
         review_cycle_boundary_reason=review_cycle_boundary.boundary_reason,
+        closing_review_action=closing_review_action,
     )
 
 

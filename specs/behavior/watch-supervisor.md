@@ -853,6 +853,18 @@ When the installed `gza` package fingerprint changes while watch is running:
   cycle. Merely evaluating a candidate before selection, remaining on a blocked merge lane,
   or switching to a different selected action/reason MUST NOT increment the streak.
   Restarting watch MUST NOT reset a streak created by those unchanged repeats.
+- There is one narrow compatibility exception for legacy unmaterialized `create_review`
+  evidence: if the selected action is `create_review` and the observed action task is the
+  same row as the subject implementation, watch MUST treat that subject-as-action-task pair
+  as invalid stale progress evidence. It MUST clear the subject's persisted watch-progress
+  and recovery-backoff state, emit the ordinary dispatch/routing diagnostic for the current
+  cycle, and retry on a later cycle instead of parking from that invalid evidence. This
+  exception applies only before a review row matching the selected create-review action
+  has been materialized. Resolution-review actions MUST match the expected
+  implementation, rebase task, resolved head SHA, and resolved target SHA; historical
+  reviews from an older action epoch MUST NOT count as materialization. Once the action
+  task is an actual matching review row, unchanged executed outcomes and unchanged
+  undispatched selections MUST follow the normal no-progress streak and parking policy.
 - After selecting a worker-consuming action, watch MUST wait only a small bounded
   `watch.slot_settle_seconds` window for the chosen task to prove execution. A live
   running state counts, and a live registered worker counts, including the legitimate

@@ -14,6 +14,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -90,6 +91,7 @@ from gza.cli.watch import (
     _maybe_park_watch_no_progress,
     _maybe_repair_target_already_merged_skip,
     _maybe_skip_watch_no_progress_for_transient_terminal,
+    _observe_selected_watch_no_progress_without_dispatch,
     _OwnerFailureBackoffState,
     _query_owner_rows_with_context,
     _record_failure_backoff_updates,
@@ -166,13 +168,20 @@ from gza.main_verify_format import (
     main_verify_state_is_remediation_exhausted,
 )
 from gza.plan_review_verdict import validate_plan_review_manifest
+from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.recovery_read_context import RecoveryReadContext
+from gza.review_scope import (
+    build_resolution_review_scope,
+    build_spec_coherence_review_scope,
+    parse_resolution_review_scope,
+)
 from gza.review_verdict import ParsedReviewReport
 from gza.review_verify_state import VERIFY_GATE_ARTIFACT_KIND, persist_verify_gate_artifact
 from gza.runner import _make_review_verify_result
 from gza.unstick import VERIFY_FIX_FAILED_REASON, select_and_clear_parked_tasks
 from gza.watch_progress import (
+    CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY,
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
     WatchProgressCandidate,
     build_watch_progress_candidate,
@@ -3179,7 +3188,7 @@ def test_watch_cycle_recovery_launch_terminal_before_confirmation_boundary_does_
 
 def test_watch_cycle_repeated_recovery_evaluation_does_not_park_pending_descendant(tmp_path: Path) -> None:
     setup_config(tmp_path)
-    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 1\n")
     store = make_store(tmp_path)
 
     failed = store.add("Failed implement", task_type="implement")
@@ -7461,7 +7470,7 @@ def test_watch_cycle_recovery_only_running_recovery_child_keeps_pending_queue_bl
 ) -> None:
     """A merely re-evaluated running recovery child no longer parks and therefore still blocks recovery-only pending pickup."""
     setup_config(tmp_path)
-    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 1\n")
     store = make_store(tmp_path)
 
     failed = store.add("Failed review", task_type="review")
@@ -24761,7 +24770,179 @@ def test_watch_cycle_create_review_routes_impl_chain_through_iterate(tmp_path: P
     )
 
 
-def test_watch_cycle_undispatched_create_review_counts_toward_no_progress_backstop(tmp_path: Path) -> None:
+def test_watch_cycle_create_review_resolution_child_materializes_and_runs_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+    from gza.cli.execution import cmd_iterate
+
+    setup_config(tmp_path)
+    _append_watch_config(
+        tmp_path,
+        "verify_command: ./bin/tests\n"
+        "autonomous_verify_timeout_seconds: 120\n"
+        "review_verify_timeout_grace_seconds: 5.0\n"
+        "watch:\n"
+        "  no_progress_cycles: 2\n",
+    )
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/watch-resolution-review"
+    impl.has_commits = True
+    impl.merge_status = "unmerged"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Approved review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 8, 18, 23, 58, tzinfo=UTC)
+    review.review_verify_head_sha = "pre-rebase-head"
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+
+    rebase = store.add("Rebase after review", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert rebase.id is not None
+    rebase.status = "completed"
+    rebase.completed_at = datetime(2026, 8, 21, 4, 31, tzinfo=UTC)
+    rebase.branch = impl.branch
+    rebase.has_commits = True
+    rebase.changed_diff = True
+    rebase.review_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip="pre-rebase-head",
+            target_at_start="pre-rebase-target",
+            merge_base_at_start="pre-rebase-base",
+        ),
+        resolved_head_sha="rebased-head",
+        resolved_target_sha="target-head",
+    )
+    store.update(rebase)
+
+    config = Config.load(tmp_path)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=_make_review_verify_result(
+            "./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime.now(UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="rebased-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED",
+            findings=(),
+            format_version="legacy",
+        ),
+    )
+
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    git.can_merge.return_value = True
+    git.is_merged.return_value = False
+    git.resolve_merge_source_ref.return_value = None
+    git.resolve_fresh_merge_source.return_value = (impl.branch, None)
+    git.rev_parse_if_exists.side_effect = lambda ref: {
+        impl.branch: "rebased-head",
+        "main": "target-head",
+    }.get(ref)
+    executed_reviews: list[str] = []
+
+    def fake_run_foreground(_config, task_id, **_kwargs):
+        task = store.get(task_id)
+        assert task is not None
+        assert task.task_type == "review"
+        executed_reviews.append(task.id)
+        task.status = "completed"
+        task.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+        return 0
+
+    def run_detached_child(iterate_args, child_config, task, **_kwargs):
+        assert task.id == impl.id
+        child_args = argparse.Namespace(
+            impl_task_id=task.id,
+            max_iterations=iterate_args.max_iterations,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+            auto_iterate=True,
+        )
+        with (
+            patch("gza.cli.Config.load", return_value=child_config),
+            patch("gza.cli.execution.Config.load", return_value=child_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=git),
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+        ):
+            return cmd_iterate(child_args)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "create_review"}),
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            side_effect=AssertionError("watch should route implementation review creation through iterate"),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=run_detached_child),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+    assert result.work_done is True
+    reviews = [task for task in store.get_reviews_for_task(impl.id) if task.id != review.id]
+    assert len(reviews) == 1
+    resolution_review = reviews[0]
+    assert executed_reviews == [resolution_review.id]
+    scope = parse_resolution_review_scope(resolution_review.review_scope)
+    assert scope is not None
+    assert scope.implementation_task_id == impl.id
+    assert scope.rebase_task_id == rebase.id
+    assert scope.resolved_head_sha == "rebased-head"
+    assert scope.resolved_target_sha == "target-head"
+
+
+def test_watch_cycle_undispatched_unmaterialized_create_review_does_not_no_progress_park(
+    tmp_path: Path,
+) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
     store = make_store(tmp_path)
@@ -24834,17 +25015,408 @@ def test_watch_cycle_undispatched_create_review_counts_toward_no_progress_backst
         subject_kind=candidate.subject_kind,
         subject_id=candidate.subject_id,
     )
-    assert len(observations) == 1
-    assert observations[0].streak == 2
-    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert observations == []
     text = log_path.read_text()
-    assert "ATTENTION" in text
-    assert "Needs attention (1 task):" in text
+    assert "ATTENTION" not in text
+    assert "Needs attention (1 task):" not in text
     assert f"{impl.id} create_review: dispatch did not reach live slot occupancy" in text
-    assert "watch selected the same create review action without durable progress for 2 cycles" in text
+    assert "watch selected the same create review action without durable progress" not in text
 
 
-def test_watch_cycle_selected_create_review_skip_reasons_do_not_reset_no_progress_streak(tmp_path: Path) -> None:
+def test_watch_cycle_materialized_create_review_iterate_records_review_task_and_parks(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Completed implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/create-review-materialized"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    git = MagicMock()
+    git.current_branch.return_value = "main"
+    git.default_branch.return_value = "main"
+    git.branch_exists.return_value = True
+    settle_statuses = [watch_module._DispatchSettleStatus.LIVE]
+    selected_action = {"type": "create_review", CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY: ()}
+
+    def run_iterate_and_materialize_review(
+        _args: argparse.Namespace,
+        _config: Config,
+        task: object,
+        **_kwargs: object,
+    ) -> int:
+        task_id = getattr(task, "id", None)
+        assert task_id == impl.id
+        if not store.get_reviews_for_task(impl.id):
+            review = store.add("Auto review", task_type="review", depends_on=impl.id, based_on=impl.id)
+            assert review.id is not None
+            review.status = "completed"
+            review.completed_at = datetime.now(UTC)
+            review.output_content = "## Verdict\n\nVerdict: NEEDS_DISCUSSION\n"
+            store.update(review)
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        refreshed_impl.status = "completed"
+        refreshed_impl.completed_at = datetime.now(UTC)
+        refreshed_impl.running_pid = None
+        store.update(refreshed_impl)
+        return 0
+
+    def settle_lifecycle_starts(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
+        assert [getattr(entry, "task_id", None) for entry in pending_starts] == [impl.id]
+        status = settle_statuses.pop(0)
+        return [
+            watch_module._WatchDispatchSettleResult(
+                entry=pending_starts[0],
+                status=status,
+                reason=f"task {impl.id} settled as {status.value}",
+                task=store.get(impl.id),
+            )
+        ]
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.determine_next_action", return_value=selected_action),
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            side_effect=AssertionError("plain review creation should not run"),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=run_iterate_and_materialize_review) as spawn_iterate,
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_lifecycle_starts),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+    reviews = store.get_reviews_for_task(impl.id)
+    assert len(reviews) == 1
+    attention = _observe_selected_watch_no_progress_without_dispatch(
+        store=store,
+        subject_task=store.get(impl.id) or impl,
+        action=selected_action,
+        action_task=store.get(impl.id) or impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    assert spawn_iterate.call_count == 1
+    assert settle_statuses == []
+    observed_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=store.get(impl.id) or impl,
+        action=selected_action,
+        action_task=reviews[0],
+        failed_task=None,
+    )
+    observations = store.list_watch_progress_observations(
+        subject_kind=observed_candidate.subject_kind,
+        subject_id=observed_candidate.subject_id,
+    )
+    assert attention is not None
+    assert attention["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert len(observations) == 1
+    assert observations[0].action_type == "create_review"
+    assert observations[0].action_task_id == reviews[0].id
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert observations[0].streak == 2
+    text = log_path.read_text()
+    assert any("START" in line and f"{impl.id} iterate" in line for line in text.splitlines())
+
+
+@pytest.mark.parametrize(
+    "review_epoch",
+    ["ordinary", "resolution", "spec_coherence"],
+)
+def test_watch_cycle_fresh_create_review_action_keeps_materialized_review_identity_and_parks(
+    tmp_path: Path,
+    review_epoch: str,
+) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 1\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Completed implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = f"feature/create-review-materialized-{review_epoch}"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    def fresh_action() -> dict[str, Any]:
+        if review_epoch == "resolution":
+            return {
+                "type": "create_review",
+                "description": "Create resolution review",
+                "review_mode": "resolution",
+                "resolution_rebase_task_id": "gza-100",
+                "resolution_head_sha": "selected-head",
+                "resolution_target_sha": "selected-target",
+            }
+        if review_epoch == "spec_coherence":
+            return {
+                "type": "create_review",
+                "description": "Create behavior-spec coherence review",
+                "review_mode": "spec_coherence",
+                "review_head_sha": "selected-head",
+                "review_changed_paths": ("specs/behavior/lifecycle-engine.md",),
+            }
+        return {
+            "type": "create_review",
+            "description": "Create review",
+            "review_head_sha": "selected-head",
+        }
+
+    materialized_review_id: str | None = None
+
+    def run_iterate_and_materialize_review(
+        _args: argparse.Namespace,
+        _config: Config,
+        task: object,
+        **_kwargs: object,
+    ) -> int:
+        nonlocal materialized_review_id
+        assert getattr(task, "id", None) == impl.id
+        if materialized_review_id is None:
+            review = store.add("Materialized review", task_type="review", depends_on=impl.id, based_on=impl.id)
+            assert review.id is not None
+            review.status = "completed"
+            review.completed_at = datetime.now(UTC)
+            review.output_content = "## Verdict\n\nVerdict: NEEDS_DISCUSSION\n"
+            if review_epoch == "resolution":
+                review.review_scope = build_resolution_review_scope(
+                    implementation_task_id=impl.id,
+                    rebase_task_id="gza-100",
+                    resolved_head_sha="selected-head",
+                    resolved_target_sha="selected-target",
+                )
+            elif review_epoch == "spec_coherence":
+                review.review_scope = build_spec_coherence_review_scope(
+                    implementation_task_id=impl.id,
+                    reviewed_head_sha="selected-head",
+                    changed_paths=("specs/behavior/lifecycle-engine.md",),
+                )
+            else:
+                review.review_verify_head_sha = "selected-head"
+            store.update(review)
+            materialized_review_id = review.id
+        refreshed_impl = store.get(impl.id)
+        assert refreshed_impl is not None
+        refreshed_impl.status = "completed"
+        refreshed_impl.completed_at = datetime.now(UTC)
+        refreshed_impl.running_pid = None
+        store.update(refreshed_impl)
+        return 0
+
+    def settle_lifecycle_starts(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
+        assert [getattr(entry, "task_id", None) for entry in pending_starts] == [impl.id]
+        return [
+            watch_module._WatchDispatchSettleResult(
+                entry=pending_starts[0],
+                status=watch_module._DispatchSettleStatus.LIVE,
+                reason=f"task {impl.id} settled live",
+                task=store.get(impl.id),
+            )
+        ]
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    git = _make_watch_git()
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.determine_next_action", side_effect=lambda *_args, **_kwargs: fresh_action()),
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            side_effect=AssertionError("plain review creation should not run"),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=run_iterate_and_materialize_review) as spawn_iterate,
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_lifecycle_starts),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+    assert spawn_iterate.call_count == 1
+    assert materialized_review_id is not None
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=store.get(impl.id) or impl,
+        action=fresh_action(),
+        action_task=store.get(materialized_review_id),
+        failed_task=None,
+    )
+    observations = store.list_watch_progress_observations(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+    )
+    assert len(observations) == 1
+    assert observations[0].action_task_id == materialized_review_id
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert observations[0].streak == 1
+
+
+def test_watch_cycle_fresh_create_review_action_survives_restart_after_materialization(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 1\n")
+    store = make_store(tmp_path)
+
+    impl = store.add("Completed implementation", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/create-review-materialized-restart"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    def fresh_action() -> dict[str, Any]:
+        return {
+            "type": "create_review",
+            "description": "Create review",
+            "review_head_sha": "restart-head",
+        }
+
+    materialized_review_id: str | None = None
+
+    def run_iterate_and_materialize_review(
+        _args: argparse.Namespace,
+        _config: Config,
+        task: object,
+        **_kwargs: object,
+    ) -> int:
+        nonlocal materialized_review_id
+        assert getattr(task, "id", None) == impl.id
+        review = store.add("Materialized review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime.now(UTC)
+        review.review_verify_head_sha = "restart-head"
+        review.output_content = "## Verdict\n\nVerdict: NEEDS_DISCUSSION\n"
+        store.update(review)
+        materialized_review_id = review.id
+        return 0
+
+    def settle_lifecycle_starts(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
+        return [
+            watch_module._WatchDispatchSettleResult(
+                entry=pending_starts[0],
+                status=watch_module._DispatchSettleStatus.LIVE,
+                reason=f"task {impl.id} settled live",
+                task=store.get(impl.id),
+            )
+        ]
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    git = _make_watch_git()
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.determine_next_action", side_effect=lambda *_args, **_kwargs: fresh_action()),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=run_iterate_and_materialize_review) as spawn_iterate,
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_lifecycle_starts),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+        restarted_store = make_store(tmp_path)
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=restarted_store,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+        restarted_store_again = make_store(tmp_path)
+        _run_cycle(
+            config=Config.load(tmp_path),
+            store=restarted_store_again,
+            batch=1,
+            max_iterations=1,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+        )
+
+    assert spawn_iterate.call_count == 1
+    assert materialized_review_id is not None
+    restarted_store = make_store(tmp_path)
+    candidate = build_watch_progress_candidate(
+        restarted_store,
+        subject_task=restarted_store.get(impl.id) or impl,
+        action=fresh_action(),
+        action_task=restarted_store.get(materialized_review_id),
+        failed_task=None,
+    )
+    observations = restarted_store.list_watch_progress_observations(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+    )
+    assert len(observations) == 1
+    assert observations[0].action_task_id == materialized_review_id
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+
+
+def test_watch_cycle_selected_unmaterialized_create_review_skip_does_not_no_progress_park(
+    tmp_path: Path,
+) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  no_progress_cycles: 2\n")
     store = make_store(tmp_path)
@@ -24924,13 +25496,11 @@ def test_watch_cycle_selected_create_review_skip_reasons_do_not_reset_no_progres
         subject_kind=candidate.subject_kind,
         subject_id=candidate.subject_id,
     )
-    assert len(observations) == 1
-    assert observations[0].streak == 2
-    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert observations == []
     text = log_path.read_text()
     assert f"{impl.id}: no watch worker slots available for create_review" in text
-    assert "iterate routing requires implementation status completed or pending (found failed)" not in text
-    assert "watch selected the same create review action without durable progress for 2 cycles" in text
+    assert "iterate routing requires implementation status completed or pending (found failed)" in text
+    assert "watch selected the same create review action without durable progress" not in text
 
 
 def test_watch_cycle_verify_gate_followup_progress_does_not_trigger_no_progress_backstop(tmp_path: Path) -> None:
@@ -26495,6 +27065,1224 @@ def test_background_no_progress_finalizer_completed_noop_improve_still_parks(
     assert len(observations) == 1
     assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
     assert observations[0].streak == 2
+
+
+def test_background_no_progress_finalizer_materialized_create_review_still_parks(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/materialized-review-no-progress"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "## Verdict\n\nVerdict: NEEDS_DISCUSSION\n"
+    store.update(review)
+
+    refreshed_impl = store.get(impl.id)
+    refreshed_review = store.get(review.id)
+    assert refreshed_impl is not None
+    assert refreshed_review is not None
+    action = {
+        "type": "create_review",
+        "description": "Create review (required before merge)",
+        CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY: (),
+    }
+
+    first_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=refreshed_impl,
+        action=action,
+        action_task_before=refreshed_review,
+        action_task_after=refreshed_review,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    second_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=refreshed_impl,
+        action=action,
+        action_task_before=refreshed_review,
+        action_task_after=refreshed_review,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=refreshed_impl,
+        action=action,
+        action_task=refreshed_review,
+        failed_task=None,
+    )
+    observations = store.list_watch_progress_observations(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+    )
+    assert first_attention is None
+    assert second_attention is not None
+    assert second_attention["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert len(observations) == 1
+    assert observations[0].action_task_id == review.id
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert observations[0].streak == 2
+
+
+def test_create_review_stale_park_preserves_persisted_materialized_review_task(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/create-review-stale-park"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Review feature", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    store.update(review)
+
+    action = {
+        "type": "create_review",
+        "description": "Create review (required before merge)",
+        CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY: (),
+    }
+    materialized_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=review,
+        failed_task=None,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=materialized_candidate.subject_kind,
+            subject_id=materialized_candidate.subject_id,
+            action_type=materialized_candidate.action_type,
+            action_reason=materialized_candidate.action_reason,
+            subject_task_id=materialized_candidate.subject_task_id,
+            action_task_id=materialized_candidate.action_task_id,
+            action_task_status=materialized_candidate.action_task_status,
+            action_task_started_at=materialized_candidate.action_task_started_at,
+            action_task_running_pid=materialized_candidate.action_task_running_pid,
+            failed_task_id=materialized_candidate.failed_task_id,
+            recovery_task_id=materialized_candidate.recovery_task_id,
+            merge_unit_id=materialized_candidate.merge_unit_id,
+            merge_unit_state=materialized_candidate.merge_unit_state,
+            merge_unit_head_sha=materialized_candidate.merge_unit_head_sha,
+            evidence_fingerprint=materialized_candidate.evidence_fingerprint,
+            streak=2,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+    active_attention = _maybe_park_watch_no_progress(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    cleared_count = reconcile_stale_watch_no_progress_parks(store)
+    observations = store.list_watch_progress_observations(
+        subject_kind=materialized_candidate.subject_kind,
+        subject_id=materialized_candidate.subject_id,
+    )
+
+    assert active_attention is not None
+    assert active_attention["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert cleared_count == 0
+    assert len(observations) == 1
+    assert observations[0].action_task_id == review.id
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+
+
+def _make_changed_rebase_resolution_review_fixture(
+    tmp_path: Path,
+) -> tuple[SqliteTaskStore, DbTask, DbTask, DbTask, dict[str, Any]]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/post-rebase-resolution-review"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    old_review = store.add("Approved pre-rebase review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert old_review.id is not None
+    old_review.status = "completed"
+    old_review.completed_at = datetime(2026, 8, 18, 23, 58, tzinfo=UTC)
+    old_review.review_verify_head_sha = "pre-rebase-head"
+    old_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(old_review)
+
+    rebase = store.add("Rebase after review", task_type="rebase", based_on=impl.id, same_branch=True)
+    assert rebase.id is not None
+    rebase.status = "completed"
+    rebase.completed_at = datetime(2026, 8, 21, 4, 31, tzinfo=UTC)
+    rebase.branch = impl.branch
+    rebase.has_commits = True
+    rebase.changed_diff = True
+    rebase.review_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip="pre-rebase-head",
+            target_at_start="pre-rebase-target",
+            merge_base_at_start="pre-rebase-base",
+        ),
+        resolved_head_sha="rebased-head",
+        resolved_target_sha="target-head",
+    )
+    store.update(rebase)
+
+    action: dict[str, Any] = {
+        "type": "create_review",
+        "description": f"Create resolution review (rebase {rebase.id} changed diff)",
+        "review_mode": "resolution",
+        "resolution_rebase_task_id": rebase.id,
+        "resolution_head_sha": "rebased-head",
+        "resolution_target_sha": "target-head",
+    }
+    return store, impl, old_review, rebase, action
+
+
+def _add_resolution_review_for_action(
+    store: SqliteTaskStore,
+    *,
+    impl: DbTask,
+    rebase: DbTask,
+    status: str,
+) -> DbTask:
+    assert impl.id is not None
+    assert rebase.id is not None
+    review = store.add("Post-rebase resolution review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    review.status = status
+    review.review_scope = build_resolution_review_scope(
+        implementation_task_id=impl.id,
+        rebase_task_id=rebase.id,
+        resolved_head_sha="rebased-head",
+        resolved_target_sha="target-head",
+        pre_rebase_head_sha="pre-rebase-head",
+        pre_rebase_target_sha="pre-rebase-target",
+        pre_rebase_merge_base_sha="pre-rebase-base",
+    )
+    if status == "in_progress":
+        review.started_at = datetime.now(UTC)
+        review.running_pid = 12345
+    elif status == "completed":
+        review.completed_at = datetime.now(UTC)
+        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+    return review
+
+
+def test_legacy_create_review_subject_action_clears_despite_historical_pre_rebase_review(
+    tmp_path: Path,
+) -> None:
+    store, impl, old_review, _rebase, action = _make_changed_rebase_resolution_review_fixture(tmp_path)
+    assert impl.id is not None
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            action_task_started_at=candidate.action_task_started_at,
+            action_task_running_pid=candidate.action_task_running_pid,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            streak=2,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+    store.upsert_watch_recovery_backoff(
+        WatchRecoveryBackoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            last_failure_task_id=impl.id,
+            last_failure_reason="PROVIDER_UNAVAILABLE",
+            last_failure_fingerprint="fp-pre-rebase-review",
+            streak=1,
+            next_retry_at=datetime.now(UTC) + timedelta(seconds=60),
+            updated_at=datetime.now(UTC),
+        )
+    )
+
+    cleared_count = reconcile_stale_watch_no_progress_parks(store)
+    assert cleared_count == 1
+    assert (
+        store.list_watch_progress_observations(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+        )
+        == []
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            action_task_started_at=candidate.action_task_started_at,
+            action_task_running_pid=candidate.action_task_running_pid,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            streak=2,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+    active_attention = get_active_watch_no_progress_attention(store, candidate=candidate)
+    attention = _observe_selected_watch_no_progress_without_dispatch(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+
+    assert active_attention is None
+    assert attention is None
+    assert [review.id for review in store.get_reviews_for_task(impl.id)] == [old_review.id]
+    assert (
+        store.list_watch_progress_observations(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+        )
+        == []
+    )
+    assert (
+        store.get_watch_recovery_backoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+        )
+        is None
+    )
+
+
+def test_failed_resolution_review_materialization_does_not_park_on_old_review(
+    tmp_path: Path,
+) -> None:
+    store, impl, old_review, _rebase, action = _make_changed_rebase_resolution_review_fixture(tmp_path)
+    assert impl.id is not None
+
+    first_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task_before=impl,
+        action_task_after=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    second_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task_before=impl,
+        action_task_after=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+
+    assert first_attention is None
+    assert second_attention is None
+    assert [review.id for review in store.get_reviews_for_task(impl.id)] == [old_review.id]
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+    )
+    assert (
+        store.list_watch_progress_observations(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+        )
+        == []
+    )
+
+
+@pytest.mark.parametrize("status", ["pending", "in_progress"])
+def test_resolution_review_materialization_records_new_incomplete_review_not_old_completed_review(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    store, impl, old_review, rebase, action = _make_changed_rebase_resolution_review_fixture(tmp_path)
+    assert impl.id is not None
+    new_review = _add_resolution_review_for_action(store, impl=impl, rebase=rebase, status=status)
+
+    attention = _observe_selected_watch_no_progress_without_dispatch(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=new_review,
+        failed_task=None,
+    )
+    observations = store.list_watch_progress_observations(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+    )
+
+    assert attention is None
+    assert old_review.id != new_review.id
+    assert len(observations) == 1
+    assert observations[0].action_task_id == new_review.id
+    assert observations[0].action_task_id != old_review.id
+
+
+def test_materialized_resolution_review_repeated_no_progress_still_parks_at_threshold(
+    tmp_path: Path,
+) -> None:
+    store, impl, old_review, rebase, action = _make_changed_rebase_resolution_review_fixture(tmp_path)
+    assert impl.id is not None
+    action[CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY] = ()
+    new_review = _add_resolution_review_for_action(store, impl=impl, rebase=rebase, status="completed")
+
+    first_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task_before=impl,
+        action_task_after=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    second_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task_before=impl,
+        action_task_after=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=new_review,
+        failed_task=None,
+    )
+    observations = store.list_watch_progress_observations(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+    )
+
+    assert first_attention is None
+    assert second_attention is not None
+    assert second_attention["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert old_review.id != new_review.id
+    assert len(observations) == 1
+    assert observations[0].action_task_id == new_review.id
+    assert observations[0].action_task_id != old_review.id
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert observations[0].streak == 2
+
+
+def test_branch_head_advanced_review_refresh_ignores_old_approved_review_without_parking(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/branch-head-refresh"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    old_review = store.add("Approved old-head review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert old_review.id is not None
+    old_review.status = "completed"
+    old_review.completed_at = datetime(2026, 8, 18, tzinfo=UTC)
+    old_review.review_verify_head_sha = "old-head"
+    old_review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(old_review)
+
+    action = {
+        "type": "create_review",
+        "description": "Create review (branch head advanced)",
+        "review_head_sha": "new-head",
+    }
+
+    first_attention = _observe_selected_watch_no_progress_without_dispatch(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    second_attention = _observe_selected_watch_no_progress_without_dispatch(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+    )
+
+    assert first_attention is None
+    assert second_attention is None
+    assert (
+        store.list_watch_progress_observations(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+        )
+        == []
+    )
+
+
+def test_closing_review_retry_ignores_prior_failed_review_without_parking(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/closing-review-retry"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    failed_review = store.add("Failed closing review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert failed_review.id is not None
+    failed_review.status = "failed"
+    failed_review.completed_at = datetime(2026, 8, 18, tzinfo=UTC)
+    failed_review.review_verify_head_sha = "retry-head"
+    store.update(failed_review)
+
+    action = {
+        "type": "create_review",
+        "description": "Create closing review (previous attempt failed)",
+        "review_head_sha": "retry-head",
+    }
+
+    first_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task_before=impl,
+        action_task_after=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    second_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task_before=impl,
+        action_task_after=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+    )
+
+    assert first_attention is None
+    assert second_attention is None
+    assert (
+        store.list_watch_progress_observations(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+        )
+        == []
+    )
+
+
+def test_resolution_review_retry_ignores_prior_same_scope_failed_review_without_parking(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement conflict resolution", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/resolution-review-retry"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    failed_review = store.add("Failed resolution review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert failed_review.id is not None
+    failed_review.status = "failed"
+    failed_review.completed_at = datetime(2026, 8, 18, tzinfo=UTC)
+    failed_review.review_scope = build_resolution_review_scope(
+        implementation_task_id=impl.id,
+        rebase_task_id="gza-100",
+        resolved_head_sha="resolved-head",
+        resolved_target_sha="target-head",
+    )
+    store.update(failed_review)
+
+    action = {
+        "type": "create_review",
+        "description": "Create resolution review after rebase changed the diff",
+        "review_mode": "resolution",
+        "resolution_rebase_task_id": "gza-100",
+        "resolution_head_sha": "resolved-head",
+        "resolution_target_sha": "target-head",
+    }
+
+    assert _observe_selected_watch_no_progress_without_dispatch(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    ) is None
+    assert _observe_selected_watch_no_progress_without_dispatch(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    ) is None
+    candidate = build_watch_progress_candidate(store, subject_task=impl, action=action, action_task=impl)
+    assert store.list_watch_progress_observations(subject_kind=candidate.subject_kind, subject_id=candidate.subject_id) == []
+
+
+def test_spec_coherence_retry_ignores_prior_same_scope_failed_review_without_parking(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement behavior spec update", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/spec-coherence-retry"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    failed_review = store.add("Failed spec coherence review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert failed_review.id is not None
+    failed_review.status = "failed"
+    failed_review.completed_at = datetime(2026, 8, 18, tzinfo=UTC)
+    failed_review.review_scope = build_spec_coherence_review_scope(
+        implementation_task_id=impl.id,
+        reviewed_head_sha="spec-head",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+    )
+    store.update(failed_review)
+
+    action = {
+        "type": "create_review",
+        "description": "Create behavior-spec coherence review",
+        "review_mode": "spec_coherence",
+        "review_head_sha": "spec-head",
+        "review_changed_paths": ("specs/behavior/lifecycle-engine.md",),
+    }
+
+    assert _observe_selected_watch_no_progress_without_dispatch(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    ) is None
+    assert _observe_selected_watch_no_progress_without_dispatch(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    ) is None
+    candidate = build_watch_progress_candidate(store, subject_task=impl, action=action, action_task=impl)
+    assert store.list_watch_progress_observations(subject_kind=candidate.subject_kind, subject_id=candidate.subject_id) == []
+
+
+@pytest.mark.parametrize(
+    ("action", "review_scope_kind"),
+    [
+        (
+            {"type": "create_review", "description": "Create review", "review_head_sha": "retry-head"},
+            "ordinary",
+        ),
+        (
+            {
+                "type": "create_review",
+                "description": "Create review",
+                "review_mode": "resolution",
+                "resolution_rebase_task_id": "gza-100",
+                "resolution_head_sha": "retry-head",
+                "resolution_target_sha": "target-head",
+            },
+            "resolution",
+        ),
+        (
+            {
+                "type": "create_review",
+                "description": "Create review",
+                "review_mode": "spec_coherence",
+                "review_head_sha": "retry-head",
+                "review_changed_paths": ("specs/behavior/lifecycle-engine.md",),
+            },
+            "spec_coherence",
+        ),
+    ],
+)
+def test_watch_cycle_create_review_retry_ignores_preexisting_terminal_same_epoch_review(
+    tmp_path: Path,
+    action: dict[str, Any],
+    review_scope_kind: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = f"feature/create-review-retry-{review_scope_kind}"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    failed_review = store.add("Failed same-epoch review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert failed_review.id is not None
+    failed_review.status = "failed"
+    failed_review.completed_at = datetime(2026, 8, 18, tzinfo=UTC)
+    if review_scope_kind == "resolution":
+        failed_review.review_scope = build_resolution_review_scope(
+            implementation_task_id=impl.id,
+            rebase_task_id="gza-100",
+            resolved_head_sha="retry-head",
+            resolved_target_sha="target-head",
+        )
+    elif review_scope_kind == "spec_coherence":
+        failed_review.review_scope = build_spec_coherence_review_scope(
+            implementation_task_id=impl.id,
+            reviewed_head_sha="retry-head",
+            changed_paths=("specs/behavior/lifecycle-engine.md",),
+        )
+    else:
+        failed_review.review_verify_head_sha = "retry-head"
+    store.update(failed_review)
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = _make_watch_git()
+    execute_result = AdvanceActionExecutionResult(
+        action_type="create_review",
+        status="skip",
+        message="SKIP: selected review did not materialize",
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.determine_next_action", side_effect=lambda *_args, **_kwargs: dict(action)),
+        patch("gza.cli.watch.execute_advance_action", return_value=execute_result),
+    ):
+        for _ in range(config.watch.no_progress_cycles + 1):
+            _run_cycle(
+                config=config,
+                store=store,
+                batch=1,
+                max_iterations=1,
+                dry_run=False,
+                log=log,
+            )
+
+    candidate = build_watch_progress_candidate(store, subject_task=impl, action=action, action_task=impl)
+    assert store.list_watch_progress_observations(subject_kind=candidate.subject_kind, subject_id=candidate.subject_id) == []
+    assert WATCH_NO_PROGRESS_BACKSTOP_REASON not in (tmp_path / ".gza" / "watch.log").read_text()
+
+
+def test_spec_coherence_refresh_ignores_ordinary_and_wrong_epoch_reviews(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement behavior spec update", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/spec-coherence-refresh"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    ordinary_review = store.add("Ordinary review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert ordinary_review.id is not None
+    ordinary_review.status = "completed"
+    ordinary_review.completed_at = datetime(2026, 8, 18, tzinfo=UTC)
+    store.update(ordinary_review)
+
+    old_spec_review = store.add("Old spec coherence review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert old_spec_review.id is not None
+    old_spec_review.status = "completed"
+    old_spec_review.completed_at = datetime(2026, 8, 19, tzinfo=UTC)
+    old_spec_review.review_scope = build_spec_coherence_review_scope(
+        implementation_task_id=impl.id,
+        reviewed_head_sha="old-head",
+        changed_paths=("specs/behavior/old.md",),
+    )
+    store.update(old_spec_review)
+
+    action = {
+        "type": "create_review",
+        "description": "Create behavior-spec coherence review",
+        "review_mode": "spec_coherence",
+        "review_head_sha": "new-head",
+        "review_changed_paths": ("specs/behavior/lifecycle-engine.md",),
+        CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY: (),
+    }
+
+    attention = _observe_selected_watch_no_progress_without_dispatch(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+    )
+
+    assert attention is None
+    assert (
+        store.list_watch_progress_observations(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+        )
+        == []
+    )
+
+
+def test_matching_spec_coherence_review_repeated_no_progress_still_parks_at_threshold(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement behavior spec update", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/spec-coherence-match"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    review = store.add("Matching spec coherence review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.review_scope = build_spec_coherence_review_scope(
+        implementation_task_id=impl.id,
+        reviewed_head_sha="new-head",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+    )
+    store.update(review)
+
+    action = {
+        "type": "create_review",
+        "description": "Create behavior-spec coherence review",
+        "review_mode": "spec_coherence",
+        "review_head_sha": "new-head",
+        "review_changed_paths": ("specs/behavior/lifecycle-engine.md",),
+        CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY: (),
+    }
+
+    first_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task_before=impl,
+        action_task_after=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    second_attention = _maybe_finalize_watch_no_progress_for_background_action(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task_before=impl,
+        action_task_after=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=review,
+        failed_task=None,
+    )
+    observations = store.list_watch_progress_observations(
+        subject_kind=candidate.subject_kind,
+        subject_id=candidate.subject_id,
+    )
+
+    assert first_attention is None
+    assert second_attention is not None
+    assert second_attention["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
+    assert len(observations) == 1
+    assert observations[0].action_task_id == review.id
+    assert observations[0].parked_reason == WATCH_NO_PROGRESS_BACKSTOP_REASON
+
+
+def _store_parked_watch_observation(store: SqliteTaskStore, candidate: WatchProgressCandidate) -> None:
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            action_task_started_at=candidate.action_task_started_at,
+            action_task_running_pid=candidate.action_task_running_pid,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            launch_evidence_fingerprint=None,
+            streak=2,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("old_action", "new_action", "old_review_scope"),
+    [
+        (
+            {"type": "create_review", "description": "Create review", "review_head_sha": "old-head"},
+            {"type": "create_review", "description": "Create review", "review_head_sha": "new-head"},
+            "ordinary",
+        ),
+        (
+            {
+                "type": "create_review",
+                "description": "Create review",
+                "review_mode": "resolution",
+                "resolution_rebase_task_id": "gza-100",
+                "resolution_head_sha": "old-head",
+                "resolution_target_sha": "old-target",
+            },
+            {
+                "type": "create_review",
+                "description": "Create review",
+                "review_mode": "resolution",
+                "resolution_rebase_task_id": "gza-100",
+                "resolution_head_sha": "new-head",
+                "resolution_target_sha": "new-target",
+            },
+            "resolution",
+        ),
+        (
+            {
+                "type": "create_review",
+                "description": "Create review",
+                "review_mode": "spec_coherence",
+                "review_head_sha": "old-head",
+                "review_changed_paths": ("specs/behavior/watch-supervisor.md",),
+            },
+            {
+                "type": "create_review",
+                "description": "Create review",
+                "review_mode": "spec_coherence",
+                "review_head_sha": "new-head",
+                "review_changed_paths": ("specs/behavior/lifecycle-engine.md",),
+            },
+            "spec_coherence",
+        ),
+    ],
+)
+def test_create_review_no_progress_park_clears_when_selected_epoch_changes(
+    tmp_path: Path,
+    old_action: dict[str, Any],
+    new_action: dict[str, Any],
+    old_review_scope: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/create-review-epoch-park"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    old_review = store.add("Old selected review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert old_review.id is not None
+    old_review.status = "failed"
+    old_review.completed_at = datetime(2026, 8, 18, tzinfo=UTC)
+    if old_review_scope == "resolution":
+        old_review.review_scope = build_resolution_review_scope(
+            implementation_task_id=impl.id,
+            rebase_task_id="gza-100",
+            resolved_head_sha="old-head",
+            resolved_target_sha="old-target",
+        )
+    elif old_review_scope == "spec_coherence":
+        old_review.review_scope = build_spec_coherence_review_scope(
+            implementation_task_id=impl.id,
+            reviewed_head_sha="old-head",
+            changed_paths=("specs/behavior/watch-supervisor.md",),
+        )
+    else:
+        old_review.review_verify_head_sha = "old-head"
+    store.update(old_review)
+
+    old_action[CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY] = ()
+    old_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=old_action,
+        action_task=old_review,
+        failed_task=None,
+    )
+    _store_parked_watch_observation(store, old_candidate)
+
+    attention = _maybe_park_watch_no_progress(
+        store=store,
+        subject_task=impl,
+        action=new_action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+    new_candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=new_action,
+        action_task=impl,
+        failed_task=None,
+    )
+
+    assert attention is None
+    assert (
+        store.list_watch_progress_observations(
+            subject_kind=new_candidate.subject_kind,
+            subject_id=new_candidate.subject_id,
+        )
+        == []
+    )
+
+
+def test_create_review_matching_active_duplicate_still_parks_at_threshold(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/create-review-active-duplicate"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    active_review = store.add("Active review", task_type="review", depends_on=impl.id, based_on=impl.id)
+    assert active_review.id is not None
+    active_review.status = "pending"
+    active_review.review_verify_head_sha = "same-head"
+    store.update(active_review)
+
+    action = {"type": "create_review", "description": "Create review", "review_head_sha": "same-head"}
+
+    assert _observe_selected_watch_no_progress_without_dispatch(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    ) is None
+    attention = _observe_selected_watch_no_progress_without_dispatch(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+
+    assert attention is not None
+    assert attention["needs_attention_reason"] == WATCH_NO_PROGRESS_BACKSTOP_REASON
+
+
+def test_unmaterialized_create_review_subject_action_clears_progress_and_backoff(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/create-review-legacy-clear"
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    action = {"type": "create_review", "description": "Create review (required before merge)"}
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            action_task_started_at=candidate.action_task_started_at,
+            action_task_running_pid=candidate.action_task_running_pid,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            streak=1,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+    store.upsert_watch_recovery_backoff(
+        WatchRecoveryBackoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            last_failure_task_id=impl.id,
+            last_failure_reason="PROVIDER_UNAVAILABLE",
+            last_failure_fingerprint="fp-legacy-create-review",
+            streak=1,
+            next_retry_at=datetime.now(UTC) + timedelta(seconds=60),
+            updated_at=datetime.now(UTC),
+        )
+    )
+
+    attention = _observe_selected_watch_no_progress_without_dispatch(
+        store=store,
+        subject_task=impl,
+        action=action,
+        action_task=impl,
+        failed_task=None,
+        no_progress_cycles=2,
+    )
+
+    assert attention is None
+    assert store.get_reviews_for_task(impl.id) == []
+    assert (
+        store.list_watch_progress_observations(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+        )
+        == []
+    )
+    assert (
+        store.get_watch_recovery_backoff(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+        )
+        is None
+    )
 
 
 def test_watch_progress_candidate_treats_dispute_artifacts_as_progress(tmp_path: Path) -> None:

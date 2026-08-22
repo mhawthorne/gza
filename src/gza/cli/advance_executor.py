@@ -78,6 +78,7 @@ from ..verify_fix_outcome import (
     inspect_verify_fix_completion_outcome,
     persist_verify_fix_completion_outcome,
 )
+from ..watch_progress import review_matches_create_review_action
 from ._common import (
     PlanReviewMaterializationRepairBlocked,
     PlanReviewMaterializationRepairResult,
@@ -285,6 +286,19 @@ def _prepare_resolution_review_action(
             trigger_source=trigger_source,
         )
     except DuplicateReviewError as exc:
+        if task.id is None or not review_matches_create_review_action(
+            exc.active_review,
+            subject_task_id=task.id,
+            action=action,
+        ):
+            return _InlineCreateReviewActionResult(
+                status="skip",
+                review_task=None,
+                message=(
+                    f"SKIP: active review {exc.active_review.id} is {exc.active_review.status} "
+                    "but does not match the selected resolution review action"
+                ),
+            )
         return _InlineCreateReviewActionResult(
             status="skip",
             review_task=exc.active_review,
@@ -338,6 +352,19 @@ def _prepare_spec_coherence_review_action(
             trigger_source=trigger_source,
         )
     except DuplicateReviewError as exc:
+        if task.id is None or not review_matches_create_review_action(
+            exc.active_review,
+            subject_task_id=task.id,
+            action=action,
+        ):
+            return _InlineCreateReviewActionResult(
+                status="skip",
+                review_task=None,
+                message=(
+                    f"SKIP: active review {exc.active_review.id} is {exc.active_review.status} "
+                    "but does not match the selected behavior-spec coherence review action"
+                ),
+            )
         return _InlineCreateReviewActionResult(
             status="skip",
             review_task=exc.active_review,
@@ -2686,6 +2713,14 @@ def execute_advance_action(
                 status="error",
                 message="review creation returned no task",
             )
+        selected_head_sha = action.get("review_head_sha")
+        if (
+            action.get("review_mode") not in {"resolution", "spec_coherence"}
+            and isinstance(selected_head_sha, str)
+            and selected_head_sha.strip()
+        ):
+            review_task.review_verify_head_sha = selected_head_sha.strip()
+            context.store.update(review_task)
 
         prepared_review_task, prepare_error = _prepare_background_start(
             context=context,

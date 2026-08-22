@@ -101,6 +101,7 @@ from ..review_tasks import (
     VerifyFixContextError,
     build_review_blocker_dispute_metadata,
     create_or_reuse_verify_fix_task,
+    create_resolution_review_task,
     create_spec_coherence_review_task,
     resolve_latest_failed_verify_epoch,
 )
@@ -120,6 +121,7 @@ from ..runner import (
 from ..status_ops import apply_manual_task_status
 from ..task_query import TaskQuery, TaskQueryService, TaskRow, parse_csv
 from ..task_types import CLI_ADD_TASK_TYPES
+from ..watch_progress import review_matches_create_review_action
 from ..workers import WorkerRegistry
 from ._common import (
     _REUSE_WORKER_OWNER_ENV,
@@ -5339,6 +5341,72 @@ def _cmd_iterate_impl(
                 ),
             )
 
+    def _create_selected_iterate_review_task(
+        selected_action: dict[str, Any],
+        review_target: DbTask,
+        *,
+        config: Config | None,
+        trigger_source: str,
+    ) -> DbTask:
+        review_mode = selected_action.get("review_mode")
+        if review_mode == "resolution":
+            rebase_task_id = selected_action.get("resolution_rebase_task_id")
+            rebase_task = store.get(rebase_task_id) if isinstance(rebase_task_id, str) else None
+            if rebase_task is None:
+                raise ValueError(f"missing rebase task {rebase_task_id}")
+            return create_resolution_review_task(
+                store,
+                review_target,
+                config=config,
+                rebase_task=rebase_task,
+                resolved_head_sha=str(selected_action.get("resolution_head_sha") or "").strip(),
+                resolved_target_sha=str(selected_action.get("resolution_target_sha") or "").strip(),
+                trigger_source=trigger_source,
+            )
+        if review_mode == "spec_coherence":
+            raw_head_sha = selected_action.get("review_head_sha")
+            if not isinstance(raw_head_sha, str) or not raw_head_sha.strip():
+                raise ValueError("missing behavior-spec coherence reviewed head SHA")
+            raw_paths = selected_action.get("review_changed_paths")
+            if not isinstance(raw_paths, (tuple, list)):
+                raise ValueError("missing behavior-spec coherence changed paths")
+            changed_paths = tuple(str(path).strip() for path in raw_paths if str(path).strip())
+            if not changed_paths:
+                raise ValueError("missing behavior-spec coherence changed paths")
+            return create_spec_coherence_review_task(
+                store,
+                review_target,
+                config=config,
+                reviewed_head_sha=raw_head_sha.strip(),
+                changed_paths=changed_paths,
+                trigger_source=trigger_source,
+            )
+        review_task = _create_review_task(
+            store,
+            review_target,
+            config=config,
+            trigger_source=trigger_source,
+        )
+        selected_head_sha = selected_action.get("review_head_sha")
+        if isinstance(selected_head_sha, str) and selected_head_sha.strip():
+            review_task.review_verify_head_sha = selected_head_sha.strip()
+            store.update(review_task)
+        return review_task
+
+    def _duplicate_review_matches_selected_action(
+        active_review: DbTask,
+        *,
+        selected_action: dict[str, Any],
+        review_target: DbTask,
+    ) -> bool:
+        if review_target.id is None:
+            return False
+        return review_matches_create_review_action(
+            active_review,
+            subject_task_id=review_target.id,
+            action=selected_action,
+        )
+
     def _prepare_background_iterate_start(
         iterate_task: DbTask,
         preflight_context: _IterateBackgroundPreflightContext | None,
@@ -5413,9 +5481,29 @@ def _cmd_iterate_impl(
                 if permit is False:
                     return None, 1
                 try:
-                    action_task = _create_review_task(store, iterate_task, config=config, trigger_source="auto-recovery")
+                    action_task = _create_selected_iterate_review_task(
+                        initial_action,
+                        iterate_task,
+                        config=config,
+                        trigger_source="auto-recovery",
+                    )
                 except DuplicateReviewError as exc:
                     action_task = exc.active_review
+                    if not _duplicate_review_matches_selected_action(
+                        action_task,
+                        selected_action=initial_action,
+                        review_target=iterate_task,
+                    ):
+                        if isinstance(permit, LaunchPermit):
+                            permit.release()
+                        print_phase1_message(
+                            args,
+                            (
+                                f"  Waiting for review {action_task.id}: active review does not match "
+                                "selected create_review action."
+                            ),
+                        )
+                        return None, 1
                     if action_task.status != "pending":
                         if isinstance(permit, LaunchPermit):
                             permit.release()
@@ -6260,10 +6348,15 @@ def _cmd_iterate_impl(
         )
         if current_action.get("type") in {"merge", "merge_with_followups"}:
             return False
+        selected_action = (
+            current_action
+            if current_action.get("type") in {"create_review", "run_review", "wait_review"}
+            else closing_action
+        )
 
-        action_type = closing_action["type"]
+        action_type = selected_action["type"]
         if action_type == "wait_review":
-            review_task = closing_action.get("review_task")
+            review_task = selected_action.get("review_task")
             print("\nClosing review already in progress before termination.")
             final_status = "blocked"
             final_stop_reason = "review_in_progress"
@@ -6290,12 +6383,60 @@ def _cmd_iterate_impl(
 
         print("\nClosing review required before termination.")
         action_task: DbTask | None = None
+        mismatched_active_review = next(
+            (
+                review
+                for review in store.get_reviews_for_task(impl_task_key)
+                if review.status in {"pending", "in_progress"}
+                and not _duplicate_review_matches_selected_action(
+                    review,
+                    selected_action=selected_action,
+                    review_target=current_impl_task,
+                )
+            ),
+            None,
+        )
+        if mismatched_active_review is not None:
+            final_status = "blocked"
+            final_stop_reason = "review_in_progress"
+            _append_summary_row(
+                summary_rows,
+                iteration_index=iteration_index,
+                task_type="review",
+                task=mismatched_active_review,
+                status="in_progress",
+            )
+            return True
         if action_type == "create_review":
             try:
-                action_task = _create_review_task(store, current_impl_task, config=config, trigger_source="auto-recovery")
+                action_task = _create_selected_iterate_review_task(
+                    selected_action,
+                    current_impl_task,
+                    config=config,
+                    trigger_source="auto-recovery",
+                )
             except DuplicateReviewError as e:
                 action_task = e.active_review
                 assert action_task.id is not None
+                if not _duplicate_review_matches_selected_action(
+                    action_task,
+                    selected_action=selected_action,
+                    review_target=current_impl_task,
+                ):
+                    final_status = "blocked"
+                    final_stop_reason = (
+                        "review_in_progress"
+                        if action_task.status in {"pending", "in_progress"}
+                        else "review_failed"
+                    )
+                    _append_summary_row(
+                        summary_rows,
+                        iteration_index=iteration_index,
+                        task_type="review",
+                        task=action_task,
+                        status="in_progress" if action_task.status in {"pending", "in_progress"} else "failed",
+                    )
+                    return True
                 if action_task.status == "in_progress":
                     final_status = "blocked"
                     final_stop_reason = "review_in_progress"
@@ -6331,8 +6472,27 @@ def _cmd_iterate_impl(
                 )
                 return True
         else:
-            maybe_review_task = closing_action.get("review_task")
+            maybe_review_task = selected_action.get("review_task")
             if isinstance(maybe_review_task, DbTask):
+                if not _duplicate_review_matches_selected_action(
+                    maybe_review_task,
+                    selected_action=selected_action,
+                    review_target=current_impl_task,
+                ):
+                    final_status = "blocked"
+                    final_stop_reason = (
+                        "review_in_progress"
+                        if maybe_review_task.status in {"pending", "in_progress"}
+                        else "review_failed"
+                    )
+                    _append_summary_row(
+                        summary_rows,
+                        iteration_index=iteration_index,
+                        task_type="review",
+                        task=maybe_review_task,
+                        status="in_progress" if maybe_review_task.status in {"pending", "in_progress"} else "failed",
+                    )
+                    return True
                 action_task = maybe_review_task
 
         if action_task is None:
@@ -6785,38 +6945,35 @@ def _cmd_iterate_impl(
                     break
                 permit_for_review: LaunchPermit | None = permit_candidate
                 try:
-                    if action.get("review_mode") == "spec_coherence":
-                        raw_head_sha = action.get("review_head_sha")
-                        if not isinstance(raw_head_sha, str) or not raw_head_sha.strip():
-                            raise ValueError("missing behavior-spec coherence reviewed head SHA")
-                        raw_paths = action.get("review_changed_paths")
-                        if not isinstance(raw_paths, (tuple, list)):
-                            raise ValueError("missing behavior-spec coherence changed paths")
-                        changed_paths = tuple(
-                            str(path).strip() for path in raw_paths if str(path).strip()
-                        )
-                        if not changed_paths:
-                            raise ValueError("missing behavior-spec coherence changed paths")
-                        created_review_task = create_spec_coherence_review_task(
-                            store,
-                            impl_task,
-                            config=config,
-                            reviewed_head_sha=raw_head_sha.strip(),
-                            changed_paths=changed_paths,
-                            trigger_source="manual",
-                        )
-                    else:
-                        created_review_task = _create_review_task(
-                            store,
-                            impl_task,
-                            config=config,
-                            trigger_source="manual",
-                        )
+                    created_review_task = _create_selected_iterate_review_task(
+                        action,
+                        impl_task,
+                        config=config,
+                        trigger_source="manual",
+                    )
                 except DuplicateReviewError as e:
                     if isinstance(permit_for_review, LaunchPermit):
                         permit_for_review.release()
                     action_task = e.active_review
                     assert action_task.id is not None
+                    if not _duplicate_review_matches_selected_action(
+                        action_task,
+                        selected_action=action,
+                        review_target=impl_task,
+                    ):
+                        print(
+                            f"  Waiting for review {action_task.id}: active review does not match selected create_review action."
+                        )
+                        final_status = "blocked"
+                        final_stop_reason = "review_in_progress"
+                        _append_summary_row(
+                            summary_rows,
+                            iteration_index=iteration,
+                            task_type="review",
+                            task=action_task,
+                            status=action_task.status,
+                        )
+                        break
                     if action_task.status == "in_progress":
                         print(f"  Waiting for review {action_task.id}: already in progress.")
                         final_status = "blocked"

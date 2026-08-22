@@ -29,6 +29,8 @@ from gza.extractions import ExtractionDraft, SourceSelection
 from gza.git import Git
 from gza.log_paths import ops_log_path_for
 from gza.query import build_lineage_tree
+from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
+from gza.review_scope import parse_resolution_review_scope, parse_spec_coherence_review_scope
 from gza.review_verify_state import VERIFY_GATE_ARTIFACT_KIND, persist_verify_gate_artifact
 from gza.runner import DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
 from gza.workers import WorkerMetadata, WorkerRegistry
@@ -11257,6 +11259,63 @@ class TestIterateCommand:
             producer="test",
         )
 
+    def _make_post_rebase_resolution_review_fixture(self, tmp_path: Path, store):
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(
+            config_path.read_text()
+            + "verify_command: ./bin/tests\n"
+            + "autonomous_verify_timeout_seconds: 120\n"
+            + "review_verify_timeout_grace_seconds: 5.0\n"
+        )
+        impl = self._make_completed_impl(store)
+        assert impl.id is not None
+        impl.branch = "feature/rebased-resolution-review"
+        impl.merge_status = "unmerged"
+        store.update(impl)
+        store.set_merge_status(impl.id, "unmerged")
+
+        review = store.add("Approved review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 8, 18, 23, 58, tzinfo=UTC)
+        review.review_verify_head_sha = "pre-rebase-head"
+        review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+        store.update(review)
+
+        rebase = store.add("Rebase after review", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.completed_at = datetime(2026, 8, 21, 4, 31, tzinfo=UTC)
+        rebase.branch = impl.branch
+        rebase.has_commits = True
+        rebase.changed_diff = True
+        rebase.review_scope = build_rebase_diff_provenance(
+            baseline=RebaseDiffBaseline(
+                old_tip="pre-rebase-head",
+                target_at_start="pre-rebase-target",
+                merge_base_at_start="pre-rebase-base",
+            ),
+            resolved_head_sha="rebased-head",
+            resolved_target_sha="target-head",
+        )
+        store.update(rebase)
+
+        self._persist_current_green_verify(store, tmp_path, impl, head_sha="rebased-head")
+
+        git = MagicMock()
+        git.current_branch.return_value = "main"
+        git.default_branch.return_value = "main"
+        git.branch_exists.return_value = True
+        git.can_merge.return_value = True
+        git.is_merged.return_value = False
+        git.resolve_merge_source_ref.return_value = None
+        git.resolve_fresh_merge_source.return_value = (impl.branch, None)
+        git.rev_parse_if_exists.side_effect = lambda ref: {
+            impl.branch: "rebased-head",
+            "main": "target-head",
+        }.get(ref)
+        return impl, review, rebase, git
+
     def test_iterate_reconciles_merge_unit_verify_evidence_then_runs_review(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -12241,6 +12300,329 @@ class TestIterateCommand:
         assert "max 1 iterations" in output
         assert "Next action: verify_gate" in output
         assert "Action 1/1" not in output
+
+    def test_background_auto_iterate_create_review_preserves_resolution_review_action(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza import advance_engine as advance_engine_module
+        from gza.cli.execution import cmd_iterate
+        from gza.review_verdict import ParsedReviewReport
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl, review, rebase, git = self._make_post_rebase_resolution_review_fixture(tmp_path, store)
+        monkeypatch.setattr(
+            advance_engine_module,
+            "get_review_report",
+            lambda _project_dir, _review: ParsedReviewReport(
+                verdict="APPROVED",
+                findings=(),
+                format_version="legacy",
+            ),
+        )
+
+        spawned: list[SimpleNamespace] = []
+
+        def fake_spawn_background_iterate(args, config, task, **kwargs):
+            spawned.append(SimpleNamespace(args=args, config=config, task=task, kwargs=kwargs))
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=True,
+            force=False,
+            worker_id=None,
+            auto_iterate=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Git", return_value=git),
+            patch("gza.cli.execution._spawn_background_iterate", side_effect=fake_spawn_background_iterate),
+        ):
+            rc = cmd_iterate(args)
+
+        assert rc == 0
+        assert len(spawned) == 1
+        prepared_task_id = spawned[0].kwargs["prepared_task_id"]
+        assert prepared_task_id is not None
+        assert spawned[0].kwargs["prepared_action_type"] == "create_review"
+
+        reviews = [task for task in store.get_reviews_for_task(impl.id) if task.id != review.id]
+        assert len(reviews) == 1
+        resolution_review = reviews[0]
+        assert resolution_review.id == prepared_task_id
+        scope = parse_resolution_review_scope(resolution_review.review_scope)
+        assert scope is not None
+        assert scope.implementation_task_id == impl.id
+        assert scope.rebase_task_id == rebase.id
+        assert scope.resolved_head_sha == "rebased-head"
+        assert scope.resolved_target_sha == "target-head"
+        assert store.list_all_watch_progress_observations() == []
+        assert "Error creating review" not in capsys.readouterr().out
+
+    def test_background_auto_iterate_resolution_review_rejects_mismatched_pending_duplicate_then_creates_scoped_review(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza import advance_engine as advance_engine_module
+        from gza.cli.execution import cmd_iterate
+        from gza.review_verdict import ParsedReviewReport
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl, _review, rebase, git = self._make_post_rebase_resolution_review_fixture(tmp_path, store)
+        assert impl.id is not None
+
+        pending_ordinary = store.add("Pending ordinary review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        assert pending_ordinary.id is not None
+        pending_ordinary.status = "pending"
+        store.update(pending_ordinary)
+        action = {
+            "type": "create_review",
+            "description": f"Create resolution review (rebase {rebase.id} changed diff)",
+            "review_mode": "resolution",
+            "resolution_rebase_task_id": rebase.id,
+            "resolution_head_sha": "rebased-head",
+            "resolution_target_sha": "target-head",
+        }
+
+        monkeypatch.setattr(
+            advance_engine_module,
+            "get_review_report",
+            lambda _project_dir, _review: ParsedReviewReport(
+                verdict="APPROVED",
+                findings=(),
+                format_version="legacy",
+            ),
+        )
+
+        spawned: list[SimpleNamespace] = []
+
+        def fake_spawn_background_iterate(args, config, task, **kwargs):
+            spawned.append(SimpleNamespace(args=args, config=config, task=task, kwargs=kwargs))
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=True,
+            force=False,
+            worker_id=None,
+            auto_iterate=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Git", return_value=git),
+            patch("gza.cli.execution._determine_selected_iterate_action_for_args", return_value=action),
+            patch("gza.cli.execution._spawn_background_iterate", side_effect=fake_spawn_background_iterate),
+        ):
+            first_rc = cmd_iterate(args)
+
+        assert first_rc == 1
+        assert spawned == []
+        assert store.get(pending_ordinary.id).status == "pending"
+
+        pending_ordinary.status = "dropped"
+        store.update(pending_ordinary)
+
+        with (
+            patch("gza.cli.execution.Git", return_value=git),
+            patch("gza.cli.execution._determine_selected_iterate_action_for_args", return_value=action),
+            patch("gza.cli.execution._spawn_background_iterate", side_effect=fake_spawn_background_iterate),
+        ):
+            second_rc = cmd_iterate(args)
+
+        assert second_rc == 0
+        scoped_reviews = [
+            task
+            for task in store.get_reviews_for_task(impl.id)
+            if task.id not in {_review.id, pending_ordinary.id}
+        ]
+        assert len(scoped_reviews) == 1
+        resolution_review = scoped_reviews[0]
+        assert spawned[-1].kwargs["prepared_task_id"] == resolution_review.id
+        scope = parse_resolution_review_scope(resolution_review.review_scope)
+        assert scope is not None
+        assert scope.implementation_task_id == impl.id
+        assert scope.rebase_task_id == rebase.id
+
+    def test_foreground_auto_iterate_create_review_preserves_resolution_review_action(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza import advance_engine as advance_engine_module
+        from gza.cli.execution import cmd_iterate
+        from gza.review_verdict import ParsedReviewReport
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl, review, rebase, git = self._make_post_rebase_resolution_review_fixture(tmp_path, store)
+        monkeypatch.setattr(
+            advance_engine_module,
+            "get_review_report",
+            lambda _project_dir, _review: ParsedReviewReport(
+                verdict="APPROVED",
+                findings=(),
+                format_version="legacy",
+            ),
+        )
+
+        executed_reviews: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task.task_type == "review"
+            executed_reviews.append(task.id)
+            task.status = "completed"
+            task.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+            auto_iterate=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Git", return_value=git),
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+        ):
+            rc = cmd_iterate(args)
+
+        assert rc == 0
+        reviews = [task for task in store.get_reviews_for_task(impl.id) if task.id != review.id]
+        assert len(reviews) == 1
+        resolution_review = reviews[0]
+        assert executed_reviews == [resolution_review.id]
+        scope = parse_resolution_review_scope(resolution_review.review_scope)
+        assert scope is not None
+        assert scope.implementation_task_id == impl.id
+        assert scope.rebase_task_id == rebase.id
+        assert scope.resolved_head_sha == "rebased-head"
+        assert scope.resolved_target_sha == "target-head"
+        assert "Iteration 1/1: create_review" in capsys.readouterr().out
+
+    def test_foreground_auto_iterate_spec_coherence_review_rejects_mismatched_pending_duplicate_then_creates_scoped_review(
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from gza.cli.execution import cmd_iterate
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        assert impl.id is not None
+
+        pending_ordinary = store.add("Pending ordinary review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        assert pending_ordinary.id is not None
+        pending_ordinary.status = "pending"
+        store.update(pending_ordinary)
+
+        action = {
+            "type": "create_review",
+            "description": "Create behavior-spec coherence review",
+            "review_mode": "spec_coherence",
+            "review_head_sha": "spec-head",
+            "review_changed_paths": ("specs/behavior/lifecycle-engine.md",),
+        }
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+            auto_iterate=True,
+        )
+        mock_config = MagicMock(project_dir=tmp_path, use_docker=False, project_prefix="testproject")
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.determine_next_action", return_value=action),
+            patch("gza.cli._run_foreground") as run_foreground,
+        ):
+            first_rc = cmd_iterate(args)
+
+        first_output = capsys.readouterr().out
+        assert first_rc == 3
+        run_foreground.assert_not_called()
+        assert "does not match selected create_review action" in first_output
+
+        pending_ordinary.status = "dropped"
+        store.update(pending_ordinary)
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            task.status = "completed"
+            task.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        with (
+            patch("gza.cli.Config.load", return_value=mock_config),
+            patch("gza.cli.get_store", return_value=store),
+            patch("gza.cli.Git", return_value=mock_git),
+            patch("gza.cli.determine_next_action", return_value=action),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground) as run_foreground,
+            patch("gza.cli.get_review_verdict", return_value="APPROVED"),
+        ):
+            second_rc = cmd_iterate(args)
+
+        assert second_rc == 0
+        scoped_reviews = [
+            task
+            for task in store.get_reviews_for_task(impl.id)
+            if task.id != pending_ordinary.id
+        ]
+        assert len(scoped_reviews) == 1
+        spec_review = scoped_reviews[0]
+        run_foreground.assert_called_once()
+        assert run_foreground.call_args.kwargs["task_id"] == spec_review.id
+        scope = parse_spec_coherence_review_scope(spec_review.review_scope)
+        assert scope is not None
+        assert scope.implementation_task_id == impl.id
+        assert scope.reviewed_head_sha == "spec-head"
+        assert scope.changed_paths == ("specs/behavior/lifecycle-engine.md",)
 
     def test_iterate_without_required_review_still_runs_closing_review(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -17373,6 +17755,18 @@ class TestIterateCommand:
                 format_version="legacy",
             ),
         )
+        executed_review_ids: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            assert task_id == first_cycle_review.id
+            task = store.get(task_id)
+            assert task is not None
+            executed_review_ids.append(task.id)
+            task.status = "completed"
+            task.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
 
         args = argparse.Namespace(
             impl_task_id=impl.id,
@@ -23288,6 +23682,187 @@ class TestIterateCommand:
             next_review.id,
         ]
         create_review.assert_called_once()
+
+    def test_max_iterations_forced_closing_preserves_resolution_review_scope(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza import advance_engine as advance_engine_module
+        from gza.cli.execution import cmd_iterate
+        from gza.review_verdict import ParsedReviewReport
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl, old_review, rebase, git = self._make_post_rebase_resolution_review_fixture(tmp_path, store)
+        assert impl.id is not None
+        first_cycle_review = store.add("First cycle review", task_type="review")
+        assert first_cycle_review.id is not None
+        monkeypatch.setattr(
+            advance_engine_module,
+            "get_review_report",
+            lambda _project_dir, _review: ParsedReviewReport(
+                verdict="APPROVED",
+                findings=(),
+                format_version="legacy",
+            ),
+        )
+        executed_review_ids: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            task = store.get(task_id)
+            assert task is not None
+            assert task.task_type == "review"
+            executed_review_ids.append(task.id)
+            task.status = "completed"
+            task.output_content = (
+                "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+                if task.id == first_cycle_review.id
+                else "## Verdict\n\nVerdict: APPROVED\n"
+            )
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+        selected_resolution_action = {
+            "type": "create_review",
+            "description": f"Create resolution review (rebase {rebase.id} changed diff)",
+            "review_mode": "resolution",
+            "resolution_rebase_task_id": rebase.id,
+            "resolution_head_sha": "rebased-head",
+            "resolution_target_sha": "target-head",
+        }
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+            auto_iterate=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Git", return_value=git),
+            patch(
+                "gza.cli.execution._determine_selected_iterate_action_for_args",
+                return_value={
+                    "type": "run_review",
+                    "description": f"Run review {first_cycle_review.id}",
+                    "review_task": first_cycle_review,
+                },
+            ),
+            patch("gza.cli.execution._determine_selected_iterate_action", return_value=selected_resolution_action),
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+        ):
+            rc = cmd_iterate(args)
+
+        assert rc == 0
+        reviews = [review for review in store.get_reviews_for_task(impl.id) if review.id != old_review.id]
+        assert len(reviews) == 1
+        resolution_review = reviews[0]
+        assert executed_review_ids == [first_cycle_review.id, resolution_review.id]
+        scope = parse_resolution_review_scope(resolution_review.review_scope)
+        assert scope is not None
+        assert scope.implementation_task_id == impl.id
+        assert scope.rebase_task_id == rebase.id
+        assert scope.resolved_head_sha == "rebased-head"
+        assert scope.resolved_target_sha == "target-head"
+
+    def test_max_iterations_forced_closing_does_not_run_mismatched_active_review(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza import advance_engine as advance_engine_module
+        from gza.cli.execution import cmd_iterate
+        from gza.review_verdict import ParsedReviewReport
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl, _old_review, rebase, git = self._make_post_rebase_resolution_review_fixture(tmp_path, store)
+        assert impl.id is not None
+        first_cycle_review = store.add("First cycle review", task_type="review")
+        assert first_cycle_review.id is not None
+        pending_ordinary = store.add("Running ordinary review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        assert pending_ordinary.id is not None
+        pending_ordinary.status = "in_progress"
+        pending_ordinary.started_at = datetime.now(UTC)
+        pending_ordinary.running_pid = 12345
+        store.update(pending_ordinary)
+        selected_resolution_action = {
+            "type": "create_review",
+            "description": f"Create resolution review (rebase {rebase.id} changed diff)",
+            "review_mode": "resolution",
+            "resolution_rebase_task_id": rebase.id,
+            "resolution_head_sha": "rebased-head",
+            "resolution_target_sha": "target-head",
+        }
+        monkeypatch.setattr(
+            advance_engine_module,
+            "get_review_report",
+            lambda _project_dir, _review: ParsedReviewReport(
+                verdict="APPROVED",
+                findings=(),
+                format_version="legacy",
+            ),
+        )
+        executed_review_ids: list[str] = []
+
+        def fake_run_foreground(_config, task_id, **_kwargs):
+            assert task_id == first_cycle_review.id
+            task = store.get(task_id)
+            assert task is not None
+            executed_review_ids.append(task.id)
+            task.status = "completed"
+            task.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+            task.completed_at = datetime.now(UTC)
+            store.update(task)
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=False,
+            worker_id=None,
+            auto_iterate=True,
+        )
+
+        with (
+            patch("gza.cli.execution.Git", return_value=git),
+            patch(
+                "gza.cli.execution._determine_selected_iterate_action_for_args",
+                return_value={
+                    "type": "run_review",
+                    "description": f"Run review {first_cycle_review.id}",
+                    "review_task": first_cycle_review,
+                },
+            ),
+            patch("gza.cli.execution._determine_selected_iterate_action", return_value=selected_resolution_action),
+            patch("gza.cli.execution._run_foreground", side_effect=fake_run_foreground),
+            patch("gza.cli._run_foreground", side_effect=fake_run_foreground),
+        ):
+            rc = cmd_iterate(args)
+
+        assert rc == 3
+        assert executed_review_ids == [first_cycle_review.id]
+        assert store.get(pending_ordinary.id).status == "in_progress"
+        assert [
+            review.id
+            for review in store.get_reviews_for_task(impl.id)
+            if review.id != pending_ordinary.id
+        ] == [_old_review.id]
 
     def test_changes_requested_with_retry_eligible_failed_improve_retries_instead_of_blocking(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

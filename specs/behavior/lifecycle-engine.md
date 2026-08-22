@@ -630,6 +630,14 @@ failure *and* actionable merge/review work remains eligible for the latter.
   `verify_fix` handling before merge. This review-disabled branch is the only exception
   to the ordinary implementation two-gate merge rule from
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules).
+- A selected `create_review` action has epoch identity, and automation MUST NOT treat an
+  older review row or mismatched active duplicate as the selected action. Ordinary
+  branch-head and closing-review refreshes match the implementation and selected reviewed
+  head when that head is known; resolution reviews match implementation, rebase task,
+  resolved head SHA, and resolved target SHA; behavior-spec coherence reviews match
+  implementation, reviewed head SHA, and changed behavior-spec paths. A mismatched active
+  review is a conflict to surface or wait on, not a review task to run or account as the
+  selected action.
 - A failed implementation task is never mergeable. Timeout-style failed implementations
   with a resumable `session_id` MUST stay in recovery until that recovery resolves to a
   valid completed representative, exhausts its bounded policy, or is parked for manual

@@ -11,9 +11,16 @@ from typing import Any, Literal
 
 from .db import SqliteTaskStore, Task as DbTask, WatchProgressObservation, task_id_numeric_key
 from .lineage import resolve_lineage_root
+from .review_scope import (
+    declares_resolution_review_mode,
+    declares_spec_coherence_review_mode,
+    parse_resolution_review_scope,
+    parse_spec_coherence_review_scope,
+)
 from .runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
 
 WATCH_NO_PROGRESS_BACKSTOP_REASON = "watch-no-progress-backstop"
+CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY = "_create_review_preexisting_terminal_task_ids"
 WatchProgressScopeKind = Literal["canonical_owner", "effective_leaf"]
 WatchProgressScope = tuple[WatchProgressScopeKind, str]
 
@@ -185,6 +192,90 @@ def _verify_gate_progress_marker(task: DbTask | None) -> dict[str, object | None
     }
 
 
+def _create_review_epoch_marker(action: dict[str, Any]) -> dict[str, object | None] | None:
+    if action.get("type") != "create_review":
+        return None
+    raw_preexisting_terminal_ids = action.get(CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY)
+    preexisting_terminal_ids: tuple[str, ...]
+    if isinstance(raw_preexisting_terminal_ids, (list, tuple)):
+        preexisting_terminal_ids = tuple(
+            str(task_id).strip() for task_id in raw_preexisting_terminal_ids if str(task_id).strip()
+        )
+    else:
+        preexisting_terminal_ids = ()
+    changed_paths = action.get("review_changed_paths")
+    normalized_paths: tuple[str, ...] | None = None
+    if isinstance(changed_paths, (list, tuple)):
+        normalized_paths = tuple(str(path).strip() for path in changed_paths if str(path).strip())
+    return {
+        "review_mode": action.get("review_mode"),
+        "review_head_sha": action.get("review_head_sha"),
+        "review_changed_paths": normalized_paths,
+        "resolution_rebase_task_id": action.get("resolution_rebase_task_id"),
+        "resolution_head_sha": action.get("resolution_head_sha"),
+        "resolution_target_sha": action.get("resolution_target_sha"),
+        "preexisting_terminal_review_task_ids": tuple(sorted(preexisting_terminal_ids, key=task_id_numeric_key)),
+    }
+
+
+def mark_selected_create_review_action_epoch(
+    store: SqliteTaskStore,
+    *,
+    subject_task_id: str,
+    action: dict[str, Any],
+) -> None:
+    """Record terminal same-epoch reviews that existed before this selected dispatch."""
+    if action.get("type") != "create_review":
+        return
+    if CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY in action:
+        return
+    subject_task = store.get(subject_task_id)
+    launch_observed_at: datetime | None = None
+    materialized_review_task_id: str | None = None
+    if subject_task is not None:
+        subject_kind, subject_id, _merge_unit_id, _merge_unit_state, _merge_unit_head_sha = _resolve_subject(
+            store,
+            subject_task=subject_task,
+        )
+        observation = store.get_watch_progress_observation(
+            subject_kind=subject_kind,
+            subject_id=subject_id,
+            action_type="create_review",
+            action_reason=_normalize_action_reason(action),
+        )
+        if observation is not None:
+            launch_observed_at = observation.observed_at
+            if observation.action_task_id and observation.action_task_id != subject_task_id:
+                materialized_review_task_id = observation.action_task_id
+
+    def terminal_before_selected_dispatch(review: DbTask) -> bool:
+        if review.status in {"pending", "in_progress"}:
+            return False
+        if review.id == materialized_review_task_id:
+            return False
+        if launch_observed_at is None:
+            return True
+        terminal_at = review.completed_at or review.updated_at
+        if terminal_at is None:
+            return False
+        return _normalize_time(terminal_at) <= _normalize_time(launch_observed_at)
+
+    preexisting_terminal_ids = [
+        review.id
+        for review in store.get_reviews_for_task(subject_task_id)
+        if review.id is not None
+        and terminal_before_selected_dispatch(review)
+        and _review_matches_create_review_action(
+            review,
+            subject_task_id=subject_task_id,
+            action=action,
+        )
+    ]
+    action[CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY] = tuple(
+        sorted(preexisting_terminal_ids, key=task_id_numeric_key)
+    )
+
+
 def build_watch_progress_candidate(
     store: SqliteTaskStore,
     *,
@@ -232,6 +323,9 @@ def build_watch_progress_candidate(
     )
     if review_resolution_marker is not None:
         evidence["review_resolution_marker"] = review_resolution_marker
+    create_review_epoch_marker = _create_review_epoch_marker(action)
+    if create_review_epoch_marker is not None:
+        evidence["create_review_epoch_marker"] = create_review_epoch_marker
     if action_type in {"verify_gate", "reconcile_verify_gate_evidence"}:
         verify_gate_marker = _verify_gate_progress_marker(action_task or subject_task)
         if verify_gate_marker is not None:
@@ -292,7 +386,10 @@ def get_active_watch_no_progress_attention(
             subject_id=observation.subject_id,
         )
         return None
-    if observation.evidence_fingerprint != candidate.evidence_fingerprint:
+    if (
+        observation.evidence_fingerprint != candidate.evidence_fingerprint
+        and not _create_review_park_has_materialized_action_task(observation=observation, candidate=candidate)
+    ):
         return None
     return build_watch_no_progress_attention_action(
         subject_task_id=candidate.subject_task_id,
@@ -315,6 +412,19 @@ def _watch_no_progress_park_is_stale(
         return True
 
     action_task_id = candidate.action_task_id if candidate is not None else observation.action_task_id
+    if observation.action_type == "create_review":
+        if (
+            candidate is not None
+            and observation.evidence_fingerprint != candidate.evidence_fingerprint
+            and not _create_review_park_has_materialized_action_task(observation=observation, candidate=candidate)
+        ):
+            return True
+        if observation.action_task_id == subject_task_id:
+            return True
+        if observation.action_task_id is not None:
+            action_task_id = observation.action_task_id
+        elif action_task_id == subject_task_id:
+            return True
     if action_task_id is not None:
         action_task = store.get(action_task_id)
         if action_task is None:
@@ -365,6 +475,153 @@ def _task_is_in_watch_progress_scope(
             if merge_unit is not None and merge_unit.owner_task_id == scope_task_id:
                 return True
     return False
+
+
+def _review_matches_create_review_action(
+    review: DbTask,
+    *,
+    subject_task_id: str,
+    action: dict[str, Any] | None,
+) -> bool:
+    if review.id is None or review.task_type != "review":
+        return False
+    if review.depends_on != subject_task_id and review.based_on != subject_task_id:
+        return False
+    if action is None:
+        return (
+            not declares_resolution_review_mode(review.review_scope)
+            and not declares_spec_coherence_review_mode(review.review_scope)
+        )
+    review_mode = action.get("review_mode")
+    if review_mode == "spec_coherence":
+        expected_head_sha = action.get("review_head_sha")
+        expected_changed_paths = action.get("review_changed_paths")
+        if not isinstance(expected_head_sha, str) or not expected_head_sha.strip():
+            return False
+        if not isinstance(expected_changed_paths, (tuple, list)):
+            return False
+        expected_paths = tuple(str(path).strip() for path in expected_changed_paths if str(path).strip())
+        if not expected_paths:
+            return False
+        try:
+            spec_metadata = parse_spec_coherence_review_scope(review.review_scope)
+        except ValueError:
+            return False
+        return (
+            spec_metadata is not None
+            and spec_metadata.implementation_task_id == subject_task_id
+            and spec_metadata.reviewed_head_sha == expected_head_sha.strip()
+            and spec_metadata.changed_paths == expected_paths
+        )
+    if review_mode != "resolution":
+        if declares_resolution_review_mode(review.review_scope) or declares_spec_coherence_review_mode(review.review_scope):
+            return False
+        expected_head_sha = action.get("review_head_sha")
+        if isinstance(expected_head_sha, str) and expected_head_sha.strip():
+            return review.review_verify_head_sha == expected_head_sha.strip()
+        return True
+    expected_rebase_task_id = action.get("resolution_rebase_task_id")
+    expected_head_sha = action.get("resolution_head_sha")
+    expected_target_sha = action.get("resolution_target_sha")
+    if not (
+        isinstance(expected_rebase_task_id, str)
+        and expected_rebase_task_id
+        and isinstance(expected_head_sha, str)
+        and expected_head_sha
+        and isinstance(expected_target_sha, str)
+        and expected_target_sha
+    ):
+        return False
+    try:
+        resolution_metadata = parse_resolution_review_scope(review.review_scope)
+    except ValueError:
+        return False
+    return (
+        resolution_metadata is not None
+        and resolution_metadata.implementation_task_id == subject_task_id
+        and resolution_metadata.rebase_task_id == expected_rebase_task_id
+        and resolution_metadata.resolved_head_sha == expected_head_sha
+        and resolution_metadata.resolved_target_sha == expected_target_sha
+    )
+
+
+def review_matches_create_review_action(
+    review: DbTask,
+    *,
+    subject_task_id: str,
+    action: dict[str, Any] | None,
+) -> bool:
+    """Return whether an existing review is the selected create_review epoch."""
+    return _review_matches_create_review_action(
+        review,
+        subject_task_id=subject_task_id,
+        action=action,
+    )
+
+
+def materialized_create_review_action_task(
+    store: SqliteTaskStore,
+    *,
+    subject_task_id: str,
+    action: dict[str, Any] | None,
+) -> DbTask | None:
+    raw_preexisting_terminal_ids = (
+        action.get(CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY) if action is not None else None
+    )
+    preexisting_terminal_ids = (
+        {str(task_id).strip() for task_id in raw_preexisting_terminal_ids if str(task_id).strip()}
+        if isinstance(raw_preexisting_terminal_ids, (tuple, list, set))
+        else set()
+    )
+    reviews = [
+        review
+        for review in store.get_reviews_for_task(subject_task_id)
+        if _review_matches_create_review_action(
+            review,
+            subject_task_id=subject_task_id,
+            action=action,
+        )
+        and not (review.id in preexisting_terminal_ids and review.status not in {"pending", "in_progress"})
+    ]
+    if not reviews:
+        return None
+    return max(
+        reviews,
+        key=lambda review: (
+            _normalize_time(review.created_at),
+            _normalize_time(review.updated_at),
+            _normalize_time(review.completed_at),
+            task_id_numeric_key(review.id or ""),
+        ),
+    )
+
+
+def _latest_materialized_review_task_id(
+    store: SqliteTaskStore,
+    *,
+    subject_task_id: str,
+    action: dict[str, Any] | None = None,
+) -> str | None:
+    review = materialized_create_review_action_task(
+        store,
+        subject_task_id=subject_task_id,
+        action=action,
+    )
+    return review.id if review is not None else None
+
+
+def _create_review_park_has_materialized_action_task(
+    *,
+    observation: WatchProgressObservation,
+    candidate: WatchProgressCandidate,
+) -> bool:
+    return (
+        observation.action_type == "create_review"
+        and observation.action_task_id is not None
+        and observation.subject_task_id is not None
+        and observation.action_task_id != observation.subject_task_id
+        and candidate.action_task_id == observation.action_task_id
+    )
 
 
 def reconcile_stale_watch_no_progress_parks(
@@ -472,7 +729,10 @@ def observe_watch_progress_and_maybe_park(
         raise AssertionError("watch no-progress threshold must be positive")
     existing = _clear_other_subject_actions(store, candidate=candidate)
 
-    same_evidence = existing is not None and existing.evidence_fingerprint == candidate.evidence_fingerprint
+    same_evidence = existing is not None and (
+        existing.evidence_fingerprint == candidate.evidence_fingerprint
+        or _create_review_park_has_materialized_action_task(observation=existing, candidate=candidate)
+    )
     streak = (existing.streak + 1) if (same_evidence and existing is not None) else 1
     parked_reason = (
         WATCH_NO_PROGRESS_BACKSTOP_REASON
@@ -536,6 +796,16 @@ def finalize_watch_progress_after_execution(
     if before.subject_kind != after.subject_kind or before.subject_id != after.subject_id:
         raise AssertionError("watch progress execution finalizer requires a stable subject")
     if before.evidence_fingerprint != after.evidence_fingerprint:
+        if (
+            after.action_type == "create_review"
+            and after.action_task_id is not None
+            and after.action_task_id != after.subject_task_id
+        ):
+            return observe_watch_progress_and_maybe_park(
+                store,
+                candidate=after,
+                no_progress_cycles=no_progress_cycles,
+            )
         _clear_watch_subject_state(
             store,
             subject_kind=after.subject_kind,
