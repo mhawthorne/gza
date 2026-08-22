@@ -834,14 +834,22 @@ def _execute_reconcile_verify_gate_evidence(
             handled_task_id=owner_task.id,
         )
 
-    _credit_verify_gate_result_to_owner(
-        context=context,
-        owner_task=owner_task,
-        source_task=selection.source_task,
-        result=selection.lookup.result,
-        source_metadata=selection.lookup.artifact_metadata,
-        producer="advance_verify_gate_recredit",
-    )
+    try:
+        _credit_verify_gate_result_to_owner(
+            context=context,
+            owner_task=owner_task,
+            source_task=selection.source_task,
+            result=selection.lookup.result,
+            source_metadata=selection.lookup.artifact_metadata,
+            producer="advance_verify_gate_recredit",
+        )
+    except Exception as exc:
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="error",
+            error_message=f"could not persist verify gate reconciliation evidence: {exc}",
+            handled_task_id=owner_task.id,
+        )
     status = selection.lookup.result.status
     return AdvanceActionExecutionResult(
         action_type=action_type,

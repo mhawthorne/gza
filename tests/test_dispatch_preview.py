@@ -637,27 +637,6 @@ def test_recovery_preview_scoped_seed_ignores_large_non_recovery_descendant_hist
     store.attach_task_to_merge_unit(failed.id, failed_unit.id, "owner")
     _bulk_insert_completed_history(store, count=3000, start=200000, based_on=failed.id)
 
-    with patch(
-        "gza.recovery_engine._load_merge_context",
-        return_value=recovery_engine._MergeContext(git=None, default_branch="main"),
-    ):
-        full_preview = build_dispatch_preview(
-            store,
-            tags=None,
-            any_tag=False,
-            max_recovery_attempts=1,
-            selection_mode="recovery_only",
-            include_pending=False,
-        )
-        tagged_full_preview = build_dispatch_preview(
-            store,
-            tags=("alpha",),
-            any_tag=False,
-            max_recovery_attempts=1,
-            selection_mode="recovery_only",
-            include_pending=False,
-        )
-
     def fail_get_all():
         raise AssertionError("scoped recovery preview must not fall back to get_all()")
 
@@ -691,16 +670,14 @@ def test_recovery_preview_scoped_seed_ignores_large_non_recovery_descendant_hist
             include_pending=False,
         )
 
+    assert [entry.task.id for entry in scoped_preview.recovery_entries] == [failed.id]
+    assert [entry.task.id for entry in tagged_scoped_preview.recovery_entries] == [failed.id]
     assert [(entry.owner_task.id, entry.task.id, entry.action) for entry in scoped_preview.recovery_entries] == [
-        (entry.owner_task.id, entry.task.id, entry.action) for entry in full_preview.recovery_entries
+        (failed.id, failed.id, "retry")
     ]
     assert [
         (entry.owner_task.id, entry.task.id, entry.action) for entry in tagged_scoped_preview.recovery_entries
-    ] == [
-        (entry.owner_task.id, entry.task.id, entry.action) for entry in tagged_full_preview.recovery_entries
-    ]
-    assert [entry.task.id for entry in scoped_preview.recovery_entries] == [failed.id]
-    assert [entry.task.id for entry in tagged_scoped_preview.recovery_entries] == [failed.id]
+    ] == [(failed.id, failed.id, "retry")]
     assert failed.id in hydrated_ids
     assert len(set(hydrated_ids)) < 50
 

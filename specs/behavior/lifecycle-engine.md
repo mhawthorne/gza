@@ -472,10 +472,14 @@ epoch.
   dual-writing, or otherwise mutating merge-unit or verify evidence. If query-only
   merge-unit planning encounters cyclic branchless-review lineage, dry-run and writable
   invocations MUST return non-zero with a concise diagnostic before mutating merge-unit
-  or verify evidence. A forced
-  rerun MUST return success only when the invoked verify action succeeds and produces fresh current
-  green evidence; setup, execution, unsupported-action, or persistence failures MUST
-  return non-zero and label any old verdict as pre-existing evidence.
+  or verify evidence. A forced rerun MUST return success only when the invoked
+  verify action succeeds and
+  produces fresh current green evidence. If the forced action persists fresh
+  current red or unavailable evidence, the command MUST render that fresh evidence
+  normally and return non-zero.
+  Setup, unsupported-action, execution-before-persistence, or persistence failures
+  that leave no newly selected current result MUST return non-zero and label any old
+  verdict as pre-existing evidence.
 - If the current pre-review verify gate is unavailable and lifecycle cannot safely route
   through `verify_fix`, it MUST park with `verify-unavailable`. If that same unavailable
   state persists after one completed same-epoch `verify_fix`, it MUST park with

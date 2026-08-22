@@ -115,16 +115,31 @@ def _verify_artifact_ids(store: Any, owner_task: Any) -> set[int]:
     }
 
 
-def _forced_run_persisted_current_green(
+def _forced_run_persisted_current_result(
     *,
     decision: VerifyGateDecision,
     previous_artifact_ids: set[int],
 ) -> bool:
     result = decision.lookup.result
-    if decision.state != "passed" or result is None:
+    if result is None or decision.state in {"missing", "stale"}:
         return False
     artifact_id = decision.lookup.artifact_id
     return artifact_id is not None and artifact_id not in previous_artifact_ids
+
+
+def _print_forced_pre_existing_decision(
+    *,
+    store: Any,
+    owner_task: Any,
+    decision: VerifyGateDecision,
+) -> None:
+    _print_decision(
+        store=store,
+        owner_task=owner_task,
+        decision=decision,
+        prefix="Pre-existing verify gate evidence",
+    )
+    print("Forced verify rerun did not produce new current green evidence.")
 
 
 def _make_verify_context(*, config: Config, store: Any, git: Git) -> AdvanceActionExecutionContext:
@@ -224,7 +239,15 @@ def cmd_verify(args: argparse.Namespace) -> int:
                 owner_task=refreshed_owner,
                 config=config,
                 git=git,
+                member_tasks=resolved_members,
             )
+            if args.force:
+                _print_forced_pre_existing_decision(
+                    store=store,
+                    owner_task=refreshed_owner,
+                    decision=refreshed_decision,
+                )
+                return 1
             _print_decision(store=store, owner_task=refreshed_owner, decision=refreshed_decision)
             return 1
         reconciled = True
@@ -280,22 +303,29 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print(f"Error: Task {task_id} has no resolvable verify owner")
         return 1
     refreshed_owner = store.get(owner_task_id) or verify_owner_task
-    refreshed_decision = _effective_verify_gate_decision(store=store, owner_task=refreshed_owner, config=config, git=git)
-    if args.force and not (
-        result.status == "success"
-        and result.work_done
-        and _forced_run_persisted_current_green(
-            decision=refreshed_decision,
-            previous_artifact_ids=previous_artifact_ids,
-        )
-    ):
-        _print_decision(
+    refreshed_decision = _effective_verify_gate_decision(
+        store=store,
+        owner_task=refreshed_owner,
+        config=config,
+        git=git,
+        member_tasks=resolved_members,
+    )
+    forced_run_persisted_current_result = _forced_run_persisted_current_result(
+        decision=refreshed_decision,
+        previous_artifact_ids=previous_artifact_ids,
+    )
+    if args.force and not forced_run_persisted_current_result:
+        _print_forced_pre_existing_decision(
             store=store,
             owner_task=refreshed_owner,
             decision=refreshed_decision,
-            prefix="Pre-existing verify gate evidence",
         )
-        print("Forced verify rerun did not produce new current green evidence.")
         return 1
     _print_decision(store=store, owner_task=refreshed_owner, decision=refreshed_decision)
+    if args.force:
+        return (
+            0
+            if result.status == "success" and result.work_done and refreshed_decision.state == "passed"
+            else 1
+        )
     return 0 if refreshed_decision.state == "passed" else 1
