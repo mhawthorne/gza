@@ -179,9 +179,12 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   completed-but-unmerged remediation whose red-main-exempt merge did not succeed,
   before replacing a dropped same-signature terminal owner observed on restart, and
   after a merged remediation is proven ineffective by post-merge verify. Watch MUST
-  stop requeueing once the configured bound is spent. Legacy failed remediation rows
-  that predate explicit attempt metadata MUST be treated conservatively as already
-  having spent one automatic attempt.
+  dedupe consumption by stable terminal execution-epoch evidence, so an interrupted
+  revival of the same unchanged terminal row cannot spend the same epoch more than
+  once, but a later real rerun that reaches a new terminal epoch can spend the next
+  attempt. Watch MUST stop requeueing once the configured bound is spent. Legacy
+  failed remediation rows that predate explicit attempt metadata MUST be treated
+  conservatively as already having spent one automatic attempt.
 - When the automatic remediation bound is exhausted for a failure signature, watch MUST
   leave the single remediation row failed, persist an explicit exhausted reason on that
   row, and emit one signature-scoped human-attention condition instead of creating or

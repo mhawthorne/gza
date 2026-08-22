@@ -10775,7 +10775,7 @@ class SqliteTaskStore:
                 )
             )
             next_active_task_id = existing.active_task_id if existing is not None else None
-            if increment > 0 and (task_id is None or next_active_task_id == task_id):
+            if task_id is None or next_active_task_id == task_id:
                 next_active_task_id = None
             next_last_consumed_task_id = (
                 task_id if increment > 0 else existing.last_consumed_task_id if existing is not None else None

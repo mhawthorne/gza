@@ -17911,10 +17911,10 @@ def test_watch_cycle_dropped_unmerged_active_main_verify_owner_consumes_before_s
     assert log_text.count("ATTENTION main verify remediation exhausted for phase:functional after 2/2 attempts") == 1
 
 
-def test_watch_cycle_unroutable_completed_active_remediation_consumes_and_clears_without_successor(
+def test_watch_cycle_unroutable_completed_active_remediation_consumes_terminal_epoch_once(
     tmp_path: Path,
 ) -> None:
-    (tmp_path / "gza.yaml").write_text(
+    unroutable_config_text = (
         "project_name: test-project\n"
         "provider: codex\n"
         "db_path: .gza/gza.db\n"
@@ -17924,7 +17924,8 @@ def test_watch_cycle_unroutable_completed_active_remediation_consumes_and_clears
         "      plan:\n"
         "        model: gpt-5.5\n"
     )
-    config = Config.load(tmp_path)
+    (tmp_path / "gza.yaml").write_text(unroutable_config_text)
+    unroutable_config = Config.load(tmp_path)
     store = make_store(tmp_path)
 
     active = _make_completed_watch_merge_task(
@@ -17969,18 +17970,19 @@ def test_watch_cycle_unroutable_completed_active_remediation_consumes_and_clears
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch._execute_merge_action") as execute_merge,
         patch("gza.cli.watch.check_main_integration_verify", return_value=_main_verify_red_check(main_verify_task)),
-        pytest.raises(ConfigError, match="'model' is required for task type 'implement'"),
     ):
-        _run_cycle_and_emit_transition_events(
-            config=config,
-            store=store,
-            batch=1,
-            max_iterations=10,
-            dry_run=False,
-            log=log,
-            tags=("202606-recovery",),
-            any_tag=False,
-        )
+        for _ in range(2):
+            with pytest.raises(ConfigError, match="'model' is required for task type 'implement'"):
+                _run_cycle_and_emit_transition_events(
+                    config=unroutable_config,
+                    store=store,
+                    batch=1,
+                    max_iterations=10,
+                    dry_run=False,
+                    log=log,
+                    tags=("202606-recovery",),
+                    any_tag=False,
+                )
 
     execute_merge.assert_not_called()
     attempt_state = store.get_main_verify_remediation_attempt_state(
@@ -18001,6 +18003,164 @@ def test_watch_cycle_unroutable_completed_active_remediation_consumes_and_clears
     assert refreshed is not None
     assert refreshed.status == "completed"
     assert "consumed terminal fix remediation attempt" not in log_path.read_text()
+    assert "ATTENTION main verify remediation exhausted" not in log_path.read_text()
+
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
+        "db_path: .gza/gza.db\n"
+    )
+    routable_config = Config.load(tmp_path)
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.lineage_query.current_main_integration_verify_alert", return_value=None),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "wait"}),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._execute_merge_action") as execute_merge_after_route,
+        patch("gza.cli.watch.check_main_integration_verify", return_value=_main_verify_red_check(main_verify_task)),
+    ):
+        _run_cycle_and_emit_transition_events(
+            config=routable_config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+        rerun = store.get(active.id)
+        assert rerun is not None
+        assert rerun.status == "pending"
+        assert "Remediation attempts spent: 1/2" in rerun.prompt
+        rerun.status = "failed"
+        rerun.completed_at = datetime.now(UTC)
+        rerun.failure_reason = "UNKNOWN"
+        store.update(rerun)
+
+        _run_cycle_and_emit_transition_events(
+            config=routable_config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    execute_merge_after_route.assert_not_called()
+    exhausted = store.get(active.id)
+    assert exhausted is not None
+    assert exhausted.status == "failed"
+    assert exhausted.failure_reason == MAIN_VERIFY_REMEDIATION_EXHAUSTED_REASON
+    assert "Remediation attempts spent: 2/2" in exhausted.prompt
+    exhausted_attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert exhausted_attempt_state is not None
+    assert exhausted_attempt_state.consumed_attempt_count == 2
+    assert exhausted_attempt_state.active_task_id is None
+    assert exhausted_attempt_state.exhausted_at is not None
+    log_text = log_path.read_text()
+    assert log_text.count("ATTENTION main verify remediation exhausted for phase:functional after 2/2 attempts") == 1
+
+
+@pytest.mark.parametrize("terminal_status", ["failed", "completed", "unmerged", "dropped"])
+def test_main_verify_remediation_requeue_consumes_each_terminal_epoch_once_per_status(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "provider: codex\n"
+        "db_path: .gza/gza.db\n"
+        "providers:\n"
+        "  codex:\n"
+        "    task_types:\n"
+        "      plan:\n"
+        "        model: gpt-5.5\n"
+    )
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: fp-functional-a",
+                "Observed main HEAD: feedfacecafe",
+                "Remediation attempts spent: 0/2",
+            ]
+        ),
+        task_type="implement",
+        tags=("202606-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert task.id is not None
+    task.status = terminal_status
+    task.completed_at = datetime.now(UTC)
+    task.branch = f"feature/watch-main-remediation-{terminal_status}"
+    task.has_commits = True
+    if terminal_status == "failed":
+        task.failure_reason = "UNKNOWN"
+    elif terminal_status == "dropped":
+        task.drop_reason = "operator dropped stale active owner"
+    else:
+        task.merge_status = "unmerged"
+    store.update(task)
+    store.record_main_verify_remediation_active_task(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        task_id=task.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure="verify_command failed twice",
+    )
+    remediation = MainIntegrationVerifyRemediation(
+        kind="fix",
+        signature="phase:functional",
+        tree_fingerprint="fp-functional-a",
+        failing_phase="functional",
+        failure="verify_command failed twice",
+        observed_environment_identity=None,
+        artifact_path=None,
+        failing_test_ids=(),
+        verify_excerpt=None,
+    )
+
+    for _ in range(2):
+        fresh = store.get(task.id)
+        assert fresh is not None
+        with pytest.raises(ConfigError, match="'model' is required for task type 'implement'"):
+            watch_module._queue_main_verify_remediation_task(
+                config=config,
+                store=store,
+                task=fresh,
+                remediation=remediation,
+                head_sha="feedfacecafe",
+                desired_tags=("system", MAIN_INTEGRATION_VERIFY_TAG, "202606-recovery"),
+                tags=("202606-recovery",),
+                any_tag=False,
+            )
+
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 1
+    assert attempt_state.active_task_id is None
+    assert attempt_state.exhausted_at is None
 
 
 def test_watch_cycle_descendant_non_merge_action_consumes_active_main_verify_owner(

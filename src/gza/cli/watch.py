@@ -572,6 +572,25 @@ def _main_verify_remediation_ledger_fingerprint(_tree_fingerprint: str | None) -
     return None
 
 
+def _main_verify_remediation_terminal_epoch_consumption_key(task: DbTask) -> str:
+    """Return a stable consume key for one stored terminal execution epoch."""
+    assert task.id is not None
+    evidence = {
+        "id": task.id,
+        "status": task.status,
+        "started_at": task.started_at.isoformat() if task.started_at is not None else None,
+        "completed_at": task.completed_at.isoformat() if task.completed_at is not None else None,
+        "merge_status": task.merge_status,
+        "merged_at": task.merged_at.isoformat() if task.merged_at is not None else None,
+        "failure_reason": task.failure_reason,
+        "completion_reason": task.completion_reason,
+        "drop_reason": task.drop_reason,
+    }
+    encoded = json.dumps(evidence, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+    return f"{task.id}:{task.status}-requeue:{digest}"
+
+
 def _main_verify_remediation_is_still_unmerged(
     store: SqliteTaskStore,
     task: DbTask,
@@ -1099,7 +1118,7 @@ def _queue_main_verify_remediation_task(
             signature=remediation.signature,
             tree_fingerprint=ledger_fingerprint,
             task_id=task.id,
-            consumption_key=f"{task.id}:{task.status}-requeue:{spent_attempts}",
+            consumption_key=_main_verify_remediation_terminal_epoch_consumption_key(task),
             consumed_attempt_floor=max(spent_attempts - 1, 0),
             last_observed_head_sha=head_sha,
             last_observed_failure=remediation.failure,
