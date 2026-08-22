@@ -91,10 +91,10 @@
     {% endif %}
   </section>
 
-  {% if detail.plan_content is not none or edit_mode == "plan" or rejected_edit_mode == "plan" %}
+  {% if detail.output_content is not none or edit_mode == "plan" or rejected_edit_mode == "plan" %}
     <section>
-      <h2>Plan</h2>
-      {% if detail.task.task_type == "plan" and detail.plan_content is not none and edit_mode != "plan" %}<p><a class="edit-link" href="{{ detail.detail_url }}?edit=plan">edit plan</a></p>{% endif %}
+      <h2>Output</h2>
+      {% if detail.plan_editable and edit_mode != "plan" %}<p><a class="edit-link" href="{{ detail.detail_url }}?edit=plan">edit plan</a></p>{% endif %}
       {% if rejected_edit_mode == "plan" %}
         <p class="error" role="alert">{{ edit_error }}</p>
         <p class="muted">Your submitted Markdown is preserved below for copying.</p>
@@ -104,11 +104,11 @@
         <form class="content-editor" method="post" action="/api/tasks/{{ task.id }}/plan">
           <input type="hidden" name="project_id" value="{{ detail.project_id }}">
           <label for="plan-content">Plan Markdown</label>
-          <textarea id="plan-content" name="plan" rows="20">{{ edited_content if edited_content is not none else detail.plan_content }}</textarea>
+          <textarea id="plan-content" name="plan" rows="20">{{ edited_content if edited_content is not none else detail.output_content }}</textarea>
           <p><button type="submit">Save plan</button> <a href="{{ detail.detail_url }}">Cancel</a></p>
         </form>
       {% else %}
-        <div class="markdown">{{ detail.plan_html }}</div>
+        <div class="markdown">{{ detail.output_html }}</div>
       {% endif %}
     </section>
   {% endif %}

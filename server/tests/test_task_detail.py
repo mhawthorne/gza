@@ -2,6 +2,7 @@ import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from gza_server.app import create_app
 
@@ -43,7 +44,7 @@ def test_implement_task_detail_renders_metadata_prompt_and_full_json(tmp_path: P
     assert "120.5 seconds" in response.text
     assert "<h2>Ship safely</h2>" in response.text
     assert "Use <strong>targeted checks</strong> before release." in response.text
-    assert "<h2>Plan</h2>" not in response.text
+    assert "<h2>Output</h2>" not in response.text
 
     assert api_response.status_code == 200
     record = api_response.json()
@@ -72,7 +73,7 @@ def test_plan_task_detail_renders_cli_plan_content_below_prompt(tmp_path: Path) 
 
     assert response.status_code == 200
     assert "<h1>Planning prompt</h1>" in response.text
-    assert "<h2>Plan</h2>" in response.text
+    assert "<h2>Output</h2>" in response.text
     assert "<h2>Rollout plan</h2>" in response.text
     assert "<li>Ship canary</li>" in response.text
     assert response.text.index("Planning prompt") < response.text.index("Rollout plan")
@@ -263,3 +264,26 @@ def test_cross_project_plan_content_uses_owner_root_for_file_only_and_newer_file
         assert foreign not in html.text
         assert json_response.json()["plan_content"] == f"## {expected}\n"
         assert foreign not in json_response.json()["plan_content"]
+
+
+@pytest.mark.parametrize(
+    "task_type",
+    ["implement", "explore", "review", "improve", "fix", "internal"],
+)
+def test_non_plan_task_detail_renders_output_without_edit_affordance(
+    tmp_path: Path, task_type: str
+) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Do the thing.", task_type=task_type)
+    store.mark_completed(task, output_content="## Findings\n\nOne blocker remains.")
+    client = _client(store, project_dir=tmp_path)
+
+    response = client.get(f"/tasks/{task.id}")
+    record = client.get(f"/api/tasks/{task.id}").json()
+
+    assert response.status_code == 200
+    assert "<h2>Output</h2>" in response.text
+    assert "<h2>Findings</h2>" in response.text
+    assert "edit=plan" not in response.text
+    assert record["task_output"] == "## Findings\n\nOne blocker remains."
+    assert record["plan_content"] is None

@@ -37,7 +37,7 @@ class TaskDetail:
     detail_url: str
     parents: tuple[LineageLink, ...]
     children: tuple[LineageLink, ...]
-    plan_content: str | None
+    output_content: str | None
     merge_unit: MergeUnit | None = None
 
     @property
@@ -57,7 +57,10 @@ class TaskDetail:
         record["updated_at"] = task_updated_at(self.task)
         record["parents"] = [asdict(link) for link in self.parents]
         record["children"] = [asdict(link) for link in self.children]
-        record["plan_content"] = self.plan_content
+        record["task_output"] = self.output_content
+        record["plan_content"] = (
+            self.output_content if self.task.task_type == "plan" else None
+        )
         record["merge_unit_id"] = None if self.merge_unit is None else self.merge_unit.id
         record["merge_unit_state"] = None if self.merge_unit is None else self.merge_unit.state
         record["merge_unit_url"] = self.merge_unit_url
@@ -68,10 +71,15 @@ class TaskDetail:
         return Markup(_MARKDOWN.render(self.task.prompt))
 
     @property
-    def plan_html(self) -> Markup | None:
-        if not self.plan_content:
+    def output_html(self) -> Markup | None:
+        if not self.output_content:
             return None
-        return Markup(_MARKDOWN.render(self.plan_content))
+        return Markup(_MARKDOWN.render(self.output_content))
+
+    @property
+    def plan_editable(self) -> bool:
+        """Only plan tasks expose the in-page Markdown editor for their output."""
+        return self.task.task_type == "plan" and self.output_content is not None
 
     @property
     def updated_at(self) -> datetime | None:
@@ -142,16 +150,14 @@ def query_task_detail(
                 )
             )
 
-    plan_content = (
-        get_task_output(task, project_store.project_root) if task.task_type == "plan" else None
-    )
+    output_content = get_task_output(task, project_store.project_root)
     return TaskDetail(
         task=task,
         project_id=owning_project_id,
         detail_url=detail_url,
         parents=tuple(parents),
         children=tuple(children),
-        plan_content=plan_content,
+        output_content=output_content,
         merge_unit=project_store.resolve_merge_unit_for_task(task_id),
     )
 

@@ -723,7 +723,7 @@ def create_app(
             )
         rejected_edit_mode: str | None = None
         prompt_eligible = detail.task.status == "pending"
-        plan_eligible = detail.task.task_type == "plan" and detail.plan_content is not None
+        plan_eligible = detail.plan_editable
         if edit_mode == "prompt" and not prompt_eligible:
             if edit_error is not None and edited_content is not None:
                 rejected_edit_mode = edit_mode
