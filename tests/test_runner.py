@@ -14577,7 +14577,7 @@ class TestExtractedRunInnerHelpers:
                 "gza.runner._capture_noop_improve_review_verify_result",
                 wraps=_capture_noop_improve_review_verify_result,
             ) as capture_verify,
-            patch("gza.runner._run_review_verify_command") as run_verify,
+            patch("gza.runner._run_review_verify_command"),
             patch("gza.runner.sync_task_branch_if_live_pr") as sync_branch,
             patch("gza.runner._create_and_run_review_task") as run_review,
             patch("gza.runner.task_footer"),
@@ -16369,7 +16369,7 @@ class TestExtractedRunInnerHelpers:
                 "gza.runner._ensure_work_pr_for_completed_code_task",
                 return_value=CompletedCodeTaskPrPublicationOutcome(kind="ready", status="created", message="created"),
             ),
-            patch("gza.runner._create_and_run_review_task", return_value=0) as run_review,
+            patch("gza.runner._create_and_run_review_task", return_value=0),
             patch("gza.runner.task_footer"),
         ):
             rc = run(config, task_id=task.id, create_pr=True)

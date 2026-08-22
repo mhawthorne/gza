@@ -3954,7 +3954,6 @@ def test_query_lineage_owner_rows_reroots_failed_based_on_leaf_when_merged_owner
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
-    config = Config.load(tmp_path)
 
     owner = store.add("Merged owner", task_type="implement")
     assert owner.id is not None

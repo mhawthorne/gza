@@ -8,6 +8,7 @@ import pytest
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.git import Git
 from tests.cli.conftest import (
     make_store,
     run_gza,

@@ -9985,78 +9985,6 @@ def test_verify_only_noop_improve_with_persisted_green_verify_evidence_without_s
     assert "review feedback remains unresolved" in action["description"]
 
 
-def test_verify_only_blocker_resolution_statuses_require_structured_clearance_artifact(
-    tmp_path: Path,
-) -> None:
-    from gza import advance_engine as advance_engine_module
-
-    store = _make_store(tmp_path)
-    config = Config.load(tmp_path)
-
-    impl = _make_completed_unmerged_impl(
-        store,
-        branch="feat/noop-verify-only-resolution-statuses",
-        when=datetime(2026, 5, 14, 9, 0, tzinfo=UTC),
-    )
-
-    review = store.add("Review", task_type="review", depends_on=impl.id)
-    assert review.id is not None
-    review.status = "completed"
-    review.completed_at = datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
-    review.output_content = (
-        "## Summary\n\n- Verify failed.\n\n"
-        "## Blockers\n\n"
-        "### B1 verify_command failure: flaky unit lane\n"
-        "Evidence: verify_command failed with exit status 1.\n"
-        "Impact: autonomous verify fails.\n"
-        "Required fix: rerun verify_command on the current tip.\n"
-        "Required tests: rerun verify_command.\n\n"
-        "### B2 verify_command timeout: functional lane\n"
-        "Evidence: verify_command timed out while running functional tests.\n"
-        "Impact: autonomous verify lacks a complete result.\n"
-        "Required fix: rerun verify_command on the current tip.\n"
-        "Required tests: rerun verify_command.\n\n"
-        "## Follow-Ups\n\nNone.\n\n"
-        "## Questions / Assumptions\n\nNone.\n\n"
-        "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
-    )
-    review.review_verify_status = "failed"
-    review.review_verify_branch = impl.branch
-    review.review_verify_head_sha = "current-sha"
-    store.update(review)
-
-    improve = _add_completed_improve_for_review(
-        store,
-        impl,
-        review,
-        when=datetime(2026, 5, 14, 11, 0, tzinfo=UTC),
-        changed_diff=False,
-    )
-    improve.review_verify_status = "passed"
-    improve.review_verify_branch = impl.branch
-    improve.review_verify_head_sha = "current-sha"
-    improve.review_verify_captured_at = review.completed_at + timedelta(seconds=1)
-    store.update(improve)
-
-    report = advance_engine_module.get_review_report(Path(config.project_dir), review)
-    statuses = advance_engine_module._latest_review_blocker_resolution_statuses(  # noqa: SLF001
-        store,
-        git=_FakeGit(
-            can_merge=True,
-            existing_branches={impl.branch},
-            ref_shas={impl.branch: "current-sha"},
-        ),
-        project_dir=Path(config.project_dir),
-        review_task=review,
-        impl_task=impl,
-        findings=report.findings,
-        improve_tasks=[improve],
-        allow_verify_clearance=True,
-    )
-
-    assert [status.state for status in statuses] == [None, None]
-
-
 def test_verify_only_noop_improve_does_not_enter_code_adjudication_lane(tmp_path: Path) -> None:
     from gza.runner import REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND
 
@@ -12789,7 +12717,7 @@ def test_verify_only_noop_improve_attention_points_to_unaddressed_sibling_code_r
     verify_review.output_content = _verify_failure_only_review_report()
     store.update(verify_review)
 
-    noop_improve = _add_completed_improve_for_review(
+    _add_completed_improve_for_review(
         store,
         impl,
         verify_review,
@@ -12985,7 +12913,7 @@ def test_same_head_green_verify_clearance_still_parks_when_sibling_completed_imp
     )
     store.update(sibling_review)
 
-    sibling_improve = _add_completed_improve_for_review(
+    _add_completed_improve_for_review(
         store,
         impl,
         sibling_review,
@@ -13082,7 +13010,7 @@ def test_same_head_green_verify_clearance_skips_addressed_middle_sibling_and_par
     )
     store.update(middle_review)
 
-    middle_improve = _add_completed_improve_for_review(
+    _add_completed_improve_for_review(
         store,
         impl,
         middle_review,

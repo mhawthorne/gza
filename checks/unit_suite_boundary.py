@@ -84,13 +84,6 @@ def _find_file_violations(test_file: Path) -> list[Violation]:
         return []
 
     module = ast.parse(source, filename=str(test_file))
-    subprocess_names = {
-        alias.asname or alias.name
-        for node in ast.walk(module)
-        if isinstance(node, ast.Import)
-        for alias in node.names
-        if alias.name == "subprocess"
-    }
     parent_map = (
         {child: parent for parent in ast.walk(module) for child in ast.iter_child_nodes(parent)}
         if has_direct_git_run_call

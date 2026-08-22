@@ -61,7 +61,7 @@ def load_rows(db: Path, project_id: str | None, since: str | None, unit_ids: lis
         where.append("COALESCE(mu.merged_at, mu.updated_at) >= ?")
         params.append(since)
     if unit_ids:
-        where.append("mu.id IN (%s)" % ",".join("?" * len(unit_ids)))
+        where.append(f"mu.id IN ({','.join('?' * len(unit_ids))})")
         params.extend(unit_ids)
     rows = conn.execute(
         f"""

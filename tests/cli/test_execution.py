@@ -15968,7 +15968,7 @@ class TestIterateCommand:
             branch="feature/iterate-force-recovered-real-cap",
         )
         self._attach_recovered_lineage_merge_unit(store, root, head)
-        review = self._make_review_task(store, head, status="completed", verdict="CHANGES_REQUESTED")
+        self._make_review_task(store, head, status="completed", verdict="CHANGES_REQUESTED")
         config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
             store,
             tmp_path,
