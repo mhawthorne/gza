@@ -561,7 +561,9 @@ def test_status_reports_pid_port_and_uptime(tmp_path):
     ):
         result = status_server(path, now=datetime(2026, 8, 17, 5, 1, 30, tzinfo=UTC))
 
-    assert result == "pid: 1234\nport: 4321\nuptime: 90s"
+    assert result == (
+        f"pid: 1234\nport: 4321\nuptime: 90s\nlog: {tmp_path / 'gza-server.log'}"
+    )
 
 
 def test_status_clears_stale_state(tmp_path):

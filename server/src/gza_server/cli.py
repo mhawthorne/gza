@@ -30,6 +30,10 @@ HOST = "127.0.0.1"
 PORT_ENV_VAR = "GZA_SERVER_PORT"
 STATE_FILENAME = "gza-server.json"
 LOCK_FILENAME = "gza-server.lock"
+LOG_FILENAME = "gza-server.log"
+# Rotate one generation so a crash loop cannot fill the disk, while the run
+# before the current one stays readable.
+LOG_MAX_BYTES = 5_000_000
 STOP_TIMEOUT_SECONDS = 5.0
 STARTUP_TIMEOUT_SECONDS = 10.0
 HEALTH_REQUEST_TIMEOUT_SECONDS = 0.25
@@ -87,6 +91,23 @@ def state_file_path(project_dir: Path | None = None) -> Path:
     """Return the server state file in gza's project-local state directory."""
     config = Config.load(project_dir or Path.cwd(), discover=True)
     return config.project_dir / ".gza" / STATE_FILENAME
+
+
+def log_file_path(path: Path) -> Path:
+    """Return the server log beside the state file for this project."""
+    return path.parent / LOG_FILENAME
+
+
+def _open_log_file(path: Path) -> BinaryIO:
+    """Open the append-only server log, rotating one generation when large."""
+    log_path = log_file_path(path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if log_path.stat().st_size > LOG_MAX_BYTES:
+            os.replace(log_path, log_path.with_suffix(log_path.suffix + ".1"))
+    except OSError:
+        pass
+    return log_path.open("ab")
 
 
 def read_state(path: Path) -> ServerState | None:
@@ -450,13 +471,22 @@ def _cleanup_child(process: subprocess.Popen[object]) -> None:
     process.wait()
 
 
-def _startup_diagnostic(stream: BinaryIO) -> str:
+@contextmanager
+def _log_reader(stream: BinaryIO) -> Iterator[BinaryIO]:
+    """Read a stream opened for append, which cannot itself be read."""
+    with open(stream.name, "rb") as reader:  # type: ignore[arg-type]
+        yield reader
+
+
+def _startup_diagnostic(stream: BinaryIO, start_offset: int = 0) -> str:
+    """Read this run's output, ignoring any earlier run's tail in the log."""
     try:
         stream.flush()
-        stream.seek(0, os.SEEK_END)
-        size = stream.tell()
-        stream.seek(max(0, size - STARTUP_DIAGNOSTIC_MAX_BYTES))
-        output = stream.read().decode("utf-8", errors="replace").strip()
+        with _log_reader(stream) as reader:
+            reader.seek(0, os.SEEK_END)
+            size = reader.tell()
+            reader.seek(max(start_offset, size - STARTUP_DIAGNOSTIC_MAX_BYTES))
+            output = reader.read().decode("utf-8", errors="replace").strip()
     except (OSError, ValueError):
         return ""
     if not output:
@@ -496,7 +526,9 @@ def start_server(path: Path, *, reload: bool = True, port: int | None = None) ->
         instance_id = secrets.token_urlsafe(32)
         environment = os.environ.copy()
         environment["GZA_SERVER_INSTANCE_ID"] = instance_id
-        with tempfile.TemporaryFile(mode="w+b") as startup_output:
+        environment[PORT_ENV_VAR] = str(port)
+        with _open_log_file(path) as startup_output:
+            start_offset = startup_output.tell()
             command = [
                 sys.executable,
                 "-m",
@@ -511,6 +543,9 @@ def start_server(path: Path, *, reload: bool = True, port: int | None = None) ->
             ]
             if reload:
                 command += ["--reload", "--reload-dir", str(RELOAD_DIR)]
+            # The guard owns the child, so a server that stops answering is
+            # noticed instead of leaving the port held with nothing behind it.
+            command = [sys.executable, "-m", "gza_server.supervisor", *command]
             process = subprocess.Popen(
                 command,
                 cwd=Path.cwd(),
@@ -534,7 +569,7 @@ def start_server(path: Path, *, reload: bool = True, port: int | None = None) ->
             except BaseException as exc:
                 startup_diagnostic = (
                     f"{_exception_diagnostic(exc)}"
-                    f"{_startup_diagnostic(startup_output)}"
+                    f"{_startup_diagnostic(startup_output, start_offset)}"
                 )
                 try:
                     _cleanup_child(process)
@@ -649,7 +684,21 @@ def status_server(path: Path, *, now: datetime | None = None) -> str:
         if started_at.tzinfo is None:
             started_at = started_at.replace(tzinfo=UTC)
         uptime = max(0, int((current - started_at).total_seconds()))
-        return f"pid: {state.pid}\nport: {state.port}\nuptime: {uptime}s"
+        return (
+            f"pid: {state.pid}\nport: {state.port}\nuptime: {uptime}s\n"
+            f"log: {log_file_path(path)}"
+        )
+
+
+def logs_server(path: Path, *, lines: int = 200) -> str:
+    """Return the tail of the server log, which outlives the server process."""
+    log_path = log_file_path(path)
+    if not log_path.exists():
+        return f"no server log yet at {log_path}"
+    with log_path.open("rb") as reader:
+        text = reader.read().decode("utf-8", errors="replace")
+    tail = text.splitlines()[-lines:]
+    return "\n".join([f"==> {log_path} <==", *tail])
 
 
 def open_server(path: Path) -> str:
@@ -703,6 +752,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="show the running server's pid, port, and uptime",
     )
     subparsers.add_parser("open", help="open the running server in a browser")
+    logs = subparsers.add_parser(
+        "logs", help="print the tail of the server log, including past runs"
+    )
+    logs.add_argument(
+        "-n",
+        "--lines",
+        type=int,
+        default=200,
+        help="how many trailing lines to print",
+    )
     return parser
 
 
@@ -716,6 +775,8 @@ def main(argv: list[str] | None = None) -> int:
             message = stop_server(path)
         elif args.command == "status":
             message = status_server(path)
+        elif args.command == "logs":
+            message = logs_server(path, lines=args.lines)
         else:
             message = open_server(path)
     except LifecycleError as exc:
