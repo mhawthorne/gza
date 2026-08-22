@@ -135,16 +135,25 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   remediation kind, fingerprint context, or other prompt evidence for that same
   signature, the reused task MUST be updated in place so its prompt still matches the
   current classification, except that a row already `in_progress` MUST keep the prompt
-  evidence, tags, urgency, and queue state the running worker actually received. If a
-  same-signature non-live row also exists, watch MUST prefer that non-live row for
-  refresh or requeue and leave the live duplicate untouched until worker-aware
-  reconciliation can retire it. If the live row is the only same-signature match, watch
-  MUST keep it as the signature-owned open row but limit any updates to safe freshness
-  bookkeeping that does not misrepresent the running worker.
+  evidence, tags, urgency, and queue state the running worker actually received. A
+  completed-but-unmerged `fix` row that is still the active remediation MAY remain
+  completed for one production lifecycle cycle so watch can attempt its
+  red-main-exempt merge, and watch MUST describe that row as merge-ready rather than as
+  live in-progress work. If that cycle cannot execute and complete the exempt merge
+  successfully, including a non-merge, needs-attention, skip, merge-environment
+  refusal, stale/nonmergeable pre-execution refusal, or nonzero merge result, watch
+  MUST consume the terminal attempt, clear the active owner, and either requeue the row
+  with incremented attempt metadata or mark the signature exhausted once the configured
+  bound is spent. If a same-signature non-live row also exists, watch MUST prefer that
+  non-live row for refresh or requeue and leave the live duplicate untouched until
+  worker-aware reconciliation can retire it. If the live row is the only same-signature
+  match, watch MUST keep it as the signature-owned open row but limit any updates to
+  safe freshness bookkeeping that does not misrepresent the running worker.
   A post-merge verify rerun that turns green for the same remediation identity MUST clear
-  the active attempt without consuming the budget. A post-merge rerun that is red for a
-  different identity or lacks a trustworthy identity match MUST fail closed on reuse for
-  the old task, but MUST NOT consume that old task's attempt budget.
+  the active attempt without consuming the budget. A post-merge rerun that remains red
+  for the same identity MUST consume the merged remediation attempt. A post-merge rerun
+  that is red for a different identity or lacks a trustworthy identity match MUST fail
+  closed on reuse for the old task, but MUST NOT consume that old task's attempt budget.
 - Reused or newly created remediation tasks for this gate MUST be bumped to the front of
   the runnable queue, because a red or flaky local-target verify is pipeline-critical
   system work.
@@ -166,10 +175,13 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   unbounded verify log.
 - Reusing the same remediation row after a failed automatic attempt MUST be bounded and
   sequential. Watch MUST track the consumed automatic attempts on that single row,
-  increment that state before requeueing a failed remediation, and stop requeueing once
-  the configured bound is spent. Legacy failed remediation rows that predate explicit
-  attempt metadata MUST be treated conservatively as already having spent one automatic
-  attempt.
+  increment that state before requeueing a failed remediation, before requeueing a
+  completed-but-unmerged remediation whose red-main-exempt merge did not succeed,
+  before replacing a dropped same-signature terminal owner observed on restart, and
+  after a merged remediation is proven ineffective by post-merge verify. Watch MUST
+  stop requeueing once the configured bound is spent. Legacy failed remediation rows
+  that predate explicit attempt metadata MUST be treated conservatively as already
+  having spent one automatic attempt.
 - When the automatic remediation bound is exhausted for a failure signature, watch MUST
   leave the single remediation row failed, persist an explicit exhausted reason on that
   row, and emit one signature-scoped human-attention condition instead of creating or
@@ -191,8 +203,11 @@ The repair path MUST distinguish flaky from deterministic verify failures:
   authorized only when the merge subject matches the active remediation by trigger
   source, remediation kind, failure signature, and exact tree fingerprint when one is
   available from the bounded rerun evidence. If the active evidence has no tree
-  fingerprint, the exemption MUST stay conservative and only match a remediation prompt
-  that likewise records fingerprint unavailability.
+  fingerprint and a durable active remediation task id exists for that signature, the
+  exemption MUST match that task id exactly; a same-signature prompt that records
+  fingerprint unavailability MUST NOT override a durable id mismatch. Only when no
+  durable active task id exists may the exemption fall back to a remediation prompt that
+  likewise records fingerprint unavailability.
 - After that exempt remediation merge, watch MUST immediately rerun local-target verify
   against the post-merge local target tree before allowing any later merge in the same
   cycle. Only a green rerun clears the freeze. If the rerun is still red, automation

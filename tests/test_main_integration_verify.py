@@ -93,14 +93,11 @@ def _current_identity(
     )
 
 
-def test_main_verify_remediation_requeue_requires_resolved_existing_route_before_attempt_mutation(tmp_path) -> None:
+def test_main_verify_remediation_pending_reuse_requires_resolved_route_before_mutation(tmp_path) -> None:
     config = _setup_plan_only_model_config(tmp_path)
     store = make_store(tmp_path)
     task = store.add("Existing main verify remediation", task_type="implement")
     assert task.id is not None
-    task.status = "failed"
-    task.failure_reason = "MAX_TURNS"
-    task.completed_at = datetime(2026, 8, 18, 1, 0, tzinfo=UTC)
     store.update(task)
     original = task.__dict__.copy()
     remediation = MainIntegrationVerifyRemediation(
@@ -138,6 +135,75 @@ def test_main_verify_remediation_requeue_requires_resolved_existing_route_before
         )
         is None
     )
+
+
+def test_main_verify_remediation_completed_unmerged_consumes_attempt_and_requeues(tmp_path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    remediation = MainIntegrationVerifyRemediation(
+        kind="fix",
+        signature="phase:ruff",
+        tree_fingerprint=None,
+        failing_phase="ruff",
+        failure="ruff failed",
+        observed_environment_identity=None,
+        artifact_path=None,
+        failing_test_ids=(),
+        verify_excerpt=None,
+    )
+    task = store.add(
+        _main_verify_remediation_prompt(
+            remediation,
+            head_sha="deadbeefcafe",
+            attempts_spent=0,
+            attempt_limit=config.watch.main_verify_remediation_max_attempts,
+        ),
+        task_type="implement",
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime(2026, 8, 22, 1, 0, tzinfo=UTC)
+    task.merge_status = "unmerged"
+    task.branch = "20260822-fix-ruff"
+    task.has_commits = True
+    store.update(task)
+    store.record_main_verify_remediation_active_task(
+        signature="phase:ruff",
+        tree_fingerprint=None,
+        task_id=task.id,
+        last_observed_head_sha="deadbeefcafe",
+        last_observed_failure="ruff failed",
+    )
+
+    outcome = _queue_main_verify_remediation_task(
+        config=config,
+        store=store,
+        task=task,
+        remediation=remediation,
+        head_sha="feedfacecafe",
+        desired_tags=("system", "system-main-verify"),
+        tags=None,
+        any_tag=False,
+    )
+
+    assert outcome == "queued"
+    updated = store.get(task.id)
+    assert updated is not None
+    assert updated.status == "pending"
+    assert updated.completed_at is None
+    assert updated.urgent is True
+    assert updated.queue_position == 1
+    assert "Remediation attempts spent: 1/2" in updated.prompt
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:ruff",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 1
+    assert attempt_state.active_task_id is None
+    assert attempt_state.last_consumed_task_id == task.id
 
 
 def test_candidate_rework_reuse_requires_resolved_existing_route_before_pending_mutation(tmp_path) -> None:

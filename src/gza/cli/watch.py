@@ -355,7 +355,7 @@ class _MainVerifyRemediationIdentity:
 @dataclass(frozen=True)
 class _MainVerifyRemediationEnsureResult:
     task: DbTask | None
-    outcome: Literal["created", "reused", "reused_live", "exhausted"]
+    outcome: Literal["created", "reused", "reused_live", "merge_ready", "exhausted", "not_consumed"]
 
 
 @dataclass(frozen=True)
@@ -368,6 +368,12 @@ class _MainVerifyRemediationSelection:
 class _MainVerifyMootRetireResult:
     retired_ids: tuple[str, ...] = ()
     deferred_live_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class _MainVerifyRemediationConsumeResult:
+    consumed: bool
+    refreshed_state: MainIntegrationVerifyState | None = None
 
 
 MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON = "superseded_same_signature_remediation"
@@ -593,6 +599,59 @@ def _main_verify_remediation_task_is_reusable(
     return False
 
 
+def _main_verify_remediation_task_matches_identity(
+    task: DbTask,
+    identity: _MainVerifyRemediationIdentity,
+) -> bool:
+    if task.task_type != "implement":
+        return False
+    if task.trigger_source != MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE:
+        return False
+    existing_identity = _main_verify_remediation_identity_from_prompt(task.prompt)
+    return existing_identity is not None and _main_verify_remediation_identity_matches(existing_identity, identity)
+
+
+def _main_verify_remediation_active_owner(
+    *,
+    store: SqliteTaskStore,
+    identity: _MainVerifyRemediationIdentity,
+    ledger_fingerprint: str | None,
+    head_sha: str | None = None,
+    failure: str | None = None,
+    clear_invalid: bool,
+) -> tuple[DbTask | None, MainVerifyRemediationAttemptState | None]:
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature=identity.signature,
+        tree_fingerprint=ledger_fingerprint,
+    )
+    if attempt_state is None or attempt_state.active_task_id is None:
+        return None, attempt_state
+    active = store.get(attempt_state.active_task_id)
+    if active is not None and _main_verify_remediation_task_matches_identity(active, identity):
+        return active, attempt_state
+    if clear_invalid:
+        attempt_state = store.clear_main_verify_remediation_active_task(
+            signature=identity.signature,
+            tree_fingerprint=ledger_fingerprint,
+            last_observed_head_sha=head_sha,
+            last_observed_failure=failure,
+        )
+    return None, attempt_state
+
+
+def _main_verify_remediation_effective_merge_state(store: SqliteTaskStore, task: DbTask) -> str | None:
+    if task.id is None:
+        return task.merge_status
+    merge_unit = store.resolve_merge_unit_for_task(task.id)
+    if merge_unit is not None:
+        return effective_no_work_merge_state(task, merge_unit.state)
+    return task.merge_status
+
+
+def _main_verify_remediation_task_is_effectively_merged(store: SqliteTaskStore, task: DbTask) -> bool:
+    return _main_verify_remediation_effective_merge_state(store, task) in {"merged", "empty", "redundant"}
+
+
 def _legacy_main_verify_remediation_rank(
     existing: _MainVerifyRemediationIdentity,
     requested: _MainVerifyRemediationIdentity,
@@ -618,6 +677,7 @@ def _select_legacy_open_main_verify_remediation_tasks(
     store: SqliteTaskStore,
     *,
     identity: _MainVerifyRemediationIdentity,
+    active_task_id: str | None = None,
 ) -> _MainVerifyRemediationSelection:
     preferred: DbTask | None = None
     preferred_rank = (-1, -1)
@@ -631,6 +691,10 @@ def _select_legacy_open_main_verify_remediation_tasks(
         if not _main_verify_remediation_identity_matches(existing_identity, identity):
             continue
         matches.append(task)
+        if active_task_id is not None and task.id == active_task_id:
+            preferred = task
+            preferred_rank = (999, 999)
+            continue
         rank = _main_verify_remediation_selection_rank(task, existing_identity, identity)
         if rank > preferred_rank:
             preferred = task
@@ -685,12 +749,17 @@ def _find_open_main_verify_remediation_tasks(
     *,
     signature: str,
     tree_fingerprint: str | None,
+    active_task_id: str | None = None,
 ) -> _MainVerifyRemediationSelection:
     identity = _MainVerifyRemediationIdentity(
         signature=signature,
         tree_fingerprint=tree_fingerprint,
     )
-    return _select_legacy_open_main_verify_remediation_tasks(store, identity=identity)
+    return _select_legacy_open_main_verify_remediation_tasks(
+        store,
+        identity=identity,
+        active_task_id=active_task_id,
+    )
 
 
 def _retire_moot_main_verify_remediation_tasks(
@@ -972,6 +1041,8 @@ def _main_verify_remediation_prompt_records_unavailable_tree_fingerprint(prompt:
 def _is_active_main_verify_fix_remediation_merge(
     task: DbTask,
     active_remediation: MainIntegrationVerifyRemediation | None,
+    *,
+    active_task_id: str | None = None,
 ) -> bool:
     if active_remediation is None or active_remediation.kind != "fix":
         return False
@@ -985,6 +1056,8 @@ def _is_active_main_verify_fix_remediation_merge(
         return False
     task_tree_fingerprint = _main_verify_remediation_tree_fingerprint_from_prompt(task.prompt)
     if active_remediation.tree_fingerprint is None:
+        if active_task_id is not None:
+            return task.id == active_task_id
         return task_tree_fingerprint is None and _main_verify_remediation_prompt_records_unavailable_tree_fingerprint(
             task.prompt
         )
@@ -1007,7 +1080,6 @@ def _queue_main_verify_remediation_task(
         return "queued"
     if task.status == "in_progress":
         return "live_untouched"
-    require_execution_route_for_task(task, config)
     attempt_limit = config.watch.main_verify_remediation_max_attempts
     previous_tags = tuple(task.tags or ())
     task.tags = desired_tags
@@ -1021,13 +1093,13 @@ def _queue_main_verify_remediation_task(
         attempt_limit=attempt_limit,
         attempt_state=attempt_state,
     )
-    if task.status == "failed":
+    if task.status in {"failed", "completed", "unmerged", "dropped"}:
         spent_attempts = min(spent_attempts + 1, attempt_limit)
         attempt_state = store.record_main_verify_remediation_consumed_attempt(
             signature=remediation.signature,
             tree_fingerprint=ledger_fingerprint,
             task_id=task.id,
-            consumption_key=f"{task.id}:failed-requeue:{spent_attempts}",
+            consumption_key=f"{task.id}:{task.status}-requeue:{spent_attempts}",
             consumed_attempt_floor=max(spent_attempts - 1, 0),
             last_observed_head_sha=head_sha,
             last_observed_failure=remediation.failure,
@@ -1055,6 +1127,7 @@ def _queue_main_verify_remediation_task(
                 ledger_fingerprint=ledger_fingerprint,
             )
             return "exhausted"
+        require_execution_route_for_task(task, config)
         task.status = "pending"
         task.started_at = None
         task.running_pid = None
@@ -1064,6 +1137,8 @@ def _queue_main_verify_remediation_task(
         task.drop_reason = None
         task.execution_mode = None
         store.update(task)
+    else:
+        require_execution_route_for_task(task, config)
     desired_prompt = _main_verify_remediation_prompt(
         remediation,
         head_sha=head_sha,
@@ -1098,6 +1173,7 @@ def _mark_main_verify_remediation_task_exhausted(
     attempt_limit: int,
     ledger_fingerprint: str | None,
 ) -> None:
+    was_effectively_merged = task.id is not None and _main_verify_remediation_task_is_effectively_merged(store, task)
     task.tags = desired_tags
     task.prompt = _main_verify_remediation_prompt(
         remediation,
@@ -1121,6 +1197,8 @@ def _mark_main_verify_remediation_task_exhausted(
     )
     task.completion_reason = f"main verify remediation exhausted after {attempt_limit}/{attempt_limit} attempts"
     store.update(task)
+    if was_effectively_merged and task.id is not None:
+        store.set_merge_status(task.id, "merged")
     store.mark_main_verify_remediation_exhausted(
         signature=remediation.signature,
         tree_fingerprint=ledger_fingerprint,
@@ -1130,10 +1208,68 @@ def _mark_main_verify_remediation_task_exhausted(
     )
 
 
+def _consume_merged_main_verify_remediation_attempt(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    log: "_WatchLog",
+    task: DbTask,
+    remediation: MainIntegrationVerifyRemediation,
+    state,
+    reason: str,
+) -> MainVerifyRemediationAttemptState | None:
+    if task.id is None:
+        return None
+    identity = _main_verify_remediation_identity(remediation)
+    if not _main_verify_remediation_task_matches_identity(task, identity):
+        return None
+    if not _main_verify_remediation_task_is_effectively_merged(store, task):
+        return None
+    attempt_state = store.record_main_verify_remediation_consumed_attempt(
+        signature=identity.signature,
+        tree_fingerprint=_main_verify_remediation_ledger_fingerprint(identity.tree_fingerprint),
+        task_id=task.id,
+        last_observed_head_sha=getattr(state, "head_sha", None),
+        last_observed_failure=remediation.failure,
+    )
+    consumed_count = attempt_state.consumed_attempt_count if attempt_state is not None else 0
+    attempt_budget = config.watch.main_verify_remediation_max_attempts
+    if _main_verify_remediation_attempt_state_exhausted(attempt_state, attempt_limit=attempt_budget):
+        _mark_main_verify_remediation_task_exhausted(
+            config=config,
+            store=store,
+            task=task,
+            remediation=remediation,
+            head_sha=getattr(state, "head_sha", None),
+            desired_tags=_merge_main_verify_remediation_tags([tuple(task.tags or ())], None),
+            spent_attempts=consumed_count,
+            attempt_limit=attempt_budget,
+            ledger_fingerprint=_main_verify_remediation_ledger_fingerprint(identity.tree_fingerprint),
+        )
+        store.set_merge_status(task.id, "merged")
+    else:
+        apply_manual_task_status(
+            config=config,
+            store=store,
+            task=task,
+            status="dropped",
+            reason="main verify remained red after merged remediation; attempt consumed",
+        )
+    phase = remediation.failing_phase or remediation.signature
+    fingerprint_label = remediation.tree_fingerprint or "unavailable"
+    log.emit(
+        "REMEDY",
+        f"{task.id}: consumed merged fix remediation attempt for {phase} on {fingerprint_label} "
+        f"after {reason}; attempt {consumed_count}/{attempt_budget}",
+    )
+    return attempt_state
+
+
 def _ensure_main_verify_remediation_task(
     *,
     config: Config,
     store: SqliteTaskStore,
+    log: "_WatchLog",
     remediation: MainIntegrationVerifyRemediation,
     state,
     tags: tuple[str, ...] | None,
@@ -1146,10 +1282,95 @@ def _ensure_main_verify_remediation_task(
         signature=identity.signature,
         tree_fingerprint=ledger_fingerprint,
     )
+    active_owner, attempt_state = _main_verify_remediation_active_owner(
+        store=store,
+        identity=identity,
+        ledger_fingerprint=ledger_fingerprint,
+        head_sha=state.head_sha,
+        failure=remediation.failure,
+        clear_invalid=True,
+    )
+    active_task_id = active_owner.id if active_owner is not None else None
+    if (
+        active_owner is not None
+        and active_owner.status in {"completed", "unmerged", "dropped"}
+        and _main_verify_remediation_task_is_effectively_merged(store, active_owner)
+    ):
+        attempt_state = _consume_merged_main_verify_remediation_attempt(
+            config=config,
+            store=store,
+            log=log,
+            task=active_owner,
+            remediation=remediation,
+            state=state,
+            reason="restart observed same red signature after merge",
+        )
+        active_owner = None
+        active_task_id = None
+        if _main_verify_remediation_attempt_state_exhausted(attempt_state, attempt_limit=attempt_limit):
+            store.mark_main_verify_remediation_exhausted(
+                signature=identity.signature,
+                tree_fingerprint=ledger_fingerprint,
+                consumed_attempt_count=attempt_limit,
+                last_observed_head_sha=state.head_sha,
+                last_observed_failure=remediation.failure,
+            )
+            return _MainVerifyRemediationEnsureResult(task=None, outcome="exhausted")
+    if (
+        active_owner is not None
+        and active_owner.status == "dropped"
+        and not _main_verify_remediation_task_is_effectively_merged(store, active_owner)
+    ):
+        attempt_state = _consume_terminal_active_main_verify_remediation_without_requeue(
+            store=store,
+            task=active_owner,
+            remediation=remediation,
+            state=state,
+        )
+        if attempt_state is None:
+            store.clear_main_verify_remediation_active_task(
+                signature=identity.signature,
+                tree_fingerprint=ledger_fingerprint,
+                last_observed_head_sha=state.head_sha,
+                last_observed_failure=remediation.failure,
+            )
+            phase = remediation.failing_phase or remediation.signature
+            fingerprint_label = remediation.tree_fingerprint or "unavailable"
+            log.emit(
+                "WARN",
+                f"{active_owner.id}: could not record terminal {remediation.kind} remediation consumption for "
+                f"{phase} on {fingerprint_label} after restart observed dropped active owner; "
+                "cleared stale active owner without selecting successor",
+            )
+            return _MainVerifyRemediationEnsureResult(task=None, outcome="not_consumed")
+        consumed_count = attempt_state.consumed_attempt_count if attempt_state is not None else 0
+        phase = remediation.failing_phase or remediation.signature
+        fingerprint_label = remediation.tree_fingerprint or "unavailable"
+        log.emit(
+            "REMEDY",
+            f"{active_owner.id}: consumed terminal {remediation.kind} remediation attempt for {phase} on "
+            f"{fingerprint_label} after restart observed dropped active owner; selecting successor",
+        )
+        if _main_verify_remediation_attempt_state_exhausted(attempt_state, attempt_limit=attempt_limit):
+            _mark_main_verify_remediation_task_exhausted(
+                config=config,
+                store=store,
+                task=active_owner,
+                remediation=remediation,
+                head_sha=state.head_sha,
+                desired_tags=_merge_main_verify_remediation_tags([tuple(active_owner.tags or ())], tags),
+                spent_attempts=consumed_count,
+                attempt_limit=attempt_limit,
+                ledger_fingerprint=ledger_fingerprint,
+            )
+            return _MainVerifyRemediationEnsureResult(task=active_owner, outcome="exhausted")
+        active_owner = None
+        active_task_id = None
     selection = _find_open_main_verify_remediation_tasks(
         store,
         signature=identity.signature,
         tree_fingerprint=identity.tree_fingerprint,
+        active_task_id=active_task_id,
     )
     existing = selection.canonical
     if existing is not None:
@@ -1172,8 +1393,6 @@ def _ensure_main_verify_remediation_task(
         )
         desired_tags = _merge_main_verify_remediation_tags([merged_legacy_tags], tags)
         should_refresh_existing_metadata = existing.status != "in_progress"
-        if should_refresh_existing_metadata:
-            require_execution_route_for_task(existing, config)
         if should_refresh_existing_metadata and _main_verify_remediation_attempt_state_exhausted(
             attempt_state,
             attempt_limit=attempt_limit,
@@ -1198,8 +1417,12 @@ def _ensure_main_verify_remediation_task(
             existing.prompt = desired_prompt
             existing.tags = desired_tags
             store.update(existing)
-        queue_outcome: Literal["queued", "live_untouched", "exhausted"] = "live_untouched"
-        if existing.status != "in_progress":
+        terminal_fix_ready_for_merge = existing.status in {"completed", "unmerged"} and remediation.kind == "fix"
+        if terminal_fix_ready_for_merge:
+            queue_outcome: Literal["queued", "live_untouched", "exhausted"] = "live_untouched"
+        elif existing.status != "in_progress":
+            if should_refresh_existing_metadata:
+                require_execution_route_for_task(existing, config)
             queue_outcome = _queue_main_verify_remediation_task(
                 config=config,
                 store=store,
@@ -1210,6 +1433,8 @@ def _ensure_main_verify_remediation_task(
                 tags=tags,
                 any_tag=any_tag,
             )
+        else:
+            queue_outcome = "live_untouched"
         if queue_outcome == "exhausted":
             return _MainVerifyRemediationEnsureResult(task=existing, outcome="exhausted")
         if existing.id is not None:
@@ -1220,6 +1445,8 @@ def _ensure_main_verify_remediation_task(
                 last_observed_head_sha=state.head_sha,
                 last_observed_failure=remediation.failure,
             )
+        if terminal_fix_ready_for_merge:
+            return _MainVerifyRemediationEnsureResult(task=existing, outcome="merge_ready")
         return _MainVerifyRemediationEnsureResult(
             task=existing,
             outcome="reused_live" if queue_outcome == "live_untouched" else "reused",
@@ -1390,35 +1617,26 @@ def _maybe_file_main_verify_remediation(
     result = _ensure_main_verify_remediation_task(
         config=config,
         store=store,
+        log=log,
         remediation=remediation,
         state=check.state,
         tags=tags,
         any_tag=any_tag,
     )
     phase = remediation.failing_phase or remediation.signature
-    signature_label = remediation.signature
-    fingerprint_label = remediation.tree_fingerprint or "unavailable"
     attempt_limit = _main_verify_remediation_attempt_limit(config)
     if result.outcome == "exhausted":
-        base_message = check.state.alert_message or "main verify is red; merges halted"
-        exhausted_task = result.task.id if result.task is not None else "no-open-task"
-        message = (
-            f"{base_message}; automatic remediation exhausted after {attempt_limit}/{attempt_limit} "
-            f"attempts for {signature_label} on {fingerprint_label}; remediation {exhausted_task}; "
-            f"signature {remediation.signature}; "
-            "human intervention required"
-        )
-        persisted_state = persist_main_integration_verify_alert_message(
-            store,
+        exhausted_task = result.task.id if result.task is not None and result.task.id is not None else "no-open-task"
+        return _persist_main_verify_remediation_exhausted_attention(
+            store=store,
+            log=log,
             state=check.state,
-            alert_message=message,
+            remediation=remediation,
+            exhausted_task_id=exhausted_task,
+            attempt_limit=attempt_limit,
         )
-        log.emit(
-            "REMEDY",
-            f"automatic remediation exhausted after {attempt_limit}/{attempt_limit} attempts for "
-            f"{signature_label} on {fingerprint_label}",
-        )
-        return persisted_state
+    if result.outcome == "not_consumed":
+        return None
     assert result.task is not None
     if result.outcome == "reused_live":
         log.emit(
@@ -1426,12 +1644,135 @@ def _maybe_file_main_verify_remediation(
             f"{result.task.id}: reused live {remediation.kind} remediation for {phase}; "
             "left existing in_progress row untouched and deferred queue changes",
         )
+    elif result.outcome == "merge_ready":
+        log.emit(
+            "REMEDY",
+            f"{result.task.id}: reused merge-ready {remediation.kind} remediation for {phase}; "
+            "left completed/unmerged row available for lifecycle merge",
+        )
     else:
         log.emit(
             "REMEDY",
             f"{result.task.id}: {result.outcome} {remediation.kind} remediation for {phase}; moved to queue position 1",
         )
     return None
+
+
+def _persist_main_verify_remediation_exhausted_attention(
+    *,
+    store: SqliteTaskStore,
+    log: "_WatchLog",
+    state,
+    remediation: MainIntegrationVerifyRemediation,
+    exhausted_task_id: str,
+    attempt_limit: int,
+) -> MainIntegrationVerifyState:
+    signature_label = remediation.signature
+    fingerprint_label = remediation.tree_fingerprint or "unavailable"
+    base_message = state.alert_message or "main verify is red; merges halted"
+    message = (
+        f"{base_message}; automatic remediation exhausted after {attempt_limit}/{attempt_limit} "
+        f"attempts for {signature_label} on {fingerprint_label}; remediation {exhausted_task_id}; "
+        f"signature {remediation.signature}; "
+        "human intervention required"
+    )
+    persisted_state = persist_main_integration_verify_alert_message(
+        store,
+        state=state,
+        alert_message=message,
+    )
+    log.emit(
+        "REMEDY",
+        f"automatic remediation exhausted after {attempt_limit}/{attempt_limit} attempts for "
+        f"{signature_label} on {fingerprint_label}",
+    )
+    return persisted_state
+
+
+def _consume_unmerged_main_verify_remediation_attempt(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    log: "_WatchLog",
+    task: DbTask,
+    remediation: MainIntegrationVerifyRemediation,
+    state,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    reason: str,
+    active_task_id: str | None = None,
+) -> _MainVerifyRemediationConsumeResult:
+    if task.id is None:
+        return _MainVerifyRemediationConsumeResult(consumed=False)
+    fresh = store.get(task.id)
+    if fresh is None:
+        return _MainVerifyRemediationConsumeResult(consumed=False)
+    if fresh.status not in {"completed", "unmerged", "dropped"}:
+        return _MainVerifyRemediationConsumeResult(consumed=False)
+    if remediation.kind != "fix":
+        return _MainVerifyRemediationConsumeResult(consumed=False)
+    if not _is_active_main_verify_fix_remediation_merge(
+        fresh,
+        remediation,
+        active_task_id=active_task_id,
+    ):
+        return _MainVerifyRemediationConsumeResult(consumed=False)
+    desired_tags = _merge_main_verify_remediation_tags([tuple(fresh.tags or ())], tags)
+    attempt_limit = _main_verify_remediation_attempt_limit(config)
+    queue_outcome = _queue_main_verify_remediation_task(
+        config=config,
+        store=store,
+        task=fresh,
+        remediation=remediation,
+        head_sha=getattr(state, "head_sha", None),
+        desired_tags=desired_tags,
+        tags=tags,
+        any_tag=any_tag,
+    )
+    phase = remediation.failing_phase or remediation.signature
+    fingerprint_label = remediation.tree_fingerprint or "unavailable"
+    if queue_outcome == "exhausted":
+        return _MainVerifyRemediationConsumeResult(
+            consumed=True,
+            refreshed_state=_persist_main_verify_remediation_exhausted_attention(
+                store=store,
+                log=log,
+                state=state,
+                remediation=remediation,
+                exhausted_task_id=task.id,
+                attempt_limit=attempt_limit,
+            ),
+        )
+    log.emit(
+        "REMEDY",
+        f"{task.id}: consumed terminal {remediation.kind} remediation attempt for {phase} on "
+        f"{fingerprint_label} after {reason}; {queue_outcome}",
+    )
+    return _MainVerifyRemediationConsumeResult(consumed=True)
+
+
+def _consume_terminal_active_main_verify_remediation_without_requeue(
+    *,
+    store: SqliteTaskStore,
+    task: DbTask,
+    remediation: MainIntegrationVerifyRemediation,
+    state,
+) -> MainVerifyRemediationAttemptState | None:
+    if task.id is None:
+        return None
+    identity = _main_verify_remediation_identity(remediation)
+    if not _main_verify_remediation_task_matches_identity(task, identity):
+        return None
+    if task.status not in {"completed", "unmerged", "dropped"}:
+        return None
+    return store.record_main_verify_remediation_consumed_attempt(
+        signature=identity.signature,
+        tree_fingerprint=_main_verify_remediation_ledger_fingerprint(identity.tree_fingerprint),
+        task_id=task.id,
+        consumption_key=f"{task.id}:{task.status}-terminal-owner",
+        last_observed_head_sha=getattr(state, "head_sha", None),
+        last_observed_failure=remediation.failure,
+    )
 
 
 def _resolve_merged_main_verify_remediation_task(
@@ -1500,19 +1841,14 @@ def _handle_post_merge_main_verify_remediation_verdict(
     head_sha = getattr(check.state, "head_sha", None)
 
     if check.merges_halted and current_remediation is not None and same_identity:
-        apply_manual_task_status(
+        attempt_state = _consume_merged_main_verify_remediation_attempt(
             config=config,
             store=store,
+            log=log,
             task=remediation_task,
-            status="dropped",
-            reason="main verify remained red after merged remediation; attempt consumed",
-        )
-        attempt_state = store.record_main_verify_remediation_consumed_attempt(
-            signature=merged_identity.signature,
-            tree_fingerprint=_main_verify_remediation_ledger_fingerprint(merged_identity.tree_fingerprint),
-            task_id=remediation_task.id,
-            last_observed_head_sha=head_sha,
-            last_observed_failure=current_remediation.failure,
+            remediation=current_remediation,
+            state=check.state,
+            reason="post-merge verify still red",
         )
         consumed_count = attempt_state.consumed_attempt_count if attempt_state is not None else 0
         attempt_budget = config.watch.main_verify_remediation_max_attempts
@@ -1521,7 +1857,7 @@ def _handle_post_merge_main_verify_remediation_verdict(
         log.emit(
             "REMEDY",
             f"{remediation_task.id}: post-merge verify still red for {phase} on {fingerprint_label}; "
-            f"dropped remediation attempt {consumed_count}/{attempt_budget}",
+            f"consumed remediation attempt {consumed_count}/{attempt_budget}",
         )
         return
 
@@ -8409,6 +8745,7 @@ def _run_cycle(
 
     merge_halted_for_cycle = False
     active_main_verify_remediation: MainIntegrationVerifyRemediation | None = None
+    active_main_verify_remediation_task_id: str | None = None
     merge_verify_git: Git | None = None
     latest_main_verify_state: Any | None = None
     latest_main_verify_git: Git | None = None
@@ -8416,6 +8753,24 @@ def _run_cycle(
         merge_verify_git = merge_git
     elif current_branch == target_branch:
         merge_verify_git = git
+
+    def _set_active_main_verify_remediation(
+        remediation: MainIntegrationVerifyRemediation | None,
+    ) -> None:
+        nonlocal active_main_verify_remediation, active_main_verify_remediation_task_id
+        if remediation is not None and remediation.kind == "fix":
+            active_main_verify_remediation = remediation
+            active_state = store.get_main_verify_remediation_attempt_state(
+                signature=remediation.signature,
+                tree_fingerprint=_main_verify_remediation_ledger_fingerprint(remediation.tree_fingerprint),
+            )
+            active_main_verify_remediation_task_id = (
+                active_state.active_task_id if active_state is not None else None
+            )
+        else:
+            active_main_verify_remediation = None
+            active_main_verify_remediation_task_id = None
+
     if merge_verify_git is not None:
         main_verify = _run_watch_main_integration_verify(
             config=config,
@@ -8456,8 +8811,7 @@ def _run_cycle(
                 target_branch=target_branch,
             )
             remediation = getattr(main_verify, "remediation", None)
-            if remediation is not None and remediation.kind == "fix":
-                active_main_verify_remediation = remediation
+            _set_active_main_verify_remediation(remediation)
         elif getattr(main_verify, "needs_attention", False) and main_verify_state is not None:
             _emit_main_verify_attention(
                 log=log,
@@ -8468,6 +8822,116 @@ def _run_cycle(
             )
         else:
             _clear_main_verify_attention(log=log, state=main_verify_state)
+
+    active_main_verify_terminal_attempt_consumed = False
+
+    def _consume_active_main_verify_remediation_terminal_attempt(
+        candidate: DbTask | None,
+        *,
+        reason: str,
+        require_candidate_lineage: bool = True,
+    ) -> bool:
+        nonlocal active_main_verify_remediation, active_main_verify_remediation_task_id
+        nonlocal latest_main_verify_state, work_done, active_main_verify_terminal_attempt_consumed
+        if dry_run or active_main_verify_terminal_attempt_consumed:
+            return False
+        if active_main_verify_remediation is None or latest_main_verify_state is None:
+            return False
+        if active_main_verify_remediation.kind != "fix" or active_main_verify_remediation_task_id is None:
+            return False
+        active_task = store.get(active_main_verify_remediation_task_id)
+        if active_task is None:
+            store.clear_main_verify_remediation_active_task(
+                signature=active_main_verify_remediation.signature,
+                tree_fingerprint=_main_verify_remediation_ledger_fingerprint(
+                    active_main_verify_remediation.tree_fingerprint
+                ),
+                last_observed_head_sha=getattr(latest_main_verify_state, "head_sha", None),
+                last_observed_failure=active_main_verify_remediation.failure,
+            )
+            active_main_verify_remediation = None
+            active_main_verify_remediation_task_id = None
+            return False
+        active_identity = _main_verify_remediation_identity(active_main_verify_remediation)
+        if not _main_verify_remediation_task_matches_identity(active_task, active_identity):
+            store.clear_main_verify_remediation_active_task(
+                signature=active_main_verify_remediation.signature,
+                tree_fingerprint=_main_verify_remediation_ledger_fingerprint(
+                    active_main_verify_remediation.tree_fingerprint
+                ),
+                last_observed_head_sha=getattr(latest_main_verify_state, "head_sha", None),
+                last_observed_failure=active_main_verify_remediation.failure,
+            )
+            active_main_verify_remediation = None
+            active_main_verify_remediation_task_id = None
+            return False
+        if require_candidate_lineage:
+            if candidate is None or candidate.id is None:
+                return False
+            if not _task_is_descendant_of(store, candidate.id, active_main_verify_remediation_task_id):
+                return False
+        if active_task.status not in {"completed", "unmerged", "dropped"}:
+            return False
+        refreshed_main_verify_state: MainIntegrationVerifyState | None = None
+        if _main_verify_remediation_task_is_effectively_merged(store, active_task):
+            attempt_state = _consume_merged_main_verify_remediation_attempt(
+                config=config,
+                store=store,
+                log=log,
+                task=active_task,
+                remediation=active_main_verify_remediation,
+                state=latest_main_verify_state,
+                reason=reason,
+            )
+            attempt_limit = _main_verify_remediation_attempt_limit(config)
+            if _main_verify_remediation_attempt_state_exhausted(attempt_state, attempt_limit=attempt_limit):
+                store.mark_main_verify_remediation_exhausted(
+                    signature=active_main_verify_remediation.signature,
+                    tree_fingerprint=_main_verify_remediation_ledger_fingerprint(
+                        active_main_verify_remediation.tree_fingerprint
+                    ),
+                    consumed_attempt_count=attempt_limit,
+                    last_observed_head_sha=getattr(latest_main_verify_state, "head_sha", None),
+                    last_observed_failure=active_main_verify_remediation.failure,
+                )
+                refreshed_main_verify_state = _persist_main_verify_remediation_exhausted_attention(
+                    store=store,
+                    log=log,
+                    state=latest_main_verify_state,
+                    remediation=active_main_verify_remediation,
+                    exhausted_task_id=active_main_verify_remediation_task_id,
+                    attempt_limit=attempt_limit,
+                )
+        else:
+            consume_result = _consume_unmerged_main_verify_remediation_attempt(
+                config=config,
+                store=store,
+                log=log,
+                task=active_task,
+                remediation=active_main_verify_remediation,
+                state=latest_main_verify_state,
+                tags=tags,
+                any_tag=any_tag,
+                reason=reason,
+                active_task_id=active_main_verify_remediation_task_id,
+            )
+            if not consume_result.consumed:
+                return False
+            refreshed_main_verify_state = consume_result.refreshed_state
+        if refreshed_main_verify_state is not None:
+            latest_main_verify_state = refreshed_main_verify_state
+            _emit_main_verify_attention(
+                log=log,
+                state=refreshed_main_verify_state,
+                now=datetime.now(UTC),
+                git=git,
+                target_branch=target_branch,
+            )
+        active_main_verify_terminal_attempt_consumed = True
+        active_main_verify_remediation = None
+        active_main_verify_remediation_task_id = None
+        work_done = True
+        return True
 
     if lifecycle_rows:
         action_plan = list(analysis.action_plan)
@@ -8556,6 +9020,7 @@ def _run_cycle(
                         note_handled_child_task_id=step1_handled_child_task_ids.add,
                         defer_lifecycle_start=deferred_lifecycle_starts.append,
                     )
+                    _set_active_main_verify_remediation(active_main_verify_remediation)
                     if batch_work_done:
                         work_done = True
                     batch_processed = len(leading_merge_decisions)
@@ -8568,6 +9033,11 @@ def _run_cycle(
             action = dict(lifecycle_execution_decision.action)
             display_task = row.owner_task
             action_type = action.get("type")
+            if action_type not in {"merge", "merge_with_followups"} and _consume_active_main_verify_remediation_terminal_attempt(
+                task,
+                reason=f"lifecycle selected {action_type or 'non-merge'}",
+            ):
+                continue
             if classify_advance_action(action) == "needs_attention":
                 original_attention_reason = get_needs_attention_reason(action)
                 attention_key: str
@@ -8653,9 +9123,16 @@ def _run_cycle(
                 continue
 
             if action_type in {"merge", "merge_with_followups"}:
+                if task.id is not None:
+                    fresh_task = store.get(task.id)
+                    if fresh_task is not None:
+                        task = fresh_task
+                    if display_task.id == task.id:
+                        display_task = task
                 freeze_exempt = merge_halted_for_cycle and _is_active_main_verify_fix_remediation_merge(
                     task,
                     active_main_verify_remediation,
+                    active_task_id=active_main_verify_remediation_task_id,
                 )
                 if merge_halted_for_cycle and not freeze_exempt:
                     log.emit(
@@ -8676,19 +9153,23 @@ def _run_cycle(
                             "merge actions skipped: isolated checkout unavailable",
                             dedupe_key="merge-isolated-checkout-unavailable",
                         )
+                        if freeze_exempt:
+                            _consume_active_main_verify_remediation_terminal_attempt(
+                                task,
+                                reason="isolated checkout unavailable before merge",
+                            )
                         continue
                     log.emit(
                         "SKIP",
                         "merge actions skipped: not on default branch",
                         dedupe_key="merge-not-default-branch",
                     )
+                    if freeze_exempt:
+                        _consume_active_main_verify_remediation_terminal_attempt(
+                            task,
+                            reason="merge unavailable before execution",
+                        )
                     continue
-                if task.id is not None:
-                    fresh_task = store.get(task.id)
-                    if fresh_task is not None:
-                        task = fresh_task
-                    if display_task.id == task.id:
-                        display_task = task
                 merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
                 effective_merge_state = (
                     effective_no_work_merge_state(task, merge_unit.state)
@@ -8701,6 +9182,11 @@ def _run_cycle(
                         f"{display_task.id}: merge candidate no longer mergeable after watch reconciliation",
                         dedupe_key=f"merge-stale-skip:{display_task.id}",
                     )
+                    if freeze_exempt:
+                        _consume_active_main_verify_remediation_terminal_attempt(
+                            task,
+                            reason="merge candidate no longer mergeable",
+                        )
                     continue
                 if dry_run:
                     merge_event = None
@@ -8729,6 +9215,11 @@ def _run_cycle(
                             f"isolated merge checkout refresh failed; rebuilding: {exc}",
                         )
                         if not _rebuild_isolated_checkout():
+                            if freeze_exempt:
+                                _consume_active_main_verify_remediation_terminal_attempt(
+                                    task,
+                                    reason="isolated checkout rebuild failed before merge",
+                                )
                             continue
                 merge_execution_git = merge_git if (isolation_enabled and merge_git is not None) else git
                 merge_execution_branch = target_branch if isolation_enabled else current_branch
@@ -8762,9 +9253,15 @@ def _run_cycle(
                     ),
                 )
                 rc = merge_result.rc
+                consumed_exempt_terminal_attempt = False
                 if rc == 0:
                     for warning in getattr(merge_result, "promotion_warnings", ()):
                         log.emit("WARN", warning)
+                elif freeze_exempt and active_main_verify_remediation is not None:
+                    consumed_exempt_terminal_attempt = _consume_active_main_verify_remediation_terminal_attempt(
+                        task,
+                        reason="failed merge",
+                    )
                 if rc == 0 and merge_event is not None:
                     merge_status_after = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
                         "merge_status"
@@ -8824,13 +9321,10 @@ def _run_cycle(
                             target_branch=target_branch,
                         )
                         remediation = getattr(main_verify, "remediation", None)
-                        if remediation is not None and remediation.kind == "fix":
-                            active_main_verify_remediation = remediation
-                        else:
-                            active_main_verify_remediation = None
+                        _set_active_main_verify_remediation(remediation)
                     else:
                         merge_halted_for_cycle = False
-                        active_main_verify_remediation = None
+                        _set_active_main_verify_remediation(None)
                         if getattr(main_verify, "needs_attention", False) and main_verify_state is not None:
                             _emit_main_verify_attention(
                                 log=log,
@@ -8897,6 +9391,8 @@ def _run_cycle(
                     continue
                 if rc == 0:
                     work_done = True
+                elif consumed_exempt_terminal_attempt:
+                    continue
                 else:
                     conflict_assessment: _IsolatedMergeFailureAssessment | None = None
                     if isolation_enabled and task.branch is not None:
@@ -9253,6 +9749,12 @@ def _run_cycle(
                         attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
                         message=_watch_needs_attention_message(display_task, no_progress_attention),
                     )
+
+    _consume_active_main_verify_remediation_terminal_attempt(
+        None,
+        reason="no lifecycle merge opportunity",
+        require_candidate_lineage=False,
+    )
 
     _settle_deferred_dispatch_starts(
         deferred_lifecycle_starts,
