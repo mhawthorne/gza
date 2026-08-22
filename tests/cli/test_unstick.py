@@ -2232,10 +2232,14 @@ def test_unstick_run_reports_merge_conflict_rebase_capacity_races_as_capacity_bl
     assert "Direct Blocked:" not in result.stdout
     assert "Cleared Only:" not in result.stdout
     if failure_kind == "permit":
-        assert create_rebase.call_count == 0
+        assert create_rebase.call_count == 1
         assert spawn_worker.call_count == 0
         assert (
             "already at max concurrent tasks: 1 running, limit is 1"
+            in (tmp_path / ".gza" / "unstick-run.log").read_text()
+        )
+        assert (
+            f"merge conflict queued rebase {rebase_task.id} (no launch capacity)"
             in (tmp_path / ".gza" / "unstick-run.log").read_text()
         )
     else:

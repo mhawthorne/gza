@@ -542,9 +542,32 @@ Each watch cycle MUST execute these phases in order:
    per landed merge unit without paying a duplicate full post-merge verify for the same
    exact tree.
    If a member conflicts while being staged into the detached checkout, watch MUST reset
-   the detached checkout to the pre-member staged tip, emit `SKIP <task-id>: merge
-   conflict`, drop only that member from the staged batch, and continue staging later
-   members in lifecycle order.
+   the detached checkout to the pre-member staged tip, emit a `SKIP` line identifying the
+   member conflict or conflict-routed rebase, drop only that member from the staged batch,
+   and continue staging later members in lifecycle order. The conflicting member MUST run
+   the same isolated merge failure assessment and durable rebase-task routing used by
+   the non-batch isolated merge path: a real conflict creates or reuses exactly one
+   active rebase child for the member's branch against the target branch before any
+   worker-dispatch capacity is required, while duplicate active rebase children are
+   reused/deduped instead of accumulating another rebase task on later watch cycles.
+   If that durable child cannot be created or reused, watch MUST fail closed for the
+   batch before staging later members, before running candidate verify, and before
+   promoting or finalizing any staged prefix.
+   Non-batch conflict routing MAY immediately dispatch the child because the target
+   branch is already authoritative. Batch conflict routing MUST NOT start that child
+   until after the canonical target branch has been promoted to include the accumulated
+   staged prefix against which the conflict was classified. If the batch is not
+   promoted, or if launch capacity is unavailable after promotion, the child MUST remain
+   queued for a later cycle and MUST be excluded from generic pending-worker pickup in
+   the same unpromoted cycle. After reserving launch capacity and immediately before
+   startup preparation, both batch and non-batch conflict routing MUST re-read the
+   durable child row and dispatch only a currently pending child. A child that refreshed
+   to `in_progress` MUST be treated as already owned work and MUST NOT be relaunched;
+   a missing or terminal refreshed row MUST emit a visible stale-launch diagnostic
+   without preparing or spawning the stale snapshot. If post-promotion startup
+   preparation for that child fails, watch MUST keep or restore the same child as
+   pending, emit the preparation failure, and allow a later cycle to reuse it instead of
+   creating a duplicate.
    Only an explicitly classified merge conflict may use that per-member skip path;
    non-conflict staging failures MUST remain visible failures and MUST NOT promote the
    remaining batch under conflict semantics. A branch that is already merged into the

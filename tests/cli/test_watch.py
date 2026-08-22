@@ -271,6 +271,40 @@ def _make_completed_watch_merge_task(
     return task
 
 
+def _candidate_verify_check(
+    tmp_path: Path,
+    *,
+    status: str = "passed",
+    classification: str = "pass",
+    tree_fingerprint: str = "fp-candidate",
+    head_sha: str = "candidate-head",
+    failure: str | None = None,
+    failing_phase: str | None = None,
+) -> CandidateIntegrationVerifyCheck:
+    return CandidateIntegrationVerifyCheck(
+        evidence=CandidateIntegrationVerifyEvidence(
+            gate_enabled=True,
+            verify_command="./bin/tests",
+            verify_timeout_seconds=300,
+            verify_timeout_grace_seconds=5.0,
+            environment_identity=None,
+            tree_fingerprint=tree_fingerprint,
+            head_sha=head_sha,
+            verify_status=status,
+            verify_exit_status="0" if status == "passed" else "1",
+            failure=failure,
+            failing_phase=failing_phase,
+            reviewed_branch="main",
+            working_directory=str(tmp_path),
+            captured_at=datetime.now(UTC),
+        ),
+        classification=classification,
+        merges_halted=status != "passed",
+        remediation=None,
+        verify_runs=1,
+    )
+
+
 def _main_verify_red_check(
     main_verify_task: DbTask,
     *,
@@ -945,7 +979,9 @@ def test_watch_query_owner_rows_keeps_same_branch_failed_leaf_with_live_unmerged
 
     assert [row.owner_task.id for row in rows] == [failed.id]
     assert [row.owner_task.id for row in scoped_rows] == [failed.id]
-    assert all(row.recovery_leaf_task is not None and row.recovery_leaf_task.id == failed.id for row in rows + scoped_rows)
+    assert all(
+        row.recovery_leaf_task is not None and row.recovery_leaf_task.id == failed.id for row in rows + scoped_rows
+    )
 
 
 def test_watch_query_owner_rows_flush_prerequisite_reconciliation_after_read_session(
@@ -1821,7 +1857,9 @@ def test_watch_cycle_rebase_duplicate_recovery_message_uses_active_canonical_bra
             side_effect=DuplicateActiveChildError(active_child),
         ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("duplicate should not spawn")),
-        patch("gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("duplicate should not spawn")),
+        patch(
+            "gza.cli.watch._spawn_background_resume_worker", side_effect=AssertionError("duplicate should not spawn")
+        ),
         patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("duplicate should not spawn")),
     ):
         result = _run_cycle(
@@ -10262,7 +10300,12 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_c
     isolated_git.is_merged.return_value = False
     isolated_git.can_merge.side_effect = [False]
 
-    rebase_task = SimpleNamespace(id="gza-rebase-1")
+    rebase_task = store.add(
+        "Cleanup failure conflict rebase",
+        task_type="rebase",
+        based_on=task_a.id,
+        branch=task_a.branch,
+    )
 
     def choose_action(_cfg, _store, _git, task, _target, *, impl_based_on_ids, **_kwargs):  # noqa: ARG001
         if task.id == task_a.id:
@@ -11018,7 +11061,9 @@ def test_watch_cycle_without_isolation_preserves_default_branch_merge_guard(tmp_
 
 def test_watch_cycle_uses_auto_squash_merge_args_from_shared_logic(tmp_path: Path) -> None:
     """Watch merge execution should honor merge_squash_threshold auto-squash."""
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmerge_squash_threshold: 2\n")
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmerge_squash_threshold: 2\n"
+    )
     store = make_store(tmp_path)
 
     task = store.add("Completed task", task_type="implement")
@@ -11712,8 +11757,13 @@ def test_watch_cycle_isolated_batch_skips_conflicting_members_and_promotes_survi
 
     assert result.work_done is True
     assert can_merge_checks == [
-        (task.branch, tip_by_stage_branch[task.branch])
-        for task in expected_stage_order
+        (expected_stage_order[0].branch, tip_by_stage_branch[expected_stage_order[0].branch]),
+        (expected_stage_order[1].branch, tip_by_stage_branch[expected_stage_order[1].branch]),
+        (expected_stage_order[2].branch, tip_by_stage_branch[expected_stage_order[2].branch]),
+        (expected_stage_order[2].branch, tip_by_stage_branch[expected_stage_order[2].branch]),
+        (expected_stage_order[3].branch, tip_by_stage_branch[expected_stage_order[3].branch]),
+        (expected_stage_order[4].branch, tip_by_stage_branch[expected_stage_order[4].branch]),
+        (expected_stage_order[4].branch, tip_by_stage_branch[expected_stage_order[4].branch]),
     ]
     assert staged_merge_sources == [task.branch for task in surviving_tasks]
     assert candidate_verify.call_count == 1
@@ -11727,11 +11777,1429 @@ def test_watch_cycle_isolated_batch_skips_conflicting_members_and_promotes_survi
         assert (store.get(task.id) or SimpleNamespace()).merge_status == "merged"
     for task in (expected_stage_order[2], expected_stage_order[4]):
         assert (store.get(task.id) or SimpleNamespace()).merge_status == "unmerged"
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert {row.based_on for row in rebase_tasks} == {
+        task.id for task in (expected_stage_order[2], expected_stage_order[4])
+    }
+    assert {row.branch for row in rebase_tasks} == {
+        task.branch for task in (expected_stage_order[2], expected_stage_order[4])
+    }
+    assert {row.base_branch for row in rebase_tasks} == {"main"}
     log_text = log_path.read_text()
     for task in surviving_tasks:
         assert f"MERGE     {task.id} -> main" in log_text
-    assert f"SKIP      {expected_stage_order[2].id}: merge conflict" in log_text
-    assert f"SKIP      {expected_stage_order[4].id}: merge conflict" in log_text
+    assert f"SKIP      {expected_stage_order[2].id}: merge conflict routed to rebase" in log_text
+    assert f"SKIP      {expected_stage_order[4].id}: merge conflict routed to rebase" in log_text
+
+
+def test_watch_cycle_isolated_batch_conflict_files_rebase_targeting_default_branch(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    task = _make_completed_watch_merge_task(
+        store,
+        "Batch conflict rebase",
+        branch="feature/watch-batch-conflict-rebase",
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.default_branch.return_value = "main"
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.has_changes.return_value = False
+    merge_git.rev_parse.return_value = "tip-before-conflict"
+    merge_git.can_merge.return_value = False
+
+    def settle_lifecycle_starts(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
+        return [
+            watch_module._WatchDispatchSettleResult(
+                entry=entry,
+                status=watch_module._DispatchSettleStatus.LIVE,
+                reason=f"task {entry.task_id} reached running state",
+                task=store.get(entry.task_id),
+            )
+            for entry in pending_starts
+        ]
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_lifecycle_starts),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is True
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].based_on == task.id
+    assert rebase_tasks[0].branch == task.branch
+    assert rebase_tasks[0].base_branch == "main"
+    assert merge_git.can_merge.call_args_list == [
+        call(task.branch, "tip-before-conflict"),
+        call(task.branch, "tip-before-conflict"),
+    ]
+    assert f"SKIP      {task.id}: merge conflict routed to rebase" in log_path.read_text()
+
+
+def test_watch_cycle_isolated_batch_conflict_dedupes_rebase_across_cycles(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    task = _make_completed_watch_merge_task(
+        store,
+        "Batch duplicate conflict rebase",
+        branch="feature/watch-batch-conflict-rebase-dedupe",
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.default_branch.return_value = "main"
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.has_changes.return_value = False
+    merge_git.rev_parse.return_value = "tip-before-conflict"
+    merge_git.can_merge.return_value = False
+
+    def settle_lifecycle_starts(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
+        return [
+            watch_module._WatchDispatchSettleResult(
+                entry=entry,
+                status=watch_module._DispatchSettleStatus.LIVE,
+                reason=f"task {entry.task_id} reached running state",
+                task=store.get(entry.task_id),
+            )
+            for entry in pending_starts
+        ]
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_lifecycle_starts),
+    ):
+        first = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+        second = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert first.work_done is True
+    assert second.work_done is False
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].based_on == task.id
+    assert rebase_tasks[0].branch == task.branch
+    assert rebase_tasks[0].base_branch == "main"
+    assert "rebase already pending/in progress" in log_path.read_text()
+
+
+def test_watch_cycle_isolated_batch_conflict_starts_rebase_only_after_target_promotion(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    conflicting = _make_completed_watch_merge_task(
+        store,
+        "Later conflicting merge",
+        branch="feature/watch-batch-order-conflict",
+    )
+    earlier = _make_completed_watch_merge_task(
+        store,
+        "Earlier surviving merge",
+        branch="feature/watch-batch-order-earlier",
+    )
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.rev_parse_if_exists.return_value = "candidate-head"
+    merge_git.rev_parse.side_effect = ["tip-before-earlier", "tip-after-earlier"]
+    merge_git.can_merge.return_value = False
+    events: list[str] = []
+
+    staged_earlier = _StagedIsolatedMergeAction(
+        merge_subject=earlier,
+        merge_unit_id=None,
+        merge_branch=earlier.branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+    )
+
+    def fake_stage(*args, **_kwargs):
+        task = args[3]
+        if task.id == earlier.id:
+            return staged_earlier
+        return _MergeActionResult(
+            rc=1,
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+            status="merge_conflict",
+            block_reason="conflict",
+        )
+
+    def fake_finalize(*_args, **kwargs):
+        store.set_merge_status(kwargs["staged"].merge_subject.id, "merged")
+        return SimpleNamespace(
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+        )
+
+    def settle_lifecycle_starts(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
+        return [
+            watch_module._WatchDispatchSettleResult(
+                entry=entry,
+                status=watch_module._DispatchSettleStatus.LIVE,
+                reason=f"task {entry.task_id} reached running state",
+                task=store.get(entry.task_id),
+            )
+            for entry in pending_starts
+        ]
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
+        ),
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch(
+            "gza.cli.watch._promote_isolated_merge_to_target_branch",
+            side_effect=lambda *_a, **_k: events.append("promote") or (),
+        ),
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action", side_effect=fake_finalize),
+        patch("gza.cli.watch.launch_permit"),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=lambda *_a, **_k: events.append("spawn") or 0),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_lifecycle_starts),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is True
+    assert events == ["promote", "spawn"]
+    assert merge_git.can_merge.call_args_list == [call(conflicting.branch, "tip-after-earlier")]
+    assert (store.get(earlier.id) or SimpleNamespace()).merge_status == "merged"
+    assert (store.get(conflicting.id) or SimpleNamespace()).merge_status == "unmerged"
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].based_on == conflicting.id
+    assert rebase_tasks[0].branch == conflicting.branch
+    assert rebase_tasks[0].base_branch == "main"
+
+
+def test_watch_cycle_isolated_batch_rebase_creation_failure_stops_before_later_work(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    later = _make_completed_watch_merge_task(
+        store,
+        "Later merge after unrouted conflict",
+        branch="feature/watch-batch-create-failure-later",
+    )
+    conflicting = _make_completed_watch_merge_task(
+        store,
+        "Conflict with failing rebase creation",
+        branch="feature/watch-batch-create-failure-conflict",
+    )
+    survivor = _make_completed_watch_merge_task(
+        store,
+        "Survivor before failing rebase creation",
+        branch="feature/watch-batch-create-failure-survivor",
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.rev_parse.side_effect = ["tip-before-survivor", "tip-after-survivor"]
+    merge_git.can_merge.return_value = False
+    stage_order: list[str] = []
+    staged_survivor = _StagedIsolatedMergeAction(
+        merge_subject=survivor,
+        merge_unit_id=None,
+        merge_branch=survivor.branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+    )
+
+    def fake_stage(*args, **_kwargs):
+        task = args[3]
+        stage_order.append(task.id)
+        if task.id == survivor.id:
+            return staged_survivor
+        if task.id == conflicting.id:
+            return _MergeActionResult(
+                rc=1,
+                created_followups=[],
+                reused_followups=[],
+                created_investigation_task_ids=[],
+                reused_investigation_task_ids=[],
+                status="merge_conflict",
+                block_reason="conflict",
+            )
+        raise AssertionError("later batch member must not stage after rebase creation failure")
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch("gza.cli.watch._create_rebase_task", side_effect=RuntimeError("database unavailable")),
+        patch("gza.cli.watch.check_candidate_integration_verify") as candidate_verify,
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch") as promote,
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action") as finalize,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=3,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is False
+    assert stage_order == [survivor.id, conflicting.id]
+    candidate_verify.assert_not_called()
+    promote.assert_not_called()
+    finalize.assert_not_called()
+    assert [row for row in store.get_all() if row.task_type == "rebase"] == []
+    for task in (survivor, conflicting, later):
+        assert (store.get(task.id) or SimpleNamespace()).merge_status == "unmerged"
+    log_text = log_path.read_text()
+    assert f"ERROR     {conflicting.id}: failed to create rebase task (database unavailable)" in log_text
+    assert f"ERROR     {conflicting.id}: merge conflict could not be routed to rebase" in log_text
+    assert "merge conflict routed to rebase" not in log_text
+
+
+def test_watch_cycle_isolated_batch_prepare_failure_keeps_pending_rebase_for_reuse(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    conflicting = _make_completed_watch_merge_task(
+        store,
+        "Conflict with failing delayed rebase prepare",
+        branch="feature/watch-batch-prepare-failure-conflict",
+    )
+    survivor = _make_completed_watch_merge_task(
+        store,
+        "Survivor before failing delayed rebase prepare",
+        branch="feature/watch-batch-prepare-failure-survivor",
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.rev_parse_if_exists.return_value = "candidate-head"
+    merge_git.rev_parse.side_effect = [
+        "tip-before-survivor",
+        "tip-after-survivor",
+        "tip-before-conflict-next-cycle",
+    ]
+    merge_git.can_merge.return_value = False
+    staged_survivor = _StagedIsolatedMergeAction(
+        merge_subject=survivor,
+        merge_unit_id=None,
+        merge_branch=survivor.branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+    )
+
+    def fake_stage(*args, **_kwargs):
+        task = args[3]
+        if task.id == survivor.id:
+            return staged_survivor
+        return _MergeActionResult(
+            rc=1,
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+            status="merge_conflict",
+            block_reason="conflict",
+        )
+
+    def fake_finalize(*_args, **kwargs):
+        store.set_merge_status(kwargs["staged"].merge_subject.id, "merged")
+        return SimpleNamespace(
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch("gza.cli.watch._create_rebase_task", wraps=watch_module._create_rebase_task) as create_rebase,
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
+        ),
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch", return_value=()) as promote,
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action", side_effect=fake_finalize) as finalize,
+        patch("gza.cli.watch.launch_permit"),
+        patch("gza.cli._common.prepare_task_startup_phase", side_effect=RuntimeError("startup exploded")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("spawn must not run")) as spawn,
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+    ):
+        first = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+        rebase_tasks_after_first = [row for row in store.get_all() if row.task_type == "rebase"]
+        assert len(rebase_tasks_after_first) == 1
+        first_rebase_id = rebase_tasks_after_first[0].id
+        second = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert first.work_done is True
+    assert second.work_done is False
+    assert create_rebase.call_count == 2
+    promote.assert_called_once()
+    finalize.assert_called_once()
+    spawn.assert_not_called()
+    assert (store.get(survivor.id) or SimpleNamespace()).merge_status == "merged"
+    assert (store.get(conflicting.id) or SimpleNamespace()).merge_status == "unmerged"
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].id == first_rebase_id
+    assert rebase_tasks[0].status == "pending"
+    assert rebase_tasks[0].based_on == conflicting.id
+    assert rebase_tasks[0].branch == conflicting.branch
+    assert rebase_tasks[0].base_branch == "main"
+    log_text = log_path.read_text()
+    assert f"ERROR     {conflicting.id}: failed to prepare merge-conflict rebase task {first_rebase_id}" in log_text
+    assert "rebase already pending/in progress" in log_text
+
+
+def test_watch_cycle_isolated_batch_conflict_keeps_rebase_queued_when_combined_candidate_unavailable(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    survivor = _make_completed_watch_merge_task(
+        store,
+        "Survivor before unavailable combined verify",
+        branch="feature/watch-batch-unavailable-survivor",
+    )
+    conflicting = _make_completed_watch_merge_task(
+        store,
+        "Conflict before unavailable combined verify",
+        branch="feature/watch-batch-unavailable-conflict",
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.rev_parse.side_effect = ["tip-before-survivor", "tip-after-survivor"]
+    merge_git.can_merge.return_value = False
+    staged_survivor = _StagedIsolatedMergeAction(
+        merge_subject=survivor,
+        merge_unit_id=None,
+        merge_branch=survivor.branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+    )
+
+    def fake_stage(*args, **_kwargs):
+        task = args[3]
+        if task.id == survivor.id:
+            return staged_survivor
+        return _MergeActionResult(
+            rc=1,
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+            status="merge_conflict",
+            block_reason="conflict",
+        )
+
+    unavailable_check = _candidate_verify_check(
+        tmp_path,
+        status="unavailable",
+        classification="unavailable",
+        tree_fingerprint="fp-unavailable",
+        head_sha="candidate-head",
+        failure="verify unavailable",
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch("gza.cli.watch.check_candidate_integration_verify", side_effect=[unavailable_check, unavailable_check]),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch") as promote,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("spawn must not run")) as spawn,
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is True
+    promote.assert_not_called()
+    spawn.assert_not_called()
+    assert (store.get(survivor.id) or SimpleNamespace()).merge_status == "unmerged"
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].status == "pending"
+    assert rebase_tasks[0].based_on == conflicting.id
+    assert rebase_tasks[0].branch == conflicting.branch
+    assert rebase_tasks[0].base_branch == "main"
+    assert (
+        f"{conflicting.id}: merge conflict queued rebase {rebase_tasks[0].id} (awaiting target promotion)"
+        in log_path.read_text()
+    )
+
+
+def test_watch_cycle_isolated_batch_conflict_creates_one_rebase_when_launch_capacity_exhausted(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    survivor = _make_completed_watch_merge_task(
+        store,
+        "Survivor before capacity blocked rebase",
+        branch="feature/watch-batch-capacity-survivor",
+    )
+    conflicting = _make_completed_watch_merge_task(
+        store,
+        "Conflict with no launch capacity",
+        branch="feature/watch-batch-capacity-conflict",
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.rev_parse_if_exists.return_value = "candidate-head"
+    merge_git.rev_parse.side_effect = ["tip-before-survivor", "tip-after-survivor"] * 2
+    merge_git.can_merge.return_value = False
+    staged_survivor = _StagedIsolatedMergeAction(
+        merge_subject=survivor,
+        merge_unit_id=None,
+        merge_branch=survivor.branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+    )
+
+    def fake_stage(*args, **_kwargs):
+        task = args[3]
+        if task.id == survivor.id:
+            return staged_survivor
+        return _MergeActionResult(
+            rc=1,
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+            status="merge_conflict",
+            block_reason="conflict",
+        )
+
+    def fake_finalize(*_args, **kwargs):
+        store.set_merge_status(kwargs["staged"].merge_subject.id, "merged")
+        return SimpleNamespace(
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
+        ),
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch", return_value=()),
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action", side_effect=fake_finalize),
+        patch(
+            "gza.cli.watch.launch_permit",
+            side_effect=MaxConcurrentTasksError("already at max concurrent tasks: 1 running, limit is 1"),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("spawn must not run")) as spawn,
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+    ):
+        first = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+        store.set_merge_status(survivor.id, "unmerged")
+        second = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert first.work_done is True
+    assert second.work_done is True
+    spawn.assert_not_called()
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].status == "pending"
+    assert rebase_tasks[0].based_on == conflicting.id
+    assert rebase_tasks[0].branch == conflicting.branch
+    assert rebase_tasks[0].base_branch == "main"
+    log_text = log_path.read_text()
+    assert "already at max concurrent tasks: 1 running, limit is 1" in log_text
+    assert f"{conflicting.id}: merge conflict queued rebase {rebase_tasks[0].id} (no launch capacity)" in log_text
+    assert "rebase already pending/in progress" in log_text
+
+
+def test_watch_cycle_isolated_batch_in_progress_duplicate_rebase_is_not_dispatched_after_promotion(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    survivor = _make_completed_watch_merge_task(
+        store,
+        "Survivor before active duplicate rebase",
+        branch="feature/watch-batch-active-duplicate-survivor",
+    )
+    conflicting = _make_completed_watch_merge_task(
+        store,
+        "Conflict with active duplicate rebase",
+        branch="feature/watch-batch-active-duplicate-conflict",
+    )
+    active_rebase = store.add(
+        "Existing active rebase",
+        task_type="rebase",
+        based_on=conflicting.id,
+        branch=conflicting.branch,
+        base_branch="main",
+    )
+    active_rebase.status = "in_progress"
+    store.update(active_rebase)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.rev_parse_if_exists.return_value = "candidate-head"
+    merge_git.rev_parse.side_effect = ["tip-before-survivor", "tip-after-survivor"]
+    merge_git.can_merge.return_value = False
+    staged_survivor = _StagedIsolatedMergeAction(
+        merge_subject=survivor,
+        merge_unit_id=None,
+        merge_branch=survivor.branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+    )
+
+    def fake_stage(*args, **_kwargs):
+        task = args[3]
+        if task.id == survivor.id:
+            return staged_survivor
+        return _MergeActionResult(
+            rc=1,
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+            status="merge_conflict",
+            block_reason="conflict",
+        )
+
+    def fake_finalize(*_args, **kwargs):
+        store.set_merge_status(kwargs["staged"].merge_subject.id, "merged")
+        return SimpleNamespace(
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
+        ),
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch", return_value=()),
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action", side_effect=fake_finalize),
+        patch("gza.cli.watch.launch_permit", side_effect=AssertionError("reserve must not run")) as reserve,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("spawn must not run")) as spawn,
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is True
+    reserve.assert_not_called()
+    spawn.assert_not_called()
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].id == active_rebase.id
+    assert rebase_tasks[0].status == "in_progress"
+    assert (store.get(survivor.id) or SimpleNamespace()).merge_status == "merged"
+    assert (store.get(conflicting.id) or SimpleNamespace()).merge_status == "unmerged"
+    log_text = log_path.read_text()
+    assert "no launch capacity" not in log_text
+    assert "spawn failed" not in log_text
+
+
+def test_watch_cycle_isolated_batch_pending_rebase_claimed_during_promotion_is_not_relaunched(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    survivor = _make_completed_watch_merge_task(
+        store,
+        "Survivor before claimed pending rebase",
+        branch="feature/watch-batch-claimed-pending-survivor",
+    )
+    conflicting = _make_completed_watch_merge_task(
+        store,
+        "Conflict with claimed pending rebase",
+        branch="feature/watch-batch-claimed-pending-conflict",
+    )
+    active_rebase = store.add(
+        "Existing pending rebase claimed during promotion",
+        task_type="rebase",
+        based_on=conflicting.id,
+        branch=conflicting.branch,
+        base_branch="main",
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.rev_parse_if_exists.return_value = "candidate-head"
+    merge_git.rev_parse.side_effect = ["tip-before-survivor", "tip-after-survivor"]
+    merge_git.can_merge.return_value = False
+    staged_survivor = _StagedIsolatedMergeAction(
+        merge_subject=survivor,
+        merge_unit_id=None,
+        merge_branch=survivor.branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+    )
+
+    def fake_stage(*args, **_kwargs):
+        task = args[3]
+        if task.id == survivor.id:
+            return staged_survivor
+        return _MergeActionResult(
+            rc=1,
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+            status="merge_conflict",
+            block_reason="conflict",
+        )
+
+    def fake_promote(*_args, **_kwargs):
+        claimed = store.get(active_rebase.id)
+        assert claimed is not None
+        claimed.status = "in_progress"
+        claimed.running_pid = 4242
+        claimed.started_at = datetime.now(UTC)
+        store.update(claimed)
+        return ()
+
+    def fake_finalize(*_args, **kwargs):
+        store.set_merge_status(kwargs["staged"].merge_subject.id, "merged")
+        return SimpleNamespace(
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch("gza.cli.watch._create_rebase_task", side_effect=DuplicateActiveChildError(active_rebase)),
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
+        ),
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch", side_effect=fake_promote),
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action", side_effect=fake_finalize),
+        patch("gza.cli._common.prepare_task_startup_phase", side_effect=AssertionError("prepare must not run")) as prep,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("spawn must not run")) as spawn,
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is True
+    prep.assert_not_called()
+    spawn.assert_not_called()
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].id == active_rebase.id
+    assert rebase_tasks[0].status == "in_progress"
+    assert rebase_tasks[0].running_pid == 4242
+    assert (store.get(survivor.id) or SimpleNamespace()).merge_status == "merged"
+    assert (store.get(conflicting.id) or SimpleNamespace()).merge_status == "unmerged"
+    log_text = log_path.read_text()
+    assert f"{conflicting.id}: merge conflict rebase {active_rebase.id} already in_progress; not relaunching" in log_text
+    assert "spawn failed" not in log_text
+
+
+def test_watch_cycle_isolated_batch_dedupes_same_pending_rebase_dispatch_after_promotion(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    survivor = _make_completed_watch_merge_task(
+        store,
+        "Survivor before shared pending rebase",
+        branch="feature/watch-batch-shared-pending-survivor",
+    )
+    conflicting_first = _make_completed_watch_merge_task(
+        store,
+        "First conflict sharing pending rebase",
+        branch="feature/watch-batch-shared-pending-first",
+    )
+    conflicting_second = _make_completed_watch_merge_task(
+        store,
+        "Second conflict sharing pending rebase",
+        branch="feature/watch-batch-shared-pending-second",
+    )
+    active_rebase = store.add(
+        "Existing pending shared rebase",
+        task_type="rebase",
+        based_on=conflicting_first.id,
+        branch=conflicting_first.branch,
+        base_branch="main",
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.rev_parse_if_exists.return_value = "candidate-head"
+    merge_git.rev_parse.side_effect = [
+        "tip-before-survivor",
+        "tip-after-survivor",
+        "tip-after-first-conflict",
+    ]
+    merge_git.can_merge.return_value = False
+    staged_survivor = _StagedIsolatedMergeAction(
+        merge_subject=survivor,
+        merge_unit_id=None,
+        merge_branch=survivor.branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+    )
+
+    def fake_stage(*args, **_kwargs):
+        task = args[3]
+        if task.id == survivor.id:
+            return staged_survivor
+        return _MergeActionResult(
+            rc=1,
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+            status="merge_conflict",
+            block_reason="conflict",
+        )
+
+    def fake_finalize(*_args, **kwargs):
+        store.set_merge_status(kwargs["staged"].merge_subject.id, "merged")
+        return SimpleNamespace(
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+        )
+
+    pending_start_batches: list[list[str]] = []
+
+    def fake_settle_lifecycle_starts(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
+        pending_start_batches.append([entry.task_id for entry in pending_starts])
+        return [
+            watch_module._WatchDispatchSettleResult(
+                entry=entry,
+                status=watch_module._DispatchSettleStatus.LIVE,
+                reason=f"task {entry.task_id} reached running state",
+                task=store.get(entry.task_id),
+            )
+            for entry in pending_starts
+        ]
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch(
+            "gza.cli.watch._create_rebase_task",
+            side_effect=DuplicateActiveChildError(active_rebase),
+        ),
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
+        ),
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch", return_value=()),
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action", side_effect=fake_finalize),
+        patch("gza.cli.watch.launch_permit") as reserve,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn,
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=fake_settle_lifecycle_starts),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=3,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is True
+    assert reserve.call_count == 1
+    assert spawn.call_count == 1
+    assert pending_start_batches == [[active_rebase.id]]
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].id == active_rebase.id
+    assert (store.get(survivor.id) or SimpleNamespace()).merge_status == "merged"
+    assert (store.get(conflicting_first.id) or SimpleNamespace()).merge_status == "unmerged"
+    assert (store.get(conflicting_second.id) or SimpleNamespace()).merge_status == "unmerged"
+
+
+def test_watch_cycle_isolated_batch_reused_pending_rebase_remains_queued_when_promotion_blocked(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    survivor = _make_completed_watch_merge_task(
+        store,
+        "Survivor before blocked pending duplicate",
+        branch="feature/watch-batch-blocked-pending-survivor",
+    )
+    conflicting = _make_completed_watch_merge_task(
+        store,
+        "Conflict reusing blocked pending rebase",
+        branch="feature/watch-batch-blocked-pending-conflict",
+    )
+    active_rebase = store.add(
+        "Existing pending blocked rebase",
+        task_type="rebase",
+        based_on=conflicting.id,
+        branch=conflicting.branch,
+        base_branch="main",
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.rev_parse.side_effect = ["tip-before-survivor", "tip-after-survivor"]
+    merge_git.can_merge.return_value = False
+    staged_survivor = _StagedIsolatedMergeAction(
+        merge_subject=survivor,
+        merge_unit_id=None,
+        merge_branch=survivor.branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+    )
+
+    def fake_stage(*args, **_kwargs):
+        task = args[3]
+        if task.id == survivor.id:
+            return staged_survivor
+        return _MergeActionResult(
+            rc=1,
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+            status="merge_conflict",
+            block_reason="conflict",
+        )
+
+    unavailable_check = _candidate_verify_check(
+        tmp_path,
+        status="unavailable",
+        classification="unavailable",
+        tree_fingerprint="fp-unavailable",
+        head_sha="candidate-head",
+        failure="verify unavailable",
+    )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch("gza.cli.watch._create_rebase_task", side_effect=DuplicateActiveChildError(active_rebase)),
+        patch("gza.cli.watch.check_candidate_integration_verify", side_effect=[unavailable_check, unavailable_check]),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch") as promote,
+        patch("gza.cli.watch.launch_permit", side_effect=AssertionError("reserve must not run")) as reserve,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("spawn must not run")) as spawn,
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is False
+    promote.assert_not_called()
+    reserve.assert_not_called()
+    spawn.assert_not_called()
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].id == active_rebase.id
+    assert rebase_tasks[0].status == "pending"
+    assert (store.get(survivor.id) or SimpleNamespace()).merge_status == "unmerged"
+    assert (store.get(conflicting.id) or SimpleNamespace()).merge_status == "unmerged"
+    assert f"{conflicting.id}: rebase already pending/in progress" in log_path.read_text()
+
+
+def test_watch_cycle_isolated_batch_conflict_then_member_candidate_blocker_keeps_work_done(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    blocker = _make_completed_watch_merge_task(
+        store, "Candidate verify blocker", branch="feature/watch-batch-member-blocker"
+    )
+    conflicting = _make_completed_watch_merge_task(store, "Conflict first", branch="feature/watch-batch-conflict-first")
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.rev_parse.side_effect = ["tip-before-conflict", "tip-before-blocker"]
+    merge_git.can_merge.return_value = False
+
+    blocked_result = _MergeActionResult(
+        rc=1,
+        created_followups=[],
+        reused_followups=[],
+        created_investigation_task_ids=[],
+        reused_investigation_task_ids=[],
+        status="blocked_candidate_verify_unavailable",
+        block_reason="candidate verify blocked isolated promotion",
+        candidate_verify=_candidate_verify_check(
+            tmp_path,
+            status="unavailable",
+            classification="unavailable",
+            tree_fingerprint="fp-member-red",
+            failure="member verify unavailable",
+        ),
+    )
+
+    def fake_stage(*args, **_kwargs):
+        task = args[3]
+        if task.id == conflicting.id:
+            return _MergeActionResult(
+                rc=1,
+                created_followups=[],
+                reused_followups=[],
+                created_investigation_task_ids=[],
+                reused_investigation_task_ids=[],
+                status="merge_conflict",
+                block_reason="conflict",
+            )
+        assert task.id == blocker.id
+        return blocked_result
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch") as promote,
+        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn,
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is True
+    promote.assert_not_called()
+    assert spawn.call_count == 1
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].status == "pending"
+    assert rebase_tasks[0].based_on == conflicting.id
+    assert (store.get(blocker.id) or SimpleNamespace()).merge_status == "unmerged"
+
+
+def test_watch_cycle_isolated_batch_conflict_then_exact_tree_proof_failure_keeps_work_done(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    survivor = _make_completed_watch_merge_task(
+        store, "Survivor before proof failure", branch="feature/watch-proof-survivor"
+    )
+    conflicting = _make_completed_watch_merge_task(
+        store, "Conflict before proof failure", branch="feature/watch-proof-conflict"
+    )
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.rev_parse_if_exists.return_value = "different-head"
+    merge_git.rev_parse.side_effect = ["tip-before-survivor", "tip-after-survivor"]
+    merge_git.can_merge.return_value = False
+    staged_survivor = _StagedIsolatedMergeAction(
+        merge_subject=survivor,
+        merge_unit_id=None,
+        merge_branch=survivor.branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+    )
+
+    def fake_stage(*args, **_kwargs):
+        task = args[3]
+        if task.id == survivor.id:
+            return staged_survivor
+        return _MergeActionResult(
+            rc=1,
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+            status="merge_conflict",
+            block_reason="conflict",
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
+        ),
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch") as promote,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("spawn must not run")) as spawn,
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is True
+    promote.assert_not_called()
+    spawn.assert_not_called()
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].status == "pending"
+    assert rebase_tasks[0].based_on == conflicting.id
+    assert (store.get(survivor.id) or SimpleNamespace()).merge_status == "unmerged"
 
 
 def test_watch_cycle_isolated_batch_non_conflict_stage_failure_stops_without_conflict_skip_or_promotion(
@@ -11743,7 +13211,9 @@ def test_watch_cycle_isolated_batch_non_conflict_stage_failure_stops_without_con
     store = make_store(tmp_path)
 
     tasks = [
-        _make_completed_watch_merge_task(store, f"Batch non-conflict {index}", branch=f"feature/watch-batch-fail-{index}")
+        _make_completed_watch_merge_task(
+            store, f"Batch non-conflict {index}", branch=f"feature/watch-batch-fail-{index}"
+        )
         for index in range(1, 4)
     ]
     expected_stage_order = list(reversed(tasks))
@@ -11827,6 +13297,111 @@ def test_watch_cycle_isolated_batch_non_conflict_stage_failure_stops_without_con
     ) in log_text
 
 
+@pytest.mark.parametrize(
+    ("assessment_reason", "branch_exists", "is_merged", "can_merge"),
+    [
+        ("branch missing", False, False, False),
+        ("no merge conflict detected", True, False, True),
+    ],
+)
+def test_watch_cycle_isolated_batch_conflict_reassessment_non_conflict_stops_before_promotion(
+    tmp_path: Path,
+    assessment_reason: str,
+    branch_exists: bool,
+    is_merged: bool,
+    can_merge: bool,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    tasks = [
+        _make_completed_watch_merge_task(
+            store,
+            f"Batch reassessment {index}",
+            branch=f"feature/watch-batch-reassessment-{assessment_reason.replace(' ', '-')}-{index}",
+        )
+        for index in range(1, 4)
+    ]
+    expected_stage_order = list(reversed(tasks))
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.return_value = branch_exists
+    merge_git.is_merged.return_value = is_merged
+    merge_git.can_merge.return_value = can_merge
+    merge_git.rev_parse.side_effect = ["tip-before-first", "tip-before-second"]
+    staged_first = _StagedIsolatedMergeAction(
+        merge_subject=expected_stage_order[0],
+        merge_unit_id=None,
+        merge_branch=expected_stage_order[0].branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+    )
+    stage_order: list[str] = []
+
+    def fake_stage(*args, **_kwargs):
+        task = args[3]
+        stage_order.append(task.id)
+        if task.id == expected_stage_order[1].id:
+            return _MergeActionResult(
+                rc=1,
+                created_followups=[],
+                reused_followups=[],
+                created_investigation_task_ids=[],
+                reused_investigation_task_ids=[],
+                status="merge_conflict",
+                block_reason="stale conflict",
+            )
+        return staged_first
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch("gza.cli.watch.check_candidate_integration_verify") as candidate_verify,
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch") as promote,
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action") as finalize,
+        patch("gza.cli.watch._create_rebase_task") as create_rebase,
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=3,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is False
+    assert stage_order == [task.id for task in expected_stage_order[:2]]
+    candidate_verify.assert_not_called()
+    promote.assert_not_called()
+    finalize.assert_not_called()
+    create_rebase.assert_not_called()
+    assert [row for row in store.get_all() if row.task_type == "rebase"] == []
+    for task in tasks:
+        assert (store.get(task.id) or SimpleNamespace()).merge_status == "unmerged"
+    log_text = log_path.read_text()
+    assert (
+        f"ERROR     {expected_stage_order[1].id}: merge failed ({assessment_reason}); stopping isolated merge batch"
+        in log_text
+    )
+    assert "merge conflict routed to rebase" not in log_text
+
+
 def test_watch_cycle_isolated_batch_already_merged_reconciliation_counts_as_work_without_conflict_or_verify(
     tmp_path: Path,
 ) -> None:
@@ -11893,6 +13468,130 @@ def test_watch_cycle_isolated_batch_already_merged_reconciliation_counts_as_work
     log_text = log_path.read_text()
     assert "merge conflict" not in log_text
     assert log_text.count(f"MERGE     {task.id} -> main") == 1
+
+
+def test_watch_cycle_isolated_batch_conflict_reassessment_already_merged_reconciles_and_continues(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    tasks = [
+        _make_completed_watch_merge_task(
+            store,
+            f"Batch already-merged race {index}",
+            branch=f"feature/watch-batch-already-merged-race-{index}",
+        )
+        for index in range(1, 4)
+    ]
+    expected_stage_order = list(reversed(tasks))
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = True
+    merge_git.rev_parse_if_exists.return_value = "candidate-head"
+    merge_git.rev_parse.side_effect = ["tip-before-first", "tip-before-second", "tip-before-third"]
+    staged_entries = {
+        task.id: _StagedIsolatedMergeAction(
+            merge_subject=task,
+            merge_unit_id=None,
+            merge_branch=task.branch,
+            pending_squash_reconcile=None,
+            review_task=None,
+            followup_findings=(),
+            created_investigation_task_ids=(),
+            reused_investigation_task_ids=(),
+        )
+        for task in (expected_stage_order[0], expected_stage_order[2])
+    }
+    stage_order: list[str] = []
+
+    def fake_stage(*args, **_kwargs):
+        task = args[3]
+        stage_order.append(task.id)
+        if task.id == expected_stage_order[1].id:
+            return _MergeActionResult(
+                rc=1,
+                created_followups=[],
+                reused_followups=[],
+                created_investigation_task_ids=[],
+                reused_investigation_task_ids=[],
+                status="merge_conflict",
+                block_reason="stale conflict",
+            )
+        return staged_entries[task.id]
+
+    def fake_reconcile(_store, _git, task_id, **_kwargs):
+        store.set_merge_status(task_id, "merged")
+        return SimpleNamespace(ok=True, merge_status="merged")
+
+    def fake_finalize(*_args, **kwargs):
+        store.set_merge_status(kwargs["staged"].merge_subject.id, "merged")
+        return SimpleNamespace(
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch("gza.cli.watch.reconcile_task_branch_merge_truth", side_effect=fake_reconcile) as reconcile_branch,
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
+        ) as candidate_verify,
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch", return_value=()) as promote,
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action", side_effect=fake_finalize) as finalize,
+        patch("gza.cli.watch._create_rebase_task") as create_rebase,
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=3,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is True
+    assert stage_order == [task.id for task in expected_stage_order]
+    reconcile_branch.assert_called_once_with(
+        store,
+        git,
+        str(expected_stage_order[1].id),
+        target_branch="main",
+        include_diff_stats=True,
+        persist=True,
+    )
+    create_rebase.assert_not_called()
+    candidate_verify.assert_called_once()
+    promote.assert_called_once()
+    assert finalize.call_count == 2
+    assert [row for row in store.get_all() if row.task_type == "rebase"] == []
+    for task in tasks:
+        assert (store.get(task.id) or SimpleNamespace()).merge_status == "merged"
+    log_text = log_path.read_text()
+    assert f"REPAIR    {expected_stage_order[1].id}: marked merged after shared reconciliation against main" in log_text
+    assert "merge conflict routed to rebase" not in log_text
 
 
 @pytest.mark.parametrize(
@@ -12632,7 +14331,9 @@ def test_watch_cycle_red_main_after_merge_halts_later_merges_and_emits_single_at
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
-    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "deadbeefcafe" if ref in {"HEAD", "refs/heads/main"} else None)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: "deadbeefcafe" if ref in {"HEAD", "refs/heads/main"} else None
+    )  # type: ignore[method-assign]
 
     merge_calls: list[str] = []
 
@@ -12763,16 +14464,16 @@ def test_watch_cycle_logs_main_verify_green_progress(tmp_path: Path) -> None:
         verify_runs=1,
         remediation=None,
         resolved_signature=None,
-            state=SimpleNamespace(
-                task=main_verify_task,
-                gate_enabled=True,
-                verify_status="passed",
-                verify_exit_status="0",
-                alert_message=None,
-                failing_phase=None,
-                pending_retirement_signatures=(),
-                head_sha="abcdef1234567890",
-            ),
+        state=SimpleNamespace(
+            task=main_verify_task,
+            gate_enabled=True,
+            verify_status="passed",
+            verify_exit_status="0",
+            alert_message=None,
+            failing_phase=None,
+            pending_retirement_signatures=(),
+            head_sha="abcdef1234567890",
+        ),
     )
 
     def fake_main_verify(*_args, **kwargs):
@@ -13028,11 +14729,7 @@ def test_cmd_main_verify_never_asserts_unproven_target_sha_or_halt(
     git = _make_watch_git()
     git.current_branch = MagicMock(return_value="topic")  # type: ignore[method-assign]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
-        side_effect=lambda ref: current_head
-        if ref == "refs/heads/main"
-        else short_ref_head
-        if ref == "main"
-        else None
+        side_effect=lambda ref: current_head if ref == "refs/heads/main" else short_ref_head if ref == "main" else None
     )
     state = SimpleNamespace(
         task=SimpleNamespace(id="gza-main"),
@@ -13157,10 +14854,7 @@ def test_cmd_main_verify_renders_canonical_launch_failure_concisely(
         verify_status="unavailable",
         verify_exit_status=MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
         failing_phase="ruff",
-        failure=(
-            "verify_command environment error: could not launch `ruff` "
-            "for phase `ruff` (not on PATH)"
-        ),
+        failure=("verify_command environment error: could not launch `ruff` for phase `ruff` (not on PATH)"),
         alert_message=(
             "main verify misconfigured - could not launch `ruff` "
             "for phase `ruff` (not on PATH); fix the environment, not the code"
@@ -13277,7 +14971,9 @@ def test_cmd_main_verify_rejects_legacy_exhaustion_with_unknown_invalid_or_empty
     stdout = capsys.readouterr().out.strip()
     assert rc == 1
     assert "main verify evidence unknown for current HEAD" in stdout
-    assert ("unrecognized verify status `mystery`" if verify_status == "mystery" else "invalid verify status evidence") in stdout
+    assert (
+        "unrecognized verify status `mystery`" if verify_status == "mystery" else "invalid verify status evidence"
+    ) in stdout
     assert "feedfacecafe" not in stdout
     assert "RED" not in stdout
     assert "merges halted" not in stdout
@@ -13483,8 +15179,7 @@ def test_watch_main_verify_warns_when_target_sha_lookup_returns_none(tmp_path: P
     warning = "WARN      main verify target SHA unavailable for main: HEAD did not resolve; using unknown"
     checkpoint = "INFO      main verify checking checkpoint for watch-main-verify against main@unknown; will run if stale or if a red result needs bounded confirmation"
     start = (
-        "INFO      main verify starting attempt 1/3 for watch-main-verify against main@unknown; "
-        "suite may take a while"
+        "INFO      main verify starting attempt 1/3 for watch-main-verify against main@unknown; suite may take a while"
     )
     completion = "INFO      main verify green for watch-main-verify against main@unknown; elapsed 2s; attempts 1/3"
     assert warning in log_text
@@ -13542,8 +15237,7 @@ def test_watch_main_verify_expected_target_giterror_reuses_unknown_for_real_chec
     log_text = log_path.read_text()
     assert "WARN      main verify target SHA unavailable for main: HEAD unavailable; using unknown" in log_text
     assert (
-        "INFO      main verify starting attempt 1/1 for watch-main-verify against main@unknown; "
-        "suite may take a while"
+        "INFO      main verify starting attempt 1/1 for watch-main-verify against main@unknown; suite may take a while"
     ) in log_text
     assert (
         "INFO      main verify red for watch-main-verify against main@unknown; phase unit; elapsed 3s; attempts 1/1"
@@ -13681,9 +15375,7 @@ def test_watch_cycle_logs_disabled_main_verify_as_not_green(tmp_path: Path) -> N
         "INFO      main verify checking checkpoint for watch-main-verify against main@0ddba11cafe9; will run if stale or if a red result needs bounded confirmation"
         in log_text
     )
-    assert (
-        "INFO      main verify disabled for watch-main-verify against main@0ddba11cafe9; elapsed 1s"
-    ) in log_text
+    assert ("INFO      main verify disabled for watch-main-verify against main@0ddba11cafe9; elapsed 1s") in log_text
 
 
 def test_watch_main_verify_missing_structured_status_completes_unknown_not_green(tmp_path: Path) -> None:
@@ -13784,12 +15476,10 @@ def test_watch_main_verify_freshness_unavailable_with_halt_completes_unavailable
     assert "main verify red" not in log_text
     assert "after red result" not in log_text
     assert (
-        "INFO      main verify rerun 2/3 for watch-main-verify against main@feedbead1234 "
-        "after unavailable result"
+        "INFO      main verify rerun 2/3 for watch-main-verify against main@feedbead1234 after unavailable result"
     ) in log_text
     assert (
-        "INFO      main verify rerun 3/3 for watch-main-verify against main@feedbead1234 "
-        "after unavailable result"
+        "INFO      main verify rerun 3/3 for watch-main-verify against main@feedbead1234 after unavailable result"
     ) in log_text
     assert (
         "INFO      main verify unavailable for watch-main-verify against main@feedbead1234; elapsed 2s; attempts 3/3"
@@ -13976,8 +15666,7 @@ def test_watch_main_verify_unrecognized_rerun_status_renders_unknown_not_non_gre
     log_text = log_path.read_text()
     assert "after non-green result" not in log_text
     assert (
-        "INFO      main verify rerun 2/3 for watch-main-verify against main@badcafe12345 "
-        "after unknown result"
+        "INFO      main verify rerun 2/3 for watch-main-verify against main@badcafe12345 after unknown result"
     ) in log_text
     assert (
         "INFO      main verify unknown for watch-main-verify against main@badcafe12345; elapsed 2s; attempts 2/3"
@@ -14038,8 +15727,7 @@ def test_watch_cycle_logs_launch_failed_main_verify_as_not_green_with_attention(
         "INFO      main verify launch-failed for watch-main-verify against main@badc0ffee123; elapsed 2s; attempts 1/3"
     ) in log_text
     assert (
-        "ATTENTION main verify misconfigured - verify command launch failed; "
-        "fix the environment, not the code"
+        "ATTENTION main verify misconfigured - verify command launch failed; fix the environment, not the code"
     ) in log_text
     attention_text = log_text.split("ATTENTION ", maxsplit=1)[1]
     assert alert not in attention_text
@@ -14073,10 +15761,7 @@ def test_watch_cycle_logs_main_verify_red_rerun_attempt_progress(
             reviewed_branch="main",
             reviewed_head_sha="1234567890abcdef",
             working_directory=str(tmp_path),
-            output=(
-                "gza-verify phase=failed name=unit duration_seconds=1.0\n"
-                f"VERIFY BODY {run_count}"
-            ),
+            output=(f"gza-verify phase=failed name=unit duration_seconds=1.0\nVERIFY BODY {run_count}"),
             failure="verify failed",
         )
 
@@ -14106,12 +15791,8 @@ def test_watch_cycle_logs_main_verify_red_rerun_attempt_progress(
         "INFO      main verify starting attempt 1/3 for watch-main-verify against main@1234567890ab; "
         "suite may take a while"
     )
-    rerun_2 = (
-        "INFO      main verify rerun 2/3 for watch-main-verify against main@1234567890ab after red result"
-    )
-    rerun_3 = (
-        "INFO      main verify rerun 3/3 for watch-main-verify against main@1234567890ab after red result"
-    )
+    rerun_2 = "INFO      main verify rerun 2/3 for watch-main-verify against main@1234567890ab after red result"
+    rerun_3 = "INFO      main verify rerun 3/3 for watch-main-verify against main@1234567890ab after red result"
     assert stdout.index(start) < stdout.index("VERIFY BODY 1")
     assert stdout.index("VERIFY BODY 1") < stdout.index(rerun_2)
     assert stdout.index(rerun_2) < stdout.index("VERIFY BODY 2")
@@ -14801,7 +16482,9 @@ def test_watch_cycle_red_main_freeze_allows_only_active_fix_remediation_merge(tm
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
-    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "deadbeefcafe" if ref in {"HEAD", "refs/heads/main"} else None)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: "deadbeefcafe" if ref in {"HEAD", "refs/heads/main"} else None
+    )  # type: ignore[method-assign]
 
     merge_calls: list[str] = []
 
@@ -16301,8 +17984,7 @@ def test_watch_cycle_main_verify_remediation_exhaustion_blocks_new_task_creation
     assert attempt_state.exhausted_at is not None
     log_text = log_path.read_text()
     expected_attention = (
-        "main verify remediation exhausted for phase:functional after 2/2 attempts; "
-        "human intervention required"
+        "main verify remediation exhausted for phase:functional after 2/2 attempts; human intervention required"
     )
     assert log_text.count("ATTENTION") == 1
     assert log_text.count("Needs attention (1 task):") == 1
@@ -16803,12 +18485,10 @@ def test_main_verify_exhausted_attention_uses_non_phase_signature_for_key_and_me
     attention_lines = [line for line in log_path.read_text().splitlines() if " ATTENTION " in line]
     assert len(attention_lines) == 2
     assert (
-        "main verify remediation exhausted for status:failed:exit:1 after 2/2 attempts; "
-        "human intervention required"
+        "main verify remediation exhausted for status:failed:exit:1 after 2/2 attempts; human intervention required"
     ) in attention_lines[0]
     assert (
-        "main verify remediation exhausted for status:failed:exit:2 after 2/2 attempts; "
-        "human intervention required"
+        "main verify remediation exhausted for status:failed:exit:2 after 2/2 attempts; human intervention required"
     ) in attention_lines[1]
     assert "feedfacecafe" not in "\n".join(attention_lines)
     assert "merges halted" not in "\n".join(attention_lines)
@@ -17111,10 +18791,7 @@ def test_watch_cycle_emits_attention_for_main_verify_launch_issue_without_freezi
             verify_status="unavailable",
             verify_exit_status="launch failed",
             failing_phase="ruff",
-            failure=(
-                "verify_command environment error: could not launch `ruff` "
-                "for phase `ruff` (not on PATH)"
-            ),
+            failure=("verify_command environment error: could not launch `ruff` for phase `ruff` (not on PATH)"),
         ),
     )
 
@@ -17532,7 +19209,7 @@ def test_watch_cycle_replaces_buffered_main_verify_red_with_exhausted_after_reme
             log=log,
             tags=("202606-recovery",),
             any_tag=False,
-    )
+        )
 
     assert merge_calls == [remediation_task.id]
     log_text = log_path.read_text()
@@ -17555,7 +19232,9 @@ def test_watch_cycle_keeps_current_main_verify_red_attention_when_head_unchanged
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
-    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None
+    )  # type: ignore[method-assign]
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -17893,7 +19572,9 @@ def test_watch_cycle_green_drops_failed_main_verify_remediation_with_real_check_
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
     git.repo_dir = tmp_path
-    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None
+    )  # type: ignore[method-assign]
 
     green_result = _make_review_verify_result(
         "./bin/tests",
@@ -18715,7 +20396,9 @@ def test_watch_stale_green_main_verify_rerun_retries_pending_retirement_after_li
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
     git.repo_dir = tmp_path
-    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None
+    )  # type: ignore[method-assign]
     green_result = _make_review_verify_result(
         "./bin/tests",
         status="passed",
@@ -20485,7 +22168,9 @@ def test_watch_cycle_configured_unavailable_main_verify_halts_later_merges(tmp_p
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
-    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "deadbeefcafe" if ref in {"HEAD", "refs/heads/main"} else None)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: "deadbeefcafe" if ref in {"HEAD", "refs/heads/main"} else None
+    )  # type: ignore[method-assign]
 
     merge_calls: list[str] = []
 
@@ -20574,7 +22259,9 @@ def test_watch_cycle_head_change_reverifies_main_and_surfaces_attention_without_
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
-    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None
+    )  # type: ignore[method-assign]
 
     red = SimpleNamespace(
         merges_halted=True,
@@ -20658,7 +22345,9 @@ def test_watch_cycle_isolated_main_verify_summary_uses_real_target_ref(
         side_effect=lambda ref: "cafebabecafe" if ref == "refs/heads/main" else "feedfacecafe"
     )
     isolated_git = _make_watch_git()
-    isolated_git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None)  # type: ignore[method-assign]
+    isolated_git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None
+    )  # type: ignore[method-assign]
 
     red = SimpleNamespace(
         merges_halted=True,
@@ -20751,7 +22440,9 @@ def test_watch_cycle_idle_head_change_reverifies_main_and_surfaces_attention_row
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
-    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None
+    )  # type: ignore[method-assign]
 
     red = SimpleNamespace(
         merges_halted=True,
@@ -22999,7 +24690,12 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebas
     isolated_git.is_merged.return_value = False
     isolated_git.can_merge.return_value = False
 
-    created_rebase = SimpleNamespace(id="test-rebase-raw")
+    created_rebase = store.add(
+        "Prepared rebase child",
+        task_type="rebase",
+        based_on=task.id,
+        branch=task.branch,
+    )
     prepared_rebase = SimpleNamespace(id="test-rebase-prepared")
 
     with (
@@ -23049,6 +24745,126 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebas
     assert f"START     {prepared_rebase.id} rebase" in log_path.read_text()
 
 
+def test_isolated_merge_conflict_rebase_dispatch_refreshes_pending_child_after_permit(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n")
+    store = make_store(tmp_path)
+    display_task = _make_completed_watch_merge_task(
+        store,
+        "Immediate stale refresh owner",
+        branch="feature/watch-immediate-refresh-owner",
+    )
+    rebase_task = store.add(
+        "Immediate stale refresh rebase",
+        task_type="rebase",
+        based_on=display_task.id,
+        branch=display_task.branch,
+    )
+    stale_snapshot = store.get(rebase_task.id)
+    assert stale_snapshot is not None
+    claimed = store.get(rebase_task.id)
+    assert claimed is not None
+    claimed.status = "in_progress"
+    claimed.running_pid = 5151
+    claimed.started_at = datetime.now(UTC)
+    store.update(claimed)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    permit = MagicMock()
+    observations: list[tuple[str | None, str, str, str | None]] = []
+
+    result = watch_module._dispatch_isolated_merge_conflict_rebase(
+        display_task=display_task,
+        task=display_task,
+        rebase_task=stale_snapshot,
+        log=log,
+        reserve_launch=lambda _subject_id: permit,
+        refresh_rebase_task=lambda task_id: store.get(task_id),
+        prepare_reserved_task=MagicMock(side_effect=AssertionError("prepare must not run")),
+        free_worker_start_slots=lambda: 1,
+        spawn_rebase_worker=MagicMock(side_effect=AssertionError("spawn must not run")),
+        release_reserved_task=MagicMock(),
+        observe_dispatch=lambda *args: observations.append(args),
+        defer_lifecycle_start=MagicMock(),
+        conflict_assessment=None,
+    )
+
+    assert result.handled is True
+    assert result.work_done is True
+    assert result.rebase_task is not None
+    assert result.rebase_task.status == "in_progress"
+    assert (store.get(rebase_task.id) or SimpleNamespace()).running_pid == 5151
+    permit.release.assert_called_once_with()
+    assert observations == []
+    assert f"{display_task.id}: merge conflict rebase {rebase_task.id} already in_progress; not relaunching" in log_path.read_text()
+
+
+@pytest.mark.parametrize(
+    ("refresh_status", "expected_detail"),
+    [
+        (None, "disappeared before launch"),
+        ("completed", "is no longer pending (status: completed); stale launch skipped"),
+    ],
+)
+def test_isolated_merge_conflict_rebase_dispatch_skips_missing_or_terminal_refresh(
+    tmp_path: Path,
+    refresh_status: str | None,
+    expected_detail: str,
+) -> None:
+    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n")
+    store = make_store(tmp_path)
+    display_task = _make_completed_watch_merge_task(
+        store,
+        "Immediate terminal refresh owner",
+        branch="feature/watch-immediate-terminal-refresh-owner",
+    )
+    rebase_task = store.add(
+        "Immediate terminal refresh rebase",
+        task_type="rebase",
+        based_on=display_task.id,
+        branch=display_task.branch,
+    )
+    stale_snapshot = store.get(rebase_task.id)
+    assert stale_snapshot is not None
+    if refresh_status is not None:
+        refreshed = store.get(rebase_task.id)
+        assert refreshed is not None
+        refreshed.status = refresh_status
+        refreshed.completed_at = datetime.now(UTC)
+        store.update(refreshed)
+
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    permit = MagicMock()
+    observations: list[tuple[str | None, str, str, str | None]] = []
+
+    result = watch_module._dispatch_isolated_merge_conflict_rebase(
+        display_task=display_task,
+        task=display_task,
+        rebase_task=stale_snapshot,
+        log=log,
+        reserve_launch=lambda _subject_id: permit,
+        refresh_rebase_task=lambda task_id: None if refresh_status is None else store.get(task_id),
+        prepare_reserved_task=MagicMock(side_effect=AssertionError("prepare must not run")),
+        free_worker_start_slots=lambda: 1,
+        spawn_rebase_worker=MagicMock(side_effect=AssertionError("spawn must not run")),
+        release_reserved_task=MagicMock(),
+        observe_dispatch=lambda *args: observations.append(args),
+        defer_lifecycle_start=MagicMock(),
+        conflict_assessment=None,
+    )
+
+    assert result.handled is True
+    assert result.work_done is False
+    permit.release.assert_called_once_with()
+    assert observations
+    assert observations[0][:3] == (display_task.id, "launch_blocked", "needs_rebase")
+    assert expected_detail in str(observations[0][3])
+    assert expected_detail in log_path.read_text()
+
+
 def test_watch_cycle_merge_conflict_undispatched_rebase_does_not_consume_slot(tmp_path: Path) -> None:
     """An undispatched merge-conflict rebase should fall through so the next queued task can start."""
     (tmp_path / "gza.yaml").write_text(
@@ -23081,7 +24897,12 @@ def test_watch_cycle_merge_conflict_undispatched_rebase_does_not_consume_slot(tm
     isolated_git.is_merged.return_value = False
     isolated_git.can_merge.return_value = False
 
-    created_rebase = SimpleNamespace(id="test-rebase-raw")
+    created_rebase = store.add(
+        "Undispatched rebase child",
+        task_type="rebase",
+        based_on=task.id,
+        branch=task.branch,
+    )
     prepared_rebase = SimpleNamespace(id="test-rebase-prepared")
 
     def settle_lifecycle_starts(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
@@ -23145,7 +24966,7 @@ def test_watch_cycle_merge_conflict_undispatched_rebase_does_not_consume_slot(tm
     assert f"START     {queued.id} plan" in log_text
 
 
-def test_watch_cycle_merge_conflict_skips_rebase_at_max_concurrent_without_creating_task(tmp_path: Path) -> None:
+def test_watch_cycle_merge_conflict_queues_rebase_at_max_concurrent_without_spawning(tmp_path: Path) -> None:
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
     )
@@ -23172,8 +24993,6 @@ def test_watch_cycle_merge_conflict_skips_rebase_at_max_concurrent_without_creat
     isolated_git.branch_exists.return_value = True
     isolated_git.is_merged.return_value = False
     isolated_git.can_merge.return_value = False
-
-    before_count = len(store.get_all())
 
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
@@ -23212,10 +25031,16 @@ def test_watch_cycle_merge_conflict_skips_rebase_at_max_concurrent_without_creat
             log=log,
         )
 
-    assert result.work_done is False
-    assert len(store.get_all()) == before_count
-    assert [row for row in store.get_all() if row.task_type == "rebase"] == []
-    assert "already at max concurrent tasks: 1 running, limit is 1" in log_path.read_text()
+    assert result.work_done is True
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].status == "pending"
+    assert rebase_tasks[0].based_on == task.id
+    assert rebase_tasks[0].branch == task.branch
+    assert rebase_tasks[0].base_branch == "main"
+    log_text = log_path.read_text()
+    assert "already at max concurrent tasks: 1 running, limit is 1" in log_text
+    assert f"{task.id}: merge conflict queued rebase {rebase_tasks[0].id} (no launch capacity)" in log_text
 
 
 def test_watch_cycle_off_default_branch_targets_rebase_to_default_branch(tmp_path: Path) -> None:
@@ -23999,11 +25824,14 @@ def test_blind_parked_auto_rearm_ignores_verify_fix_failed_without_mutating_manu
 
     assert result.decisions == ()
     assert result.rearmed_owner_ids == ()
-    assert store.get_parked_task_rearm(
-        subject_kind="task",
-        subject_id=impl.id,
-        attention_reason=VERIFY_FIX_FAILED_REASON,
-    ) is None
+    assert (
+        store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id=impl.id,
+            attention_reason=VERIFY_FIX_FAILED_REASON,
+        )
+        is None
+    )
     assert store.list_all_watch_progress_observations(parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON)
     after_auto_action = determine_next_action(
         config,
@@ -25092,7 +26920,9 @@ def test_watch_cycle_materialized_create_review_iterate_records_review_task_and_
             side_effect=AssertionError("plain review creation should not run"),
         ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
-        patch("gza.cli.watch._spawn_background_iterate", side_effect=run_iterate_and_materialize_review) as spawn_iterate,
+        patch(
+            "gza.cli.watch._spawn_background_iterate", side_effect=run_iterate_and_materialize_review
+        ) as spawn_iterate,
         patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_lifecycle_starts),
     ):
         _run_cycle(
@@ -25257,7 +27087,9 @@ def test_watch_cycle_fresh_create_review_action_keeps_materialized_review_identi
             side_effect=AssertionError("plain review creation should not run"),
         ),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("plain worker should not run")),
-        patch("gza.cli.watch._spawn_background_iterate", side_effect=run_iterate_and_materialize_review) as spawn_iterate,
+        patch(
+            "gza.cli.watch._spawn_background_iterate", side_effect=run_iterate_and_materialize_review
+        ) as spawn_iterate,
         patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_lifecycle_starts),
     ):
         _run_cycle(
@@ -25365,7 +27197,9 @@ def test_watch_cycle_fresh_create_review_action_survives_restart_after_materiali
         patch("gza.cli._common.prune_terminal_dead_workers"),
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.watch.determine_next_action", side_effect=lambda *_args, **_kwargs: fresh_action()),
-        patch("gza.cli.watch._spawn_background_iterate", side_effect=run_iterate_and_materialize_review) as spawn_iterate,
+        patch(
+            "gza.cli.watch._spawn_background_iterate", side_effect=run_iterate_and_materialize_review
+        ) as spawn_iterate,
         patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_lifecycle_starts),
     ):
         _run_cycle(
@@ -25591,7 +27425,10 @@ def test_watch_cycle_verify_gate_followup_progress_does_not_trigger_no_progress_
         patch("gza.cli.watch.Git", return_value=git),
         patch("gza.cli.advance_executor.Git", return_value=worktree_git),
         patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=lifecycle_verify_result),
-        patch("gza.cli.watch._prepare_create_review_action", side_effect=AssertionError("second cycle should not need review creation")),
+        patch(
+            "gza.cli.watch._prepare_create_review_action",
+            side_effect=AssertionError("second cycle should not need review creation"),
+        ),
     ):
         _run_cycle(
             config=config,
@@ -27699,24 +29536,33 @@ def test_resolution_review_retry_ignores_prior_same_scope_failed_review_without_
         "resolution_target_sha": "target-head",
     }
 
-    assert _observe_selected_watch_no_progress_without_dispatch(
-        store=store,
-        subject_task=impl,
-        action=action,
-        action_task=impl,
-        failed_task=None,
-        no_progress_cycles=2,
-    ) is None
-    assert _observe_selected_watch_no_progress_without_dispatch(
-        store=store,
-        subject_task=impl,
-        action=action,
-        action_task=impl,
-        failed_task=None,
-        no_progress_cycles=2,
-    ) is None
+    assert (
+        _observe_selected_watch_no_progress_without_dispatch(
+            store=store,
+            subject_task=impl,
+            action=action,
+            action_task=impl,
+            failed_task=None,
+            no_progress_cycles=2,
+        )
+        is None
+    )
+    assert (
+        _observe_selected_watch_no_progress_without_dispatch(
+            store=store,
+            subject_task=impl,
+            action=action,
+            action_task=impl,
+            failed_task=None,
+            no_progress_cycles=2,
+        )
+        is None
+    )
     candidate = build_watch_progress_candidate(store, subject_task=impl, action=action, action_task=impl)
-    assert store.list_watch_progress_observations(subject_kind=candidate.subject_kind, subject_id=candidate.subject_id) == []
+    assert (
+        store.list_watch_progress_observations(subject_kind=candidate.subject_kind, subject_id=candidate.subject_id)
+        == []
+    )
 
 
 def test_spec_coherence_retry_ignores_prior_same_scope_failed_review_without_parking(
@@ -27752,24 +29598,33 @@ def test_spec_coherence_retry_ignores_prior_same_scope_failed_review_without_par
         "review_changed_paths": ("specs/behavior/lifecycle-engine.md",),
     }
 
-    assert _observe_selected_watch_no_progress_without_dispatch(
-        store=store,
-        subject_task=impl,
-        action=action,
-        action_task=impl,
-        failed_task=None,
-        no_progress_cycles=2,
-    ) is None
-    assert _observe_selected_watch_no_progress_without_dispatch(
-        store=store,
-        subject_task=impl,
-        action=action,
-        action_task=impl,
-        failed_task=None,
-        no_progress_cycles=2,
-    ) is None
+    assert (
+        _observe_selected_watch_no_progress_without_dispatch(
+            store=store,
+            subject_task=impl,
+            action=action,
+            action_task=impl,
+            failed_task=None,
+            no_progress_cycles=2,
+        )
+        is None
+    )
+    assert (
+        _observe_selected_watch_no_progress_without_dispatch(
+            store=store,
+            subject_task=impl,
+            action=action,
+            action_task=impl,
+            failed_task=None,
+            no_progress_cycles=2,
+        )
+        is None
+    )
     candidate = build_watch_progress_candidate(store, subject_task=impl, action=action, action_task=impl)
-    assert store.list_watch_progress_observations(subject_kind=candidate.subject_kind, subject_id=candidate.subject_id) == []
+    assert (
+        store.list_watch_progress_observations(subject_kind=candidate.subject_kind, subject_id=candidate.subject_id)
+        == []
+    )
 
 
 @pytest.mark.parametrize(
@@ -27867,7 +29722,10 @@ def test_watch_cycle_create_review_retry_ignores_preexisting_terminal_same_epoch
             )
 
     candidate = build_watch_progress_candidate(store, subject_task=impl, action=action, action_task=impl)
-    assert store.list_watch_progress_observations(subject_kind=candidate.subject_kind, subject_id=candidate.subject_id) == []
+    assert (
+        store.list_watch_progress_observations(subject_kind=candidate.subject_kind, subject_id=candidate.subject_id)
+        == []
+    )
     assert WATCH_NO_PROGRESS_BACKSTOP_REASON not in (tmp_path / ".gza" / "watch.log").read_text()
 
 
@@ -28175,14 +30033,17 @@ def test_create_review_matching_active_duplicate_still_parks_at_threshold(tmp_pa
 
     action = {"type": "create_review", "description": "Create review", "review_head_sha": "same-head"}
 
-    assert _observe_selected_watch_no_progress_without_dispatch(
-        store=store,
-        subject_task=impl,
-        action=action,
-        action_task=impl,
-        failed_task=None,
-        no_progress_cycles=2,
-    ) is None
+    assert (
+        _observe_selected_watch_no_progress_without_dispatch(
+            store=store,
+            subject_task=impl,
+            action=action,
+            action_task=impl,
+            failed_task=None,
+            no_progress_cycles=2,
+        )
+        is None
+    )
     attention = _observe_selected_watch_no_progress_without_dispatch(
         store=store,
         subject_task=impl,
@@ -33011,7 +34872,9 @@ def test_main_verify_attention_summary_keeps_red_line_when_head_is_unchanged(tmp
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
-    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: "feedfacecafe" if ref in {"HEAD", "refs/heads/main"} else None
+    )  # type: ignore[method-assign]
     state = SimpleNamespace(
         task=SimpleNamespace(id="gza-main"),
         head_sha="feedfacecafe",
@@ -33195,8 +35058,7 @@ def test_main_verify_formatter_omits_duration_for_current_freshness_unavailable(
 
     assert message is not None
     assert message == (
-        "main verify freshness unproven at `feedfacecafe` - merges halted; "
-        "exact tree fingerprint unavailable"
+        "main verify freshness unproven at `feedfacecafe` - merges halted; exact tree fingerprint unavailable"
     )
     assert "red for" not in message
 
@@ -33234,8 +35096,7 @@ def test_main_verify_formatter_limits_exhausted_duration_to_current_proven_faile
 
     assert message is not None
     assert (
-        "main verify remediation exhausted for phase:unit after 2/2 attempts; "
-        "human intervention required"
+        "main verify remediation exhausted for phase:unit after 2/2 attempts; human intervention required"
     ) in message
     assert ("red for 8m" in message) is expected_has_duration
 
@@ -33641,10 +35502,7 @@ def test_main_verify_attention_summary_sanitizes_launch_failure_with_legacy_red_
     [
         (
             MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
-            (
-                "main verify freshness unproven at `feedfacecafe` - merges halted; "
-                "exact tree fingerprint unavailable"
-            ),
+            ("main verify freshness unproven at `feedfacecafe` - merges halted; exact tree fingerprint unavailable"),
         ),
         (
             MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
@@ -33871,8 +35729,7 @@ def test_main_verify_attention_summary_limits_exhausted_duration_to_current_prov
 
     summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
     assert (
-        "main verify remediation exhausted for phase:unit after 2/2 attempts; "
-        "human intervention required"
+        "main verify remediation exhausted for phase:unit after 2/2 attempts; human intervention required"
     ) in summary_text
     assert ("red for 8m" in summary_text) is expected_has_duration
     if target_head != "feedfacecafe":
@@ -33944,8 +35801,7 @@ def test_main_verify_missing_alert_exhaustion_finalizes_as_proof_free_human_atte
 
     summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1]
     assert (
-        "main verify remediation exhausted for phase:functional after 2/2 attempts; "
-        "human intervention required"
+        "main verify remediation exhausted for phase:functional after 2/2 attempts; human intervention required"
     ) in summary_text
     assert "feedfacecafe" not in summary_text
     assert "merges halted" not in summary_text
@@ -34013,7 +35869,9 @@ def test_main_verify_attention_summary_clears_exhausted_key_after_green_resoluti
     )
     _emit_cycle_attention_summary(log)
 
-    summary_text = log_path.read_text().split("INFO      ", maxsplit=1)[1] if "INFO      " in log_path.read_text() else ""
+    summary_text = (
+        log_path.read_text().split("INFO      ", maxsplit=1)[1] if "INFO      " in log_path.read_text() else ""
+    )
     assert "Needs attention" not in summary_text
     assert "remediation exhausted" not in summary_text
 
@@ -35327,7 +37185,9 @@ def _add_landed_reroot_owner(
     return owner, selected, sibling
 
 
-def _park_task_watch_progress(store: SqliteTaskStore, task: Task, *, parked_reason: str = "retry-limit-reached") -> None:
+def _park_task_watch_progress(
+    store: SqliteTaskStore, task: Task, *, parked_reason: str = "retry-limit-reached"
+) -> None:
     assert task.id is not None
     store.upsert_watch_progress_observation(
         WatchProgressObservation(
@@ -35485,8 +37345,7 @@ def test_watch_scoped_ordinary_descendant_selector_keeps_canonical_owner_scope(t
         for row in plan.analysis.owner_rows
     )
     assert any(
-        row.owner_task.id == owner.id and task.id == owner.id
-        for row, task, _action in plan.analysis.action_plan
+        row.owner_task.id == owner.id and task.id == owner.id for row, task, _action in plan.analysis.action_plan
     )
     assert result.scoped_done is False
     assert result.scoped_active == 1
@@ -35565,8 +37424,7 @@ def test_watch_scoped_failed_descendant_under_nonterminal_owner_keeps_canonical_
 
     assert plan.analysis.effective_scoped_owner_ids == (owner.id,)
     assert any(
-        row.owner_task.id == owner.id and task.id == owner.id
-        for row, task, _action in plan.analysis.action_plan
+        row.owner_task.id == owner.id and task.id == owner.id for row, task, _action in plan.analysis.action_plan
     )
     assert result.effective_scoped_owner_ids == (owner.id,)
     assert result.scoped_done is False
@@ -35670,8 +37528,7 @@ def test_watch_scoped_failed_descendant_honors_nonterminal_active_unit_over_stal
 
     assert plan.analysis.effective_scoped_owner_ids == (owner.id,)
     assert any(
-        row.owner_task.id == owner.id and task.id == owner.id
-        for row, task, _action in plan.analysis.action_plan
+        row.owner_task.id == owner.id and task.id == owner.id for row, task, _action in plan.analysis.action_plan
     )
     assert result.effective_scoped_owner_ids == (owner.id,)
     scope_line = next(line for line in log_path.read_text().splitlines() if "scope: owners=" in line)
@@ -35892,9 +37749,7 @@ def test_watch_scoped_leaf_failure_backoff_boundaries_do_not_collapse_to_shared_
         config=config,
         scoped_owner_ids=(selected.id, sibling.id),
     )
-    assert [(failure.task_id, failure.owner_task_id) for failure in failures] == [
-        (selected_recovery.id, selected.id)
-    ]
+    assert [(failure.task_id, failure.owner_task_id) for failure in failures] == [(selected_recovery.id, selected.id)]
 
     log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
     failure_backoffs: dict[str, _OwnerFailureBackoffState] = {}
@@ -36100,17 +37955,23 @@ def test_watch_stale_park_reconcile_scope_boundaries_cover_unscoped_owner_and_le
     _park_stale_pending_action_watch_progress(store, selected)
     _park_stale_pending_action_watch_progress(store, sibling)
 
-    assert reconcile_stale_watch_no_progress_parks(
-        store,
-        scopes=(("effective_leaf", selected.id),),
-    ) == 1
+    assert (
+        reconcile_stale_watch_no_progress_parks(
+            store,
+            scopes=(("effective_leaf", selected.id),),
+        )
+        == 1
+    )
     assert store.list_watch_progress_observations(subject_kind="task", subject_id=selected.id) == []
     assert store.list_watch_progress_observations(subject_kind="task", subject_id=sibling.id)
 
-    assert reconcile_stale_watch_no_progress_parks(
-        store,
-        scopes=(("canonical_owner", owner.id),),
-    ) == 1
+    assert (
+        reconcile_stale_watch_no_progress_parks(
+            store,
+            scopes=(("canonical_owner", owner.id),),
+        )
+        == 1
+    )
     assert store.list_watch_progress_observations(subject_kind="task", subject_id=sibling.id) == []
 
     _park_stale_pending_action_watch_progress(store, selected)
@@ -36154,7 +38015,10 @@ def test_watch_scoped_leaf_blind_auto_rearm_does_not_clear_stale_sibling_backsto
         startup_scoped_owner_ids=(owner.id,),
     )
 
-    assert any(decision.status == "rearmed" and decision.candidate.subject_task.id == selected_parked.id for decision in result.decisions)
+    assert any(
+        decision.status == "rearmed" and decision.candidate.subject_task.id == selected_parked.id
+        for decision in result.decisions
+    )
     assert store.list_watch_progress_observations(subject_kind="task", subject_id=sibling.id)
 
 
@@ -36559,7 +38423,9 @@ def test_watch_scoped_parked_leaf_ignores_unselected_sibling_running_work(tmp_pa
 
 def test_watch_scoped_two_parked_leaf_selectors_under_one_owner_complete(tmp_path: Path) -> None:
     _config, store, owner, selected, sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
-    second_selected = store.add("Second selected parked leaf", task_type="implement", based_on=owner.id, same_branch=True)
+    second_selected = store.add(
+        "Second selected parked leaf", task_type="implement", based_on=owner.id, same_branch=True
+    )
     assert second_selected.id is not None
     second_selected.status = "failed"
     second_selected.failure_reason = "MAX_TURNS"
@@ -36695,7 +38561,9 @@ def _make_stale_selected_recovery_plan(
         recovery_attention_rows=(),
         recovery_visible_skips=(),
         recovery_undispatched_rows=(),
-        actionable_failed=((row, selected, decision, {"type": "retry", "description": "Retry selected"}, True, selected),),
+        actionable_failed=(
+            (row, selected, decision, {"type": "retry", "description": "Retry selected"}, True, selected),
+        ),
         pending_recovery_task_ids=frozenset(),
         effective_scoped_owner_ids=(selected.id,),
     )
@@ -36713,7 +38581,9 @@ def _make_stale_selected_recovery_plan(
 
 def test_cmd_watch_scoped_boundary_backoff_discards_primed_recovery_plan(tmp_path: Path) -> None:
     config, store, owner, selected, _sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
-    recovery_child = store.add("Selected recovery child fails before first cycle", task_type="implement", based_on=selected.id)
+    recovery_child = store.add(
+        "Selected recovery child fails before first cycle", task_type="implement", based_on=selected.id
+    )
     assert recovery_child.id is not None
     recovery_child.status = "pending"
     store.update(recovery_child)
@@ -36761,7 +38631,9 @@ def test_cmd_watch_scoped_boundary_backoff_discards_primed_recovery_plan(tmp_pat
 
 def test_cmd_watch_scoped_boundary_backoff_discards_confirmed_preview_plan(tmp_path: Path) -> None:
     _config, store, owner, selected, _sibling = _setup_stale_failed_leaf_live_reroot_scope(tmp_path)
-    recovery_child = store.add("Selected preview recovery child fails before first cycle", task_type="implement", based_on=selected.id)
+    recovery_child = store.add(
+        "Selected preview recovery child fails before first cycle", task_type="implement", based_on=selected.id
+    )
     assert recovery_child.id is not None
     recovery_child.status = "pending"
     store.update(recovery_child)
@@ -37077,16 +38949,22 @@ def test_watch_cycle_scoped_blind_auto_rearm_keeps_sibling_parked_and_replans_le
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
     assert f"[resume of {selected.id}]" in log_text
     assert sibling.id not in log_text
-    assert store.get_parked_task_rearm(
-        subject_kind="task",
-        subject_id=selected.id,
-        attention_reason="retry-limit-reached",
-    ) is not None
-    assert store.get_parked_task_rearm(
-        subject_kind="task",
-        subject_id=sibling.id,
-        attention_reason="retry-limit-reached",
-    ) is None
+    assert (
+        store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id=selected.id,
+            attention_reason="retry-limit-reached",
+        )
+        is not None
+    )
+    assert (
+        store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id=sibling.id,
+            attention_reason="retry-limit-reached",
+        )
+        is None
+    )
     assert store.list_watch_progress_observations(subject_kind="task", subject_id=sibling.id)
 
 
@@ -37165,16 +39043,22 @@ def test_watch_cycle_scoped_blind_auto_rearm_uses_real_discovery_for_selected_le
     assert result.scoped_done is False
     assert result.scoped_active == 1
     assert SCOPED_WATCH_COMPLETE_MESSAGE not in log_path.read_text()
-    assert store.get_parked_task_rearm(
-        subject_kind="task",
-        subject_id=selected.id,
-        attention_reason="retry-limit-reached",
-    ) is not None
-    assert store.get_parked_task_rearm(
-        subject_kind="task",
-        subject_id=unselected.id,
-        attention_reason="retry-limit-reached",
-    ) is None
+    assert (
+        store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id=selected.id,
+            attention_reason="retry-limit-reached",
+        )
+        is not None
+    )
+    assert (
+        store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id=unselected.id,
+            attention_reason="retry-limit-reached",
+        )
+        is None
+    )
 
 
 def test_blind_auto_rearm_real_discovery_keeps_two_selected_parked_leaves_distinct_under_one_owner(
@@ -37219,8 +39103,7 @@ def test_blind_auto_rearm_real_discovery_keeps_two_selected_parked_leaves_distin
     )
 
     assert {
-        (decision.candidate.subject_task.id, decision.status, decision.detail)
-        for decision in result.decisions
+        (decision.candidate.subject_task.id, decision.status, decision.detail) for decision in result.decisions
     } == {
         (selected_a.id, "rearmed", "blind auto-rearm"),
         (selected_b.id, "rearmed", "blind auto-rearm"),
@@ -37357,9 +39240,7 @@ def test_blind_auto_rearm_real_discovery_expands_owner_scope_but_not_leaf_scope(
     )
 
     assert {
-        decision.candidate.subject_task.id
-        for decision in owner_result.decisions
-        if decision.status == "rearmed"
+        decision.candidate.subject_task.id for decision in owner_result.decisions if decision.status == "rearmed"
     } == {selected.id, sibling.id}
 
     with store._connect() as conn:  # noqa: SLF001 - reset temp rearm state between selector modes
@@ -37382,15 +39263,16 @@ def test_blind_auto_rearm_real_discovery_expands_owner_scope_but_not_leaf_scope(
     )
 
     assert {
-        decision.candidate.subject_task.id
-        for decision in leaf_result.decisions
-        if decision.status == "rearmed"
+        decision.candidate.subject_task.id for decision in leaf_result.decisions if decision.status == "rearmed"
     } == {selected.id}
-    assert store.get_parked_task_rearm(
-        subject_kind="task",
-        subject_id=sibling.id,
-        attention_reason="retry-limit-reached",
-    ) is None
+    assert (
+        store.get_parked_task_rearm(
+            subject_kind="task",
+            subject_id=sibling.id,
+            attention_reason="retry-limit-reached",
+        )
+        is None
+    )
 
 
 def test_cmd_watch_scoped_live_reroot_retains_two_selected_leaves_under_one_owner(tmp_path: Path) -> None:
@@ -37703,17 +39585,20 @@ def test_watch_scoped_positional_effective_scope_survives_duplicate_selector_row
 
     scope_line = watch_module._format_scope_message(None, any_tag=False, scoped_owner_ids=retained_effective)
     assert selected.id in scope_line
-    assert _collect_unhandled_failures(
-        {
-            sibling.id: {"status": "pending", "task_type": "implement", "failure_reason": None},
-        },
-        {
-            sibling.id: {"status": "failed", "task_type": "implement", "failure_reason": "SIBLING_BOOM"},
-        },
-        store=store,
-        config=_config,
-        scoped_owner_ids=(selected.id, selected.id),
-    ) == []
+    assert (
+        _collect_unhandled_failures(
+            {
+                sibling.id: {"status": "pending", "task_type": "implement", "failure_reason": None},
+            },
+            {
+                sibling.id: {"status": "failed", "task_type": "implement", "failure_reason": "SIBLING_BOOM"},
+            },
+            store=store,
+            config=_config,
+            scoped_owner_ids=(selected.id, selected.id),
+        )
+        == []
+    )
 
 
 def test_watch_cycle_scoped_mode_does_not_log_unrelated_quiet_pending_tasks(tmp_path: Path) -> None:
@@ -38007,7 +39892,9 @@ def test_watch_cycle_verify_gate_owner_mismatch_passes_planned_task_to_executor(
         analysis=analysis,
     )
     git = _make_watch_git()
-    git.rev_parse_if_exists = MagicMock(side_effect=lambda ref: "head-1" if ref in {"feature/planned-owner", "main"} else None)
+    git.rev_parse_if_exists = MagicMock(
+        side_effect=lambda ref: "head-1" if ref in {"feature/planned-owner", "main"} else None
+    )
 
     with (
         patch("gza.cli.watch.Git", return_value=git),
@@ -40237,7 +42124,7 @@ def test_watch_scoped_terminal_merged_owner_does_not_select_distinct_failed_desc
             max_recovery_attempts=1,
             scoped_owner_ids=scoped_owner_ids,
             scoped_task_ids=(str(owner.id),),
-    )
+        )
 
     assert scoped_owner_ids == (owner.id,)
     assert plan.analysis.owner_rows == ()
@@ -41716,7 +43603,9 @@ def test_collect_unhandled_failures_default_mode_counts_resumable_failure_after_
     tmp_path: Path,
 ) -> None:
     """Default watch should count capped resumable failures toward backoff."""
-    (tmp_path / "gza.yaml").write_text("project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n")
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmax_resume_attempts: 1\n"
+    )
     store = make_store(tmp_path)
 
     root = store.add("Failed root", task_type="implement")

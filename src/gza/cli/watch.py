@@ -1959,9 +1959,7 @@ def _query_scoped_owner_rows_with_context(
     for selector in selectors:
         raw_task = store.get(selector.raw_task_id) if selector.raw_task_id is not None else None
         raw_self_scopes_failed_leaf = (
-            selector.raw_task_id == selector.startup_owner_id
-            and raw_task is not None
-            and raw_task.status == "failed"
+            selector.raw_task_id == selector.startup_owner_id and raw_task is not None and raw_task.status == "failed"
         )
         selector_task_ids = (
             None
@@ -1979,7 +1977,9 @@ def _query_scoped_owner_rows_with_context(
             any_tag=any_tag,
             owner_task_ids=selector_owner_ids,
             task_ids=selector_task_ids,
-            selector_filter_mode="union" if selector_owner_ids is not None and selector_task_ids is not None else "intersection",
+            selector_filter_mode="union"
+            if selector_owner_ids is not None and selector_task_ids is not None
+            else "intersection",
             max_recovery_attempts=max_recovery_attempts,
             include_skipped=include_skipped,
         )
@@ -3588,6 +3588,22 @@ class _CandidateReworkBatchContext:
     batch_size: int
 
 
+@dataclass(frozen=True)
+class _MergeConflictRebaseRoutingResult:
+    handled: bool
+    work_done: bool
+    assessment: _IsolatedMergeFailureAssessment | None
+    rebase_task: DbTask | None = None
+    routing_error: str | None = None
+
+
+@dataclass(frozen=True)
+class _BatchConflictRebaseDispatch:
+    display_task: DbTask
+    task: DbTask
+    rebase_task: DbTask
+
+
 def _candidate_rework_identity(display_task: DbTask, check: CandidateIntegrationVerifyCheck) -> str:
     evidence = check.evidence
     gate_identity = (
@@ -3726,6 +3742,252 @@ def _should_queue_candidate_rework(check: CandidateIntegrationVerifyCheck | None
     }
 
 
+def _route_isolated_merge_conflict_to_rebase(
+    *,
+    merge_git: Git,
+    task: DbTask,
+    display_task: DbTask,
+    assessment_target_branch: str,
+    log: "_WatchLog",
+    reserve_launch: Callable[[str], LaunchPermit | None],
+    create_rebase_task: Callable[[DbTask], DbTask],
+    refresh_rebase_task: Callable[[str], DbTask | None],
+    prepare_reserved_task: Callable[[DbTask, LaunchPermit], DbTask | None],
+    free_worker_start_slots: Callable[[], int],
+    spawn_rebase_worker: Callable[[DbTask], int],
+    release_reserved_task: Callable[[str | None], None],
+    observe_dispatch: Callable[
+        [
+            str | None,
+            Literal[
+                "started",
+                "direct",
+                "direct_blocked",
+                "direct_error",
+                "capacity_blocked",
+                "launch_blocked",
+            ],
+            str,
+            str | None,
+        ],
+        None,
+    ],
+    note_handled_child_task_id: Callable[[str], None],
+    defer_lifecycle_start: Callable[["_DeferredWatchDispatchStart"], None],
+    cleanup_after_conflict: Callable[[], None] | None = None,
+    dispatch_immediately: bool = True,
+) -> _MergeConflictRebaseRoutingResult:
+    if task.branch is None:
+        return _MergeConflictRebaseRoutingResult(False, False, None)
+    conflict_assessment = _assess_isolated_merge_failure(
+        merge_git,
+        task.branch,
+        assessment_target_branch,
+    )
+    if not conflict_assessment.is_conflict:
+        return _MergeConflictRebaseRoutingResult(False, False, conflict_assessment)
+    if cleanup_after_conflict is not None:
+        cleanup_after_conflict()
+    try:
+        rebase_task = create_rebase_task(task)
+    except DuplicateActiveChildError as rebase_error:
+        detail = format_duplicate_rebase_message(
+            rebase_error,
+            parent_task_id=str(display_task.id),
+        )
+        observe_dispatch(display_task.id, "launch_blocked", "needs_rebase", detail)
+        log.emit(
+            "SKIP",
+            f"{display_task.id}: {detail}",
+            dedupe_key=f"watch-duplicate-rebase:{display_task.id}",
+        )
+        active_child = rebase_error.active_child
+        if active_child.id is not None:
+            note_handled_child_task_id(str(active_child.id))
+        return _MergeConflictRebaseRoutingResult(True, False, conflict_assessment, active_child)
+    except Exception as rebase_error:
+        detail = f"failed to create rebase task ({rebase_error})"
+        observe_dispatch(display_task.id, "launch_blocked", "needs_rebase", detail)
+        log.emit("ERROR", f"{display_task.id}: {detail}")
+        return _MergeConflictRebaseRoutingResult(False, False, conflict_assessment, routing_error=detail)
+    assert rebase_task.id is not None
+    note_handled_child_task_id(str(rebase_task.id))
+    if not dispatch_immediately:
+        log.emit(
+            "SKIP",
+            f"{display_task.id}: merge conflict queued rebase {rebase_task.id} (awaiting target promotion)",
+            dedupe_key=f"merge-conflict-rebase-queued:{display_task.id}",
+        )
+        log.emit(
+            "SKIP",
+            f"{display_task.id}: merge conflict routed to rebase",
+            dedupe_key=f"merge-conflict:{display_task.id}",
+        )
+        return _MergeConflictRebaseRoutingResult(True, True, conflict_assessment, rebase_task)
+
+    return _dispatch_isolated_merge_conflict_rebase(
+        display_task=display_task,
+        task=task,
+        rebase_task=rebase_task,
+        log=log,
+        reserve_launch=reserve_launch,
+        refresh_rebase_task=refresh_rebase_task,
+        prepare_reserved_task=prepare_reserved_task,
+        free_worker_start_slots=free_worker_start_slots,
+        spawn_rebase_worker=spawn_rebase_worker,
+        release_reserved_task=release_reserved_task,
+        observe_dispatch=observe_dispatch,
+        defer_lifecycle_start=defer_lifecycle_start,
+        conflict_assessment=conflict_assessment,
+    )
+
+
+def _dispatch_isolated_merge_conflict_rebase(
+    *,
+    display_task: DbTask,
+    task: DbTask,
+    rebase_task: DbTask,
+    log: "_WatchLog",
+    reserve_launch: Callable[[str], LaunchPermit | None],
+    refresh_rebase_task: Callable[[str], DbTask | None],
+    prepare_reserved_task: Callable[[DbTask, LaunchPermit], DbTask | None],
+    free_worker_start_slots: Callable[[], int],
+    spawn_rebase_worker: Callable[[DbTask], int],
+    release_reserved_task: Callable[[str | None], None],
+    observe_dispatch: Callable[
+        [
+            str | None,
+            Literal[
+                "started",
+                "direct",
+                "direct_blocked",
+                "direct_error",
+                "capacity_blocked",
+                "launch_blocked",
+            ],
+            str,
+            str | None,
+        ],
+        None,
+    ],
+    defer_lifecycle_start: Callable[["_DeferredWatchDispatchStart"], None],
+    conflict_assessment: _IsolatedMergeFailureAssessment | None,
+) -> _MergeConflictRebaseRoutingResult:
+    reserved_launch = reserve_launch(str(display_task.id))
+    if reserved_launch is None:
+        observe_dispatch(display_task.id, "capacity_blocked", "needs_rebase", None)
+        log.emit(
+            "SKIP",
+            f"{display_task.id}: merge conflict queued rebase {rebase_task.id} (no launch capacity)",
+            dedupe_key=f"merge-conflict-rebase-queued:{display_task.id}",
+        )
+        log.emit(
+            "SKIP",
+            f"{display_task.id}: merge conflict routed to rebase",
+            dedupe_key=f"merge-conflict:{display_task.id}",
+        )
+        return _MergeConflictRebaseRoutingResult(True, True, conflict_assessment, rebase_task)
+    rebase_task_id = str(rebase_task.id) if rebase_task.id is not None else None
+    if rebase_task_id is None:
+        reserved_launch.release()
+        detail = "merge-conflict rebase task has no durable id before launch"
+        observe_dispatch(display_task.id, "launch_blocked", "needs_rebase", detail)
+        log.emit("ERROR", f"{display_task.id}: {detail}")
+        return _MergeConflictRebaseRoutingResult(True, False, conflict_assessment, rebase_task)
+    fresh_rebase_task = refresh_rebase_task(rebase_task_id)
+    if fresh_rebase_task is None:
+        reserved_launch.release()
+        detail = f"merge-conflict rebase task {rebase_task_id} disappeared before launch"
+        observe_dispatch(display_task.id, "launch_blocked", "needs_rebase", detail)
+        log.emit("ERROR", f"{display_task.id}: {detail}")
+        return _MergeConflictRebaseRoutingResult(True, False, conflict_assessment, rebase_task)
+    if fresh_rebase_task.status == "in_progress":
+        reserved_launch.release()
+        log.emit(
+            "SKIP",
+            f"{display_task.id}: merge conflict rebase {rebase_task_id} already in_progress; not relaunching",
+            dedupe_key=f"merge-conflict-rebase-already-owned:{display_task.id}:{rebase_task_id}",
+        )
+        log.emit(
+            "SKIP",
+            f"{display_task.id}: merge conflict routed to rebase",
+            dedupe_key=f"merge-conflict:{display_task.id}",
+        )
+        return _MergeConflictRebaseRoutingResult(True, True, conflict_assessment, fresh_rebase_task)
+    if fresh_rebase_task.status != "pending":
+        reserved_launch.release()
+        detail = (
+            f"merge-conflict rebase task {rebase_task_id} is no longer pending "
+            f"(status: {fresh_rebase_task.status}); stale launch skipped"
+        )
+        observe_dispatch(display_task.id, "launch_blocked", "needs_rebase", detail)
+        log.emit("ERROR", f"{display_task.id}: {detail}")
+        return _MergeConflictRebaseRoutingResult(True, False, conflict_assessment, fresh_rebase_task)
+    rebase_task = fresh_rebase_task
+    prepared_rebase_task = prepare_reserved_task(rebase_task, reserved_launch)
+    if prepared_rebase_task is None:
+        detail = f"failed to prepare merge-conflict rebase task {rebase_task.id}"
+        observe_dispatch(display_task.id, "launch_blocked", "needs_rebase", detail)
+        log.emit(
+            "ERROR",
+            f"{display_task.id}: {detail}",
+        )
+        return _MergeConflictRebaseRoutingResult(True, False, conflict_assessment, rebase_task)
+    if free_worker_start_slots() > 0:
+        rebase_task_before = _snapshot_watch_dispatch_task(prepared_rebase_task)
+        rebase_rc = spawn_rebase_worker(prepared_rebase_task)
+        release_reserved_task(str(prepared_rebase_task.id))
+        if rebase_rc == 0:
+            defer_lifecycle_start(
+                _DeferredWatchDispatchStart(
+                    settle=_PendingWatchDispatchSettle(
+                        task_id=str(prepared_rebase_task.id),
+                        task_before=rebase_task_before,
+                        start_label=f"{display_task.id} -> {prepared_rebase_task.id}",
+                        dedupe_key=(f"merge-conflict-rebase-undispatched:{display_task.id}:{prepared_rebase_task.id}"),
+                    ),
+                    subject_task=display_task,
+                    action={
+                        "type": "needs_rebase",
+                        "description": "Merge conflict routed to rebase",
+                    },
+                    action_task_before=task,
+                    failed_task=None,
+                    owner_task_id=display_task.id,
+                    action_type="needs_rebase",
+                    start_message=f"{prepared_rebase_task.id} rebase",
+                    emit_merge_conflict_skip_on_unsettled=True,
+                )
+            )
+            log.emit(
+                "SKIP",
+                f"{display_task.id}: merge conflict routed to rebase",
+                dedupe_key=f"merge-conflict:{display_task.id}",
+            )
+            return _MergeConflictRebaseRoutingResult(True, True, conflict_assessment, rebase_task)
+        detail = "merge conflict rebase worker spawn failed"
+        observe_dispatch(display_task.id, "launch_blocked", "needs_rebase", detail)
+        log.emit(
+            "SKIP",
+            f"{display_task.id}: {detail}",
+            dedupe_key=f"merge-conflict-rebase-spawn-failed:{display_task.id}",
+        )
+        return _MergeConflictRebaseRoutingResult(True, True, conflict_assessment, rebase_task)
+    release_reserved_task(str(prepared_rebase_task.id))
+    observe_dispatch(display_task.id, "capacity_blocked", "needs_rebase", None)
+    log.emit(
+        "SKIP",
+        f"{display_task.id}: merge conflict queued rebase {rebase_task.id} (no free slots)",
+        dedupe_key=f"merge-conflict-rebase-queued:{display_task.id}",
+    )
+    log.emit(
+        "SKIP",
+        f"{display_task.id}: merge conflict routed to rebase",
+        dedupe_key=f"merge-conflict:{display_task.id}",
+    )
+    return _MergeConflictRebaseRoutingResult(True, True, conflict_assessment, rebase_task)
+
+
 def _run_isolated_merge_batch(
     *,
     config: Config,
@@ -3740,9 +4002,35 @@ def _run_isolated_merge_batch(
     log: "_WatchLog",
     tags: tuple[str, ...] | None,
     any_tag: bool,
+    reserve_rebase_launch: Callable[[str], LaunchPermit | None],
+    create_rebase_task: Callable[[DbTask], DbTask],
+    prepare_rebase_task: Callable[[DbTask, LaunchPermit], DbTask | None],
+    free_worker_start_slots: Callable[[], int],
+    spawn_rebase_worker: Callable[[DbTask], int],
+    release_reserved_task: Callable[[str | None], None],
+    observe_dispatch: Callable[
+        [
+            str | None,
+            Literal[
+                "started",
+                "direct",
+                "direct_blocked",
+                "direct_error",
+                "capacity_blocked",
+                "launch_blocked",
+            ],
+            str,
+            str | None,
+        ],
+        None,
+    ],
+    note_handled_child_task_id: Callable[[str], None],
+    defer_lifecycle_start: Callable[["_DeferredWatchDispatchStart"], None],
 ) -> tuple[bool, bool, MainIntegrationVerifyRemediation | None]:
     del dry_run
     staged_batch: list[_WatchBatchStagedMerge] = []
+    batch_conflict_rebases: list[_BatchConflictRebaseDispatch] = []
+    batch_conflict_rebase_task_ids: set[str] = set()
     reconciled_work_done = False
 
     def _restore_isolated_checkout_to_tip(tip: str) -> None:
@@ -3812,7 +4100,7 @@ def _run_isolated_merge_batch(
                 )
                 if rework_task is not None:
                     log.emit("FOLLOW", _format_follow_line(str(rework_task.id), str(display_task.id), reused=False))
-                return False, False, None
+                return reconciled_work_done, False, None
             if stage_status == "already_merged":
                 if merge_event is not None:
                     merge_status_after = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
@@ -3840,11 +4128,99 @@ def _run_isolated_merge_batch(
                 quiet,
                 lambda: _restore_isolated_checkout_to_tip(isolated_tip_before_stage),
             )
-            log.emit(
-                "SKIP",
-                f"{display_task.id}: merge conflict",
-                dedupe_key=f"merge-conflict:{display_task.id}",
+            rebase_route = _route_isolated_merge_conflict_to_rebase(
+                merge_git=merge_git,
+                task=task,
+                display_task=display_task,
+                assessment_target_branch=isolated_tip_before_stage,
+                log=log,
+                reserve_launch=reserve_rebase_launch,
+                create_rebase_task=create_rebase_task,
+                refresh_rebase_task=lambda task_id: store.get(task_id),
+                prepare_reserved_task=prepare_rebase_task,
+                free_worker_start_slots=free_worker_start_slots,
+                spawn_rebase_worker=spawn_rebase_worker,
+                release_reserved_task=release_reserved_task,
+                observe_dispatch=observe_dispatch,
+                note_handled_child_task_id=note_handled_child_task_id,
+                defer_lifecycle_start=defer_lifecycle_start,
+                dispatch_immediately=False,
             )
+            if rebase_route.work_done:
+                reconciled_work_done = True
+            if not rebase_route.handled:
+                if (
+                    rebase_route.assessment is not None
+                    and rebase_route.assessment.reason == "branch already merged"
+                    and task.id is not None
+                ):
+                    repaired = reconcile_task_branch_merge_truth(
+                        store,
+                        git,
+                        str(task.id),
+                        target_branch=target_branch,
+                        include_diff_stats=True,
+                        persist=True,
+                    )
+                    if repaired.ok and repaired.merge_status == "merged":
+                        log.emit(
+                            "REPAIR",
+                            f"{display_task.id}: marked merged after shared reconciliation against {target_branch}",
+                        )
+                        if merge_event is not None:
+                            merge_status_after = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
+                                "merge_status"
+                            )
+                            if (
+                                merge_status_before != "merged"
+                                and merge_status_after == "merged"
+                                and not log.was_merge_logged(merge_event.merge_key)
+                            ):
+                                log.emit("MERGE", f"{merge_event.display_task_id} -> {merge_event.target_branch}")
+                                log.note_merge_logged(merge_event.merge_key)
+                        reconciled_work_done = True
+                        continue
+                    log.emit(
+                        "ERROR",
+                        (
+                            f"{display_task.id}: merge failed (branch already merged) but shared reconciliation "
+                            f"did not prove merged; stopping isolated merge batch"
+                        ),
+                    )
+                    return reconciled_work_done, False, None
+                if rebase_route.routing_error is not None:
+                    log.emit(
+                        "ERROR",
+                        f"{display_task.id}: merge conflict could not be routed to rebase; stopping isolated merge batch",
+                    )
+                elif rebase_route.assessment is not None and rebase_route.assessment.reason is not None:
+                    log.emit(
+                        "ERROR",
+                        (
+                            f"{display_task.id}: merge failed ({rebase_route.assessment.reason}); "
+                            "stopping isolated merge batch"
+                        ),
+                    )
+                else:
+                    log.emit(
+                        "ERROR",
+                        f"{display_task.id}: merge conflict could not be routed to rebase; stopping isolated merge batch",
+                    )
+                return reconciled_work_done, False, None
+            if (
+                rebase_route.rebase_task is not None
+                and rebase_route.rebase_task.id is not None
+                and rebase_route.rebase_task.status == "pending"
+                and str(rebase_route.rebase_task.id) not in batch_conflict_rebase_task_ids
+            ):
+                batch_conflict_rebase_task_ids.add(str(rebase_route.rebase_task.id))
+                batch_conflict_rebases.append(
+                    _BatchConflictRebaseDispatch(
+                        display_task=display_task,
+                        task=task,
+                        rebase_task=rebase_route.rebase_task,
+                    )
+                )
             continue
         staged_batch.append(
             _WatchBatchStagedMerge(
@@ -3884,11 +4260,29 @@ def _run_isolated_merge_batch(
                 display_task=staged_batch[0].display_task,
                 merge_result=synthetic_result,
             )
-            return False, False, None
+            return reconciled_work_done, False, None
         warnings = _run_with_optional_stdout_suppressed(
             quiet,
             lambda: _promote_isolated_merge_to_target_branch(git, merge_git, target_branch),
         )
+        for rebase_dispatch in batch_conflict_rebases:
+            dispatch_result = _dispatch_isolated_merge_conflict_rebase(
+                display_task=rebase_dispatch.display_task,
+                task=rebase_dispatch.task,
+                rebase_task=rebase_dispatch.rebase_task,
+                log=log,
+                reserve_launch=reserve_rebase_launch,
+                refresh_rebase_task=lambda task_id: store.get(task_id),
+                prepare_reserved_task=prepare_rebase_task,
+                free_worker_start_slots=free_worker_start_slots,
+                spawn_rebase_worker=spawn_rebase_worker,
+                release_reserved_task=release_reserved_task,
+                observe_dispatch=observe_dispatch,
+                defer_lifecycle_start=defer_lifecycle_start,
+                conflict_assessment=None,
+            )
+            if dispatch_result.work_done:
+                reconciled_work_done = True
         assert proof.verified_head_sha is not None
         assert proof.verified_tree_fingerprint is not None
         persisted = promote_candidate_integration_verify_evidence(
@@ -4030,7 +4424,7 @@ def _run_isolated_merge_batch(
             any_tag=any_tag,
         )
         log.emit("FOLLOW", _format_follow_line(str(rework_task.id), str(first_red_entry.display_task.id), reused=False))
-    return False, False, None
+    return reconciled_work_done, False, None
 
 
 def _sleep_interruptibly(seconds: int, stop_requested: Callable[[], bool], *, quantum: float = 1.0) -> None:
@@ -6457,32 +6851,42 @@ def _evaluate_blind_parked_auto_rearm(
         elif scoped_owner_ids is not None and owner_id in scoped_owner_id_set and subject_id != owner_id:
             guard_task = replace(candidate.subject_task, merge_status=None, has_commits=True)
             if guard_task.branch:
-                scoped_leaf_has_live_work = git.has_non_empty_source_diff_against_target(
-                    guard_task.branch,
-                    target_branch,
-                ) is True
-        elif (
-            scoped_owner_ids is not None
-            and resolve_lineage_owner_task_id(store, subject_id) in scoped_owner_id_set
-        ):
+                scoped_leaf_has_live_work = (
+                    git.has_non_empty_source_diff_against_target(
+                        guard_task.branch,
+                        target_branch,
+                    )
+                    is True
+                )
+        elif scoped_owner_ids is not None and resolve_lineage_owner_task_id(store, subject_id) in scoped_owner_id_set:
             guard_task = replace(candidate.subject_task, merge_status=None, has_commits=True)
             if guard_task.branch:
-                scoped_leaf_has_live_work = git.has_non_empty_source_diff_against_target(
-                    guard_task.branch,
-                    target_branch,
-                ) is True
+                scoped_leaf_has_live_work = (
+                    git.has_non_empty_source_diff_against_target(
+                        guard_task.branch,
+                        target_branch,
+                    )
+                    is True
+                )
         elif subject_is_effective_leaf_scope:
             guard_task = replace(candidate.subject_task, merge_status=None, has_commits=True)
             if guard_task.branch:
-                scoped_leaf_has_live_work = git.has_non_empty_source_diff_against_target(
-                    guard_task.branch,
-                    target_branch,
-                ) is True
-        guard_reason = None if scoped_leaf_has_live_work else skip_reason_for_landed_or_moot(
-            store,
-            git=git,
-            target_branch=target_branch,
-            task=guard_task,
+                scoped_leaf_has_live_work = (
+                    git.has_non_empty_source_diff_against_target(
+                        guard_task.branch,
+                        target_branch,
+                    )
+                    is True
+                )
+        guard_reason = (
+            None
+            if scoped_leaf_has_live_work
+            else skip_reason_for_landed_or_moot(
+                store,
+                git=git,
+                target_branch=target_branch,
+                task=guard_task,
+            )
         )
         if guard_reason is not None:
             decisions.append(
@@ -6638,10 +7042,7 @@ def _derive_effective_scoped_owner_ids(
                     row_owner_id is not None
                     and row.recovery_leaf_task is not None
                     and row.recovery_leaf_task.id == raw_task_id
-                    and (
-                        has_proven_leaf_scope
-                        or _row_owner_has_terminal_merge_proof(row)
-                    )
+                    and (has_proven_leaf_scope or _row_owner_has_terminal_merge_proof(row))
                     and resolve_lineage_owner_task_id(store, row_owner_id) == scoped_owner_id
                 ):
                     matching_row_ids = [str(raw_task_id)]
@@ -6673,12 +7074,9 @@ def _derive_effective_scoped_owner_ids(
                 matching_row_ids = [row_owner_id]
                 break
             row_member_ids = _scoped_member_task_ids([row], ())
-            if (
-                raw_task_id != scoped_owner_id
-                and (
-                    scoped_owner_id in row_member_ids
-                    or resolve_lineage_owner_task_id(store, row_owner_id) == scoped_owner_id
-                )
+            if raw_task_id != scoped_owner_id and (
+                scoped_owner_id in row_member_ids
+                or resolve_lineage_owner_task_id(store, row_owner_id) == scoped_owner_id
             ):
                 matching_row_ids.append(row_owner_id)
         if len(set(matching_row_ids)) == 1:
@@ -6809,7 +7207,9 @@ def _scoped_selector_recovery_closure_by_owner(
         raw_task = store.get(raw_task_id)
         if raw_task is None or raw_task.id is None:
             continue
-        raw_owner_id = raw_task_id if raw_task_id in scoped_owner_id_set else resolve_lineage_owner_task(store, raw_task).id
+        raw_owner_id = (
+            raw_task_id if raw_task_id in scoped_owner_id_set else resolve_lineage_owner_task(store, raw_task).id
+        )
         if raw_owner_id is None or raw_owner_id not in scoped_owner_id_set:
             continue
         if raw_task.status != "failed":
@@ -6828,9 +7228,7 @@ def _scoped_selector_recovery_closure_by_owner(
         closure_ids = closure_by_owner.setdefault(raw_owner_id, set())
         closure_ids.add(raw_task_id)
         stack = [
-            child
-            for child in store.get_based_on_children(raw_task_id)
-            if child.recovery_origin in {"resume", "retry"}
+            child for child in store.get_based_on_children(raw_task_id) if child.recovery_origin in {"resume", "retry"}
         ]
         while stack:
             current = stack.pop()
@@ -8021,6 +8419,19 @@ def _run_cycle(
                         log=log,
                         tags=tags,
                         any_tag=any_tag,
+                        reserve_rebase_launch=lambda subject_id: _reserve_watch_launch("rebase", subject_id),
+                        create_rebase_task=_create_rebase_from_task,
+                        prepare_rebase_task=lambda rebase_task, permit: _prepare_watch_reserved_task(
+                            rebase_task,
+                            permit=permit,
+                            rollback_on_failure=False,
+                        ),
+                        free_worker_start_slots=_free_worker_start_slots,
+                        spawn_rebase_worker=lambda rebase_task: _watch_spawn_worker(rebase_task, "rebase"),
+                        release_reserved_task=_release_watch_reserved_task,
+                        observe_dispatch=_observe_dispatch,
+                        note_handled_child_task_id=step1_handled_child_task_ids.add,
+                        defer_lifecycle_start=deferred_lifecycle_starts.append,
                     )
                     if batch_work_done:
                         work_done = True
@@ -8364,16 +8775,10 @@ def _run_cycle(
                 if rc == 0:
                     work_done = True
                 else:
-                    conflict_handled = False
                     conflict_assessment: _IsolatedMergeFailureAssessment | None = None
                     if isolation_enabled and task.branch is not None:
-                        conflict_assessment = _assess_isolated_merge_failure(
-                            merge_execution_git,
-                            task.branch,
-                            target_branch,
-                        )
-                        if conflict_assessment.is_conflict:
-                            conflict_handled = True
+
+                        def _cleanup_non_batch_failed_merge_checkout() -> None:
                             try:
                                 cleanup_failed_merge_checkout(merge_execution_git)
                             except GitError as cleanup_error:
@@ -8385,103 +8790,34 @@ def _run_cycle(
                                     ),
                                 )
                                 _rebuild_isolated_checkout()
-                            reserved_launch: LaunchPermit | None = None
-                            try:
-                                reserved_launch = _reserve_watch_launch("rebase", str(display_task.id))
-                                if reserved_launch is None:
-                                    _observe_dispatch(display_task.id, "capacity_blocked", "needs_rebase")
-                                    continue
-                                rebase_task = _create_rebase_from_task(task)
-                            except DuplicateActiveChildError as rebase_error:
-                                if reserved_launch is not None:
-                                    reserved_launch.release()
-                                detail = format_duplicate_rebase_message(
-                                    rebase_error,
-                                    parent_task_id=str(display_task.id),
-                                )
-                                _observe_dispatch(display_task.id, "launch_blocked", "needs_rebase", detail)
-                                log.emit(
-                                    "SKIP",
-                                    f"{display_task.id}: {detail}",
-                                    dedupe_key=f"watch-duplicate-rebase:{display_task.id}",
-                                )
-                                continue
-                            except Exception as rebase_error:
-                                if reserved_launch is not None:
-                                    reserved_launch.release()
-                                detail = f"failed to create rebase task ({rebase_error})"
-                                _observe_dispatch(display_task.id, "launch_blocked", "needs_rebase", detail)
-                                log.emit("ERROR", f"{display_task.id}: {detail}")
-                                continue
-                            assert rebase_task.id is not None
-                            prepared_rebase_task = _prepare_watch_reserved_task(
+
+                        rebase_route = _route_isolated_merge_conflict_to_rebase(
+                            merge_git=merge_execution_git,
+                            task=task,
+                            display_task=display_task,
+                            assessment_target_branch=target_branch,
+                            log=log,
+                            reserve_launch=lambda subject_id: _reserve_watch_launch("rebase", subject_id),
+                            create_rebase_task=_create_rebase_from_task,
+                            refresh_rebase_task=lambda task_id: store.get(task_id),
+                            prepare_reserved_task=lambda rebase_task, permit: _prepare_watch_reserved_task(
                                 rebase_task,
-                                permit=reserved_launch,
+                                permit=permit,
                                 rollback_on_failure=True,
-                            )
-                            if prepared_rebase_task is None:
-                                detail = f"failed to prepare merge-conflict rebase task {rebase_task.id}"
-                                _observe_dispatch(display_task.id, "launch_blocked", "needs_rebase", detail)
-                                log.emit(
-                                    "ERROR",
-                                    f"{display_task.id}: {detail}",
-                                )
-                                continue
-                            step1_handled_child_task_ids.add(str(rebase_task.id))
-                            if _free_worker_start_slots() > 0:
-                                rebase_task_before = _snapshot_watch_dispatch_task(prepared_rebase_task)
-                                rebase_rc = _watch_spawn_worker(prepared_rebase_task, "rebase")
-                                _release_watch_reserved_task(str(prepared_rebase_task.id))
-                                if rebase_rc == 0:
-                                    deferred_lifecycle_starts.append(
-                                        _DeferredWatchDispatchStart(
-                                            settle=_PendingWatchDispatchSettle(
-                                                task_id=str(prepared_rebase_task.id),
-                                                task_before=rebase_task_before,
-                                                start_label=f"{display_task.id} -> {prepared_rebase_task.id}",
-                                                dedupe_key=(
-                                                    f"merge-conflict-rebase-undispatched:{display_task.id}:"
-                                                    f"{prepared_rebase_task.id}"
-                                                ),
-                                            ),
-                                            subject_task=display_task,
-                                            action={
-                                                "type": "needs_rebase",
-                                                "description": "Merge conflict routed to rebase",
-                                            },
-                                            action_task_before=task,
-                                            failed_task=None,
-                                            owner_task_id=display_task.id,
-                                            action_type="needs_rebase",
-                                            start_message=f"{prepared_rebase_task.id} rebase",
-                                            emit_merge_conflict_skip_on_unsettled=True,
-                                        )
-                                    )
-                                    work_done = True
-                                else:
-                                    detail = "merge conflict rebase worker spawn failed"
-                                    _observe_dispatch(display_task.id, "launch_blocked", "needs_rebase", detail)
-                                    log.emit(
-                                        "SKIP",
-                                        f"{display_task.id}: {detail}",
-                                        dedupe_key=f"merge-conflict-rebase-spawn-failed:{display_task.id}",
-                                    )
-                            else:
-                                _release_watch_reserved_task(str(prepared_rebase_task.id))
-                                _observe_dispatch(display_task.id, "capacity_blocked", "needs_rebase")
-                                log.emit(
-                                    "SKIP",
-                                    f"{display_task.id}: merge conflict queued rebase {rebase_task.id} (no free slots)",
-                                    dedupe_key=f"merge-conflict-rebase-queued:{display_task.id}",
-                                )
-                                work_done = True
-                            log.emit(
-                                "SKIP",
-                                f"{display_task.id}: merge conflict routed to rebase",
-                                dedupe_key=f"merge-conflict:{display_task.id}",
-                            )
-                    if conflict_handled:
-                        continue
+                            ),
+                            free_worker_start_slots=_free_worker_start_slots,
+                            spawn_rebase_worker=lambda rebase_task: _watch_spawn_worker(rebase_task, "rebase"),
+                            release_reserved_task=_release_watch_reserved_task,
+                            observe_dispatch=_observe_dispatch,
+                            note_handled_child_task_id=step1_handled_child_task_ids.add,
+                            defer_lifecycle_start=deferred_lifecycle_starts.append,
+                            cleanup_after_conflict=_cleanup_non_batch_failed_merge_checkout,
+                        )
+                        conflict_assessment = rebase_route.assessment
+                        if rebase_route.work_done:
+                            work_done = True
+                        if rebase_route.handled:
+                            continue
                     if (
                         conflict_assessment is not None
                         and conflict_assessment.reason == "branch already merged"
@@ -10848,9 +11184,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
             _prime_effective_scope_for_boundary()
             pre_cycle_snapshot = _task_snapshot(store)
-            pre_cycle_scoped_selector_recovery_closure_by_owner = (
-                _current_scoped_selector_recovery_closure_by_owner()
-            )
+            pre_cycle_scoped_selector_recovery_closure_by_owner = _current_scoped_selector_recovery_closure_by_owner()
             pre_cycle_confirmed_start_ids = _emit_transition_events(
                 previous_snapshot,
                 pre_cycle_snapshot,
@@ -10955,9 +11289,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             )
 
             current_snapshot = _task_snapshot(store)
-            post_cycle_scoped_selector_recovery_closure_by_owner = (
-                _current_scoped_selector_recovery_closure_by_owner()
-            )
+            post_cycle_scoped_selector_recovery_closure_by_owner = _current_scoped_selector_recovery_closure_by_owner()
             post_cycle_confirmed_start_ids = _emit_transition_events(
                 previous_snapshot,
                 current_snapshot,
