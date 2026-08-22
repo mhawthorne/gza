@@ -458,11 +458,57 @@ def test_merge_single_task_preflights_conflicts_before_merge(tmp_path, capsys) -
         result = _merge_single_task(task.id, config, store, git, args, "main")
 
     assert result.rc == 1
+    assert result.status == "merge_conflict"
     git.can_merge.assert_called_once_with("feature/conflicts", "main")
     git.merge.assert_not_called()
     output = capsys.readouterr().out
     assert "has conflicts against 'main'" in output
     assert f"uv run gza rebase {task.id} --resolve" in output
+
+
+def test_merge_single_task_does_not_classify_generic_merge_failure_as_conflict(tmp_path, capsys) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement merge failure", task_type="implement")
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/generic-merge-failure"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        get_diff_name_status=MagicMock(return_value=""),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(side_effect=GitError("merge exploded")),
+        merge_abort=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        remote=False,
+        resolve=False,
+    )
+    config = Config.load(tmp_path)
+
+    with _force_merge_planner_action():
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    assert result.status == "merged"
+    git.can_merge.assert_called_once_with("feature/generic-merge-failure", "main")
+    git.merge.assert_called_once()
+    git.merge_abort.assert_called_once()
+    output = capsys.readouterr().out
+    assert "Error during merge: merge exploded" in output
+    assert "has conflicts against" not in output
 
 
 def test_merge_single_task_returns_blocked_dirty_checkout_status(tmp_path: Path, capsys) -> None:

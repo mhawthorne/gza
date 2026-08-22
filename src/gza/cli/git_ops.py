@@ -1508,6 +1508,7 @@ def _merge_single_task(
     args: argparse.Namespace,
     current_branch: str,
     *,
+    merge_preflight_ref: str | None = None,
     merge_source: str = MERGE_SOURCE_MANUAL,
     quiet_mechanics: bool = False,
     materialize_side_effects: bool = True,
@@ -1684,14 +1685,19 @@ def _merge_single_task(
         print("Error: --resolve requires --rebase")
         return _MergeSingleTaskResult(rc=1)
 
-    if not args.rebase and not git.can_merge(merge_source_ref, current_branch):
+    merge_preflight_target = merge_preflight_ref or current_branch
+    if not args.rebase and not git.can_merge(merge_source_ref, merge_preflight_target):
         print(
-            f"Error: Branch '{merge_source_ref}' has conflicts against '{current_branch}' "
+            f"Error: Branch '{merge_source_ref}' has conflicts against '{merge_preflight_target}' "
             "and cannot be merged cleanly."
         )
         print(f"Run: uv run gza rebase {merge_subject.id} --resolve")
         print(f"Or preview the lifecycle action with: uv run gza advance {merge_subject.id} --dry-run")
-        return _MergeSingleTaskResult(rc=1)
+        return _MergeSingleTaskResult(
+            rc=1,
+            status="merge_conflict",
+            block_reason=f"branch '{merge_source_ref}' conflicts against '{merge_preflight_target}'",
+        )
 
     if materialize_side_effects:
         deferred_blockers = _materialize_merge_deferred_blockers(
@@ -3340,6 +3346,7 @@ def _stage_isolated_merge_action(
     current_branch: str,
     merge_git: Git,
     merge_current_branch: str,
+    merge_preflight_ref: str | None = None,
     already_merged_behavior: str = "error",
     merge_source: str = MERGE_SOURCE_MANUAL,
     quiet_mechanics: bool = False,
@@ -3441,6 +3448,7 @@ def _stage_isolated_merge_action(
             merge_git,
             merge_args,
             merge_current_branch,
+            merge_preflight_ref=merge_preflight_ref,
             merge_source=merge_source,
             quiet_mechanics=quiet_mechanics,
             materialize_side_effects=False,

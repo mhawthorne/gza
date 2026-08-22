@@ -541,6 +541,15 @@ Each watch cycle MUST execute these phases in order:
    promoted tree exactly matches the verified candidate tree, and emit one `MERGE` line
    per landed merge unit without paying a duplicate full post-merge verify for the same
    exact tree.
+   If a member conflicts while being staged into the detached checkout, watch MUST reset
+   the detached checkout to the pre-member staged tip, emit `SKIP <task-id>: merge
+   conflict`, drop only that member from the staged batch, and continue staging later
+   members in lifecycle order.
+   Only an explicitly classified merge conflict may use that per-member skip path;
+   non-conflict staging failures MUST remain visible failures and MUST NOT promote the
+   remaining batch under conflict semantics. A branch that is already merged into the
+   target during staging MUST be reconciled as successful merge-state work, not reported
+   as a conflict.
    If the isolated checkout is unavailable, or combined candidate verify is red or
    freshness is unproven, watch MUST leave the canonical target untouched. A red staged
    batch MUST trigger bounded replay from the canonical target until the first

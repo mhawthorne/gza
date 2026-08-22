@@ -3621,6 +3621,15 @@ def _run_isolated_merge_batch(
 ) -> tuple[bool, bool, MainIntegrationVerifyRemediation | None]:
     del dry_run
     staged_batch: list[_WatchBatchStagedMerge] = []
+    reconciled_work_done = False
+
+    def _restore_isolated_checkout_to_tip(tip: str) -> None:
+        try:
+            merge_git.merge_abort()
+        except GitError:
+            pass
+        merge_git.reset_hard(tip)
+
     for execution_decision in decisions:
         row, task, action = execution_decision.item
         action = dict(execution_decision.action)
@@ -3647,14 +3656,17 @@ def _run_isolated_merge_batch(
                 current_branch=current_branch,
                 merge_git=merge_git,
                 merge_current_branch=target_branch,
+                merge_preflight_ref=isolated_tip_before_stage,
                 already_merged_behavior="mark_merged",
                 merge_source=MERGE_SOURCE_WATCH,
                 quiet_mechanics=True,
             )
 
+        isolated_tip_before_stage = _run_with_optional_stdout_suppressed(quiet, lambda: merge_git.rev_parse("HEAD"))
         staged_result = _run_with_optional_stdout_suppressed(quiet, _stage_current_merge)
         if not isinstance(staged_result, _StagedIsolatedMergeAction):
-            if getattr(staged_result, "status", None) in {
+            stage_status = getattr(staged_result, "status", None)
+            if stage_status in {
                 "blocked_candidate_verify",
                 "blocked_candidate_verify_unavailable",
             }:
@@ -3679,12 +3691,39 @@ def _run_isolated_merge_batch(
                 if rework_task is not None:
                     log.emit("FOLLOW", _format_follow_line(str(rework_task.id), str(display_task.id), reused=False))
                 return False, False, None
+            if stage_status == "already_merged":
+                if merge_event is not None:
+                    merge_status_after = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
+                        "merge_status"
+                    )
+                    if (
+                        merge_status_before != "merged"
+                        and merge_status_after == "merged"
+                        and not log.was_merge_logged(merge_event.merge_key)
+                    ):
+                        log.emit("MERGE", f"{merge_event.display_task_id} -> {merge_event.target_branch}")
+                        log.note_merge_logged(merge_event.merge_key)
+                reconciled_work_done = True
+                continue
+            if stage_status != "merge_conflict":
+                status_suffix = f" ({stage_status})" if stage_status and stage_status != "merged" else ""
+                reason = getattr(staged_result, "block_reason", None)
+                reason_suffix = f": {reason}" if reason else ""
+                log.emit(
+                    "ERROR",
+                    f"{display_task.id}: isolated merge staging failed{status_suffix}{reason_suffix}",
+                )
+                return reconciled_work_done, False, None
+            _run_with_optional_stdout_suppressed(
+                quiet,
+                lambda: _restore_isolated_checkout_to_tip(isolated_tip_before_stage),
+            )
             log.emit(
                 "SKIP",
-                f"{display_task.id}: merge failed",
-                dedupe_key=f"merge-failed:{display_task.id}",
+                f"{display_task.id}: merge conflict",
+                dedupe_key=f"merge-conflict:{display_task.id}",
             )
-            return False, False, None
+            continue
         staged_batch.append(
             _WatchBatchStagedMerge(
                 row=row,
@@ -3696,6 +3735,9 @@ def _run_isolated_merge_batch(
                 staged=staged_result,
             )
         )
+
+    if not staged_batch:
+        return reconciled_work_done, False, None
 
     combined_candidate = _run_with_optional_stdout_suppressed(
         quiet,
@@ -3805,6 +3847,7 @@ def _run_isolated_merge_batch(
                 current_branch=current_branch,
                 merge_git=merge_git,
                 merge_current_branch=target_branch,
+                merge_preflight_ref="HEAD",
                 already_merged_behavior="mark_merged",
                 merge_source=MERGE_SOURCE_WATCH,
                 quiet_mechanics=True,
