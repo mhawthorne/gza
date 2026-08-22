@@ -9,7 +9,9 @@ from typing import cast
 from markdown_it import MarkdownIt
 from markupsafe import Markup
 
-from gza.db import SqliteTaskStore, Task, task_updated_at
+from gza.db import MergeUnit, SqliteTaskStore, Task, task_updated_at
+
+from .merge_unit_detail import merge_unit_url
 from gza.runner import get_task_output
 
 _MARKDOWN = MarkdownIt("commonmark", {"html": False})
@@ -36,6 +38,14 @@ class TaskDetail:
     parents: tuple[LineageLink, ...]
     children: tuple[LineageLink, ...]
     plan_content: str | None
+    merge_unit: MergeUnit | None = None
+
+    @property
+    def merge_unit_url(self) -> str | None:
+        """Link to the merge unit this task belongs to, when it has one."""
+        if self.merge_unit is None:
+            return None
+        return merge_unit_url(self.project_id, self.merge_unit.id)
 
     def json_record(self) -> dict[str, object]:
         """Return the full persisted record and its navigable lineage."""
@@ -48,6 +58,9 @@ class TaskDetail:
         record["parents"] = [asdict(link) for link in self.parents]
         record["children"] = [asdict(link) for link in self.children]
         record["plan_content"] = self.plan_content
+        record["merge_unit_id"] = None if self.merge_unit is None else self.merge_unit.id
+        record["merge_unit_state"] = None if self.merge_unit is None else self.merge_unit.state
+        record["merge_unit_url"] = self.merge_unit_url
         return record
 
     @property
@@ -139,6 +152,7 @@ def query_task_detail(
         parents=tuple(parents),
         children=tuple(children),
         plan_content=plan_content,
+        merge_unit=project_store.resolve_merge_unit_for_task(task_id),
     )
 
 

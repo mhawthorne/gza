@@ -175,6 +175,9 @@ def test_task_rows_include_requested_fields_and_detail_links(
         "created_at": tasks["alpha"].created_at.isoformat().replace("+00:00", "Z"),
         "updated_at": stored.updated_at.isoformat().replace("+00:00", "Z"),
         "age": api_row["age"],
+        "merge_unit_id": None,
+        "merge_unit_state": None,
+        "merge_unit_url": None,
     }
     assert f'href="/projects/server-test/tasks/{tasks["alpha"].id}"' in html
     assert 'class="status status-completed"' in html

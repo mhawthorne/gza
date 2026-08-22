@@ -13,6 +13,17 @@
       <dd>{% for tag in task.tags %}<span class="tag">{{ tag }}</span>{% else %}<span class="muted">—</span>{% endfor %}</dd>
     </div>
     <div><dt>Branch</dt><dd>{{ task.branch or "—" }}</dd></div>
+    <div>
+      <dt>Merge unit</dt>
+      <dd>
+        {% if detail.merge_unit_url %}
+          <a href="{{ detail.merge_unit_url }}">{{ detail.merge_unit.id }}</a>
+          <span class="muted">{{ detail.merge_unit.state }}</span>
+        {% else %}
+          <span class="muted">&mdash;</span>
+        {% endif %}
+      </dd>
+    </div>
     <div><dt>Created</dt><dd><time datetime="{{ task.created_at.isoformat() if task.created_at else '' }}">{{ task.created_at.strftime('%Y-%m-%d %H:%M:%S UTC') if task.created_at else '—' }}</time></dd></div>
     <div><dt>Updated</dt><dd><time datetime="{{ detail.updated_at.isoformat() if detail.updated_at else '' }}">{{ detail.updated_at.strftime('%Y-%m-%d %H:%M:%S UTC') if detail.updated_at else '—' }}</time></dd></div>
     <div><dt>Started</dt><dd><time datetime="{{ task.started_at.isoformat() if task.started_at else '' }}">{{ task.started_at.strftime('%Y-%m-%d %H:%M:%S UTC') if task.started_at else '—' }}</time></dd></div>

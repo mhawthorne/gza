@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}{{ detail.unit.id }} · merge unit · gza{% endblock %}
+{% block content %}
+  <p><a href="/tasks">← All tasks</a></p>
+  <h1>Merge unit {{ detail.unit.id }}</h1>
+  {% if detail.owner %}
+    <p class="muted">{{ detail.owner.prompt_excerpt }}</p>
+  {% endif %}
+
+  <dl class="metadata">
+    <div><dt>Project</dt><dd>{{ detail.project_id }}</dd></div>
+    <div><dt>State</dt><dd><span class="status status-{{ detail.unit.state }}">{{ detail.unit.state }}</span></dd></div>
+    <div><dt>Source branch</dt><dd><code>{{ detail.unit.source_branch }}</code></dd></div>
+    <div><dt>Target branch</dt><dd><code>{{ detail.unit.target_branch }}</code></dd></div>
+    <div>
+      <dt>Owner task</dt>
+      <dd>
+        {% if detail.owner %}
+          <a href="{{ detail.owner.detail_url }}">{{ detail.owner.id }}</a>
+        {% elif detail.unit.owner_task_id %}
+          {{ detail.unit.owner_task_id }}
+        {% else %}
+          <span class="muted">—</span>
+        {% endif %}
+      </dd>
+    </div>
+    <div><dt>Created</dt><dd><time datetime="{{ detail.unit.created_at.isoformat() if detail.unit.created_at else '' }}">{{ detail.unit.created_at.strftime('%Y-%m-%d %H:%M:%S UTC') if detail.unit.created_at else '—' }}</time></dd></div>
+    <div><dt>Updated</dt><dd><time datetime="{{ detail.unit.updated_at.isoformat() if detail.unit.updated_at else '' }}">{{ detail.unit.updated_at.strftime('%Y-%m-%d %H:%M:%S UTC') if detail.unit.updated_at else '—' }}</time></dd></div>
+    <div><dt>Merged</dt><dd><time datetime="{{ detail.unit.merged_at.isoformat() if detail.unit.merged_at else '' }}">{{ detail.unit.merged_at.strftime('%Y-%m-%d %H:%M:%S UTC') if detail.unit.merged_at else '—' }}</time></dd></div>
+    <div><dt>Merged by</dt><dd>{{ detail.unit.merged_by_task_id or "—" }}</dd></div>
+    <div><dt>Merge source</dt><dd>{{ detail.unit.merge_source or "—" }}</dd></div>
+    {% if detail.unit.superseded_by_unit_id %}
+      <div>
+        <dt>Superseded by</dt>
+        <dd><a href="/projects/{{ detail.project_id }}/merge-units/{{ detail.unit.superseded_by_unit_id }}">{{ detail.unit.superseded_by_unit_id }}</a></dd>
+      </div>
+    {% endif %}
+  </dl>
+
+  {% if detail.has_pr %}
+    <section>
+      <h2>Pull request</h2>
+      <dl class="metadata">
+        <div><dt>Number</dt><dd>#{{ detail.unit.pr_number }}</dd></div>
+        <div><dt>State</dt><dd>{{ detail.unit.pr_state or "unknown" }}</dd></div>
+        <div><dt>Last synced</dt><dd><time datetime="{{ detail.unit.pr_last_synced_at.isoformat() if detail.unit.pr_last_synced_at else '' }}">{{ detail.unit.pr_last_synced_at.strftime('%Y-%m-%d %H:%M:%S UTC') if detail.unit.pr_last_synced_at else '—' }}</time></dd></div>
+      </dl>
+    </section>
+  {% endif %}
+
+  {% if detail.has_diff_stats %}
+    <section>
+      <h2>Diff</h2>
+      <dl class="metadata">
+        <div><dt>Files changed</dt><dd>{{ detail.unit.diff_files_changed if detail.unit.diff_files_changed is not none else '—' }}</dd></div>
+        <div><dt>Lines added</dt><dd>{{ detail.unit.diff_lines_added if detail.unit.diff_lines_added is not none else '—' }}</dd></div>
+        <div><dt>Lines removed</dt><dd>{{ detail.unit.diff_lines_removed if detail.unit.diff_lines_removed is not none else '—' }}</dd></div>
+      </dl>
+    </section>
+  {% endif %}
+
+  <section>
+    <h2>Tasks in this unit</h2>
+    {% if detail.members %}
+      <table class="tasks">
+        <thead>
+          <tr><th>Task</th><th>Role</th><th>Type</th><th>Status</th><th>Created</th><th>Summary</th></tr>
+        </thead>
+        <tbody>
+          {% for member in detail.members %}
+            <tr{% if member.is_owner %} class="merge-unit-owner"{% endif %}>
+              <td><a href="{{ member.detail_url }}">{{ member.id }}</a></td>
+              <td>{{ member.role }}{% if member.is_owner %} <span class="muted">(owner)</span>{% endif %}</td>
+              <td>{{ member.task_type }}</td>
+              <td><span class="status status-{{ member.status }}">{{ member.status }}</span></td>
+              <td><time datetime="{{ member.created_at.isoformat() if member.created_at else '' }}">{{ member.created_at.strftime('%Y-%m-%d %H:%M') if member.created_at else '—' }}</time></td>
+              <td>{{ member.prompt_excerpt }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">No tasks are attached to this merge unit.</p>
+    {% endif %}
+  </section>
+{% endblock %}

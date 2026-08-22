@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 from _thread import RLock as RLockType
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -1767,6 +1767,11 @@ def task_updated_at(task: Task) -> datetime | None:
     return max(available, key=normalized)
 
 
+# SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999; leave room for the
+# non-list parameters that accompany a chunked IN clause.
+_SQL_VARIABLE_CHUNK = 900
+
+
 @dataclass
 class MergeUnit:
     """Authoritative merge-truth record for one source branch vs one target branch."""
@@ -2046,6 +2051,53 @@ class ProjectLease:
     owner_pid: int
     owner_token: str
     acquired_at: datetime
+
+
+# A watch whose heartbeat is older than this multiple of its poll interval is
+# treated as gone. Generous on purpose: a slow cycle must not read as a crash.
+_WATCH_HEARTBEAT_STALE_MULTIPLIER = 4
+# Floor for the staleness window, for watches with a very short or unknown poll.
+_WATCH_HEARTBEAT_MIN_STALE_SECONDS = 120.0
+
+
+@dataclass(frozen=True)
+class WatchSession:
+    """The scope a running ``gza watch`` was invoked with.
+
+    Recorded so readers -- the web UI above all -- can answer "what is the watch
+    actually working on?" without parsing a process command line.
+    """
+
+    project_id: str
+    owner_pid: int
+    tags: tuple[str, ...]
+    batch_size: int | None
+    poll_seconds: float | None
+    started_at: datetime
+    heartbeat_at: datetime
+
+    def is_stale(self, *, now: datetime | None = None) -> bool:
+        """Whether the heartbeat is too old for this session to be believed."""
+        reference = now or datetime.now(UTC)
+        heartbeat = self.heartbeat_at
+        if heartbeat.tzinfo is None:
+            heartbeat = heartbeat.replace(tzinfo=UTC)
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=UTC)
+        window = max(
+            _WATCH_HEARTBEAT_MIN_STALE_SECONDS,
+            (self.poll_seconds or 0.0) * _WATCH_HEARTBEAT_STALE_MULTIPLIER,
+        )
+        return (reference - heartbeat).total_seconds() > window
+
+    def is_active(self, *, now: datetime | None = None) -> bool:
+        """Whether this row represents a watch that is still running.
+
+        Both signals must hold: the process must exist, and it must have checked
+        in recently. A pid alone is not enough -- pids get reused -- and a fresh
+        heartbeat alone cannot outlive the process that wrote it.
+        """
+        return _pid_is_alive(self.owner_pid) and not self.is_stale(now=now)
 
 
 _DB_TIMESTAMP_COLUMNS: dict[str, tuple[str, ...]] = {
@@ -2591,8 +2643,24 @@ UPDATE tasks SET updated_at = MAX(
 UPDATE tasks SET updated_at = NULL WHERE updated_at = '';
 """
 
+# Migration from v67 to v68: durable scope record for a running watch
+MIGRATION_V67_TO_V68 = """
+CREATE TABLE IF NOT EXISTS watch_sessions (
+    project_id TEXT NOT NULL,
+    owner_pid INTEGER NOT NULL,
+    tags TEXT NOT NULL,
+    batch_size INTEGER,
+    poll_seconds REAL,
+    started_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, owner_pid)
+);
+CREATE INDEX IF NOT EXISTS idx_watch_sessions_heartbeat
+    ON watch_sessions(project_id, heartbeat_at DESC);
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 67
+SCHEMA_VERSION = 68
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -3508,6 +3576,7 @@ _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
         65,
         66,
         67,
+        68,
     }
 )
 
@@ -4856,6 +4925,19 @@ CREATE TABLE IF NOT EXISTS main_verify_remediation_consumed_task_ids (
     consumed_at TEXT NOT NULL,
     PRIMARY KEY(project_id, signature, tree_fingerprint, task_id)
 );
+
+CREATE TABLE IF NOT EXISTS watch_sessions (
+    project_id TEXT NOT NULL,
+    owner_pid INTEGER NOT NULL,
+    tags TEXT NOT NULL,
+    batch_size INTEGER,
+    poll_seconds REAL,
+    started_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, owner_pid)
+);
+CREATE INDEX IF NOT EXISTS idx_watch_sessions_heartbeat
+    ON watch_sessions(project_id, heartbeat_at DESC);
 """
 
 # Migration from v1 to v2
@@ -5171,6 +5253,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (65, MIGRATION_V64_TO_V65),
     (66, MIGRATION_V65_TO_V66),
     (67, MIGRATION_V66_TO_V67),
+    (68, MIGRATION_V67_TO_V68),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -5456,6 +5539,186 @@ class SqliteTaskStore:
             return self._query_only_table_exists.get("behavior_check_findings", False)
         with self._connect() as conn:
             return _table_exists(conn, "behavior_check_findings")
+
+    def supports_watch_sessions(self) -> bool:
+        """Return whether watch-scope storage is available."""
+        if self._open_mode == "query_only":
+            return self._query_only_table_exists.get("watch_sessions", False)
+        with self._connect() as conn:
+            return _table_exists(conn, "watch_sessions")
+
+    def record_watch_session(
+        self,
+        *,
+        owner_pid: int,
+        tags: Sequence[str],
+        batch_size: int | None = None,
+        poll_seconds: float | None = None,
+        started_at: datetime | None = None,
+        now: datetime | None = None,
+    ) -> WatchSession:
+        """Record (or refresh) the scope of the watch running under ``owner_pid``.
+
+        Re-recording an existing pid keeps the original ``started_at`` so a watch
+        that re-registers mid-run does not appear to have just started.
+        """
+        if not self.supports_watch_sessions():
+            raise RuntimeError("watch sessions are not available on this database")
+        moment = now or datetime.now(UTC)
+        heartbeat_text = _format_db_timestamp(moment)
+        started_text = _format_db_timestamp(started_at or moment)
+        assert heartbeat_text is not None
+        assert started_text is not None
+        # Order is preserved but duplicates are dropped: the tag list is what the
+        # operator typed, and repeating a tag says nothing extra.
+        normalized_tags = tuple(dict.fromkeys(tag for tag in tags if tag))
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO watch_sessions(
+                    project_id, owner_pid, tags, batch_size, poll_seconds,
+                    started_at, heartbeat_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, owner_pid)
+                DO UPDATE SET
+                    tags = excluded.tags,
+                    batch_size = excluded.batch_size,
+                    poll_seconds = excluded.poll_seconds,
+                    heartbeat_at = excluded.heartbeat_at
+                """,
+                (
+                    self._project_id,
+                    owner_pid,
+                    json.dumps(list(normalized_tags)),
+                    batch_size,
+                    poll_seconds,
+                    started_text,
+                    heartbeat_text,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM watch_sessions WHERE project_id = ? AND owner_pid = ?",
+                (self._project_id, owner_pid),
+            ).fetchone()
+        session = self._row_to_watch_session(row)
+        assert session is not None
+        return session
+
+    def heartbeat_watch_session(
+        self,
+        *,
+        owner_pid: int,
+        now: datetime | None = None,
+    ) -> bool:
+        """Refresh the heartbeat for a recorded watch. Returns whether a row moved."""
+        if not self.supports_watch_sessions():
+            return False
+        heartbeat_text = _format_db_timestamp(now or datetime.now(UTC))
+        assert heartbeat_text is not None
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE watch_sessions
+                SET heartbeat_at = ?
+                WHERE project_id = ? AND owner_pid = ?
+                """,
+                (heartbeat_text, self._project_id, owner_pid),
+            )
+            return cur.rowcount > 0
+
+    def clear_watch_session(self, *, owner_pid: int) -> bool:
+        """Remove a watch's scope record on shutdown. Returns whether a row went."""
+        if not self.supports_watch_sessions():
+            return False
+        with self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM watch_sessions WHERE project_id = ? AND owner_pid = ?",
+                (self._project_id, owner_pid),
+            )
+            return cur.rowcount > 0
+
+    def list_watch_sessions(
+        self,
+        *,
+        active_only: bool = True,
+        all_projects: bool = False,
+        now: datetime | None = None,
+    ) -> list[WatchSession]:
+        """Return recorded watch sessions, most recently seen first.
+
+        ``active_only`` (the default) hides rows left behind by a crashed watch.
+        Pass ``False`` to inspect the raw ledger, including the dead rows.
+
+        ``all_projects`` reads every project's sessions from the shared database.
+        Readers surveying "what watches are running?" need it, because a watch
+        can cover a project that has no task rows yet, and the project-derived
+        store list is built from tasks.
+        """
+        if not self.supports_watch_sessions():
+            return []
+        with self._connect() as conn:
+            if all_projects:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM watch_sessions
+                    ORDER BY heartbeat_at DESC, owner_pid DESC
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM watch_sessions
+                    WHERE project_id = ?
+                    ORDER BY heartbeat_at DESC, owner_pid DESC
+                    """,
+                    (self._project_id,),
+                ).fetchall()
+        sessions = [
+            session for row in rows if (session := self._row_to_watch_session(row)) is not None
+        ]
+        if not active_only:
+            return sessions
+        return [session for session in sessions if session.is_active(now=now)]
+
+    def get_active_watch_session(
+        self,
+        *,
+        all_projects: bool = False,
+        now: datetime | None = None,
+    ) -> WatchSession | None:
+        """Return the most recently seen live watch, if any."""
+        sessions = self.list_watch_sessions(
+            active_only=True,
+            all_projects=all_projects,
+            now=now,
+        )
+        return sessions[0] if sessions else None
+
+    def _row_to_watch_session(self, row: sqlite3.Row | None) -> WatchSession | None:
+        if row is None:
+            return None
+        started_at = _parse_db_timestamp(row["started_at"])
+        heartbeat_at = _parse_db_timestamp(row["heartbeat_at"])
+        if started_at is None or heartbeat_at is None:
+            return None
+        try:
+            tags = tuple(str(tag) for tag in json.loads(row["tags"] or "[]"))
+        except (TypeError, ValueError):
+            tags = ()
+        poll_seconds = row["poll_seconds"]
+        batch_size = row["batch_size"]
+        return WatchSession(
+            project_id=str(row["project_id"]),
+            owner_pid=int(row["owner_pid"]),
+            tags=tags,
+            batch_size=None if batch_size is None else int(batch_size),
+            poll_seconds=None if poll_seconds is None else float(poll_seconds),
+            started_at=started_at,
+            heartbeat_at=heartbeat_at,
+        )
 
     def supports_project_leases(self) -> bool:
         """Return whether project-scoped lease storage is available."""
@@ -5805,6 +6068,7 @@ class SqliteTaskStore:
             "main_verify_remediation_consumed_task_ids",
             "parked_task_rearms",
             "behavior_check_findings",
+            "watch_sessions",
         )
         self._query_only_table_exists = {table: _table_exists(conn, table) for table in tables}
         self._query_only_columns = {
@@ -11208,6 +11472,111 @@ class SqliteTaskStore:
                 (self._project_id, merge_unit_id),
             ).fetchall()
             return self._rows_to_tasks(conn, rows)
+
+    def list_merge_units_merged_since(
+        self,
+        since: datetime,
+        *,
+        limit: int | None = None,
+    ) -> list[MergeUnit]:
+        """Return units merged at or after ``since``, most recently merged first.
+
+        Units with no ``merged_at`` are excluded even if their state says merged:
+        a merge we cannot place in time cannot be reported in a time window.
+        """
+        if not self.supports_merge_units():
+            return []
+        since_text = _format_db_timestamp(since)
+        if since_text is None:
+            return []
+        sql = """
+            SELECT *
+            FROM merge_units
+            WHERE project_id = ?
+              AND merged_at IS NOT NULL
+              AND merged_at >= ?
+            ORDER BY merged_at DESC, id DESC
+        """
+        params: list[object] = [self._project_id, since_text]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(sql, tuple(params)).fetchall()
+        return [unit for row in rows if (unit := self._row_to_merge_unit(row)) is not None]
+
+    def list_merge_unit_memberships(self, merge_unit_id: str) -> list[tuple[Task, str]]:
+        """Return ``(task, role)`` pairs for a merge unit, oldest attachment first.
+
+        :meth:`list_tasks_for_merge_unit` drops the membership role, which is the
+        one thing a reader rendering the unit as a whole needs in order to say why
+        each task is there. Ordering is chronological by task creation so the pairs
+        read as the unit's history.
+        """
+        if not self.supports_merge_units():
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT t.*, mut.role AS merge_unit_role
+                FROM merge_unit_tasks mut
+                JOIN tasks t
+                  ON t.project_id = mut.project_id
+                 AND t.id = mut.task_id
+                WHERE mut.project_id = ?
+                  AND mut.merge_unit_id = ?
+                ORDER BY t.created_at ASC, t.id ASC
+                """,
+                (self._project_id, merge_unit_id),
+            ).fetchall()
+            roles = [str(row["merge_unit_role"]) for row in rows]
+            tasks = self._rows_to_tasks(conn, rows)
+        return list(zip(tasks, roles, strict=True))
+
+    def resolve_merge_units_for_tasks(
+        self,
+        task_ids: Sequence[str],
+    ) -> dict[str, MergeUnit]:
+        """Resolve the active merge unit for many tasks in one query.
+
+        The per-task :meth:`resolve_merge_unit_for_task` is fine for a detail view
+        but turns a listing into one query per row. Callers rendering a page of
+        tasks should use this instead so the cost stays flat in the row count.
+        """
+        if not self.supports_merge_units():
+            return {}
+        unique_ids = list(dict.fromkeys(task_id for task_id in task_ids if task_id))
+        if not unique_ids:
+            return {}
+        resolved: dict[str, MergeUnit] = {}
+        with self._connect() as conn:
+            for start in range(0, len(unique_ids), _SQL_VARIABLE_CHUNK):
+                chunk = unique_ids[start : start + _SQL_VARIABLE_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"""
+                    SELECT mut.task_id AS attached_task_id, mu.*
+                    FROM merge_unit_tasks mut
+                    JOIN merge_units mu
+                      ON mu.project_id = mut.project_id
+                     AND mu.id = mut.merge_unit_id
+                    WHERE mut.project_id = ?
+                      AND mut.task_id IN ({placeholders})
+                      AND {active_merge_unit_where_sql("mu")}
+                    ORDER BY mu.updated_at DESC, mu.id DESC
+                    """,
+                    (self._project_id, *chunk),
+                ).fetchall()
+                for row in rows:
+                    task_id = str(row["attached_task_id"])
+                    # Newest-first ordering means the first row wins, matching the
+                    # single-task resolver's contract of one active unit per task.
+                    if task_id in resolved:
+                        continue
+                    unit = self._row_to_merge_unit(row)
+                    if unit is not None:
+                        resolved[task_id] = unit
+        return resolved
 
     def dual_write_legacy_merge_status(self, unit_id: str) -> None:
         """Project merge-unit state onto compatibility task fields."""

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
 from typing import Annotated, Any, Literal, Protocol, cast
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
@@ -22,6 +22,17 @@ from gza.db import SqliteTaskStore
 from gza.task_query import normalize_tag_filters
 
 from . import __version__
+from .merge_unit_detail import (
+    MergeUnitDetail,
+    query_merge_unit_detail,
+)
+from .tag_dashboard import (
+    WINDOWS,
+    active_watch_scopes,
+    default_dashboard_tag,
+    query_tag_dashboard,
+    resolve_window,
+)
 from .task_detail import AmbiguousTaskIdError, TaskDetail, query_task_detail
 from .task_edit import (
     TaskEditConflict,
@@ -648,6 +659,122 @@ def create_app(
         if detail is None:
             raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
         return detail.json_record()
+
+    def load_merge_unit_detail(
+        merge_unit_id: str,
+        project_id: str | None = None,
+    ) -> MergeUnitDetail | None:
+        return query_merge_unit_detail(
+            cast(SqliteTaskStore, make_store()),
+            merge_unit_id,
+            project_id=project_id,
+        )
+
+    def render_merge_unit_detail(
+        request: Request,
+        merge_unit_id: str,
+        project_id: str | None = None,
+    ):
+        detail = load_merge_unit_detail(merge_unit_id, project_id)
+        if detail is None:
+            return _TEMPLATES.TemplateResponse(
+                request=request,
+                name="merge_unit_404.html",
+                context={"merge_unit_id": merge_unit_id},
+                status_code=404,
+            )
+        return _TEMPLATES.TemplateResponse(
+            request=request,
+            name="merge_unit_detail.html",
+            context={"detail": detail, "unit": detail.unit},
+        )
+
+    def merge_unit_detail_record(
+        merge_unit_id: str,
+        project_id: str | None = None,
+    ) -> dict[str, object]:
+        detail = load_merge_unit_detail(merge_unit_id, project_id)
+        if detail is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Merge unit {merge_unit_id} not found",
+            )
+        return detail.json_record()
+
+    def build_tag_dashboard(tag: str, window_key: str | None):
+        return query_tag_dashboard(
+            cast(SqliteTaskStore, make_store()),
+            tag,
+            window=resolve_window(window_key),
+        )
+
+    @app.get("/tags")
+    def tags_index(request: Request, window: str | None = None):
+        """Send the operator straight to the tag their watch is covering.
+
+        Without a running watch there is nothing to guess from, so offer the
+        known tags rather than rendering an empty dashboard for an arbitrary one.
+        """
+        store = cast(SqliteTaskStore, make_store())
+        tag = default_dashboard_tag(store)
+        if tag is not None:
+            return RedirectResponse(
+                f"/tags/{tag}?{urlencode({'window': resolve_window(window).key})}",
+                status_code=303,
+            )
+        return _TEMPLATES.TemplateResponse(
+            request=request,
+            name="tag_picker.html",
+            context={
+                "known_tags": store.list_tags(all_projects=True),
+                "watch_scopes": active_watch_scopes(store),
+            },
+        )
+
+    @app.get("/tags/{tag}")
+    def tag_dashboard_page(request: Request, tag: str, window: str | None = None):
+        dashboard = build_tag_dashboard(tag, window)
+        return _TEMPLATES.TemplateResponse(
+            request=request,
+            name="tag_dashboard.html",
+            context={"dashboard": dashboard, "windows": WINDOWS},
+        )
+
+    @app.get("/api/tags/{tag}")
+    def tag_dashboard_api(tag: str, window: str | None = None) -> dict[str, object]:
+        return build_tag_dashboard(tag, window).json_record()
+
+    @app.get("/api/watch-scopes")
+    def watch_scopes_api() -> dict[str, object]:
+        store = cast(SqliteTaskStore, make_store())
+        scopes = active_watch_scopes(store)
+        return {
+            "scopes": [scope.json_record() for scope in scopes],
+            "default_tag": default_dashboard_tag(store),
+        }
+
+    @app.get("/merge-units/{merge_unit_id}")
+    def merge_unit_detail_page(request: Request, merge_unit_id: str):
+        return render_merge_unit_detail(request, merge_unit_id)
+
+    @app.get("/projects/{project_id}/merge-units/{merge_unit_id}")
+    def qualified_merge_unit_detail_page(
+        request: Request,
+        project_id: str,
+        merge_unit_id: str,
+    ):
+        return render_merge_unit_detail(request, merge_unit_id, project_id)
+
+    @app.get("/api/merge-units/{merge_unit_id}")
+    def merge_unit_detail_api(merge_unit_id: str) -> dict[str, object]:
+        return merge_unit_detail_record(merge_unit_id)
+
+    @app.get("/api/projects/{project_id}/merge-units/{merge_unit_id}")
+    def qualified_merge_unit_detail_api(
+        project_id: str,
+        merge_unit_id: str,
+    ) -> dict[str, object]:
+        return merge_unit_detail_record(merge_unit_id, project_id)
 
     @app.get("/tasks/{task_id}")
     def task_detail_page(request: Request, task_id: str, edit: str | None = None):

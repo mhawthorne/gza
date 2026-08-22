@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import sqlite3
 import re
 import signal
 import sys
@@ -10200,6 +10201,59 @@ def _emit_git_health_hold(
     return True
 
 
+def _record_watch_session(
+    *,
+    store: SqliteTaskStore,
+    log: "_WatchLog",
+    owner_pid: int,
+    tags: Sequence[str],
+    batch_size: int,
+    poll_seconds: float,
+) -> bool:
+    """Publish this watch's scope so readers can discover what it covers.
+
+    Best-effort on purpose: the scope record is for reporting, so a database
+    that cannot hold it must not stop the watch from doing its actual work.
+    """
+    try:
+        store.record_watch_session(
+            owner_pid=owner_pid,
+            tags=tuple(tags),
+            batch_size=batch_size,
+            poll_seconds=poll_seconds,
+        )
+    except (RuntimeError, sqlite3.Error) as exc:
+        log.emit("WARN", f"could not record watch scope: {exc}")
+        return False
+    return True
+
+
+def _heartbeat_watch_session(
+    *,
+    store: SqliteTaskStore,
+    log: "_WatchLog",
+    owner_pid: int,
+) -> None:
+    """Refresh the scope record so readers can tell this watch is still alive."""
+    try:
+        store.heartbeat_watch_session(owner_pid=owner_pid)
+    except sqlite3.Error as exc:
+        log.emit("WARN", f"could not refresh watch scope heartbeat: {exc}")
+
+
+def _clear_watch_session(
+    *,
+    store: SqliteTaskStore,
+    log: "_WatchLog",
+    owner_pid: int,
+) -> None:
+    """Retire the scope record on shutdown so no stale row is left behind."""
+    try:
+        store.clear_watch_session(owner_pid=owner_pid)
+    except sqlite3.Error as exc:
+        log.emit("WARN", f"could not clear watch scope: {exc}")
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
     """Run continuous scheduler loop that maintains N concurrent workers."""
     config = Config.load(args.project_dir)
@@ -10329,6 +10383,16 @@ def cmd_watch(args: argparse.Namespace) -> int:
     old_sigint = signal.signal(signal.SIGINT, _handle_shutdown)
     old_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown)
     reexec_fingerprint: str | None = None
+
+    watch_pid = os.getpid()
+    watch_session_recorded = _record_watch_session(
+        store=store,
+        log=log,
+        owner_pid=watch_pid,
+        tags=tag_filters or (),
+        batch_size=batch,
+        poll_seconds=float(poll),
+    )
 
     try:
         idle_seconds = 0
@@ -10518,6 +10582,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 if preview_cycle_open:
                     log.end_cycle()
                 break
+
+            if watch_session_recorded:
+                _heartbeat_watch_session(store=store, log=log, owner_pid=watch_pid)
 
             if not _system_can_run_tasks(config):
                 if preview_cycle_open:
@@ -10803,6 +10870,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
     finally:
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
+        if watch_session_recorded:
+            _clear_watch_session(store=store, log=log, owner_pid=watch_pid)
 
     if stop_signal is not None:
         return 128 + stop_signal

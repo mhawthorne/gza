@@ -424,3 +424,11 @@ details.tag-editor > *:not(summary) { margin-inline: var(--space-3); }
 .select-cell { width: 1px; padding-right: 0; }
 .select-cell input { margin: 0; }
 tr:has(input[data-select-row]:checked) { background: var(--surface-raised, var(--surface)); }
+
+.window-picker { margin: 1rem 0; }
+.watch-live { padding: 0.5rem 0.75rem; border-left: 3px solid currentColor; }
+.muted.note { font-size: 0.9em; margin-top: -0.25rem; }
+.tag-list { list-style: none; padding-left: 0; }
+.tag-list li { display: inline-block; margin: 0 0.5rem 0.5rem 0; }
+td.merge-unit { white-space: nowrap; }
+tr.merge-unit-owner { font-weight: 600; }

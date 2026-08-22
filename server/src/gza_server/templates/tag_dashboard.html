@@ -1,0 +1,150 @@
+{% extends "base.html" %}
+{% block title %}{{ dashboard.tag }} · gza{% endblock %}
+{% block content %}
+  <p><a href="/tasks">← All tasks</a></p>
+  <h1>{{ dashboard.tag }}</h1>
+
+  {% if dashboard.watch_is_running_on_this_tag %}
+    <p class="watch-live">
+      <strong>Watch is running on this tag.</strong>
+      {% for scope in dashboard.watch_scopes %}
+        {% if dashboard.tag in scope.tags %}
+          <span class="muted">
+            pid {{ scope.owner_pid }}
+            {% if scope.batch_size %}· batch {{ scope.batch_size }}{% endif %}
+            {% if scope.poll_seconds %}· poll {{ scope.poll_seconds|int }}s{% endif %}
+            {% if scope.tags|length > 1 %}· scope {{ scope.tags|join(", ") }}{% endif %}
+          </span>
+        {% endif %}
+      {% endfor %}
+    </p>
+  {% else %}
+    <p class="muted">No running watch is covering this tag.</p>
+  {% endif %}
+
+  <form method="get" action="/tags/{{ dashboard.tag }}" class="window-picker">
+    <label>
+      Merged within
+      <select name="window" onchange="this.form.submit()">
+        {% for window in windows %}
+          <option value="{{ window.key }}"{% if window.key == dashboard.window.key %} selected{% endif %}>{{ window.label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <noscript><button type="submit">Apply</button></noscript>
+  </form>
+
+  <section>
+    <h2>Merged <span class="muted">· {{ dashboard.window.label|lower }} · {{ dashboard.merged|length }}</span></h2>
+    {% if dashboard.merged %}
+      <table class="tasks">
+        <thead>
+          <tr><th>Merge unit</th><th>Owner</th><th>Summary</th><th>Merged</th><th>Via</th><th>Diff</th></tr>
+        </thead>
+        <tbody>
+          {% for item in dashboard.merged %}
+            <tr>
+              <td><a href="{{ item.merge_unit_url }}">{{ item.id }}</a></td>
+              <td>
+                {% if item.owner_detail_url %}
+                  <a href="{{ item.owner_detail_url }}">{{ item.owner_task_id }}</a>
+                {% else %}
+                  <span class="muted">&mdash;</span>
+                {% endif %}
+              </td>
+              <td class="prompt">{{ item.subject }}</td>
+              <td><time datetime="{{ item.merged_at.isoformat() if item.merged_at else '' }}">{{ item.merged_at.strftime('%Y-%m-%d %H:%M') if item.merged_at else '—' }}</time></td>
+              <td>{{ item.merge_source or "—" }}</td>
+              <td>
+                {% if item.files_changed is not none %}
+                  {{ item.files_changed }}f
+                  <span class="added">+{{ item.lines_added or 0 }}</span>
+                  <span class="removed">−{{ item.lines_removed or 0 }}</span>
+                {% else %}
+                  <span class="muted">&mdash;</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">Nothing merged on this tag in the {{ dashboard.window.label|lower }}.</p>
+    {% endif %}
+  </section>
+
+  <section>
+    <h2>In flight <span class="muted">· {{ dashboard.in_flight|length }}</span></h2>
+    {% if dashboard.in_flight %}
+      <table class="tasks">
+        <thead>
+          <tr><th>Task</th><th>Type</th><th>Running for</th><th>Summary</th></tr>
+        </thead>
+        <tbody>
+          {% for item in dashboard.in_flight %}
+            <tr>
+              <td><a href="{{ item.detail_url }}">{{ item.id }}</a></td>
+              <td>{{ item.task_type }}</td>
+              <td>{{ item.age }}</td>
+              <td class="prompt"><a href="{{ item.detail_url }}">{{ item.prompt_excerpt }}</a></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">Nothing is running on this tag.</p>
+    {% endif %}
+  </section>
+
+  <section>
+    <h2>Queued <span class="muted">· {{ dashboard.queued|length }}</span></h2>
+    <p class="muted note">
+      Pending tasks in the order a worker would pick them up. Watch takes retries and
+      recovery candidates before any of these, so this is not the whole of what runs next.
+    </p>
+    {% if dashboard.queued %}
+      <table class="tasks">
+        <thead>
+          <tr><th>#</th><th>Task</th><th>Type</th><th>Waiting</th><th>Summary</th></tr>
+        </thead>
+        <tbody>
+          {% for item in dashboard.queued %}
+            <tr>
+              <td class="muted">{{ loop.index }}</td>
+              <td><a href="{{ item.detail_url }}">{{ item.id }}</a></td>
+              <td>{{ item.task_type }}</td>
+              <td>{{ item.age }}</td>
+              <td class="prompt"><a href="{{ item.detail_url }}">{{ item.prompt_excerpt }}</a></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">Nothing is queued on this tag.</p>
+    {% endif %}
+  </section>
+
+  <section>
+    <h2>Blocked <span class="muted">· {{ dashboard.blocked|length }}</span></h2>
+    <p class="muted note">Pending, but waiting on a dependency before they can be picked up.</p>
+    {% if dashboard.blocked %}
+      <table class="tasks">
+        <thead>
+          <tr><th>Task</th><th>Type</th><th>Waiting</th><th>Summary</th></tr>
+        </thead>
+        <tbody>
+          {% for item in dashboard.blocked %}
+            <tr>
+              <td><a href="{{ item.detail_url }}">{{ item.id }}</a></td>
+              <td>{{ item.task_type }}</td>
+              <td>{{ item.age }}</td>
+              <td class="prompt"><a href="{{ item.detail_url }}">{{ item.prompt_excerpt }}</a></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="muted">Nothing is blocked on this tag.</p>
+    {% endif %}
+  </section>
+{% endblock %}
