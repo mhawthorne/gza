@@ -43108,6 +43108,204 @@ def test_cmd_watch_signal_exit_releases_watch_lease(tmp_path: Path) -> None:
     )
 
 
+def test_cmd_watch_sigterm_handler_does_not_throw_when_shutdown_log_emit_fails(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=1, quiet=False)
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+    handlers: dict[signal.Signals, object] = {}
+    real_record_watch_session = watch_module._record_watch_session
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        signal_calls.append((sig, handler))
+        previous = original_sigint if sig == signal.SIGINT else original_sigterm
+        handlers[sig] = handler
+        return previous
+
+    def trigger_sigterm_session_publication_boundary(**kwargs: object) -> bool:
+        handler = handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+        return real_record_watch_session(**kwargs)
+
+    with (
+        patch(
+            "gza.cli.watch.signal.signal",
+            side_effect=fake_signal,
+        ),
+        patch("gza.cli.watch._record_watch_session", side_effect=trigger_sigterm_session_publication_boundary),
+        patch("gza.cli.watch._WatchLog.emit", side_effect=OSError("watch log unavailable")),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    assert signal_calls[-2:] == [
+        (signal.SIGINT, original_sigint),
+        (signal.SIGTERM, original_sigterm),
+    ]
+    store = make_store(tmp_path)
+    assert store.get_active_watch_session() is None
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-sigterm-log-failure",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_quiet_sigterm_reporting_failures_do_not_escape_cleanup(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=1, quiet=True)
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+    handlers: dict[signal.Signals, object] = {}
+    real_record_watch_session = watch_module._record_watch_session
+
+    class BrokenStderr:
+        def write(self, _text: str) -> int:
+            raise OSError("stderr unavailable")
+
+        def flush(self) -> None:
+            raise OSError("stderr unavailable")
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        signal_calls.append((sig, handler))
+        previous = original_sigint if sig == signal.SIGINT else original_sigterm
+        handlers[sig] = handler
+        return previous
+
+    def trigger_sigterm_session_publication_boundary(**kwargs: object) -> bool:
+        handler = handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+        return real_record_watch_session(**kwargs)
+
+    with (
+        patch(
+            "gza.cli.watch.signal.signal",
+            side_effect=fake_signal,
+        ),
+        patch("gza.cli.watch._record_watch_session", side_effect=trigger_sigterm_session_publication_boundary),
+        patch("gza.cli.watch._WatchLog.emit", side_effect=OSError("watch log unavailable")),
+        patch("gza.cli.watch.sys.stderr", BrokenStderr()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    assert signal_calls[-2:] == [
+        (signal.SIGINT, original_sigint),
+        (signal.SIGTERM, original_sigterm),
+    ]
+    store = make_store(tmp_path)
+    assert store.get_active_watch_session() is None
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-sigterm-quiet-report-failure",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_sigterm_immediately_after_handler_installation_cleans_startup_boundary(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=1)
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        signal_calls.append((sig, handler))
+        if sig == signal.SIGINT and len(signal_calls) == 1:
+            return original_sigint
+        if sig == signal.SIGTERM and len(signal_calls) == 2:
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+            return original_sigterm
+        return object()
+
+    with patch("gza.cli.watch.signal.signal", side_effect=fake_signal):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    assert signal_calls[-2:] == [
+        (signal.SIGINT, original_sigint),
+        (signal.SIGTERM, original_sigterm),
+    ]
+    store = make_store(tmp_path)
+    assert store.get_active_watch_session() is None
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-immediate-sigterm",
+        )
+        is not None
+        )
+
+
+def test_cmd_watch_second_sigint_after_handler_installation_restores_and_releases_startup_boundary(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=1)
+    original_sigint = object()
+    original_sigterm = object()
+    handlers: dict[signal.Signals, object] = {}
+    signal_calls: list[tuple[signal.Signals, object]] = []
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        signal_calls.append((sig, handler))
+        previous = original_sigint if sig == signal.SIGINT else original_sigterm
+        if callable(handler):
+            handlers[sig] = handler
+        return previous
+
+    def trigger_two_sigints_before_session_publication(**_kwargs: object) -> bool:
+        handler = handlers[signal.SIGINT]
+        assert callable(handler)
+        handler(signal.SIGINT, None)
+        handler(signal.SIGINT, None)
+        raise AssertionError("second SIGINT should propagate before session publication")
+
+    with (
+        patch("gza.cli.watch.signal.signal", side_effect=fake_signal),
+        patch(
+            "gza.cli.watch._record_watch_session",
+            side_effect=trigger_two_sigints_before_session_publication,
+        ),
+        patch("gza.cli.watch._run_cycle", side_effect=AssertionError("watch body should not run")),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            cmd_watch(args)
+
+    assert signal_calls[-2:] == [
+        (signal.SIGINT, original_sigint),
+        (signal.SIGTERM, original_sigterm),
+    ]
+    store = make_store(tmp_path)
+    assert store.get_active_watch_session() is None
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-second-sigint-startup-boundary",
+        )
+        is not None
+    )
+
+
 def test_cmd_watch_startup_failure_releases_watch_lease(tmp_path: Path) -> None:
     setup_config(tmp_path)
     args = _watch_args(tmp_path, [])

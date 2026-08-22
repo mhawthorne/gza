@@ -4950,16 +4950,24 @@ def _restore_installed_watch_signal_handlers(
             signal.signal(signal.SIGINT, installed.old_sigint)
         except BaseException as exc:
             errors.append(exc)
+        else:
+            installed.sigint_installed = False
     if installed.sigterm_installed:
         try:
             signal.signal(signal.SIGTERM, installed.old_sigterm)
         except BaseException as exc:
             errors.append(exc)
+        else:
+            installed.sigterm_installed = False
     return errors
 
 
-def _install_watch_signal_handlers(handler: Callable[[int, object], None]) -> _InstalledWatchSignalHandlers:
-    installed = _InstalledWatchSignalHandlers()
+def _install_watch_signal_handlers(
+    handler: Callable[[int, object], None],
+    installed: _InstalledWatchSignalHandlers | None = None,
+) -> _InstalledWatchSignalHandlers:
+    if installed is None:
+        installed = _InstalledWatchSignalHandlers()
     try:
         installed.old_sigint = signal.signal(signal.SIGINT, handler)
         installed.sigint_installed = True
@@ -4979,10 +4987,17 @@ def _emit_watch_error(log: _WatchLog, quiet: bool, message: str) -> None:
         print(message, file=sys.stderr, flush=True)
 
 
-def _emit_watch_error_safely(log: _WatchLog, quiet: bool, message: str) -> list[BaseException]:
+def _emit_watch_message_safely(
+    log: _WatchLog,
+    quiet: bool,
+    event: str,
+    message: str,
+) -> list[BaseException]:
     errors: list[BaseException] = []
     try:
-        _emit_watch_error(log, quiet, message)
+        log.emit(event, message)
+        if quiet:
+            print(message, file=sys.stderr, flush=True)
     except BaseException as exc:
         errors.append(exc)
         try:
@@ -4990,6 +5005,10 @@ def _emit_watch_error_safely(log: _WatchLog, quiet: bool, message: str) -> list[
         except BaseException as fallback_exc:
             errors.append(fallback_exc)
     return errors
+
+
+def _emit_watch_error_safely(log: _WatchLog, quiet: bool, message: str) -> list[BaseException]:
+    return _emit_watch_message_safely(log, quiet, "ERROR", message)
 
 
 def _watch_exception_messages(prefix: str, exc: BaseException) -> tuple[str, ...]:
@@ -11526,241 +11545,207 @@ def cmd_watch(args: argparse.Namespace) -> int:
     stop_requested = False
     stop_signal: int | None = None
     sigint_count = 0
+    shutdown_message_emitted = False
+    reexec_fingerprint: str | None = None
+    cleanup_errors: list[BaseException] = []
+    result_code: int | None = None
+    watch_pid = os.getpid()
+    watch_session_recorded = False
+
+    def _emit_shutdown_message_once() -> None:
+        nonlocal shutdown_message_emitted
+        if shutdown_message_emitted:
+            return
+        shutdown_message_emitted = True
+        _emit_watch_message_safely(log, quiet, "INFO", "shutting down (workers left running)")
 
     def _handle_shutdown(_signum: int, _frame: object) -> None:
         nonlocal stop_requested, stop_signal, sigint_count
         if _signum == signal.SIGINT:
             sigint_count += 1
             if sigint_count >= 2:
+                _emit_shutdown_message_once()
                 raise KeyboardInterrupt
         stop_requested = True
         stop_signal = _signum
-        log.emit("INFO", "shutting down (workers left running)")
-        if quiet:
-            print("shutting down (workers left running)", file=sys.stderr, flush=True)
 
+    installed_signal_handlers = _InstalledWatchSignalHandlers()
     try:
-        installed_signal_handlers = _install_watch_signal_handlers(_handle_shutdown)
-    except BaseException as exc:
-        for message in _watch_exception_messages("watch signal handler setup failed", exc):
-            _emit_watch_error_safely(log, quiet, message)
-        _release_watch_lease_set_for_cleanup(watch_lease_set, log=log, quiet=quiet)
-        return 1
-    reexec_fingerprint: str | None = None
-    cleanup_errors: list[BaseException] = []
-    result_code: int | None = None
-
-    watch_pid = os.getpid()
-    watch_session_recorded = False
-
-    try:
-        watch_session_recorded = _record_watch_session(
-            store=store,
-            log=log,
-            owner_pid=watch_pid,
-            tags=tag_filters or (),
-            batch_size=batch,
-            poll_seconds=float(poll),
-        )
-        idle_seconds = 0
-        failure_backoffs: dict[str, _OwnerFailureBackoffState] = {}
-        previous_snapshot = _task_snapshot(store)
-        expected_starts: dict[str, _ExpectedStart] = {}
-        seen_active_recovery_subject_ids: frozenset[str] = frozenset()
-        system_hold_active = False
-        git_health_hold_active = False
-
-        # Preview the first watch pass and ask for confirmation before executing
-        if dispatch_mode == "recovery_only" and dry_run and scoped_owner_ids is None:
-            if _emit_git_health_hold(
+        try:
+            _install_watch_signal_handlers(_handle_shutdown, installed=installed_signal_handlers)
+        except BaseException as exc:
+            for message in _watch_exception_messages("watch signal handler setup failed", exc):
+                cleanup_errors.extend(_emit_watch_error_safely(log, quiet, message))
+            result_code = 1
+        else:
+            watch_session_recorded = _record_watch_session(
                 store=store,
-                config=config,
                 log=log,
-                persist=False,
-                hold_active=git_health_hold_active,
-            ):
-                result_code = 0
-            else:
-                _dry_run_git = Git(config.project_dir)
-                _dry_run_target_branch = _dry_run_git.default_branch()
-                _emit_recovery_dry_run_report(
+                owner_pid=watch_pid,
+                tags=tag_filters or (),
+                batch_size=batch,
+                poll_seconds=float(poll),
+            )
+            idle_seconds = 0
+            failure_backoffs: dict[str, _OwnerFailureBackoffState] = {}
+            previous_snapshot = _task_snapshot(store)
+            expected_starts: dict[str, _ExpectedStart] = {}
+            seen_active_recovery_subject_ids: frozenset[str] = frozenset()
+            system_hold_active = False
+            git_health_hold_active = False
+
+            # Preview the first watch pass and ask for confirmation before executing
+            if dispatch_mode == "recovery_only" and dry_run and scoped_owner_ids is None:
+                if _emit_git_health_hold(
+                    store=store,
+                    config=config,
+                    log=log,
+                    persist=False,
+                    hold_active=git_health_hold_active,
+                ):
+                    result_code = 0
+                else:
+                    _dry_run_git = Git(config.project_dir)
+                    _dry_run_target_branch = _dry_run_git.default_branch()
+                    _emit_recovery_dry_run_report(
+                        store=store,
+                        tags=tag_filters,
+                        any_tag=any_tag,
+                        max_recovery_attempts=max_recovery_attempts,
+                        show_skipped=show_skipped,
+                        git=_dry_run_git,
+                        target_branch=_dry_run_target_branch,
+                    )
+                    result_code = 0
+
+            resumed_reexec = bool(getattr(args, "resumed_reexec", False))
+            skip_confirm = dry_run or bool(getattr(args, "yes", False)) or resumed_reexec
+            suppress_main_verify_stdout = quiet or bool(getattr(args, "yes", False))
+            needs_initial_preview = not skip_confirm
+            pending_first_cycle_plan: _WatchCyclePlan | None = None
+            preview_cycle_open = False
+
+            def _active_failure_owner_ids() -> frozenset[str]:
+                return _active_failure_backoff_owner_ids(
+                    failure_backoffs,
+                    now=datetime.now(UTC),
+                )
+
+            def _current_scoped_selector_recovery_closure_by_owner() -> dict[str, frozenset[str]] | None:
+                if scoped_owner_ids is None:
+                    return None
+                scoped_git = Git(config.project_dir)
+                scoped_target_branch = scoped_git.default_branch()
+                return _scoped_selector_recovery_closure_by_owner(
+                    store=store,
+                    scoped_owner_ids=scoped_owner_ids,
+                    scoped_task_ids=scoped_task_ids,
+                    config=config,
+                    git=scoped_git,
+                    target_branch=scoped_target_branch,
+                    max_recovery_attempts=max_recovery_attempts,
+                )
+
+            def _process_failure_boundary(
+                old_snapshot: dict[str, dict[str, str | None]],
+                new_snapshot: dict[str, dict[str, str | None]],
+                *,
+                boundary_scoped_owner_ids: tuple[str, ...] | None,
+                scoped_selector_recovery_closure_by_owner: Mapping[str, frozenset[str]] | None,
+            ) -> bool:
+                completed_ids = _collect_completed_transition_ids(
+                    old_snapshot,
+                    new_snapshot,
                     store=store,
                     tags=tag_filters,
                     any_tag=any_tag,
-                    max_recovery_attempts=max_recovery_attempts,
-                    show_skipped=show_skipped,
-                    git=_dry_run_git,
-                    target_branch=_dry_run_target_branch,
+                    scoped_owner_ids=boundary_scoped_owner_ids,
+                    scoped_selector_recovery_closure_by_owner=scoped_selector_recovery_closure_by_owner,
                 )
-                result_code = 0
+                _reset_failure_backoff_for_completed_owners(
+                    store=store,
+                    completed_ids=completed_ids,
+                    failure_backoffs=failure_backoffs,
+                    log=log,
+                    scoped_owner_ids=boundary_scoped_owner_ids,
+                )
+                unhandled_failures = _collect_unhandled_failures(
+                    old_snapshot,
+                    new_snapshot,
+                    store=store,
+                    max_recovery_attempts=max_recovery_attempts,
+                    restart_failed_mode=dispatch_mode == "recovery_only",
+                    tags=tag_filters,
+                    any_tag=any_tag,
+                    scoped_owner_ids=boundary_scoped_owner_ids,
+                    scoped_selector_recovery_closure_by_owner=scoped_selector_recovery_closure_by_owner,
+                )
+                return _record_failure_backoff_updates(
+                    config=config,
+                    store=store,
+                    failures=unhandled_failures,
+                    failure_backoffs=failure_backoffs,
+                    log=log,
+                    now=datetime.now(UTC),
+                )
 
-        resumed_reexec = bool(getattr(args, "resumed_reexec", False))
-        skip_confirm = dry_run or bool(getattr(args, "yes", False)) or resumed_reexec
-        suppress_main_verify_stdout = quiet or bool(getattr(args, "yes", False))
-        needs_initial_preview = not skip_confirm
-        pending_first_cycle_plan: _WatchCyclePlan | None = None
-        preview_cycle_open = False
-
-        def _active_failure_owner_ids() -> frozenset[str]:
-            return _active_failure_backoff_owner_ids(
-                failure_backoffs,
-                now=datetime.now(UTC),
-            )
-
-        def _current_scoped_selector_recovery_closure_by_owner() -> dict[str, frozenset[str]] | None:
-            if scoped_owner_ids is None:
-                return None
-            scoped_git = Git(config.project_dir)
-            scoped_target_branch = scoped_git.default_branch()
-            return _scoped_selector_recovery_closure_by_owner(
-                store=store,
-                scoped_owner_ids=scoped_owner_ids,
-                scoped_task_ids=scoped_task_ids,
-                config=config,
-                git=scoped_git,
-                target_branch=scoped_target_branch,
-                max_recovery_attempts=max_recovery_attempts,
-            )
-
-        def _process_failure_boundary(
-            old_snapshot: dict[str, dict[str, str | None]],
-            new_snapshot: dict[str, dict[str, str | None]],
-            *,
-            boundary_scoped_owner_ids: tuple[str, ...] | None,
-            scoped_selector_recovery_closure_by_owner: Mapping[str, frozenset[str]] | None,
-        ) -> bool:
-            completed_ids = _collect_completed_transition_ids(
-                old_snapshot,
-                new_snapshot,
-                store=store,
-                tags=tag_filters,
-                any_tag=any_tag,
-                scoped_owner_ids=boundary_scoped_owner_ids,
-                scoped_selector_recovery_closure_by_owner=scoped_selector_recovery_closure_by_owner,
-            )
-            _reset_failure_backoff_for_completed_owners(
-                store=store,
-                completed_ids=completed_ids,
-                failure_backoffs=failure_backoffs,
-                log=log,
-                scoped_owner_ids=boundary_scoped_owner_ids,
-            )
-            unhandled_failures = _collect_unhandled_failures(
-                old_snapshot,
-                new_snapshot,
-                store=store,
-                max_recovery_attempts=max_recovery_attempts,
-                restart_failed_mode=dispatch_mode == "recovery_only",
-                tags=tag_filters,
-                any_tag=any_tag,
-                scoped_owner_ids=boundary_scoped_owner_ids,
-                scoped_selector_recovery_closure_by_owner=scoped_selector_recovery_closure_by_owner,
-            )
-            return _record_failure_backoff_updates(
-                config=config,
-                store=store,
-                failures=unhandled_failures,
-                failure_backoffs=failure_backoffs,
-                log=log,
-                now=datetime.now(UTC),
-            )
-
-        def _preview_initial_cycle_and_confirm() -> int | None:
-            nonlocal needs_initial_preview, pending_first_cycle_plan, preview_cycle_open, effective_scoped_owner_ids
-            preview_result, preview_plan = _preview_initial_watch_cycle(
-                config=config,
-                store=store,
-                batch=batch,
-                max_iterations=max_iterations,
-                log=log,
-                tags=tag_filters,
-                any_tag=any_tag,
-                recovery_slots=recovery_slots,
-                recovery_mode=dispatch_mode,
-                max_recovery_attempts=max_recovery_attempts,
-                show_skipped=show_skipped,
-                auto_restart_on_drift=auto_restart_on_drift,
-                installed_package_drift=installed_package_drift,
-                scoped_owner_ids=scoped_owner_ids,
-                scoped_task_ids=raw_task_ids if scoped_owner_ids is not None else None,
-                known_effective_scoped_owner_ids=effective_scoped_owner_ids,
-                excluded_owner_ids=_active_failure_owner_ids(),
-            )
-            needs_initial_preview = False
-            if preview_plan is not None:
-                effective_scoped_owner_ids = preview_plan.analysis.effective_scoped_owner_ids or scoped_owner_ids
-            if preview_result.work_done:
-                if not sys.stdout.isatty():
-                    log.end_cycle()
-                    print(
-                        "watch: stdout is not a terminal, so the initial confirmation "
-                        "prompt cannot be shown. Re-run with -y to auto-confirm.",
-                        file=sys.stderr,
-                    )
-                    return 1
-                try:
-                    sys.stdout.flush()
-                    answer = input("\nProceed? [y/N] ").strip().lower()
-                except EOFError:
-                    answer = ""
-                except KeyboardInterrupt:
-                    raise
-                if answer not in ("y", "yes"):
-                    log.end_cycle()
-                    print("Aborted.")
-                    return 0
-                pending_first_cycle_plan = preview_plan
-                preview_cycle_open = True
-                return None
-
-            log.end_cycle()
-            return None
-
-        def _prime_effective_scope_for_boundary() -> None:
-            nonlocal effective_scoped_owner_ids, pending_first_cycle_plan
-            if scoped_owner_ids is None:
-                return
-            if pending_first_cycle_plan is None:
-                pending_first_cycle_plan = _build_watch_cycle_plan(
+            def _preview_initial_cycle_and_confirm() -> int | None:
+                nonlocal needs_initial_preview, pending_first_cycle_plan, preview_cycle_open, effective_scoped_owner_ids
+                preview_result, preview_plan = _preview_initial_watch_cycle(
                     config=config,
                     store=store,
                     batch=batch,
+                    max_iterations=max_iterations,
+                    log=log,
                     tags=tag_filters,
                     any_tag=any_tag,
                     recovery_slots=recovery_slots,
                     recovery_mode=dispatch_mode,
                     max_recovery_attempts=max_recovery_attempts,
+                    show_skipped=show_skipped,
+                    auto_restart_on_drift=auto_restart_on_drift,
+                    installed_package_drift=installed_package_drift,
                     scoped_owner_ids=scoped_owner_ids,
-                    scoped_task_ids=raw_task_ids,
+                    scoped_task_ids=raw_task_ids if scoped_owner_ids is not None else None,
                     known_effective_scoped_owner_ids=effective_scoped_owner_ids,
                     excluded_owner_ids=_active_failure_owner_ids(),
                 )
-            effective_scoped_owner_ids = (
-                pending_first_cycle_plan.analysis.effective_scoped_owner_ids or scoped_owner_ids
-            )
+                needs_initial_preview = False
+                if preview_plan is not None:
+                    effective_scoped_owner_ids = preview_plan.analysis.effective_scoped_owner_ids or scoped_owner_ids
+                if preview_result.work_done:
+                    if not sys.stdout.isatty():
+                        log.end_cycle()
+                        print(
+                            "watch: stdout is not a terminal, so the initial confirmation "
+                            "prompt cannot be shown. Re-run with -y to auto-confirm.",
+                            file=sys.stderr,
+                        )
+                        return 1
+                    try:
+                        sys.stdout.flush()
+                        answer = input("\nProceed? [y/N] ").strip().lower()
+                    except EOFError:
+                        answer = ""
+                    except KeyboardInterrupt:
+                        raise
+                    if answer not in ("y", "yes"):
+                        log.end_cycle()
+                        print("Aborted.")
+                        return 0
+                    pending_first_cycle_plan = preview_plan
+                    preview_cycle_open = True
+                    return None
 
-        if resumed_reexec:
-            log.emit(
-                "INFO",
-                "auto-resumed after code update (skipping first-pass confirmation)",
-            )
+                log.end_cycle()
+                return None
 
-        while result_code is None:
-            if stop_requested:
-                if preview_cycle_open:
-                    log.end_cycle()
-                break
-
-            if watch_session_recorded:
-                _heartbeat_watch_session(store=store, log=log, owner_pid=watch_pid)
-
-            if not _system_can_run_tasks(config):
-                if preview_cycle_open:
-                    log.end_cycle()
-                    preview_cycle_open = False
-                    pending_first_cycle_plan = None
-                if scoped_owner_ids is not None:
-                    scoped_activity = _scoped_watch_activity(
+            def _prime_effective_scope_for_boundary() -> None:
+                nonlocal effective_scoped_owner_ids, pending_first_cycle_plan
+                if scoped_owner_ids is None:
+                    return
+                if pending_first_cycle_plan is None:
+                    pending_first_cycle_plan = _build_watch_cycle_plan(
                         config=config,
                         store=store,
                         batch=batch,
@@ -11772,298 +11757,346 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         scoped_owner_ids=scoped_owner_ids,
                         scoped_task_ids=raw_task_ids,
                         known_effective_scoped_owner_ids=effective_scoped_owner_ids,
+                        excluded_owner_ids=_active_failure_owner_ids(),
                     )
-                    effective_scoped_owner_ids = scoped_activity.effective_scoped_owner_ids
-                    scope_message = _format_scope_message(
-                        tag_filters,
-                        any_tag=any_tag,
-                        scoped_owner_ids=effective_scoped_owner_ids,
-                    )
-                    if scope_message is not None:
-                        log.emit("INFO", scope_message)
-                    if scoped_activity.active_count == 0:
-                        log.emit("INFO", SCOPED_WATCH_COMPLETE_MESSAGE)
-                        break
-                    log.emit(
-                        "HOLD",
-                        (
-                            "System unavailable: Docker daemon unreachable - "
-                            f"holding scoped watch ({scoped_activity.active_count} active owner units), "
-                            "nothing started/failed"
-                        ),
-                    )
-                else:
-                    pending_count = len(
-                        _pending_runnable_tasks(
-                            store,
+                effective_scoped_owner_ids = (
+                    pending_first_cycle_plan.analysis.effective_scoped_owner_ids or scoped_owner_ids
+                )
+
+            if resumed_reexec:
+                log.emit(
+                    "INFO",
+                    "auto-resumed after code update (skipping first-pass confirmation)",
+                )
+
+            while result_code is None:
+                if stop_requested:
+                    _emit_shutdown_message_once()
+                    if preview_cycle_open:
+                        log.end_cycle()
+                    break
+
+                if watch_session_recorded:
+                    _heartbeat_watch_session(store=store, log=log, owner_pid=watch_pid)
+
+                if not _system_can_run_tasks(config):
+                    if preview_cycle_open:
+                        log.end_cycle()
+                        preview_cycle_open = False
+                        pending_first_cycle_plan = None
+                    if scoped_owner_ids is not None:
+                        scoped_activity = _scoped_watch_activity(
                             config=config,
+                            store=store,
+                            batch=batch,
                             tags=tag_filters,
                             any_tag=any_tag,
-                            excluded_owner_ids=_active_failure_owner_ids(),
+                            recovery_slots=recovery_slots,
+                            recovery_mode=dispatch_mode,
+                            max_recovery_attempts=max_recovery_attempts,
+                            scoped_owner_ids=scoped_owner_ids,
+                            scoped_task_ids=raw_task_ids,
+                            known_effective_scoped_owner_ids=effective_scoped_owner_ids,
                         )
-                    )
-                    log.emit(
-                        "HOLD",
-                        (
-                            "System unavailable: Docker daemon unreachable - "
-                            f"holding queue ({pending_count} pending), nothing started/failed"
-                        ),
-                    )
-                system_hold_active = True
-                if stop_requested:
+                        effective_scoped_owner_ids = scoped_activity.effective_scoped_owner_ids
+                        scope_message = _format_scope_message(
+                            tag_filters,
+                            any_tag=any_tag,
+                            scoped_owner_ids=effective_scoped_owner_ids,
+                        )
+                        if scope_message is not None:
+                            log.emit("INFO", scope_message)
+                        if scoped_activity.active_count == 0:
+                            log.emit("INFO", SCOPED_WATCH_COMPLETE_MESSAGE)
+                            break
+                        log.emit(
+                            "HOLD",
+                            (
+                                "System unavailable: Docker daemon unreachable - "
+                                f"holding scoped watch ({scoped_activity.active_count} active owner units), "
+                                "nothing started/failed"
+                            ),
+                        )
+                    else:
+                        pending_count = len(
+                            _pending_runnable_tasks(
+                                store,
+                                config=config,
+                                tags=tag_filters,
+                                any_tag=any_tag,
+                                excluded_owner_ids=_active_failure_owner_ids(),
+                            )
+                        )
+                        log.emit(
+                            "HOLD",
+                            (
+                                "System unavailable: Docker daemon unreachable - "
+                                f"holding queue ({pending_count} pending), nothing started/failed"
+                            ),
+                        )
+                    system_hold_active = True
+                    if stop_requested:
+                        break
+                    _sleep_interruptibly(poll, lambda: stop_requested)
+                    continue
+
+                if system_hold_active:
+                    log.emit("RESUME", "Docker available again - resuming")
+                    system_hold_active = False
+
+                if _emit_git_health_hold(
+                    store=store,
+                    config=config,
+                    log=log,
+                    persist=not dry_run,
+                    hold_active=git_health_hold_active,
+                ):
+                    if preview_cycle_open:
+                        log.end_cycle()
+                        preview_cycle_open = False
+                        pending_first_cycle_plan = None
+                        needs_initial_preview = not skip_confirm
+                    if dry_run:
+                        result_code = 0
+                        break
+                    git_health_hold_active = True
+                    if stop_requested:
+                        break
+                    _sleep_interruptibly(poll, lambda: stop_requested)
+                    continue
+
+                if git_health_hold_active:
+                    log.emit("RESUME", "git worktree health restored - resuming dispatch")
+                    git_health_hold_active = False
+
+                if needs_initial_preview:
+                    preview_abort_code = _preview_initial_cycle_and_confirm()
+                    if preview_abort_code is not None:
+                        result_code = preview_abort_code
+                        break
+                    continue
+
+                _prime_effective_scope_for_boundary()
+                pre_cycle_snapshot = _task_snapshot(store)
+                pre_cycle_scoped_selector_recovery_closure_by_owner = _current_scoped_selector_recovery_closure_by_owner()
+                pre_cycle_confirmed_start_ids = _emit_transition_events(
+                    previous_snapshot,
+                    pre_cycle_snapshot,
+                    store=store,
+                    config=config,
+                    log=log,
+                    restart_failed_mode=dispatch_mode == "recovery_only",
+                    max_recovery_attempts=max_recovery_attempts,
+                    scoped_owner_ids=effective_scoped_owner_ids,
+                    scoped_selector_recovery_closure_by_owner=pre_cycle_scoped_selector_recovery_closure_by_owner,
+                )
+                cycle_confirmed_start_count = _process_expected_start_boundary(
+                    store=store,
+                    config=config,
+                    log=log,
+                    expected_starts=expected_starts,
+                    snapshot=pre_cycle_snapshot,
+                    confirmed_start_ids=pre_cycle_confirmed_start_ids,
+                )
+                excluded_owner_ids_before_boundary = _active_failure_owner_ids()
+                if _process_failure_boundary(
+                    previous_snapshot,
+                    pre_cycle_snapshot,
+                    boundary_scoped_owner_ids=effective_scoped_owner_ids,
+                    scoped_selector_recovery_closure_by_owner=pre_cycle_scoped_selector_recovery_closure_by_owner,
+                ):
+                    previous_snapshot = pre_cycle_snapshot
                     break
-                _sleep_interruptibly(poll, lambda: stop_requested)
-                continue
-
-            if system_hold_active:
-                log.emit("RESUME", "Docker available again - resuming")
-                system_hold_active = False
-
-            if _emit_git_health_hold(
-                store=store,
-                config=config,
-                log=log,
-                persist=not dry_run,
-                hold_active=git_health_hold_active,
-            ):
-                if preview_cycle_open:
-                    log.end_cycle()
-                    preview_cycle_open = False
-                    pending_first_cycle_plan = None
-                    needs_initial_preview = not skip_confirm
-                if dry_run:
-                    result_code = 0
-                    break
-                git_health_hold_active = True
-                if stop_requested:
-                    break
-                _sleep_interruptibly(poll, lambda: stop_requested)
-                continue
-
-            if git_health_hold_active:
-                log.emit("RESUME", "git worktree health restored - resuming dispatch")
-                git_health_hold_active = False
-
-            if needs_initial_preview:
-                preview_abort_code = _preview_initial_cycle_and_confirm()
-                if preview_abort_code is not None:
-                    result_code = preview_abort_code
-                    break
-                continue
-
-            _prime_effective_scope_for_boundary()
-            pre_cycle_snapshot = _task_snapshot(store)
-            pre_cycle_scoped_selector_recovery_closure_by_owner = _current_scoped_selector_recovery_closure_by_owner()
-            pre_cycle_confirmed_start_ids = _emit_transition_events(
-                previous_snapshot,
-                pre_cycle_snapshot,
-                store=store,
-                config=config,
-                log=log,
-                restart_failed_mode=dispatch_mode == "recovery_only",
-                max_recovery_attempts=max_recovery_attempts,
-                scoped_owner_ids=effective_scoped_owner_ids,
-                scoped_selector_recovery_closure_by_owner=pre_cycle_scoped_selector_recovery_closure_by_owner,
-            )
-            cycle_confirmed_start_count = _process_expected_start_boundary(
-                store=store,
-                config=config,
-                log=log,
-                expected_starts=expected_starts,
-                snapshot=pre_cycle_snapshot,
-                confirmed_start_ids=pre_cycle_confirmed_start_ids,
-            )
-            excluded_owner_ids_before_boundary = _active_failure_owner_ids()
-            if _process_failure_boundary(
-                previous_snapshot,
-                pre_cycle_snapshot,
-                boundary_scoped_owner_ids=effective_scoped_owner_ids,
-                scoped_selector_recovery_closure_by_owner=pre_cycle_scoped_selector_recovery_closure_by_owner,
-            ):
                 previous_snapshot = pre_cycle_snapshot
-                break
-            previous_snapshot = pre_cycle_snapshot
-            excluded_owner_ids = _active_failure_owner_ids()
-            if excluded_owner_ids != excluded_owner_ids_before_boundary:
+                excluded_owner_ids = _active_failure_owner_ids()
+                if excluded_owner_ids != excluded_owner_ids_before_boundary:
+                    pending_first_cycle_plan = None
+
+                if scoped_owner_ids is not None:
+                    cycle_result = _dispatch_scoped_watch_once(
+                        config=config,
+                        store=store,
+                        batch=batch,
+                        max_iterations=max_iterations,
+                        dry_run=dry_run,
+                        quiet=quiet,
+                        suppress_main_verify_stdout=suppress_main_verify_stdout,
+                        log=log,
+                        tags=tag_filters,
+                        any_tag=any_tag,
+                        recovery_slots=recovery_slots,
+                        recovery_mode=dispatch_mode,
+                        max_recovery_attempts=max_recovery_attempts,
+                        show_skipped=show_skipped,
+                        auto_restart_on_drift=auto_restart_on_drift,
+                        installed_package_drift=installed_package_drift,
+                        precomputed_plan=pending_first_cycle_plan,
+                        begin_cycle=not preview_cycle_open,
+                        end_cycle=True,
+                        emit_cycle_header=not preview_cycle_open,
+                        emit_lifecycle_summary=not preview_cycle_open,
+                        scoped_owner_ids=scoped_owner_ids,
+                        scoped_task_ids=raw_task_ids,
+                        known_effective_scoped_owner_ids=effective_scoped_owner_ids,
+                        excluded_owner_ids=excluded_owner_ids,
+                        seen_active_recovery_subject_ids=seen_active_recovery_subject_ids,
+                    )
+                else:
+                    cycle_result = _run_cycle(
+                        config=config,
+                        store=store,
+                        batch=batch,
+                        max_iterations=max_iterations,
+                        dry_run=dry_run,
+                        quiet=quiet,
+                        suppress_main_verify_stdout=suppress_main_verify_stdout,
+                        log=log,
+                        tags=tag_filters,
+                        any_tag=any_tag,
+                        recovery_slots=recovery_slots,
+                        recovery_mode=dispatch_mode,
+                        max_recovery_attempts=max_recovery_attempts,
+                        show_skipped=show_skipped,
+                        auto_restart_on_drift=auto_restart_on_drift,
+                        installed_package_drift=installed_package_drift,
+                        precomputed_plan=pending_first_cycle_plan,
+                        begin_cycle=not preview_cycle_open,
+                        end_cycle=True,
+                        emit_cycle_header=not preview_cycle_open,
+                        emit_lifecycle_summary=not preview_cycle_open,
+                        scoped_owner_ids=scoped_owner_ids,
+                        scoped_task_ids=raw_task_ids if scoped_owner_ids is not None else None,
+                        known_effective_scoped_owner_ids=effective_scoped_owner_ids,
+                        excluded_owner_ids=excluded_owner_ids,
+                        seen_active_recovery_subject_ids=seen_active_recovery_subject_ids,
+                    )
                 pending_first_cycle_plan = None
-
-            if scoped_owner_ids is not None:
-                cycle_result = _dispatch_scoped_watch_once(
-                    config=config,
-                    store=store,
-                    batch=batch,
-                    max_iterations=max_iterations,
-                    dry_run=dry_run,
-                    quiet=quiet,
-                    suppress_main_verify_stdout=suppress_main_verify_stdout,
-                    log=log,
-                    tags=tag_filters,
-                    any_tag=any_tag,
-                    recovery_slots=recovery_slots,
-                    recovery_mode=dispatch_mode,
-                    max_recovery_attempts=max_recovery_attempts,
-                    show_skipped=show_skipped,
-                    auto_restart_on_drift=auto_restart_on_drift,
-                    installed_package_drift=installed_package_drift,
-                    precomputed_plan=pending_first_cycle_plan,
-                    begin_cycle=not preview_cycle_open,
-                    end_cycle=True,
-                    emit_cycle_header=not preview_cycle_open,
-                    emit_lifecycle_summary=not preview_cycle_open,
-                    scoped_owner_ids=scoped_owner_ids,
-                    scoped_task_ids=raw_task_ids,
-                    known_effective_scoped_owner_ids=effective_scoped_owner_ids,
-                    excluded_owner_ids=excluded_owner_ids,
-                    seen_active_recovery_subject_ids=seen_active_recovery_subject_ids,
+                preview_cycle_open = False
+                effective_scoped_owner_ids = cycle_result.effective_scoped_owner_ids or scoped_owner_ids
+                cycle_result.confirmed_start_count += cycle_confirmed_start_count
+                if cycle_result.expected_starts:
+                    expected_starts.update(cycle_result.expected_starts)
+                seen_active_recovery_subject_ids = cycle_result.active_recovery_subject_ids | frozenset(
+                    str(task.based_on)
+                    for task in store.get_all()
+                    if task.status in {"pending", "in_progress"} and task.based_on is not None
                 )
-            else:
-                cycle_result = _run_cycle(
-                    config=config,
-                    store=store,
-                    batch=batch,
-                    max_iterations=max_iterations,
-                    dry_run=dry_run,
-                    quiet=quiet,
-                    suppress_main_verify_stdout=suppress_main_verify_stdout,
-                    log=log,
-                    tags=tag_filters,
-                    any_tag=any_tag,
-                    recovery_slots=recovery_slots,
-                    recovery_mode=dispatch_mode,
-                    max_recovery_attempts=max_recovery_attempts,
-                    show_skipped=show_skipped,
-                    auto_restart_on_drift=auto_restart_on_drift,
-                    installed_package_drift=installed_package_drift,
-                    precomputed_plan=pending_first_cycle_plan,
-                    begin_cycle=not preview_cycle_open,
-                    end_cycle=True,
-                    emit_cycle_header=not preview_cycle_open,
-                    emit_lifecycle_summary=not preview_cycle_open,
-                    scoped_owner_ids=scoped_owner_ids,
-                    scoped_task_ids=raw_task_ids if scoped_owner_ids is not None else None,
-                    known_effective_scoped_owner_ids=effective_scoped_owner_ids,
-                    excluded_owner_ids=excluded_owner_ids,
-                    seen_active_recovery_subject_ids=seen_active_recovery_subject_ids,
-                )
-            pending_first_cycle_plan = None
-            preview_cycle_open = False
-            effective_scoped_owner_ids = cycle_result.effective_scoped_owner_ids or scoped_owner_ids
-            cycle_result.confirmed_start_count += cycle_confirmed_start_count
-            if cycle_result.expected_starts:
-                expected_starts.update(cycle_result.expected_starts)
-            seen_active_recovery_subject_ids = cycle_result.active_recovery_subject_ids | frozenset(
-                str(task.based_on)
-                for task in store.get_all()
-                if task.status in {"pending", "in_progress"} and task.based_on is not None
-            )
 
-            current_snapshot = _task_snapshot(store)
-            post_cycle_scoped_selector_recovery_closure_by_owner = _current_scoped_selector_recovery_closure_by_owner()
-            post_cycle_confirmed_start_ids = _emit_transition_events(
-                previous_snapshot,
-                current_snapshot,
-                store=store,
-                config=config,
-                log=log,
-                restart_failed_mode=dispatch_mode == "recovery_only",
-                max_recovery_attempts=max_recovery_attempts,
-                scoped_owner_ids=effective_scoped_owner_ids,
-                scoped_selector_recovery_closure_by_owner=post_cycle_scoped_selector_recovery_closure_by_owner,
-            )
-            cycle_result.confirmed_start_count += _process_expected_start_boundary(
-                store=store,
-                config=config,
-                log=log,
-                expected_starts=expected_starts,
-                snapshot=current_snapshot,
-                confirmed_start_ids=post_cycle_confirmed_start_ids,
-            )
-            if _process_failure_boundary(
-                previous_snapshot,
-                current_snapshot,
-                boundary_scoped_owner_ids=effective_scoped_owner_ids,
-                scoped_selector_recovery_closure_by_owner=post_cycle_scoped_selector_recovery_closure_by_owner,
-            ):
+                current_snapshot = _task_snapshot(store)
+                post_cycle_scoped_selector_recovery_closure_by_owner = _current_scoped_selector_recovery_closure_by_owner()
+                post_cycle_confirmed_start_ids = _emit_transition_events(
+                    previous_snapshot,
+                    current_snapshot,
+                    store=store,
+                    config=config,
+                    log=log,
+                    restart_failed_mode=dispatch_mode == "recovery_only",
+                    max_recovery_attempts=max_recovery_attempts,
+                    scoped_owner_ids=effective_scoped_owner_ids,
+                    scoped_selector_recovery_closure_by_owner=post_cycle_scoped_selector_recovery_closure_by_owner,
+                )
+                cycle_result.confirmed_start_count += _process_expected_start_boundary(
+                    store=store,
+                    config=config,
+                    log=log,
+                    expected_starts=expected_starts,
+                    snapshot=current_snapshot,
+                    confirmed_start_ids=post_cycle_confirmed_start_ids,
+                )
+                if _process_failure_boundary(
+                    previous_snapshot,
+                    current_snapshot,
+                    boundary_scoped_owner_ids=effective_scoped_owner_ids,
+                    scoped_selector_recovery_closure_by_owner=post_cycle_scoped_selector_recovery_closure_by_owner,
+                ):
+                    previous_snapshot = current_snapshot
+                    break
                 previous_snapshot = current_snapshot
-                break
-            previous_snapshot = current_snapshot
 
-            if _should_reexec_watch(
-                auto_restart_on_drift=auto_restart_on_drift,
-                dry_run=dry_run,
-                stop_requested=stop_requested,
-                drift_state=installed_package_drift,
-            ):
-                reexec_fingerprint = installed_package_drift.pending_restart_fingerprint
-                assert reexec_fingerprint is not None
-                break
-
-            if cycle_result.work_done:
-                idle_seconds = 0
-            if scoped_owner_ids is not None and cycle_result.scoped_done:
-                log.emit("INFO", SCOPED_WATCH_COMPLETE_MESSAGE)
-                break
-            if dry_run and scoped_owner_ids is not None:
-                break
-            log.emit(
-                "SLEEP",
-                _format_sleep_message(
-                    poll=poll,
-                    pending=cycle_result.pending,
-                    running=cycle_result.running,
-                    confirmed_start_count=cycle_result.confirmed_start_count,
-                    anonymous_worker_count=cycle_result.anonymous_worker_count,
-                    starting_worker_count=cycle_result.starting_worker_count,
-                ),
-            )
-            if not cycle_result.work_done:
-                idle_seconds += poll
-                if max_idle is not None and idle_seconds >= max_idle:
-                    log.emit("INFO", f"max idle time reached ({max_idle}s), exiting")
+                if _should_reexec_watch(
+                    auto_restart_on_drift=auto_restart_on_drift,
+                    dry_run=dry_run,
+                    stop_requested=stop_requested,
+                    drift_state=installed_package_drift,
+                ):
+                    reexec_fingerprint = installed_package_drift.pending_restart_fingerprint
+                    assert reexec_fingerprint is not None
                     break
 
-            if stop_requested:
-                break
-            _sleep_interruptibly(poll, lambda: stop_requested)
+                if cycle_result.work_done:
+                    idle_seconds = 0
+                if scoped_owner_ids is not None and cycle_result.scoped_done:
+                    log.emit("INFO", SCOPED_WATCH_COMPLETE_MESSAGE)
+                    break
+                if dry_run and scoped_owner_ids is not None:
+                    break
+                log.emit(
+                    "SLEEP",
+                    _format_sleep_message(
+                        poll=poll,
+                        pending=cycle_result.pending,
+                        running=cycle_result.running,
+                        confirmed_start_count=cycle_result.confirmed_start_count,
+                        anonymous_worker_count=cycle_result.anonymous_worker_count,
+                        starting_worker_count=cycle_result.starting_worker_count,
+                    ),
+                )
+                if not cycle_result.work_done:
+                    idle_seconds += poll
+                    if max_idle is not None and idle_seconds >= max_idle:
+                        log.emit("INFO", f"max idle time reached ({max_idle}s), exiting")
+                        break
 
-        if result_code is not None:
-            pass
-        elif stop_signal is not None:
-            result_code = 128 + stop_signal
-        elif reexec_fingerprint is not None:
-            try:
-                exec_argv = _watch_reexec_argv(args)
-                if stop_signal is not None:
-                    result_code = 128 + stop_signal
-                elif stop_requested:
-                    result_code = 0
-                else:
-                    log.emit(
-                        "INFO",
-                        (
-                            "re-execing watch to load updated gza "
-                            f"{installed_package_drift.startup_fingerprint}"
-                            f"->{reexec_fingerprint}"
-                        ),
-                    )
+                if stop_requested:
+                    break
+                _sleep_interruptibly(poll, lambda: stop_requested)
+
+            if result_code is not None:
+                pass
+            elif stop_signal is not None:
+                _emit_shutdown_message_once()
+                result_code = 128 + stop_signal
+            elif reexec_fingerprint is not None:
+                try:
+                    exec_argv = _watch_reexec_argv(args)
                     if stop_signal is not None:
+                        _emit_shutdown_message_once()
                         result_code = 128 + stop_signal
                     elif stop_requested:
+                        _emit_shutdown_message_once()
                         result_code = 0
                     else:
-                        os.execv(sys.executable, exec_argv)
+                        log.emit(
+                            "INFO",
+                            (
+                                "re-execing watch to load updated gza "
+                                f"{installed_package_drift.startup_fingerprint}"
+                                f"->{reexec_fingerprint}"
+                            ),
+                        )
+                        if stop_signal is not None:
+                            _emit_shutdown_message_once()
+                            result_code = 128 + stop_signal
+                        elif stop_requested:
+                            _emit_shutdown_message_once()
+                            result_code = 0
+                        else:
+                            os.execv(sys.executable, exec_argv)
+                            result_code = 1
+                except Exception as exc:
+                    if stop_signal is not None:
+                        _emit_shutdown_message_once()
+                        result_code = 128 + stop_signal
+                    elif stop_requested:
+                        _emit_shutdown_message_once()
+                        result_code = 0
+                    else:
+                        for message in _watch_exception_messages("watch re-exec failed", exc):
+                            _emit_watch_error(log, quiet, message)
                         result_code = 1
-            except Exception as exc:
-                if stop_signal is not None:
-                    result_code = 128 + stop_signal
-                elif stop_requested:
-                    result_code = 0
-                else:
-                    for message in _watch_exception_messages("watch re-exec failed", exc):
-                        _emit_watch_error(log, quiet, message)
-                    result_code = 1
-        else:
-            result_code = 0
+            else:
+                result_code = 0
+
     finally:
         for restore_error in _restore_installed_watch_signal_handlers(installed_signal_handlers):
             cleanup_errors.append(restore_error)
