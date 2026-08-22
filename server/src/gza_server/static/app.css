@@ -535,3 +535,34 @@ tr.merge-unit-owner { font-weight: 600; }
 }
 
 .log-event.log-thinking .log-body { color: var(--ink-dim); }
+
+/* Review findings --------------------------------------------------------- */
+
+.findings {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.finding {
+  border-left: 3px solid var(--hairline-strong);
+  padding: 0.35rem 0.7rem;
+}
+
+.finding-blocker { border-left-color: var(--status-failed); }
+.finding-followup { border-left-color: var(--status-in-progress); }
+.finding-nit { border-left-color: var(--ink-faint); }
+
+.finding .severity,
+.verdict {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.04em;
+  color: var(--ink-dim);
+  margin-right: 0.5rem;
+}
+
+.finding p { margin: 0.2rem 0 0; }

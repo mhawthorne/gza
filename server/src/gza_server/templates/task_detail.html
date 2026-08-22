@@ -59,6 +59,32 @@
     </form>
   </section>
 
+  {% if detail.reviews %}
+    <section class="reviews">
+      <h2>Review findings</h2>
+      {% for review in detail.reviews %}
+        <h3>
+          <a href="{{ review.detail_url }}">{{ review.task_id }}</a>
+          {% if review.verdict %}<span class="verdict verdict-{{ review.verdict|lower }}">{{ review.verdict }}</span>{% endif %}
+          <span class="muted">{{ review.task_type }} · {{ review.status }}</span>
+        </h3>
+        {% if review.findings %}
+          <ul class="findings">
+            {% for finding in review.findings %}
+              <li class="finding finding-{{ finding.severity|lower }}">
+                <span class="severity">{{ finding.severity }}</span>
+                <strong>{{ finding.title }}</strong>
+                {% if finding.evidence %}<p class="muted">{{ finding.evidence }}</p>{% endif %}
+              </li>
+            {% endfor %}
+          </ul>
+        {% else %}
+          <p class="muted">No findings recorded.</p>
+        {% endif %}
+      {% endfor %}
+    </section>
+  {% endif %}
+
   <section>
     <h2>Lineage</h2>
     <h3>Parents</h3>

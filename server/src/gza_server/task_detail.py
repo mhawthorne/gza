@@ -11,6 +11,7 @@ from markdown_it import MarkdownIt
 from markupsafe import Markup
 
 from gza.db import MergeUnit, SqliteTaskStore, Task, task_updated_at
+from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.runner import get_task_output
 
 from .merge_unit_detail import merge_unit_url
@@ -29,6 +30,35 @@ class LineageLink:
     relationship: str
 
 
+REVIEW_TASK_TYPES = ("review", "plan_review")
+
+
+@dataclass(frozen=True)
+class ReviewSummary:
+    """A child review's verdict and findings, shown on the task it reviewed."""
+
+    task_id: str
+    task_type: str
+    status: str
+    detail_url: str
+    verdict: str | None
+    findings: tuple[ReviewFinding, ...]
+
+    @property
+    def blockers(self) -> tuple[ReviewFinding, ...]:
+        return tuple(finding for finding in self.findings if finding.severity == "BLOCKER")
+
+    def json_record(self) -> dict[str, object]:
+        return {
+            "task_id": self.task_id,
+            "task_type": self.task_type,
+            "status": self.status,
+            "detail_url": self.detail_url,
+            "verdict": self.verdict,
+            "findings": [asdict(finding) for finding in self.findings],
+        }
+
+
 @dataclass(frozen=True)
 class TaskDetail:
     """Full task record plus direct lineage relationships."""
@@ -39,6 +69,7 @@ class TaskDetail:
     parents: tuple[LineageLink, ...]
     children: tuple[LineageLink, ...]
     output_content: str | None
+    reviews: tuple[ReviewSummary, ...] = ()
     project_root: Path | None = None
     merge_unit: MergeUnit | None = None
 
@@ -67,6 +98,7 @@ class TaskDetail:
         record["merge_unit_state"] = None if self.merge_unit is None else self.merge_unit.state
         record["merge_unit_url"] = self.merge_unit_url
         record["log_url"] = f"{self.detail_url}/log"
+        record["reviews"] = [review.json_record() for review in self.reviews]
         return record
 
     @property
@@ -154,6 +186,7 @@ def query_task_detail(
             )
 
     output_content = get_task_output(task, project_store.project_root)
+    reviews = _review_summaries(project_store, task, children, owning_project_id)
     return TaskDetail(
         task=task,
         project_id=owning_project_id,
@@ -161,9 +194,46 @@ def query_task_detail(
         parents=tuple(parents),
         children=tuple(children),
         output_content=output_content,
+        reviews=reviews,
         project_root=project_store.project_root,
         merge_unit=project_store.resolve_merge_unit_for_task(task_id),
     )
+
+
+def _review_summaries(
+    project_store: SqliteTaskStore,
+    task: Task,
+    children: list[LineageLink],
+    project_id: str,
+) -> tuple[ReviewSummary, ...]:
+    """Collect verdicts and findings from the reviews of this task.
+
+    A review's findings are about the task it reviewed, so they belong on that
+    task's page: an operator asking "why is this blocked" should not have to
+    walk the lineage to a separate review task to find out.
+    """
+    if task.task_type in REVIEW_TASK_TYPES:
+        return ()
+    review_ids = [child.id for child in children if child.task_type in REVIEW_TASK_TYPES]
+    if not review_ids:
+        return ()
+
+    summaries: list[ReviewSummary] = []
+    for review in project_store.get_many(review_ids):
+        if review.id is None:
+            continue
+        report = parse_review_report(get_task_output(review, project_store.project_root))
+        summaries.append(
+            ReviewSummary(
+                task_id=review.id,
+                task_type=review.task_type,
+                status=review.status,
+                detail_url=_detail_url(project_id, review.id),
+                verdict=report.verdict,
+                findings=report.findings,
+            )
+        )
+    return tuple(summaries)
 
 
 def _lineage_link(
