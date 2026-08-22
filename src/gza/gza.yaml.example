@@ -531,3 +531,19 @@ provider: codex
 # on every restart.
 # Default: 8765
 # server_port: 8765
+
+# Collect provider quota usage stats.
+# Default: true
+# usage: true
+
+# Days of provider usage history to retain.
+# Default: 30
+# usage_retention_days: 30
+
+# Wall-clock budget for one provider usage query.
+# Default: 10.0
+# usage_timeout_seconds: 10.0
+
+# How long a cached usage reading stays fresh.
+# Default: 900
+# usage_ttl_seconds: 900

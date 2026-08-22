@@ -21,6 +21,32 @@
     </p>
   </section>
 
+  {% if usage %}
+    <section class="board usage-board">
+      <h2>Provider usage</h2>
+      <div class="usage-card{% if usage.stale %} usage-card-stale{% endif %}">
+        <div class="usage-head">
+          <span class="usage-provider">{{ usage.provider }}</span>
+          <span class="usage-pct">{{ usage.used_percent }}%</span>
+        </div>
+        <div class="usage-meter" role="img"
+             aria-label="{{ usage.used_percent }} percent of the {{ usage.duration_label }} limit used">
+          <span class="usage-meter-fill" style="width: {{ usage.used_percent }}%"></span>
+        </div>
+        <p class="usage-detail">
+          {{ usage.remaining_percent }}% left of the {{ usage.duration_label }} window ·
+          resets in {{ usage.resets_in }}
+        </p>
+        {% if usage.warning %}
+          <p class="usage-warning">{{ usage.warning }}</p>
+        {% endif %}
+        <p class="muted usage-age">
+          {% if usage.stale %}stale {{ usage.age_label }}{% else %}updated {{ usage.age_label }} ago{% endif %}
+        </p>
+      </div>
+    </section>
+  {% endif %}
+
   <section>
     <h2>Recently updated</h2>
     <div class="table-wrap">

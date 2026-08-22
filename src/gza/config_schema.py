@@ -136,6 +136,10 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("spec_coherence.enabled", "bool", True, "Require the behavior-spec coherence gate for branches whose merge diff touches configured spec paths."),
     ConfigKeySpec("spec_coherence.paths", "list[str]", ["specs/behavior/**"], "Repo-relative path patterns that trigger the behavior-spec coherence merge gate."),
     ConfigKeySpec("log_dir", "str", ".gza/logs", "Directory for task and worker logs."),
+    ConfigKeySpec("usage", "bool", "true", "Collect provider quota usage stats."),
+    ConfigKeySpec("usage_ttl_seconds", "int", "900", "How long a cached usage reading stays fresh."),
+    ConfigKeySpec("usage_timeout_seconds", "float", "10.0", "Wall-clock budget for one provider usage query."),
+    ConfigKeySpec("usage_retention_days", "int", "30", "Days of provider usage history to retain."),
     ConfigKeySpec(
         "max_resume_attempts",
         "int",

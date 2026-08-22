@@ -3601,3 +3601,108 @@ def cmd_skills_install(
         print()
 
     return 1 if any_failed else 0
+
+
+def cmd_usage(args: argparse.Namespace) -> int:
+    """Show provider quota usage, refreshing through the TTL cache."""
+    import json as _json
+    from datetime import UTC as _UTC, datetime as _datetime, timedelta as _timedelta
+
+    from ..usage import format_duration_short, format_usage_line
+    from ..usage_service import get_usage, usage_providers
+
+    config = Config.load(args.project_dir)
+    store = get_store(config)
+
+    show_all: bool = getattr(args, "all", False)
+    output_json: bool = getattr(args, "json", False)
+    no_refresh: bool = getattr(args, "no_refresh", False)
+    force_refresh: bool = getattr(args, "refresh", False)
+
+    if not config.usage:
+        if output_json:
+            print(_json.dumps({"enabled": False, "providers": []}, indent=2))
+        else:
+            print("Usage collection is disabled (set 'usage: true' in gza.yaml).")
+        return 0
+
+    providers = usage_providers(config)
+    if not providers:
+        if output_json:
+            print(_json.dumps({"enabled": True, "providers": []}, indent=2))
+        else:
+            print("No routed provider reports usage stats.")
+        return 0
+
+    now = _datetime.now(_UTC)
+    # --refresh forces a fetch by treating everything cached as stale.
+    max_age = _timedelta(0) if force_refresh else _timedelta(seconds=config.usage_ttl_seconds)
+
+    payload: list[dict[str, object]] = []
+    exit_code = 0
+    for provider in providers:
+        snapshot = get_usage(
+            store,
+            provider,
+            max_age=max_age,
+            refresh=not no_refresh,
+            timeout_seconds=config.usage_timeout_seconds,
+            retention_days=config.usage_retention_days,
+            now=now,
+        )
+        if output_json:
+            usage = snapshot.usage
+            payload.append(
+                {
+                    "provider": provider,
+                    "source": snapshot.source,
+                    "stale": snapshot.stale,
+                    "error": snapshot.error,
+                    "error_reason": snapshot.error_reason,
+                    "fetched_at": usage.fetched_at.isoformat() if usage else None,
+                    "plan_type": usage.plan_type if usage else None,
+                    "reset_credits_available": usage.reset_credits_available if usage else 0,
+                    # JSON always emits every window: machine consumers should
+                    # not inherit a display default meant for humans.
+                    "windows": [
+                        {
+                            "limit_id": w.limit_id,
+                            "limit_name": w.limit_name,
+                            "window": w.window,
+                            "used_percent": w.used_percent,
+                            "remaining_percent": w.remaining_percent,
+                            "window_duration_minutes": w.window_duration_minutes,
+                            "resets_at": w.resets_at.isoformat(),
+                            "is_account_wide": w.is_account_wide,
+                        }
+                        for w in (usage.windows if usage else ())
+                    ],
+                }
+            )
+            if not snapshot.available:
+                exit_code = 1
+            continue
+
+        print(format_usage_line(snapshot, now=now))
+        if not snapshot.available:
+            exit_code = 1
+            continue
+
+        usage = snapshot.usage
+        assert usage is not None
+        if usage.reset_credits_available:
+            print(f"  {usage.reset_credits_available} rate-limit reset credit(s) available")
+        if show_all:
+            print()
+            header = f"  {'LIMIT':<20} {'NAME':<24} {'WINDOW':<10} {'USED':>6} {'LEFT':>6} {'DUR':>6}  RESETS IN"
+            print(header)
+            for w in sorted(usage.windows, key=lambda w: (not w.is_account_wide, w.limit_id, w.window)):
+                print(
+                    f"  {w.limit_id:<20} {(w.limit_name or '-'):<24} {w.window:<10} "
+                    f"{w.used_percent:>5.0f}% {w.remaining_percent:>5.0f}% {w.duration_label:>6}  "
+                    f"{format_duration_short(w.resets_at - now)}"
+                )
+
+    if output_json:
+        print(_json.dumps({"enabled": True, "providers": payload}, indent=2))
+    return exit_code

@@ -37,6 +37,7 @@ _SQLITE_CLOSE_LABELS = {"operation": "close"}
 
 if TYPE_CHECKING:
     from gza.config import Config
+    from gza.usage import ProviderUsage
 
 
 def _launch_editor(cmd: list[str]) -> subprocess.CompletedProcess[bytes]:
@@ -2705,8 +2706,51 @@ CREATE INDEX IF NOT EXISTS idx_watch_sessions_heartbeat
     ON watch_sessions(project_id, heartbeat_at DESC);
 """
 
+# Migration from v68 to v69: provider usage/quota history.
+# Fetch-level facts (plan, credits, spend control) live on the parent row; one
+# sample row per limit window. Every bucket is captured even though only the
+# account-wide one is displayed -- windows we decline to record cannot be
+# backfilled later.
+MIGRATION_V68_TO_V69 = """
+CREATE TABLE IF NOT EXISTS provider_usage_fetches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    plan_type TEXT,
+    spend_control_reached INTEGER,
+    rate_limit_reached_type TEXT,
+    credits_has INTEGER,
+    credits_unlimited INTEGER,
+    credits_balance TEXT,
+    reset_credits_available INTEGER NOT NULL DEFAULT 0,
+    raw_json TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_provider_usage_fetch_latest
+    ON provider_usage_fetches(provider, fetched_at DESC);
+
+CREATE TABLE IF NOT EXISTS provider_usage_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fetch_id INTEGER NOT NULL REFERENCES provider_usage_fetches(id) ON DELETE CASCADE,
+    limit_id TEXT NOT NULL,
+    limit_name TEXT,
+    window TEXT NOT NULL,
+    used_percent REAL NOT NULL,
+    window_duration_minutes INTEGER NOT NULL,
+    resets_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_provider_usage_sample_fetch
+    ON provider_usage_samples(fetch_id);
+
+CREATE TABLE IF NOT EXISTS provider_usage_failures (
+    provider TEXT PRIMARY KEY,
+    last_error TEXT NOT NULL,
+    last_error_reason TEXT NOT NULL,
+    last_error_at TEXT NOT NULL
+);
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 68
+SCHEMA_VERSION = 69
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -3623,6 +3667,7 @@ _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
         66,
         67,
         68,
+        69,
     }
 )
 
@@ -4984,6 +5029,42 @@ CREATE TABLE IF NOT EXISTS watch_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_watch_sessions_heartbeat
     ON watch_sessions(project_id, heartbeat_at DESC);
+
+CREATE TABLE IF NOT EXISTS provider_usage_fetches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider TEXT NOT NULL,
+    fetched_at TEXT NOT NULL,
+    plan_type TEXT,
+    spend_control_reached INTEGER,
+    rate_limit_reached_type TEXT,
+    credits_has INTEGER,
+    credits_unlimited INTEGER,
+    credits_balance TEXT,
+    reset_credits_available INTEGER NOT NULL DEFAULT 0,
+    raw_json TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_provider_usage_fetch_latest
+    ON provider_usage_fetches(provider, fetched_at DESC);
+
+CREATE TABLE IF NOT EXISTS provider_usage_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    fetch_id INTEGER NOT NULL REFERENCES provider_usage_fetches(id) ON DELETE CASCADE,
+    limit_id TEXT NOT NULL,
+    limit_name TEXT,
+    window TEXT NOT NULL,
+    used_percent REAL NOT NULL,
+    window_duration_minutes INTEGER NOT NULL,
+    resets_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_provider_usage_sample_fetch
+    ON provider_usage_samples(fetch_id);
+
+CREATE TABLE IF NOT EXISTS provider_usage_failures (
+    provider TEXT PRIMARY KEY,
+    last_error TEXT NOT NULL,
+    last_error_reason TEXT NOT NULL,
+    last_error_at TEXT NOT NULL
+);
 """
 
 # Migration from v1 to v2
@@ -5300,6 +5381,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (66, MIGRATION_V65_TO_V66),
     (67, MIGRATION_V66_TO_V67),
     (68, MIGRATION_V67_TO_V68),
+    (69, MIGRATION_V68_TO_V69),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -5588,6 +5670,176 @@ class SqliteTaskStore:
             return self._query_only_table_exists.get("behavior_check_findings", False)
         with self._connect() as conn:
             return _table_exists(conn, "behavior_check_findings")
+
+    def supports_provider_usage(self) -> bool:
+        """Return whether provider usage history storage is available."""
+        if self._open_mode == "query_only":
+            return self._query_only_table_exists.get("provider_usage_fetches", False)
+        with self._connect() as conn:
+            return _table_exists(conn, "provider_usage_fetches")
+
+    def record_provider_usage(self, usage: "ProviderUsage", *, retention_days: int = 30) -> int:
+        """Append one usage fetch and its window samples; return the fetch id.
+
+        Recording a success clears any standing failure marker for the provider:
+        the last thing we know about it is now good.
+        """
+        if not self.supports_provider_usage():
+            raise RuntimeError("provider usage storage is not available on this database")
+        fetched_at = _format_db_timestamp(usage.fetched_at)
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO provider_usage_fetches(
+                    provider, fetched_at, plan_type, spend_control_reached,
+                    rate_limit_reached_type, credits_has, credits_unlimited,
+                    credits_balance, reset_credits_available, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    usage.provider,
+                    fetched_at,
+                    usage.plan_type,
+                    None if usage.spend_control_reached is None else int(usage.spend_control_reached),
+                    usage.rate_limit_reached_type,
+                    None if usage.credits_has is None else int(usage.credits_has),
+                    None if usage.credits_unlimited is None else int(usage.credits_unlimited),
+                    usage.credits_balance,
+                    usage.reset_credits_available,
+                    usage.raw_json,
+                ),
+            )
+            fetch_id = int(cur.lastrowid or 0)
+            conn.executemany(
+                """
+                INSERT INTO provider_usage_samples(
+                    fetch_id, limit_id, limit_name, window,
+                    used_percent, window_duration_minutes, resets_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        fetch_id,
+                        window.limit_id,
+                        window.limit_name,
+                        window.window,
+                        float(window.used_percent),
+                        int(window.window_duration_minutes),
+                        _format_db_timestamp(window.resets_at),
+                    )
+                    for window in usage.windows
+                ],
+            )
+            conn.execute("DELETE FROM provider_usage_failures WHERE provider = ?", (usage.provider,))
+            self._prune_provider_usage(conn, usage.provider, retention_days=retention_days)
+        return fetch_id
+
+    def _prune_provider_usage(
+        self, conn: sqlite3.Connection, provider: str, *, retention_days: int
+    ) -> None:
+        """Drop fetches older than the retention window (samples cascade)."""
+        if retention_days <= 0:
+            return
+        cutoff = _format_db_timestamp(datetime.now(UTC) - timedelta(days=retention_days))
+        conn.execute(
+            "DELETE FROM provider_usage_samples WHERE fetch_id IN ("
+            "  SELECT id FROM provider_usage_fetches WHERE provider = ? AND fetched_at < ?"
+            ")",
+            (provider, cutoff),
+        )
+        conn.execute(
+            "DELETE FROM provider_usage_fetches WHERE provider = ? AND fetched_at < ?",
+            (provider, cutoff),
+        )
+
+    def record_provider_usage_failure(self, provider: str, *, error: str, reason: str) -> None:
+        """Record why the last usage fetch failed, leaving the last good sample intact."""
+        if not self.supports_provider_usage():
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO provider_usage_failures(provider, last_error, last_error_reason, last_error_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(provider) DO UPDATE SET
+                    last_error = excluded.last_error,
+                    last_error_reason = excluded.last_error_reason,
+                    last_error_at = excluded.last_error_at
+                """,
+                (provider, error, reason, _format_db_timestamp(datetime.now(UTC))),
+            )
+
+    def get_provider_usage_failure(self, provider: str) -> tuple[str, str] | None:
+        """Return (error, reason) for the last failed fetch, if any."""
+        if not self.supports_provider_usage():
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT last_error, last_error_reason FROM provider_usage_failures WHERE provider = ?",
+                (provider,),
+            ).fetchone()
+        if row is None:
+            return None
+        return (row["last_error"], row["last_error_reason"])
+
+    def get_latest_provider_usage(self, provider: str) -> "ProviderUsage | None":
+        """Return the most recent recorded usage fetch for a provider."""
+        if not self.supports_provider_usage():
+            return None
+        from .usage import ProviderUsage, UsageWindow
+
+        with self._connect() as conn:
+            fetch = conn.execute(
+                """
+                SELECT * FROM provider_usage_fetches
+                WHERE provider = ?
+                ORDER BY fetched_at DESC, id DESC
+                LIMIT 1
+                """,
+                (provider,),
+            ).fetchone()
+            if fetch is None:
+                return None
+            samples = conn.execute(
+                """
+                SELECT * FROM provider_usage_samples
+                WHERE fetch_id = ?
+                ORDER BY limit_id, window
+                """,
+                (fetch["id"],),
+            ).fetchall()
+
+        fetched_at = _parse_db_timestamp(fetch["fetched_at"])
+        if fetched_at is None:
+            return None
+        windows = tuple(
+            UsageWindow(
+                limit_id=row["limit_id"],
+                limit_name=row["limit_name"],
+                window=row["window"],
+                used_percent=float(row["used_percent"]),
+                window_duration_minutes=int(row["window_duration_minutes"]),
+                resets_at=_parse_db_timestamp(row["resets_at"]) or fetched_at,
+            )
+            for row in samples
+        )
+        return ProviderUsage(
+            provider=fetch["provider"],
+            fetched_at=fetched_at,
+            windows=windows,
+            plan_type=fetch["plan_type"],
+            spend_control_reached=(
+                None if fetch["spend_control_reached"] is None else bool(fetch["spend_control_reached"])
+            ),
+            rate_limit_reached_type=fetch["rate_limit_reached_type"],
+            credits_has=None if fetch["credits_has"] is None else bool(fetch["credits_has"]),
+            credits_unlimited=(
+                None if fetch["credits_unlimited"] is None else bool(fetch["credits_unlimited"])
+            ),
+            credits_balance=fetch["credits_balance"],
+            reset_credits_available=int(fetch["reset_credits_available"] or 0),
+            raw_json=fetch["raw_json"] or "",
+        )
 
     def supports_watch_sessions(self) -> bool:
         """Return whether watch-scope storage is available."""
@@ -6115,6 +6367,9 @@ class SqliteTaskStore:
             "parked_task_rearms",
             "behavior_check_findings",
             "watch_sessions",
+            "provider_usage_fetches",
+            "provider_usage_samples",
+            "provider_usage_failures",
         )
         self._query_only_table_exists = {table: _table_exists(conn, table) for table in tables}
         self._query_only_columns = {

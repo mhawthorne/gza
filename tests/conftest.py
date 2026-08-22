@@ -5,6 +5,7 @@ import fcntl
 import os
 import shlex
 import subprocess
+import threading
 import time
 from contextlib import ExitStack
 from pathlib import Path
@@ -280,6 +281,17 @@ def _disable_git_signing(tmp_path, monkeypatch):
     global_config = tmp_path / ".gitconfig-empty"
     global_config.write_text("")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+
+
+@pytest.fixture(autouse=True)
+def _disable_usage_warmers(monkeypatch):
+    """Keep background provider-usage refreshes out of the unit suite.
+
+    The warmers are daemon threads that shell out to a provider CLI on purpose.
+    That is correct in production and out of bounds for a unit test, so the seam
+    is disabled here rather than weakening the subprocess guard.
+    """
+    monkeypatch.setattr("gza.cli.watch.start_usage_warmer", lambda *a, **k: threading.Event())
 
 
 @pytest.fixture(autouse=True)

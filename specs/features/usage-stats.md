@@ -169,16 +169,19 @@ worse than a slightly stale number.
 The store is refreshed opportunistically by whatever process happens to notice
 staleness, so nothing depends on a dedicated daemon:
 
-- **Watch cycle** — at the top of each cycle, `get_usage(..., refresh=True)`.
-  At a 5-minute loop and a 15-minute TTL this refreshes every third cycle, and
-  the header line always prints the cached value regardless.
-- **`gza usage`** — `refresh=True`, plus `--no-refresh` to read cache only and
-  `--refresh` to force past the TTL.
+- **Watch** — the cycle header renders from cache only, and a background
+  warmer thread started for the life of the watch run does the fetching on the
+  TTL interval. Rendering a header must never block on a provider subprocess:
+  a slow or hanging query would otherwise delay scheduling for every task.
+- **`gza usage`** — refreshes when stale, plus `--no-refresh` to read cache only
+  and `--refresh` to force past the TTL.
 - **Server** — `refresh=False` on the request path, always. A background
-  refresh task inside `gza-server` (same supervisor that already manages the
-  server lifecycle) ticks at the TTL and refreshes out of band. That way the
-  homepage never blocks on a subprocess, and usage stays warm even when watch
-  is not running.
+  refresh thread inside `gza-server` ticks at the TTL and refreshes out of band,
+  so the homepage never blocks on a subprocess and usage stays warm even when
+  watch is not running.
+
+Both warmers go through the same lease, so a watch and a server running side by
+side still spawn at most one provider process at a time.
 
 ## Config
 

@@ -2,18 +2,31 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import io
 import json
 import logging
 import os
+import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rich.markup import escape as rich_escape
 
+from ..usage import (
+    ProviderUsage,
+    UsageCliMissing,
+    UsageError,
+    UsageProtocolError,
+    UsageTimeout,
+    UsageUnauthenticated,
+    parse_codex_rate_limits,
+)
 from .base import (
     DEFAULT_PROVIDER_DOCKER_STARTUP_TIMEOUT,
     DockerConfig,
@@ -715,6 +728,155 @@ def _get_docker_config(
         )
 
 
+
+_USAGE_STDERR_TAIL_BYTES = 2000
+
+
+def _gza_version() -> str:
+    """Version reported to codex app-server as client info; never fatal."""
+    try:
+        return importlib.metadata.version("gza-agent")
+    except importlib.metadata.PackageNotFoundError:
+        return "0"
+
+
+def _read_codex_usage(*, timeout_seconds: float, gza_version: str) -> ProviderUsage:
+    """Query Codex quota via one short-lived `codex app-server` child process.
+
+    Codex owns ChatGPT authentication throughout: we never read auth.json,
+    cookies, or tokens, and never call undocumented HTTP endpoints.
+    """
+    if shutil.which("codex") is None:
+        raise UsageCliMissing("codex CLI is not installed")
+
+    messages = [
+        {
+            "method": "initialize",
+            "id": 0,
+            "params": {
+                "clientInfo": {"name": "gza", "title": "Gza", "version": gza_version}
+            },
+        },
+        {"method": "initialized", "params": {}},
+        {"method": "account/rateLimits/read", "id": 1},
+    ]
+
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        process = subprocess.Popen(
+            ["codex", "app-server"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as exc:
+        raise UsageCliMissing(f"could not start codex app-server: {exc}") from exc
+
+    result: dict[str, Any] | None = None
+    raw_line = ""
+    failure: UsageError | None = None
+
+    def _pump() -> None:
+        # Runs on a worker thread so the blocking readline cannot outlive the
+        # deadline: the main thread stops waiting and kills the child.
+        nonlocal result, raw_line, failure
+        assert process.stdout is not None
+        for line in process.stdout:
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # Notifications may interleave; only id==1 matters.
+            if not isinstance(message, dict) or message.get("id") != 1:
+                continue
+            if "error" in message:
+                failure = _classify_usage_rpc_error(message["error"])
+                return
+            payload = message.get("result")
+            if not isinstance(payload, dict):
+                failure = UsageProtocolError("codex returned a non-object usage result")
+                return
+            result = payload
+            raw_line = line.strip()
+            return
+
+    reader = threading.Thread(target=_pump, daemon=True)
+    reader.start()
+    try:
+        assert process.stdin is not None
+        for message in messages:
+            process.stdin.write(json.dumps(message) + "\n")
+        process.stdin.flush()
+        reader.join(timeout=max(0.0, deadline - time.monotonic()))
+    except (BrokenPipeError, OSError) as exc:
+        raise UsageProtocolError(f"codex app-server closed its input: {exc}") from exc
+    finally:
+        _terminate_usage_process(process)
+
+    if failure is not None:
+        raise failure
+    if result is None:
+        if reader.is_alive():
+            raise UsageTimeout(f"codex app-server did not respond within {timeout_seconds:g}s")
+        tail = _usage_stderr_tail(process)
+        detail = f": {tail}" if tail else ""
+        raise UsageProtocolError(f"codex app-server exited without a usage response{detail}")
+
+    return parse_codex_rate_limits(
+        result,
+        fetched_at=datetime.now(UTC),
+        raw_json=raw_line,
+    )
+
+
+def _classify_usage_rpc_error(error: object) -> UsageError:
+    """Map a JSON-RPC error into the usage failure taxonomy."""
+    message = ""
+    if isinstance(error, dict):
+        message = str(error.get("message") or error)
+    else:
+        message = str(error)
+    lowered = message.lower()
+    if any(token in lowered for token in ("auth", "login", "unauthorized", "401")):
+        error_obj: UsageError = UsageUnauthenticated(f"{message} — run `codex login`")
+    elif "method not found" in lowered or "unknown method" in lowered:
+        error_obj = UsageCliMissing(f"this codex version does not support usage queries: {message}")
+    else:
+        error_obj = UsageProtocolError(message)
+    return error_obj
+
+
+def _usage_stderr_tail(process: subprocess.Popen[str]) -> str:
+    """Bounded stderr tail for diagnostics; never contains credentials."""
+    if process.stderr is None:
+        return ""
+    try:
+        return (process.stderr.read() or "")[-_USAGE_STDERR_TAIL_BYTES:].strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def _terminate_usage_process(process: subprocess.Popen[str]) -> None:
+    """Always reap the child, including on cancellation."""
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+    for stream in (process.stdin, process.stdout):
+        try:
+            if stream is not None:
+                stream.close()
+        except OSError:
+            pass
+
+
 class CodexProvider(Provider):
     """OpenAI Codex CLI provider."""
 
@@ -728,6 +890,13 @@ class CodexProvider(Provider):
             "Set CODEX_API_KEY in ~/.gza/.env (OPENAI_API_KEY is also accepted as an alias) "
             "or run 'codex --login' to authenticate with OAuth"
         )
+
+    def supports_usage(self) -> bool:
+        return True
+
+    def read_usage(self, *, timeout_seconds: float = 10.0) -> ProviderUsage:
+        """Read ChatGPT-backed Codex quota windows."""
+        return _read_codex_usage(timeout_seconds=timeout_seconds, gza_version=_gza_version())
 
     def check_credentials(self) -> bool:
         """Check for Codex credentials (API key or OAuth).

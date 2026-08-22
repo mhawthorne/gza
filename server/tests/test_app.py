@@ -110,3 +110,69 @@ def test_every_task_status_has_a_style_rule() -> None:
         status for status in ALL_TASK_STATUSES if f".status-{status}" not in stylesheet
     ]
     assert not missing, f"statuses without a style rule: {missing}"
+
+
+def test_usage_card_is_cache_only_and_never_starts_a_provider(monkeypatch, tmp_path: Path):
+    """A page render must never pay for a provider subprocess."""
+    from gza_server import app as app_module
+
+    seen: dict[str, object] = {}
+
+    def _fake_get_primary_usage(store, config, *, refresh=True, now=None):
+        seen["refresh"] = refresh
+        return None
+
+    monkeypatch.setattr("gza.usage_service.get_primary_usage", _fake_get_primary_usage)
+    monkeypatch.setattr(
+        "gza.config.Config.load",
+        classmethod(lambda cls, *a, **k: _UsageConfig()),
+    )
+    monkeypatch.setattr(
+        "gza.db.SqliteTaskStore.from_config", classmethod(lambda cls, *a, **k: FakeStore())
+    )
+
+    assert app_module.resolve_usage_card(tmp_path) is None
+    assert seen["refresh"] is False
+
+
+class _UsageConfig:
+    usage = True
+    usage_ttl_seconds = 900
+
+
+def test_index_omits_the_usage_card_when_usage_is_unavailable(tmp_path: Path, monkeypatch):
+    from gza_server import app as app_module
+
+    monkeypatch.setattr(app_module, "resolve_usage_card", lambda *a, **k: None)
+    db_path = tmp_path / "gza.db"
+    store = SqliteTaskStore(db_path)
+    app = create_app(store_factory=lambda: store)
+    response = TestClient(app).get("/")
+    assert response.status_code == 200
+    assert "usage-board" not in response.text
+
+
+def test_index_renders_the_usage_card_when_a_reading_is_cached(tmp_path: Path, monkeypatch):
+    from gza_server import app as app_module
+
+    card = app_module.UsageCard(
+        provider="codex",
+        used_percent=45.0,
+        remaining_percent=55.0,
+        duration_label="7d",
+        resets_in="4d20h",
+        age_label="4m",
+        stale=False,
+        warning="",
+    )
+    monkeypatch.setattr(app_module, "resolve_usage_card", lambda *a, **k: card)
+    store = SqliteTaskStore(tmp_path / "gza.db")
+    app = create_app(store_factory=lambda: store)
+    response = TestClient(app).get("/")
+
+    assert response.status_code == 200
+    assert "usage-board" in response.text
+    assert "45.0%" in response.text
+    assert "resets in 4d20h" in response.text
+    # Per-model buckets are captured but never surfaced on the homepage.
+    assert "Spark" not in response.text

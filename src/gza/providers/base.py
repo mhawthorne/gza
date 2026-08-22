@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..config import DEFAULT_DOCKER_STARTUP_TIMEOUT
+from ..usage import ProviderUsage, UsageUnsupported
 
 if TYPE_CHECKING:
     from ..config import Config
@@ -1045,6 +1046,18 @@ class Provider(ABC):
         """
         return "Check the provider documentation for credential setup."
 
+    def supports_usage(self) -> bool:
+        """Whether this provider can report account quota usage."""
+        return False
+
+    def read_usage(self, *, timeout_seconds: float = 10.0) -> ProviderUsage:
+        """Read current quota usage for this provider.
+
+        Optional capability: providers that cannot report usage inherit this
+        and raise, which callers treat as "unsupported" rather than a failure.
+        """
+        raise UsageUnsupported(f"{self.name} does not report usage")
+
     @abstractmethod
     def check_credentials(self) -> bool:
         """Check if credentials are configured (quick check)."""
@@ -1369,4 +1382,24 @@ def get_provider(config: Config) -> Provider:
     if not provider_class:
         raise ValueError(f"Unknown provider: {config.provider}")
 
+    return provider_class()
+
+
+def get_provider_by_name(name: str) -> Provider:
+    """Build a provider from its bare name, with no config to hand.
+
+    Usage queries only need the provider identity, not a project config.
+    """
+    from .claude import ClaudeProvider
+    from .codex import CodexProvider
+    from .gemini import GeminiProvider
+
+    providers: dict[str, type[Provider]] = {
+        "claude": ClaudeProvider,
+        "codex": CodexProvider,
+        "gemini": GeminiProvider,
+    }
+    provider_class = providers.get(name.strip().lower())
+    if not provider_class:
+        raise ValueError(f"Unknown provider: {name}")
     return provider_class()
