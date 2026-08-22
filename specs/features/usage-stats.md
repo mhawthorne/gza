@@ -201,35 +201,58 @@ spawn `codex app-server`.
 
 One shared formatter so all three surfaces agree.
 
-Compact (watch header, one line). Windows are labelled by their **duration**,
-never by primary/secondary position, and named by `limitName` when present:
+### Primary limit vs. the rest
+
+Capture and display are decided separately:
+
+- **Capture: every window.** All buckets and windows are stored on every fetch.
+  The marginal cost is two extra rows per fetch (a few hundred bytes against a
+  ~1.5KB `raw_json` we are already writing), so storing them is effectively
+  free, while *not* storing them is irreversible — there is no way to backfill
+  a window we declined to record. The per-model buckets are also precisely the
+  evidence needed to answer "is Spark worth routing to?", a question we cannot
+  ask without a history.
+- **Display: the primary limit only.** Every surface shows one window by
+  default: the account-wide bucket, identified as the entry whose `limitName`
+  is null (equivalently `limitId == "codex"` today; match on the null name,
+  since the ID is not guaranteed stable). Per-model buckets are captured
+  silently and rendered nowhere unless explicitly asked for.
+
+`UsageSnapshot` exposes `primary_window` for this, so no consumer re-implements
+the selection. When a bucket has several windows, `primary_window` is its
+most-consumed one.
+
+If no bucket has a null `limitName` — a shape we have not observed — fall back
+to the most-consumed window across all buckets rather than rendering nothing.
+
+### Formats
+
+Compact (watch header, one line). The window is labelled by its **duration**,
+never by primary/secondary position:
 
 ```
-usage  codex 45% 168h (resets 4d21h) · Spark 0% 5h · Spark 0% 168h   (cached 4m ago)
+usage  codex 45% used · 168h window · resets in 4d21h   (cached 4m ago)
 ```
-
-Selection rule for the compact line: show every window with `used_percent > 0`,
-plus the shortest-duration window always (it is the one that bites mid-session),
-capped at three entries with a `+N more` suffix beyond that. If every window is
-at 0%, show only the shortest. On the observed account that renders the 45%
-weekly and the 5h Spark window, which is exactly the pair worth watching.
 
 Stale or failed:
 
 ```
-usage  codex 45% 168h (resets 4d21h)   (stale 41m, last fetch failed)
+usage  codex 45% used · 168h window · resets in 4d21h   (stale 41m, last fetch failed)
 usage  codex unavailable — run `codex login`
 ```
 
 When `rateLimitReachedType` is non-null or `spendControlReached` is true, the
 line is rendered in the warning style with the reason appended.
 
-`gza usage` prints every window in a table (limit, window, used, remaining,
-duration, resets at, age) and supports `--json`.
+`gza usage` shows the primary limit by default, in the same one-line form.
+`--all` prints every captured bucket and window in a table (limit, name, window,
+used, remaining, duration, resets at); `--json` always emits everything, since
+machine consumers should not inherit a display default.
 
-Homepage: a small card in the board row next to "Tasks by status" — one meter per
-window, percent used, reset countdown, and a muted "updated Nm ago". Absent or
-unsupported → the card is omitted entirely rather than showing an empty box.
+Homepage: a small card in the board row next to "Tasks by status" — a single
+meter for the primary limit, percent used, reset countdown, and a muted
+"updated Nm ago". Absent or unsupported → the card is omitted entirely rather
+than showing an empty box. Per-model buckets are not surfaced on the homepage.
 
 ## Failure Policy
 
@@ -248,8 +271,11 @@ The history table exists so that becomes possible later, on real data.
 - The watch header prints usage every cycle without a per-cycle fetch.
 - The homepage never spawns a provider process on a request.
 - A provider that fails still renders the last good value marked stale.
-- All three windows observed on a multi-bucket account round-trip intact; the
-  legacy `rateLimits` field does not produce a duplicate fourth window.
+- All three windows observed on a multi-bucket account are captured and
+  round-trip intact; the legacy `rateLimits` field does not produce a duplicate
+  fourth window.
+- Watch, the homepage, and bare `gza usage` each render exactly one window: the
+  bucket whose `limitName` is null. `gza usage --all` and `--json` show the rest.
 - Windows are labelled from `windowDurationMins`; a bucket whose primary is the
   weekly window renders as weekly.
 - Samples accumulate in `provider_usage_samples` with `raw_json` retained on the
