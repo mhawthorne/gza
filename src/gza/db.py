@@ -5959,6 +5959,7 @@ class SqliteTaskStore:
                         f"Registry DB appeared before mutation: {public_path}. "
                         "Retry the registry command after inspecting the database."
                     ) from exc
+                self._existing_db_uri_mode = "rw"
                 self._registry_mutation_validated_identity = self._db_file_identity()
             except Exception:
                 self._registry_mutation_validated_identity = None
@@ -6788,6 +6789,11 @@ class SqliteTaskStore:
         if self._existing_db_uri_mode is not None:
             database = self.db_path.resolve().as_uri() + f"?mode={self._existing_db_uri_mode}"
             uri = True
+            if self._existing_db_uri_mode == "rw" and self._open_mode in {
+                "registry_mutation",
+                "registry_mutation_existing",
+            }:
+                self._validate_registry_mutation_identity()
 
         conn = _timed_sqlite_connect(
             database,

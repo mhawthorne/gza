@@ -3,6 +3,7 @@
 import shlex
 import shutil
 import sqlite3
+import tempfile
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -89,6 +90,33 @@ def _sidecar_snapshot(db_path: Path) -> dict[str, int]:
         if sidecar.exists():
             sidecars[suffix] = sidecar.stat().st_size
     return sidecars
+
+
+def _db_file_state_snapshot(db_path: Path) -> dict[str, Any] | None:
+    if not db_path.exists():
+        return None
+    sidecars_before = _sidecar_snapshot(db_path)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        probe_db = Path(tmp_dir) / db_path.name
+        shutil.copy2(db_path, probe_db)
+        for suffix in sidecars_before:
+            shutil.copy2(Path(f"{db_path}{suffix}"), Path(f"{probe_db}{suffix}"))
+        logical_snapshot = _db_snapshot(probe_db)
+        journal_mode = _journal_mode(probe_db)
+    assert _sidecar_snapshot(db_path) == sidecars_before
+    return {
+        "logical_snapshot": logical_snapshot,
+        "journal_mode": journal_mode,
+        "sidecars": sidecars_before,
+    }
+
+
+def _assert_db_file_state_unchanged(db_path: Path, before: dict[str, Any]) -> None:
+    after = _db_file_state_snapshot(db_path)
+    assert after is not None
+    assert after["logical_snapshot"] == before["logical_snapshot"]
+    assert after["journal_mode"] == before["journal_mode"]
+    assert after["sidecars"] == before["sidecars"]
 
 
 def _unlink_sidecars(db_path: Path) -> None:
@@ -636,6 +664,63 @@ def test_projects_register_existing_db_deleted_after_activation_refuses_without_
     assert "Traceback" not in result.stdout
     assert "Traceback" not in result.stderr
     assert not db_path.exists()
+
+
+def test_projects_register_first_activation_deleted_before_registration_refuses_without_recreating(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "shared.db"
+    project_dir = tmp_path / "project"
+    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
+    original = SqliteTaskStore.register_project_paths_for_identity
+
+    def delete_before_registration(self: SqliteTaskStore, *args: Any, **kwargs: Any) -> Any:
+        assert self._open_mode == "registry_mutation"
+        db_path.unlink()
+        return original(self, *args, **kwargs)
+
+    with patch.object(SqliteTaskStore, "register_project_paths_for_identity", delete_before_registration):
+        result = invoke_gza("projects", "register", "--project", str(project_dir))
+
+    assert result.returncode == 1
+    assert "disappeared before mutation" in result.stdout
+    _assert_no_traceback(result)
+    _assert_db_and_sidecars_absent(db_path)
+
+
+def test_projects_register_first_activation_replaced_before_registration_refuses_without_mutating_either_db(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "shared.db"
+    original_db = tmp_path / "original.db"
+    replacement_db = tmp_path / "replacement.db"
+    project_dir = tmp_path / "project"
+    _write_project_config(project_dir, project_name="Project", project_id="project", db_path=db_path)
+    _write_current_registry_db(replacement_db, project_id="replacement")
+    _prepare_replacement_db_for_pragma_guard(replacement_db)
+    replacement_before = _db_file_state_snapshot(replacement_db)
+    assert replacement_before is not None
+    original = SqliteTaskStore.register_project_paths_for_identity
+    original_before: dict[str, Any] | None = None
+
+    def replace_before_registration(self: SqliteTaskStore, *args: Any, **kwargs: Any) -> Any:
+        nonlocal original_before
+        assert self._open_mode == "registry_mutation"
+        original_before = _db_file_state_snapshot(db_path)
+        assert original_before is not None
+        _install_replacement_db(db_path, original_db=original_db, replacement_db=replacement_db)
+        return original(self, *args, **kwargs)
+
+    with patch.object(SqliteTaskStore, "register_project_paths_for_identity", replace_before_registration):
+        result = invoke_gza("projects", "register", "--project", str(project_dir))
+
+    assert result.returncode == 1
+    assert "changed after validation" in result.stdout
+    _assert_no_traceback(result)
+    assert original_before is not None
+    _assert_db_file_state_unchanged(original_db, original_before)
+    _assert_db_file_state_unchanged(db_path, replacement_before)
+    assert _registry_row(db_path, "project") is None
 
 
 def test_projects_deactivate_refuses_current_project_id_drift_before_activation(tmp_path: Path) -> None:
