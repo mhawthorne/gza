@@ -12765,6 +12765,7 @@ class TestIterateCommand:
         assert review_task is not None
         assert review_task.id == prior_review.id
         assert action["description"] == "Create improve task (review CHANGES_REQUESTED)"
+        assert action["improve_reason"] == "review_changes_requested"
 
     def test_iterate_verify_only_noop_recovery_clears_and_finishes_merge_ready(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]

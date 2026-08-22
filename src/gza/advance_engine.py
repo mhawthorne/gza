@@ -157,6 +157,9 @@ PARK_REASON_DUPLICATE_BLOCKER_NO_PROGRESS = "duplicate-blocker-no-progress"
 PARK_REASON_REVIEW_MAX_CYCLES_REACHED = "review-max-cycles-reached"
 PARK_REASON_RETRY_LIMIT_REACHED = "retry-limit-reached"
 PARK_REASON_RETRYABLE_PROVIDER_ERROR = "retryable-provider-error"
+IMPROVE_ACTION_REASON_FRESH_COMMENTS = "fresh_comments"
+IMPROVE_ACTION_REASON_REVIEW_CHANGES_REQUESTED = "review_changes_requested"
+IMPROVE_ACTION_REASON_SPEC_COHERENCE_CHANGES_REQUESTED = "spec_coherence_changes_requested"
 
 WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS = frozenset(
     {
@@ -7041,6 +7044,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
         action=lambda ctx: {
             "type": "improve",
             "description": "Create improve task (behavior-spec coherence review CHANGES_REQUESTED)",
+            "improve_reason": IMPROVE_ACTION_REASON_SPEC_COHERENCE_CHANGES_REQUESTED,
+            "review_mode": "spec_coherence",
             "review_task": ctx.spec_coherence_latest_completed_review,
         },
     ),
@@ -7371,6 +7376,7 @@ ADVANCE_RULES: list[AdvanceRule] = [
                 "Create improve task (unresolved comments newer than latest review)"
                 f"{_noop_improve_followup_suffix(ctx)}"
             ),
+            "improve_reason": IMPROVE_ACTION_REASON_FRESH_COMMENTS,
             "review_task": ctx.latest_completed_review,
         },
     ),
@@ -7571,6 +7577,8 @@ ADVANCE_RULES: list[AdvanceRule] = [
         action=lambda ctx: {
             "type": "improve",
             "description": f"Create improve task (review CHANGES_REQUESTED){_noop_improve_followup_suffix(ctx)}",
+            "improve_reason": IMPROVE_ACTION_REASON_REVIEW_CHANGES_REQUESTED,
+            "review_mode": _review_mode(ctx.latest_completed_review),
             "review_task": ctx.latest_completed_review,
         },
     ),

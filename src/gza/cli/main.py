@@ -1519,8 +1519,11 @@ def main() -> int:
         "--force",
         action="store_true",
         help=(
-            "Override lifecycle parked merge gates for manual merge execution, but still refuse git conflicts "
-            "and open review BLOCKER findings unless --defer-blockers is also passed"
+            "Override parked needs-attention lifecycle gates for manual merge execution. "
+            "Still refuses git conflicts and actionable gates such as rebase, verify, or improve work "
+            "except for latest plain-full or resolution CHANGES_REQUESTED review blockers explicitly deferred "
+            "with --defer-blockers; behavior-spec coherence review blockers are not deferable; "
+            "successful overrides record manual_force provenance."
         ),
     )
     merge_parser.add_argument(
@@ -1535,8 +1538,10 @@ def main() -> int:
         "--defer-blockers",
         action="store_true",
         help=(
-            "Allow manual merge over open review BLOCKER findings by creating urgent "
-            "PR-required deferred-blocker follow-up tasks first"
+            "Allow manual merge over a latest plain-full or resolution CHANGES_REQUESTED review with parsed "
+            "BLOCKER findings by creating or reusing urgent PR-required deferred-blocker tasks before merge; "
+            "behavior-spec coherence review blockers are not deferable; "
+            "successful overrides record manual_force provenance."
         ),
     )
     merge_parser.add_argument(

@@ -19,10 +19,13 @@ worker-consuming-vs-direct action accounting stay identical across `watch` and
 `unstick --run`.
 
 Manual `gza merge` has two deliberate operator-only escape hatches that `advance`/`watch`
-do not share: a human can defer review blockers into urgent PR-required follow-up tasks,
-and can pass `--force` to override lifecycle parked merge gates such as malformed
-resolution-review metadata. The automated lifecycle remains stricter and does not merge
-`CHANGES_REQUESTED` reviews by deferring blockers or bypass lifecycle parked states.
+do not share: a human can defer latest plain-full or resolution review blockers into
+urgent PR-required follow-up tasks, and can pass `--force` to override parked
+needs-attention lifecycle gates such as malformed resolution-review metadata. It still
+refuses ordinary actionable gates such as rebase, verify, or improve work, and
+behavior-spec coherence review blockers are not deferable with `--defer-blockers`. The
+automated lifecycle remains stricter and does not merge `CHANGES_REQUESTED` reviews by
+deferring blockers or bypass lifecycle parked states.
 
 ## Usage
 

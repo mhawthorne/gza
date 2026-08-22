@@ -19,6 +19,7 @@ from gza.cli.git_ops import (
     _build_auto_merge_args,
     _classify_rebase_git_failure,
     _classify_squash_reconcile_push_failure,
+    _create_or_reuse_deferred_blocker_tasks,
     _execute_merge_action,
     _merge_single_task,
     _MergeSingleTaskResult,
@@ -1384,6 +1385,10 @@ def test_merge_single_task_defer_blockers_flag_materializes_and_proceeds(
             "gza.cli.git_ops.get_review_report",
             return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=blockers, format_version="v2"),
         ),
+        patch(
+            "gza.cli.git_ops.summarize_review_blockers",
+            return_value=SimpleNamespace(blocker_count=2),
+        ),
         patch("gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks", return_value=([deferred_task], [])) as materialize,
     ):
         with _force_merge_planner_action():
@@ -1408,6 +1413,8 @@ def test_merge_single_task_mark_only_materializes_blockers_before_marking_merged
     task.has_commits = True
     task.merge_status = "unmerged"
     store.update(task)
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
 
     review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
     assert review.id is not None
@@ -1470,6 +1477,10 @@ def test_merge_single_task_mark_only_materializes_blockers_before_marking_merged
             return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
         ),
         patch(
+            "gza.cli.git_ops.summarize_review_blockers",
+            return_value=SimpleNamespace(blocker_count=1),
+        ),
+        patch(
             "gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks",
             side_effect=lambda *a, **k: (order.append("defer") or ([deferred_task], [])),
         ),
@@ -1479,6 +1490,52 @@ def test_merge_single_task_mark_only_materializes_blockers_before_marking_merged
 
     assert result.rc == 0
     assert order == ["defer", "mark"]
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.merge_source == "manual_force"
+
+
+def test_merge_single_task_mark_only_without_deferred_blockers_records_manual_source(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement ordinary mark-only path", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/ordinary-mark-only"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=True,
+        remote=False,
+        resolve=False,
+        defer_blockers=False,
+        no_followups=False,
+    )
+    config = Config.load(tmp_path)
+
+    result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.merge_source == "manual"
 
 
 def test_merge_single_task_no_followups_does_not_suppress_deferred_blockers(
@@ -1541,6 +1598,10 @@ def test_merge_single_task_no_followups_does_not_suppress_deferred_blockers(
         patch(
             "gza.cli.git_ops.get_review_report",
             return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
+        ),
+        patch(
+            "gza.cli.git_ops.summarize_review_blockers",
+            return_value=SimpleNamespace(blocker_count=1),
         ),
         patch("gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks", return_value=([deferred_task], [])),
         patch("gza.cli.git_ops._materialize_merge_followups") as materialize_followups,
@@ -1726,6 +1787,669 @@ def test_merge_single_task_same_merge_unit_review_on_representative_defer_flag_m
 
     assert result.rc == 0
     assert merge_order == ["merge"]
+
+
+def test_merge_single_task_defer_blockers_merges_over_changes_requested_gate_once(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    owner, representative, review = _add_same_merge_unit_owner_representative_with_review(
+        tmp_path,
+        store,
+        review_content=_changes_requested_review_with_blocker(
+            title="Missing data migration",
+            evidence="The representative branch adds a new column without a migration.",
+            required_fix="add the migration and backfill path.",
+        ),
+    )
+    unit = store.resolve_merge_unit_for_task(owner.id)
+    assert unit is not None
+
+    deferred_task = store.add("Deferred blocker B1", task_type="implement", based_on=review.id, depends_on=owner.id)
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        force=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+    config = Config.load(tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={
+                "type": "improve",
+                "description": "Create improve task (review CHANGES_REQUESTED)",
+                "improve_reason": "review_changes_requested",
+                "review_task": review,
+            },
+        ),
+        patch(
+            "gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks",
+            return_value=([deferred_task], []),
+        ) as materialize,
+    ):
+        result = _merge_single_task(representative.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    git.merge.assert_called_once_with(owner.branch, squash=False, commit_message=None)
+    materialize.assert_called_once()
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit.merge_source == "manual_force"
+    output = capsys.readouterr().out
+    assert output.count(f"DEFERRED-BLOCKER {deferred_task.id} created from {owner.id}") == 1
+    assert "Warning: Forcing merge despite lifecycle gate: Create improve task (review CHANGES_REQUESTED)" in output
+
+
+def test_merge_single_task_defer_blockers_merges_over_resolution_changes_requested_gate_once(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    owner, representative, review = _add_same_merge_unit_owner_representative_with_review(
+        tmp_path,
+        store,
+        review_content=_changes_requested_review_with_blocker(
+            title="Resolution cleanup missing",
+            evidence="The conflict resolution leaves both sides of the branch choice active.",
+            required_fix="defer the cleanup into a PR-required follow-up.",
+        ),
+    )
+    review.review_scope = "\n".join(
+        (
+            "Review mode: resolution",
+            f"Implementation task: {owner.id}",
+            "Rebase task: gza-1",
+            "Resolved head SHA: resolved-head",
+            "Resolved target SHA: resolved-target",
+        )
+    )
+    store.update(review)
+    unit = store.resolve_merge_unit_for_task(owner.id)
+    assert unit is not None
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        force=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+    config = Config.load(tmp_path)
+
+    with patch(
+        "gza.cli.git_ops.determine_next_action",
+        return_value={
+            "type": "improve",
+            "description": "Create improve task (resolution review CHANGES_REQUESTED)",
+            "improve_reason": "review_changes_requested",
+            "review_task": review,
+        },
+    ):
+        result = _merge_single_task(representative.id, config, store, git, args, "main")
+
+    assert result.rc == 0
+    git.merge.assert_called_once_with(owner.branch, squash=False, commit_message=None)
+    blockers = [
+        child
+        for child in store.get_based_on_children(review.id)
+        if child.prompt.startswith(f"Deferred blocker B1 from review {review.id} for task {owner.id}:")
+    ]
+    assert len(blockers) == 1
+    assert blockers[0].status == "pending"
+    assert blockers[0].urgent is True
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit.merge_source == "manual_force"
+    output = capsys.readouterr().out
+    assert output.count(f"DEFERRED-BLOCKER {blockers[0].id} created from {owner.id}") == 1
+    assert f"DEFERRED-BLOCKER {blockers[0].id} reused from {owner.id}" not in output
+    assert "Warning: Forcing merge despite lifecycle gate: Create improve task (resolution review CHANGES_REQUESTED)" in output
+
+
+def test_merge_single_task_defer_blockers_prints_created_task_before_conflict_refusal(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    owner, representative, review = _add_same_merge_unit_owner_representative_with_review(
+        tmp_path,
+        store,
+        review_content=_changes_requested_review_with_blocker(
+            title="Missing data migration",
+            evidence="The representative branch adds a new column without a migration.",
+            required_fix="add the migration and backfill path.",
+        ),
+    )
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=False),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        force=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+    config = Config.load(tmp_path)
+
+    with patch(
+        "gza.cli.git_ops.determine_next_action",
+            return_value={
+                "type": "improve",
+                "description": "Create improve task (review CHANGES_REQUESTED)",
+                "improve_reason": "review_changes_requested",
+                "review_task": review,
+            },
+        ):
+        result = _merge_single_task(representative.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    blockers = [
+        child for child in store.get_based_on_children(review.id)
+        if child.prompt.startswith(f"Deferred blocker B1 from review {review.id} for task {owner.id}:")
+    ]
+    assert len(blockers) == 1
+    assert blockers[0].status == "pending"
+    assert blockers[0].urgent is True
+    output = capsys.readouterr().out
+    assert output.count(f"DEFERRED-BLOCKER {blockers[0].id} created from {owner.id}") == 1
+    assert f"DEFERRED-BLOCKER {blockers[0].id} reused from {owner.id}" not in output
+    assert "has conflicts against 'main' and cannot be merged cleanly" in output
+
+
+def test_merge_single_task_defer_blockers_prints_reused_task_before_invalid_flag_refusal(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    owner, representative, review = _add_same_merge_unit_owner_representative_with_review(
+        tmp_path,
+        store,
+        review_content=_changes_requested_review_with_blocker(
+            title="Missing data migration",
+            evidence="The representative branch adds a new column without a migration.",
+            required_fix="add the migration and backfill path.",
+        ),
+    )
+    config = Config.load(tmp_path)
+    deferred_task, created_now = _create_or_reuse_deferred_blocker_tasks(
+        store,
+        config=config,
+        review_task=review,
+        impl_task=owner,
+        findings=(
+            ReviewFinding(
+                id="B1",
+                severity="BLOCKER",
+                title="Missing data migration",
+                body="Evidence: The representative branch adds a new column without a migration.\n"
+                "Required fix: add the migration and backfill path.",
+                evidence="The representative branch adds a new column without a migration.",
+                impact="merge should stay blocked until handled.",
+                fix_or_followup="add the migration and backfill path.",
+                tests="add focused coverage.",
+                open_state_citation=None,
+            ),
+        ),
+        trigger_source="manual",
+    )
+    assert len(deferred_task) == 1
+    assert created_now == []
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=True,
+        squash=True,
+        delete=False,
+        mark_only=False,
+        force=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+
+    with patch(
+        "gza.cli.git_ops.determine_next_action",
+        return_value={
+            "type": "improve",
+            "description": "Create improve task (review CHANGES_REQUESTED)",
+            "improve_reason": "review_changes_requested",
+            "review_task": review,
+        },
+    ):
+        result = _merge_single_task(representative.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    output = capsys.readouterr().out
+    assert output.count(f"DEFERRED-BLOCKER {deferred_task[0].id} reused from {owner.id}") == 1
+    assert f"DEFERRED-BLOCKER {deferred_task[0].id} created from {owner.id}" not in output
+    assert "Error: Cannot use --rebase and --squash together" in output
+
+
+def test_merge_single_task_defer_blockers_refuses_ambiguous_changes_requested_gate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement ambiguous deferred blocker merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/ambiguous-defer-blockers"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        force=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+    config = Config.load(tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={
+                "type": "improve",
+                "description": "Create improve task (review CHANGES_REQUESTED)",
+                "improve_reason": "review_changes_requested",
+                "review_task": review,
+            },
+        ),
+        patch("gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks") as materialize,
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    materialize.assert_not_called()
+    output = capsys.readouterr().out
+    assert (
+        f"Error: Task {task.id} has CHANGES_REQUESTED review {review.id}, "
+        "but no parsed BLOCKER findings were available to defer. Refusing to guess."
+    ) in output
+
+
+def test_merge_single_task_defer_blockers_force_refuses_spec_coherence_changes_requested_gate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement spec coherence gated merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/spec-coherence-defer-force"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Spec coherence review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.review_scope = "\n".join(
+        (
+            "Review mode: spec-coherence",
+            f"Implementation task: {task.id}",
+            "Reviewed head SHA: reviewed-head",
+            'Changed behavior-spec paths JSON: ["specs/behavior/merge.md"]',
+        )
+    )
+    review.output_content = _changes_requested_review_with_blocker(
+        title="Spec and code disagree",
+        evidence="The behavior spec says this gate must remain actionable.",
+        required_fix="keep the spec-coherence improve gate intact.",
+    )
+    store.update(review)
+
+    blocker = ReviewFinding(
+        id="B-spec",
+        severity="BLOCKER",
+        title="Spec and code disagree",
+        body="Body",
+        evidence=None,
+        impact=None,
+        fix_or_followup="keep the spec-coherence improve gate intact",
+        tests=None,
+        open_state_citation="citation",
+    )
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        force=True,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+    config = Config.load(tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={
+                "type": "improve",
+                "description": "Create improve task (behavior-spec coherence review CHANGES_REQUESTED)",
+                "improve_reason": "spec_coherence_changes_requested",
+                "review_mode": "spec_coherence",
+                "review_task": review,
+            },
+        ),
+        patch(
+            "gza.cli.git_ops.get_review_report",
+            return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
+        ),
+        patch("gza.cli.git_ops._materialize_merge_deferred_blockers") as materialize,
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    materialize.assert_not_called()
+    output = capsys.readouterr().out
+    assert "Error: Create improve task (behavior-spec coherence review CHANGES_REQUESTED)" in output
+
+
+def test_merge_single_task_defer_blockers_force_refuses_fresh_comments_improve_gate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement fresh comments gated merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/fresh-comments-defer-force"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "## Verdict\n\nVerdict: APPROVED\n"
+    store.update(review)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        force=True,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+    config = Config.load(tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={
+                "type": "improve",
+                "description": "Create improve task (unresolved comments newer than latest review)",
+                "improve_reason": "fresh_comments",
+                "review_task": review,
+            },
+        ),
+        patch("gza.cli.git_ops._materialize_merge_deferred_blockers") as materialize,
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    materialize.assert_not_called()
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state != "merged"
+    assert refreshed_unit.merge_source != "manual_force"
+    assert not store.get_based_on_children(review.id)
+    output = capsys.readouterr().out
+    assert "Error: Create improve task (unresolved comments newer than latest review)" in output
+    assert "Warning: Forcing merge despite lifecycle gate" not in output
+
+
+def test_merge_single_task_defer_blockers_refuses_blocker_count_mismatch(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement mismatched deferred blocker merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/mismatched-defer-blockers"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+
+    blocker = ReviewFinding(
+        id="B-mismatch",
+        severity="BLOCKER",
+        title="Missing data migration",
+        body="Body",
+        evidence=None,
+        impact=None,
+        fix_or_followup="add migration",
+        tests=None,
+        open_state_citation="citation",
+    )
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        force=False,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+    config = Config.load(tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={
+                "type": "improve",
+                "description": "Create improve task (review CHANGES_REQUESTED)",
+                "improve_reason": "review_changes_requested",
+                "review_task": review,
+            },
+        ),
+        patch(
+            "gza.cli.git_ops.get_review_report",
+            return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
+        ),
+        patch("gza.cli.git_ops.get_review_content", return_value="review content without structured blockers"),
+        patch("gza.cli.git_ops.summarize_review_blockers", return_value=SimpleNamespace(blocker_count=0)),
+        patch("gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks") as materialize,
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    materialize.assert_not_called()
+    output = capsys.readouterr().out
+    assert (
+        f"Error: Task {task.id} has CHANGES_REQUESTED review {review.id}, "
+        "but blocker classification did not match the parsed blocker set. Refusing to guess."
+    ) in output
+
+
+def test_merge_single_task_defer_blockers_force_still_refuses_needs_rebase_gate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement needs rebase merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/needs-rebase-defer-force"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        force=True,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+    config = Config.load(tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={"type": "needs_rebase", "description": "rebase --resolve (conflicts detected)"},
+        ),
+        patch("gza.cli.git_ops._materialize_merge_deferred_blockers") as materialize,
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    materialize.assert_not_called()
+    output = capsys.readouterr().out
+    assert "Error: rebase --resolve (conflicts detected)" in output
 
 
 def test_merge_single_task_force_still_refuses_open_review_blockers_without_defer_flag(

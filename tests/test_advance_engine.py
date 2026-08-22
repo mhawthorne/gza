@@ -19651,6 +19651,7 @@ def test_approved_with_followups_and_newer_unresolved_comment_creates_improve(tm
 
     action = evaluate_advance_rules(config, store, _FakeGit(can_merge=True), task, "main")
     assert action["type"] == "improve"
+    assert action["improve_reason"] == "fresh_comments"
     assert action["review_task"].id == review.id
 
 
@@ -20124,6 +20125,7 @@ def test_spec_coherence_changes_requested_routes_through_improve(tmp_path: Path,
     action = evaluate_advance_rules(config, store, git, impl, "main")
 
     assert action["type"] == "improve"
+    assert action["improve_reason"] == "spec_coherence_changes_requested"
     assert action["review_task"].id == review.id
 
 

@@ -1481,8 +1481,13 @@ class TestHelpOutput:
         help_text = " ".join(merge_help.stdout.split())
 
         assert "--force" in merge_help.stdout
-        assert "Override lifecycle parked merge gates for manual merge execution" in help_text
-        assert "still refuse git conflicts and open review BLOCKER findings unless --defer-blockers is also passed" in help_text
+        assert "Override parked needs-attention lifecycle gates for manual merge execution" in help_text
+        assert (
+            "except for latest plain-full or resolution CHANGES_REQUESTED review blockers explicitly deferred "
+            "with --defer-blockers"
+        ) in help_text
+        assert "Allow manual merge over a latest plain-full or resolution CHANGES_REQUESTED review" in help_text
+        assert "behavior-spec coherence review blockers are not deferable" in help_text
 
     def test_show_help_and_docs_describe_prompt_as_plain_text(self, tmp_path):
         """`show --prompt` should be documented as plain prompt-text output, not JSON."""

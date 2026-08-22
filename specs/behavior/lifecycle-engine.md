@@ -680,8 +680,10 @@ failure *and* actionable merge/review work remains eligible for the latter.
   lifecycle gates for the local merge path only, but it MUST still refuse any real git
   conflict and MUST leave the unit's persisted provenance distinguishable from an
   ordinary manual merge. Manual `gza merge` MUST refuse a latest completed
-  `CHANGES_REQUESTED` review that still has any open non-verify `BLOCKER` finding unless
-  the operator passes `--defer-blockers`.
+  plain-full or resolution `CHANGES_REQUESTED` review that still has any open non-verify
+  `BLOCKER` finding unless the operator passes `--defer-blockers`. Behavior-spec
+  coherence `CHANGES_REQUESTED` reviews are not eligible for `--defer-blockers` and MUST
+  remain refused by the manual merge path.
 - For manual `gza merge`, when the latest completed `CHANGES_REQUESTED` review is a
   verify-only compatibility case blocked only by verify failures/timeouts, the
   command MAY auto-defer those blockers without a flag. Every blocker bypassed by either
