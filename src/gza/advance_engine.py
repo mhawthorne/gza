@@ -116,8 +116,10 @@ from gza.review_verdict import (
 from gza.review_verify_state import (
     MergeUnitVerifyEvidenceSelection,
     VerifyGateDecision,
+    make_verify_epoch,
     resolve_verify_gate_decision,
     select_current_merge_unit_verify_evidence,
+    verify_epoch_matches,
     verify_result_is_timeout_origin,
 )
 from gza.runner import (
@@ -3494,6 +3496,96 @@ def classify_advance_action(action: Mapping[str, Any]) -> str:
     return "actionable"
 
 
+_RED_VERIFY_GATE_BYPASS_ACTION_TYPES = frozenset(
+    {
+        "create_verify_fix",
+        "rerun_completed_verify_fix",
+    }
+)
+_RED_VERIFY_GATE_FAMILY_ACTION_TYPES = frozenset(
+    {
+        "create_verify_fix",
+        "run_verify_fix",
+        "wait_verify_fix",
+        "rerun_completed_verify_fix",
+    }
+)
+
+
+def _red_verify_gate_proof(ctx: AdvanceContext, *, phase: str) -> dict[str, Any] | None:
+    """Return explicit current failed verify proof for manual red-gate bypasses."""
+    decision = getattr(ctx, "verify_gate_decision", None)
+    if decision is None or decision.state != "failed" or decision.current_epoch is None:
+        return None
+    result = decision.lookup.result
+    if result is None or result.status != "failed":
+        return None
+    result_epoch = make_verify_epoch(
+        reviewed_branch=result.reviewed_branch,
+        reviewed_head_sha=result.reviewed_head_sha,
+        verify_command=result.command,
+        verify_timeout_seconds=decision.current_epoch.verify_timeout_seconds,
+        verify_timeout_grace_seconds=decision.current_epoch.verify_timeout_grace_seconds,
+    )
+    if not verify_epoch_matches(expected=decision.current_epoch, candidate=result_epoch):
+        return None
+    return {
+        "phase": phase,
+        "reviewed_branch": result.reviewed_branch,
+        "reviewed_head_sha": result.reviewed_head_sha,
+        "verify_command": result.command,
+        "source_task_id": result.source_task_id,
+        "source_task_type": result.source_task_type,
+        "captured_at": result.captured_at.isoformat(),
+    }
+
+
+def _with_red_verify_gate_metadata(
+    ctx: AdvanceContext,
+    action: dict[str, Any],
+    *,
+    phase: str,
+) -> dict[str, Any]:
+    action["verify_gate_phase"] = phase
+    action["verify_gate_family"] = "verify_fix_routing"
+    proof = _red_verify_gate_proof(ctx, phase=phase)
+    if proof is not None:
+        action["red_verify_gate_proof"] = proof
+    return action
+
+
+def is_current_red_verify_gate_action(action: Mapping[str, Any]) -> bool:
+    """Return whether a planned action represents current red verify evidence."""
+    proof = action.get("red_verify_gate_proof")
+    if not isinstance(proof, Mapping):
+        return False
+    if proof.get("phase") != "pre_merge":
+        return False
+    if not isinstance(proof.get("reviewed_head_sha"), str) or not proof.get("reviewed_head_sha"):
+        return False
+    if not isinstance(proof.get("verify_command"), str) or not proof.get("verify_command"):
+        return False
+    action_type = str(action.get("type", ""))
+    if action_type in _RED_VERIFY_GATE_BYPASS_ACTION_TYPES:
+        return True
+    if action_type != "needs_discussion":
+        return False
+    return get_needs_attention_reason(action) == PARK_REASON_VERIFY_FIX_FAILED
+
+
+def is_red_verify_gate_family_action(action: Mapping[str, Any]) -> bool:
+    """Return whether an action belongs to the red verify-gate bypass family."""
+    if (
+        action.get("verify_gate_phase") == "pre_merge"
+        and action.get("verify_gate_family") == "verify_fix_routing"
+    ):
+        return True
+    action_type = str(action.get("type", ""))
+    if action_type in _RED_VERIFY_GATE_FAMILY_ACTION_TYPES:
+        return True
+    return action_type == "needs_discussion" and get_needs_attention_reason(action) == PARK_REASON_VERIFY_FIX_FAILED
+
+
 def format_needs_attention_entry(task: DbTask, *, prompt: str, action: Mapping[str, Any]) -> str:
     """Render a stable needs-attention line shared by advance/watch/iterate."""
     description = str(action.get("description", "")).strip()
@@ -4966,32 +5058,40 @@ def _verify_fix_failed_manual_rearm_requires_fresh_verify(
     return decision.lookup.result.captured_at < rearm.manual_rearmed_at
 
 
-def _pre_review_verify_fix_action(ctx: AdvanceContext) -> dict[str, Any]:
+def _pre_review_verify_fix_action(ctx: AdvanceContext, *, phase: str = "pre_review") -> dict[str, Any]:
     decision = getattr(ctx, "verify_gate_decision", None)
     owner_task = _verify_gate_owner_task(ctx)
     if decision is None or owner_task is None or owner_task.id is None:
-        return with_needs_attention(
-            {
-                "type": "needs_discussion",
-                "description": "SKIP: verify_fix routing is unavailable before review",
-            },
-            reason=PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
-            subject_task_id=ctx.task.id,
+        return _with_red_verify_gate_metadata(
+            ctx,
+            with_needs_attention(
+                {
+                    "type": "needs_discussion",
+                    "description": "SKIP: verify_fix routing is unavailable before review",
+                },
+                reason=PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
+                subject_task_id=ctx.task.id,
+            ),
+            phase=phase,
         )
 
     current_epoch = decision.current_epoch
     if current_epoch is None:
-        return with_needs_attention(
-            {
-                "type": "needs_discussion",
-                "description": "SKIP: current verify epoch is unavailable before review",
-            },
-            reason=(
-                PARK_REASON_VERIFY_FAILED_NEEDS_FIX
-                if decision.state == "failed"
-                else PARK_REASON_VERIFY_UNAVAILABLE
+        return _with_red_verify_gate_metadata(
+            ctx,
+            with_needs_attention(
+                {
+                    "type": "needs_discussion",
+                    "description": "SKIP: current verify epoch is unavailable before review",
+                },
+                reason=(
+                    PARK_REASON_VERIFY_FAILED_NEEDS_FIX
+                    if decision.state == "failed"
+                    else PARK_REASON_VERIFY_UNAVAILABLE
+                ),
+                subject_task_id=owner_task.id,
             ),
-            subject_task_id=owner_task.id,
+            phase=phase,
         )
 
     existing = find_existing_verify_fix_task(
@@ -5001,19 +5101,27 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext) -> dict[str, Any]:
     )
     if existing is not None:
         if existing.status == "in_progress":
-            return {
-                "type": "wait_verify_fix",
-                "description": f"SKIP: verify_fix task {_task_id(existing)} is in_progress",
-                "verify_fix_task": existing,
-                "verify_epoch": current_epoch,
-            }
+            return _with_red_verify_gate_metadata(
+                ctx,
+                {
+                    "type": "wait_verify_fix",
+                    "description": f"SKIP: verify_fix task {_task_id(existing)} is in_progress",
+                    "verify_fix_task": existing,
+                    "verify_epoch": current_epoch,
+                },
+                phase=phase,
+            )
         if existing.status == "pending":
-            return {
-                "type": "run_verify_fix",
-                "description": f"Spawn worker for pending verify_fix {_task_id(existing)}",
-                "verify_fix_task": existing,
-                "verify_epoch": current_epoch,
-            }
+            return _with_red_verify_gate_metadata(
+                ctx,
+                {
+                    "type": "run_verify_fix",
+                    "description": f"Spawn worker for pending verify_fix {_task_id(existing)}",
+                    "verify_fix_task": existing,
+                    "verify_epoch": current_epoch,
+                },
+                phase=phase,
+            )
         if existing.status == "completed":
             if (
                 decision.state == "failed"
@@ -5021,19 +5129,23 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext) -> dict[str, Any]:
             ):
                 canonical_outcome = inspect_verify_fix_completion_outcome(existing)
                 if canonical_outcome.state == "invalid":
-                    return with_needs_attention(
-                        {
-                            "type": "needs_discussion",
-                            "description": (
-                                f"SKIP: completed verify_fix {_task_id(existing)} has invalid canonical "
-                                "completion proof; repair or rerun that verify_fix before lifecycle can "
-                                f"consume timeout-origin recovery. Proof failure: {canonical_outcome.invalid_reason}"
-                            ),
-                            "verify_fix_task": existing,
-                            "verify_epoch": current_epoch,
-                        },
-                        reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
-                        subject_task_id=owner_task.id,
+                    return _with_red_verify_gate_metadata(
+                        ctx,
+                        with_needs_attention(
+                            {
+                                "type": "needs_discussion",
+                                "description": (
+                                    f"SKIP: completed verify_fix {_task_id(existing)} has invalid canonical "
+                                    "completion proof; repair or rerun that verify_fix before lifecycle can "
+                                    f"consume timeout-origin recovery. Proof failure: {canonical_outcome.invalid_reason}"
+                                ),
+                                "verify_fix_task": existing,
+                                "verify_epoch": current_epoch,
+                            },
+                            reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+                            subject_task_id=owner_task.id,
+                        ),
+                        phase=phase,
                     )
                 legacy_scope_outcome = (
                     inspect_legacy_review_scope_completion_outcome(existing.review_scope)
@@ -5041,22 +5153,26 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext) -> dict[str, Any]:
                     else None
                 )
                 if legacy_scope_outcome is not None and legacy_scope_outcome.state == "invalid":
-                    return with_needs_attention(
-                        {
-                            "type": "needs_discussion",
-                            "description": (
-                                f"SKIP: completed verify_fix {_task_id(existing)} has invalid legacy "
-                                "completion proof; repair or rerun that verify_fix before lifecycle can "
-                                f"consume timeout-origin recovery. Proof failure: {legacy_scope_outcome.invalid_reason}"
-                            ),
-                            "verify_fix_task": existing,
-                            "verify_epoch": current_epoch,
-                        },
-                        reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
-                        subject_task_id=owner_task.id,
+                    return _with_red_verify_gate_metadata(
+                        ctx,
+                        with_needs_attention(
+                            {
+                                "type": "needs_discussion",
+                                "description": (
+                                    f"SKIP: completed verify_fix {_task_id(existing)} has invalid legacy "
+                                    "completion proof; repair or rerun that verify_fix before lifecycle can "
+                                    f"consume timeout-origin recovery. Proof failure: {legacy_scope_outcome.invalid_reason}"
+                                ),
+                                "verify_fix_task": existing,
+                                "verify_epoch": current_epoch,
+                            },
+                            reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+                            subject_task_id=owner_task.id,
+                        ),
+                        phase=phase,
                     )
                 if _verify_fix_failed_manual_rearm_requires_fresh_verify(ctx, owner_task=owner_task):
-                    return _verify_gate_action(ctx, phase="pre_review", explicit_refresh=True)
+                    return _verify_gate_action(ctx, phase=phase, explicit_refresh=True)
                 outcome = effective_verify_fix_completion_outcome(existing)
                 legacy_completion_proof: LegacyVerifyFixCompletionProof | None = None
                 if outcome is None:
@@ -5067,122 +5183,154 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext) -> dict[str, Any]:
                         verify_epoch=current_epoch,
                     )
                     if isinstance(legacy_repair, LegacyVerifyFixProofUnavailable):
-                        return with_needs_attention(
-                            {
-                                "type": "needs_discussion",
-                                "description": (
-                                    f"SKIP: completed verify_fix {_task_id(existing)} exact-head proof is unavailable; "
-                                    "repair the branch/status probe or retry from a healthy checkout. "
-                                    f"Proof failure: {legacy_repair.diagnostic}"
-                                ),
-                                "verify_fix_task": existing,
-                                "verify_epoch": current_epoch,
-                            },
-                            reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
-                            subject_task_id=owner_task.id,
+                        return _with_red_verify_gate_metadata(
+                            ctx,
+                            with_needs_attention(
+                                {
+                                    "type": "needs_discussion",
+                                    "description": (
+                                        f"SKIP: completed verify_fix {_task_id(existing)} exact-head proof is unavailable; "
+                                        "repair the branch/status probe or retry from a healthy checkout. "
+                                        f"Proof failure: {legacy_repair.diagnostic}"
+                                    ),
+                                    "verify_fix_task": existing,
+                                    "verify_epoch": current_epoch,
+                                },
+                                reason=PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
+                                subject_task_id=owner_task.id,
+                            ),
+                            phase=phase,
                         )
                     if isinstance(legacy_repair, LegacyVerifyFixCompletionProof):
                         legacy_completion_proof = legacy_repair
                 if outcome is not None and outcome.no_source_changes and outcome.completion_head_sha:
                     if outcome.recovery_rerun_attempted:
-                        return with_needs_attention(
-                            {
-                                "type": "needs_discussion",
-                                "description": (
-                                    f"SKIP: completed verify_fix {_task_id(existing)} already consumed its exact-head "
-                                    "recovery rerun and verify evidence remains red for the current epoch"
-                                ),
-                                "verify_fix_task": existing,
-                                "verify_epoch": current_epoch,
-                            },
-                            reason=PARK_REASON_VERIFY_FIX_FAILED,
-                            subject_task_id=owner_task.id,
+                        return _with_red_verify_gate_metadata(
+                            ctx,
+                            with_needs_attention(
+                                {
+                                    "type": "needs_discussion",
+                                    "description": (
+                                        f"SKIP: completed verify_fix {_task_id(existing)} already consumed its "
+                                        "exact-head recovery rerun and verify evidence remains red for the current epoch"
+                                    ),
+                                    "verify_fix_task": existing,
+                                    "verify_epoch": current_epoch,
+                                },
+                                reason=PARK_REASON_VERIFY_FIX_FAILED,
+                                subject_task_id=owner_task.id,
+                            ),
+                            phase=phase,
                         )
                     if (
                         decision.lookup.result is not None
                         and decision.lookup.result.source_task_id == existing.id
                         and decision.lookup.result.status != "passed"
                     ):
-                        return with_needs_attention(
-                            {
-                                "type": "needs_discussion",
-                                "description": (
-                                    f"SKIP: completed verify_fix {_task_id(existing)} already produced non-green "
-                                    "exact-head recovery rerun evidence for the current epoch; park instead of "
-                                    "scheduling another rerun."
-                                ),
-                                "verify_fix_task": existing,
-                                "verify_epoch": current_epoch,
-                            },
-                            reason=PARK_REASON_VERIFY_FIX_FAILED,
-                            subject_task_id=owner_task.id,
+                        return _with_red_verify_gate_metadata(
+                            ctx,
+                            with_needs_attention(
+                                {
+                                    "type": "needs_discussion",
+                                    "description": (
+                                        f"SKIP: completed verify_fix {_task_id(existing)} already produced non-green "
+                                        "exact-head recovery rerun evidence for the current epoch; park instead of "
+                                        "scheduling another rerun."
+                                    ),
+                                    "verify_fix_task": existing,
+                                    "verify_epoch": current_epoch,
+                                },
+                                reason=PARK_REASON_VERIFY_FIX_FAILED,
+                                subject_task_id=owner_task.id,
+                            ),
+                            phase=phase,
                         )
-                    return {
-                        "type": "rerun_completed_verify_fix",
-                        "description": (
-                            f"Rerun exact-head verify for completed no-source verify_fix {_task_id(existing)} "
-                            "before treating timeout-origin red evidence as terminal"
-                        ),
-                        "verify_fix_task": existing,
-                        "verify_owner_task": owner_task,
-                        "verify_epoch": current_epoch,
-                    }
+                    return _with_red_verify_gate_metadata(
+                        ctx,
+                        {
+                            "type": "rerun_completed_verify_fix",
+                            "description": (
+                                f"Rerun exact-head verify for completed no-source verify_fix {_task_id(existing)} "
+                                "before treating timeout-origin red evidence as terminal"
+                            ),
+                            "verify_fix_task": existing,
+                            "verify_owner_task": owner_task,
+                            "verify_epoch": current_epoch,
+                        },
+                        phase=phase,
+                    )
                 if legacy_completion_proof is not None:
-                    return {
-                        "type": "rerun_completed_verify_fix",
-                        "description": (
-                            f"Repair legacy no-source completion proof for completed verify_fix {_task_id(existing)} "
-                            "inside the writable executor, then rerun exact-head verify"
-                        ),
-                        "verify_fix_task": existing,
-                        "verify_owner_task": owner_task,
-                        "verify_epoch": current_epoch,
-                        "legacy_completion_proof": legacy_completion_proof,
-                    }
+                    return _with_red_verify_gate_metadata(
+                        ctx,
+                        {
+                            "type": "rerun_completed_verify_fix",
+                            "description": (
+                                f"Repair legacy no-source completion proof for completed verify_fix {_task_id(existing)} "
+                                "inside the writable executor, then rerun exact-head verify"
+                            ),
+                            "verify_fix_task": existing,
+                            "verify_owner_task": owner_task,
+                            "verify_epoch": current_epoch,
+                            "legacy_completion_proof": legacy_completion_proof,
+                        },
+                        phase=phase,
+                    )
             if _verify_fix_failed_manual_rearm_requires_fresh_verify(ctx, owner_task=owner_task):
-                return _verify_gate_action(ctx, phase="pre_review", explicit_refresh=True)
+                return _verify_gate_action(ctx, phase=phase, explicit_refresh=True)
             reason = (
                 PARK_REASON_VERIFY_FIX_FAILED
                 if decision.state == "failed"
                 else PARK_REASON_VERIFY_UNAVAILABLE_AFTER_FIX
             )
             detail = "red" if decision.state == "failed" else "unavailable"
-            return with_needs_attention(
+            return _with_red_verify_gate_metadata(
+                ctx,
+                with_needs_attention(
+                    {
+                        "type": "needs_discussion",
+                        "description": (
+                            f"SKIP: verify gate is still {detail} after completed verify_fix "
+                            f"{_task_id(existing)} for the current epoch"
+                        ),
+                        "verify_fix_task": existing,
+                        "verify_epoch": current_epoch,
+                    },
+                    reason=reason,
+                    subject_task_id=owner_task.id,
+                ),
+                phase=phase,
+            )
+        return _with_red_verify_gate_metadata(
+            ctx,
+            with_needs_attention(
                 {
                     "type": "needs_discussion",
                     "description": (
-                        f"SKIP: verify gate is still {detail} after completed verify_fix "
-                        f"{_task_id(existing)} for the current epoch"
+                        f"SKIP: verify_fix task {_task_id(existing)} is {existing.status}; "
+                        "recover that task before review can continue"
                     ),
                     "verify_fix_task": existing,
                     "verify_epoch": current_epoch,
                 },
-                reason=reason,
-                subject_task_id=owner_task.id,
-            )
-        return with_needs_attention(
-            {
-                "type": "needs_discussion",
-                "description": (
-                    f"SKIP: verify_fix task {_task_id(existing)} is {existing.status}; "
-                    "recover that task before review can continue"
-                ),
-                "verify_fix_task": existing,
-                "verify_epoch": current_epoch,
-            },
-            reason=PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
-            subject_task_id=existing.id or owner_task.id,
+                reason=PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
+                subject_task_id=existing.id or owner_task.id,
+            ),
+            phase=phase,
         )
 
     if decision.state != "failed":
-        return with_needs_attention(
-            {
-                "type": "needs_discussion",
-                "description": "SKIP: current verify gate is unavailable before review",
-                "verify_epoch": current_epoch,
-            },
-            reason=PARK_REASON_VERIFY_UNAVAILABLE,
-            subject_task_id=owner_task.id,
+        return _with_red_verify_gate_metadata(
+            ctx,
+            with_needs_attention(
+                {
+                    "type": "needs_discussion",
+                    "description": "SKIP: current verify gate is unavailable before review",
+                    "verify_epoch": current_epoch,
+                },
+                reason=PARK_REASON_VERIFY_UNAVAILABLE,
+                subject_task_id=owner_task.id,
+            ),
+            phase=phase,
         )
 
     try:
@@ -5192,23 +5340,31 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext) -> dict[str, Any]:
             verify_epoch=current_epoch,
         )
     except ValueError as exc:
-        return with_needs_attention(
-            {
-                "type": "needs_discussion",
-                "description": f"SKIP: could not resolve verify_fix representative task: {exc}",
-                "verify_epoch": current_epoch,
-            },
-            reason=PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
-            subject_task_id=owner_task.id,
+        return _with_red_verify_gate_metadata(
+            ctx,
+            with_needs_attention(
+                {
+                    "type": "needs_discussion",
+                    "description": f"SKIP: could not resolve verify_fix representative task: {exc}",
+                    "verify_epoch": current_epoch,
+                },
+                reason=PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
+                subject_task_id=owner_task.id,
+            ),
+            phase=phase,
         )
 
-    return {
-        "type": "create_verify_fix",
-        "description": f"Create verify_fix task for verify epoch at head {current_epoch.reviewed_head_sha}",
-        "impl_task": owner_task,
-        "based_on_task": based_on_task,
-        "verify_epoch": current_epoch,
-    }
+    return _with_red_verify_gate_metadata(
+        ctx,
+        {
+            "type": "create_verify_fix",
+            "description": f"Create verify_fix task for verify epoch at head {current_epoch.reviewed_head_sha}",
+            "impl_task": owner_task,
+            "based_on_task": based_on_task,
+            "verify_epoch": current_epoch,
+        },
+        phase=phase,
+    )
 
 
 def _verify_gate_blocks_merge(ctx: AdvanceContext) -> bool:
@@ -5234,7 +5390,7 @@ def _verify_gate_action(ctx: AdvanceContext, *, phase: str, explicit_refresh: bo
             "description": "SKIP: verify gate context unavailable",
         }
     if phase == "pre_merge" and decision.state == "failed" and not explicit_refresh:
-        return _pre_review_verify_fix_action(ctx)
+        return _pre_review_verify_fix_action(ctx, phase="pre_merge")
     owner_task = _verify_gate_owner_task(ctx)
     description_suffix = "review" if phase == "pre_review" else "merge"
     if explicit_refresh or decision.state in {"missing", "stale"}:

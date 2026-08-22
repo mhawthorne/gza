@@ -1537,7 +1537,16 @@ def main() -> int:
             "Still refuses git conflicts and actionable gates such as rebase, verify, or improve work "
             "except for latest plain-full or resolution CHANGES_REQUESTED review blockers explicitly deferred "
             "with --defer-blockers; behavior-spec coherence review blockers are not deferable; "
-            "successful overrides record manual_force provenance."
+            "red verify gates also require --ignore-verify-gate; forced merges cannot be combined with "
+            "--rebase --resolve; successful overrides record manual_force provenance."
+        ),
+    )
+    merge_parser.add_argument(
+        "--ignore-verify-gate",
+        action="store_true",
+        help=(
+            "With --force, allow manual merge over a red verify gate after printing the failing epoch head "
+            "and verify command"
         ),
     )
     merge_parser.add_argument(

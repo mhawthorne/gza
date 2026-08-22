@@ -24,6 +24,8 @@ from ..advance_engine import (
     IMPROVE_ACTION_REASON_REVIEW_CHANGES_REQUESTED,
     _resolve_and_persist_post_merge_rebase_state,
     _resolve_current_merge_source,
+    is_current_red_verify_gate_action,
+    is_red_verify_gate_family_action,
     resolve_post_merge_rebase_state,
 )
 from ..branch_publication import load_branch_publication_state
@@ -1657,6 +1659,14 @@ def _resolve_merge_subject_query_only(
     )
 
 
+def _merge_option_relationship_error(args: argparse.Namespace) -> str | None:
+    if getattr(args, "ignore_verify_gate", False) and not getattr(args, "force", False):
+        return "Error: --ignore-verify-gate requires --force"
+    if getattr(args, "force", False) and getattr(args, "rebase", False) and getattr(args, "resolve", False):
+        return "Error: --force cannot be combined with --rebase --resolve; forced lifecycle merges must refuse conflicts"
+    return None
+
+
 def _merge_single_task(
     task_id: str,
     config: Config,
@@ -1671,6 +1681,11 @@ def _merge_single_task(
     materialize_side_effects: bool = True,
 ) -> _MergeSingleTaskResult:
     """Merge a single task's branch."""
+    option_error = _merge_option_relationship_error(args)
+    if option_error is not None:
+        print(option_error)
+        return _MergeSingleTaskResult(rc=1)
+
     target_branch = git.default_branch()
     resolved = _resolve_merge_subject(store, git, task_id, target_branch=target_branch)
     if resolved is None:
@@ -1688,7 +1703,6 @@ def _merge_single_task(
     if status_error is not None:
         print(f"Error: {status_error}")
         return _MergeSingleTaskResult(rc=1)
-
     if resolved.merge_source_warning:
         print(f"Error: {resolved.merge_source_warning}")
         return _MergeSingleTaskResult(rc=1)
@@ -1795,8 +1809,30 @@ def _merge_single_task(
     effective_merge_source = merge_source
     pregate_deferred_blockers: tuple[list[DbTask], list[DbTask]] | None = None
     pregate_deferred_blockers_printed = False
+
     if planned_action.get("type") not in {"merge", "merge_with_followups"}:
-        if (
+        if is_current_red_verify_gate_action(planned_action):
+            if not (getattr(args, "force", False) and getattr(args, "ignore_verify_gate", False)):
+                description = str(planned_action.get("description") or "verify gate is red")
+                print(
+                    "Error: "
+                    f"{description}. Red verify gates require --force --ignore-verify-gate."
+                )
+                return _MergeSingleTaskResult(rc=1)
+            effective_merge_source = (
+                MERGE_SOURCE_MANUAL_FORCE
+                if merge_source == MERGE_SOURCE_MANUAL
+                else merge_source
+            )
+            proof = planned_action["red_verify_gate_proof"]
+            failing_head = str(proof["reviewed_head_sha"])
+            verify_command = str(proof["verify_command"])
+            description = str(planned_action.get("description") or "verify gate is red")
+            print(
+                "Warning: Forcing merge despite red verify gate: "
+                f"{description}; failing epoch head={failing_head}; verify command={verify_command!r}"
+            )
+        elif (
             getattr(args, "defer_blockers", False)
             and materialize_side_effects
             and _is_review_changes_requested_improve_action(
@@ -1828,6 +1864,37 @@ def _merge_single_task(
             )
             description = str(planned_action.get("description") or "merge is blocked")
             print(f"Warning: Forcing merge despite lifecycle gate: {description}")
+        elif is_red_verify_gate_family_action(planned_action):
+            description = str(planned_action.get("description") or "verify gate proof is unavailable")
+            action_type = str(planned_action.get("type") or "")
+            if action_type in {"run_verify_fix", "wait_verify_fix"}:
+                print(
+                    "Error: "
+                    f"{description}. Live verify-fix tasks cannot be bypassed; wait for the existing "
+                    "same-epoch verify_fix task to complete before forcing merge."
+                )
+                return _MergeSingleTaskResult(rc=1)
+            proof = planned_action.get("red_verify_gate_proof")
+            if (
+                isinstance(proof, dict)
+                and proof.get("phase") == "pre_merge"
+                and isinstance(proof.get("reviewed_head_sha"), str)
+                and proof.get("reviewed_head_sha")
+                and isinstance(proof.get("verify_command"), str)
+                and proof.get("verify_command")
+            ):
+                print(
+                    "Error: "
+                    f"{description}. This current red verify-gate recovery state cannot be bypassed; "
+                    "follow the remediation above before forcing merge."
+                )
+                return _MergeSingleTaskResult(rc=1)
+            print(
+                "Error: "
+                f"{description}. Red verify gate bypass requires current failed pre-merge proof; "
+                "rerun or repair the verify gate evidence before forcing merge."
+            )
+            return _MergeSingleTaskResult(rc=1)
         elif getattr(args, "force", False) and classify_advance_action(planned_action) == "needs_attention":
             effective_merge_source = (
                 MERGE_SOURCE_MANUAL_FORCE
@@ -2088,6 +2155,11 @@ def _merge_single_task(
 
 def cmd_merge(args: argparse.Namespace) -> int:
     """Merge task branches into the current branch."""
+    option_error = _merge_option_relationship_error(args)
+    if option_error is not None:
+        print(option_error)
+        return 1
+
     config = Config.load(args.project_dir)
     store = get_store(config)
     git = Git(config.project_dir)

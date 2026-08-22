@@ -723,12 +723,25 @@ failure *and* actionable merge/review work remains eligible for the latter.
   blockers, and they MUST NOT bypass parked lifecycle `needs_attention` /
   `needs_discussion` merge gates. Manual `gza merge --force` MAY override those parked
   lifecycle gates for the local merge path only, but it MUST still refuse any real git
-  conflict and MUST leave the unit's persisted provenance distinguishable from an
+  conflict, MUST reject `--force --rebase --resolve` before any rebase conflict
+  resolution path, and MUST leave the unit's persisted provenance distinguishable from an
   ordinary manual merge. Manual `gza merge` MUST refuse a latest completed
   plain-full or resolution `CHANGES_REQUESTED` review that still has any open non-verify
   `BLOCKER` finding unless the operator passes `--defer-blockers`. Behavior-spec
   coherence `CHANGES_REQUESTED` reviews are not eligible for `--defer-blockers` and MUST
-  remain refused by the manual merge path.
+  remain refused by the manual merge path. Current red verify-gate actions are a stricter manual exception:
+  `create_verify_fix`, `rerun_completed_verify_fix`, and `needs_discussion` with reason
+  `verify-fix-failed` for the same current verify epoch MUST NOT be bypassed by `--force`
+  alone. They MAY be bypassed only when the operator passes both `--force` and
+  `--ignore-verify-gate`; a successful bypass MUST print a loud warning that includes the
+  failing epoch head and verify command, and MUST persist `manual_force` merge provenance.
+  Pending and in-progress same-epoch verify-fix work (`run_verify_fix` and
+  `wait_verify_fix`) MUST fail closed even with both red-gate bypass flags because the
+  live recovery task may still mutate the source branch. Unavailable verify evidence,
+  unavailable epochs, invalid verify-fix proof, stopped verify-fix tasks, and other
+  non-red attention states MUST stay distinct from current red evidence and MUST NOT be
+  accepted by the red-gate bypass predicate. Manual `gza merge` MUST refuse any real git conflict even
+  with both red-gate bypass flags.
 - For manual `gza merge`, when the latest completed `CHANGES_REQUESTED` review is a
   verify-only compatibility case blocked only by verify failures/timeouts, the
   command MAY auto-defer those blockers without a flag. Every blocker bypassed by either

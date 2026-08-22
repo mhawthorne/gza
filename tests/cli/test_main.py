@@ -1481,11 +1481,13 @@ class TestHelpOutput:
         help_text = " ".join(merge_help.stdout.split())
 
         assert "--force" in merge_help.stdout
+        assert "--ignore-verify-gate" in merge_help.stdout
         assert "Override parked needs-attention lifecycle gates for manual merge execution" in help_text
         assert (
             "except for latest plain-full or resolution CHANGES_REQUESTED review blockers explicitly deferred "
             "with --defer-blockers"
         ) in help_text
+        assert "red verify gates also require --ignore-verify-gate" in help_text
         assert "Allow manual merge over a latest plain-full or resolution CHANGES_REQUESTED review" in help_text
         assert "behavior-spec coherence review blockers are not deferable" in help_text
 

@@ -171,6 +171,17 @@ Repeated failed rebases are bounded independently of the ordinary failed-rebase 
 | Current live implementation branch head differs from the latest completed review's recorded reviewed head SHA AND both SHAs are known AND `advance_create_reviews=true` | `create_review` — durable branch progress made the latest review stale |
 | Either stale-review condition above AND `advance_create_reviews=false` | `needs_discussion` — park and require a manual review refresh before merge |
 
+Manual `gza merge` can bypass current red verify-gate actions only with the two-key gesture
+`--force --ignore-verify-gate`. The covered actions are `create_verify_fix`,
+`rerun_completed_verify_fix`, and same-epoch `needs_discussion` with
+reason=`verify-fix-failed`. Successful bypasses print the failing epoch head and verify
+command and persist `manual_force` merge provenance. The red-gate bypass does not cover
+pending/in-progress verify-fix task recovery (`run_verify_fix` / `wait_verify_fix`),
+unavailable verify evidence, invalid verify-fix proof, failed/stopped verify-fix task
+recovery, git conflicts, or open review `BLOCKER` findings. Manual forced lifecycle
+merges also reject `--rebase --resolve` before starting rebase work; automatic conflict
+resolution remains available only for ordinary non-forced rebase merges.
+
 When a completed changed-diff rebase row has lost or partially lost its persisted provenance block, a writable maintenance/lifecycle path first re-derives that provenance from local reflogs plus the surviving branch/target refs and writes the repaired `review_scope` back to the rebase row. Complete recovered provenance is usable for the narrow resolution-review optimization when all pre-rebase SHAs plus resolved post-rebase head/target SHAs are available. When a required post-rebase refresh review already exists but its persisted resolution metadata is blank or otherwise inconsistent with that authoritative rebase context, writable lifecycle re-derives the canonical resolved head/target SHAs, rewrites the review row with structured resolution metadata, and continues through the normal narrow review/merge path. Plain reviews remain plain; they are not rewritten into resolution reviews merely because they were completed after a changed-diff rebase.
 
 If rebase or resolution metadata cannot be validated or deterministically repaired, lifecycle degrades to the coarser full-review rule instead of permanently parking on provenance absence: only a plain full review whose stored reviewed head SHA equals the proven current live implementation branch head can satisfy the review gate, and stale full-review approvals are rejected. Until that review exists, lifecycle runs the normal pre-review verify gate and creates a plain full review at the live head. A pending plain full-review row is reused only when its stored reviewed head already matches the proven live head, and the executor checks that selected head before launch; otherwise the row is superseded or lifecycle fails closed if no live proof exists. Pending malformed resolution-review refresh rows can be dropped before that fallback, but valid spec-coherence reviews remain owned by the spec-coherence gate and an `in_progress` malformed refresh row is waited on until terminalization so its worker cannot complete concurrently with a replacement review. If the live branch head itself cannot be established, lifecycle fails closed with `review-freshness-unverified`; cached merge-unit head metadata is not equivalent proof. Operator wording distinguishes unavailable resolution metadata from true branch-head advancement. Query-only surfaces such as `gza show`, incomplete-lineage rendering, dispatch preview, and watch scope-gap analysis may apply proven repairs in memory, but they must not write.
@@ -338,7 +349,7 @@ These actions create background workers and count toward the batch limit. The so
 |--------|-------------|
 | `needs_rebase` | Creates rebase task via `_create_rebase_task()`, spawns worker |
 | `create_verify_fix` | Creates one same-branch `verify_fix` task for the exact red verify epoch, then starts the remediation worker |
-| `run_verify_fix` | Starts an existing pending same-epoch `verify_fix` task |
+| `run_verify_fix` | Starts an existing pending same-epoch `verify_fix` task; manual red-gate force bypass must refuse while this live task exists |
 | `create_review` | `gza advance`: creates review task, spawns worker. `gza watch`: for unmerged implementation chains, launches `gza iterate <impl>` and lets iterate create/reuse the review work internally. Foreground iterate and background iterate startup both use the same selected-action review factory, so stale-review refreshes after changed rebases create resolution-scoped review rows instead of falling back to ordinary reviews. |
 | `run_review` | `gza advance`: spawns worker for existing pending review. `gza watch`: for unmerged implementation chains, launches `gza iterate <impl>` instead of the child review directly. |
 | `improve` | `gza advance`: creates/resumes/retries improve work directly. `gza watch`: for unmerged implementation chains, launches `gza iterate <impl>` and lets iterate choose the improve action. |
@@ -371,7 +382,7 @@ These actions create background workers and count toward the batch limit. The so
 |--------|---------|
 | `skip` | No action needed or possible |
 | `wait_review` | Review in progress, wait for it |
-| `wait_verify_fix` | Verify-fix remediation is already in progress for the current verify epoch, wait for it |
+| `wait_verify_fix` | Verify-fix remediation is already in progress for the current verify epoch; manual red-gate force bypass must refuse while this live task exists |
 | `wait_improve` | Improve in progress, wait for it |
 | `awaiting_human` | Plan is intentionally held for manual review before implementation follow-up (`reason=awaiting-human-review`) |
 | `needs_discussion` | Requires manual intervention (shown in attention summary) |
