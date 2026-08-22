@@ -136,19 +136,33 @@ section supplies the missing denominator by configuration.
 
 Cost is already solved. The unanswered question is **"how much of my quota is
 left"**, and for a subscription harness that publishes no quota, the only way to
-answer it is to supply the denominator ourselves: configure a token budget per
+answer it is to supply the denominator ourselves: configure a token budget for a
 window, sum our own consumption over that window, and divide.
+
+### A budget is always per unit of time
+
+Every budget number is an allowance **per window**, never a lifetime or absolute
+total. Subscription limits are overwhelmingly weekly (with a shorter session
+window alongside), so `7d` is the default, but the period is explicit in config
+and the key names say so, because "2 billion tokens" is meaningless without it:
 
 ```yaml
 usage_budgets:
   claude:
-    window: 7d           # rolling
-    input_tokens: 2_000_000_000
+    window: 7d                             # the period the allowance covers
+    uncached_input_tokens_per_window: 2_000_000_000
+    output_tokens_per_window: 20_000_000   # optional; omit to meter input only
 ```
 
-`used_percent = tokens_in_window / budget`, `resets_at` = end of the rolling
-window. That produces a genuine `UsageWindow` — same shape, same renderer, same
-homepage meter as Codex — with `source: "derived"` instead of `"provider"`.
+`window` accepts a duration (`5h`, `7d`, `30d`). Changing it changes what the
+allowance means, so the numbers must be restated when it changes — there is no
+automatic rescaling, which would silently invent a limit nobody set.
+
+`used_percent = tokens_in_window / allowance_per_window`, `resets_at` = end of
+the rolling window. That produces a genuine `UsageWindow` — same shape, same
+renderer, same homepage meter as Codex — with `source: "derived"` instead of
+`"provider"`. Multiple windows per provider are allowed (a `5h` and a `7d`
+entry), which is exactly how Codex already reports.
 
 The query is already available from the data we keep:
 
@@ -161,6 +175,51 @@ WHERE provider = ?
 
 Measured on the live DB, a 7-day window returns 4.7B input tokens across 894
 tasks, 795 of which carry token counts — the signal is dense enough to meter.
+
+## Reconciling the meter against reality
+
+A configured allowance is a guess until something contradicts it. The
+contradiction is cheap to observe: **record a timestamp and the window's
+token total every time a run fails on a rate or usage limit.**
+
+```sql
+CREATE TABLE provider_limit_events (
+    id INTEGER PRIMARY KEY,
+    provider TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    window TEXT NOT NULL,              -- the budget window in force, e.g. "7d"
+    observed_tokens INTEGER NOT NULL,  -- our own count over that window, at the time
+    observed_percent REAL,             -- what the meter was claiming
+    detail TEXT                        -- provider message / classified reason
+);
+```
+
+These events are rare by design — an operator who paces against limits should
+almost never generate one — which is precisely why each is worth keeping.
+
+**The calibration.** Getting limited means the real allowance was exhausted, so
+our own count at that moment *is* the visible portion of the true allowance.
+Setting the allowance to that observed figure makes the meter read 100% exactly
+when reality says 100%. Two directions:
+
+- **Meter says headroom, provider says no** (`observed_percent` well under 100):
+  the allowance is set too high. The implied allowance is `observed_tokens`.
+- **Meter passes 100% with no limit event for a full window:** the allowance is
+  set too low, and the meter is crying wolf. Raise it toward actual consumption.
+
+**Which figure to adopt.** Take the *lowest* `observed_tokens` across recent
+limit events for that window rather than the latest or the mean. Our count only
+covers gza's own traffic, so it varies with how much invisible usage was in
+flight; the lowest observation is the most conservative reading and errs toward
+reporting less headroom than we have. Under-promising headroom is the safe
+failure; over-promising it is what produced the surprise in the first place.
+
+**Advise, do not auto-apply.** Calibration is reported, not silently written:
+`gza usage` and the watch header surface a line when recent limit events
+disagree with the configured allowance, and the operator changes the number. A
+single named knob (`usage_budget_autocalibrate`, default off) can flip that to
+automatic for anyone who wants it. A meter that rewrites its own denominator
+without saying so is worse than a wrong one.
 
 ### Four things that decide whether the number means anything
 
@@ -182,11 +241,9 @@ tasks, 795 of which carry token counts — the signal is dense enough to meter.
    arguably more useful for pacing, but it will not agree with what `/usage`
    shows.
 
-4. **The budget has to be calibrated, not guessed.** A number pulled from the
-   air produces a confident-looking meter with no meaning. The honest path is to
-   let the operator set it and refine it — and, better, to record the timestamp
-   whenever a run fails on a rate/usage limit, so observed limit events
-   calibrate the budget against reality over time.
+4. **The allowance has to be calibrated, not guessed.** A number pulled from
+   the air produces a confident-looking meter with no meaning. See
+   [Reconciling the meter against reality](#reconciling-the-meter-against-reality).
 
 ### Labelling
 
@@ -195,7 +252,8 @@ Same meter, explicit provenance:
 
 ```
 usage  codex  45% used · 7d window · resets in 4d20h        (cached 4m ago)
-usage  claude 62% used · 7d rolling · budget 2.0B tok       (derived, gza traffic only)
+usage  claude 62% used · 7d rolling · 2.0B tok/week          (derived, gza traffic only)
+usage  claude 62% used · 7d rolling · 2.0B tok/week          (derived; hit a limit at 61% on 08-19 -- allowance may be too high)
 ```
 
 ## Recommendation
@@ -206,8 +264,9 @@ usage  claude 62% used · 7d rolling · budget 2.0B tok       (derived, gza traf
    `UsageWindow`, config-driven, off unless a budget is set. It is
    provider-agnostic by construction — it would work for any harness that
    reports tokens but not quota.
-3. **Record limit-hit events** so the configured budget can be calibrated
-   against observed reality rather than left at a guess.
+3. **Record limit-hit events** (`provider_limit_events`) so the configured
+   allowance is calibrated against observed reality rather than left at a guess,
+   and surface the disagreement when the meter and the provider conflict.
 4. **Add the Admin API (Option A) only if a Console org with an Admin key
    appears.** Not applicable to this machine's subscription auth.
 5. **Do not pursue the undocumented `/usage` endpoint.**
