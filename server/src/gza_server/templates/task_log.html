@@ -26,6 +26,10 @@
       <p class="muted">Showing the tail of this log. Earlier entries are above the current window.</p>
     {% endif %}
 
+    {% if view.is_running %}
+      <p class="log-follow-status muted">Following this running task&rsquo;s log&hellip;</p>
+    {% endif %}
+
     <ol class="log-events"
         data-task-id="{{ task.id }}"
         data-project-id="{{ detail.project_id }}"

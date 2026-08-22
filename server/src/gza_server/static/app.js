@@ -71,4 +71,80 @@
   for (const form of document.querySelectorAll(".selection-form")) {
     wireSelection(form);
   }
+  // Follow a running task's log. The list carries the byte offset the server
+  // page stopped at, so the stream resumes with no gap and no repeats.
+  function wireLogFollow(list) {
+    if (list.dataset.running !== "true") return;
+
+    const taskId = list.dataset.taskId;
+    const projectId = list.dataset.projectId;
+    const stream = list.dataset.stream || "conversation";
+    const offset = list.dataset.nextOffset || "0";
+    const status = document.querySelector(".log-follow-status");
+
+    const base = projectId
+      ? `/api/projects/${encodeURIComponent(projectId)}/tasks/${encodeURIComponent(taskId)}`
+      : `/api/tasks/${encodeURIComponent(taskId)}`;
+    const source = new EventSource(
+      `${base}/log/stream?stream=${encodeURIComponent(stream)}&offset=${encodeURIComponent(offset)}`
+    );
+
+    const atBottom = () =>
+      window.innerHeight + window.scrollY >= document.body.offsetHeight - 40;
+
+    function setStatus(text) {
+      if (status) status.textContent = text;
+    }
+
+    source.addEventListener("entries", (event) => {
+      const payload = JSON.parse(event.data);
+      const stick = atBottom();
+      for (const entry of payload.events) {
+        const item = document.createElement("li");
+        item.className = `log-event log-${entry.kind}${entry.is_error ? " log-error" : ""}`;
+
+        const kind = document.createElement("span");
+        kind.className = "log-kind";
+        kind.textContent = entry.tool_name || entry.role || entry.kind;
+        item.appendChild(kind);
+
+        if (entry.title) {
+          const title = document.createElement("span");
+          title.className = "log-title";
+          title.textContent = entry.title;
+          item.appendChild(title);
+        }
+        if (entry.body && entry.body.trim()) {
+          const body = document.createElement("pre");
+          body.className = "log-body";
+          body.textContent = entry.body;
+          item.appendChild(body);
+        }
+        list.appendChild(item);
+      }
+      list.dataset.nextOffset = String(payload.next_offset);
+      // Only auto-scroll a reader who was already at the bottom.
+      if (stick) window.scrollTo(0, document.body.scrollHeight);
+    });
+
+    source.addEventListener("waiting", (event) => {
+      setStatus(JSON.parse(event.data).message);
+    });
+
+    source.addEventListener("end", (event) => {
+      const payload = JSON.parse(event.data);
+      setStatus(
+        payload.reason === "task_finished"
+          ? `Task ${payload.status}. Reload for the full log.`
+          : `Stopped following (${payload.reason}). Reload to continue.`
+      );
+      source.close();
+    });
+
+    source.onerror = () => setStatus("Lost connection to the log stream.");
+  }
+
+  for (const list of document.querySelectorAll(".log-events[data-running]")) {
+    wireLogFollow(list);
+  }
 })();
