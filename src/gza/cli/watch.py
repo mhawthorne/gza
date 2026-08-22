@@ -146,6 +146,13 @@ from ..unstick import (
     discover_parked_tasks,
     skip_reason_for_landed_or_moot,
 )
+from ..watch_leases import (
+    WatchLeaseConflict,
+    WatchLeaseReleaseError,
+    WatchLeaseSet,
+    WatchLeaseTarget,
+    acquire_watch_project_leases,
+)
 from ..watch_progress import (
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
     WatchProgressCandidate,
@@ -1837,6 +1844,7 @@ def _query_owner_rows_with_context(
     include_skipped: bool,
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
+    apply_deferred_recovery_reconciliations: bool = True,
 ) -> tuple[list[LineageOwnerRow], RecoveryReadContext]:
     rows, read_context = query_lineage_owner_rows_in_read_session(
         store,
@@ -1856,6 +1864,7 @@ def _query_owner_rows_with_context(
         target_branch=target_branch,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
         persist_review_clearance=persist_review_clearance,
+        apply_deferred_recovery_reconciliations=apply_deferred_recovery_reconciliations,
     )
     return list(rows), read_context
 
@@ -1875,6 +1884,7 @@ def _query_owner_rows(
     include_skipped: bool,
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
+    apply_deferred_recovery_reconciliations: bool = True,
 ) -> list[LineageOwnerRow]:
     rows, _ = _query_owner_rows_with_context(
         store=store,
@@ -1890,6 +1900,7 @@ def _query_owner_rows(
         include_skipped=include_skipped,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
         persist_review_clearance=persist_review_clearance,
+        apply_deferred_recovery_reconciliations=apply_deferred_recovery_reconciliations,
     )
     return rows
 
@@ -2048,6 +2059,7 @@ def _resolve_watch_scope_owner_ids(
             max_recovery_attempts=max_recovery_attempts,
             include_skipped=True,
             task_ids=(raw_task_id,),
+            apply_deferred_recovery_reconciliations=False,
         )
         if owner_task is None and rows:
             owner_task = rows[0].owner_task
@@ -3303,6 +3315,9 @@ def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
     if getattr(args, "yes", False):
         argv.append("--yes")
     argv.append("--resumed-reexec")
+    watch_lease_token = getattr(args, "watch_lease_token", None)
+    if isinstance(watch_lease_token, str) and watch_lease_token:
+        argv.extend(["--watch-lease-token", watch_lease_token])
     for tag in getattr(args, "tags", None) or ():
         argv.extend(["--tag", tag])
     if getattr(args, "all_tags", False):
@@ -4580,6 +4595,104 @@ class _WatchLog:
             f.write(line + "\n")
         if not self.quiet:
             console.print(_render_watch_stdout(line), soft_wrap=True, highlight=False)
+
+
+@dataclass
+class _InstalledWatchSignalHandlers:
+    old_sigint: Any = None
+    old_sigterm: Any = None
+    sigint_installed: bool = False
+    sigterm_installed: bool = False
+
+
+def _restore_installed_watch_signal_handlers(
+    installed: _InstalledWatchSignalHandlers,
+) -> list[BaseException]:
+    errors: list[BaseException] = []
+    if installed.sigint_installed:
+        try:
+            signal.signal(signal.SIGINT, installed.old_sigint)
+        except BaseException as exc:
+            errors.append(exc)
+    if installed.sigterm_installed:
+        try:
+            signal.signal(signal.SIGTERM, installed.old_sigterm)
+        except BaseException as exc:
+            errors.append(exc)
+    return errors
+
+
+def _install_watch_signal_handlers(handler: Callable[[int, object], None]) -> _InstalledWatchSignalHandlers:
+    installed = _InstalledWatchSignalHandlers()
+    try:
+        installed.old_sigint = signal.signal(signal.SIGINT, handler)
+        installed.sigint_installed = True
+        installed.old_sigterm = signal.signal(signal.SIGTERM, handler)
+        installed.sigterm_installed = True
+    except BaseException as exc:
+        rollback_errors = _restore_installed_watch_signal_handlers(installed)
+        if rollback_errors:
+            raise BaseExceptionGroup("watch signal handler setup failed", [exc, *rollback_errors]) from exc
+        raise
+    return installed
+
+
+def _emit_watch_error(log: _WatchLog, quiet: bool, message: str) -> None:
+    log.emit("ERROR", message)
+    if quiet:
+        print(message, file=sys.stderr, flush=True)
+
+
+def _emit_watch_error_safely(log: _WatchLog, quiet: bool, message: str) -> list[BaseException]:
+    errors: list[BaseException] = []
+    try:
+        _emit_watch_error(log, quiet, message)
+    except BaseException as exc:
+        errors.append(exc)
+        try:
+            print(message, file=sys.stderr, flush=True)
+        except BaseException as fallback_exc:
+            errors.append(fallback_exc)
+    return errors
+
+
+def _watch_exception_messages(prefix: str, exc: BaseException) -> tuple[str, ...]:
+    if isinstance(exc, BaseExceptionGroup):
+        messages = [f"{prefix}: {exc}"]
+        messages.extend(f"{prefix}: {type(child).__name__}: {child}" for child in exc.exceptions)
+        return tuple(messages)
+    return (f"{prefix}: {exc}",)
+
+
+def _release_watch_lease_set(
+    watch_lease_set: WatchLeaseSet | None,
+    *,
+    log: _WatchLog,
+    quiet: bool,
+) -> WatchLeaseReleaseError | None:
+    if watch_lease_set is None:
+        return None
+    try:
+        watch_lease_set.release()
+    except WatchLeaseReleaseError as exc:
+        _emit_watch_error(log, quiet, str(exc))
+        return exc
+    return None
+
+
+def _release_watch_lease_set_for_cleanup(
+    watch_lease_set: WatchLeaseSet | None,
+    *,
+    log: _WatchLog,
+    quiet: bool,
+) -> list[BaseException]:
+    if watch_lease_set is None:
+        return []
+    try:
+        watch_lease_set.release()
+    except WatchLeaseReleaseError as exc:
+        return [exc, *_emit_watch_error_safely(log, quiet, str(exc))]
+    return []
 
 
 def _emit_transition_events(
@@ -10757,12 +10870,26 @@ def _clear_watch_session(
     store: SqliteTaskStore,
     log: "_WatchLog",
     owner_pid: int,
-) -> None:
+) -> list[BaseException]:
     """Retire the scope record on shutdown so no stale row is left behind."""
     try:
         store.clear_watch_session(owner_pid=owner_pid)
     except sqlite3.Error as exc:
-        log.emit("WARN", f"could not clear watch scope: {exc}")
+        message = f"could not clear watch scope: {exc}"
+        errors: list[BaseException] = [exc]
+        try:
+            log.emit("WARN", message)
+        except BaseException as report_exc:
+            errors.append(report_exc)
+            try:
+                print(message, file=sys.stderr, flush=True)
+            except BaseException as fallback_exc:
+                errors.append(fallback_exc)
+        return errors
+    except Exception as exc:
+        message = f"could not clear watch scope: {exc}"
+        return [exc, *_emit_watch_error_safely(log, quiet=True, message=message)]
+    return []
 
 
 def cmd_watch(args: argparse.Namespace) -> int:
@@ -10854,7 +10981,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             f" from {source}" if source else ""
         )
 
-    store = get_store(config)
+    store = get_store(config, open_mode="watch_lease_activation")
     log = _WatchLog(config.project_dir / ".gza" / "watch.log", quiet=quiet)
     if startup_cap_warning is not None:
         log.emit("WARN", startup_cap_warning)
@@ -10874,6 +11001,25 @@ def cmd_watch(args: argparse.Namespace) -> int:
     else:
         scoped_owner_ids = None
         scoped_task_ids = None
+    watch_lease_token = getattr(args, "watch_lease_token", None)
+    if not isinstance(watch_lease_token, str) or not watch_lease_token:
+        watch_lease_token = None
+    watch_lease_set: WatchLeaseSet | None = None
+    try:
+        watch_lease_set = acquire_watch_project_leases(
+            [WatchLeaseTarget(config.project_name, store)],
+            owner_token=watch_lease_token,
+        )
+    except WatchLeaseConflict as exc:
+        print(f"Error: {exc}")
+        return 1
+    args.watch_lease_token = watch_lease_set.owner_token
+    try:
+        store.repair_inconsistent_unmerged_merge_units()
+        store.repair_stale_unmerged_merge_unit_owners()
+    except BaseException:
+        _release_watch_lease_set_for_cleanup(watch_lease_set, log=log, quiet=quiet)
+        raise
     effective_scoped_owner_ids = scoped_owner_ids
     stop_requested = False
     stop_signal: int | None = None
@@ -10891,21 +11037,29 @@ def cmd_watch(args: argparse.Namespace) -> int:
         if quiet:
             print("shutting down (workers left running)", file=sys.stderr, flush=True)
 
-    old_sigint = signal.signal(signal.SIGINT, _handle_shutdown)
-    old_sigterm = signal.signal(signal.SIGTERM, _handle_shutdown)
+    try:
+        installed_signal_handlers = _install_watch_signal_handlers(_handle_shutdown)
+    except BaseException as exc:
+        for message in _watch_exception_messages("watch signal handler setup failed", exc):
+            _emit_watch_error_safely(log, quiet, message)
+        _release_watch_lease_set_for_cleanup(watch_lease_set, log=log, quiet=quiet)
+        return 1
     reexec_fingerprint: str | None = None
+    cleanup_errors: list[BaseException] = []
+    result_code: int | None = None
 
     watch_pid = os.getpid()
-    watch_session_recorded = _record_watch_session(
-        store=store,
-        log=log,
-        owner_pid=watch_pid,
-        tags=tag_filters or (),
-        batch_size=batch,
-        poll_seconds=float(poll),
-    )
+    watch_session_recorded = False
 
     try:
+        watch_session_recorded = _record_watch_session(
+            store=store,
+            log=log,
+            owner_pid=watch_pid,
+            tags=tag_filters or (),
+            batch_size=batch,
+            poll_seconds=float(poll),
+        )
         idle_seconds = 0
         failure_backoffs: dict[str, _OwnerFailureBackoffState] = {}
         previous_snapshot = _task_snapshot(store)
@@ -10923,19 +11077,20 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 persist=False,
                 hold_active=git_health_hold_active,
             ):
-                return 0
-            _dry_run_git = Git(config.project_dir)
-            _dry_run_target_branch = _dry_run_git.default_branch()
-            _emit_recovery_dry_run_report(
-                store=store,
-                tags=tag_filters,
-                any_tag=any_tag,
-                max_recovery_attempts=max_recovery_attempts,
-                show_skipped=show_skipped,
-                git=_dry_run_git,
-                target_branch=_dry_run_target_branch,
-            )
-            return 0
+                result_code = 0
+            else:
+                _dry_run_git = Git(config.project_dir)
+                _dry_run_target_branch = _dry_run_git.default_branch()
+                _emit_recovery_dry_run_report(
+                    store=store,
+                    tags=tag_filters,
+                    any_tag=any_tag,
+                    max_recovery_attempts=max_recovery_attempts,
+                    show_skipped=show_skipped,
+                    git=_dry_run_git,
+                    target_branch=_dry_run_target_branch,
+                )
+                result_code = 0
 
         resumed_reexec = bool(getattr(args, "resumed_reexec", False))
         skip_confirm = dry_run or bool(getattr(args, "yes", False)) or resumed_reexec
@@ -11088,7 +11243,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 "auto-resumed after code update (skipping first-pass confirmation)",
             )
 
-        while True:
+        while result_code is None:
             if stop_requested:
                 if preview_cycle_open:
                     log.end_cycle()
@@ -11175,7 +11330,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     pending_first_cycle_plan = None
                     needs_initial_preview = not skip_confirm
                 if dry_run:
-                    return 0
+                    result_code = 0
+                    break
                 git_health_hold_active = True
                 if stop_requested:
                     break
@@ -11189,7 +11345,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
             if needs_initial_preview:
                 preview_abort_code = _preview_initial_cycle_and_confirm()
                 if preview_abort_code is not None:
-                    return preview_abort_code
+                    result_code = preview_abort_code
+                    break
                 continue
 
             _prime_effective_scope_for_boundary()
@@ -11337,14 +11494,6 @@ def cmd_watch(args: argparse.Namespace) -> int:
             ):
                 reexec_fingerprint = installed_package_drift.pending_restart_fingerprint
                 assert reexec_fingerprint is not None
-                log.emit(
-                    "INFO",
-                    (
-                        "re-execing watch to load updated gza "
-                        f"{installed_package_drift.startup_fingerprint}"
-                        f"->{reexec_fingerprint}"
-                    ),
-                )
                 break
 
             if cycle_result.work_done:
@@ -11374,26 +11523,58 @@ def cmd_watch(args: argparse.Namespace) -> int:
             if stop_requested:
                 break
             _sleep_interruptibly(poll, lambda: stop_requested)
+
+        if result_code is not None:
+            pass
+        elif stop_signal is not None:
+            result_code = 128 + stop_signal
+        elif reexec_fingerprint is not None:
+            try:
+                exec_argv = _watch_reexec_argv(args)
+                if stop_signal is not None:
+                    result_code = 128 + stop_signal
+                elif stop_requested:
+                    result_code = 0
+                else:
+                    log.emit(
+                        "INFO",
+                        (
+                            "re-execing watch to load updated gza "
+                            f"{installed_package_drift.startup_fingerprint}"
+                            f"->{reexec_fingerprint}"
+                        ),
+                    )
+                    if stop_signal is not None:
+                        result_code = 128 + stop_signal
+                    elif stop_requested:
+                        result_code = 0
+                    else:
+                        os.execv(sys.executable, exec_argv)
+                        result_code = 1
+            except Exception as exc:
+                if stop_signal is not None:
+                    result_code = 128 + stop_signal
+                elif stop_requested:
+                    result_code = 0
+                else:
+                    for message in _watch_exception_messages("watch re-exec failed", exc):
+                        _emit_watch_error(log, quiet, message)
+                    result_code = 1
+        else:
+            result_code = 0
     finally:
-        signal.signal(signal.SIGINT, old_sigint)
-        signal.signal(signal.SIGTERM, old_sigterm)
+        for restore_error in _restore_installed_watch_signal_handlers(installed_signal_handlers):
+            cleanup_errors.append(restore_error)
+            cleanup_errors.extend(
+                _emit_watch_error_safely(log, quiet, f"watch signal handler restore failed: {restore_error}")
+            )
         if watch_session_recorded:
-            _clear_watch_session(store=store, log=log, owner_pid=watch_pid)
+            cleanup_errors.extend(_clear_watch_session(store=store, log=log, owner_pid=watch_pid))
+        cleanup_errors.extend(_release_watch_lease_set_for_cleanup(watch_lease_set, log=log, quiet=quiet))
 
-    if stop_signal is not None:
-        return 128 + stop_signal
-
-    if reexec_fingerprint is not None:
-        exec_argv = _watch_reexec_argv(args)
-        try:
-            os.execv(sys.executable, exec_argv)
-        except OSError as exc:
-            log.emit("ERROR", f"watch re-exec failed: {exc}")
-            if quiet:
-                print(f"watch re-exec failed: {exc}", file=sys.stderr, flush=True)
-            return 1
-
-    return 0
+    if cleanup_errors:
+        return 1
+    return result_code if result_code is not None else 0
 
 
 def cmd_main_verify(args: argparse.Namespace) -> int:

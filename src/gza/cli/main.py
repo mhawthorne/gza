@@ -1193,6 +1193,12 @@ def main() -> int:
         help=argparse.SUPPRESS,
     )
     watch_parser.add_argument(
+        "--watch-lease-token",
+        default=None,
+        dest="watch_lease_token",
+        help=argparse.SUPPRESS,
+    )
+    watch_parser.add_argument(
         "--tag",
         action="append",
         dest="tags",

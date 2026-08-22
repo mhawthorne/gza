@@ -1794,7 +1794,15 @@ class TestCommandAliases:
             patch.object(
                 sys,
                 "argv",
-                ["gza", "watch", "--resumed-reexec", "--project", str(tmp_path)],
+                [
+                    "gza",
+                    "watch",
+                    "--resumed-reexec",
+                    "--watch-lease-token",
+                    "lease-token",
+                    "--project",
+                    str(tmp_path),
+                ],
             ),
             patch("gza.cli.main.cmd_watch", return_value=0) as cmd_watch,
         ):
@@ -1805,6 +1813,7 @@ class TestCommandAliases:
         args = cmd_watch.call_args.args[0]
         assert args.command == "watch"
         assert args.resumed_reexec is True
+        assert args.watch_lease_token == "lease-token"
 
     @pytest.mark.parametrize(
         ("command", "argv_tail", "patch_target"),

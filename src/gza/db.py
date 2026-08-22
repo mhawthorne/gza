@@ -92,7 +92,13 @@ __all__ = [
     "behavior_check_finding_fingerprint",
 ]
 
-StoreOpenMode = Literal["readwrite", "query_only", "registry_mutation", "registry_mutation_existing"]
+StoreOpenMode = Literal[
+    "readwrite",
+    "query_only",
+    "registry_mutation",
+    "registry_mutation_existing",
+    "watch_lease_activation",
+]
 SqliteIsolationLevel = Literal["DEFERRED", "EXCLUSIVE", "IMMEDIATE"] | None
 _DbFileIdentity = tuple[int, int]
 ExecutionProjectSelectorKind = Literal["path", "registry_id"]
@@ -5408,6 +5414,9 @@ class SqliteTaskStore:
             self._ensure_db_registry_mutation_bootstrap()
         elif self._open_mode == "registry_mutation_existing":
             self._ensure_db_registry_mutation_existing()
+        elif self._open_mode == "watch_lease_activation":
+            self._ensure_db()
+            self._ensure_project_row()
         else:
             self._ensure_db()
             self.repair_inconsistent_unmerged_merge_units()

@@ -9,6 +9,7 @@ import os
 import platform
 import re
 import signal
+import sqlite3
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -180,6 +181,11 @@ from gza.review_verdict import ParsedReviewReport
 from gza.review_verify_state import VERIFY_GATE_ARTIFACT_KIND, persist_verify_gate_artifact
 from gza.runner import _make_review_verify_result
 from gza.unstick import VERIFY_FIX_FAILED_REASON, select_and_clear_parked_tasks
+from gza.watch_leases import (
+    WATCH_SUPERVISOR_LEASE_NAME,
+    WatchLeaseReleaseError,
+    WatchLeaseReleaseFailure,
+)
 from gza.watch_progress import (
     CREATE_REVIEW_PREEXISTING_TERMINAL_TASK_IDS_KEY,
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
@@ -725,6 +731,7 @@ def _watch_args(tmp_path: Path, task_ids: list[str], **overrides: object) -> arg
         "auto_restart_on_drift": True,
         "dispatch_mode": None,
         "recovery_slots": None,
+        "watch_lease_token": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -36238,6 +36245,7 @@ def test_watch_reexec_argv_preserves_requested_watch_flags(tmp_path: Path) -> No
         all_tags=True,
         auto_restart_on_drift=False,
         task_ids=["gza-1", "gza-2"],
+        watch_lease_token="lease-token",
     )
 
     argv = _watch_reexec_argv(args)
@@ -36266,6 +36274,8 @@ def test_watch_reexec_argv_preserves_requested_watch_flags(tmp_path: Path) -> No
         "--quiet",
         "--yes",
         "--resumed-reexec",
+        "--watch-lease-token",
+        "lease-token",
         "--tag",
         "release",
         "--tag",
@@ -36306,6 +36316,56 @@ def test_watch_reexec_argv_scoped_default_with_zero_recovery_slots_does_not_add_
     assert "0" in argv
     assert "--pending-only" not in argv
     assert argv[-2:] == ["gza-1", "gza-2"]
+
+
+def test_watch_reexec_argv_omits_empty_watch_lease_token(tmp_path: Path) -> None:
+    args = _watch_args(tmp_path, [], watch_lease_token="")
+
+    argv = _watch_reexec_argv(args)
+
+    assert "--resumed-reexec" in argv
+    assert "--watch-lease-token" not in argv
+
+
+def test_cmd_watch_resumed_reexec_adopts_same_token_live_watch_lease(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="same-reexec-token",
+        )
+        is not None
+    )
+    args = _watch_args(
+        tmp_path,
+        [],
+        resumed_reexec=True,
+        yes=False,
+        max_idle=1,
+        watch_lease_token="same-reexec-token",
+    )
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
+        patch("builtins.input") as input_mock,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch._sleep_interruptibly"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_count == 1
+    input_mock.assert_not_called()
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-adoption",
+        )
+        is not None
+    )
 
 
 def test_watch_reexec_argv_scoped_pending_only_with_zero_recovery_slots_preserves_pending_only(
@@ -40538,6 +40598,1154 @@ def test_cmd_watch_declining_first_start_aborts_without_dispatch_mutations(tmp_p
     input_mock.assert_called_once_with("\nProceed? [y/N] ")
 
 
+def test_cmd_watch_refuses_when_live_watch_lease_exists(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="other-live-watch",
+        )
+        is not None
+    )
+
+    args = _watch_args(tmp_path, [], max_idle=1)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=AssertionError("conflicted watch should not run")),
+        patch("gza.cli.watch.signal.signal", side_effect=AssertionError("signals should not be installed")),
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "watch-supervisor lease" in captured.out
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="second-live-watch",
+        )
+        is None
+    )
+
+
+def _fetch_watch_lease_repair_snapshot(
+    db_path: Path,
+    *,
+    project_id: str,
+    unit_ids: tuple[str, str],
+    task_ids: tuple[str, ...],
+) -> dict[str, Any]:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        units = {
+            str(row["id"]): dict(row)
+            for row in conn.execute(
+                """
+                SELECT *
+                FROM merge_units
+                WHERE project_id = ?
+                  AND id IN (?, ?)
+                ORDER BY id
+                """,
+                (project_id, *unit_ids),
+            ).fetchall()
+        }
+        roles = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT merge_unit_id, task_id, role, attached_at
+                FROM merge_unit_tasks
+                WHERE project_id = ?
+                  AND merge_unit_id IN (?, ?)
+                ORDER BY merge_unit_id, task_id
+                """,
+                (project_id, *unit_ids),
+            ).fetchall()
+        ]
+        task_placeholders = ",".join("?" for _ in task_ids)
+        tasks = {
+            str(row["id"]): dict(row)
+            for row in conn.execute(
+                f"""
+                SELECT id, status, merge_status, merged_at, updated_at
+                FROM tasks
+                WHERE project_id = ?
+                  AND id IN ({task_placeholders})
+                ORDER BY id
+                """,
+                (project_id, *task_ids),
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+    return {"units": units, "roles": roles, "tasks": tasks}
+
+
+def _seed_watch_lease_repair_regressions(
+    tmp_path: Path,
+) -> tuple[SqliteTaskStore, str, str, tuple[str, str, str]]:
+    store = make_store(tmp_path)
+
+    inconsistent = store.add("Inconsistent merge unit", task_type="implement")
+    store.mark_completed(inconsistent, has_commits=True, branch="feature/watch-lease-inconsistent")
+    assert inconsistent.id is not None
+    inconsistent_unit = store.resolve_merge_unit_for_task(inconsistent.id)
+    assert inconsistent_unit is not None
+
+    first = store.add("Stale owner first slice", task_type="implement")
+    store.mark_completed(first, has_commits=True, branch="feature/watch-lease-stale-owner")
+    assert first.id is not None
+    second = store.add(
+        "Stale owner second slice",
+        task_type="implement",
+        based_on=first.id,
+    )
+    store.mark_completed(second, has_commits=True, branch="feature/watch-lease-stale-owner")
+    assert second.id is not None
+    stale_owner_unit = store.resolve_merge_unit_for_task(second.id)
+    assert stale_owner_unit is not None
+
+    stale_time = "2026-01-02T03:04:05+00:00"
+    with store._connect() as conn:
+        conn.execute(
+            """
+            UPDATE merge_units
+            SET state = 'unmerged',
+                merged_at = ?,
+                merged_by_task_id = ?,
+                merge_source = 'manual-force',
+                updated_at = ?
+            WHERE project_id = ? AND id = ?
+            """,
+            (stale_time, inconsistent.id, stale_time, store._project_id, inconsistent_unit.id),
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET merge_status = 'merged',
+                merged_at = ?,
+                updated_at = ?
+            WHERE project_id = ? AND id = ?
+            """,
+            (stale_time, stale_time, store._project_id, inconsistent.id),
+        )
+        conn.execute(
+            """
+            UPDATE merge_units
+            SET owner_task_id = ?,
+                updated_at = ?
+            WHERE project_id = ? AND id = ?
+            """,
+            (first.id, stale_time, store._project_id, stale_owner_unit.id),
+        )
+        conn.execute(
+            """
+            UPDATE merge_unit_tasks
+            SET role = CASE task_id
+                WHEN ? THEN 'owner'
+                WHEN ? THEN 'contributor'
+                ELSE role
+            END
+            WHERE project_id = ?
+              AND merge_unit_id = ?
+              AND task_id IN (?, ?)
+            """,
+            (first.id, second.id, store._project_id, stale_owner_unit.id, first.id, second.id),
+        )
+
+    return store, inconsistent_unit.id, stale_owner_unit.id, (inconsistent.id, first.id, second.id)
+
+
+def test_cmd_watch_live_lease_conflict_does_not_run_startup_merge_unit_repairs(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store, inconsistent_unit_id, stale_owner_unit_id, task_ids = _seed_watch_lease_repair_regressions(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="other-live-watch",
+        )
+        is not None
+    )
+    before = _fetch_watch_lease_repair_snapshot(
+        tmp_path / ".gza" / "gza.db",
+        project_id=store.project_id,
+        unit_ids=(inconsistent_unit_id, stale_owner_unit_id),
+        task_ids=task_ids,
+    )
+
+    args = _watch_args(tmp_path, [], max_idle=1)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=AssertionError("conflicted watch should not run")),
+        patch("gza.cli.watch.signal.signal", side_effect=AssertionError("signals should not be installed")),
+    ):
+        rc = cmd_watch(args)
+
+    after = _fetch_watch_lease_repair_snapshot(
+        tmp_path / ".gza" / "gza.db",
+        project_id=store.project_id,
+        unit_ids=(inconsistent_unit_id, stale_owner_unit_id),
+        task_ids=task_ids,
+    )
+    assert rc == 1
+    assert after == before
+
+
+def test_cmd_watch_owned_lease_runs_startup_merge_unit_repairs(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store, inconsistent_unit_id, stale_owner_unit_id, task_ids = _seed_watch_lease_repair_regressions(tmp_path)
+    inconsistent_task_id, first_task_id, second_task_id = task_ids
+    args = _watch_args(tmp_path, [], max_idle=1)
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch._sleep_interruptibly"),
+    ):
+        rc = cmd_watch(args)
+
+    after = _fetch_watch_lease_repair_snapshot(
+        tmp_path / ".gza" / "gza.db",
+        project_id=store.project_id,
+        unit_ids=(inconsistent_unit_id, stale_owner_unit_id),
+        task_ids=task_ids,
+    )
+    inconsistent_unit = after["units"][inconsistent_unit_id]
+    stale_owner_unit = after["units"][stale_owner_unit_id]
+    tasks = after["tasks"]
+    roles = {
+        (str(row["merge_unit_id"]), str(row["task_id"])): row["role"]
+        for row in after["roles"]
+    }
+
+    assert rc == 0
+    assert inconsistent_unit["state"] == "unmerged"
+    assert inconsistent_unit["merged_at"] is None
+    assert inconsistent_unit["merged_by_task_id"] is None
+    assert inconsistent_unit["merge_source"] is None
+    assert tasks[inconsistent_task_id]["merge_status"] == "unmerged"
+    assert tasks[inconsistent_task_id]["merged_at"] is None
+    assert stale_owner_unit["owner_task_id"] == second_task_id
+    assert roles[(stale_owner_unit_id, first_task_id)] == "contributor"
+    assert roles[(stale_owner_unit_id, second_task_id)] == "owner"
+
+
+def test_cmd_watch_live_lease_conflict_does_not_normalize_scoped_legacy_pr_required(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    failed = store.add("Legacy publish failure", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PR_REQUIRED"
+    failed.branch = "feature/live-conflict-legacy-pr-required"
+    failed.has_commits = True
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="other-live-watch",
+        )
+        is not None
+    )
+
+    args = _watch_args(tmp_path, [failed.id], max_idle=1)
+
+    with patch("gza.cli.watch._run_cycle", side_effect=AssertionError("conflicted watch should not run")):
+        rc = cmd_watch(args)
+
+    assert rc == 1
+    refreshed = store.get(failed.id)
+    assert refreshed is not None
+    assert refreshed.failure_reason == "PR_REQUIRED"
+
+
+def test_cmd_watch_live_lease_conflict_does_not_persist_scoped_prerequisite_no_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza.recovery_engine import _MergeContext
+
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    dependency = store.add("Merged dependency", task_type="implement")
+    assert dependency.id is not None
+    dependency.status = "completed"
+    dependency.merge_status = "merged"
+    dependency.completed_at = datetime.now(UTC)
+    store.update(dependency)
+
+    failed = store.add("Historical blocked implementation", task_type="implement", depends_on=dependency.id)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "PREREQUISITE_UNMERGED"
+    failed.branch = "feature/live-conflict-prereq-empty"
+    failed.has_commits = False
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    class _EmptyBranchGit:
+        def resolve_fresh_merge_source(self, branch: str):
+            from gza.git import ResolvedMergeSourceRef
+
+            return ResolvedMergeSourceRef(branch)
+
+        def rev_parse_if_exists(self, ref: str) -> str | None:
+            if ref in {"main", "feature/live-conflict-prereq-empty"}:
+                return "abc123"
+            return None
+
+        def branch_exists(self, branch: str) -> bool:
+            return bool(branch)
+
+        def is_merged(self, branch: str, into: str) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=_EmptyBranchGit(), default_branch="main"),
+    )
+    assert store.resolve_merge_unit_for_task(failed.id) is None
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="other-live-watch",
+        )
+        is not None
+    )
+
+    args = _watch_args(tmp_path, [failed.id], max_idle=1)
+
+    with patch("gza.cli.watch._run_cycle", side_effect=AssertionError("conflicted watch should not run")):
+        rc = cmd_watch(args)
+
+    assert rc == 1
+    assert store.resolve_merge_unit_for_task(failed.id) is None
+
+
+def test_cmd_watch_live_lease_conflict_does_not_persist_scoped_historical_rebase_success(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Failed rebase", task_type="rebase")
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "GIT_ERROR"
+    task.log_file = "logs/live-conflict-rebase-success.log"
+    task.branch = "feature/live-conflict-rebase-success"
+    task.has_commits = True
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+    log_path = tmp_path / task.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text(
+        "Rebase completed successfully on feature/example onto local main\n"
+        "All checks passed!\n"
+    )
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="other-live-watch",
+        )
+        is not None
+    )
+
+    args = _watch_args(tmp_path, [task.id], max_idle=1)
+
+    with patch("gza.cli.watch._run_cycle", side_effect=AssertionError("conflicted watch should not run")):
+        rc = cmd_watch(args)
+
+    assert rc == 1
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "failed"
+    assert refreshed.failure_reason == "GIT_ERROR"
+
+
+def test_cmd_watch_steals_stale_watch_lease_and_releases_on_normal_exit(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=-1,
+            owner_token="dead-watch",
+        )
+        is not None
+    )
+
+    args = _watch_args(tmp_path, [], max_idle=1)
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch._sleep_interruptibly"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_count == 1
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-normal-exit",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_declining_first_start_releases_watch_lease(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+
+    args = _watch_args(tmp_path, [], yes=False, max_idle=None)
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(True, 0, 0)),
+        patch("builtins.input", return_value="n"),
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("gza.cli.watch.sys.stdout.flush"),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-refusal",
+        )
+        is not None
+    )
+
+
+def _release_error() -> WatchLeaseReleaseError:
+    return WatchLeaseReleaseError(
+        results=(),
+        failures=(
+            WatchLeaseReleaseFailure(
+                target_key="test",
+                error=RuntimeError("release exploded"),
+            ),
+        ),
+    )
+
+
+def _assert_release_failure_cleanup(
+    *,
+    tmp_path: Path,
+    rc: int,
+    capsys: pytest.CaptureFixture[str],
+    signal_calls: list[tuple[signal.Signals, object]],
+    original_sigint: object,
+    original_sigterm: object,
+) -> None:
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "failed to release watch-supervisor leases for: test" in captured.err
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "failed to release watch-supervisor leases for: test" in log_text
+    store = make_store(tmp_path)
+    assert store.get_active_watch_session() is None
+    assert signal_calls[-2:] == [
+        (signal.SIGINT, original_sigint),
+        (signal.SIGTERM, original_sigterm),
+    ]
+
+
+def _recording_signal_installer(
+    *,
+    calls: list[tuple[signal.Signals, object]],
+    original_sigint: object,
+    original_sigterm: object,
+):
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        calls.append((sig, handler))
+        if sig == signal.SIGINT and len([call for call in calls if call[0] == signal.SIGINT]) == 1:
+            return original_sigint
+        if sig == signal.SIGTERM and len([call for call in calls if call[0] == signal.SIGTERM]) == 1:
+            return original_sigterm
+        return object()
+
+    return fake_signal
+
+
+def test_cmd_watch_restart_failed_dry_run_release_failure_returns_error_and_cleans_session(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    failed = store.add("Failed implement", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "MAX_TURNS"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    args = _watch_args(
+        tmp_path,
+        [],
+        dry_run=True,
+        restart_failed=True,
+        max_resume_attempts=None,
+        quiet=True,
+    )
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+
+    with (
+        patch(
+            "gza.cli.watch.signal.signal",
+            side_effect=_recording_signal_installer(
+                calls=signal_calls,
+                original_sigint=original_sigint,
+                original_sigterm=original_sigterm,
+            ),
+        ),
+        patch("gza.cli.watch.WatchLeaseSet.release", side_effect=_release_error()),
+    ):
+        rc = cmd_watch(args)
+
+    _assert_release_failure_cleanup(
+        tmp_path=tmp_path,
+        rc=rc,
+        capsys=capsys,
+        signal_calls=signal_calls,
+        original_sigint=original_sigint,
+        original_sigterm=original_sigterm,
+    )
+
+
+def test_cmd_watch_restart_failed_dry_run_git_health_hold_release_failure_returns_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(
+        tmp_path,
+        [],
+        dry_run=True,
+        restart_failed=True,
+        max_resume_attempts=1,
+        quiet=True,
+    )
+    red_check = SimpleNamespace(
+        dispatch_halted=True,
+        state=SimpleNamespace(alert_message="git worktree health RED - dispatch halted"),
+    )
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+
+    with (
+        patch("gza.cli.watch.check_git_health", return_value=red_check),
+        patch("gza.cli.watch._emit_recovery_dry_run_report") as dry_run_report,
+        patch(
+            "gza.cli.watch.signal.signal",
+            side_effect=_recording_signal_installer(
+                calls=signal_calls,
+                original_sigint=original_sigint,
+                original_sigterm=original_sigterm,
+            ),
+        ),
+        patch("gza.cli.watch.WatchLeaseSet.release", side_effect=_release_error()),
+    ):
+        rc = cmd_watch(args)
+
+    dry_run_report.assert_not_called()
+    _assert_release_failure_cleanup(
+        tmp_path=tmp_path,
+        rc=rc,
+        capsys=capsys,
+        signal_calls=signal_calls,
+        original_sigint=original_sigint,
+        original_sigterm=original_sigterm,
+    )
+
+
+def test_cmd_watch_initial_confirmation_refusal_release_failure_returns_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], yes=False, quiet=True)
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+
+    with (
+        patch(
+            "gza.cli.watch._preview_initial_watch_cycle",
+            return_value=(SimpleNamespace(work_done=True), None),
+        ),
+        patch("builtins.input", return_value="n"),
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("gza.cli.watch.sys.stdout.flush"),
+        patch(
+            "gza.cli.watch.signal.signal",
+            side_effect=_recording_signal_installer(
+                calls=signal_calls,
+                original_sigint=original_sigint,
+                original_sigterm=original_sigterm,
+            ),
+        ),
+        patch("gza.cli.watch.WatchLeaseSet.release", side_effect=_release_error()),
+    ):
+        rc = cmd_watch(args)
+
+    _assert_release_failure_cleanup(
+        tmp_path=tmp_path,
+        rc=rc,
+        capsys=capsys,
+        signal_calls=signal_calls,
+        original_sigint=original_sigint,
+        original_sigterm=original_sigterm,
+    )
+
+
+def test_cmd_watch_noninteractive_initial_preview_refusal_release_failure_returns_error(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], yes=False, quiet=True)
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+
+    with (
+        patch(
+            "gza.cli.watch._preview_initial_watch_cycle",
+            return_value=(SimpleNamespace(work_done=True), None),
+        ),
+        patch("builtins.input") as input_mock,
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=False),
+        patch(
+            "gza.cli.watch.signal.signal",
+            side_effect=_recording_signal_installer(
+                calls=signal_calls,
+                original_sigint=original_sigint,
+                original_sigterm=original_sigterm,
+            ),
+        ),
+        patch("gza.cli.watch.WatchLeaseSet.release", side_effect=_release_error()),
+    ):
+        rc = cmd_watch(args)
+
+    input_mock.assert_not_called()
+    _assert_release_failure_cleanup(
+        tmp_path=tmp_path,
+        rc=rc,
+        capsys=capsys,
+        signal_calls=signal_calls,
+        original_sigint=original_sigint,
+        original_sigterm=original_sigterm,
+    )
+
+
+def test_cmd_watch_signal_exit_releases_watch_lease(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=None)
+    handlers: dict[signal.Signals, object] = {}
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        handlers[sig] = handler
+        return object()
+
+    def fake_sleep(_seconds: int, _stop_requested) -> None:
+        handler = handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-signal",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_startup_failure_releases_watch_lease(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [])
+
+    with (
+        patch("gza.cli.watch._task_snapshot", side_effect=RuntimeError("startup failed")),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        with pytest.raises(RuntimeError, match="startup failed"):
+            cmd_watch(args)
+
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-startup-failure",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_first_signal_install_failure_releases_watch_lease(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [])
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=AssertionError("signal setup failure should not run")),
+        patch("gza.cli.watch.signal.signal", side_effect=RuntimeError("sigint install failed")),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 1
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-first-signal-install-failure",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_second_signal_install_failure_rolls_back_sigint_and_releases_watch_lease(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [])
+    original_sigint = object()
+    calls: list[tuple[signal.Signals, object]] = []
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        calls.append((sig, handler))
+        if sig == signal.SIGINT and len(calls) == 1:
+            return original_sigint
+        if sig == signal.SIGTERM:
+            raise RuntimeError("sigterm install failed")
+        return object()
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=AssertionError("signal setup failure should not run")),
+        patch("gza.cli.watch.signal.signal", side_effect=fake_signal),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 1
+    assert calls[0][0] == signal.SIGINT
+    assert calls[1][0] == signal.SIGTERM
+    assert calls[2] == (signal.SIGINT, original_sigint)
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-second-signal-install-failure",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_signal_restore_failure_still_releases_watch_lease(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=1)
+    original_sigint = object()
+    original_sigterm = object()
+    calls: list[tuple[signal.Signals, object]] = []
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        calls.append((sig, handler))
+        if sig == signal.SIGINT and len(calls) == 1:
+            return original_sigint
+        if sig == signal.SIGTERM and len(calls) == 2:
+            return original_sigterm
+        if sig == signal.SIGINT and handler is original_sigint:
+            raise RuntimeError("sigint restore failed")
+        return object()
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)),
+        patch("gza.cli.watch.signal.signal", side_effect=fake_signal),
+        patch("gza.cli.watch._sleep_interruptibly"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 1
+    assert (signal.SIGINT, original_sigint) in calls
+    assert (signal.SIGTERM, original_sigterm) in calls
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-signal-restore-failure",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_session_publication_failure_restores_handlers_and_releases_lease(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=1)
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+
+    with (
+        patch(
+            "gza.cli.watch.signal.signal",
+            side_effect=_recording_signal_installer(
+                calls=signal_calls,
+                original_sigint=original_sigint,
+                original_sigterm=original_sigterm,
+            ),
+        ),
+        patch("gza.cli.watch._record_watch_session", side_effect=RuntimeError("publication exploded")),
+        pytest.raises(RuntimeError, match="publication exploded"),
+    ):
+        cmd_watch(args)
+
+    assert signal_calls[-2:] == [
+        (signal.SIGINT, original_sigint),
+        (signal.SIGTERM, original_sigterm),
+    ]
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-session-publication-failure",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_restore_report_failure_still_clears_session_and_releases_lease(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=1)
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        signal_calls.append((sig, handler))
+        if sig == signal.SIGINT and len(signal_calls) == 1:
+            return original_sigint
+        if sig == signal.SIGTERM and len(signal_calls) == 2:
+            return original_sigterm
+        if sig == signal.SIGINT and handler is original_sigint:
+            raise RuntimeError("sigint restore failed")
+        return object()
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)),
+        patch("gza.cli.watch.signal.signal", side_effect=fake_signal),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch._emit_watch_error", side_effect=OSError("watch log failed")),
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "watch signal handler restore failed: sigint restore failed" in captured.err
+    assert signal_calls[-2:] == [
+        (signal.SIGINT, original_sigint),
+        (signal.SIGTERM, original_sigterm),
+    ]
+    store = make_store(tmp_path)
+    assert store.get_active_watch_session() is None
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-restore-report-failure",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_session_clear_report_failure_still_releases_lease(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=1)
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+
+    def fail_clear_report(self: _WatchLog, level: str, message: str) -> None:
+        if level == "WARN" and "could not clear watch scope" in message:
+            raise OSError("watch log failed")
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)),
+        patch(
+            "gza.cli.watch.signal.signal",
+            side_effect=_recording_signal_installer(
+                calls=signal_calls,
+                original_sigint=original_sigint,
+                original_sigterm=original_sigterm,
+            ),
+        ),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch.object(
+            SqliteTaskStore,
+            "clear_watch_session",
+            side_effect=sqlite3.OperationalError("clear failed"),
+        ) as clear_watch_session,
+        patch("gza.cli.watch._WatchLog.emit", autospec=True, side_effect=fail_clear_report),
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "could not clear watch scope: clear failed" in captured.err
+    assert signal_calls[-2:] == [
+        (signal.SIGINT, original_sigint),
+        (signal.SIGTERM, original_sigterm),
+    ]
+    clear_watch_session.assert_called_once_with(owner_pid=os.getpid())
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-session-clear-report-failure",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_non_sqlite_session_clear_failure_still_restores_and_releases(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=1)
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)),
+        patch(
+            "gza.cli.watch.signal.signal",
+            side_effect=_recording_signal_installer(
+                calls=signal_calls,
+                original_sigint=original_sigint,
+                original_sigterm=original_sigterm,
+            ),
+        ),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch.object(
+            SqliteTaskStore,
+            "clear_watch_session",
+            side_effect=RuntimeError("clear exploded"),
+        ) as clear_watch_session,
+        patch("gza.cli.watch.WatchLeaseSet.release") as release,
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "could not clear watch scope: clear exploded" in captured.err
+    assert signal_calls[-2:] == [
+        (signal.SIGINT, original_sigint),
+        (signal.SIGTERM, original_sigterm),
+    ]
+    clear_watch_session.assert_called_once_with(owner_pid=os.getpid())
+    release.assert_called_once()
+
+
+def test_cmd_watch_session_clear_and_lease_release_failures_both_remain_visible(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=1)
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+
+    with (
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)),
+        patch(
+            "gza.cli.watch.signal.signal",
+            side_effect=_recording_signal_installer(
+                calls=signal_calls,
+                original_sigint=original_sigint,
+                original_sigterm=original_sigterm,
+            ),
+        ),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch.object(
+            SqliteTaskStore,
+            "clear_watch_session",
+            side_effect=RuntimeError("clear exploded"),
+        ) as clear_watch_session,
+        patch("gza.cli.watch.WatchLeaseSet.release", side_effect=_release_error()) as release,
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "could not clear watch scope: clear exploded" in captured.err
+    assert "failed to release watch-supervisor leases for: test" in captured.err
+    assert signal_calls[-2:] == [
+        (signal.SIGINT, original_sigint),
+        (signal.SIGTERM, original_sigterm),
+    ]
+    clear_watch_session.assert_called_once_with(owner_pid=os.getpid())
+    release.assert_called_once()
+
+
+def test_cmd_watch_drift_handoff_argv_failure_releases_watch_lease(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=None)
+
+    def run_cycle_with_drift(**kwargs) -> _CycleResult:
+        drift_state = kwargs["installed_package_drift"]
+        drift_state.pending_restart_fingerprint = "updated"
+        return _CycleResult(False, 0, 0)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=run_cycle_with_drift),
+        patch("gza.cli.watch._task_snapshot", return_value={}),
+        patch("gza.cli.watch._emit_transition_events"),
+        patch("gza.cli.watch._collect_completed_transition_ids", return_value=[]),
+        patch("gza.cli.watch._collect_unhandled_failures", return_value=[]),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch._installed_gza_package_fingerprint", return_value="startup"),
+        patch("gza.cli.watch._watch_reexec_argv", side_effect=RuntimeError("argv failed")),
+        patch("gza.cli.watch.os.execv") as execv,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 1
+    execv.assert_not_called()
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-drift-handoff-failure",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_sigterm_during_drift_handoff_argv_suppresses_exec_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=None)
+    handlers: dict[signal.Signals, object] = {}
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        handlers[sig] = handler
+        return object()
+
+    def run_cycle_with_drift(**kwargs) -> _CycleResult:
+        drift_state = kwargs["installed_package_drift"]
+        drift_state.pending_restart_fingerprint = "updated"
+        return _CycleResult(False, 0, 0)
+
+    def build_argv_with_sigterm(argv_args: argparse.Namespace) -> list[str]:
+        handler = handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+        return _watch_reexec_argv(argv_args)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=run_cycle_with_drift),
+        patch("gza.cli.watch._task_snapshot", return_value={}),
+        patch("gza.cli.watch._emit_transition_events"),
+        patch("gza.cli.watch._collect_completed_transition_ids", return_value=[]),
+        patch("gza.cli.watch._collect_unhandled_failures", return_value=[]),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch._installed_gza_package_fingerprint", return_value="startup"),
+        patch("gza.cli.watch._watch_reexec_argv", side_effect=build_argv_with_sigterm),
+        patch("gza.cli.watch.os.execv") as execv,
+        patch("gza.cli.watch.signal.signal", side_effect=fake_signal),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    execv.assert_not_called()
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "shutting down (workers left running)" in log_text
+    assert "re-execing watch to load updated gza" not in log_text
+    store = make_store(tmp_path)
+    assert store.get_active_watch_session() is None
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-drift-signal",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_scoped_resolution_failure_happens_before_watch_lease_acquire(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, ["missing-task"])
+
+    with (
+        patch("gza.cli.watch._resolve_watch_scope_owner_ids", side_effect=ValueError("bad scope")),
+        patch(
+            "gza.cli.watch.acquire_watch_project_leases",
+            side_effect=AssertionError("lease should not be acquired after scoped resolution failure"),
+        ) as acquire_leases,
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 1
+    acquire_leases.assert_not_called()
+
+
 def test_cmd_watch_cli_batch_derives_runtime_cap_when_max_concurrent_unset(tmp_path: Path) -> None:
     setup_config(tmp_path)
     _append_watch_config(tmp_path, "watch:\n  batch: 1\n")
@@ -40849,33 +42057,89 @@ def test_cmd_watch_reexecs_on_drift_after_cycle_boundary(tmp_path: Path) -> None
     assert excinfo.value.code == 0
     assert run_cycle.call_count == 1
     execv.assert_called_once()
-    assert execv.call_args.args == (
+    executable, argv = execv.call_args.args
+    assert executable == sys.executable
+    assert argv[:25] == [
         sys.executable,
-        [
-            sys.executable,
-            "-m",
-            "gza",
-            "watch",
-            "--project",
-            str(tmp_path),
-            "--batch",
-            "2",
-            "--poll",
-            "5",
-            "--max-iterations",
-            "10",
-            "--recovery-only",
-            "--recovery-slots",
-            "1",
-            "--max-resume-attempts",
-            "2",
-            "--quiet",
-            "--yes",
-            "--resumed-reexec",
-            "--tag",
-            "release",
-        ],
+        "-m",
+        "gza",
+        "watch",
+        "--project",
+        str(tmp_path),
+        "--batch",
+        "2",
+        "--poll",
+        "5",
+        "--max-iterations",
+        "10",
+        "--recovery-only",
+        "--recovery-slots",
+        "1",
+        "--max-resume-attempts",
+        "2",
+        "--quiet",
+        "--yes",
+        "--resumed-reexec",
+        "--watch-lease-token",
+        args.watch_lease_token,
+        "--tag",
+        "release",
+    ]
+    assert isinstance(args.watch_lease_token, str) and args.watch_lease_token
+
+
+def test_cmd_watch_drift_handoff_keeps_lease_and_session_owned_until_execv(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    args = _watch_args(
+        tmp_path,
+        [],
+        batch=2,
+        poll=5,
+        max_idle=None,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        auto_restart_on_drift=True,
     )
+
+    def run_cycle_with_drift(**kwargs) -> _CycleResult:
+        drift_state = kwargs["installed_package_drift"]
+        drift_state.pending_restart_fingerprint = "updated"
+        return _CycleResult(False, 1, 1)
+
+    def fake_execv(_executable: str, _argv: list[str]) -> None:
+        assert args.watch_lease_token is not None
+        active_session = store.get_active_watch_session()
+        assert active_session is not None
+        assert active_session.owner_pid == os.getpid()
+        assert (
+            store.try_acquire_project_lease(
+                lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+                owner_pid=os.getpid(),
+                owner_token="competing-watch",
+            )
+            is None
+        )
+        raise SystemExit(0)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=run_cycle_with_drift),
+        patch("gza.cli.watch._task_snapshot", return_value={}),
+        patch("gza.cli.watch._emit_transition_events"),
+        patch("gza.cli.watch._collect_completed_transition_ids", return_value=[]),
+        patch("gza.cli.watch._collect_unhandled_failures", return_value=[]),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch._installed_gza_package_fingerprint", return_value="startup"),
+        patch("gza.cli.watch.os.execv", side_effect=fake_execv) as execv,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        with pytest.raises(SystemExit) as excinfo:
+            cmd_watch(args)
+
+    assert excinfo.value.code == 0
+    execv.assert_called_once()
 
 
 def test_cmd_watch_scoped_reexec_preserves_task_ids(tmp_path: Path) -> None:
@@ -40930,32 +42194,33 @@ def test_cmd_watch_scoped_reexec_preserves_task_ids(tmp_path: Path) -> None:
     assert excinfo.value.code == 0
     assert run_cycle.call_count == 1
     execv.assert_called_once()
-    assert execv.call_args.args == (
+    executable, argv = execv.call_args.args
+    assert executable == sys.executable
+    assert argv[:21] == [
         sys.executable,
-        [
-            sys.executable,
-            "-m",
-            "gza",
-            "watch",
-            "--project",
-            str(tmp_path),
-            "--batch",
-            "2",
-            "--poll",
-            "5",
-            "--max-iterations",
-            "10",
-            "--recovery-slots",
-            "1",
-            "--max-resume-attempts",
-            "2",
-            "--quiet",
-            "--yes",
-            "--resumed-reexec",
-            first.id,
-            second.id,
-        ],
-    )
+        "-m",
+        "gza",
+        "watch",
+        "--project",
+        str(tmp_path),
+        "--batch",
+        "2",
+        "--poll",
+        "5",
+        "--max-iterations",
+        "10",
+        "--recovery-slots",
+        "1",
+        "--max-resume-attempts",
+        "2",
+        "--quiet",
+        "--yes",
+        "--resumed-reexec",
+        "--watch-lease-token",
+        args.watch_lease_token,
+    ]
+    assert argv[-2:] == [first.id, second.id]
+    assert isinstance(args.watch_lease_token, str) and args.watch_lease_token
 
 
 def test_watch_restart_failed_skips_historical_prerequisite_unmerged_row_after_empty_reconciliation(

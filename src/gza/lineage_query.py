@@ -1432,6 +1432,7 @@ def query_lineage_owner_rows_in_read_session(
     persist_post_merge_rebase_state: bool = True,
     persist_review_clearance: bool = True,
     reuse_recovery_merge_context: bool = False,
+    apply_deferred_recovery_reconciliations: bool = True,
 ) -> tuple[tuple[LineageOwnerRow, ...], RecoveryReadContext]:
     from .recovery_engine import apply_pending_recovery_reconciliations
 
@@ -1446,7 +1447,8 @@ def query_lineage_owner_rows_in_read_session(
             persist_review_clearance=False,
             reuse_recovery_merge_context=reuse_recovery_merge_context,
         )
-    apply_pending_recovery_reconciliations(store, read_context=read_context)
+    if apply_deferred_recovery_reconciliations:
+        apply_pending_recovery_reconciliations(store, read_context=read_context)
     return rows, read_context
 
 
