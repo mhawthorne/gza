@@ -10,7 +10,11 @@ from gza.branch_publication import BranchPublicationState, persist_branch_public
 from gza.config import Config, ConfigError
 from gza.db import MergeTargetResolutionError, SqliteTaskStore, Task
 from gza.git import Git, GitError
-from gza.lineage_query import LineageOwnerQuery, _load_indexes, query_lineage_owner_rows, query_lineage_owner_rows_in_read_session
+from gza.lineage_query import (
+    LineageOwnerQuery,
+    _load_indexes,
+    query_lineage_owner_rows_in_read_session,
+)
 from gza.operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL, MOOT_REDUNDANT_LIFECYCLE_DETAIL
 from gza.recovery_engine import (
     FailedRecoveryDecision,

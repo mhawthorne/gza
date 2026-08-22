@@ -24,8 +24,8 @@ from gza.artifacts import store_command_output_artifact
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.cli._common import (
     PLAN_REVIEW_MATERIALIZATION_AUTO_REPAIR_DROP_REASON,
-    _create_retry_task,
     _create_rebase_task,
+    _create_retry_task,
     _materialize_plan_review_slices,
     _repair_plan_review_slice_materialization,
     resolve_improve_action,
@@ -52,6 +52,7 @@ from gza.flaky_investigations import (
     build_flaky_reproduction_plan,
     normalize_flaky_investigation_dedup_key,
 )
+from gza.git import Git, GitError, ResolvedMergeSourceRef
 from gza.log_paths import ops_log_path_for
 from gza.off_topic_verify import FailingNode, PytestPassFailCounts, PytestXdistMetadata
 from gza.pickup import count_worker_consuming_actions, is_worker_consuming_advance_action
@@ -64,19 +65,18 @@ from gza.plan_review_materialization import (
 from gza.plan_review_verdict import validate_plan_review_manifest
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.review_tasks import OffTopicVerifyPersistenceError, build_verify_fix_prompt, create_or_reuse_verify_fix_task
+from gza.review_verdict import ReviewFinding
 from gza.review_verify_state import (
+    VERIFY_GATE_ARTIFACT_KIND,
     VerifyEpoch,
     VerifyGateResult,
-    VERIFY_GATE_ARTIFACT_KIND,
     latest_verify_result_for_epoch,
     owner_task_verify_epoch,
     persist_recredited_verify_gate_artifact,
     persist_verify_gate_artifact,
 )
-from gza.review_verdict import ReviewFinding
 from gza.runner import CROSS_PROJECT_TAG, _make_review_verify_result
 from gza.verify_fix_outcome import effective_verify_fix_completion_outcome
-from gza.git import Git, GitError, ResolvedMergeSourceRef
 
 from .conftest import make_store, setup_config
 

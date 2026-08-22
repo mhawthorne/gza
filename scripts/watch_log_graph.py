@@ -44,8 +44,7 @@ import math
 import re
 import sys
 import time
-from datetime import date as date_cls
-from datetime import datetime, timedelta
+from datetime import date as date_cls, datetime, timedelta
 from pathlib import Path
 
 # Make sibling scripts/ modules (e.g. palette) importable whether this file is run

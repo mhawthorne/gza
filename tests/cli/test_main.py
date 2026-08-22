@@ -15,8 +15,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from gza.config import Config
 from gza.cli._common import get_store
+from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,

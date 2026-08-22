@@ -646,7 +646,7 @@ def test_advance_dry_run_mixed_owner_recovery_row_shows_recovery_leaf_and_lifecy
     assert "Recovery subset (shared preview):" in captured.out
     assert failed_review.id in captured.out
     assert "Resume failed task (MAX_TURNS)" in captured.out
-    assert f"Would advance 1 task(s):" in captured.out
+    assert "Would advance 1 task(s):" in captured.out
     assert plan.id in captured.out
     assert "Create and start plan review task" in captured.out
 

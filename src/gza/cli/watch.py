@@ -6,9 +6,9 @@ import hashlib
 import io
 import json
 import os
-import sqlite3
 import re
 import signal
+import sqlite3
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence

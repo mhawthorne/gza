@@ -10,9 +10,9 @@ from markdown_it import MarkdownIt
 from markupsafe import Markup
 
 from gza.db import MergeUnit, SqliteTaskStore, Task, task_updated_at
+from gza.runner import get_task_output
 
 from .merge_unit_detail import merge_unit_url
-from gza.runner import get_task_output
 
 _MARKDOWN = MarkdownIt("commonmark", {"html": False})
 

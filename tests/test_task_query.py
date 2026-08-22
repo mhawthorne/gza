@@ -16,12 +16,12 @@ import gza.task_query as task_query
 from gza.cli._queue_render import partition_queue_rows
 from gza.cli.advance_engine import determine_next_action
 from gza.config import Config
-from gza.git import GitError
-from gza.main_integration_verify import MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
-from gza.review_verify_state import persist_verify_gate_artifact
 from gza.db import SqliteTaskStore
+from gza.git import GitError
 from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows, query_lineage_owner_rows_in_read_session
+from gza.main_integration_verify import MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
 from gza.query import TaskLineageNode
+from gza.review_verify_state import persist_verify_gate_artifact
 from gza.task_query import (
     DateFilter,
     PresentationSpec,

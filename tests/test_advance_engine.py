@@ -25,8 +25,8 @@ from gza.advance_engine import (
     WORKER_CONSUMING_ACTIONS,
     _count_consecutive_plan_review_cycles,
     _empty_merge_state_description,
-    _resolve_owning_implementation_task,
     _resolve_and_persist_post_merge_rebase_state,
+    _resolve_owning_implementation_task,
     classify_advance_action,
     evaluate_advance_rules,
     failed_recovery_decision_to_action,
@@ -50,8 +50,7 @@ from gza.plan_review_materialization import (
     build_plan_review_slice_task_specs,
     plan_review_manifest_digest,
 )
-from gza.query import get_reviews_for_root
-from gza.query import get_implementation_review_evidence
+from gza.query import get_implementation_review_evidence, get_reviews_for_root
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
 from gza.recovery_engine import FailedRecoveryDecision, decide_failed_task_recovery
 from gza.review_scope import (

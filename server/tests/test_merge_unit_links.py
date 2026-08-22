@@ -6,9 +6,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 from gza_server.app import create_app
 from gza_server.task_list import (
-    TaskListFilters,
     _resolve_merge_units,
-    query_task_list,
 )
 
 from gza.db import SqliteTaskStore, Task

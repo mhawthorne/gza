@@ -66,9 +66,7 @@ SIMILAR_MODE = "similar"
 
 
 def _rgb_to_hex(red: float, green: float, blue: float) -> str:
-    return "#{:02x}{:02x}{:02x}".format(
-        int(round(red * 255)), int(round(green * 255)), int(round(blue * 255))
-    )
+    return f"#{int(round(red * 255)):02x}{int(round(green * 255)):02x}{int(round(blue * 255)):02x}"
 
 
 def _distinct(count: int) -> list[str]:
@@ -148,8 +146,9 @@ def style(fig=None, ax=None) -> None:
 def _preview(out_path: str) -> None:
     import matplotlib
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
     from pathlib import Path
+
+    import matplotlib.pyplot as plt
 
     apply()
     fig, ax = plt.subplots(figsize=(9, 5))

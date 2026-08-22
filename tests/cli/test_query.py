@@ -38,8 +38,8 @@ from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerRow
 from gza.pr_ops import LookupTaskPrResult
 from gza.rebase_diff import parse_rebase_diff_provenance
-from gza.review_scope import parse_resolution_review_scope
 from gza.recovery_read_context import RecoveryReadContext
+from gza.review_scope import parse_resolution_review_scope
 from gza.review_tasks import build_verify_fix_prompt
 from gza.review_verdict import ParsedReviewReport
 from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact

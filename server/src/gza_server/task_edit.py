@@ -8,7 +8,6 @@ from typing import Any
 from gza.db import (
     SqliteTaskStore,
     Task,
-    TaskPromptEditConflict as TaskEditConflict,
     edit_task_prompt as _edit_task_prompt,
 )
 from gza.report_sync import synchronize_task_report

@@ -1,7 +1,7 @@
 """Tests for branch-scoped sync operations."""
 
-from datetime import UTC, datetime, timedelta
 from contextlib import nullcontext
+from datetime import UTC, datetime, timedelta
 from unittest.mock import Mock, patch
 
 import pytest

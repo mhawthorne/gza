@@ -5,8 +5,8 @@ from unittest.mock import patch
 
 import pytest
 
-from gza.config import Config
 from gza.cli.git_ops import _collect_advance_completed_tasks
+from gza.config import Config
 from gza.review_verify_state import persist_verify_gate_artifact
 from tests.cli.conftest import make_store, setup_config
 from tests.helpers.cli import invoke_gza

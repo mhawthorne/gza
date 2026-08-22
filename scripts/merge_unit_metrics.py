@@ -18,9 +18,8 @@ import argparse
 import json
 import os
 import sqlite3
-import statistics
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 DEFAULT_DB = Path.home() / "work" / "supreme" / "gza" / ".gza" / "gza.db"
@@ -47,7 +46,7 @@ def parse_ts(raw: str | None) -> datetime | None:
         parsed = datetime.fromisoformat(text)
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def load_rows(db: Path, project_id: str | None, since: str | None, unit_ids: list[str]) -> list[dict]:
@@ -279,7 +278,7 @@ def main() -> int:
         return 1
     since = args.since
     if since is None and not args.unit:
-        since = (datetime.now(timezone.utc) - timedelta(days=args.days)).strftime("%Y-%m-%d %H:%M:%S")
+        since = (datetime.now(UTC) - timedelta(days=args.days)).strftime("%Y-%m-%d %H:%M:%S")
 
     rows = load_rows(args.db, args.project_id, since, args.unit)
     grouped: dict[str, list[dict]] = defaultdict(list)

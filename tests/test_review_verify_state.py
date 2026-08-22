@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from gza.config import Config
 from gza.db import SqliteTaskStore
+from gza.git import GitError
 from gza.review_verify_state import (
     VERIFY_GATE_ARTIFACT_KIND,
     build_verify_gate_artifact_payload,
@@ -22,7 +23,6 @@ from gza.review_verify_state import (
     verify_epoch_matches,
     verify_result_is_timeout_origin,
 )
-from gza.git import GitError
 
 
 def _config(tmp_path: Path) -> Config:

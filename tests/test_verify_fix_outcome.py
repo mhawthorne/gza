@@ -9,8 +9,8 @@ from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.verify_fix_outcome import (
     effective_verify_fix_completion_outcome,
-    inspect_verify_fix_completion_outcome,
     inspect_legacy_review_scope_completion_outcome,
+    inspect_verify_fix_completion_outcome,
     persist_verify_fix_completion_outcome,
 )
 

@@ -4,19 +4,19 @@ import pytest
 
 from gza.db import SqliteTaskStore
 from gza.review_scope import (
-    build_spec_coherence_review_scope,
     build_resolution_review_scope,
-    declares_spec_coherence_review_mode,
+    build_spec_coherence_review_scope,
     declares_resolution_review_mode,
+    declares_spec_coherence_review_mode,
     extract_resolution_review_scope_identity,
     extract_resolution_review_scope_rebuild_fields,
     extract_review_scope_from_prompt,
     get_latest_review_scope_comment_for_impl,
     normalize_review_scope_identity_text,
-    parse_spec_coherence_review_scope,
     parse_plan_review_slice_provenance,
     parse_plan_review_slice_provenance_result,
     parse_resolution_review_scope,
+    parse_spec_coherence_review_scope,
     resolve_implement_slice_identity,
     resolve_review_scope_for_impl,
 )

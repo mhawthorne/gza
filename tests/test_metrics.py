@@ -8,7 +8,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
 from pytest import approx
 
 
@@ -111,7 +110,7 @@ def test_instrument_public_methods_preserves_metadata_and_descriptors(monkeypatc
             return self.value
 
         @classmethod
-        def build(cls, value: int) -> "DummyStore":
+        def build(cls, value: int) -> DummyStore:
             return cls(value)
 
         @staticmethod

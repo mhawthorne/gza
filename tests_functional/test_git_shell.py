@@ -25,8 +25,14 @@ from gza.log_paths import ops_log_path_for
 from gza.recovery_engine import FailedRecoveryDecision
 from gza.review_verdict import ParsedReviewReport
 from gza.review_verify_state import persist_verify_gate_artifact
-from gza.runner import WIP_DIR, _complete_code_task, _restore_wip_changes, _save_wip_changes, _squash_wip_commits
-from gza.runner import _make_review_verify_result
+from gza.runner import (
+    WIP_DIR,
+    _complete_code_task,
+    _make_review_verify_result,
+    _restore_wip_changes,
+    _save_wip_changes,
+    _squash_wip_commits,
+)
 from tests.cli.conftest import make_store, setup_config
 from tests.test_advance_engine import _make_store
 from tests.test_db import _make_v24_db

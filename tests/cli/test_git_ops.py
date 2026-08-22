@@ -47,8 +47,8 @@ from gza.main_integration_verify import (
 )
 from gza.rebase_checkout import StaleRebaseImportError
 from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult, parse_rebase_diff_provenance
-from gza.review_verify_state import persist_verify_gate_artifact
 from gza.review_verdict import ReviewFinding
+from gza.review_verify_state import persist_verify_gate_artifact
 from gza.worktree_roots import managed_worktree_root_paths
 
 from .conftest import invoke_gza, make_store, setup_config

@@ -1,8 +1,8 @@
 """CLI coverage for explicit project registry repair commands."""
 
-import sqlite3
-import shutil
 import shlex
+import shutil
+import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,10 +11,9 @@ from unittest.mock import patch
 
 import pytest
 
-from gza.config import Config
-from gza.db import SCHEMA_VERSION, SchemaIntegrityError, SqliteTaskStore
-from gza.db import _QUERY_ONLY_REQUIRED_TASK_COLUMNS
 from gza.cli import config_cmds
+from gza.config import Config
+from gza.db import _QUERY_ONLY_REQUIRED_TASK_COLUMNS, SCHEMA_VERSION, SchemaIntegrityError, SqliteTaskStore
 
 from .conftest import invoke_gza
 

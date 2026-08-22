@@ -11798,7 +11798,6 @@ class TestIterateCommand:
     ):
         from gza.review_tasks import create_or_reuse_verify_fix_task
         from gza.review_verify_state import VerifyEpoch
-        from gza.runner import _make_review_verify_result
 
         config = Config.load(tmp_path)
         config.verify_command = "./bin/tests"
