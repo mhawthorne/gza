@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import cast
 
 from markdown_it import MarkdownIt
@@ -38,6 +39,7 @@ class TaskDetail:
     parents: tuple[LineageLink, ...]
     children: tuple[LineageLink, ...]
     output_content: str | None
+    project_root: Path | None = None
     merge_unit: MergeUnit | None = None
 
     @property
@@ -64,6 +66,7 @@ class TaskDetail:
         record["merge_unit_id"] = None if self.merge_unit is None else self.merge_unit.id
         record["merge_unit_state"] = None if self.merge_unit is None else self.merge_unit.state
         record["merge_unit_url"] = self.merge_unit_url
+        record["log_url"] = f"{self.detail_url}/log"
         return record
 
     @property
@@ -158,6 +161,7 @@ def query_task_detail(
         parents=tuple(parents),
         children=tuple(children),
         output_content=output_content,
+        project_root=project_store.project_root,
         merge_unit=project_store.resolve_merge_unit_for_task(task_id),
     )
 

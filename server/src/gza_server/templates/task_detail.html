@@ -14,6 +14,14 @@
     </div>
     <div><dt>Branch</dt><dd>{{ task.branch or "—" }}</dd></div>
     <div>
+      <dt>Log</dt>
+      <dd>
+        <a href="{{ detail.detail_url }}/log">conversation</a>
+        ·
+        <a href="{{ detail.detail_url }}/log?stream=ops">ops</a>
+      </dd>
+    </div>
+    <div>
       <dt>Merge unit</dt>
       <dd>
         {% if detail.merge_unit_url %}
