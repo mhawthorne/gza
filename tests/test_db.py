@@ -285,6 +285,121 @@ def test_project_lease_can_be_released_and_reacquired(tmp_path: Path) -> None:
     assert reacquired is not None
 
 
+def _project_lease_row(store: SqliteTaskStore, lease_name: str) -> sqlite3.Row | None:
+    with store._connect() as conn:  # noqa: SLF001 - targeted lease state assertion
+        return conn.execute(
+            """
+            SELECT owner_pid, owner_token, acquired_at
+            FROM project_leases
+            WHERE project_id = ?
+              AND lease_name = ?
+            """,
+            (store.project_id, lease_name),
+        ).fetchone()
+
+
+def test_live_project_lease_same_pid_same_token_renews(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    first_acquired_at = datetime(2026, 1, 1, tzinfo=UTC)
+    renewed_at = datetime(2026, 1, 2, tzinfo=UTC)
+
+    first = store.try_acquire_project_lease(
+        lease_name="watch-supervisor",
+        owner_pid=os.getpid(),
+        owner_token="run-token",
+        acquired_at=first_acquired_at,
+    )
+    renewed = store.try_acquire_project_lease(
+        lease_name="watch-supervisor",
+        owner_pid=os.getpid(),
+        owner_token="run-token",
+        acquired_at=renewed_at,
+    )
+
+    assert first is not None
+    assert renewed is not None
+    assert renewed.owner_pid == os.getpid()
+    assert renewed.owner_token == "run-token"
+    assert renewed.acquired_at == renewed_at
+
+
+def test_live_project_lease_same_token_different_pid_conflicts_without_mutating(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    first_acquired_at = datetime(2026, 1, 1, tzinfo=UTC)
+    attempted_at = datetime(2026, 1, 2, tzinfo=UTC)
+    first = store.try_acquire_project_lease(
+        lease_name="watch-supervisor",
+        owner_pid=os.getpid(),
+        owner_token="run-token",
+        acquired_at=first_acquired_at,
+    )
+    before = _project_lease_row(store, "watch-supervisor")
+
+    attempted = store.try_acquire_project_lease(
+        lease_name="watch-supervisor",
+        owner_pid=-1,
+        owner_token="run-token",
+        acquired_at=attempted_at,
+    )
+    after = _project_lease_row(store, "watch-supervisor")
+
+    assert first is not None
+    assert before is not None
+    assert attempted is None
+    assert after is not None
+    assert dict(after) == dict(before)
+
+
+def test_stale_project_lease_takeover_with_fresh_token_succeeds(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+
+    stale = store.try_acquire_project_lease(
+        lease_name="watch-supervisor",
+        owner_pid=-1,
+        owner_token="stale-token",
+    )
+    acquired = store.try_acquire_project_lease(
+        lease_name="watch-supervisor",
+        owner_pid=os.getpid(),
+        owner_token="fresh-token",
+    )
+
+    assert stale is not None
+    assert acquired is not None
+    assert acquired.owner_pid == os.getpid()
+    assert acquired.owner_token == "fresh-token"
+
+
+def test_live_project_lease_same_pid_different_token_conflicts_and_release_is_token_guarded(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    first = store.try_acquire_project_lease(
+        lease_name="watch-supervisor",
+        owner_pid=os.getpid(),
+        owner_token="first-token",
+    )
+
+    conflict = store.try_acquire_project_lease(
+        lease_name="watch-supervisor",
+        owner_pid=os.getpid(),
+        owner_token="second-token",
+    )
+
+    assert first is not None
+    assert conflict is None
+    assert store.release_project_lease(lease_name="watch-supervisor", owner_token="second-token") is False
+    assert (
+        store.try_acquire_project_lease(
+            lease_name="watch-supervisor",
+            owner_pid=os.getpid(),
+            owner_token="second-token",
+        )
+        is None
+    )
+    assert store.release_project_lease(lease_name="watch-supervisor", owner_token="first-token") is True
+
+
 def test_set_task_changed_diff_persists_and_rebase_wrapper_still_works(tmp_path: Path) -> None:
     db_path = tmp_path / "test.db"
     store = SqliteTaskStore(db_path)

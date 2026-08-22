@@ -1,0 +1,183 @@
+"""Watch-supervisor project lease helpers."""
+
+import os
+import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Protocol
+
+from gza.db import ProjectLease
+
+WATCH_SUPERVISOR_LEASE_NAME = "watch-supervisor"
+
+
+class WatchLeaseStore(Protocol):
+    @property
+    def project_id(self) -> str:
+        """Return the project identity for diagnostics."""
+
+    def try_acquire_project_lease(
+        self,
+        *,
+        lease_name: str,
+        owner_pid: int,
+        owner_token: str,
+        acquired_at: datetime | None = None,
+    ) -> ProjectLease | None:
+        """Acquire a project lease, returning None on conflict."""
+
+    def release_project_lease(
+        self,
+        *,
+        lease_name: str,
+        owner_token: str,
+    ) -> bool:
+        """Release a project lease when the owner token still matches."""
+
+
+@dataclass(frozen=True)
+class WatchLeaseTarget:
+    """One project store selected for watch-supervisor leasing."""
+
+    key: str
+    store: WatchLeaseStore
+
+
+@dataclass(frozen=True)
+class WatchLeaseHeld:
+    """One acquired watch-supervisor lease."""
+
+    target: WatchLeaseTarget
+    lease: ProjectLease
+
+
+@dataclass(frozen=True)
+class WatchLeaseRelease:
+    """Release result for one acquired lease."""
+
+    target_key: str
+    released: bool
+
+
+class WatchLeaseConflict(RuntimeError):
+    """Raised when another live owner holds a selected watch-supervisor lease."""
+
+    def __init__(self, target: WatchLeaseTarget) -> None:
+        self.target_key = target.key
+        self.project_id = target.store.project_id
+        super().__init__(
+            f"watch-supervisor lease for project {self.project_id!r} "
+            f"({self.target_key}) is held by another live owner"
+        )
+
+
+@dataclass(frozen=True)
+class WatchLeaseReleaseFailure:
+    """Release failure for one acquired lease."""
+
+    target_key: str
+    error: Exception
+
+
+class WatchLeaseReleaseError(RuntimeError):
+    """Raised after best-effort watch-supervisor lease release encounters failures."""
+
+    def __init__(
+        self,
+        *,
+        results: tuple[WatchLeaseRelease, ...],
+        failures: tuple[WatchLeaseReleaseFailure, ...],
+    ) -> None:
+        self.results = results
+        self.failures = failures
+        failed_keys = ", ".join(failure.target_key for failure in failures)
+        super().__init__(f"failed to release watch-supervisor leases for: {failed_keys}")
+
+
+@dataclass(frozen=True)
+class WatchLeaseSet:
+    """A deterministic set of acquired watch-supervisor leases."""
+
+    owner_pid: int
+    owner_token: str
+    held: tuple[WatchLeaseHeld, ...]
+
+    def release(self) -> tuple[WatchLeaseRelease, ...]:
+        """Release owned leases in reverse acquisition order."""
+        return _release_held_best_effort(self.held, owner_token=self.owner_token)
+
+
+def generate_watch_lease_owner_token() -> str:
+    """Generate the stable run token used to own watch-supervisor leases."""
+    return uuid.uuid4().hex
+
+
+def _release_held_best_effort(
+    held: Sequence[WatchLeaseHeld],
+    *,
+    owner_token: str,
+) -> tuple[WatchLeaseRelease, ...]:
+    released: list[WatchLeaseRelease] = []
+    failures: list[WatchLeaseReleaseFailure] = []
+    for acquired in reversed(held):
+        try:
+            release_result = acquired.target.store.release_project_lease(
+                lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+                owner_token=owner_token,
+            )
+        except Exception as exc:
+            release_result = False
+            failures.append(WatchLeaseReleaseFailure(target_key=acquired.target.key, error=exc))
+        released.append(WatchLeaseRelease(target_key=acquired.target.key, released=release_result))
+    results = tuple(released)
+    if failures:
+        raise WatchLeaseReleaseError(results=results, failures=tuple(failures))
+    return results
+
+
+def _raise_with_cleanup_context(primary: Exception, cleanup_error: WatchLeaseReleaseError) -> None:
+    raise ExceptionGroup(
+        "watch-supervisor lease acquisition failed and rollback also failed",
+        [primary, cleanup_error],
+    )
+
+
+def acquire_watch_project_leases(
+    targets: Sequence[WatchLeaseTarget],
+    *,
+    owner_token: str | None = None,
+    owner_pid: int | None = None,
+    acquired_at: datetime | None = None,
+) -> WatchLeaseSet:
+    """Acquire all selected project leases, rolling back earlier leases on conflict."""
+    resolved_owner_token = owner_token or generate_watch_lease_owner_token()
+    resolved_owner_pid = owner_pid if owner_pid is not None else os.getpid()
+    held: list[WatchLeaseHeld] = []
+    for target in targets:
+        try:
+            lease = target.store.try_acquire_project_lease(
+                lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+                owner_pid=resolved_owner_pid,
+                owner_token=resolved_owner_token,
+                acquired_at=acquired_at,
+            )
+        except Exception as exc:
+            try:
+                _release_held_best_effort(held, owner_token=resolved_owner_token)
+            except WatchLeaseReleaseError as cleanup_error:
+                _raise_with_cleanup_context(exc, cleanup_error)
+            raise
+        if lease is None:
+            conflict = WatchLeaseConflict(target)
+            try:
+                _release_held_best_effort(held, owner_token=resolved_owner_token)
+            except WatchLeaseReleaseError as cleanup_error:
+                _raise_with_cleanup_context(conflict, cleanup_error)
+            raise conflict
+        held.append(WatchLeaseHeld(target=target, lease=lease))
+    return WatchLeaseSet(
+        owner_pid=resolved_owner_pid,
+        owner_token=resolved_owner_token,
+        held=tuple(held),
+    )

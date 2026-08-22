@@ -9506,7 +9506,7 @@ class SqliteTaskStore:
         owner_token: str,
         acquired_at: datetime | None = None,
     ) -> ProjectLease | None:
-        """Acquire a project-scoped lease, stealing only from dead owners."""
+        """Acquire a project-scoped lease, renewing same-token owners or stealing dead owners."""
         if not self.supports_project_leases():
             raise RuntimeError("project leases are not available on this database")
         acquired_at_text = _format_db_timestamp(acquired_at or datetime.now(UTC))
@@ -9524,8 +9524,12 @@ class SqliteTaskStore:
                 (self._project_id, lease_name),
             ).fetchone()
             if existing is not None and _pid_is_alive(int(existing["owner_pid"])):
-                conn.rollback()
-                return None
+                same_owner = (
+                    int(existing["owner_pid"]) == owner_pid and str(existing["owner_token"]) == owner_token
+                )
+                if not same_owner:
+                    conn.rollback()
+                    return None
             if existing is None:
                 conn.execute(
                     """
