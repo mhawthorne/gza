@@ -12165,7 +12165,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         result_code = 0
                     else:
                         for message in _watch_exception_messages("watch re-exec failed", exc):
-                            _emit_watch_error(log, quiet, message)
+                            cleanup_errors.extend(_emit_watch_error_safely(log, quiet, message))
                         result_code = 1
             else:
                 result_code = 0

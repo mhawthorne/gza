@@ -43842,6 +43842,93 @@ def test_cmd_watch_drift_handoff_argv_failure_releases_watch_lease(tmp_path: Pat
     )
 
 
+@pytest.mark.parametrize(
+    ("failure_mode", "primary_message"),
+    [
+        ("argv", "watch re-exec failed: argv failed"),
+        ("execv", "watch re-exec failed: execv failed"),
+    ],
+)
+def test_cmd_watch_drift_handoff_failure_falls_back_when_watch_log_fails(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    failure_mode: str,
+    primary_message: str,
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=None, quiet=True)
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+
+    def run_cycle_with_drift(**kwargs) -> _CycleResult:
+        drift_state = kwargs["installed_package_drift"]
+        drift_state.pending_restart_fingerprint = "updated"
+        return _CycleResult(False, 0, 0)
+
+    real_emit = _WatchLog.emit
+
+    def fail_reexec_error_emit(self: _WatchLog, event: str, message: str) -> None:
+        if event == "ERROR" and message.startswith("watch re-exec failed:"):
+            raise OSError("watch log failed")
+        real_emit(self, event, message)
+
+    reexec_argv_patch = (
+        patch("gza.cli.watch._watch_reexec_argv", side_effect=RuntimeError("argv failed"))
+        if failure_mode == "argv"
+        else contextlib.nullcontext()
+    )
+    execv_patch = (
+        patch("gza.cli.watch.os.execv")
+        if failure_mode == "argv"
+        else patch("gza.cli.watch.os.execv", side_effect=OSError("execv failed"))
+    )
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=run_cycle_with_drift),
+        patch("gza.cli.watch._task_snapshot", return_value={}),
+        patch("gza.cli.watch._emit_transition_events"),
+        patch("gza.cli.watch._collect_completed_transition_ids", return_value=[]),
+        patch("gza.cli.watch._collect_unhandled_failures", return_value=[]),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch._installed_gza_package_fingerprint", return_value="startup"),
+        patch("gza.cli.watch._WatchLog.emit", autospec=True, side_effect=fail_reexec_error_emit),
+        patch(
+            "gza.cli.watch.signal.signal",
+            side_effect=_recording_signal_installer(
+                calls=signal_calls,
+                original_sigint=original_sigint,
+                original_sigterm=original_sigterm,
+            ),
+        ),
+        reexec_argv_patch,
+        execv_patch as execv,
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert primary_message in captured.err
+    assert signal_calls[-2:] == [
+        (signal.SIGINT, original_sigint),
+        (signal.SIGTERM, original_sigterm),
+    ]
+    store = make_store(tmp_path)
+    assert store.get_active_watch_session() is None
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token=f"after-{failure_mode}-reexec-report-fallback",
+        )
+        is not None
+    )
+    if failure_mode == "argv":
+        execv.assert_not_called()
+    else:
+        execv.assert_called_once()
+
+
 def test_cmd_watch_sigterm_during_drift_handoff_argv_suppresses_exec_and_cleans_up(
     tmp_path: Path,
 ) -> None:
