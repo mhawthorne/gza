@@ -7266,7 +7266,7 @@ def _scoped_failed_selector_has_actionable_owner_row(
         config=config,
         git=git,
         target_branch=target_branch,
-        owner_task_ids=(raw_owner_id,),
+        owner_task_ids=(raw_owner_id, raw_task_id),
         task_ids=(raw_task_id,),
         max_recovery_attempts=max_recovery_attempts,
         include_skipped=True,
@@ -7282,7 +7282,17 @@ def _scoped_failed_selector_has_actionable_owner_row(
             return True
         if raw_task_id in {str(task.id) for task in row.unresolved_tasks if task.id is not None}:
             return True
-    return False
+    from ..recovery_engine import list_failed_tasks_for_recovery
+
+    return raw_task_id in {
+        str(task.id)
+        for task in list_failed_tasks_for_recovery(
+            store,
+            git=git,
+            target_branch=target_branch,
+        )
+        if task.id is not None
+    }
 
 
 def _scoped_selector_task_is_active(

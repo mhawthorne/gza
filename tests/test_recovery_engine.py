@@ -13,8 +13,10 @@ from gza.git import Git, GitError
 from gza.lineage_query import (
     LineageOwnerQuery,
     _load_indexes,
+    query_lineage_owner_rows,
     query_lineage_owner_rows_in_read_session,
 )
+from gza.merge_state import BranchMergeClassification
 from gza.operator_state import MOOT_EMPTY_LIFECYCLE_DETAIL, MOOT_REDUNDANT_LIFECYCLE_DETAIL
 from gza.recovery_engine import (
     FailedRecoveryDecision,
@@ -202,7 +204,7 @@ def _plan_review_slice_prompt_duplicate_provenance(
     )
 
 
-class _StubMergeGit:
+class _StubMergeGit(Git):
     def __init__(
         self,
         *,
@@ -216,6 +218,9 @@ class _StubMergeGit:
         self.merged_branches = self.merged_side_branches | self.empty_merged_branches
         self.default_branch = default_branch
         self.prove_empty_diff = prove_empty_diff
+
+    def local_branch_names(self) -> frozenset[str]:
+        return frozenset(self.merged_branches)
 
     def resolve_fresh_merge_source(self, branch: str):
         from gza.git import ResolvedMergeSourceRef
@@ -253,6 +258,23 @@ class _StubMergeGit:
 
     def is_on_first_parent_history(self, commit: str, target: str) -> bool:
         return target == self.default_branch and commit in self.empty_merged_branches
+
+
+class _ReachabilityOnlyMergedGit(_StubMergeGit):
+    def __init__(self, *, merged_branches: set[str], default_branch: str = "main") -> None:
+        super().__init__(merged_side_branches=merged_branches, default_branch=default_branch)
+
+    def count_commits_ahead(self, source_ref: str, base_ref: str) -> int | None:
+        return None
+
+    def count_commits_ahead_checked(self, branch: str, base: str) -> int | None:
+        return None
+
+    def has_non_empty_source_diff_against_target(self, source_ref: str, target: str) -> bool | None:
+        return None
+
+    def is_on_first_parent_history(self, commit: str, target: str) -> bool:
+        raise GitError("first-parent proof unavailable")
 
 
 class _StubEmptyBranchGit:
@@ -328,6 +350,14 @@ _REAL_CONFIG = recovery_engine.Config
 _REAL_GIT = recovery_engine.Git
 
 
+def _stub_unavailable_merge_context(monkeypatch: pytest.MonkeyPatch, *, default_branch: str = "main") -> None:
+    monkeypatch.setattr(
+        recovery_engine,
+        "_load_merge_context",
+        lambda _project_dir=None: _MergeContext(git=None, default_branch=default_branch),
+    )
+
+
 def _failed_sidequest(store, *, task_type: str, impl_id: str, reason: str):
     depends_on = None
     based_on = None
@@ -379,6 +409,8 @@ def test_recovery_engine_suppresses_failed_sidequests_when_target_impl_is_merged
     assert impl.id is not None
 
     failed = _failed_sidequest(store, task_type=task_type, impl_id=impl.id, reason=reason)
+    failed.has_commits = False
+    store.update(failed)
 
     assert is_resolved_by_merged_target(store, failed) is True
 
@@ -388,6 +420,69 @@ def test_recovery_engine_suppresses_failed_sidequests_when_target_impl_is_merged
     assert decision.reason_text == "target implementation already merged"
     assert get_failed_recovery_needs_attention_reason(store, failed, decision=decision, max_recovery_attempts=1) is None
     assert list_failed_tasks_for_recovery(store) == []
+
+
+@pytest.mark.parametrize("task_type", ["review", "improve", "rebase"])
+@pytest.mark.parametrize(
+    ("owner_unit_state", "expected_resolved"),
+    [("unmerged", False), ("merged", True)],
+)
+def test_stale_merged_task_row_does_not_override_owner_merge_unit_for_failed_sidequest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task_type: str,
+    owner_unit_state: str,
+    expected_resolved: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_unavailable_merge_context(monkeypatch)
+
+    impl = _completed_impl(store, merge_status="merged")
+    assert impl.id is not None
+    impl.branch = f"feature/stale-row-owner-{task_type}-{owner_unit_state}"
+    store.update(impl)
+    owner_unit = store.create_merge_unit(
+        source_branch=impl.branch,
+        target_branch="main",
+        owner_task_id=impl.id,
+        state=owner_unit_state,
+    )
+    store.attach_task_to_merge_unit(impl.id, owner_unit.id, "owner")
+
+    failed = _failed_sidequest(store, task_type=task_type, impl_id=impl.id, reason="WORKER_DIED")
+    failed.same_branch = True
+    failed.branch = impl.branch
+    failed.has_commits = False
+    store.update(failed)
+    store.attach_task_to_merge_unit(failed.id, owner_unit.id, task_type)
+
+    assert is_resolved_by_merged_target(store, failed) is expected_resolved
+    retained_failed_ids = [task.id for task in list_failed_tasks_for_recovery(store)]
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=None,
+        target_branch="main",
+    )
+    retained_recovery_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+
+    if expected_resolved:
+        assert retained_failed_ids == []
+        assert decision.action == "skip"
+        assert decision.reason_code == "resolved_by_merged_target"
+        assert failed.id not in retained_recovery_leaf_ids
+    else:
+        assert retained_failed_ids == [failed.id]
+        assert decision.reason_code != "resolved_by_merged_target"
+        assert any(row.owner_task.id == impl.id for row in rows)
+        assert failed.id in retained_recovery_leaf_ids
 
 
 @pytest.mark.parametrize("task_type", ["improve", "rebase"])
@@ -424,15 +519,774 @@ def test_list_failed_tasks_for_recovery_keeps_same_branch_sidequest_with_live_un
 
 
 @pytest.mark.parametrize("task_type", ["improve", "rebase"])
-def test_list_failed_tasks_for_recovery_suppresses_same_branch_sidequest_when_git_proves_empty(
+def test_same_branch_unknown_failed_sidequest_under_merged_impl_stays_recoverable_and_reroots(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     task_type: str,
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
-    branch = "feature/empty-sidequest-work"
-    _stub_merge_context(monkeypatch, empty_merged_branches={branch}, prove_empty_diff=True)
+    _stub_unavailable_merge_context(monkeypatch)
+
+    impl = _completed_impl(store, merge_status="merged")
+    assert impl.id is not None
+    impl.branch = "feature/unknown-same-branch"
+    store.update(impl)
+    owner_unit = store.create_merge_unit(
+        source_branch=impl.branch,
+        target_branch="main",
+        owner_task_id=impl.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(impl.id, owner_unit.id, "owner")
+
+    failed = _failed_sidequest(store, task_type=task_type, impl_id=impl.id, reason="WORKER_DIED")
+    failed.same_branch = True
+    failed.branch = impl.branch
+    failed.has_commits = None
+    store.update(failed)
+    store.attach_task_to_merge_unit(failed.id, owner_unit.id, task_type)
+
+    assert is_resolved_by_merged_target(store, failed) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.reason_code != "resolved_by_merged_target"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=None,
+        target_branch="main",
+    )
+    assert {row.owner_task.id for row in rows} == {failed.id}
+    row = rows[0]
+    assert row.owner_task.id == failed.id
+    assert row.recovery_leaf_task is not None
+    assert row.recovery_leaf_task.id == failed.id
+    assert row.unresolved_tasks == (failed,)
+
+
+def test_branchless_failed_sidequest_with_self_owned_unmerged_unit_stays_visible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_unavailable_merge_context(monkeypatch)
+
+    impl = _completed_impl(store, merge_status="merged")
+    assert impl.id is not None
+    impl.branch = "feature/branchless-sidequest-target"
+    store.update(impl)
+
+    failed = _failed_sidequest(store, task_type="review", impl_id=impl.id, reason="WORKER_DIED")
+    failed.branch = None
+    failed.has_commits = None
+    store.update(failed)
+    failed_unit = store.create_merge_unit(
+        source_branch="feature/branchless-review-unit",
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(failed.id, failed_unit.id, "owner")
+
+    assert is_resolved_by_merged_target(store, failed) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=None,
+        target_branch="main",
+    )
+    assert failed.id in {row.owner_task.id for row in rows if row.owner_task.id is not None}
+
+
+@pytest.mark.parametrize("has_commits", [None, True])
+def test_branchless_non_owner_member_of_merged_unit_stays_visible_across_recovery_surfaces(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    has_commits: bool | None,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_unavailable_merge_context(monkeypatch)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = "feature/branchless-non-owner-target"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed = _failed_sidequest(store, task_type="review", impl_id=owner.id, reason="WORKER_DIED")
+    failed.branch = None
+    failed.has_commits = has_commits
+    store.update(failed)
+    store.attach_task_to_merge_unit(failed.id, owner_unit.id, "review")
+
+    assert is_resolved_by_merged_target(store, failed) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.reason_code != "resolved_by_merged_target"
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=None,
+        target_branch="main",
+    )
+    assert {row.owner_task.id for row in rows} == {failed.id}
+    row = rows[0]
+    assert row.owner_task.id == failed.id
+    assert row.recovery_leaf_task is not None
+    assert row.recovery_leaf_task.id == failed.id
+    assert row.unresolved_tasks == (failed,)
+
+
+@pytest.mark.parametrize("merge_state", ["empty", "redundant"])
+def test_session_backed_non_owner_live_no_work_sidequest_stays_visible_across_recovery_surfaces(
+    tmp_path: Path,
+    merge_state: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = "feature/session-backed-owner-target"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed = _failed_sidequest(store, task_type="improve", impl_id=owner.id, reason="WORKER_DIED")
+    failed.branch = f"feature/live-{merge_state}-sidequest"
+    failed.session_id = f"sess-live-{merge_state}"
+    failed.num_steps_computed = 1
+    failed.has_commits = merge_state == "redundant"
+    store.update(failed)
+    store.attach_task_to_merge_unit(failed.id, owner_unit.id, "improve")
+
+    git = _StubMergeGit(empty_merged_branches={failed.branch}, prove_empty_diff=True)
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({failed.branch}),
+    )
+
+    assert is_resolved_by_merged_target(store, failed, merge_context=merge_context) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store, git=git, target_branch="main")] == [failed.id]
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1, merge_context=merge_context)
+    assert decision.reason_code not in {
+        "resolved_by_merged_target",
+        "merge_unit_empty",
+        "merge_unit_redundant",
+        "terminal_no_work_recovery_already_resolved",
+    }
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=git,
+        target_branch="main",
+        reuse_recovery_merge_context=True,
+    )
+    assert failed.id in {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+
+
+@pytest.mark.parametrize(
+    ("live_path", "task_type", "has_commits", "session_backed"),
+    [
+        ("same_branch", "improve", None, False),
+        ("same_branch", "rebase", None, False),
+        ("shared_contributor", "review", False, True),
+        ("shared_contributor", "improve", False, True),
+        ("shared_contributor", "rebase", False, True),
+        ("distinct_branch", "review", False, True),
+        ("distinct_branch", "improve", False, True),
+        ("distinct_branch", "rebase", False, True),
+    ],
+)
+def test_reachability_only_merged_failed_sidequests_stay_recoverable_across_surfaces(
+    tmp_path: Path,
+    live_path: str,
+    task_type: str,
+    has_commits: bool | None,
+    session_backed: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = f"feature/reachability-only-{live_path}-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed = _failed_sidequest(store, task_type=task_type, impl_id=owner.id, reason="WORKER_DIED")
+    failed.branch = owner.branch if live_path == "same_branch" else f"{owner.branch}-{task_type}-{live_path}"
+    failed.same_branch = live_path == "same_branch"
+    failed.has_commits = has_commits
+    failed.session_id = f"sess-{task_type}-{live_path}" if session_backed else None
+    failed.num_steps_computed = 1 if session_backed else None
+    store.update(failed)
+    if live_path in {"same_branch", "shared_contributor"}:
+        store.attach_task_to_merge_unit(failed.id, owner_unit.id, task_type)
+
+    assert failed.branch is not None
+    git = _ReachabilityOnlyMergedGit(merged_branches={failed.branch})
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({"main", str(owner.branch), str(failed.branch)}),
+    )
+
+    classification = recovery_engine._classify_failed_task_branch_merge_state_for_target(
+        git=git,
+        failed_task=failed,
+        target_branch="main",
+        source_has_commits=failed.has_commits,
+        recorded_head_sha=None,
+    )
+    assert classification.state == "merged"
+    assert classification.reason == "content-equivalent-with-commits-unverified"
+
+    assert is_resolved_by_merged_target(store, failed, merge_context=merge_context) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store, git=git, target_branch="main")] == [failed.id]
+    decision = decide_failed_task_recovery(
+        store,
+        failed,
+        max_recovery_attempts=1,
+        merge_context=merge_context,
+    )
+    assert decision.reason_code != "resolved_by_merged_target"
+    assert should_hide_failed_recovery_decision(decision) is False
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=git,
+        target_branch="main",
+        reuse_recovery_merge_context=True,
+    )
+    recovery_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert failed.id in recovery_leaf_ids
+    if live_path == "same_branch":
+        assert failed.id in {row.owner_task.id for row in rows if row.owner_task.id is not None}
+
+
+@pytest.mark.parametrize(
+    ("live_path", "task_type"),
+    [
+        ("same_branch", "improve"),
+        ("shared_contributor", "review"),
+        ("distinct_branch", "rebase"),
+    ],
+)
+def test_affirmative_landed_proof_still_suppresses_failed_sidequests_across_surfaces(
+    tmp_path: Path,
+    live_path: str,
+    task_type: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = f"feature/proven-landed-{live_path}-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed = _failed_sidequest(store, task_type=task_type, impl_id=owner.id, reason="WORKER_DIED")
+    failed.branch = owner.branch if live_path == "same_branch" else f"{owner.branch}-{task_type}-{live_path}"
+    failed.same_branch = live_path == "same_branch"
+    failed.has_commits = True
+    store.update(failed)
+    if live_path in {"same_branch", "shared_contributor"}:
+        store.attach_task_to_merge_unit(failed.id, owner_unit.id, task_type)
+
+    assert failed.branch is not None
+    git = _StubMergeGit(merged_side_branches={failed.branch})
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({"main", str(owner.branch), str(failed.branch)}),
+    )
+
+    assert is_resolved_by_merged_target(store, failed, merge_context=merge_context) is True
+    assert list_failed_tasks_for_recovery(store, git=git, target_branch="main") == []
+    decision = decide_failed_task_recovery(
+        store,
+        failed,
+        max_recovery_attempts=1,
+        merge_context=merge_context,
+    )
+    assert decision.action == "skip"
+    assert decision.reason_code == "resolved_by_merged_target"
+    assert should_hide_failed_recovery_decision(decision) is True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=git,
+        target_branch="main",
+        reuse_recovery_merge_context=True,
+    )
+    assert failed.id not in {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+
+
+@pytest.mark.parametrize("has_commits", [None, True])
+def test_no_unit_failed_sidequest_with_live_merged_branch_suppresses_across_recovery_surfaces(
+    tmp_path: Path,
+    has_commits: bool | None,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = "feature/live-merged-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed = _failed_sidequest(store, task_type="rebase", impl_id=owner.id, reason="WORKER_DIED")
+    failed.branch = f"feature/live-merged-sidequest-{has_commits}"
+    failed.has_commits = has_commits
+    store.update(failed)
+
+    git = _StubMergeGit(merged_side_branches={failed.branch})
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({failed.branch}),
+    )
+
+    assert is_resolved_by_merged_target(store, failed, merge_context=merge_context) is True
+    assert list_failed_tasks_for_recovery(store, git=git, target_branch="main") == []
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1, merge_context=merge_context)
+    assert decision.action == "skip"
+    assert decision.reason_code == "resolved_by_merged_target"
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=git,
+        target_branch="main",
+        reuse_recovery_merge_context=True,
+    )
+    assert failed.id not in {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+
+
+@pytest.mark.parametrize("task_type", ["review", "improve", "rebase"])
+@pytest.mark.parametrize("merge_state", ["empty", "redundant"])
+def test_session_backed_self_owned_no_work_sidequests_remain_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task_type: str,
+    merge_state: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
+
+    impl = _completed_impl(store, merge_status="merged")
+    assert impl.id is not None
+    impl.branch = "feature/session-backed-no-work-target"
+    store.update(impl)
+
+    failed = _failed_sidequest(store, task_type=task_type, impl_id=impl.id, reason="WORKER_DIED")
+    failed.branch = f"feature/session-backed-{task_type}-{merge_state}"
+    failed.session_id = f"sess-{task_type}-{merge_state}"
+    failed.num_steps_computed = 1
+    failed.has_commits = False
+    store.update(failed)
+    failed_unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state=merge_state,
+    )
+    store.attach_task_to_merge_unit(failed.id, failed_unit.id, "owner")
+
+    assert is_resolved_by_merged_target(store, failed) is False
+    assert empty_task_requires_recovery(store, failed, merge_state=merge_state) is True
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.reason_code not in {
+        "resolved_by_merged_target",
+        "merge_unit_empty",
+        "merge_unit_redundant",
+        "terminal_no_work_recovery_already_resolved",
+    }
+
+
+@pytest.mark.parametrize("task_type", ["review", "improve", "rebase"])
+@pytest.mark.parametrize("merge_state", ["empty", "redundant"])
+@pytest.mark.parametrize("branchless", [False, True])
+def test_session_backed_self_owned_no_work_sidequests_with_unavailable_git_do_not_recurse(
+    tmp_path: Path,
+    task_type: str,
+    merge_state: str,
+    branchless: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = _completed_impl(store, merge_status="merged")
+    assert impl.id is not None
+    impl.branch = "feature/unavailable-git-owner"
+    store.update(impl)
+    owner_unit = store.create_merge_unit(
+        source_branch=impl.branch,
+        target_branch="main",
+        owner_task_id=impl.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(impl.id, owner_unit.id, "owner")
+
+    failed = _failed_sidequest(store, task_type=task_type, impl_id=impl.id, reason="WORKER_DIED")
+    failed.branch = None if branchless else impl.branch
+    failed.session_id = f"sess-{task_type}-{merge_state}-{branchless}"
+    failed.num_steps_computed = 1
+    failed.has_commits = False
+    store.update(failed)
+    failed_unit = store.create_merge_unit(
+        source_branch=failed.branch or f"feature/branchless-{task_type}-{merge_state}",
+        target_branch="main",
+        owner_task_id=failed.id,
+        state=merge_state,
+    )
+    store.attach_task_to_merge_unit(failed.id, failed_unit.id, "owner")
+
+    merge_context = _MergeContext(git=None, default_branch="main")
+    read_context = _read_context_for_store(store)
+    read_context.merge_context = merge_context
+
+    assert empty_task_requires_recovery(
+        store,
+        failed,
+        merge_state=merge_state,
+        merge_context=merge_context,
+        read_context=read_context,
+    ) is True
+    assert [task.id for task in list_failed_tasks_for_recovery(store, read_context=read_context)] == [failed.id]
+    decision = decide_failed_task_recovery(
+        store,
+        failed,
+        max_recovery_attempts=1,
+        merge_context=merge_context,
+        read_context=read_context,
+    )
+    assert decision.reason_code not in {
+        "resolved_by_merged_target",
+        "merge_unit_empty",
+        "merge_unit_redundant",
+        "terminal_no_work_recovery_already_resolved",
+    }
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=None,
+        target_branch="main",
+    )
+    assert {row.owner_task.id for row in rows} == {failed.id}
+    row = rows[0]
+    assert row.owner_task.id == failed.id
+    assert row.recovery_leaf_task is not None
+    assert row.recovery_leaf_task.id == failed.id
+    assert row.unresolved_tasks == ()
+
+
+@pytest.mark.parametrize("task_type", ["review", "improve", "rebase"])
+@pytest.mark.parametrize("merge_state", ["empty", "redundant"])
+@pytest.mark.parametrize("has_commits", [True, None])
+def test_non_owner_member_of_shared_no_work_unit_uses_empty_policy_with_unavailable_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task_type: str,
+    merge_state: str,
+    has_commits: bool | None,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_unavailable_merge_context(monkeypatch)
+
+    owner = _completed_impl(store, merge_status="unmerged")
+    assert owner.id is not None
+    owner.branch = f"feature/shared-{merge_state}-{task_type}-owner"
+    owner.has_commits = merge_state == "redundant"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state=merge_state,
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    moot_leaf = _failed_sidequest(store, task_type=task_type, impl_id=owner.id, reason="WORKER_DIED")
+    moot_leaf.branch = owner.branch
+    moot_leaf.has_commits = has_commits
+    moot_leaf.session_id = None
+    store.update(moot_leaf)
+    store.attach_task_to_merge_unit(moot_leaf.id, owner_unit.id, task_type)
+
+    recoverable_leaf = _failed_sidequest(store, task_type=task_type, impl_id=owner.id, reason="WORKER_DIED")
+    recoverable_leaf.branch = f"{owner.branch}-recoverable"
+    recoverable_leaf.has_commits = has_commits
+    recoverable_leaf.session_id = f"sess-shared-{merge_state}-{task_type}"
+    recoverable_leaf.num_steps_computed = 1
+    recoverable_leaf.completed_at = datetime.now(UTC)
+    store.update(recoverable_leaf)
+    store.attach_task_to_merge_unit(recoverable_leaf.id, owner_unit.id, task_type)
+    for leaf in (moot_leaf, recoverable_leaf):
+        if leaf.depends_on is None:
+            continue
+        dependency = store.get(leaf.depends_on)
+        if dependency is not None and dependency.task_type == "review" and dependency.status == "pending":
+            dependency.status = "completed"
+            dependency.has_commits = False
+            dependency.completed_at = datetime.now(UTC)
+            store.update(dependency)
+
+    read_context = _read_context_for_store(store)
+    read_context.merge_context = _MergeContext(git=None, default_branch="main")
+
+    assert empty_task_requires_recovery(
+        store,
+        moot_leaf,
+        merge_state=merge_state,
+        read_context=read_context,
+    ) is False
+    assert empty_task_requires_recovery(
+        store,
+        recoverable_leaf,
+        merge_state=merge_state,
+        read_context=read_context,
+    ) is True
+    assert [task.id for task in list_failed_tasks_for_recovery(store, read_context=read_context)] == [
+        recoverable_leaf.id
+    ]
+
+    moot_decision = decide_failed_task_recovery(
+        store,
+        moot_leaf,
+        max_recovery_attempts=1,
+        read_context=read_context,
+    )
+    assert moot_decision.action == "skip"
+    assert should_hide_failed_recovery_decision(moot_decision) is True
+
+    recoverable_decision = decide_failed_task_recovery(
+        store,
+        recoverable_leaf,
+        max_recovery_attempts=1,
+        read_context=read_context,
+    )
+    assert recoverable_decision.action in {"resume", "retry"}
+    assert should_hide_failed_recovery_decision(recoverable_decision) is False
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=None,
+        target_branch="main",
+        reuse_recovery_merge_context=True,
+    )
+    recovery_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert moot_leaf.id not in recovery_leaf_ids
+    assert recoverable_leaf.id in recovery_leaf_ids
+    assert owner.id not in {row.owner_task.id for row in rows if row.owner_task.id is not None}
+
+
+def test_session_backed_no_work_task_resolves_when_completed_recovery_descendant_exists(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed implementation", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "WORKER_DIED"
+    failed.branch = "feature/no-work-with-recovery"
+    failed.session_id = "sess-no-work-with-recovery"
+    failed.num_steps_computed = 1
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    _attach_empty_merge_unit(store, failed)
+
+    recovery = store.add(
+        failed.prompt,
+        task_type="implement",
+        based_on=failed.id,
+        recovery_origin="retry",
+    )
+    assert recovery.id is not None
+    recovery.status = "completed"
+    recovery.branch = "feature/no-work-with-recovery-retry"
+    recovery.has_commits = True
+    recovery.merge_status = "merged"
+    recovery.completed_at = datetime.now(UTC)
+    store.update(recovery)
+    recovery_unit = store.create_merge_unit(
+        source_branch=recovery.branch,
+        target_branch="main",
+        owner_task_id=recovery.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(recovery.id, recovery_unit.id, "owner")
+
+    merge_context = _MergeContext(git=None, default_branch="main")
+    assert empty_task_requires_recovery(store, failed, merge_state="empty", merge_context=merge_context) is False
+    assert list_failed_tasks_for_recovery(store) == []
+
+
+@pytest.mark.parametrize("has_commits", [True, None])
+def test_legacy_same_branch_failed_leaf_under_merged_owner_reroots_without_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    has_commits: bool | None,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_merge_context(monkeypatch)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = "feature/legacy-same-branch-owner"
+    store.update(owner)
+
+    failed = store.add("Legacy failed same-branch leaf", task_type="improve", based_on=owner.id, same_branch=True)
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "WORKER_DIED"
+    failed.branch = owner.branch
+    failed.has_commits = has_commits
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=None,
+        target_branch="main",
+    )
+    assert {row.owner_task.id for row in rows} == {failed.id}
+    row = rows[0]
+    assert row.owner_task.id == failed.id
+    assert row.recovery_leaf_task is not None
+    assert row.recovery_leaf_task.id == failed.id
+    assert row.unresolved_tasks == (failed,)
+
+
+def test_explicit_no_work_same_branch_and_self_owned_merged_sidequests_stay_suppressed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _stub_unavailable_merge_context(monkeypatch)
+
+    impl = _completed_impl(store, merge_status="merged")
+    assert impl.id is not None
+    impl.branch = "feature/suppressed-sidequest-target"
+    store.update(impl)
+
+    no_work = _failed_sidequest(store, task_type="improve", impl_id=impl.id, reason="WORKER_DIED")
+    no_work.same_branch = True
+    no_work.branch = impl.branch
+    no_work.has_commits = False
+    store.update(no_work)
+
+    landed = _failed_sidequest(store, task_type="rebase", impl_id=impl.id, reason="WORKER_DIED")
+    landed.branch = "feature/self-owned-merged-sidequest"
+    landed.has_commits = True
+    store.update(landed)
+    landed_unit = store.create_merge_unit(
+        source_branch=landed.branch,
+        target_branch="main",
+        owner_task_id=landed.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(landed.id, landed_unit.id, "owner")
+
+    assert is_resolved_by_merged_target(store, no_work) is True
+    assert is_resolved_by_merged_target(store, landed) is True
+    assert list_failed_tasks_for_recovery(store) == []
+
+
+@pytest.mark.parametrize("task_type", ["improve", "rebase"])
+@pytest.mark.parametrize("live_proof", ["merged", "empty"])
+def test_unknown_same_branch_sidequest_stays_visible_when_git_proves_owner_branch_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    task_type: str,
+    live_proof: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    branch = f"feature/{live_proof}-sidequest-work"
+    if live_proof == "merged":
+        _stub_merge_context(monkeypatch, merged_side_branches={branch})
+    else:
+        _stub_merge_context(monkeypatch, empty_merged_branches={branch}, prove_empty_diff=True)
 
     impl = _completed_impl(store, merge_status="merged")
     assert impl.id is not None
@@ -449,11 +1303,104 @@ def test_list_failed_tasks_for_recovery_suppresses_same_branch_sidequest_when_gi
     failed = _failed_sidequest(store, task_type=task_type, impl_id=impl.id, reason="WORKER_DIED")
     failed.same_branch = True
     failed.branch = branch
-    failed.has_commits = True
+    failed.has_commits = None
     store.update(failed)
     store.attach_task_to_merge_unit(failed.id, owner_unit.id, task_type)
 
-    assert list_failed_tasks_for_recovery(store) == []
+    assert is_resolved_by_merged_target(store, failed) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store)] == [failed.id]
+    decision = decide_failed_task_recovery(store, failed, max_recovery_attempts=1)
+    assert decision.reason_code != "resolved_by_merged_target"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=None,
+        target_branch="main",
+    )
+    assert {row.owner_task.id for row in rows} == {failed.id}
+    row = rows[0]
+    assert row.recovery_leaf_task is not None
+    assert row.recovery_leaf_task.id == failed.id
+    assert row.unresolved_tasks == (failed,)
+
+
+@pytest.mark.parametrize("task_type", ["review", "improve", "rebase"])
+@pytest.mark.parametrize("live_state", ["merged", "empty", "redundant"])
+def test_self_owned_unmerged_sidequest_stays_visible_when_live_git_reports_terminal(
+    tmp_path: Path,
+    task_type: str,
+    live_state: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = _completed_impl(store, merge_status="merged")
+    assert impl.id is not None
+    impl.branch = "feature/self-owned-unmerged-owner"
+    store.update(impl)
+    owner_unit = store.create_merge_unit(
+        source_branch=impl.branch,
+        target_branch="main",
+        owner_task_id=impl.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(impl.id, owner_unit.id, "owner")
+
+    failed = _failed_sidequest(store, task_type=task_type, impl_id=impl.id, reason="WORKER_DIED")
+    failed.branch = f"feature/self-owned-unmerged-{task_type}-{live_state}"
+    failed.has_commits = live_state != "empty"
+    store.update(failed)
+    leaf_unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(failed.id, leaf_unit.id, "owner")
+
+    if live_state == "merged":
+        git = _StubMergeGit(merged_side_branches={failed.branch})
+    else:
+        git = _StubMergeGit(empty_merged_branches={failed.branch}, prove_empty_diff=True)
+    classification = recovery_engine._classify_failed_task_branch_merge_state_for_target(
+        git=git,
+        failed_task=failed,
+        target_branch="main",
+        source_has_commits=failed.has_commits,
+        recorded_head_sha=leaf_unit.head_sha,
+    )
+    assert classification.state == live_state
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({"main", str(impl.branch), str(failed.branch)}),
+    )
+
+    assert is_resolved_by_merged_target(store, failed, merge_context=merge_context) is False
+    assert [task.id for task in list_failed_tasks_for_recovery(store, git=git, target_branch="main")] == [failed.id]
+    decision = decide_failed_task_recovery(
+        store,
+        failed,
+        max_recovery_attempts=1,
+        merge_context=merge_context,
+    )
+    assert decision.reason_code != "resolved_by_merged_target"
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=git,
+        target_branch="main",
+        reuse_recovery_merge_context=True,
+    )
+    assert {row.owner_task.id for row in rows} == {failed.id}
+    row = rows[0]
+    assert row.recovery_leaf_task is not None
+    assert row.recovery_leaf_task.id == failed.id
+    assert row.unresolved_tasks == (failed,)
 
 
 @pytest.mark.parametrize("task_type", ["review", "improve", "rebase"])
@@ -538,7 +1485,7 @@ def test_list_failed_tasks_for_recovery_keeps_failed_task_without_landed_lineage
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
-    _stub_merge_context(monkeypatch)
+    _stub_unavailable_merge_context(monkeypatch)
 
     failed = store.add("Failed implementation", task_type="implement")
     assert failed.id is not None
@@ -1167,7 +2114,7 @@ def test_list_failed_tasks_for_recovery_filters_failed_descendant_when_merged_an
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
-    _stub_merge_context(monkeypatch)
+    _stub_unavailable_merge_context(monkeypatch)
 
     merged_ancestor = _completed_impl(store, merge_status="merged")
     assert merged_ancestor.id is not None
@@ -1236,7 +2183,7 @@ def test_list_failed_tasks_for_recovery_keeps_unknown_distinct_contributor_under
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
-    _stub_merge_context(monkeypatch)
+    _stub_unavailable_merge_context(monkeypatch)
 
     owner = store.add("Merged owner with distinct failed contributor", task_type="implement")
     assert owner.id is not None
@@ -1373,7 +2320,7 @@ def test_list_failed_tasks_for_recovery_filters_same_branch_failed_improve_under
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
-    _stub_merge_context(monkeypatch)
+    _stub_unavailable_merge_context(monkeypatch)
 
     impl = _completed_impl(store, merge_status="unmerged")
     assert impl.id is not None
@@ -1406,6 +2353,7 @@ def test_list_failed_tasks_for_recovery_filters_same_branch_failed_improve_under
     failed_improve.status = "failed"
     failed_improve.failure_reason = "GIT_ERROR"
     failed_improve.branch = impl.branch
+    failed_improve.has_commits = False
     failed_improve.completed_at = datetime.now(UTC)
     store.update(failed_improve)
 
@@ -1415,7 +2363,7 @@ def test_list_failed_tasks_for_recovery_filters_same_branch_failed_improve_under
     assert list_failed_tasks_for_recovery(store) == []
 
 
-def test_is_resolved_by_landed_lineage_uses_existing_branch_set_and_branch_resolution_cache(tmp_path: Path) -> None:
+def test_is_resolved_by_landed_lineage_caches_branch_merge_classification(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -1467,7 +2415,7 @@ def test_is_resolved_by_landed_lineage_uses_existing_branch_set_and_branch_resol
 
     assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
     assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
-    assert git.branch_exists_calls == 1
+    assert git.branch_exists_calls == 2
     assert git.is_merged_calls == 1
     assert git.count_commits_ahead_checked_calls == 1
 
@@ -1568,7 +2516,7 @@ def test_is_resolved_by_landed_lineage_short_circuits_terminal_persisted_merge_s
     assert git.is_merged_calls == 0
 
 
-def test_is_resolved_by_landed_lineage_still_classifies_unmerged_state(tmp_path: Path) -> None:
+def test_is_resolved_by_landed_lineage_preserves_self_owned_active_unmerged_state(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -1604,15 +2552,24 @@ def test_is_resolved_by_landed_lineage_still_classifies_unmerged_state(tmp_path:
         existing_branches=frozenset({failed.branch}),
     )
 
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(
-            recovery_engine,
-            "classify_branch_merge_state_for_target",
-            lambda **kwargs: type("Classification", (), {"state": "merged"})(),
-        )
-        assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is True
+    classification_calls: list[str | None] = []
 
-    assert git.is_merged_calls == 1
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        def classify_merged(**kwargs: object):
+            classification_calls.append(kwargs["recorded_head_sha"])
+            return BranchMergeClassification(
+                state="merged",
+                reason="content-equivalent-with-commits",
+                source_ref=failed.branch,
+                target_ref="main",
+                source_sha="source-sha",
+                target_sha="target-sha",
+            )
+
+        monkeypatch.setattr(recovery_engine, "classify_branch_merge_state_for_target", classify_merged)
+        assert _is_resolved_by_landed_lineage(store, failed, merge_context=merge_context) is False
+
+    assert classification_calls == []
 
 
 def test_empty_task_with_provider_output_remains_visible_when_branch_has_no_unique_commits(
@@ -4873,6 +5830,7 @@ def test_list_failed_tasks_for_recovery_memoizes_lineage_tree_by_root_per_pass(
     failed_improve.status = "failed"
     failed_improve.failure_reason = "GIT_ERROR"
     failed_improve.branch = failed_root.branch
+    failed_improve.has_commits = False
     failed_improve.completed_at = datetime(2026, 5, 16, 11, 0, tzinfo=UTC)
     store.update(failed_improve)
 
@@ -5017,6 +5975,293 @@ class _MinimalRecoveryGit(Git):
         return ResolvedMergeSourceRef(None)
 
 
+@pytest.mark.parametrize("leaf_order", ("landed_first", "recoverable_first"))
+def test_failed_leaf_merge_classification_cache_separates_commit_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    leaf_order: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = "feature/cache-collision-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="owner-head",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    def _make_failed_leaf(prompt: str, *, has_commits: bool, executed: bool) -> Task:
+        leaf = store.add(prompt, task_type="rebase", based_on=owner.id)
+        assert leaf.id is not None
+        leaf.status = "failed"
+        leaf.failure_reason = "WORKER_DIED"
+        leaf.branch = "feature/shared-cache-leaf"
+        leaf.has_commits = has_commits
+        leaf.session_id = f"sess-{prompt}" if executed else None
+        leaf.num_steps_computed = 1 if executed else 0
+        leaf.completed_at = datetime.now(UTC)
+        store.update(leaf)
+        return leaf
+
+    if leaf_order == "landed_first":
+        landed_leaf = _make_failed_leaf("landed leaf", has_commits=True, executed=False)
+        recoverable_leaf = _make_failed_leaf("recoverable no-work leaf", has_commits=False, executed=True)
+    else:
+        recoverable_leaf = _make_failed_leaf("recoverable no-work leaf", has_commits=False, executed=True)
+        landed_leaf = _make_failed_leaf("landed leaf", has_commits=True, executed=False)
+
+    git = _MinimalRecoveryGit(branches=frozenset({"main", str(owner.branch), "feature/shared-cache-leaf"}))
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({"main", str(owner.branch), "feature/shared-cache-leaf"}),
+    )
+    classification_calls: list[tuple[str | None, str | None, str | None, bool | None]] = []
+
+    def classify_by_commit_metadata(**kwargs: object) -> BranchMergeClassification:
+        source_ref = kwargs.get("source_ref", kwargs.get("source_branch"))
+        recorded_head_sha = kwargs["recorded_head_sha"]
+        target_branch = kwargs["target_branch"]
+        source_has_commits = kwargs["source_has_commits"]
+        classification_calls.append((source_ref, recorded_head_sha, target_branch, source_has_commits))
+        if source_has_commits is True:
+            return BranchMergeClassification(
+                state="merged",
+                reason="content-equivalent-with-commits",
+                source_ref=source_ref,
+                target_ref=target_branch,
+                source_sha="shared-head",
+                target_sha="target-head",
+            )
+        if source_has_commits is False:
+            return BranchMergeClassification(
+                state="empty",
+                reason="no-task-commits",
+                source_ref=source_ref,
+                target_ref=target_branch,
+                source_sha="shared-head",
+                target_sha="target-head",
+            )
+        raise AssertionError(f"unexpected source_has_commits={source_has_commits!r}")
+
+    monkeypatch.setattr(recovery_engine, "classify_branch_merge_state_for_target", classify_by_commit_metadata)
+    monkeypatch.setattr("gza.lineage_query.classify_branch_merge_state_for_target", classify_by_commit_metadata)
+
+    classification_cache: recovery_engine.FailedTaskBranchClassificationCache = {}
+    classification_calls.clear()
+    assert (
+        recovery_engine._classify_failed_task_branch_merge_state_for_target(
+            git=git,
+            failed_task=landed_leaf,
+            target_branch="main",
+            recorded_head_sha=None,
+            source_has_commits=True,
+            classification_cache=classification_cache,
+        ).state
+        == "merged"
+    )
+    assert (
+        recovery_engine._classify_failed_task_branch_merge_state_for_target(
+            git=git,
+            failed_task=recoverable_leaf,
+            target_branch="main",
+            recorded_head_sha=None,
+            source_has_commits=False,
+            classification_cache=classification_cache,
+        ).state
+        == "empty"
+    )
+    assert (
+        recovery_engine._classify_failed_task_branch_merge_state_for_target(
+            git=git,
+            failed_task=recoverable_leaf,
+            target_branch="main",
+            recorded_head_sha=None,
+            source_has_commits=False,
+            classification_cache=classification_cache,
+        ).state
+        == "empty"
+    )
+    assert {
+        (recorded_head_sha, target_branch, source_has_commits)
+        for _source_ref, recorded_head_sha, target_branch, source_has_commits in classification_calls
+    } == {(None, "main", True), (None, "main", False)}
+
+    visible_ids = [task.id for task in list_failed_tasks_for_recovery(store, git=git, target_branch="main")]
+    assert recoverable_leaf.id in visible_ids
+    assert landed_leaf.id not in visible_ids
+
+    recoverable_decision = decide_failed_task_recovery(
+        store,
+        recoverable_leaf,
+        max_recovery_attempts=1,
+        merge_context=merge_context,
+    )
+    assert should_hide_failed_recovery_decision(recoverable_decision) is False
+    assert recoverable_decision.action != "skip"
+    landed_decision = decide_failed_task_recovery(
+        store,
+        landed_leaf,
+        max_recovery_attempts=1,
+        merge_context=merge_context,
+    )
+    assert landed_decision.action == "skip"
+    assert should_hide_failed_recovery_decision(landed_decision) is True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=git,
+        target_branch="main",
+        reuse_recovery_merge_context=True,
+    )
+    recovery_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert recoverable_leaf.id in recovery_leaf_ids
+    assert landed_leaf.id not in recovery_leaf_ids
+
+    scoped_rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            max_recovery_attempts=1,
+            task_ids=(recoverable_leaf.id,),
+        ),
+        config=Config.load(tmp_path),
+        git=git,
+        target_branch="main",
+        reuse_recovery_merge_context=True,
+    )
+    assert [row.recovery_leaf_task.id for row in scoped_rows if row.recovery_leaf_task is not None] == [
+        recoverable_leaf.id
+    ]
+
+
+@pytest.mark.parametrize("leaf_order", ("landed_first", "unmerged_first"))
+def test_failed_leaf_same_branch_unknown_heads_stay_visible_without_live_classification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    leaf_order: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = "feature/head-cache-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="owner-head",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    def _make_failed_leaf(prompt: str, *, recorded_head: str) -> Task:
+        leaf = store.add(prompt, task_type="rebase", based_on=owner.id, same_branch=True)
+        assert leaf.id is not None
+        leaf.status = "failed"
+        leaf.failure_reason = "WORKER_DIED"
+        leaf.branch = owner.branch
+        leaf.has_commits = None
+        leaf.completed_at = datetime.now(UTC)
+        store.update(leaf)
+        leaf_unit = store.create_merge_unit(
+            source_branch=owner.branch,
+            target_branch="main",
+            owner_task_id=leaf.id,
+            state="unmerged",
+            head_sha=recorded_head,
+        )
+        store.attach_task_to_merge_unit(leaf.id, leaf_unit.id, "owner")
+        return leaf
+
+    if leaf_order == "landed_first":
+        landed_leaf = _make_failed_leaf("landed head failed leaf", recorded_head="head-a")
+        unmerged_leaf = _make_failed_leaf("unmerged head failed leaf", recorded_head="head-b")
+    else:
+        unmerged_leaf = _make_failed_leaf("unmerged head failed leaf", recorded_head="head-b")
+        landed_leaf = _make_failed_leaf("landed head failed leaf", recorded_head="head-a")
+
+    git = _MinimalRecoveryGit(branches=frozenset({"main", str(owner.branch)}))
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({"main", str(owner.branch)}),
+    )
+    classification_calls: list[tuple[str | None, str | None, str | None, bool | None]] = []
+
+    def classify_by_recorded_head(**kwargs: object) -> BranchMergeClassification:
+        source_ref = kwargs.get("source_ref", kwargs.get("source_branch"))
+        recorded_head_sha = kwargs["recorded_head_sha"]
+        target_branch = kwargs["target_branch"]
+        source_has_commits = kwargs["source_has_commits"]
+        classification_calls.append((source_ref, recorded_head_sha, target_branch, source_has_commits))
+        state = "merged" if recorded_head_sha == "head-a" else "unmerged"
+        return BranchMergeClassification(
+            state=state,
+            reason="content-equivalent-with-commits" if state == "merged" else f"{state}-for-{recorded_head_sha}",
+            source_ref=source_ref,
+            target_ref=target_branch,
+            source_sha=recorded_head_sha,
+            target_sha="target-head",
+        )
+
+    monkeypatch.setattr(recovery_engine, "classify_branch_merge_state_for_target", classify_by_recorded_head)
+
+    failed = list_failed_tasks_for_recovery(store, git=git, target_branch="main")
+    assert {task.id for task in failed} == {landed_leaf.id, unmerged_leaf.id}
+    assert classification_calls == []
+
+    unmerged_decision = decide_failed_task_recovery(
+        store,
+        unmerged_leaf,
+        max_recovery_attempts=1,
+        merge_context=merge_context,
+    )
+    assert unmerged_decision.reason_code != "resolved_by_merged_target"
+    landed_decision = decide_failed_task_recovery(
+        store,
+        landed_leaf,
+        max_recovery_attempts=1,
+        merge_context=merge_context,
+    )
+    assert landed_decision.reason_code != "resolved_by_merged_target"
+
+    classification_calls.clear()
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=git,
+        target_branch="main",
+        reuse_recovery_merge_context=True,
+    )
+    recovery_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    assert landed_leaf.id in recovery_leaf_ids
+    assert unmerged_leaf.id in recovery_leaf_ids
+    assert {landed_leaf.id, unmerged_leaf.id}.issubset({row.owner_task.id for row in rows if row.owner_task.id is not None})
+    assert classification_calls == []
+
+
 def test_list_failed_tasks_for_recovery_uses_seeded_git_not_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5053,3 +6298,113 @@ def test_list_failed_tasks_for_recovery_uses_seeded_git_not_load(
     # Must not raise (i.e., _load_merge_context is never called)
     result = list_failed_tasks_for_recovery(store, warnings=warnings, git=git, target_branch="main")
     assert result is not None
+
+
+@pytest.mark.parametrize("live_path", ["same_branch", "shared_contributor", "distinct_branch"])
+@pytest.mark.parametrize(
+    ("has_commits", "has_executed_session", "should_remain_visible"),
+    [
+        (False, False, False),
+        (True, False, True),
+        (None, False, True),
+        (False, True, True),
+    ],
+)
+def test_live_unmerged_branch_keeps_explicit_no_work_suppressed_before_unmerged_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_path: str,
+    has_commits: bool | None,
+    has_executed_session: bool,
+    should_remain_visible: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = f"feature/live-unmerged-{live_path}-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha="owner-head",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    task_type = {
+        "same_branch": "improve",
+        "shared_contributor": "review",
+        "distinct_branch": "rebase",
+    }[live_path]
+    failed = _failed_sidequest(store, task_type=task_type, impl_id=owner.id, reason="WORKER_DIED")
+    failed.branch = owner.branch if live_path == "same_branch" else f"{owner.branch}-{live_path}-leaf"
+    failed.same_branch = live_path == "same_branch"
+    failed.has_commits = has_commits
+    failed.session_id = "sess-live-unmerged" if has_executed_session else None
+    failed.num_steps_computed = 1 if has_executed_session else None
+    store.update(failed)
+    if live_path in {"same_branch", "shared_contributor"}:
+        store.attach_task_to_merge_unit(failed.id, owner_unit.id, task_type)
+
+    assert failed.branch is not None
+    git = _MinimalRecoveryGit(branches=frozenset({"main", str(owner.branch), str(failed.branch)}))
+    merge_context = _MergeContext(
+        git=git,
+        default_branch="main",
+        existing_branches=frozenset({"main", str(owner.branch), str(failed.branch)}),
+    )
+
+    monkeypatch.setattr(
+        recovery_engine,
+        "classify_branch_merge_state_for_target",
+        lambda **kwargs: BranchMergeClassification(
+            state="unmerged",
+            reason="live-unmerged",
+            source_ref=str(failed.branch),
+            target_ref="main",
+            source_sha="failed-head",
+            target_sha="target-head",
+        ),
+    )
+
+    assert (
+        is_resolved_by_merged_target(store, failed, merge_context=merge_context)
+        is not should_remain_visible
+    )
+    assert [task.id for task in list_failed_tasks_for_recovery(store, git=git, target_branch="main")] == (
+        [failed.id] if should_remain_visible else []
+    )
+
+    decision = decide_failed_task_recovery(
+        store,
+        failed,
+        max_recovery_attempts=1,
+        merge_context=merge_context,
+    )
+    if should_remain_visible:
+        assert should_hide_failed_recovery_decision(decision) is False
+    else:
+        assert decision.action == "skip"
+        assert decision.reason_code == "resolved_by_merged_target"
+        assert should_hide_failed_recovery_decision(decision) is True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        config=Config.load(tmp_path),
+        git=git,
+        target_branch="main",
+        reuse_recovery_merge_context=True,
+    )
+    recovery_leaf_ids = {
+        row.recovery_leaf_task.id
+        for row in rows
+        if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+    if should_remain_visible:
+        assert failed.id in recovery_leaf_ids
+    else:
+        assert failed.id not in recovery_leaf_ids

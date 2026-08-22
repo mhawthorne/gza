@@ -526,6 +526,7 @@ class TestQueryIncomplete:
 
         improve = store.add("improve failed", task_type="improve", based_on=root.id, same_branch=True)
         self._fail(improve)
+        improve.has_commits = False
         store.update(improve)
         assert improve.id is not None
 
@@ -876,6 +877,7 @@ class TestQueryIncomplete:
 
         rebase = store.add("rebase failed", task_type="rebase", based_on=root.id, same_branch=True)
         self._fail(rebase)
+        rebase.has_commits = False
         store.update(rebase)
         assert rebase.id is not None
 

@@ -20,7 +20,7 @@ from .main_integration_verify import (
     main_integration_verify_attention_reason,
 )
 from .main_verify_format import format_main_verify_status_message, resolve_main_verify_target_proof
-from .merge_state import classify_branch_merge_state_for_target, resolve_task_merge_source
+from .merge_state import BranchMergeClassification, classify_branch_merge_state_for_target, resolve_task_merge_source
 from .metrics import instrument_module_functions
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 from .recovery_read_context import RecoveryReadContext
@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 LineageStatus = Literal["resolved", "actionable", "needs_attention", "waiting", "skipped"]
 ResolutionReason = Literal["lineage_complete", "branch_merged", "recovery_chain_completed"]
 _LOG = logging.getLogger(__name__)
-_FailedLeafMergeClassificationCache = dict[tuple[str | None, str | None, str], Any]
+_FailedLeafMergeClassificationCache = dict[tuple[str | None, str | None, str, bool | None], BranchMergeClassification]
 
 
 @dataclass(frozen=True)
@@ -363,6 +363,7 @@ def _owner_has_terminal_resolution_for_incomplete_display(
 
 def _failed_leaf_should_surface_apart_from_completed_owner(
     *,
+    store: SqliteTaskStore,
     failed_task: DbTask,
     completed_owner: DbTask,
     owner_merge_unit: MergeUnit | None,
@@ -370,10 +371,12 @@ def _failed_leaf_should_surface_apart_from_completed_owner(
     git: Git | None,
     target_branch: str | None = None,
     classification_cache: _FailedLeafMergeClassificationCache | None = None,
+    merge_context: Any | None = None,
 ) -> bool:
     if failed_task.id is None or failed_task.id == completed_owner.id:
         return False
     return _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+        store=store,
         failed_task=failed_task,
         completed_owner=completed_owner,
         owner_merge_unit=owner_merge_unit,
@@ -381,6 +384,7 @@ def _failed_leaf_should_surface_apart_from_completed_owner(
         git=git,
         target_branch=target_branch,
         classification_cache=classification_cache,
+        merge_context=merge_context,
     )
 
 
@@ -390,10 +394,11 @@ def _classify_failed_leaf_merge_state(
     source_branch: str | None,
     target_branch: str,
     recorded_head_sha: str | None,
+    source_has_commits: bool | None,
     classification_cache: _FailedLeafMergeClassificationCache | None,
 ) -> Any:
     source_ref = resolve_task_merge_source(git, source_branch).ref if source_branch else None
-    cache_key = (source_ref, recorded_head_sha, target_branch)
+    cache_key = (source_ref, recorded_head_sha, target_branch, source_has_commits)
     if classification_cache is not None and cache_key in classification_cache:
         return classification_cache[cache_key]
     classification = classify_branch_merge_state_for_target(
@@ -403,7 +408,7 @@ def _classify_failed_leaf_merge_state(
         target_branch=target_branch,
         persisted_state=None,
         merged_proof=None,
-        source_has_commits=None,
+        source_has_commits=source_has_commits,
         recorded_head_sha=recorded_head_sha,
         on_warning=_LOG.warning,
     )
@@ -909,7 +914,7 @@ def _resolve_owner_merge_unit(
 def _leaf_may_have_unique_work(failed_task: DbTask) -> bool:
     """Fail-closed reading of ``has_commits`` for unproven failed leaves.
 
-    ``None`` means the worker never recorded commit metadata, which is *unknown*, not
+    ``None`` means the worker never recorded commit metadata, which is unknown, not
     proof of no work. Per lineage spec P6 visibility fails closed, so unknown keeps the
     descendant visible; only an affirmative ``False`` suppresses it.
     """
@@ -922,6 +927,7 @@ def _leaf_has_explicit_no_work(failed_task: DbTask) -> bool:
 
 def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
     *,
+    store: SqliteTaskStore | None = None,
     failed_task: DbTask,
     completed_owner: DbTask,
     owner_merge_unit: MergeUnit | None,
@@ -929,7 +935,35 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
     git: Git | None,
     target_branch: str | None = None,
     classification_cache: _FailedLeafMergeClassificationCache | None = None,
+    merge_context: Any | None = None,
 ) -> bool:
+    from .recovery_engine import classify_failed_task_landed_same_unit_suppression
+
+    leaf_has_own_merge_unit = leaf_merge_unit is not None and leaf_merge_unit.owner_task_id == failed_task.id
+    if store is not None:
+        return (
+            classify_failed_task_landed_same_unit_suppression(
+                store,
+                failed_task,
+                completed_owner=completed_owner,
+                owner_merge_unit=owner_merge_unit,
+                leaf_merge_unit=leaf_merge_unit,
+                git=git,
+                target_branch=target_branch,
+                merge_context=merge_context,
+                classification_cache=classification_cache,
+            )
+            == "visible"
+        )
+
+    if leaf_has_own_merge_unit and leaf_merge_unit is not None:
+        if leaf_merge_unit.state == "unmerged" and git is None:
+            return True
+        if leaf_merge_unit.state in {"empty", "redundant"}:
+            return True
+        if merge_state_is_terminal_for_lifecycle(leaf_merge_unit.state):
+            return False
+
     if owner_merge_unit is None:
         if not (completed_owner.status == "completed" and completed_owner.merge_status == "merged"):
             return True
@@ -942,6 +976,7 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
                     source_branch=failed_task.branch,
                     target_branch=target_branch,
                     recorded_head_sha=leaf_merge_unit.head_sha if leaf_merge_unit is not None else None,
+                    source_has_commits=failed_task.has_commits,
                     classification_cache=classification_cache,
                 )
             except Exception as exc:
@@ -954,7 +989,7 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
                 return True
             return not merge_state_is_terminal_for_lifecycle(classification.state)
         if failed_task.same_branch:
-            return False
+            return _leaf_may_have_unique_work(failed_task)
         if failed_task.branch and completed_owner.branch:
             return failed_task.branch != completed_owner.branch or _leaf_may_have_unique_work(failed_task)
         return _leaf_may_have_unique_work(failed_task)
@@ -966,7 +1001,6 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
         return True
 
     leaf_targets_owner = leaf_merge_unit is not None and leaf_merge_unit.target_branch == owner_target
-    leaf_has_own_merge_unit = leaf_merge_unit is not None and leaf_merge_unit.owner_task_id == failed_task.id
     if failed_task.branch is None and not leaf_has_own_merge_unit:
         if leaf_targets_owner:
             return False
@@ -976,7 +1010,7 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
             # Persisted unmerged state on the failed leaf's own merge unit is enough to keep
             # the work visible unless live merge truth later disproves it.
             return True
-        if merge_state_is_terminal_for_lifecycle(leaf_merge_unit.state):
+        if leaf_merge_unit.state == "merged":
             return False
     if leaf_targets_owner and not leaf_has_own_merge_unit:
         if failed_task.branch == completed_owner.branch and failed_task.has_commits is False:
@@ -988,6 +1022,7 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
                     source_branch=failed_task.branch,
                     target_branch=owner_target,
                     recorded_head_sha=leaf_merge_unit.head_sha if leaf_merge_unit is not None else None,
+                    source_has_commits=failed_task.has_commits,
                     classification_cache=classification_cache,
                 )
             except Exception as exc:
@@ -1028,6 +1063,7 @@ def _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
             source_branch=source_branch,
             target_branch=owner_target,
             recorded_head_sha=leaf_merge_unit.head_sha if leaf_merge_unit is not None else None,
+            source_has_commits=failed_task.has_commits,
             classification_cache=classification_cache,
         )
     except Exception as exc:
@@ -1717,6 +1753,7 @@ def _query_lineage_owner_rows_with_context(
                         recovery_completed_by_failed_id[task.id] = completed_same_slice_sibling
                         continue
                     keep_failed_leaf_visible = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+                        store=store,
                         failed_task=task,
                         completed_owner=owner,
                         owner_merge_unit=owner_merge_unit,
@@ -1724,6 +1761,7 @@ def _query_lineage_owner_rows_with_context(
                         git=git,
                         target_branch=target_branch,
                         classification_cache=failed_leaf_merge_classification_cache,
+                        merge_context=owner_recovery_merge_context,
                     )
                     if task.id == owner.id and task.id in visible_failed_ids and not terminal_owner_resolution:
                         keep_failed_leaf_visible = True
@@ -1830,6 +1868,7 @@ def _query_lineage_owner_rows_with_context(
                         and not task.same_branch
                     )
                     and _failed_leaf_should_surface_apart_from_completed_owner(
+                        store=store,
                         failed_task=task,
                         completed_owner=owner,
                         owner_merge_unit=owner_merge_unit,
@@ -1837,6 +1876,7 @@ def _query_lineage_owner_rows_with_context(
                         git=git,
                         target_branch=target_branch,
                         classification_cache=failed_leaf_merge_classification_cache,
+                        merge_context=owner_recovery_merge_context,
                     )
                 ]
                 if terminal_owner_resolution
@@ -1955,12 +1995,13 @@ def _query_lineage_owner_rows_with_context(
             if failed_action_candidate is not None:
                 recovery_action_task = failed_action_candidate
                 recovery_leaf_task = failed_action_candidate
-            elif lifecycle_action_task is None and scoped_failed_leaves:
+            elif scoped_failed_leaves:
                 recovery_leaf_task = max(
                     scoped_failed_leaves,
                     key=lambda task: (_task_event_time(task), task_id_numeric_key(task.id)),
                 )
-                recovery_action_task = recovery_leaf_task
+                if lifecycle_action_task is None:
+                    recovery_action_task = recovery_leaf_task
             if planning_task is None:
                 planning_task = recovery_action_task
             action: dict[str, Any] | None = None

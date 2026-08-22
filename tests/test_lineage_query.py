@@ -180,6 +180,7 @@ def test_failed_leaf_with_terminal_merged_unit_skips_live_git_proof(
     git = _ExplodingLineageGit()
     with caplog.at_level("WARNING"):
         visible = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+            store=store,
             failed_task=failed,
             completed_owner=owner,
             owner_merge_unit=owner_merge_unit,
@@ -2612,7 +2613,7 @@ def test_query_lineage_owner_rows_reroots_same_unit_failed_leaf_when_proof_unava
     assert row.recovery_action_task.id == failed_leaf.id
 
 
-def test_query_lineage_owner_rows_hides_merged_owner_with_failed_review_leaf(
+def test_query_lineage_owner_rows_reroots_branchless_failed_review_leaf_under_merged_owner(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -2660,7 +2661,10 @@ def test_query_lineage_owner_rows_hides_merged_owner_with_failed_review_leaf(
         target_branch="main",
     )
 
-    assert rows == ()
+    assert len(rows) == 1
+    assert rows[0].owner_task.id == failed_review.id
+    assert rows[0].recovery_leaf_task is not None
+    assert rows[0].recovery_leaf_task.id == failed_review.id
 
 
 def test_query_lineage_owner_rows_keeps_unmerged_owner_with_failed_review_leaf(
@@ -3127,7 +3131,7 @@ def test_query_lineage_owner_rows_hides_empty_owner_with_failed_same_branch_desc
     )
 
     assert rows == ()
-    assert ("has_non_empty_source_diff_against_target", f"{impl.branch}->main") in git.probes
+    assert git.probes == []
 
 
 def test_query_lineage_owner_rows_hides_terminal_owner_with_moot_failed_implement_leaf(
@@ -3185,8 +3189,7 @@ def test_query_lineage_owner_rows_hides_terminal_owner_with_moot_failed_implemen
     )
 
     assert rows == ()
-    assert ("count_commits_ahead_checked", f"{owner.branch}->main") in git.probes
-    assert ("has_non_empty_source_diff_against_target", f"{owner.branch}->main") in git.probes
+    assert git.probes == []
 
 
 def test_query_lineage_owner_rows_keeps_empty_failed_owner_visible_for_recovery_lane(
@@ -5284,11 +5287,12 @@ def test_failed_leaf_unique_unmerged_work_short_circuits_terminal_leaf_even_with
     with (
         caplog.at_level("WARNING", logger="gza.lineage_query"),
         patch(
-            "gza.lineage_query.classify_branch_merge_state_for_target",
+            "gza.recovery_engine.classify_branch_merge_state_for_target",
             side_effect=AssertionError("terminal leaf should short-circuit before classify"),
         ) as classify,
     ):
         result = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+            store=store,
             failed_task=failed_leaf,
             completed_owner=owner,
             owner_merge_unit=owner_unit,
@@ -5359,10 +5363,10 @@ def test_failed_rebase_contributor_under_terminal_owner_suppresses_after_live_te
     with (
         caplog.at_level("WARNING", logger="gza.lineage_query"),
         patch(
-            "gza.lineage_query.classify_branch_merge_state_for_target",
+            "gza.recovery_engine.classify_branch_merge_state_for_target",
             return_value=BranchMergeClassification(
                 state="merged",
-                reason="merged-proof",
+                reason="content-equivalent-with-commits",
                 source_ref=str(failed_rebase.branch),
                 target_ref="main",
                 source_sha="source-sha",
@@ -5371,6 +5375,7 @@ def test_failed_rebase_contributor_under_terminal_owner_suppresses_after_live_te
         ) as classify,
     ):
         result = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+            store=store,
             failed_task=failed_rebase,
             completed_owner=owner,
             owner_merge_unit=owner_unit,
@@ -5499,6 +5504,184 @@ class _MinimalGit(Git):
         if self._resolved_merge_source_ref is not None:
             return ResolvedMergeSourceRef(self._resolved_merge_source_ref)
         return ResolvedMergeSourceRef(branch if branch in self._branches else None)
+
+
+class _NoWorkLineageGit(_MinimalGit):
+    def __init__(self, *, branch: str) -> None:
+        super().__init__(branches=frozenset({branch}))
+        self.ahead_probes: list[tuple[str, str]] = []
+        self.diff_probes: list[tuple[str, str]] = []
+
+    def count_commits_ahead_checked(self, source_ref: str, target_ref: str) -> int | None:  # type: ignore[override]
+        self.ahead_probes.append((source_ref, target_ref))
+        return 0
+
+    def count_commits_ahead(self, source_ref: str, target_ref: str) -> int | None:  # type: ignore[override]
+        self.ahead_probes.append((source_ref, target_ref))
+        return 0
+
+    def has_non_empty_source_diff_against_target(self, source_ref: str, target: str) -> bool | None:
+        self.diff_probes.append((source_ref, target))
+        return False
+
+
+def _terminal_owner_self_owned_unmerged_no_work_case(
+    tmp_path: Path,
+    *,
+    merge_state: str,
+    with_execution_evidence: bool,
+) -> tuple[SqliteTaskStore, DbTask, _NoWorkLineageGit]:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = store.add("Merged terminal owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime(2026, 8, 22, 8, 0, tzinfo=UTC)
+    owner.branch = "feature/terminal-owner-live-no-work"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+        head_sha=f"{owner.branch}-sha",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed = store.add(
+        f"Failed leaf live {merge_state}",
+        task_type="implement",
+        based_on=owner.id,
+        recovery_origin="manual",
+    )
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "TERMINAL_NO_WORK"
+    failed.session_id = f"sess-live-{merge_state}"
+    failed.branch = f"feature/failed-leaf-live-{merge_state}"
+    failed.has_commits = merge_state == "redundant"
+    if with_execution_evidence:
+        failed.num_steps_computed = 2
+    else:
+        failed.num_steps_computed = 0
+        failed.num_steps_reported = 0
+        failed.output_tokens = 0
+    failed.completed_at = datetime(2026, 8, 22, 9, 0, tzinfo=UTC)
+    store.update(failed)
+    leaf_unit = store.create_merge_unit(
+        source_branch=failed.branch,
+        target_branch="main",
+        owner_task_id=failed.id,
+        state="unmerged",
+        head_sha=f"{failed.branch}-sha",
+    )
+    store.attach_task_to_merge_unit(failed.id, leaf_unit.id, "owner")
+    return store, failed, _NoWorkLineageGit(branch=failed.branch)
+
+
+@pytest.mark.parametrize("merge_state", ["empty", "redundant"])
+def test_terminal_owner_self_owned_unmerged_live_no_work_keeps_executed_failed_leaf_visible(
+    tmp_path: Path,
+    merge_state: str,
+) -> None:
+    store, failed, git = _terminal_owner_self_owned_unmerged_no_work_case(
+        tmp_path,
+        merge_state=merge_state,
+        with_execution_evidence=True,
+    )
+
+    assert [task.id for task in list_failed_tasks_for_recovery(store, git=git, target_branch="main")] == [failed.id]
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        git=git,
+        target_branch="main",
+        persist_post_merge_rebase_state=False,
+        persist_review_clearance=False,
+    )
+
+    assert [row.owner_task.id for row in rows] == [failed.id]
+    assert rows[0].recovery_leaf_task == failed
+    assert rows[0].unresolved_tasks == (failed,)
+
+
+@pytest.mark.parametrize("merge_state", ["empty", "redundant"])
+def test_terminal_owner_self_owned_unmerged_live_no_work_keeps_never_executed_failed_leaf_visible(
+    tmp_path: Path,
+    merge_state: str,
+) -> None:
+    store, failed, git = _terminal_owner_self_owned_unmerged_no_work_case(
+        tmp_path,
+        merge_state=merge_state,
+        with_execution_evidence=False,
+    )
+
+    assert [task.id for task in list_failed_tasks_for_recovery(store, git=git, target_branch="main")] == [failed.id]
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
+        git=git,
+        target_branch="main",
+        persist_post_merge_rebase_state=False,
+        persist_review_clearance=False,
+    )
+
+    assert [row.owner_task.id for row in rows] == [failed.id]
+    assert rows[0].recovery_leaf_task == failed
+    assert rows[0].unresolved_tasks == (failed,)
+
+
+@pytest.mark.parametrize("merge_state", ["empty", "redundant"])
+def test_failed_leaf_store_backed_self_owned_unmerged_short_circuits_live_no_work_classification(
+    tmp_path: Path,
+    merge_state: str,
+) -> None:
+    store, failed, git = _terminal_owner_self_owned_unmerged_no_work_case(
+        tmp_path,
+        merge_state=merge_state,
+        with_execution_evidence=True,
+    )
+    owner = store.get(failed.based_on)
+    assert owner is not None
+    owner_unit = store.resolve_merge_unit_for_task(owner.id)
+    leaf_unit = store.resolve_merge_unit_for_task(failed.id)
+    assert owner_unit is not None
+    assert leaf_unit is not None
+    cache = {}
+
+    with patch(
+        "gza.recovery_engine.classify_branch_merge_state_for_target",
+        wraps=recovery_engine.classify_branch_merge_state_for_target,
+    ) as classify:
+        first = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+            store=store,
+            failed_task=failed,
+            completed_owner=owner,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=leaf_unit,
+            git=git,
+            target_branch="main",
+            classification_cache=cache,
+        )
+        second = _failed_leaf_has_unique_unmerged_work_under_terminal_owner(
+            store=store,
+            failed_task=failed,
+            completed_owner=owner,
+            owner_merge_unit=owner_unit,
+            leaf_merge_unit=leaf_unit,
+            git=git,
+            target_branch="main",
+            classification_cache=cache,
+        )
+
+    assert first is True
+    assert second is True
+    assert classify.call_count == 0
 
 
 def test_query_lineage_owner_rows_does_not_call_load_merge_context_when_git_provided(
@@ -5765,7 +5948,10 @@ def test_query_lineage_owner_rows_short_circuits_attached_member_when_owner_unit
         LineageOwnerQuery(limit=None, include_skipped=True, max_recovery_attempts=1),
     )
 
-    assert {row.owner_task.id for row in rows if row.owner_task.id is not None} == {live_failed.id}
+    assert {row.owner_task.id for row in rows if row.owner_task.id is not None} == {
+        attached_failed.id,
+        live_failed.id,
+    }
     assert read_context_calls == []
     assert store_calls == []
     assert attached_failed.id not in read_context_calls
@@ -5860,24 +6046,15 @@ def test_query_lineage_owner_rows_seeded_git_drives_same_suppression_as_non_seed
     )
 
 
-def test_query_lineage_owner_rows_seeded_git_proven_merged_suppresses_without_landed_sibling(
+def test_query_lineage_owner_rows_seeded_git_reachability_only_merged_keeps_failed_owner_visible(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Seeded git that proves a branch merged suppresses the failed owner even with no
-    landed-sibling DB row, directly exercising build_merge_context_from_git's
-    existing_branches/is_merged wiring.
+    """Seeded git reachability alone must not suppress a failed owner.
 
-    This is the complement of test_query_lineage_owner_rows_seeded_git_drives_same_suppression_as_non_seeded:
-    that test covers the lineage-scan fallback (is_merged→False); this one covers the
-    git-proven-merged path (is_merged→True) so a regression in that specific wiring
-    (e.g. existing_branches populated incorrectly or wrong default_branch) cannot be
-    masked by an incidental landed-sibling lineage-scan hit.
-
-    _load_merge_context is patched to raise to confirm the seeded merge context is the
-    sole source of merge truth.  A baseline pass with the branch absent from
-    existing_branches proves the task does appear in results when the git path cannot
-    confirm the merge, so the suppression assertion is non-trivial."""
+    The seeded path still exercises build_merge_context_from_git's existing_branches/is_merged
+    wiring, but rev/commit/diff provenance is unavailable. R5 requires this to stay
+    visible because reachability is not affirmative landed proof by itself."""
     setup_config(tmp_path)
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -5909,16 +6086,15 @@ def test_query_lineage_owner_rows_seeded_git_proven_merged_suppresses_without_la
     )
     store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
 
-    # No landed-sibling DB row: the only suppression evidence must be the seeded git path.
+    # No landed-sibling DB row: the only possible evidence is reachability from seeded git.
 
     class _MergedBranchGit(_MinimalGit):
         """Variant that reports the task branch as merged and returns it as its own source ref.
 
         resolve_fresh_merge_source returns the branch itself (not ResolvedMergeSourceRef(None))
         so that classify_branch_merge_state_for_target has a non-None source_ref and reaches
-        the merged_proof path.  rev_parse_if_exists and count_commits_ahead_checked return None
-        so no subprocess is invoked — classify_proven_merged_state then defaults to
-        state="merged", which is what drives suppression in _is_resolved_by_landed_lineage."""
+            the merged_proof path. rev_parse_if_exists and count_commits_ahead_checked return None
+            so the seeded path has reachability evidence but no landed contribution proof."""
 
         def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
             return branch == failed.branch
@@ -5955,7 +6131,7 @@ def test_query_lineage_owner_rows_seeded_git_proven_merged_suppresses_without_la
         "from existing_branches (git cannot confirm merge, no landed sibling in DB)"
     )
 
-    # Seeded git-proven path: patch _load_merge_context to raise, proving the seeded
+    # Seeded reachability path: patch _load_merge_context to raise, proving the seeded
     # context is the sole source of merge truth.
     def _raise_if_called(_project_dir=None):
         raise AssertionError("_load_merge_context was called even though git + target_branch were pre-seeded")
@@ -5976,9 +6152,9 @@ def test_query_lineage_owner_rows_seeded_git_proven_merged_suppresses_without_la
         if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
     }
 
-    assert failed.id not in failed_ids_git_proven, (
-        "seeded git path: failed owner should be suppressed when is_merged proves the "
-        "task branch merged into main, even with no landed-sibling DB row"
+    assert failed.id in failed_ids_git_proven, (
+        "seeded git path: failed owner should remain visible when is_merged is the only "
+        "available evidence and no landed-sibling DB row exists"
     )
 
 

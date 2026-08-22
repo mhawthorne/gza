@@ -41769,6 +41769,7 @@ def test_cmd_watch_restart_failed_dry_run_suppresses_failed_sidequests_with_merg
     failed_review = store.add("Failed review", task_type="review", depends_on=merged_impl.id, based_on=merged_impl.id)
     failed_review.status = "failed"
     failed_review.failure_reason = "MISSING_REPORT_ARTIFACT"
+    failed_review.has_commits = False
     failed_review.completed_at = datetime(2026, 4, 28, 10, 2, 0, tzinfo=UTC)
     store.update(failed_review)
 
@@ -41784,12 +41785,14 @@ def test_cmd_watch_restart_failed_dry_run_suppresses_failed_sidequests_with_merg
     )
     failed_improve.status = "failed"
     failed_improve.failure_reason = "GIT_ERROR"
+    failed_improve.has_commits = False
     failed_improve.completed_at = datetime(2026, 4, 28, 10, 3, 0, tzinfo=UTC)
     store.update(failed_improve)
 
     failed_rebase = store.add("Failed rebase", task_type="rebase", based_on=merged_impl.id)
     failed_rebase.status = "failed"
     failed_rebase.failure_reason = "INTERRUPTED"
+    failed_rebase.has_commits = False
     failed_rebase.completed_at = datetime(2026, 4, 28, 10, 4, 0, tzinfo=UTC)
     store.update(failed_rebase)
 
@@ -42469,7 +42472,7 @@ def test_watch_scoped_stale_same_unit_leaf_live_reroot_keeps_scope_active(
         leaf.status = "failed"
         leaf.failure_reason = "WORKER_DIED"
         leaf.branch = f"feature/scoped-stale-leaf-{index}"
-        leaf.has_commits = False
+        leaf.has_commits = True
         leaf.completed_at = datetime(2026, 4, 28, 10, index, 0, tzinfo=UTC)
         store.update(leaf)
         store.attach_task_to_merge_unit(leaf.id, owner_unit.id, "contributor")
@@ -42581,7 +42584,7 @@ def test_watch_scoped_stale_same_unit_leaf_live_reroot_keeps_scope_active(
         max_recovery_attempts=1,
         config=config,
     )
-    assert scoped_owner_ids == (owner.id,)
+    assert scoped_owner_ids == (selected_leaf.id,)
 
     live_git = _LiveUnmergedLeafGit(tmp_path)
     scoped_closure = watch_module._scoped_selector_recovery_closure_by_owner(
@@ -42593,7 +42596,7 @@ def test_watch_scoped_stale_same_unit_leaf_live_reroot_keeps_scope_active(
         target_branch="main",
         max_recovery_attempts=1,
     )
-    assert scoped_closure == {owner.id: frozenset({selected_leaf.id, selected_recovery.id})}
+    assert scoped_closure == {selected_leaf.id: frozenset({selected_leaf.id, selected_recovery.id})}
 
     def fake_git_subprocess_run(args: object, **_kwargs: object) -> SimpleNamespace:
         if (
@@ -43525,6 +43528,7 @@ def test_collect_unhandled_failures_restart_failed_suppresses_merged_target_side
     assert hidden_review.id is not None
     hidden_review.status = "failed"
     hidden_review.failure_reason = "MISSING_REPORT_ARTIFACT"
+    hidden_review.has_commits = False
     hidden_review.completed_at = datetime.now(UTC)
     store.update(hidden_review)
 
@@ -44855,6 +44859,7 @@ def test_cmd_watch_restart_failed_suppresses_merged_target_sidequest_failure(tmp
     assert failed_review.id is not None
     failed_review.status = "failed"
     failed_review.failure_reason = "MISSING_REPORT_ARTIFACT"
+    failed_review.has_commits = False
     failed_review.completed_at = datetime.now(UTC)
     store.update(failed_review)
 

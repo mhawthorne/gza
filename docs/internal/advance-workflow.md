@@ -483,7 +483,7 @@ When the recovery lane is active:
 - Implement recovery launches through iterate-aware execution; non-implement recovery launches through plain worker execution
 - `gza watch --recovery-only --dry-run` prints the failed-task recovery decision report, including shared `Needs attention` rows by default, and exits
 - Fully recovered failed ancestors are omitted from that report and from live watch recovery logs; only unresolved failed tasks and their completed recovery descendants remain visible through the normal advance plan
-- Failed `review` / `improve` / `rebase` rows whose structured target implementation is already merged are omitted from live recovery-lane failure transition output and do not contribute to backoff or halt streaks
+- Failed `review` / `improve` / `rebase` rows whose structured target implementation is already merged are omitted from live recovery-lane failure transition output only when the shared recovery classifier has affirmative landed proof or explicit historical no-work proof. Same-branch/shared-unit leaves with unknown commit metadata, persisted self-owned active `unmerged` side quests, distinct unmerged side quests, and session-backed recoverable `empty` / `redundant` leaves remain visible to recovery, owner rows, and scoped watch planning, and still contribute to the relevant recovery/backoff decisions.
 - `--max-resume-attempts` applies to all unattended watch-managed resume/retry decisions for that run, including plain watch, failed-task recovery, and advance-driven improve recovery
 
 Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to `--recovery-only`, `--restart-failed-batch` maps to `--recovery-slots`, and `watch.restart_failed_batch` maps to `watch.recovery_slots`.
