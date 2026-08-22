@@ -2161,7 +2161,7 @@ The first watch pass still requires confirmation unless you pass `--yes` / `-y`.
 
 Multiline watch log messages are rendered with continuation indentation so wake, repair, and recovery output stays readable in both stdout and `.gza/watch.log`. `WAKE` lines now include a `live workers:` block when running workers can be identified, listing active task IDs and any anonymous workers that do not currently map to a live task row.
 
-Watch-surfaced merge and rebase failure blocks include the merge subject task ID and source branch on the error, abort, and abort-warning lines so concurrent merge-lane failures can be triaged without reverse-mapping a branch name by hand.
+Watch-surfaced ordinary merge and rebase failure blocks include the merge subject task ID and source branch on the non-resolve error, abort, and abort-warning lines so concurrent merge-lane failures can be triaged without reverse-mapping a branch name by hand.
 
 When watch detects that the installed `gza` package fingerprint has changed since startup, it logs the drift immediately and, by default, re-execs itself at the next cycle boundary without waiting for running or pending work to drain. Detached workers keep running, and the replacement watch process reconciles them after it auto-resumes. The re-exec is treated as a continuation of the already-approved watch session, so it skips the first-pass confirmation prompt. Pass `--no-auto-restart-on-drift` to keep the manual-restart warning instead.
 

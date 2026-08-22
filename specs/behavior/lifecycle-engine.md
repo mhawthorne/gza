@@ -736,8 +736,8 @@ failure *and* actionable merge/review work remains eligible for the latter.
   than collapsing it into a generic merge failure.
 - An ordinary merge or rebase operation failure emitted by the shared merge executor's
   non-resolve failure block MUST identify the merge subject task ID and source branch on
-  the primary error line, the abort line, and any abort-warning line, while preserving the
-  underlying git error text.
+  that block's primary error line, abort line, and abort-warning line, while preserving
+  the underlying git error text.
 
 Note: the "implementation unit with no review" rule above applies only when the
 implementation still has reviewable commits or diff against the target. Terminal
