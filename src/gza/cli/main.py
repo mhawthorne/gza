@@ -59,6 +59,8 @@ from .config_cmds import (
     cmd_stats,
     cmd_sync_report,
     cmd_validate,
+    schema_integrity_error_description,
+    selected_project_migrate_command,
 )
 from .execution import (
     cmd_add,
@@ -140,6 +142,13 @@ def _parse_search_last(value: str) -> int:
     if parsed < 0:
         raise argparse.ArgumentTypeError("--last must be >= 0 (use 0 for all matches)")
     return parsed
+
+
+def _selected_project_migrate_command(args: argparse.Namespace) -> str:
+    project_dir = getattr(args, "project_dir", None)
+    if isinstance(project_dir, Path):
+        return selected_project_migrate_command(project_dir)
+    return "uv run gza migrate"
 
 
 def _parse_non_negative_int(value: str) -> int:
@@ -3465,7 +3474,10 @@ def main() -> int:
         return _keyboard_interrupt_exit()
     except ManualMigrationRequired as e:
         print(f"Error: {e}", file=sys.stderr)
-        print("Run 'uv run gza migrate' to upgrade the database.", file=sys.stderr)
+        print(
+            f"Run '{_selected_project_migrate_command(args)}' to upgrade the database.",
+            file=sys.stderr,
+        )
         return 1
     except ConfigError as e:
         print(f"Error: {e}", file=sys.stderr)
@@ -3477,9 +3489,11 @@ def main() -> int:
         print(f"Error: {e}", file=sys.stderr)
         return 1
     except SchemaIntegrityError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        message = schema_integrity_error_description(str(e))
+        print(f"Error: {message}", file=sys.stderr)
         print(
-            "Run 'uv run gza migrate' with a writable database (or restore schema artifacts), then retry.",
+            f"Run '{_selected_project_migrate_command(args)}' with a writable database "
+            "(or restore schema artifacts), then retry.",
             file=sys.stderr,
         )
         return 1

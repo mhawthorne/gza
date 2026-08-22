@@ -1200,6 +1200,35 @@ def test_projects_deactivate_current_refusal_quotes_register_repair_command(
     )
 
 
+def test_projects_deactivate_current_refusal_scopes_all_repair_commands_to_explicit_project(
+    tmp_path: Path,
+) -> None:
+    cwd_project = tmp_path / "project-a"
+    target_project = tmp_path / "project b with 'quote' and $semi;"
+    cwd_db = tmp_path / "a.db"
+    target_db = tmp_path / "target.db"
+    _write_project_config(cwd_project, project_name="A", project_id="a", db_path=cwd_db)
+    _write_project_config(target_project, project_name="B", project_id="b", db_path=target_db)
+    SqliteTaskStore.from_config(Config.load(cwd_project))
+    SqliteTaskStore.from_config(Config.load(target_project))
+    before_cwd = _db_snapshot(cwd_db)
+    before_target = _db_snapshot(target_db)
+    expected_project = shlex.quote(str(target_project.resolve()))
+    expected_diagnose = f"uv run gza projects diagnose --project {expected_project}"
+    expected_register = f"uv run gza projects register --project {expected_project} --replace"
+    wrong_project = shlex.quote(str(cwd_project.resolve()))
+
+    result = invoke_gza("projects", "deactivate", "b", "--project", str(target_project), cwd=cwd_project)
+
+    assert result.returncode == 1
+    assert expected_diagnose in result.stdout
+    assert expected_register in result.stdout
+    assert f"uv run gza projects diagnose --project {wrong_project}" not in result.stdout
+    assert "uv run gza projects diagnose' first" not in result.stdout
+    assert _db_snapshot(cwd_db) == before_cwd
+    assert _db_snapshot(target_db) == before_target
+
+
 def test_projects_register_anchor_path_writes_target_to_anchor_registry(tmp_path: Path) -> None:
     db_path = tmp_path / "shared.db"
     anchor_dir = tmp_path / "anchor"
@@ -1623,6 +1652,118 @@ def test_projects_current_schema_refusal_keeps_explicit_target_project_in_comman
     assert expected in result.stdout
     assert wrong_anchor not in result.stdout
     assert "uv run gza migrate' from the project root" not in result.stdout
+    assert _db_snapshot(target_db) == before_target
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "expected_error"),
+    [
+        (24, "requires manual migration"),
+        (SCHEMA_VERSION, "missing required table"),
+    ],
+)
+def test_global_migration_refusals_scope_migrate_command_to_explicit_project_without_duplicates(
+    tmp_path: Path,
+    schema_version: int,
+    expected_error: str,
+) -> None:
+    cwd_project = tmp_path / "project-a"
+    target_project = tmp_path / "project b with 'quote' and $semi;"
+    cwd_db = tmp_path / "a.db"
+    target_db = tmp_path / "target.db"
+    _write_project_config(cwd_project, project_name="A", project_id="a", db_path=cwd_db)
+    _write_project_config(target_project, project_name="B", project_id="b", db_path=target_db)
+    SqliteTaskStore.from_config(Config.load(cwd_project))
+    with sqlite3.connect(target_db) as conn:
+        conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (schema_version,))
+    before_cwd = _db_snapshot(cwd_db)
+    before_target = _db_snapshot(target_db)
+    expected_project = shlex.quote(str(target_project.resolve()))
+    expected = f"uv run gza migrate --project {expected_project}"
+    wrong_anchor = f"uv run gza migrate --project {shlex.quote(str(cwd_project.resolve()))}"
+
+    result = invoke_gza("next", "--project", str(target_project), cwd=cwd_project)
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 1
+    assert expected_error in output
+    assert output.count("uv run gza migrate") == 1
+    assert expected in output
+    assert wrong_anchor not in output
+    assert "uv run gza migrate' to upgrade" not in output
+    assert "uv run gza migrate' with a writable database" not in output
+    assert _db_snapshot(cwd_db) == before_cwd
+    assert _db_snapshot(target_db) == before_target
+
+
+def test_global_schema_integrity_handler_suppresses_embedded_bare_migrate_guidance(
+    tmp_path: Path,
+) -> None:
+    cwd_project = tmp_path / "project-a"
+    target_project = tmp_path / "project b with 'quote' and $semi;"
+    cwd_db = tmp_path / "a.db"
+    target_db = tmp_path / "target.db"
+    _write_project_config(cwd_project, project_name="A", project_id="a", db_path=cwd_db)
+    _write_project_config(target_project, project_name="B", project_id="b", db_path=target_db)
+    SqliteTaskStore.from_config(Config.load(cwd_project))
+    SqliteTaskStore.from_config(Config.load(target_project))
+    before_cwd = _db_snapshot(cwd_db)
+    before_target = _db_snapshot(target_db)
+    expected = f"uv run gza migrate --project {shlex.quote(str(target_project.resolve()))}"
+
+    with patch(
+        "gza.cli.main.cmd_next",
+        side_effect=SchemaIntegrityError(
+            "Registry mutation requires current projects schema; missing column projects.root_path. "
+            "Run 'uv run gza migrate' from the project root, then retry."
+        ),
+    ):
+        result = invoke_gza("next", "--project", str(target_project), cwd=cwd_project)
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 1
+    assert "missing column projects.root_path" in output
+    assert output.count("uv run gza migrate") == 1
+    assert expected in output
+    assert "uv run gza migrate' from the project root" not in output
+    assert _db_snapshot(cwd_db) == before_cwd
+    assert _db_snapshot(target_db) == before_target
+
+
+def test_global_schema_integrity_handler_neutralizes_generic_only_migrate_guidance(
+    tmp_path: Path,
+) -> None:
+    cwd_project = tmp_path / "project-a"
+    target_project = tmp_path / "project b with 'quote' and $semi;"
+    cwd_db = tmp_path / "a.db"
+    target_db = tmp_path / "target.db"
+    _write_project_config(cwd_project, project_name="A", project_id="a", db_path=cwd_db)
+    _write_project_config(target_project, project_name="B", project_id="b", db_path=target_db)
+    SqliteTaskStore.from_config(Config.load(cwd_project))
+    SqliteTaskStore.from_config(Config.load(target_project))
+    before_cwd = _db_snapshot(cwd_db)
+    before_target = _db_snapshot(target_db)
+    expected = f"uv run gza migrate --project {shlex.quote(str(target_project.resolve()))}"
+    wrong_anchor = f"uv run gza migrate --project {shlex.quote(str(cwd_project.resolve()))}"
+
+    with patch(
+        "gza.cli.main.cmd_next",
+        side_effect=SchemaIntegrityError(
+            "Run 'uv run gza migrate' from the project root, then retry."
+        ),
+    ):
+        result = invoke_gza("next", "--project", str(target_project), cwd=cwd_project)
+    output = result.stdout + result.stderr
+
+    assert result.returncode == 1
+    assert "Database schema integrity check failed." in output
+    assert output.count("uv run gza migrate") == 1
+    assert expected in output
+    assert wrong_anchor not in output
+    assert "Run 'uv run gza migrate' from the project root" not in output
+    assert "uv run gza migrate' with a writable database" not in output
+    assert _db_snapshot(cwd_db) == before_cwd
     assert _db_snapshot(target_db) == before_target
 
 

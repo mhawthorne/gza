@@ -266,6 +266,14 @@ def _precheck_register_conflict(
 _GENERIC_MIGRATE_GUIDANCE_RE = re.compile(r"\s*(?:Run|run) 'uv run gza migrate'[^.]*\.", re.IGNORECASE)
 
 
+def strip_generic_migrate_guidance(message: str) -> str:
+    return _GENERIC_MIGRATE_GUIDANCE_RE.sub("", message).strip()
+
+
+def schema_integrity_error_description(message: str) -> str:
+    return strip_generic_migrate_guidance(message) or "Database schema integrity check failed."
+
+
 def _shell_path(path: Path) -> str:
     return shlex.quote(str(path))
 
@@ -274,6 +282,14 @@ def _registry_migrate_command(project_dir: Path | None) -> str:
     if project_dir is None:
         return "uv run gza migrate"
     return f"uv run gza migrate --project {_shell_path(project_dir)}"
+
+
+def selected_project_migrate_command(project_dir: Path) -> str:
+    return _registry_migrate_command(project_dir)
+
+
+def selected_project_diagnose_command(project_dir: Path) -> str:
+    return f"uv run gza projects diagnose --project {_shell_path(project_dir)}"
 
 
 def _registry_register_replace_command(project_dir: Path) -> str:
@@ -287,11 +303,12 @@ def _registry_cli_error(exc: Exception, *, project_dir: Path | None = None) -> s
         versions_str = ", ".join(f"v{version}" for version in exc.pending_versions)
         return f"Database requires manual migration(s): {versions_str}. Run '{migrate_command}' to upgrade."
     if "requires manual migration" in message.lower():
-        cleaned_message = _GENERIC_MIGRATE_GUIDANCE_RE.sub("", message).strip()
-        return f"{cleaned_message} Run '{migrate_command}' to upgrade."
+        cleaned_message = strip_generic_migrate_guidance(message)
+        description = cleaned_message or "Database requires a manual migration."
+        return f"{description} Run '{migrate_command}' to upgrade."
     if isinstance(exc, SchemaIntegrityError) and "uv run gza migrate" in message:
-        cleaned_message = _GENERIC_MIGRATE_GUIDANCE_RE.sub("", message).strip()
-        return f"{cleaned_message} Run '{migrate_command}' to upgrade the selected registry database, then retry."
+        description = schema_integrity_error_description(message)
+        return f"{description} Run '{migrate_command}' to upgrade the selected registry database, then retry."
     if isinstance(exc, SchemaIntegrityError) and (
         "automatic migrations" in message.lower()
         or "requires database schema" in message.lower()
@@ -304,10 +321,11 @@ def _registry_cli_error(exc: Exception, *, project_dir: Path | None = None) -> s
 
 
 def _current_project_deactivation_error(project_dir: Path) -> str:
+    diagnose_command = selected_project_diagnose_command(project_dir)
     register_command = _registry_register_replace_command(project_dir)
     return (
         "Error: refusing to deactivate the currently selected project registry row. "
-        "Run 'uv run gza projects diagnose' first if this row is invalid, "
+        f"Run '{diagnose_command}' first if this row is invalid, "
         f"or run '{register_command}' to intentionally replace it with the canonical path."
     )
 

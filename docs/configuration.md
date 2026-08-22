@@ -2249,7 +2249,7 @@ Task IDs start at `{prefix}-1` for new databases (there is no `{prefix}-0`) and 
 
 Task ID validation is format-based (`{prefix}-{decimal}`) and does not require the prefix to match your current `project_prefix`. A mismatched but valid full ID is accepted by parsing and then fails later as "not found" if it does not exist in the current project database.
 
-If a `ManualMigrationRequired` error appears when running any other command, run `uv run gza migrate` to upgrade the database schema.
+If a `ManualMigrationRequired` error appears when running any other command, migrate the selected project database. When the selected project may differ from your current working directory, include the same project path in the migration command, for example `uv run gza migrate --project PATH`.
 
 When shared DB mode is active (explicit `db_path`) and a legacy local `.gza/gza.db` is detected, task commands stop with an explicit message until you either run `uv run gza migrate --import-local-db` or pin the project back to local with `db_path: .gza/gza.db`.
 

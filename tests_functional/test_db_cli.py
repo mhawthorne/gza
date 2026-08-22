@@ -1,6 +1,7 @@
 """Subprocess CLI regression tests for DB import and migration flows."""
 
 import os
+import shlex
 import sqlite3
 from pathlib import Path
 
@@ -653,5 +654,7 @@ class TestSharedDbImportCli:
 
         assert result.returncode == 1
         assert "Database requires manual migration(s): v25" in result.stderr
-        assert "Run 'uv run gza migrate' to upgrade the database." in result.stderr
+        expected_command = f"uv run gza migrate --project {shlex.quote(str(project_dir.resolve()))}"
+        assert f"Run '{expected_command}' to upgrade the database." in result.stderr
+        assert "Run 'uv run gza migrate' to upgrade the database." not in result.stderr
         assert "Traceback" not in result.stderr

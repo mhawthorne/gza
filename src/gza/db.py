@@ -1584,14 +1584,14 @@ def _coalesce_task_timestamp(*timestamps: datetime | None) -> datetime:
 class ManualMigrationRequired(Exception):
     """Raised when the DB needs a manual schema migration (e.g. v25/v26).
 
-    Callers should run ``uv run gza migrate`` (or call the relevant manual migration)
-    and then re-open the store.
+    CLI callers should render remediation commands with their resolved selected
+    project directory and then re-open the store.
     """
 
     def __init__(self, pending_versions: list[int]) -> None:
         self.pending_versions = pending_versions
         versions_str = ", ".join(f"v{v}" for v in pending_versions)
-        super().__init__(f"Database requires manual migration(s): {versions_str}. Run 'uv run gza migrate' to upgrade.")
+        super().__init__(f"Database requires manual migration(s): {versions_str}.")
 
 
 def _compute_percentiles(values: list[float]) -> dict | None:
