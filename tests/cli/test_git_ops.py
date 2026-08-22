@@ -1495,6 +1495,82 @@ def test_merge_single_task_mark_only_materializes_blockers_before_marking_merged
     assert refreshed_unit.merge_source == "manual_force"
 
 
+def test_merge_single_task_mark_only_defer_blockers_refuses_spec_coherence_changes_requested_review(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement mark-only spec coherence blocker path", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/mark-only-spec-coherence-blocker"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+
+    review = store.add(f"Spec coherence review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.review_scope = "\n".join(
+        (
+            "Review mode: spec-coherence",
+            f"Implementation task: {task.id}",
+            "Reviewed head SHA: reviewed-head",
+            'Changed behavior-spec paths JSON: ["specs/behavior/lifecycle-engine.md"]',
+        )
+    )
+    review.report_file = _write_review_report(
+        tmp_path,
+        name=f"{task.id}-mark-only-spec-coherence-review.md",
+        content=_changes_requested_review_with_blocker(
+            title="Spec and code disagree",
+            evidence="The behavior spec says this gate must remain actionable.",
+            required_fix="keep the spec-coherence improve gate intact.",
+        ),
+    )
+    store.update(review)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=True,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+    config = Config.load(tmp_path)
+
+    with patch("gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks") as materialize:
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    materialize.assert_not_called()
+    assert not store.get_based_on_children(review.id)
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state != "merged"
+    assert refreshed_unit.merge_source != "manual_force"
+    output = capsys.readouterr().out
+    assert "behavior-spec coherence CHANGES_REQUESTED review" in output
+    assert "not deferable" in output
+
+
 def test_merge_single_task_mark_only_without_deferred_blockers_records_manual_source(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -2312,6 +2388,96 @@ def test_merge_single_task_defer_blockers_force_refuses_fresh_comments_improve_g
     output = capsys.readouterr().out
     assert "Error: Create improve task (unresolved comments newer than latest review)" in output
     assert "Warning: Forcing merge despite lifecycle gate" not in output
+
+
+def test_merge_single_task_force_defer_blockers_refuses_spec_coherence_review_after_needs_attention_gate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement force spec coherence blocker path", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/force-spec-coherence-blocker"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+
+    review = store.add(f"Spec coherence review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.review_scope = "\n".join(
+        (
+            "Review mode: spec-coherence",
+            f"Implementation task: {task.id}",
+            "Reviewed head SHA: reviewed-head",
+            'Changed behavior-spec paths JSON: ["specs/behavior/lifecycle-engine.md"]',
+        )
+    )
+    review.report_file = _write_review_report(
+        tmp_path,
+        name=f"{task.id}-force-spec-coherence-review.md",
+        content=_changes_requested_review_with_blocker(
+            title="Spec and code disagree",
+            evidence="The behavior spec says this gate must remain actionable.",
+            required_fix="keep the spec-coherence improve gate intact.",
+        ),
+    )
+    store.update(review)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    args = argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        force=True,
+        remote=False,
+        resolve=False,
+        defer_blockers=True,
+        no_followups=False,
+    )
+    config = Config.load(tmp_path)
+
+    with (
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={
+                "type": "parked",
+                "description": "Manual review required before merge",
+                "needs_attention_reason": "operator-review-required",
+                "subject_task_id": task.id,
+            },
+        ),
+        patch("gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks") as materialize,
+    ):
+        result = _merge_single_task(task.id, config, store, git, args, "main")
+
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    materialize.assert_not_called()
+    assert not store.get_based_on_children(review.id)
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state != "merged"
+    assert refreshed_unit.merge_source != "manual_force"
+    output = capsys.readouterr().out
+    assert "Warning: Forcing merge despite lifecycle gate: Manual review required before merge" in output
+    assert "behavior-spec coherence CHANGES_REQUESTED review" in output
+    assert "not deferable" in output
 
 
 def test_merge_single_task_defer_blockers_refuses_blocker_count_mismatch(

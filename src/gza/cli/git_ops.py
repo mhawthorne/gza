@@ -372,6 +372,20 @@ def _classify_manual_merge_blockers(
             should_materialize=False,
         )
 
+    if declares_spec_coherence_review_mode(review_task.review_scope):
+        assert merge_subject.id is not None
+        assert review_task.id is not None
+        return _MergeDeferredBlockerDecision(
+            review_task=review_task,
+            blockers=(),
+            should_materialize=False,
+            refusal_message=(
+                f"Error: Task {merge_subject.id} has behavior-spec coherence "
+                f"CHANGES_REQUESTED review {review_task.id}; review blockers from "
+                "behavior-spec coherence reviews are not deferable."
+            ),
+        )
+
     blockers = tuple(finding for finding in report.findings if finding.severity == "BLOCKER")
     if not blockers:
         assert merge_subject.id is not None
