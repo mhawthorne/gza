@@ -33,7 +33,10 @@ from gza.artifacts import store_command_output_artifact
 from gza.branch_publication import BranchPublicationState, persist_branch_publication_state
 from gza.canonical_checkout import CanonicalCheckoutStatus
 from gza.cli._common import reconcile_in_progress_tasks, set_task_queue_position_scoped
-from gza.cli._lifecycle_actions import should_execute_lifecycle_action as real_should_execute_lifecycle_action
+from gza.cli._lifecycle_actions import (
+    plan_lifecycle_execution,
+    should_execute_lifecycle_action as real_should_execute_lifecycle_action,
+)
 from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.cli.advance_engine import (
     PARK_REASON_IMPROVE_NO_OP,
@@ -381,6 +384,15 @@ def _task_count(store) -> int:
         row = conn.execute("SELECT COUNT(*) AS c FROM tasks").fetchone()
     assert row is not None
     return int(row["c"])
+
+
+def _set_task_urgent_bumped_at(store, task_id: str, bumped_at: datetime) -> None:
+    with store._connect() as conn:  # noqa: SLF001 - test helper for raw queue-order column
+        conn.execute(
+            "UPDATE tasks SET urgent_bumped_at = ? WHERE project_id = ? AND id = ?",
+            (bumped_at.isoformat(), store.project_id, task_id),
+        )
+        conn.commit()
 
 
 def _main_verify_environment_identity_payload() -> dict[str, str]:
@@ -977,6 +989,699 @@ def test_watch_project_runtime_analyze_cycle_matches_project_local_plan_without_
     assert store.get(excluded.id).status == "pending"
 
 
+def test_watch_project_runtime_direct_phase_reports_project_replan_after_direct_mutation(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    direct_task = store.add("Direct lifecycle task", task_type="implement")
+    assert direct_task.id is not None
+    direct_task.status = "completed"
+    direct_task.completed_at = datetime.now(UTC)
+    store.update(direct_task)
+    worker_task = store.add("Worker lifecycle task", task_type="implement")
+    assert worker_task.id is not None
+    worker_task.status = "completed"
+    worker_task.completed_at = datetime.now(UTC)
+    worker_task.branch = "feature/direct-phase-worker"
+    worker_task.has_commits = True
+    store.update(worker_task)
+    direct_row = LineageOwnerRow(
+        owner_task=direct_task,
+        members=(direct_task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="test-direct",
+        unresolved_tasks=(),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=direct_task,
+    )
+    worker_row = LineageOwnerRow(
+        owner_task=worker_task,
+        members=(worker_task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="test-worker",
+        unresolved_tasks=(),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=worker_task,
+    )
+    plan = _empty_scoped_watch_plan(slots=1)
+    plan = replace(
+        plan,
+        pending_count=1,
+        analysis=replace(
+            plan.analysis,
+            lifecycle_rows=(direct_row, worker_row),
+            action_plan=(
+                (direct_row, direct_task, {"type": "reconcile_verify_gate_evidence"}),
+                (worker_row, worker_task, {"type": "create_review", "description": "Create review"}),
+            ),
+        ),
+    )
+    config = Config.load(tmp_path)
+    runtime = WatchProjectRuntime.create(
+        key="core",
+        config=config,
+        store=store,
+        log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+
+    with (
+        patch(
+            "gza.cli.watch._run_watch_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch._finalize_watch_no_progress_after_execution", return_value=None),
+        patch("gza.cli.watch.execute_advance_action") as execute_action,
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("pending worker started")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("pending worker started")),
+    ):
+        execute_action.return_value = AdvanceActionExecutionResult(
+            action_type="reconcile_verify_gate_evidence",
+            status="success",
+            execution_phase="direct",
+            message="reconciled",
+            success_message="reconciled",
+            work_done=True,
+        )
+        direct_result = runtime.run_direct_phase(
+            analysis=ProjectCycleAnalysis(runtime_key="core", plan=plan),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            quiet=True,
+            emit_cycle_header=False,
+        )
+
+    assert isinstance(direct_result, ProjectDirectResult)
+    assert direct_result.runtime_key == "core"
+    assert direct_result.work_done is True
+    assert direct_result.project_analysis_invalidated is True
+    assert direct_result.needs_replan is True
+    assert direct_result.cycle_result is not None
+    assert direct_result.cycle_result.pending == 0
+    execute_action.assert_called_once()
+    assert execute_action.call_args.kwargs["action"]["type"] == "reconcile_verify_gate_evidence"
+    refreshed_worker = store.get(worker_task.id)
+    assert refreshed_worker is not None
+    assert refreshed_worker.status == "completed"
+    replanned_worker_decision = plan_lifecycle_execution(
+        ((worker_row, refreshed_worker, {"type": "create_review", "description": "Create review"}),),
+        free_worker_slots=1,
+        get_action=lambda item: item[2],
+    )
+    assert replanned_worker_decision[0].selected is True
+
+
+def test_run_cycle_direct_phase_only_stops_before_worker_dispatch(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    queued = store.add("Queued worker task", task_type="implement")
+    assert queued.id is not None
+    config = Config.load(tmp_path)
+
+    with (
+        patch(
+            "gza.cli.watch._run_watch_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("pending worker started")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("pending worker started")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            direct_phase_only=True,
+            git=_make_watch_git(),
+        )
+
+    assert result.work_done is False
+    assert result.project_analysis_invalidated is False
+    assert result.needs_replan is False
+    assert result.pending == 1
+    assert store.get(queued.id).status == "pending"
+
+
+def test_run_cycle_direct_phase_only_replans_after_red_main_verify_remediation_reuse(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    checks = [
+        _main_verify_red_check(main_verify_task, tree_fingerprint="fp-functional-a"),
+        _main_verify_red_check(main_verify_task, tree_fingerprint=None, failure="verify_command failed twice again"),
+    ]
+
+    with (
+        patch("gza.cli.watch._run_watch_main_integration_verify", side_effect=checks),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("pending worker started")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("pending worker started")),
+    ):
+        first = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            direct_phase_only=True,
+            git=_make_watch_git(),
+        )
+        second = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            direct_phase_only=True,
+            git=_make_watch_git(),
+        )
+
+    assert first.work_done is True
+    assert first.needs_replan is True
+    assert second.work_done is True
+    assert second.needs_replan is True
+    remediation_tasks = [
+        task
+        for task in store.get_all()
+        if task.trigger_source == "watch-main-integration-verify-remediation"
+    ]
+    assert len(remediation_tasks) == 1
+    remediation_task = remediation_tasks[0]
+    assert remediation_task.status == "pending"
+    assert remediation_task.queue_position == 1
+    assert "Tree fingerprint: unavailable" in remediation_task.prompt
+    assert [task.id for task in store.get_pending_pickup()] == [remediation_task.id]
+
+
+def test_main_verify_remediation_rebump_reports_replan_when_urgent_timestamp_changes_pickup_head(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store)
+    check = _main_verify_red_check(main_verify_task)
+    remediation = MainIntegrationVerifyRemediation(
+        kind="fix",
+        signature="phase:functional",
+        tree_fingerprint="fp-functional-a",
+        failing_phase="functional",
+        failure="verify_command failed twice",
+        observed_environment_identity=check.remediation.observed_environment_identity,
+        artifact_path=None,
+        failing_test_ids=(),
+        verify_excerpt=None,
+    )
+    remediation_task = store.add(
+        _main_verify_remediation_prompt(
+            remediation,
+            head_sha="feedfacecafe",
+            attempts_spent=0,
+            attempt_limit=config.watch.main_verify_remediation_max_attempts,
+        ),
+        task_type="implement",
+        tags=("remediation-bucket",),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    other_head = store.add("Other urgent exact-tag head", task_type="implement", tags=("other-bucket",))
+    assert remediation_task.id is not None
+    assert other_head.id is not None
+
+    store.set_urgent(remediation_task.id, True)
+    set_task_queue_position_scoped(
+        store,
+        remediation_task.id,
+        position=1,
+        tags=("remediation-bucket",),
+        any_tag=False,
+    )
+    store.set_urgent(other_head.id, True)
+    set_task_queue_position_scoped(
+        store,
+        other_head.id,
+        position=1,
+        tags=("other-bucket",),
+        any_tag=False,
+    )
+    stale_remediation = store.get(remediation_task.id)
+    current_other = store.get(other_head.id)
+    assert stale_remediation is not None
+    assert current_other is not None
+    _set_task_urgent_bumped_at(store, remediation_task.id, datetime(2000, 1, 1, tzinfo=UTC))
+    _set_task_urgent_bumped_at(store, other_head.id, datetime.now(UTC))
+    assert store.get_pending_pickup(limit=1)[0].id == other_head.id
+
+    outcome = watch_module._queue_main_verify_remediation_task(
+        config=config,
+        store=store,
+        task=stale_remediation,
+        remediation=remediation,
+        head_sha="feedfacecafe",
+        desired_tags=("remediation-bucket",),
+        tags=("remediation-bucket",),
+        any_tag=False,
+    )
+
+    assert outcome.outcome == "queued"
+    assert outcome.dispatch_state_changed is True
+    assert store.get_pending_pickup(limit=1)[0].id == remediation_task.id
+
+
+def test_run_cycle_direct_phase_only_replans_when_stale_dropped_active_owner_cleared(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    red_check = _main_verify_red_check(main_verify_task)
+
+    _maybe_file_main_verify_remediation(
+        dry_run=False,
+        config=config,
+        store=store,
+        tags=None,
+        any_tag=False,
+        log=log,
+        check=red_check,
+    )
+    remediation_tasks = [
+        task
+        for task in store.get_all()
+        if task.trigger_source == "watch-main-integration-verify-remediation"
+    ]
+    assert len(remediation_tasks) == 1
+    remediation_task = remediation_tasks[0]
+    assert remediation_task.id is not None
+    remediation_task.status = "dropped"
+    remediation_task.drop_reason = "stale active owner"
+    remediation_task.completed_at = datetime.now(UTC)
+    store.update(remediation_task)
+    store.record_main_verify_remediation_active_task(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        task_id=remediation_task.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure="verify_command failed twice",
+    )
+
+    with (
+        patch("gza.cli.watch._run_watch_main_integration_verify", return_value=red_check),
+        patch.object(store, "record_main_verify_remediation_consumed_attempt", return_value=None),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("pending worker started")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("pending worker started")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            direct_phase_only=True,
+            git=_make_watch_git(),
+        )
+
+    assert result.work_done is True
+    assert result.needs_replan is True
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.active_task_id is None
+
+
+def test_run_cycle_direct_phase_only_stable_already_exhausted_red_main_is_idle(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store)
+    red_check = _main_verify_red_check(main_verify_task)
+    attempt_limit = config.watch.main_verify_remediation_max_attempts
+    for attempt in range(attempt_limit):
+        store.record_main_verify_remediation_consumed_attempt(
+            signature="phase:functional",
+            tree_fingerprint=None,
+            task_id=f"gza-consumed-{attempt}",
+            consumption_key=f"consumed-{attempt}",
+            last_observed_head_sha="feedfacecafe",
+            last_observed_failure="verify_command failed twice",
+        )
+
+    with (
+        patch("gza.cli.watch._run_watch_main_integration_verify", return_value=red_check),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("pending worker started")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("pending worker started")),
+    ):
+        first = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            direct_phase_only=True,
+            git=_make_watch_git(),
+        )
+        second = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            direct_phase_only=True,
+            git=_make_watch_git(),
+        )
+
+    assert first.work_done is True
+    assert first.needs_replan is True
+    assert second.work_done is False
+    assert second.needs_replan is False
+
+
+def test_run_cycle_direct_phase_only_replans_after_merged_remediation_final_attempt(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store)
+    red_check = _main_verify_red_check(main_verify_task)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    remediation_task = store.add(
+        _main_verify_remediation_prompt(
+            red_check.remediation,
+            head_sha=red_check.state.head_sha,
+            attempts_spent=config.watch.main_verify_remediation_max_attempts - 1,
+            attempt_limit=config.watch.main_verify_remediation_max_attempts,
+        ),
+        task_type="implement",
+        trigger_source="watch-main-integration-verify-remediation",
+        urgent=True,
+    )
+    assert remediation_task.id is not None
+    set_task_queue_position_scoped(store, remediation_task.id, position=1, tags=None, any_tag=False)
+    remediation_task.status = "completed"
+    remediation_task.completed_at = datetime.now(UTC)
+    remediation_task.branch = "feature/final-merged-remediation"
+    store.update(remediation_task)
+    store.set_merge_status(remediation_task.id, "merged")
+    store.record_main_verify_remediation_active_task(
+        signature=red_check.remediation.signature,
+        tree_fingerprint=None,
+        task_id=remediation_task.id,
+        last_observed_head_sha=red_check.state.head_sha,
+        last_observed_failure=red_check.remediation.failure,
+    )
+    for attempt_index in range(config.watch.main_verify_remediation_max_attempts - 1):
+        store.record_main_verify_remediation_consumed_attempt(
+            signature=red_check.remediation.signature,
+            tree_fingerprint=None,
+            task_id=f"gza-consumed-{attempt_index}",
+            consumption_key=f"consumed-{attempt_index}",
+            last_observed_head_sha=red_check.state.head_sha,
+            last_observed_failure=red_check.remediation.failure,
+        )
+
+    with (
+        patch("gza.cli.watch._run_watch_main_integration_verify", return_value=red_check),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("pending worker started")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("pending worker started")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            direct_phase_only=True,
+            git=_make_watch_git(),
+        )
+
+    assert result.work_done is True
+    assert result.needs_replan is True
+    exhausted = store.get(remediation_task.id)
+    assert exhausted is not None
+    assert exhausted.status == "failed"
+    assert exhausted.failure_reason == MAIN_VERIFY_REMEDIATION_EXHAUSTED_FAILURE_REASON
+    assert [task.id for task in store.get_pending_pickup()] == []
+
+
+def test_run_cycle_direct_phase_only_replans_when_exhausted_canonical_retires_duplicate(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store)
+    red_check = _main_verify_red_check(main_verify_task, tree_fingerprint="fp-new")
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    canonical = store.add(
+        _main_verify_remediation_prompt(
+            red_check.remediation,
+            head_sha=red_check.state.head_sha,
+            attempts_spent=config.watch.main_verify_remediation_max_attempts,
+            attempt_limit=config.watch.main_verify_remediation_max_attempts,
+        ),
+        task_type="implement",
+        tags=("exact-recovery",),
+        trigger_source="watch-main-integration-verify-remediation",
+        urgent=True,
+    )
+    duplicate = store.add(
+        "\n".join(
+            [
+                "Fix local main integration verify phase `functional`",
+                "",
+                "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+                "",
+                "Remediation kind: fix",
+                "Failure signature: phase:functional",
+                "Tree fingerprint: unavailable",
+                "Observed main HEAD: deadbeefcafe",
+            ]
+        ),
+        task_type="implement",
+        tags=("legacy-recovery",),
+        trigger_source="watch-main-integration-verify-remediation",
+        urgent=True,
+    )
+    assert canonical.id is not None
+    assert duplicate.id is not None
+    set_task_queue_position_scoped(store, canonical.id, position=1, tags=None, any_tag=False)
+    set_task_queue_position_scoped(store, duplicate.id, position=2, tags=None, any_tag=False)
+    for attempt_index in range(config.watch.main_verify_remediation_max_attempts):
+        store.record_main_verify_remediation_consumed_attempt(
+            signature=red_check.remediation.signature,
+            tree_fingerprint=None,
+            task_id=f"gza-consumed-{attempt_index}",
+            consumption_key=f"consumed-{attempt_index}",
+            last_observed_head_sha=red_check.state.head_sha,
+            last_observed_failure=red_check.remediation.failure,
+        )
+
+    with (
+        patch("gza.cli.watch._run_watch_main_integration_verify", return_value=red_check),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("pending worker started")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("pending worker started")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            direct_phase_only=True,
+            git=_make_watch_git(),
+        )
+
+    assert result.work_done is True
+    assert result.needs_replan is True
+    exhausted = store.get(canonical.id)
+    retired = store.get(duplicate.id)
+    assert exhausted is not None
+    assert exhausted.status == "failed"
+    assert retired is not None
+    assert retired.status == "dropped"
+    assert [task.id for task in store.get_pending_pickup()] == []
+
+
+def test_run_cycle_direct_phase_only_green_cleanup_replans_and_removes_candidate(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    _maybe_file_main_verify_remediation(
+        dry_run=False,
+        config=config,
+        store=store,
+        tags=None,
+        any_tag=False,
+        log=log,
+        check=_main_verify_red_check(main_verify_task),
+    )
+    remediation_tasks = [
+        task
+        for task in store.get_all()
+        if task.trigger_source == "watch-main-integration-verify-remediation"
+    ]
+    assert len(remediation_tasks) == 1
+    remediation_task = remediation_tasks[0]
+
+    green_check = _main_verify_green_check(main_verify_task)
+    green_check.resolved_signature = "phase:functional"
+    with (
+        patch("gza.cli.watch._run_watch_main_integration_verify", return_value=green_check),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("pending worker started")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("pending worker started")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            direct_phase_only=True,
+            git=_make_watch_git(),
+        )
+
+    assert result.work_done is True
+    assert result.needs_replan is True
+    retired = store.get(remediation_task.id)
+    assert retired is not None
+    assert retired.status == "dropped"
+    assert [task.id for task in store.get_pending_pickup()] == []
+
+
+def test_run_cycle_direct_phase_only_accumulates_work_done_before_later_no_work_result(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    first_task = store.add("First direct lifecycle task", task_type="implement")
+    second_task = store.add("Second direct lifecycle task", task_type="implement")
+    assert first_task.id is not None
+    assert second_task.id is not None
+    for task in (first_task, second_task):
+        task.status = "completed"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+
+    def _row(task: Task) -> LineageOwnerRow:
+        return LineageOwnerRow(
+            owner_task=task,
+            members=(task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action=None,
+            next_action_reason="test-direct",
+            unresolved_tasks=(),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=task,
+        )
+
+    first_row = _row(first_task)
+    second_row = _row(second_task)
+    plan = _empty_scoped_watch_plan(slots=1)
+    plan = replace(
+        plan,
+        analysis=replace(
+            plan.analysis,
+            lifecycle_rows=(first_row, second_row),
+            action_plan=(
+                (first_row, first_task, {"type": "reconcile_verify_gate_evidence"}),
+                (second_row, second_task, {"type": "reconcile_verify_gate_evidence"}),
+            ),
+        ),
+    )
+    config = Config.load(tmp_path)
+
+    def fake_execute(*, task, action, context):  # noqa: ARG001
+        return AdvanceActionExecutionResult(
+            action_type=str(action["type"]),
+            status="success",
+            execution_phase="direct",
+            message="reconciled",
+            success_message="reconciled",
+            work_done=task.id == first_task.id,
+        )
+
+    with (
+        patch(
+            "gza.cli.watch._run_watch_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch._finalize_watch_no_progress_after_execution", return_value=None),
+        patch("gza.cli.watch.execute_advance_action", side_effect=fake_execute),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            direct_phase_only=True,
+            precomputed_plan=plan,
+            git=_make_watch_git(),
+        )
+
+    assert result.work_done is True
+    assert result.needs_replan is True
+
+
 def test_run_cycle_preserves_reconcile_before_project_analysis_order(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -1061,6 +1766,154 @@ def test_run_cycle_uses_reconciled_occupancy_for_legacy_capacity_snapshot(tmp_pa
     assert built_plans[0].slots == min(4, config.max_concurrent) - 1
 
 
+def test_project_runtime_direct_phase_consumes_supplied_analysis_without_rerunning_worker_reconcile(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    runtime = WatchProjectRuntime.create(
+        key="core",
+        config=config,
+        store=store,
+        log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+
+    runtime.reconcile_runtime_state(dry_run=False)
+    analysis = runtime.analyze_cycle(
+        batch=1,
+        recovery_slots=0,
+        recovery_mode="pending_only",
+        max_recovery_attempts=1,
+    )
+    stale_running = store.add("State introduced after analysis", task_type="implement")
+    assert stale_running.id is not None
+    stale_running.status = "in_progress"
+    stale_running.running_pid = 999_999_991
+    stale_running.started_at = datetime.now(UTC)
+    store.update(stale_running)
+
+    with (
+        patch(
+            "gza.cli.watch._reconcile_watch_runtime_state",
+            side_effect=AssertionError("worker reconcile must not run after supplied analysis"),
+        ),
+        patch(
+            "gza.cli.watch._run_watch_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+    ):
+        result = runtime.run_direct_phase(
+            analysis=analysis,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            quiet=True,
+            emit_cycle_header=False,
+        )
+
+    assert result.work_done is False
+    assert result.needs_replan is False
+    assert store.get(stale_running.id).status == "in_progress"
+
+
+def test_project_runtime_direct_phase_consumes_supplied_analysis_without_stale_no_progress_cleanup(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    runtime = WatchProjectRuntime.create(
+        key="core",
+        config=config,
+        store=store,
+        log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+
+    runtime.reconcile_runtime_state(dry_run=False)
+    analysis = runtime.analyze_cycle(
+        batch=1,
+        recovery_slots=0,
+        recovery_mode="pending_only",
+        max_recovery_attempts=1,
+    )
+    failed = store.add("Post-analysis stale no-progress residue", task_type="implement")
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.completed_at = datetime.now(UTC)
+    store.update(failed)
+    candidate = build_watch_progress_candidate(
+        store,
+        subject_task=failed,
+        action={"type": "retry_failed", "reason": "test"},
+        action_task=failed,
+        failed_task=failed,
+    )
+    store.upsert_watch_progress_observation(
+        WatchProgressObservation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+            subject_task_id=candidate.subject_task_id,
+            action_task_id=candidate.action_task_id,
+            action_task_status=candidate.action_task_status,
+            failed_task_id=candidate.failed_task_id,
+            recovery_task_id=candidate.recovery_task_id,
+            merge_unit_id=candidate.merge_unit_id,
+            merge_unit_state=candidate.merge_unit_state,
+            merge_unit_head_sha=candidate.merge_unit_head_sha,
+            evidence_fingerprint=candidate.evidence_fingerprint,
+            streak=2,
+            parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON,
+            observed_at=datetime.now(UTC),
+        )
+    )
+
+    with (
+        patch(
+            "gza.cli.watch.reconcile_stale_watch_no_progress_parks",
+            side_effect=AssertionError("stale no-progress cleanup must not run after supplied analysis"),
+        ),
+        patch(
+            "gza.cli.watch._run_watch_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+    ):
+        result = runtime.run_direct_phase(
+            analysis=analysis,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            quiet=True,
+            emit_cycle_header=False,
+        )
+
+    assert result.work_done is False
+    assert result.needs_replan is False
+    assert (
+        store.get_watch_progress_observation(
+            subject_kind=candidate.subject_kind,
+            subject_id=candidate.subject_id,
+            action_type=candidate.action_type,
+            action_reason=candidate.action_reason,
+        )
+        is not None
+    )
+
+
 def test_project_runtime_slice_types_are_focused_value_objects(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -1078,6 +1931,8 @@ def test_project_runtime_slice_types_are_focused_value_objects(tmp_path: Path) -
 
     assert direct_result.runtime_key == "core"
     assert direct_result.work_done is True
+    assert direct_result.project_analysis_invalidated is False
+    assert direct_result.needs_replan is False
     assert candidate.runtime_key == "core"
     assert candidate.task is task
     assert candidate.lane == "pending"
@@ -5745,6 +6600,296 @@ def test_watch_cycle_direct_reconcile_does_not_block_pending_worker_slot(
     log_text = log_path.read_text()
     assert "START" in log_text
     assert str(pending_plan.id) in log_text
+
+
+def test_project_direct_phase_executes_recovery_reconcile_before_other_runtime_spawn(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    setup_config(tmp_path / "a", project_name="project-a")
+    setup_config(tmp_path / "b", project_name="project-b")
+    store_a = make_store(tmp_path / "a")
+    store_b = make_store(tmp_path / "b")
+    config_a = Config.load(tmp_path / "a")
+    config_b = Config.load(tmp_path / "b")
+    calls: list[str] = []
+
+    pending_a = store_a.add("Project A pending worker", task_type="implement")
+    failed_b = store_b.add("Project B failed reconcile", task_type="implement")
+    assert pending_a.id is not None
+    assert failed_b.id is not None
+    failed_b.status = "failed"
+    failed_b.failure_reason = "BRANCH_UNPUSHABLE"
+    failed_b.completed_at = datetime.now(UTC)
+    failed_b.branch = "feature/project-b-reconcile"
+    store_b.update(failed_b)
+
+    row_b = LineageOwnerRow(
+        owner_task=failed_b,
+        members=(failed_b,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="recovery",
+        unresolved_tasks=(failed_b,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=failed_b,
+        recovery_leaf_task=failed_b,
+    )
+    decision_b = FailedRecoveryDecision(
+        task_id=failed_b.id,
+        action="reconcile",
+        reason_code="retry_branch_unpushable",
+        reason_text="Reconcile branch publication",
+        launch_mode="none",
+        attempt_index=1,
+        attempt_limit=2,
+    )
+    plan_b = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(row_b,),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(),
+            recovery_rows=(row_b,),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=(),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            actionable_failed=(
+                (
+                    row_b,
+                    failed_b,
+                    decision_b,
+                    {
+                        "type": "reconcile_branch_divergence",
+                        "description": "Reconcile branch publication before queue pickup",
+                    },
+                    False,
+                    failed_b,
+                ),
+            ),
+        ),
+    )
+    runtime_b = WatchProjectRuntime.create(
+        key="project-b",
+        config=config_b,
+        store=store_b,
+        log=_WatchLog(tmp_path / "b" / ".gza" / "watch.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+
+    def execute_recovery(*, task, action, context):  # noqa: ARG001
+        calls.append(f"direct:{task.id}:{action['type']}")
+        return AdvanceActionExecutionResult(
+            action_type=str(action["type"]),
+            status="success",
+            execution_phase="direct",
+            message="reconciled",
+            success_message="reconciled",
+            work_done=True,
+            worker_consuming=False,
+        )
+
+    def spawn_project_a(
+        _args: argparse.Namespace,
+        _config: Config,
+        task: Task,
+        **_kwargs: object,
+    ) -> int:
+        calls.append(f"spawn:{task.id}")
+        return 0
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._run_watch_main_integration_verify", return_value=_main_verify_green_check(failed_b)),
+        patch("gza.cli.watch.execute_advance_action", side_effect=execute_recovery),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("project B must not spawn")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("project B must not spawn")),
+    ):
+        direct_result = runtime_b.run_direct_phase(
+            analysis=ProjectCycleAnalysis(runtime_key="project-b", plan=plan_b),
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            quiet=True,
+            emit_cycle_header=False,
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._run_watch_main_integration_verify", return_value=_main_verify_green_check(pending_a)),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=spawn_project_a),
+    ):
+        _run_cycle(
+            config=config_a,
+            store=store_a,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / "a" / ".gza" / "watch.log", quiet=True),
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            git=_make_watch_git(),
+        )
+
+    assert direct_result.needs_replan is True
+    assert calls == [f"direct:{failed_b.id}:reconcile_branch_divergence", f"spawn:{pending_a.id}"]
+
+
+def test_project_direct_phase_executes_direct_recovery_and_leaves_worker_recovery_unlaunched(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    direct_failed = store.add("Direct failed recovery", task_type="implement")
+    worker_failed = store.add("Worker failed recovery", task_type="implement")
+    for task, reason, branch in (
+        (direct_failed, "BRANCH_UNPUSHABLE", "feature/direct-recovery"),
+        (worker_failed, "PROVIDER_ERROR", "feature/worker-recovery"),
+    ):
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = reason
+        task.completed_at = datetime.now(UTC)
+        task.branch = branch
+        store.update(task)
+
+    def recovery_row(task: Task) -> LineageOwnerRow:
+        return LineageOwnerRow(
+            owner_task=task,
+            members=(task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action=None,
+            next_action_reason="recovery",
+            unresolved_tasks=(task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=None,
+            recovery_action_task=task,
+            recovery_leaf_task=task,
+        )
+
+    direct_row = recovery_row(direct_failed)
+    worker_row = recovery_row(worker_failed)
+    direct_decision = FailedRecoveryDecision(
+        task_id=direct_failed.id,
+        action="reconcile",
+        reason_code="retry_branch_unpushable",
+        reason_text="Reconcile branch publication",
+        launch_mode="none",
+        attempt_index=1,
+        attempt_limit=2,
+    )
+    worker_decision = FailedRecoveryDecision(
+        task_id=worker_failed.id,
+        action="retry",
+        reason_code="retry_provider_error",
+        reason_text="Retry failed implementation",
+        launch_mode="worker",
+        attempt_index=1,
+        attempt_limit=2,
+    )
+    plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(direct_row, worker_row),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(),
+            recovery_rows=(direct_row, worker_row),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=(),
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            actionable_failed=(
+                (
+                    direct_row,
+                    direct_failed,
+                    direct_decision,
+                    {"type": "reconcile_branch_divergence", "description": "Reconcile branch publication"},
+                    False,
+                    direct_failed,
+                ),
+                (
+                    worker_row,
+                    worker_failed,
+                    worker_decision,
+                    {"type": "retry", "description": "Retry failed task"},
+                    True,
+                    worker_failed,
+                ),
+            ),
+        ),
+    )
+
+    def execute_recovery(*, task, action, context):  # noqa: ARG001
+        assert task.id == direct_failed.id
+        return AdvanceActionExecutionResult(
+            action_type=str(action["type"]),
+            status="success",
+            execution_phase="direct",
+            message="reconciled",
+            success_message="reconciled",
+            work_done=True,
+            worker_consuming=False,
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch._run_watch_main_integration_verify", return_value=_main_verify_green_check(direct_failed)),
+        patch("gza.cli.watch.execute_advance_action", side_effect=execute_recovery) as execute_action,
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker recovery launched")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("worker recovery launched")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            direct_phase_only=True,
+            precomputed_plan=plan,
+            git=_make_watch_git(),
+        )
+
+    assert result.work_done is True
+    assert result.needs_replan is True
+    execute_action.assert_called_once()
+    refreshed_worker_failed = store.get(worker_failed.id)
+    assert refreshed_worker_failed is not None
+    assert refreshed_worker_failed.status == "failed"
 
 
 def test_watch_cycle_logs_off_topic_clearance_success_message_without_starting_impl_task(
@@ -10711,6 +11856,67 @@ def test_watch_cycle_with_isolation_enabled_rebuilds_after_cleanup_failure_and_c
     assert log_text.count(" MERGE ") == 1
 
 
+def test_watch_direct_phase_non_batch_merge_conflict_never_spawns_rebase_worker(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\n"
+    )
+    store = make_store(tmp_path)
+    task = _make_completed_watch_merge_task(
+        store,
+        "Direct phase non-batch conflict rebase",
+        branch="feature/watch-direct-non-batch-conflict",
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    repo_git = MagicMock()
+    repo_git.current_branch.return_value = "feature/local"
+    repo_git.default_branch.return_value = "main"
+    repo_git.branch_exists.return_value = True
+    isolated_git = MagicMock()
+    isolated_git.branch_exists.return_value = True
+    isolated_git.is_merged.return_value = False
+    isolated_git.can_merge.return_value = False
+
+    def choose_action(_cfg, _store, _git, planned_task, _target, *, impl_based_on_ids, **_kwargs):  # noqa: ARG001
+        assert planned_task.id == task.id
+        return {"type": "merge"}
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=isolated_git),
+        patch("gza.cli.watch.determine_next_action", side_effect=choose_action),
+        patch(
+            "gza.cli.watch._execute_merge_action",
+            return_value=SimpleNamespace(rc=1, created_followups=[], reused_followups=[]),
+        ),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=lambda _c, task, **_k: task),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("rebase worker spawned")),
+    ):
+        result = _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            direct_phase_only=True,
+        )
+
+    assert result.work_done is True
+    assert result.needs_replan is True
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].status == "pending"
+    assert rebase_tasks[0].based_on == task.id
+    assert "merge conflict routed to rebase" in log_path.read_text()
+
+
 def test_watch_cycle_with_isolation_enabled_merge_conflict_preparation_failure_rolls_back_rebase(
     tmp_path: Path,
 ) -> None:
@@ -12213,6 +13419,65 @@ def test_watch_cycle_isolated_batch_conflict_files_rebase_targeting_default_bran
         call(task.branch, "tip-before-conflict"),
         call(task.branch, "tip-before-conflict"),
     ]
+    assert f"SKIP      {task.id}: merge conflict routed to rebase" in log_path.read_text()
+
+
+def test_watch_direct_phase_isolated_batch_conflict_never_spawns_rebase_worker(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    task = _make_completed_watch_merge_task(
+        store,
+        "Direct phase batch conflict rebase",
+        branch="feature/watch-direct-batch-conflict-rebase",
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.default_branch.return_value = "main"
+    merge_git.branch_exists.return_value = True
+    merge_git.is_merged.return_value = False
+    merge_git.has_changes.return_value = False
+    merge_git.rev_parse.return_value = "tip-before-conflict"
+    merge_git.can_merge.return_value = False
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.git_ops.determine_next_action", return_value={"type": "merge"}),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("rebase worker spawned")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+            direct_phase_only=True,
+        )
+
+    assert result.work_done is True
+    assert result.needs_replan is True
+    rebase_tasks = [row for row in store.get_all() if row.task_type == "rebase"]
+    assert len(rebase_tasks) == 1
+    assert rebase_tasks[0].status == "pending"
+    assert rebase_tasks[0].based_on == task.id
     assert f"SKIP      {task.id}: merge conflict routed to rebase" in log_path.read_text()
 
 
@@ -20467,7 +21732,7 @@ def test_retire_duplicate_main_verify_remediation_tasks_drops_noncanonical_same_
     assert selection.canonical.id == exact_task.id
     assert [task.id for task in selection.duplicates] == [unknown_task.id]
 
-    merged_tags = _retire_duplicate_main_verify_remediation_tasks(
+    retire_result = _retire_duplicate_main_verify_remediation_tasks(
         store=store,
         identity=_MainVerifyRemediationIdentity(
             signature="phase:functional",
@@ -20476,6 +21741,7 @@ def test_retire_duplicate_main_verify_remediation_tasks_drops_noncanonical_same_
         canonical=selection.canonical,
         duplicates=selection.duplicates,
     )
+    merged_tags = retire_result.merged_tags
 
     assert set(merged_tags) == {
         "system",
@@ -20483,6 +21749,9 @@ def test_retire_duplicate_main_verify_remediation_tasks_drops_noncanonical_same_
         "legacy-recovery",
         "exact-recovery",
     }
+    assert retire_result.retired_ids == (unknown_task.id,)
+    assert retire_result.deferred_live_ids == ()
+    assert retire_result.dispatch_state_changed is True
     dropped_unknown = store.get(unknown_task.id)
     assert dropped_unknown is not None
     assert dropped_unknown.status == "dropped"
@@ -20554,7 +21823,7 @@ def test_retire_duplicate_main_verify_remediation_tasks_preserves_live_in_progre
     assert selection.canonical.id == exact_task.id
     assert [task.id for task in selection.duplicates] == [live_duplicate.id]
 
-    merged_tags = _retire_duplicate_main_verify_remediation_tasks(
+    retire_result = _retire_duplicate_main_verify_remediation_tasks(
         store=store,
         identity=_MainVerifyRemediationIdentity(
             signature="phase:functional",
@@ -20563,6 +21832,7 @@ def test_retire_duplicate_main_verify_remediation_tasks_preserves_live_in_progre
         canonical=selection.canonical,
         duplicates=selection.duplicates,
     )
+    merged_tags = retire_result.merged_tags
 
     assert set(merged_tags) == {
         "system",
@@ -20570,6 +21840,9 @@ def test_retire_duplicate_main_verify_remediation_tasks_preserves_live_in_progre
         "legacy-recovery",
         "exact-recovery",
     }
+    assert retire_result.retired_ids == ()
+    assert retire_result.deferred_live_ids == (live_duplicate.id,)
+    assert retire_result.dispatch_state_changed is False
     preserved_duplicate = store.get(live_duplicate.id)
     assert preserved_duplicate is not None
     assert preserved_duplicate.status == "in_progress"
@@ -24845,7 +26118,8 @@ def test_completed_unmerged_main_verify_remediation_recycles_until_exhausted_att
         any_tag=False,
     )
 
-    assert first_outcome == "queued"
+    assert first_outcome.outcome == "queued"
+    assert first_outcome.dispatch_state_changed is True
     first_attempt_state = store.get_main_verify_remediation_attempt_state(
         signature="phase:ruff",
         tree_fingerprint=None,
@@ -24874,7 +26148,8 @@ def test_completed_unmerged_main_verify_remediation_recycles_until_exhausted_att
         tags=("202606-recovery",),
         any_tag=False,
     )
-    assert second_outcome == "exhausted"
+    assert second_outcome.outcome == "exhausted"
+    assert second_outcome.dispatch_state_changed is True
 
     exhausted_state = _maybe_file_main_verify_remediation(
         dry_run=False,
@@ -39547,6 +40822,38 @@ def test_cmd_watch_exits_when_idle_reaches_max_idle(tmp_path: Path) -> None:
 
     assert rc == 0
     assert run_cycle.call_count == 2
+
+
+def test_cmd_watch_stable_already_exhausted_red_main_advances_max_idle(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    main_verify_task = _make_main_verify_internal_task(store)
+    red_check = _main_verify_red_check(main_verify_task)
+    store.mark_main_verify_remediation_exhausted(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        consumed_attempt_count=config.watch.main_verify_remediation_max_attempts,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure="verify_command failed twice",
+    )
+    args = _watch_args(tmp_path, [], poll=1, max_idle=2)
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._run_watch_main_integration_verify", return_value=red_check) as main_verify,
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("pending worker started")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("pending worker started")),
+        patch("gza.cli.watch._sleep_interruptibly") as sleep,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert main_verify.call_count == 2
+    assert sleep.call_count == 1
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "max idle time reached (2s), exiting" in log_text
 
 
 def test_cmd_watch_scoped_mode_exits_when_scope_is_done(tmp_path: Path) -> None:

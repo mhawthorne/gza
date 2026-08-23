@@ -188,7 +188,8 @@ def test_main_verify_remediation_completed_unmerged_consumes_attempt_and_requeue
         any_tag=False,
     )
 
-    assert outcome == "queued"
+    assert outcome.outcome == "queued"
+    assert outcome.dispatch_state_changed is True
     updated = store.get(task.id)
     assert updated is not None
     assert updated.status == "pending"
