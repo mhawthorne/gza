@@ -64,6 +64,7 @@ from gza.cli.watch import (
     ProjectCycleAnalysis,
     ProjectDirectResult,
     ProjectDispatchCandidate,
+    ProjectRuntimeReconcileResult,
     WatchProjectRuntime,
     WatchProjectSelection,
     WatchSlotAllocation,
@@ -837,6 +838,179 @@ def test_watch_project_runtime_build_plan_uses_owned_git(tmp_path: Path) -> None
     assert analyze.call_args.kwargs["git"] is git
     assert analyze.call_args.kwargs["tags"] == ("runtime",)
     assert analyze.call_args.kwargs["any_tag"] is True
+
+
+def test_watch_project_runtime_reconcile_runtime_state_preserves_legacy_order(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    runtime = WatchProjectRuntime.create(
+        key="core",
+        config=config,
+        store=store,
+        log=log,
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+    calls: list[str] = []
+
+    with (
+        patch(
+            "gza.cli._common.reconcile_in_progress_tasks",
+            side_effect=lambda cfg: calls.append("in_progress"),
+        ) as reconcile_in_progress,
+        patch(
+            "gza.cli._common.prune_terminal_dead_workers",
+            side_effect=lambda cfg: calls.append("prune"),
+        ) as prune_dead,
+        patch(
+            "gza.cli._common.reconcile_dead_pending_recovery_tasks",
+            side_effect=lambda cfg: calls.append("pending_recovery"),
+        ) as reconcile_recovery,
+        patch(
+            "gza.cli.watch._collect_live_running_state",
+            side_effect=lambda cfg, st: calls.append("collect") or ({321}, ["gza-1"], 2, 1),
+        ) as collect_live,
+    ):
+        result = runtime.reconcile_runtime_state(dry_run=False)
+
+    assert isinstance(result, ProjectRuntimeReconcileResult)
+    assert calls == ["in_progress", "prune", "pending_recovery", "collect"]
+    assert result.runtime_key == "core"
+    assert result.live_pids == frozenset({321})
+    assert result.running_task_ids == ("gza-1",)
+    assert result.running == 1
+    assert result.anonymous_worker_count == 2
+    assert result.starting_worker_count == 1
+    reconcile_in_progress.assert_called_once_with(config)
+    prune_dead.assert_called_once_with(config)
+    reconcile_recovery.assert_called_once_with(config)
+    collect_live.assert_called_once_with(config, store)
+
+
+def test_watch_project_runtime_reconcile_dry_run_only_observes_runtime_state(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    runtime = WatchProjectRuntime.create(
+        key="core",
+        config=config,
+        store=store,
+        log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+
+    with (
+        patch(
+            "gza.cli._common.reconcile_in_progress_tasks",
+            side_effect=AssertionError("dry-run reconciled"),
+        ),
+        patch(
+            "gza.cli._common.prune_terminal_dead_workers",
+            side_effect=AssertionError("dry-run pruned"),
+        ),
+        patch(
+            "gza.cli._common.reconcile_dead_pending_recovery_tasks",
+            side_effect=AssertionError("dry-run reconciled"),
+        ),
+        patch("gza.cli.watch._collect_live_running_state", return_value=({654}, ["gza-2"], 0, 3)),
+    ):
+        result = runtime.reconcile_runtime_state(dry_run=True)
+
+    assert result.live_pids == frozenset({654})
+    assert result.running_task_ids == ("gza-2",)
+    assert result.starting_worker_count == 3
+
+
+def test_watch_project_runtime_analyze_cycle_matches_project_local_plan_without_dispatch(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    included = store.add("Included queued task", task_type="implement", tags=("runtime",))
+    excluded = store.add("Excluded queued task", task_type="implement", tags=("other",))
+    assert included.id is not None
+    assert excluded.id is not None
+    config = Config.load(tmp_path)
+    git = _make_watch_git()
+    runtime = WatchProjectRuntime.create(
+        key="core",
+        config=config,
+        store=store,
+        log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        tags=("runtime",),
+        any_tag=True,
+        git=git,
+    )
+
+    with patch(
+        "gza.cli.watch.check_main_integration_verify",
+        return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+    ):
+        legacy_plan = _build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=2,
+            tags=("runtime",),
+            any_tag=True,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            git=git,
+        )
+        extracted = runtime.analyze_cycle(
+            batch=2,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+        )
+
+    assert extracted.runtime_key == "core"
+    assert extracted.plan.pending_count == legacy_plan.pending_count == 1
+    assert extracted.plan.blocked_pending_count == legacy_plan.blocked_pending_count
+    assert extracted.plan.running == legacy_plan.running
+    assert extracted.plan.slots == legacy_plan.slots
+    assert extracted.analysis.target_branch == legacy_plan.analysis.target_branch
+    assert store.get(included.id).status == "pending"
+    assert store.get(excluded.id).status == "pending"
+
+
+def test_run_cycle_preserves_reconcile_before_project_analysis_order(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    calls: list[str] = []
+
+    def fake_reconcile(**_kwargs: object) -> ProjectRuntimeReconcileResult:
+        calls.append("reconcile")
+        return ProjectRuntimeReconcileResult(
+            runtime_key="test",
+            live_pids=frozenset(),
+            running_task_ids=(),
+            anonymous_worker_count=0,
+            starting_worker_count=0,
+        )
+
+    def fake_build_plan(**_kwargs: object) -> _WatchCyclePlan:
+        calls.append("analyze")
+        return _empty_scoped_watch_plan()
+
+    with (
+        patch("gza.cli.watch._reconcile_watch_runtime_state", side_effect=fake_reconcile),
+        patch("gza.cli.watch._build_watch_cycle_plan", side_effect=fake_build_plan),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        )
+
+    assert calls[:2] == ["reconcile", "analyze"]
 
 
 def test_project_runtime_slice_types_are_focused_value_objects(tmp_path: Path) -> None:

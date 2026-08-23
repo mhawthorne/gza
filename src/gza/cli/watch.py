@@ -5351,6 +5351,36 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
     return filtered_live_pids, visible_task_ids, anonymous_worker_count, starting_worker_count
 
 
+def _reconcile_watch_runtime_state(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    runtime_key: str,
+    dry_run: bool,
+) -> "ProjectRuntimeReconcileResult":
+    from ._common import (
+        prune_terminal_dead_workers,
+        reconcile_dead_pending_recovery_tasks,
+        reconcile_in_progress_tasks,
+    )
+
+    if not dry_run:
+        reconcile_in_progress_tasks(config)
+        prune_terminal_dead_workers(config)
+        reconcile_dead_pending_recovery_tasks(config)
+    live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = _collect_live_running_state(
+        config,
+        store,
+    )
+    return ProjectRuntimeReconcileResult(
+        runtime_key=runtime_key,
+        live_pids=frozenset(live_pids),
+        running_task_ids=tuple(running_task_ids),
+        anonymous_worker_count=anonymous_worker_count,
+        starting_worker_count=starting_worker_count,
+    )
+
+
 def get_concurrency_snapshot(
     config: Config,
     store: SqliteTaskStore,
@@ -6293,6 +6323,21 @@ class ProjectCycleAnalysis:
 
 
 @dataclass(frozen=True)
+class ProjectRuntimeReconcileResult:
+    """Observed project-local worker state after the reconcile phase."""
+
+    runtime_key: str
+    live_pids: frozenset[int]
+    running_task_ids: tuple[str, ...]
+    anonymous_worker_count: int
+    starting_worker_count: int
+
+    @property
+    def running(self) -> int:
+        return len(self.running_task_ids)
+
+
+@dataclass(frozen=True)
 class ProjectDirectResult:
     """Result summary for project-local direct lifecycle work."""
 
@@ -6375,7 +6420,15 @@ class WatchProjectRuntime:
             now=datetime.now(UTC) if now is None else now,
         )
 
-    def build_cycle_plan(
+    def reconcile_runtime_state(self, *, dry_run: bool) -> ProjectRuntimeReconcileResult:
+        return _reconcile_watch_runtime_state(
+            config=self.config,
+            store=self.store,
+            runtime_key=self.key,
+            dry_run=dry_run,
+        )
+
+    def analyze_cycle(
         self,
         *,
         batch: int,
@@ -6403,6 +6456,9 @@ class WatchProjectRuntime:
             git=self.git,
         )
         return ProjectCycleAnalysis(runtime_key=self.key, plan=plan)
+
+    def build_cycle_plan(self, **kwargs: Any) -> ProjectCycleAnalysis:
+        return self.analyze_cycle(**kwargs)
 
     def run_cycle(self, **kwargs: Any) -> _CycleResult:
         return _run_cycle(
@@ -8542,12 +8598,6 @@ def _run_cycle(
     seen_active_recovery_subject_ids: frozenset[str] = frozenset(),
     git: Git | None = None,
 ) -> _CycleResult:
-    from ._common import (
-        prune_terminal_dead_workers,
-        reconcile_dead_pending_recovery_tasks,
-        reconcile_in_progress_tasks,
-    )
-
     tags = normalize_tag_filters(tags)
     scoped_mode = scoped_owner_ids is not None
     if restart_failed:
@@ -8568,10 +8618,12 @@ def _run_cycle(
         installed_package_drift,
         auto_restart_on_drift=auto_restart_on_drift,
     )
-    if not dry_run:
-        reconcile_in_progress_tasks(config)
-        prune_terminal_dead_workers(config)
-        reconcile_dead_pending_recovery_tasks(config)
+    _reconcile_watch_runtime_state(
+        config=config,
+        store=store,
+        runtime_key=config.project_name,
+        dry_run=dry_run,
+    )
 
     if precomputed_plan is not None and excluded_owner_ids:
         precomputed_plan = _filter_precomputed_watch_cycle_plan(
