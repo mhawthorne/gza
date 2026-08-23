@@ -635,7 +635,7 @@ def test_recovery_preview_scoped_seed_ignores_large_non_recovery_descendant_hist
         state="unmerged",
     )
     store.attach_task_to_merge_unit(failed.id, failed_unit.id, "owner")
-    _bulk_insert_completed_history(store, count=3000, start=200000, based_on=failed.id)
+    _bulk_insert_completed_history(store, count=9000, start=200000, based_on=failed.id)
 
     def fail_get_all():
         raise AssertionError("scoped recovery preview must not fall back to get_all()")
@@ -670,14 +670,10 @@ def test_recovery_preview_scoped_seed_ignores_large_non_recovery_descendant_hist
             include_pending=False,
         )
 
+    assert _recovery_entry_keys(scoped_preview) == [(failed.id, failed.id, "retry")]
+    assert _recovery_entry_keys(tagged_scoped_preview) == [(failed.id, failed.id, "retry")]
     assert [entry.task.id for entry in scoped_preview.recovery_entries] == [failed.id]
     assert [entry.task.id for entry in tagged_scoped_preview.recovery_entries] == [failed.id]
-    assert [(entry.owner_task.id, entry.task.id, entry.action) for entry in scoped_preview.recovery_entries] == [
-        (failed.id, failed.id, "retry")
-    ]
-    assert [
-        (entry.owner_task.id, entry.task.id, entry.action) for entry in tagged_scoped_preview.recovery_entries
-    ] == [(failed.id, failed.id, "retry")]
     assert failed.id in hydrated_ids
     assert len(set(hydrated_ids)) < 50
 

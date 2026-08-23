@@ -61,6 +61,11 @@ from gza.cli.watch import (
     MAIN_VERIFY_REMEDIATION_EXHAUSTED_REASON,
     MAIN_VERIFY_REMEDIATION_MOOT_GREEN_REASON,
     SCOPED_WATCH_COMPLETE_MESSAGE,
+    ProjectCycleAnalysis,
+    ProjectDirectResult,
+    ProjectDispatchCandidate,
+    WatchProjectRuntime,
+    WatchProjectSelection,
     WatchSlotAllocation,
     _active_failure_backoff_owner_ids,
     _build_watch_cycle_plan,
@@ -745,6 +750,115 @@ def _wait_for_dispatch_start_from_store(store):
         f"task {kwargs['task_id']} reached running state",
         store.get(str(kwargs["task_id"])),
     )
+
+
+def test_watch_project_runtime_owns_project_local_state(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Runtime-owned task", task_type="plan", group="runtime")
+    assert task.id is not None
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = _make_watch_git()
+
+    runtime = WatchProjectRuntime.create(
+        key="core",
+        config=config,
+        store=store,
+        log=log,
+        tags=("runtime",),
+        any_tag=True,
+        git=git,
+    )
+
+    assert runtime.selection == WatchProjectSelection(
+        key="core",
+        project_dir=config.project_dir,
+        tags=("runtime",),
+        any_tag=True,
+    )
+    assert runtime.config is config
+    assert runtime.store is store
+    assert runtime.git is git
+    assert runtime.log is log
+    assert runtime.tags == ("runtime",)
+    assert runtime.any_tag is True
+    assert runtime.previous_snapshot == {}
+    runtime.initialize_baseline()
+    assert task.id in runtime.previous_snapshot
+    assert runtime.failure_backoffs == {}
+    assert runtime.expected_starts == {}
+    assert runtime.seen_active_recovery_subject_ids == frozenset()
+    assert runtime.system_hold_active is False
+    assert runtime.git_health_hold_active is False
+
+
+def test_watch_project_runtime_build_plan_uses_owned_git(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    git = _make_watch_git()
+    runtime = WatchProjectRuntime.create(
+        key="core",
+        config=config,
+        store=store,
+        log=log,
+        tags=("runtime",),
+        any_tag=True,
+        git=git,
+    )
+    analysis = _WatchCycleAnalysis(
+        target_branch="main",
+        scope_gaps=(),
+        owner_rows=(),
+        watch_read_context=MagicMock(),
+        lifecycle_rows=(),
+        recovery_rows=(),
+        recovery_lane_entry_by_failed_id={},
+        action_plan=(),
+        recovery_attention_rows=(),
+        recovery_visible_skips=(),
+    )
+
+    with patch("gza.cli.watch._analyze_watch_cycle", return_value=analysis) as analyze:
+        result = runtime.build_cycle_plan(
+            batch=1,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+        )
+
+    assert isinstance(result, ProjectCycleAnalysis)
+    assert result.runtime_key == "core"
+    assert result.analysis is analysis
+    assert analyze.call_args.kwargs["config"] is config
+    assert analyze.call_args.kwargs["store"] is store
+    assert analyze.call_args.kwargs["git"] is git
+    assert analyze.call_args.kwargs["tags"] == ("runtime",)
+    assert analyze.call_args.kwargs["any_tag"] is True
+
+
+def test_project_runtime_slice_types_are_focused_value_objects(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Dispatch candidate", task_type="plan")
+    assert task.id is not None
+
+    direct_result = ProjectDirectResult(runtime_key="core", work_done=True, detail="merged")
+    candidate = ProjectDispatchCandidate(
+        runtime_key="core",
+        task=task,
+        lane="pending",
+        owner_task=None,
+        detail="head",
+    )
+
+    assert direct_result.runtime_key == "core"
+    assert direct_result.work_done is True
+    assert candidate.runtime_key == "core"
+    assert candidate.task is task
+    assert candidate.lane == "pending"
 
 
 def _settle_dispatch_starts_from_store(store):
@@ -1635,6 +1749,7 @@ def test_watch_cycle_prefers_freshly_bumped_task_over_older_urgent(tmp_path: Pat
 def test_cmd_watch_repeated_tag_filters_use_or_by_default(tmp_path: Path) -> None:
     """CLI watch should forward repeated tag filters as OR unless --all-tags is set."""
     setup_config(tmp_path)
+    store = make_store(tmp_path)
 
     args = argparse.Namespace(
         project_dir=tmp_path,
@@ -1650,6 +1765,7 @@ def test_cmd_watch_repeated_tag_filters_use_or_by_default(tmp_path: Path) -> Non
     )
 
     with (
+        patch("gza.cli.watch.get_store", return_value=store),
         patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
         patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
         patch("gza.cli.watch.time.sleep"),
@@ -1657,6 +1773,9 @@ def test_cmd_watch_repeated_tag_filters_use_or_by_default(tmp_path: Path) -> Non
         rc = cmd_watch(args)
 
     assert rc == 0
+    assert run_cycle.call_args.kwargs["store"] is store
+    assert run_cycle.call_args.kwargs["config"].project_dir == tmp_path
+    assert isinstance(run_cycle.call_args.kwargs["log"], _WatchLog)
     assert run_cycle.call_args.kwargs["tags"] == ("release-1", "system")
     assert run_cycle.call_args.kwargs["any_tag"] is True
 
@@ -17208,6 +17327,7 @@ def test_watch_cycle_non_merge_active_main_verify_remediation_action_consumes_an
     assert "Remediation attempts spent: 1/2" in refreshed.prompt
 
     refreshed.status = "completed"
+    refreshed.started_at = datetime(2026, 6, 24, 13, 0, tzinfo=UTC)
     refreshed.completed_at = datetime.now(UTC)
     refreshed.merge_status = "unmerged"
     store.update(refreshed)
@@ -17736,6 +17856,7 @@ def test_watch_cycle_scoped_out_completed_active_main_verify_remediation_consume
         assert refreshed.status == "pending"
         assert "Remediation attempts spent: 1/2" in refreshed.prompt
         refreshed.status = "completed"
+        refreshed.started_at = datetime(2026, 6, 24, 13, 0, tzinfo=UTC)
         refreshed.completed_at = datetime.now(UTC)
         refreshed.merge_status = "unmerged"
         store.update(refreshed)
@@ -17911,7 +18032,7 @@ def test_watch_cycle_dropped_unmerged_active_main_verify_owner_consumes_before_s
     assert log_text.count("ATTENTION main verify remediation exhausted for phase:functional after 2/2 attempts") == 1
 
 
-def test_watch_cycle_unroutable_completed_active_remediation_consumes_terminal_epoch_once(
+def test_watch_cycle_unroutable_completed_active_remediation_preserves_terminal_epoch(
     tmp_path: Path,
 ) -> None:
     unroutable_config_text = (
@@ -17990,9 +18111,9 @@ def test_watch_cycle_unroutable_completed_active_remediation_consumes_terminal_e
         tree_fingerprint=None,
     )
     assert attempt_state is not None
-    assert attempt_state.consumed_attempt_count == 1
-    assert attempt_state.active_task_id is None
-    assert attempt_state.last_consumed_task_id == active.id
+    assert attempt_state.consumed_attempt_count == 0
+    assert attempt_state.active_task_id == active.id
+    assert attempt_state.last_consumed_task_id is None
     remediation_tasks = [
         candidate
         for candidate in store.get_all()
@@ -18038,6 +18159,7 @@ def test_watch_cycle_unroutable_completed_active_remediation_consumes_terminal_e
         assert rerun is not None
         assert rerun.status == "pending"
         assert "Remediation attempts spent: 1/2" in rerun.prompt
+        rerun.started_at = datetime(2026, 6, 24, 12, 30, tzinfo=UTC)
         rerun.status = "failed"
         rerun.completed_at = datetime.now(UTC)
         rerun.failure_reason = "UNKNOWN"
@@ -18087,7 +18209,7 @@ def test_main_verify_remediation_requeue_consumes_each_terminal_epoch_once_per_s
         "      plan:\n"
         "        model: gpt-5.5\n"
     )
-    config = Config.load(tmp_path)
+    unroutable_config = Config.load(tmp_path)
     store = make_store(tmp_path)
     task = store.add(
         "\n".join(
@@ -18109,6 +18231,7 @@ def test_main_verify_remediation_requeue_consumes_each_terminal_epoch_once_per_s
     )
     assert task.id is not None
     task.status = terminal_status
+    task.started_at = datetime(2026, 6, 24, 12, 0, tzinfo=UTC)
     task.completed_at = datetime.now(UTC)
     task.branch = f"feature/watch-main-remediation-{terminal_status}"
     task.has_commits = True
@@ -18137,6 +18260,117 @@ def test_main_verify_remediation_requeue_consumes_each_terminal_epoch_once_per_s
         failing_test_ids=(),
         verify_excerpt=None,
     )
+    original = store.get(task.id)
+    assert original is not None
+
+    for _ in range(2):
+        fresh = store.get(task.id)
+        assert fresh is not None
+        with pytest.raises(ConfigError, match="'model' is required for task type 'implement'"):
+            watch_module._queue_main_verify_remediation_task(
+                config=unroutable_config,
+                store=store,
+                task=fresh,
+                remediation=remediation,
+                head_sha="feedfacecafe",
+                desired_tags=("system", MAIN_INTEGRATION_VERIFY_TAG, "202606-recovery"),
+                tags=("202606-recovery",),
+                any_tag=False,
+            )
+        unchanged = store.get(task.id)
+        assert unchanged == original
+        unchanged_state = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint=None,
+        )
+        assert unchanged_state is not None
+        assert unchanged_state.consumed_attempt_count == 0
+        assert unchanged_state.active_task_id == task.id
+        assert unchanged_state.last_consumed_task_id is None
+
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
+        "db_path: .gza/gza.db\n"
+    )
+    routable_config = Config.load(tmp_path)
+    for _ in range(2):
+        fresh = store.get(task.id)
+        assert fresh is not None
+        watch_module._queue_main_verify_remediation_task(
+            config=routable_config,
+            store=store,
+            task=fresh,
+            remediation=remediation,
+            head_sha="feedfacecafe",
+            desired_tags=("system", MAIN_INTEGRATION_VERIFY_TAG, "202606-recovery"),
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 1
+    assert attempt_state.active_task_id is None
+    assert attempt_state.last_consumed_task_id == task.id
+    assert attempt_state.exhausted_at is None
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.status == "pending"
+    assert refreshed.queue_position == 1
+    assert refreshed.urgent is True
+
+
+def test_main_verify_remediation_pending_invalid_route_preserves_row_and_ledger(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\n"
+        "provider: codex\n"
+        "db_path: .gza/gza.db\n"
+        "providers:\n"
+        "  codex:\n"
+        "    task_types:\n"
+        "      plan:\n"
+        "        model: gpt-5.5\n"
+    )
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add(
+        "Fix local main integration verify phase `functional`\n\n"
+        "Remediation kind: fix\n"
+        "Failure signature: phase:functional\n"
+        "Tree fingerprint: fp-functional-a\n"
+        "Observed main HEAD: feedfacecafe\n"
+        "Remediation attempts spent: 0/2",
+        task_type="implement",
+        tags=("202606-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert task.id is not None
+    store.record_main_verify_remediation_active_task(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        task_id=task.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure="verify_command failed twice",
+    )
+    remediation = MainIntegrationVerifyRemediation(
+        kind="fix",
+        signature="phase:functional",
+        tree_fingerprint="fp-functional-a",
+        failing_phase="functional",
+        failure="verify_command failed twice",
+        observed_environment_identity=None,
+        artifact_path=None,
+        failing_test_ids=(),
+        verify_excerpt=None,
+    )
+    original = store.get(task.id)
+    assert original is not None
 
     for _ in range(2):
         fresh = store.get(task.id)
@@ -18152,15 +18386,571 @@ def test_main_verify_remediation_requeue_consumes_each_terminal_epoch_once_per_s
                 tags=("202606-recovery",),
                 any_tag=False,
             )
+        assert store.get(task.id) == original
+        attempt_state = store.get_main_verify_remediation_attempt_state(
+            signature="phase:functional",
+            tree_fingerprint=None,
+        )
+        assert attempt_state is not None
+        assert attempt_state.consumed_attempt_count == 0
+        assert attempt_state.active_task_id == task.id
 
+
+def _write_main_verify_remediation_route_config(tmp_path: Path, *, routable: bool) -> Config:
+    if routable:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "db_path: .gza/gza.db\n"
+        )
+    else:
+        (tmp_path / "gza.yaml").write_text(
+            "project_name: test-project\n"
+            "provider: codex\n"
+            "db_path: .gza/gza.db\n"
+            "providers:\n"
+            "  codex:\n"
+            "    task_types:\n"
+            "      plan:\n"
+            "        model: gpt-5.5\n"
+        )
+    return Config.load(tmp_path)
+
+
+def _main_verify_remediation_prompt_for_test(
+    *,
+    attempts_spent: int = 0,
+    kind: str = "fix",
+    tree_fingerprint: str = "fp-functional-a",
+    head_sha: str = "feedfacecafe",
+) -> str:
+    heading = (
+        "De-flake local main integration verify phase `functional`"
+        if kind == "deflake"
+        else "Fix local main integration verify phase `functional`"
+    )
+    return "\n".join(
+        [
+            heading,
+            "",
+            "The verify gate stayed red across bounded reruns and is currently halting merges onto local main.",
+            "",
+            f"Remediation kind: {kind}",
+            "Failure signature: phase:functional",
+            f"Tree fingerprint: {tree_fingerprint}",
+            f"Observed main HEAD: {head_sha}",
+            f"Remediation attempts spent: {attempts_spent}/2",
+        ]
+    )
+
+
+def _main_verify_remediation_for_test() -> MainIntegrationVerifyRemediation:
+    return MainIntegrationVerifyRemediation(
+        kind="fix",
+        signature="phase:functional",
+        tree_fingerprint="fp-functional-a",
+        failing_phase="functional",
+        failure="verify_command failed twice",
+        observed_environment_identity=None,
+        artifact_path=None,
+        failing_test_ids=(),
+        verify_excerpt=None,
+    )
+
+
+def _main_verify_remediation_state_for_test() -> SimpleNamespace:
+    return SimpleNamespace(head_sha="feedfacecafe")
+
+
+def _main_verify_remediation_store_snapshot(store: SqliteTaskStore) -> dict[str, Any]:
+    tasks = {
+        str(task.id): {
+            "prompt": task.prompt,
+            "status": task.status,
+            "tags": tuple(task.tags or ()),
+            "started_at": task.started_at,
+            "running_pid": task.running_pid,
+            "completed_at": task.completed_at,
+            "urgent": task.urgent,
+            "queue_position": task.queue_position,
+            "merge_status": task.merge_status,
+            "failure_reason": task.failure_reason,
+            "completion_reason": task.completion_reason,
+            "drop_reason": task.drop_reason,
+            "trigger_source": task.trigger_source,
+        }
+        for task in store.get_all()
+        if task.trigger_source == watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE
+    }
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    return {
+        "tasks": tasks,
+        "attempt_state": None
+        if attempt_state is None
+        else {
+            "active_task_id": attempt_state.active_task_id,
+            "consumed_attempt_count": attempt_state.consumed_attempt_count,
+            "last_consumed_task_id": attempt_state.last_consumed_task_id,
+            "exhausted_at": attempt_state.exhausted_at,
+        },
+    }
+
+
+def _assert_unroutable_ensure_preserves_main_verify_remediation_state(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    log: _WatchLog,
+    before: dict[str, Any],
+) -> None:
+    for _ in range(2):
+        with pytest.raises(ConfigError, match="'model' is required for task type 'implement'"):
+            watch_module._ensure_main_verify_remediation_task(
+                config=config,
+                store=store,
+                log=log,
+                remediation=_main_verify_remediation_for_test(),
+                state=_main_verify_remediation_state_for_test(),
+                tags=("202606-recovery",),
+                any_tag=False,
+            )
+        assert _main_verify_remediation_store_snapshot(store) == before
+
+
+def test_main_verify_remediation_unroutable_merged_active_owner_is_read_only_until_valid_route(
+    tmp_path: Path,
+) -> None:
+    unroutable_config = _write_main_verify_remediation_route_config(tmp_path, routable=False)
+    store = make_store(tmp_path)
+    active = _make_completed_watch_merge_task(
+        store,
+        _main_verify_remediation_prompt_for_test(),
+        branch="feature/watch-main-remediation-unroutable-merged-active",
+        tags=("202606-recovery", "system"),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    assert active.id is not None
+    store.set_merge_status(active.id, "merged")
+    store.record_main_verify_remediation_active_task(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        task_id=active.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure="verify_command failed twice",
+    )
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    before = _main_verify_remediation_store_snapshot(store)
+
+    _assert_unroutable_ensure_preserves_main_verify_remediation_state(
+        config=unroutable_config,
+        store=store,
+        log=log,
+        before=before,
+    )
+
+    routable_config = _write_main_verify_remediation_route_config(tmp_path, routable=True)
+    for _ in range(2):
+        watch_module._ensure_main_verify_remediation_task(
+            config=routable_config,
+            store=store,
+            log=log,
+            remediation=_main_verify_remediation_for_test(),
+            state=_main_verify_remediation_state_for_test(),
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
     attempt_state = store.get_main_verify_remediation_attempt_state(
         signature="phase:functional",
         tree_fingerprint=None,
     )
     assert attempt_state is not None
     assert attempt_state.consumed_attempt_count == 1
-    assert attempt_state.active_task_id is None
-    assert attempt_state.exhausted_at is None
+    assert attempt_state.last_consumed_task_id == active.id
+    assert attempt_state.active_task_id is not None
+    assert attempt_state.active_task_id != active.id
+    successor = store.get(attempt_state.active_task_id)
+    assert successor is not None
+    assert successor.status == "pending"
+    assert "Remediation attempts spent: 1/2" in successor.prompt
+
+
+def test_main_verify_remediation_unroutable_dropped_active_owner_is_read_only_until_valid_route(
+    tmp_path: Path,
+) -> None:
+    unroutable_config = _write_main_verify_remediation_route_config(tmp_path, routable=False)
+    store = make_store(tmp_path)
+    active = _make_completed_watch_merge_task(
+        store,
+        _main_verify_remediation_prompt_for_test(),
+        branch="feature/watch-main-remediation-unroutable-dropped-active",
+        tags=("202606-recovery", "system"),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    assert active.id is not None
+    active.status = "dropped"
+    active.drop_reason = "operator dropped stale active owner"
+    store.update(active)
+    store.record_main_verify_remediation_active_task(
+        signature="phase:functional",
+        tree_fingerprint=None,
+        task_id=active.id,
+        last_observed_head_sha="feedfacecafe",
+        last_observed_failure="verify_command failed twice",
+    )
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    before = _main_verify_remediation_store_snapshot(store)
+
+    _assert_unroutable_ensure_preserves_main_verify_remediation_state(
+        config=unroutable_config,
+        store=store,
+        log=log,
+        before=before,
+    )
+
+    routable_config = _write_main_verify_remediation_route_config(tmp_path, routable=True)
+    for _ in range(2):
+        watch_module._ensure_main_verify_remediation_task(
+            config=routable_config,
+            store=store,
+            log=log,
+            remediation=_main_verify_remediation_for_test(),
+            state=_main_verify_remediation_state_for_test(),
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 1
+    assert attempt_state.last_consumed_task_id == active.id
+    assert attempt_state.active_task_id is not None
+    successor = store.get(attempt_state.active_task_id)
+    assert successor is not None
+    assert successor.id != active.id
+    assert successor.status == "pending"
+
+
+def test_main_verify_remediation_unroutable_canonical_refresh_is_read_only_until_valid_route(
+    tmp_path: Path,
+) -> None:
+    unroutable_config = _write_main_verify_remediation_route_config(tmp_path, routable=False)
+    store = make_store(tmp_path)
+    canonical = store.add(
+        _main_verify_remediation_prompt_for_test(attempts_spent=0, kind="deflake", tree_fingerprint="legacy-fp"),
+        task_type="implement",
+        tags=("legacy-tag",),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    assert canonical.id is not None
+    canonical.status = "failed"
+    canonical.started_at = datetime(2026, 6, 24, 12, 0, tzinfo=UTC)
+    canonical.completed_at = datetime.now(UTC)
+    canonical.failure_reason = "UNKNOWN"
+    store.update(canonical)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    before = _main_verify_remediation_store_snapshot(store)
+
+    _assert_unroutable_ensure_preserves_main_verify_remediation_state(
+        config=unroutable_config,
+        store=store,
+        log=log,
+        before=before,
+    )
+
+    routable_config = _write_main_verify_remediation_route_config(tmp_path, routable=True)
+    for _ in range(2):
+        watch_module._ensure_main_verify_remediation_task(
+            config=routable_config,
+            store=store,
+            log=log,
+            remediation=_main_verify_remediation_for_test(),
+            state=_main_verify_remediation_state_for_test(),
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+    refreshed = store.get(canonical.id)
+    assert refreshed is not None
+    assert refreshed.status == "pending"
+    assert refreshed.queue_position == 1
+    assert refreshed.urgent is True
+    assert "Remediation kind: fix" in refreshed.prompt
+    assert "Tree fingerprint: fp-functional-a" in refreshed.prompt
+    assert set(refreshed.tags or ()) == {"system", MAIN_INTEGRATION_VERIFY_TAG, "legacy-tag", "202606-recovery"}
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 1
+    assert attempt_state.last_consumed_task_id == canonical.id
+    assert attempt_state.active_task_id == canonical.id
+
+
+def test_main_verify_remediation_unroutable_duplicate_selection_is_read_only_until_valid_route(
+    tmp_path: Path,
+) -> None:
+    unroutable_config = _write_main_verify_remediation_route_config(tmp_path, routable=False)
+    store = make_store(tmp_path)
+    canonical = store.add(
+        _main_verify_remediation_prompt_for_test(attempts_spent=0),
+        task_type="implement",
+        tags=("canonical-tag",),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    assert canonical.id is not None
+    canonical.status = "failed"
+    canonical.started_at = datetime(2026, 6, 24, 12, 0, tzinfo=UTC)
+    canonical.completed_at = datetime.now(UTC)
+    canonical.failure_reason = "UNKNOWN"
+    store.update(canonical)
+    duplicate = store.add(
+        _main_verify_remediation_prompt_for_test(attempts_spent=0, tree_fingerprint="legacy-fp"),
+        task_type="implement",
+        tags=("duplicate-tag",),
+        trigger_source=watch_module.MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE,
+    )
+    assert duplicate.id is not None
+    duplicate.status = "failed"
+    duplicate.started_at = datetime(2026, 6, 24, 12, 5, tzinfo=UTC)
+    duplicate.completed_at = datetime.now(UTC)
+    duplicate.failure_reason = "UNKNOWN"
+    store.update(duplicate)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    before = _main_verify_remediation_store_snapshot(store)
+
+    _assert_unroutable_ensure_preserves_main_verify_remediation_state(
+        config=unroutable_config,
+        store=store,
+        log=log,
+        before=before,
+    )
+
+    routable_config = _write_main_verify_remediation_route_config(tmp_path, routable=True)
+    for _ in range(2):
+        watch_module._ensure_main_verify_remediation_task(
+            config=routable_config,
+            store=store,
+            log=log,
+            remediation=_main_verify_remediation_for_test(),
+            state=_main_verify_remediation_state_for_test(),
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+    refreshed = store.get(canonical.id)
+    retired = store.get(duplicate.id)
+    assert refreshed is not None
+    assert retired is not None
+    assert refreshed.status == "pending"
+    assert retired.status == "dropped"
+    assert retired.drop_reason == (
+        f"{MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON}:phase:functional:{canonical.id}"
+    )
+    assert set(refreshed.tags or ()) == {
+        "system",
+        MAIN_INTEGRATION_VERIFY_TAG,
+        "canonical-tag",
+        "duplicate-tag",
+        "202606-recovery",
+    }
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 1
+    assert attempt_state.last_consumed_task_id == canonical.id
+    assert attempt_state.active_task_id == canonical.id
+
+
+def test_main_verify_remediation_consumption_key_tracks_execution_epoch_not_lifecycle_metadata(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    task = store.add(
+        "Fix local main integration verify phase `functional`\n\n"
+        "Remediation kind: fix\n"
+        "Failure signature: phase:functional\n"
+        "Tree fingerprint: fp-functional-a\n"
+        "Observed main HEAD: feedfacecafe\n"
+        "Remediation attempts spent: 0/2",
+        task_type="implement",
+        tags=("202606-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert task.id is not None
+    task.status = "completed"
+    task.started_at = datetime(2026, 6, 24, 12, 0, tzinfo=UTC)
+    task.completed_at = datetime(2026, 6, 24, 12, 5, tzinfo=UTC)
+    task.branch = "feature/watch-main-remediation-epoch-key"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    task.completion_reason = "initial completion"
+    store.update(task)
+    remediation = MainIntegrationVerifyRemediation(
+        kind="fix",
+        signature="phase:functional",
+        tree_fingerprint="fp-functional-a",
+        failing_phase="functional",
+        failure="verify_command failed twice",
+        observed_environment_identity=None,
+        artifact_path=None,
+        failing_test_ids=(),
+        verify_excerpt=None,
+    )
+
+    def consume_current_terminal() -> None:
+        fresh = store.get(task.id)
+        assert fresh is not None
+        watch_module._queue_main_verify_remediation_task(
+            config=config,
+            store=store,
+            task=fresh,
+            remediation=remediation,
+            head_sha="feedfacecafe",
+            desired_tags=("system", MAIN_INTEGRATION_VERIFY_TAG, "202606-recovery"),
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    consume_current_terminal()
+    attempt_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert attempt_state is not None
+    assert attempt_state.consumed_attempt_count == 1
+
+    same_epoch = store.get(task.id)
+    assert same_epoch is not None
+    same_epoch.status = "unmerged"
+    same_epoch.started_at = datetime(2026, 6, 24, 12, 0, tzinfo=UTC)
+    same_epoch.completed_at = datetime(2026, 6, 24, 12, 15, tzinfo=UTC)
+    same_epoch.merge_status = "merged"
+    same_epoch.merged_at = datetime(2026, 6, 24, 12, 20, tzinfo=UTC)
+    same_epoch.failure_reason = "rewritten failure"
+    same_epoch.completion_reason = "rewritten completion"
+    same_epoch.drop_reason = "rewritten drop"
+    store.update(same_epoch)
+
+    consume_current_terminal()
+    unchanged_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert unchanged_state is not None
+    assert unchanged_state.consumed_attempt_count == 1
+
+    rerun = store.get(task.id)
+    assert rerun is not None
+    rerun.status = "failed"
+    rerun.started_at = datetime(2026, 6, 24, 13, 0, tzinfo=UTC)
+    rerun.completed_at = datetime(2026, 6, 24, 13, 5, tzinfo=UTC)
+    rerun.merge_status = "unmerged"
+    rerun.merged_at = None
+    rerun.failure_reason = "UNKNOWN"
+    rerun.completion_reason = None
+    rerun.drop_reason = None
+    store.update(rerun)
+
+    consume_current_terminal()
+    rerun_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert rerun_state is not None
+    assert rerun_state.consumed_attempt_count == 2
+
+
+def test_main_verify_remediation_legacy_null_started_at_key_is_idempotent_until_proven_rerun(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    task = store.add(
+        "Fix local main integration verify phase `functional`\n\n"
+        "Remediation kind: fix\n"
+        "Failure signature: phase:functional\n"
+        "Tree fingerprint: fp-functional-a\n"
+        "Observed main HEAD: feedfacecafe\n"
+        "Remediation attempts spent: 0/2",
+        task_type="implement",
+        tags=("202606-recovery", "system"),
+        trigger_source="watch-main-integration-verify-remediation",
+    )
+    assert task.id is not None
+    task.status = "completed"
+    task.started_at = None
+    task.completed_at = datetime(2026, 6, 24, 12, 5, tzinfo=UTC)
+    task.branch = "feature/watch-main-remediation-legacy-key"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    remediation = MainIntegrationVerifyRemediation(
+        kind="fix",
+        signature="phase:functional",
+        tree_fingerprint="fp-functional-a",
+        failing_phase="functional",
+        failure="verify_command failed twice",
+        observed_environment_identity=None,
+        artifact_path=None,
+        failing_test_ids=(),
+        verify_excerpt=None,
+    )
+
+    def consume_current_terminal() -> None:
+        fresh = store.get(task.id)
+        assert fresh is not None
+        watch_module._queue_main_verify_remediation_task(
+            config=config,
+            store=store,
+            task=fresh,
+            remediation=remediation,
+            head_sha="feedfacecafe",
+            desired_tags=("system", MAIN_INTEGRATION_VERIFY_TAG, "202606-recovery"),
+            tags=("202606-recovery",),
+            any_tag=False,
+        )
+
+    consume_current_terminal()
+    legacy = store.get(task.id)
+    assert legacy is not None
+    legacy.status = "dropped"
+    legacy.started_at = None
+    legacy.completed_at = datetime(2026, 6, 24, 12, 25, tzinfo=UTC)
+    legacy.drop_reason = "rewritten legacy terminal metadata"
+    store.update(legacy)
+    consume_current_terminal()
+    legacy_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert legacy_state is not None
+    assert legacy_state.consumed_attempt_count == 1
+
+    rerun = store.get(task.id)
+    assert rerun is not None
+    rerun.status = "failed"
+    rerun.started_at = datetime(2026, 6, 24, 13, 0, tzinfo=UTC)
+    rerun.completed_at = datetime(2026, 6, 24, 13, 5, tzinfo=UTC)
+    rerun.drop_reason = None
+    rerun.failure_reason = "UNKNOWN"
+    store.update(rerun)
+    consume_current_terminal()
+    rerun_state = store.get_main_verify_remediation_attempt_state(
+        signature="phase:functional",
+        tree_fingerprint=None,
+    )
+    assert rerun_state is not None
+    assert rerun_state.consumed_attempt_count == 2
 
 
 def test_watch_cycle_descendant_non_merge_action_consumes_active_main_verify_owner(
@@ -20051,6 +20841,7 @@ def test_watch_cycle_failed_main_verify_remediation_tracks_attempts_across_finge
         assert "Tree fingerprint: fp-a" in remediation_task.prompt
         assert "Remediation attempts spent: 0/2" in remediation_task.prompt
         remediation_task.status = "failed"
+        remediation_task.started_at = datetime(2026, 6, 24, 12, 0, tzinfo=UTC)
         remediation_task.completed_at = datetime.now(UTC)
         remediation_task.failure_reason = "UNKNOWN"
         store.update(remediation_task)
@@ -20078,6 +20869,7 @@ def test_watch_cycle_failed_main_verify_remediation_tracks_attempts_across_finge
         assert attempt_state.consumed_attempt_count == 1
         assert attempt_state.active_task_id == remediation_task.id
         remediation_task.status = "failed"
+        remediation_task.started_at = datetime(2026, 6, 24, 13, 0, tzinfo=UTC)
         remediation_task.completed_at = datetime.now(UTC)
         remediation_task.failure_reason = "UNKNOWN"
         store.update(remediation_task)
@@ -21193,6 +21985,7 @@ def test_watch_cycle_failed_then_merged_same_remediation_exhausts_shared_attempt
     assert "Remediation attempts spent: 0/2" in remediation_task.prompt
 
     remediation_task.status = "failed"
+    remediation_task.started_at = datetime(2026, 6, 24, 12, 0, tzinfo=UTC)
     remediation_task.completed_at = datetime.now(UTC)
     remediation_task.failure_reason = "UNKNOWN"
     store.update(remediation_task)
@@ -21234,6 +22027,7 @@ def test_watch_cycle_failed_then_merged_same_remediation_exhausts_shared_attempt
     assert attempt_state.active_task_id == remediation_task.id
 
     remediation_task.status = "completed"
+    remediation_task.started_at = datetime(2026, 6, 24, 13, 0, tzinfo=UTC)
     remediation_task.completed_at = datetime.now(UTC)
     remediation_task.branch = "feature/main-verify-remediation-shared-budget"
     remediation_task.has_commits = True
@@ -23843,6 +24637,7 @@ def test_completed_unmerged_main_verify_remediation_recycles_until_exhausted_att
     assert "Remediation attempts spent: 1/2" in recycled.prompt
 
     recycled.status = "completed"
+    recycled.started_at = datetime(2026, 6, 24, 13, 0, tzinfo=UTC)
     recycled.completed_at = datetime.now(UTC)
     recycled.merge_status = "unmerged"
     store.update(recycled)
@@ -38336,6 +39131,145 @@ def test_cmd_watch_resumed_reexec_adopts_same_token_live_watch_lease(tmp_path: P
     )
 
 
+def test_cmd_watch_normal_cycle_uses_runtime_owned_git_without_replacement(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    sentinel_git = _make_watch_git()
+    args = _watch_args(tmp_path, [], max_idle=1)
+
+    def fake_build_plan(**kwargs: object) -> _WatchCyclePlan:
+        assert kwargs["git"] is sentinel_git
+        return _empty_scoped_watch_plan()
+
+    with (
+        patch("gza.cli.watch.Git", side_effect=[sentinel_git]) as git_ctor,
+        patch("gza.cli.watch._build_watch_cycle_plan", side_effect=fake_build_plan) as build_plan,
+        patch(
+            "gza.cli.watch.check_canonical_checkout_invariant",
+            return_value=CanonicalCheckoutStatus(state="ok", expected_branch="main", current_branch="main"),
+        ),
+        patch(
+            "gza.cli.watch.check_git_health",
+            return_value=SimpleNamespace(dispatch_halted=False),
+        ),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert build_plan.call_count == 1
+    git_ctor.assert_called_once_with(tmp_path)
+
+
+def test_cmd_watch_initial_preview_uses_runtime_owned_git_without_replacement(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    sentinel_git = _make_watch_git()
+    args = _watch_args(tmp_path, [], yes=False, max_idle=1)
+
+    def fake_preview(**kwargs: object) -> tuple[_CycleResult, _WatchCyclePlan]:
+        assert kwargs["git"] is sentinel_git
+        return _CycleResult(False, 0, 0), _empty_scoped_watch_plan()
+
+    with (
+        patch("gza.cli.watch.Git", side_effect=[sentinel_git]) as git_ctor,
+        patch("gza.cli.watch._preview_initial_watch_cycle", side_effect=fake_preview) as preview,
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)),
+        patch("gza.cli.watch._sleep_interruptibly"),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert preview.call_count == 1
+    git_ctor.assert_called_once_with(tmp_path)
+
+
+def test_cmd_watch_git_health_uses_runtime_owned_git_without_replacement(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    sentinel_git = _make_watch_git()
+    args = _watch_args(tmp_path, [], dry_run=True, max_idle=1)
+
+    def fake_check_git_health(_store: SqliteTaskStore, git: Git, *, persist: bool) -> SimpleNamespace:
+        assert git is sentinel_git
+        assert persist is False
+        return SimpleNamespace(
+            dispatch_halted=True,
+            state=SimpleNamespace(alert_message="git health red"),
+        )
+
+    with (
+        patch("gza.cli.watch.Git", side_effect=[sentinel_git]) as git_ctor,
+        patch("gza.cli.watch.check_git_health", side_effect=fake_check_git_health) as check_health,
+        patch("gza.cli.watch._run_cycle", side_effect=AssertionError("git health hold should stop dry-run")),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert check_health.call_count == 1
+    git_ctor.assert_called_once_with(tmp_path)
+
+
+def test_cmd_watch_scoped_activity_uses_runtime_owned_git_without_replacement(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    scoped = store.add("Scoped owner", task_type="implement")
+    assert scoped.id is not None
+    sentinel_git = _make_watch_git()
+    args = _watch_args(tmp_path, [scoped.id], max_idle=1)
+
+    def fake_scoped_activity(**kwargs: object) -> SimpleNamespace:
+        assert kwargs["git"] is sentinel_git
+        return SimpleNamespace(active_count=0, effective_scoped_owner_ids=(scoped.id,))
+
+    with (
+        patch("gza.cli.watch.Git", side_effect=[sentinel_git]) as git_ctor,
+        patch("gza.cli.watch._system_can_run_tasks", return_value=False),
+        patch("gza.cli.watch._resolve_watch_scope_owner_ids", return_value=(scoped.id,)),
+        patch("gza.cli.watch._scoped_watch_activity", side_effect=fake_scoped_activity) as scoped_activity,
+        patch("gza.cli.watch._run_cycle", side_effect=AssertionError("scoped complete hold should not dispatch")),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert scoped_activity.call_count == 1
+    git_ctor.assert_called_once_with(tmp_path)
+
+
+def test_cmd_watch_scoped_planning_and_execution_use_runtime_owned_git_without_replacement(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    scoped = store.add("Scoped owner", task_type="implement")
+    assert scoped.id is not None
+    sentinel_git = _make_watch_git()
+    args = _watch_args(tmp_path, [scoped.id], max_idle=1)
+    plan = _empty_scoped_watch_plan_with_effective_scope((scoped.id,))
+
+    def fake_build_plan(**kwargs: object) -> _WatchCyclePlan:
+        assert kwargs["git"] is sentinel_git
+        return plan
+
+    def fake_dispatch(**kwargs: object) -> _CycleResult:
+        assert kwargs["git"] is sentinel_git
+        assert kwargs["precomputed_plan"] is plan
+        return _CycleResult(False, 0, 0, scoped_done=True, effective_scoped_owner_ids=(scoped.id,))
+
+    with (
+        patch("gza.cli.watch.Git", side_effect=[sentinel_git]) as git_ctor,
+        patch("gza.cli.watch._resolve_watch_scope_owner_ids", return_value=(scoped.id,)),
+        patch("gza.cli.watch._build_watch_cycle_plan", side_effect=fake_build_plan) as build_plan,
+        patch("gza.cli.watch._dispatch_scoped_watch_once", side_effect=fake_dispatch) as dispatch_once,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert build_plan.call_count == 1
+    assert dispatch_once.call_count == 1
+    git_ctor.assert_called_once_with(tmp_path)
+
+
 def test_watch_reexec_argv_scoped_pending_only_with_zero_recovery_slots_preserves_pending_only(
     tmp_path: Path,
 ) -> None:
@@ -43268,8 +44202,9 @@ def test_cmd_watch_signal_exit_releases_watch_lease(tmp_path: Path) -> None:
     )
 
 
-def test_cmd_watch_sigterm_handler_does_not_throw_when_shutdown_log_emit_fails(
+def test_cmd_watch_sigterm_handler_falls_back_to_stderr_when_shutdown_log_emit_fails(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     setup_config(tmp_path)
     args = _watch_args(tmp_path, [], max_idle=1, quiet=False)
@@ -43302,6 +44237,8 @@ def test_cmd_watch_sigterm_handler_does_not_throw_when_shutdown_log_emit_fails(
         rc = cmd_watch(args)
 
     assert rc == 128 + signal.SIGTERM
+    captured = capsys.readouterr()
+    assert captured.err.count("shutting down (workers left running)") == 1
     assert signal_calls[-2:] == [
         (signal.SIGINT, original_sigint),
         (signal.SIGTERM, original_sigterm),
@@ -43313,6 +44250,84 @@ def test_cmd_watch_sigterm_handler_does_not_throw_when_shutdown_log_emit_fails(
             lease_name=WATCH_SUPERVISOR_LEASE_NAME,
             owner_pid=os.getpid(),
             owner_token="after-sigterm-log-failure",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_second_sigint_falls_back_to_stderr_when_shutdown_log_emit_fails(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], max_idle=1, quiet=False)
+    original_sigint = object()
+    original_sigterm = object()
+    signal_calls: list[tuple[signal.Signals, object]] = []
+    handlers: dict[signal.Signals, object] = {}
+    in_handler = False
+    log_messages: list[tuple[str, str]] = []
+    stderr_writes: list[str] = []
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        signal_calls.append((sig, handler))
+        previous = original_sigint if sig == signal.SIGINT else original_sigterm
+        handlers[sig] = handler
+        return previous
+
+    def trigger_two_sigints(*_args: object, **_kwargs: object) -> _CycleResult:
+        nonlocal in_handler
+        handler = handlers[signal.SIGINT]
+        assert callable(handler)
+        in_handler = True
+        try:
+            handler(signal.SIGINT, None)
+        finally:
+            in_handler = False
+        in_handler = True
+        try:
+            handler(signal.SIGINT, None)
+        finally:
+            in_handler = False
+        raise AssertionError("second SIGINT should raise before returning a cycle result")
+
+    def fail_normal_log(self: _WatchLog, event: str, message: str, **_kwargs: object) -> None:
+        assert not in_handler
+        log_messages.append((event, message))
+        raise OSError("watch log unavailable")
+
+    class RecordingStderr:
+        def write(self, text: str) -> int:
+            assert not in_handler
+            stderr_writes.append(text)
+            return len(text)
+
+        def flush(self) -> None:
+            assert not in_handler
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=trigger_two_sigints),
+        patch("gza.cli.watch.signal.signal", side_effect=fake_signal),
+        patch("gza.cli.watch._WatchLog.emit", autospec=True, side_effect=fail_normal_log),
+        patch("gza.cli.watch.sys.stderr", RecordingStderr()),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            cmd_watch(args)
+
+    capsys.readouterr()
+    assert log_messages == [("INFO", "shutting down (workers left running)")]
+    assert "".join(stderr_writes).count("shutting down (workers left running)") == 1
+    assert signal_calls[-2:] == [
+        (signal.SIGINT, original_sigint),
+        (signal.SIGTERM, original_sigterm),
+    ]
+    store = make_store(tmp_path)
+    assert store.get_active_watch_session() is None
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-second-sigint-log-failure",
         )
         is not None
     )
@@ -43359,7 +44374,7 @@ def test_cmd_watch_quiet_sigterm_reporting_failures_do_not_escape_cleanup(
     ):
         rc = cmd_watch(args)
 
-    assert rc == 128 + signal.SIGTERM
+    assert rc == 1
     assert signal_calls[-2:] == [
         (signal.SIGINT, original_sigint),
         (signal.SIGTERM, original_sigterm),
@@ -43542,6 +44557,53 @@ def test_cmd_watch_second_signal_install_failure_rolls_back_sigint_and_releases_
             lease_name=WATCH_SUPERVISOR_LEASE_NAME,
             owner_pid=os.getpid(),
             owner_token="after-second-signal-install-failure",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_partial_signal_install_failure_retries_restore_and_releases_watch_lease(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [], quiet=True)
+    original_sigint = object()
+    calls: list[tuple[signal.Signals, object]] = []
+
+    def fake_signal(sig: signal.Signals, handler: object) -> object:
+        calls.append((sig, handler))
+        if sig == signal.SIGINT and len(calls) == 1:
+            return original_sigint
+        if sig == signal.SIGTERM:
+            raise RuntimeError("sigterm install failed")
+        if sig == signal.SIGINT and handler is original_sigint:
+            sigint_restore_calls = [call for call in calls if call == (signal.SIGINT, original_sigint)]
+            if len(sigint_restore_calls) == 1:
+                raise RuntimeError("first sigint restore failed")
+        return object()
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=AssertionError("signal setup failure should not run")),
+        patch("gza.cli.watch.signal.signal", side_effect=fake_signal),
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "watch signal handler setup failed" in captured.err
+    assert "sigterm install failed" in captured.err
+    assert "first sigint restore failed" in captured.err
+    assert calls[0][0] == signal.SIGINT
+    assert calls[1][0] == signal.SIGTERM
+    assert calls[2] == (signal.SIGINT, original_sigint)
+    assert calls[-1] == (signal.SIGINT, original_sigint)
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-partial-install-restore-retry",
         )
         is not None
     )
@@ -48278,6 +49340,87 @@ def test_cmd_watch_logs_owner_backoff_without_global_sleep(tmp_path: Path) -> No
     assert "BACKOFF" in log_text
     assert f"{task.id}: sleeping unit 60s before retrying more work" in log_text
     assert "other units remain dispatchable" in log_text
+
+
+def test_cmd_watch_startup_session_transition_is_in_initial_baseline(tmp_path: Path) -> None:
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
+        "db_path: .gza/gza.db\n"
+        f"worktree_dir: {worktree_dir}\n"
+        "watch:\n"
+        "  failure_backoff_initial: 60\n"
+        "  failure_backoff_max: 240\n"
+        "  failure_halt_after: 1\n"
+    )
+    store = make_store(tmp_path)
+    task = store.add("Startup worker", task_type="plan")
+    assert task.id is not None
+    task.status = "pending"
+    store.update(task)
+    real_record_watch_session = watch_module._record_watch_session
+    args = _watch_args(tmp_path, [], poll=1, max_idle=1)
+
+    def record_session_and_fail_task(**kwargs: object) -> bool:
+        task.status = "failed"
+        task.failure_reason = "MAX_TURNS"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+        return real_record_watch_session(**kwargs)  # type: ignore[arg-type]
+
+    with (
+        patch("gza.cli.watch._record_watch_session", side_effect=record_session_and_fail_task),
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_count == 1
+    assert run_cycle.call_args.kwargs["excluded_owner_ids"] == frozenset()
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "FAIL" not in log_text
+    assert "BACKOFF" not in log_text
+    assert "failure halt threshold reached" not in log_text
+
+
+def test_cmd_watch_post_baseline_transition_is_still_detected(tmp_path: Path) -> None:
+    worktree_dir = tmp_path / ".gza-test-worktrees"
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\n"
+        "db_path: .gza/gza.db\n"
+        f"worktree_dir: {worktree_dir}\n"
+        "watch:\n"
+        "  failure_backoff_initial: 60\n"
+        "  failure_backoff_max: 240\n"
+        "  failure_halt_after: 1\n"
+    )
+    store = make_store(tmp_path)
+    task = store.add("Post-baseline worker", task_type="plan")
+    assert task.id is not None
+    task.status = "pending"
+    store.update(task)
+    args = _watch_args(tmp_path, [], poll=1, max_idle=1)
+
+    def fail_task_after_baseline(**_kwargs: object) -> _CycleResult:
+        task.status = "failed"
+        task.failure_reason = "MAX_TURNS"
+        task.completed_at = datetime.now(UTC)
+        store.update(task)
+        return _CycleResult(False, 0, 0)
+
+    with (
+        patch("gza.cli.watch._run_cycle", side_effect=fail_task_after_baseline) as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_count == 1
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "BACKOFF" in log_text
+    assert "failure halt threshold reached (1 failing unit(s) >= 1" in log_text
+    assert str(task.id) in log_text
 
 
 def test_cmd_watch_restart_failed_does_not_backoff_for_actionable_review_recovery(tmp_path: Path) -> None:
