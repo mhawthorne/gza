@@ -8436,9 +8436,19 @@ def _build_watch_cycle_plan(
     known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
     excluded_owner_ids: frozenset[str] = frozenset(),
     git: Git | None = None,
+    reconciled_runtime_state: ProjectRuntimeReconcileResult | None = None,
 ) -> _WatchCyclePlan:
-    snapshot = get_concurrency_snapshot(config, store, cleanup_stale=False)
-    running_task_ids = snapshot.running_task_ids
+    if reconciled_runtime_state is None:
+        snapshot = get_concurrency_snapshot(config, store, cleanup_stale=False)
+        running_task_ids = snapshot.running_task_ids
+        running = snapshot.running
+        anonymous_worker_count = snapshot.anonymous_worker_count
+        starting_worker_count = getattr(snapshot, "starting_worker_count", 0)
+    else:
+        running_task_ids = reconciled_runtime_state.running_task_ids
+        running = reconciled_runtime_state.running
+        anonymous_worker_count = reconciled_runtime_state.anonymous_worker_count
+        starting_worker_count = reconciled_runtime_state.starting_worker_count
     pending_count = (
         0
         if scoped_owner_ids is not None
@@ -8466,7 +8476,6 @@ def _build_watch_cycle_plan(
             and store.is_task_blocked(pending_task)[0]
         )
     )
-    running = snapshot.running
     effective_batch = min(batch, config.max_concurrent)
     slots = max(0, effective_batch - running)
     cycle_git = git if git is not None else Git(config.project_dir)
@@ -8487,8 +8496,8 @@ def _build_watch_cycle_plan(
     )
     return _WatchCyclePlan(
         running_task_ids=running_task_ids,
-        anonymous_worker_count=snapshot.anonymous_worker_count,
-        starting_worker_count=getattr(snapshot, "starting_worker_count", 0),
+        anonymous_worker_count=anonymous_worker_count,
+        starting_worker_count=starting_worker_count,
         pending_count=pending_count,
         blocked_pending_count=blocked_pending_count,
         running=running,
@@ -8618,7 +8627,7 @@ def _run_cycle(
         installed_package_drift,
         auto_restart_on_drift=auto_restart_on_drift,
     )
-    _reconcile_watch_runtime_state(
+    reconciled_runtime_state = _reconcile_watch_runtime_state(
         config=config,
         store=store,
         runtime_key=config.project_name,
@@ -8645,6 +8654,7 @@ def _run_cycle(
         known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
         excluded_owner_ids=excluded_owner_ids,
         git=git,
+        reconciled_runtime_state=reconciled_runtime_state,
     )
     running_task_ids = list(plan.running_task_ids)
     anonymous_worker_count = plan.anonymous_worker_count

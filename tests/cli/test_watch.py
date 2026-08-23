@@ -1013,6 +1013,54 @@ def test_run_cycle_preserves_reconcile_before_project_analysis_order(tmp_path: P
     assert calls[:2] == ["reconcile", "analyze"]
 
 
+def test_run_cycle_uses_reconciled_occupancy_for_legacy_capacity_snapshot(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    calls: list[str] = []
+    built_plans: list[_WatchCyclePlan] = []
+    real_build_plan = watch_module._build_watch_cycle_plan
+
+    def collect_live_once(*_args: object, **_kwargs: object) -> tuple[set[int], list[str], int, int]:
+        calls.append("occupancy")
+        return {4321}, ["gza-4321"], 2, 1
+
+    def build_plan_with_order(**kwargs: object) -> _WatchCyclePlan:
+        calls.append("analyze")
+        plan = real_build_plan(**kwargs)  # type: ignore[arg-type]
+        built_plans.append(plan)
+        return plan
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks", side_effect=lambda cfg: calls.append("reconcile")),
+        patch("gza.cli._common.prune_terminal_dead_workers", return_value=None),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks", return_value=None),
+        patch("gza.cli.watch._collect_live_running_state", side_effect=collect_live_once),
+        patch(
+            "gza.cli.watch.get_concurrency_snapshot",
+            side_effect=AssertionError("plan should reuse reconciled occupancy"),
+        ),
+        patch("gza.cli.watch._build_watch_cycle_plan", side_effect=build_plan_with_order),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=4,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            git=_make_watch_git(),
+        )
+
+    assert calls[:3] == ["reconcile", "occupancy", "analyze"]
+    assert built_plans
+    assert built_plans[0].running_task_ids == ("gza-4321",)
+    assert built_plans[0].running == 1
+    assert built_plans[0].anonymous_worker_count == 2
+    assert built_plans[0].starting_worker_count == 1
+    assert built_plans[0].slots == min(4, config.max_concurrent) - 1
+
+
 def test_project_runtime_slice_types_are_focused_value_objects(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
