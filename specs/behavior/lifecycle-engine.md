@@ -1003,24 +1003,36 @@ representative, local source ref, and canonical local target branch, and re-read
 state after every mutating step. Initial resolution and every later reconciliation MUST
 first handle the complete terminal-state branch before testing ordinary unmerged
 eligibility. The reconciliation boundary is explicit: if the active unit is already
-`merged`, `empty`, or `redundant`, writable and dry-run `land` MUST return that known
-terminal result without mutating merge state or running downstream landing activity. If
-canonical writable reconciliation of an active `unmerged` unit proves one of those three
-terminal states, it MAY persist exactly one merge-state transition from `unmerged` to the
-proven state; after that write, the authoritative row MUST be refreshed, the known
-terminal result MUST be returned, and all later landing activity in the invocation is
-prohibited. Dry-run MUST remain query-only and MUST NOT perform the reconciliation
-mutation, even when the query result proves `merged`, `empty`, or `redundant`. Once a
-terminal result is known, `land` MUST NOT rebase, run a
+`merged`, writable and dry-run `land` MUST return that known terminal result without
+mutating merge state or running downstream landing activity. If the active unit is already
+`empty` or `redundant` and has no recorded head SHA, writable and dry-run `land` MUST
+return the stored terminal no-work result. If the active unit is already `empty` or
+`redundant` and has a recorded head SHA, writable and dry-run `land` MUST route it through
+the canonical recorded-head no-work validation defined in §8 before returning it as
+terminal. Valid proof that the recorded-head patch is represented on the target, or
+fail-closed unavailable proof, MAY return the stored terminal no-work result with no
+mutation. Positive proof that the recorded-head patch is missing MUST make writable
+`land` restore the unit to `unmerged`; dry-run MUST report that repair-needed nonterminal
+outcome without mutating. If canonical writable reconciliation of an active `unmerged`
+unit proves one of the three terminal states, it MAY persist exactly one merge-state
+transition from `unmerged` to the proven state; that terminal write MUST be bound to the
+durable merge-unit identity and live source/target heads used by the proof, and writable
+`land` MUST re-read and re-prove immediately before the atomic update. If that identity or
+either live head changed, the stale terminal write MUST be rejected or the fresh
+authoritative terminal state returned. After any attempted terminal write, the
+authoritative row MUST be refreshed and routed through the complete terminal-state branch
+before reporting persistence failure. Dry-run MUST remain query-only and MUST NOT perform
+the reconciliation mutation, even when the query result proves `merged`, `empty`, or
+`redundant`. Once a terminal result is known, `land` MUST NOT rebase, run a
 provider, run source verify, refresh post-merge target verify, run spec-coherence
 review, run code or resolution review, run a landing judgment, create or reuse
 follow-up/deferred tasks, materialize artifacts, mark merged, perform a git merge, or
 perform any merge-state mutation beyond the single allowed writable terminal
-reconciliation. The three terminal results are distinct: `merged` reports
-already-landed success, while `empty` and `redundant` report terminal no-work success and
-MUST NOT be described as landed, merged, or marked merged. Only after this terminal
-branch is excluded may continuing `land` require the unit's merge state to be exactly
-`unmerged`.
+reconciliation or recorded-head restoration to `unmerged`. The three terminal results are
+distinct: `merged` reports already-landed success, while `empty` and `redundant` report
+terminal no-work success and MUST NOT be described as landed, merged, or marked merged.
+Only after this terminal branch is excluded may continuing `land` require the unit's merge
+state to be exactly `unmerged`.
 
 Landing phase order is part of the safety contract. Writable `land` MUST execute or stop
 in this order, re-reading durable state between phases and after every source-head

@@ -14003,6 +14003,74 @@ class SqliteTaskStore:
         self.dual_write_legacy_merge_status(unit_id)
         return True
 
+    def set_merge_unit_state_if_identity(
+        self,
+        unit_id: str,
+        state: str,
+        *,
+        expected_identity: Any,
+    ) -> bool:
+        """Update merge-unit state only when proof-bearing identity still matches."""
+        if not self.supports_merge_units():
+            return False
+        now = datetime.now(UTC)
+        current_unit = self.get_merge_unit(unit_id)
+        if current_unit is None:
+            raise ValueError(f"Merge unit {unit_id} not found")
+        updates: list[str] = [
+            "state = ?",
+            "updated_at = ?",
+            "merged_at = ?",
+            "merged_by_task_id = ?",
+            "merge_source = ?",
+        ]
+        params: list[object] = [state, _format_db_timestamp(now)]
+        if state == "merged":
+            owner = self.resolve_merge_unit_owner_task(current_unit)
+            owner_task_id = owner.id if owner is not None else current_unit.owner_task_id
+            params.extend(
+                [
+                    _format_db_timestamp(current_unit.merged_at or now),
+                    owner_task_id,
+                    current_unit.merge_source,
+                ]
+            )
+        else:
+            params.extend([None, None, None])
+        params.extend(
+            [
+                self._project_id,
+                unit_id,
+                expected_identity.source_branch,
+                expected_identity.target_branch,
+                expected_identity.state,
+                expected_identity.owner_task_id,
+                expected_identity.head_sha,
+                expected_identity.base_sha,
+            ]
+        )
+        with self._write_transaction() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE merge_units
+                SET {', '.join(updates)}
+                WHERE project_id = ?
+                  AND id = ?
+                  AND source_branch IS ?
+                  AND target_branch IS ?
+                  AND state IS ?
+                  AND owner_task_id IS ?
+                  AND head_sha IS ?
+                  AND base_sha IS ?
+                """,
+                tuple(params),
+            )
+            updated = cursor.rowcount > 0
+        if not updated:
+            return False
+        self.dual_write_legacy_merge_status(unit_id)
+        return True
+
     def repair_inconsistent_unmerged_merge_units(self) -> int:
         """Clear merged provenance left behind on non-merged merge units."""
         if not self.supports_merge_units():

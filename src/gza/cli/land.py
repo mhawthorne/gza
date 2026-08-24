@@ -7,7 +7,7 @@ import argparse
 from gza.cli._common import get_store, resolve_id
 from gza.config import Config
 from gza.git import Git
-from gza.landing import LandResult, LandTerminalResult
+from gza.landing import LandResult, LandTerminalResult, LandingCollaborators, land_terminal_state, reconcile_terminal_merge_truth
 
 
 def cmd_land(args: argparse.Namespace) -> int:
@@ -25,6 +25,18 @@ def cmd_land(args: argparse.Namespace) -> int:
     if policy not in LANDING_POLICIES:
         print(f"Error: unknown landing policy {policy!r}")
         return 2
+
+    if hasattr(store, "resolve_merge_unit_subject"):
+        terminal_result = land_terminal_state(
+            store,
+            LandRequest(task_id=task_id, policy=policy, dry_run=bool(args.dry_run)),
+            collaborators=LandingCollaborators(
+                reconcile_terminal_state=reconcile_terminal_merge_truth(git),
+            ),
+        )
+        if isinstance(terminal_result, LandTerminalResult):
+            print(_format_terminal_result(terminal_result))
+            return 0
 
     result = LandingCoordinator(
         store=store,
