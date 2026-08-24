@@ -100,6 +100,46 @@ def test_landing_dry_run_requires_identity_evidence_phases_and_first_unknown_bou
     assert "without creating tasks, running providers, verifying, rebasing, or merging" in docs
 
 
+def test_landing_initial_resolution_defines_all_terminal_merge_unit_states() -> None:
+    overview = _read("specs/behavior/00-overview.md")
+    spec = _read("specs/behavior/lifecycle-engine.md")
+    vocabulary = _squash(_section(overview, "## Vocabulary (the data model, abstractly)"))
+    land_section = _squash(_section(spec, "### §8a — Operator-triggered land"))
+
+    assert "`unmerged` | `merged` | `empty` | `redundant`" in vocabulary
+    assert "`empty` and `redundant` mean terminal no-work" in vocabulary
+    assert "MUST NOT be reported as landed" in vocabulary
+    assert "Initial resolution and every later reconciliation MUST first handle the complete terminal-state branch" in land_section
+    assert "If authoritative merge-unit reconciliation proves the active unit is `merged`, `empty`, or `redundant`" in land_section
+    assert "MUST finish idempotently with an explicit terminal result" in land_section
+    assert "MUST NOT rebase, run source verify, run spec-coherence review, run code or resolution review, run a landing judgment" in land_section
+    assert "create or reuse follow-up/deferred tasks, materialize artifacts, mark merged, perform a git merge, or mutate merge state" in land_section
+    assert "`merged` reports already-landed success" in land_section
+    assert "`empty` and `redundant` report terminal no-work success" in land_section
+    assert "MUST NOT be described as landed, merged, or marked merged" in land_section
+    assert "Only after this terminal branch is excluded" in land_section
+    assert "merge state to be exactly `unmerged`" in land_section
+
+
+def test_landing_later_reconciliation_and_dry_run_preserve_terminal_no_work() -> None:
+    spec = _read("specs/behavior/lifecycle-engine.md")
+    docs = _read("docs/configuration.md")
+    dry_run_and_bounds = _squash(_section(spec, "#### Dry run, idempotency, and refusal output"))
+
+    assert "successful rerun after a terminal result MUST reconcile and report that terminal state without another merge" in dry_run_and_bounds
+    assert "Reconciliation to `merged` MUST still refresh or reuse the configured post-merge target checkpoint" in dry_run_and_bounds
+    assert "Reconciliation to `empty` or `redundant` has no post-merge checkpoint because no merge occurred" in dry_run_and_bounds
+    assert "MUST return terminal no-work success without running the post-merge checkpoint" in dry_run_and_bounds
+    assert "without reporting the unit as landed" in dry_run_and_bounds
+    assert "query-only state already proves the selected unit is `merged`, `empty`, or `redundant`" in dry_run_and_bounds
+    assert "dry-run MUST report that known terminal state as the command's current outcome" in dry_run_and_bounds
+    assert "MUST not cross the execution boundary to repair metadata, refresh checkpoints, create tasks, verify, review, judge, materialize, mark merged, or merge" in dry_run_and_bounds
+    assert "`empty` and `redundant` are terminal no-work, not landed success" in dry_run_and_bounds
+    assert "known terminal state" in docs
+    assert "the command returns an idempotent terminal result without source verify, review, judgment, materialization, mark-merged, or merge side effects" in docs
+    assert "`empty` and `redundant` are reported as terminal no-work, not as landed" in docs
+
+
 def test_landing_scope_and_dependency_proof_precede_rebase_and_are_recomputed() -> None:
     spec = _read("specs/behavior/lifecycle-engine.md")
     phase_order = _squash(_section(spec, "### §8a — Operator-triggered land"))

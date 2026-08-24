@@ -44,10 +44,12 @@ The contract is defined over these concepts, independent of how they are stored.
   set of related tasks that together produce one mergeable change on one branch. This is
   the thing that has a lifecycle and a merge state. A work unit MUST have exactly one
   canonical merge target branch.
-- **Merge state of a work unit:** `unmerged` | `merged`. Authoritative answer to "has
-  this landed?" It MUST be decided from recorded lifecycle state, **not** from strict
-  git ancestry (a squash-merged branch fails ancestry but is merged). See the four
-  merge-state axes in `docs/internal/task-model-canonical.md`.
+- **Merge state of a work unit:** `unmerged` | `merged` | `empty` | `redundant`.
+  Authoritative answer to "has this landed or is there terminal no-work?" It MUST be
+  decided from recorded lifecycle state, **not** from strict git ancestry (a
+  squash-merged branch fails ancestry but is merged). `merged` means landed; `empty`
+  and `redundant` mean terminal no-work and MUST NOT be reported as landed. See the
+  four merge-state axes in `docs/internal/task-model-canonical.md`.
 - **Review verdict** (on a completed `review` task): `APPROVED` |
   `APPROVED_WITH_FOLLOWUPS` | `CHANGES_REQUESTED` | `NEEDS_DISCUSSION`. Any other value
   is treated as *unknown* and escalates.
