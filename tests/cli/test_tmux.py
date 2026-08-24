@@ -1,9 +1,13 @@
 """Tests for tmux-related CLI functionality: attach command and tmux spawn logic."""
 
 import argparse
+import os
 import signal
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from .conftest import make_store, setup_config
 
@@ -68,13 +72,14 @@ class TestCmdAttach:
 
         tmux_has_session = MagicMock(returncode=0)
 
-        with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
-             patch("gza.cli.query.os.execvp") as mock_execvp:
+        with patch("gza.cli.query.get_tmux_session_pid", return_value=12345), \
+             patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
+             patch("gza.cli.query.os.execvpe") as mock_execvpe:
             from gza.cli.query import cmd_attach
             cmd_attach(args)
 
-        mock_execvp.assert_called_once()
-        call_args = mock_execvp.call_args[0]
+        mock_execvpe.assert_called_once()
+        call_args = mock_execvpe.call_args[0]
         assert call_args[0] == "tmux"
         assert "attach-session" in call_args[1]
         assert "gza-1" in call_args[1]
@@ -91,12 +96,147 @@ class TestCmdAttach:
 
         tmux_has_session = MagicMock(returncode=0)
 
-        with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
-             patch("gza.cli.query.os.execvp") as mock_execvp:
+        with patch("gza.cli.query.get_tmux_session_pid", return_value=12345), \
+             patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
+             patch("gza.cli.query.os.execvpe") as mock_execvpe:
             from gza.cli.query import cmd_attach
             cmd_attach(args)
 
-        mock_execvp.assert_called_once()
+        mock_execvpe.assert_called_once()
+
+    def test_cmd_attach_metadata_absent_fallback_uses_live_legacy_session_owned_by_worker(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """Attach fallback for old metadata validates legacy tmux PID ownership."""
+        import json
+
+        from gza.config import Config
+        from gza.runtime_context import runtime_tmux_session_name
+
+        self._setup_running_worker(tmp_path, task_id=1, tmux_session="legacy-will-be-removed", provider="codex")
+        worker_path = tmp_path / ".gza" / "workers" / "w-20260301-1.json"
+        worker_data = json.loads(worker_path.read_text())
+        worker_data.pop("tmux_session", None)
+        worker_path.write_text(json.dumps(worker_data))
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        config = Config.load(tmp_path)
+        expected_session = runtime_tmux_session_name(
+            task_id=task.id,
+            project_id=config.project_id,
+            db_path=config.db_path,
+        )
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+        tmux_has_session = MagicMock(returncode=0)
+
+        def fake_tmux_pid(session_name, **kwargs):
+            assert kwargs["cwd"] == tmp_path
+            assert kwargs["env"]["GZA_DB_PATH"] == str(config.db_path)
+            if session_name == f"gza-{task.id}":
+                return 12345
+            if session_name == expected_session:
+                return 99999
+            return None
+
+        with patch("gza.cli.query.get_tmux_session_pid", side_effect=fake_tmux_pid) as mock_pid, \
+             patch("gza.cli.query.subprocess.run", return_value=tmux_has_session) as mock_run, \
+             patch("gza.cli.query.os.execvpe") as mock_execvpe:
+            from gza.cli.query import cmd_attach
+            cmd_attach(args)
+
+        assert [call.args[0] for call in mock_pid.call_args_list] == [
+            expected_session,
+            f"gza-{task.id}",
+        ]
+        has_session_call = mock_run.call_args_list[0][0][0]
+        assert has_session_call == ["tmux", "has-session", "-t", f"gza-{task.id}"]
+        exec_args = mock_execvpe.call_args[0][1]
+        assert f"gza-{task.id}" in exec_args
+
+    def test_cmd_attach_refuses_persisted_legacy_session_owned_by_other_project(
+        self,
+        tmp_path: Path,
+        capsys,
+        monkeypatch,
+    ) -> None:
+        """Persisted legacy tmux names must prove pane PID ownership before attach."""
+        project_a = tmp_path / "a"
+        project_b = tmp_path / "b"
+        project_a.mkdir()
+        project_b.mkdir()
+        self._setup_running_worker(project_a, task_id=1, tmux_session="gza-1", provider="codex")
+        self._setup_running_worker(project_b, task_id=1, tmux_session="gza-1", provider="codex")
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(project_a, worker_id="w-20260301-1")
+
+        with patch("gza.cli.query.get_tmux_session_pid", return_value=12345 + 1), \
+             patch("gza.cli.query.subprocess.run") as mock_run, \
+             patch("gza.cli.query.os.execvpe") as mock_execvpe:
+            from gza.cli.query import cmd_attach
+
+            result = cmd_attach(args)
+
+        assert result == 1
+        mock_run.assert_not_called()
+        mock_execvpe.assert_not_called()
+        assert "expected worker" in capsys.readouterr().out
+
+    def test_cmd_attach_accepts_persisted_legacy_session_with_matching_worker_pid(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1", provider="codex")
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+
+        with patch("gza.cli.query.get_tmux_session_pid", return_value=12345), \
+             patch("gza.cli.query.subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("gza.cli.query.os.execvpe") as mock_execvpe:
+            from gza.cli.query import cmd_attach
+
+            result = cmd_attach(args)
+
+        assert result == 1
+        assert "gza-1" in mock_execvpe.call_args[0][1]
+
+    def test_cmd_attach_accepts_persisted_qualified_session_with_matching_worker_pid(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        from gza.config import Config
+        from gza.runtime_context import runtime_tmux_session_name
+
+        self._setup_running_worker(tmp_path, task_id=1, tmux_session=None, provider="codex")
+        config = Config.load(tmp_path)
+        task = make_store(tmp_path).get_all()[0]
+        qualified = runtime_tmux_session_name(
+            task_id=task.id,
+            project_id=config.project_id,
+            db_path=config.db_path,
+        )
+        worker_path = tmp_path / ".gza" / "workers" / "w-20260301-1.json"
+        import json
+
+        worker_data = json.loads(worker_path.read_text())
+        worker_data["tmux_session"] = qualified
+        worker_path.write_text(json.dumps(worker_data))
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+
+        with patch("gza.cli.query.get_tmux_session_pid", return_value=12345), \
+             patch("gza.cli.query.subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("gza.cli.query.os.execvpe") as mock_execvpe:
+            from gza.cli.query import cmd_attach
+
+            result = cmd_attach(args)
+
+        assert result == 1
+        assert qualified in mock_execvpe.call_args[0][1]
 
     def test_cmd_attach_no_running_worker_returns_1(self, tmp_path: Path):
         """cmd_attach returns 1 when no running worker is found."""
@@ -114,13 +254,14 @@ class TestCmdAttach:
         self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1")
 
         args = _make_args(tmp_path, worker_id="w-20260301-1")
-        tmux_no_session = MagicMock(returncode=1)
 
-        with patch("gza.cli.query.subprocess.run", return_value=tmux_no_session):
+        with patch("gza.cli.query.get_tmux_session_pid", return_value=None), \
+             patch("gza.cli.query.subprocess.run") as mock_run:
             from gza.cli.query import cmd_attach
             result = cmd_attach(args)
 
         assert result == 1
+        mock_run.assert_not_called()
 
     def test_cmd_attach_prints_warning_for_observe_only_provider(self, tmp_path: Path, capsys, monkeypatch):
         """cmd_attach attaches read-only and prints notice for codex/gemini providers."""
@@ -130,18 +271,52 @@ class TestCmdAttach:
         args = _make_args(tmp_path, worker_id="w-20260301-1")
         tmux_has_session = MagicMock(returncode=0)
 
-        with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
-             patch("gza.cli.query.os.execvp") as mock_execvp:
+        with patch("gza.cli.query.get_tmux_session_pid", return_value=12345), \
+             patch("gza.cli.query.subprocess.run", return_value=tmux_has_session), \
+             patch("gza.cli.query.os.execvpe") as mock_execvpe:
             from gza.cli.query import cmd_attach
             cmd_attach(args)
 
         # Should attach with -r (read-only) flag
-        mock_execvp.assert_called_once()
-        call_args = mock_execvp.call_args[0]
+        mock_execvpe.assert_called_once()
+        call_args = mock_execvpe.call_args[0]
         assert "-r" in call_args[1], "Observe-only providers should attach read-only (-r)"
 
         captured = capsys.readouterr()
         assert "headless" in captured.out.lower() or "observe" in captured.out.lower()
+
+    def test_cmd_attach_tmux_calls_use_project_runtime_environment(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """Attach/control tmux calls and final exec use the owning project's env."""
+        self._setup_running_worker(tmp_path, task_id=1, tmux_session="gza-1", provider="codex")
+        (tmp_path / ".env").write_text(
+            "TMUX_TMPDIR=/tmp/project-tmux\nPATH=/tmp/project-bin:/usr/bin\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.setenv("TMUX_TMPDIR", "/tmp/supervisor-tmux")
+        monkeypatch.setenv("PATH", "/tmp/supervisor-bin:/usr/bin")
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+
+        def fake_tmux_run(_cmd, **kwargs):
+            assert kwargs["cwd"] == tmp_path
+            assert kwargs["env"]["TMUX_TMPDIR"] == "/tmp/project-tmux"
+            assert kwargs["env"]["PATH"] == "/tmp/project-bin:/usr/bin"
+            return MagicMock(returncode=0)
+
+        with patch("gza.cli.query.get_tmux_session_pid", return_value=12345), \
+             patch("gza.cli.query.subprocess.run", side_effect=fake_tmux_run), \
+             patch("gza.cli.query.os.execvpe") as mock_execvpe:
+            from gza.cli.query import cmd_attach
+            cmd_attach(args)
+
+        exec_env = mock_execvpe.call_args[0][2]
+        assert exec_env["TMUX_TMPDIR"] == "/tmp/project-tmux"
+        assert exec_env["PATH"] == "/tmp/project-bin:/usr/bin"
+        assert os.environ["TMUX_TMPDIR"] == "/tmp/supervisor-tmux"
 
     def test_cmd_attach_uses_switch_client_inside_tmux(self, tmp_path: Path):
         """cmd_attach uses switch-client instead of attach-session when already in tmux."""
@@ -150,14 +325,15 @@ class TestCmdAttach:
         args = _make_args(tmp_path, worker_id="w-20260301-1")
         tmux_has_session = MagicMock(returncode=0)
 
-        with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session) as mock_run, \
-             patch("gza.cli.query.os.execvp") as mock_execvp, \
+        with patch("gza.cli.query.get_tmux_session_pid", return_value=12345), \
+             patch("gza.cli.query.subprocess.run", return_value=tmux_has_session) as mock_run, \
+             patch("gza.cli.query.os.execvpe") as mock_execvpe, \
              patch.dict("os.environ", {"TMUX": "/tmp/tmux-501/default,12345,0"}):
             from gza.cli.query import cmd_attach
             cmd_attach(args)
 
-        mock_execvp.assert_called_once()
-        call_args = mock_execvp.call_args[0]
+        mock_execvpe.assert_called_once()
+        call_args = mock_execvpe.call_args[0]
         assert call_args[0] == "tmux"
         assert "switch-client" in call_args[1]
         assert "gza-1" in call_args[1]
@@ -179,14 +355,15 @@ class TestCmdAttach:
         args = _make_args(tmp_path, worker_id="w-20260301-1")
         tmux_has_session = MagicMock(returncode=0)
 
-        with patch("gza.cli.query.subprocess.run", return_value=tmux_has_session) as mock_run, \
-             patch("gza.cli.query.os.execvp") as mock_execvp, \
+        with patch("gza.cli.query.get_tmux_session_pid", return_value=12345), \
+             patch("gza.cli.query.subprocess.run", return_value=tmux_has_session) as mock_run, \
+             patch("gza.cli.query.os.execvpe") as mock_execvpe, \
              patch.dict("os.environ", {"TMUX": "/tmp/tmux-501/default,12345,0"}):
             from gza.cli.query import cmd_attach
             cmd_attach(args)
 
-        mock_execvp.assert_called_once()
-        call_args = mock_execvp.call_args[0]
+        mock_execvpe.assert_called_once()
+        call_args = mock_execvpe.call_args[0]
         assert "switch-client" in call_args[1]
         assert "-r" in call_args[1]
 
@@ -219,14 +396,14 @@ class TestCmdAttach:
         with patch("gza.cli.query.os.kill", side_effect=fake_kill) as mock_kill, \
              patch("gza.cli.query.subprocess.run", return_value=MagicMock(returncode=0)), \
              patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"), \
-             patch("gza.cli.query.os.execvp") as mock_execvp:
+             patch("gza.cli.query.os.execvpe") as mock_execvpe:
             from gza.cli.query import cmd_attach
             result = cmd_attach(args)
 
         assert result == 0
         assert mock_kill.called, "interactive attach must stop the running worker"
-        mock_execvp.assert_called_once()
-        tmux_cmd = mock_execvp.call_args[0][1]
+        mock_execvpe.assert_called_once()
+        tmux_cmd = mock_execvpe.call_args[0][1]
         assert "attach-session" in tmux_cmd
         assert any(part.startswith("gza-attach-") for part in tmux_cmd)
 
@@ -235,6 +412,62 @@ class TestCmdAttach:
         assert worker is not None
         assert worker.status == "completed"
         assert worker.completion_reason == "stopped_for_attach"
+
+    def test_cmd_attach_interactive_session_names_are_project_qualified(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """Same task IDs in different projects must not kill each other's attach session."""
+        from gza.config import Config
+        from gza.runtime_context import runtime_tmux_session_name
+
+        project_a = tmp_path / "a"
+        project_b = tmp_path / "b"
+        project_a.mkdir()
+        project_b.mkdir()
+        self._setup_running_worker(project_a, task_id=1, provider="claude", session_id="ses_a")
+        self._setup_running_worker(project_b, task_id=1, provider="claude", session_id="ses_b")
+        config_a = Config.load(project_a)
+        config_b = Config.load(project_b)
+        task_a = make_store(project_a).get_all()[0]
+        task_b = make_store(project_b).get_all()[0]
+        session_a = runtime_tmux_session_name(
+            task_id=str(task_a.id),
+            project_id=config_a.project_id,
+            db_path=config_a.db_path,
+            session_kind="attach",
+        )
+        session_b = runtime_tmux_session_name(
+            task_id=str(task_b.id),
+            project_id=config_b.project_id,
+            db_path=config_b.db_path,
+            session_kind="attach",
+        )
+        assert session_a != session_b
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(project_b, worker_id="w-20260301-1")
+
+        def fake_kill(_pid: int, sig: int):
+            if sig == 0:
+                raise OSError("no such process")
+            return None
+
+        with (
+            patch("gza.cli.query.os.kill", side_effect=fake_kill),
+            patch("gza.cli.query.subprocess.run", return_value=MagicMock(returncode=0)) as mock_run,
+            patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"),
+            patch("gza.cli.query.os.execvpe") as mock_execvpe,
+        ):
+            from gza.cli.query import cmd_attach
+
+            result = cmd_attach(args)
+
+        assert result == 0
+        tmux_commands = [call.args[0] for call in mock_run.call_args_list if call.args and call.args[0][0] == "tmux"]
+        assert any(cmd[:3] == ["tmux", "kill-session", "-t"] and cmd[3] == session_b for cmd in tmux_commands)
+        assert all(session_a not in cmd for cmd in tmux_commands)
+        assert session_b in mock_execvpe.call_args[0][1]
 
     def test_cmd_attach_claude_prints_normal_exit_auto_resume_message(self, tmp_path: Path, monkeypatch, capsys):
         """Claude attach should communicate that normal exit auto-resumes in background."""
@@ -255,7 +488,7 @@ class TestCmdAttach:
         with patch("gza.cli.query.os.kill", side_effect=fake_kill), \
              patch("gza.cli.query.subprocess.run", return_value=MagicMock(returncode=0)), \
              patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"), \
-             patch("gza.cli.query.os.execvp"):
+             patch("gza.cli.query.os.execvpe"):
             from gza.cli.query import cmd_attach
             result = cmd_attach(args)
 
@@ -291,8 +524,10 @@ class TestCmdAttach:
         with patch("gza.cli.query.subprocess.run", side_effect=fake_tmux_run), \
              patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"), \
              patch("gza.cli.query.os.kill", side_effect=fake_kill), \
-             patch("gza.cli.query._infer_resume_overrides_from_worker", return_value=(False, None, True)), \
-             patch("gza.cli.query.os.execvp"):
+             patch("gza.cli.query._infer_resume_overrides_from_worker") as mock_infer, \
+             patch("gza.cli.query.os.execvpe"):
+            from gza.cli.query import ResumeOverrideInference
+            mock_infer.return_value = ResumeOverrideInference(force=True)
             from gza.cli.query import cmd_attach
             result = cmd_attach(args)
 
@@ -319,7 +554,7 @@ class TestCmdAttach:
         with patch("gza.cli.query.os.kill", side_effect=fake_kill), \
              patch("gza.cli.query.subprocess.run", return_value=MagicMock(returncode=0)) as mock_run, \
              patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"), \
-             patch("gza.cli.query.os.execvp"):
+             patch("gza.cli.query.os.execvpe"):
             from gza.cli.query import cmd_attach
             result = cmd_attach(args)
 
@@ -380,6 +615,189 @@ class TestCmdAttach:
         assert refreshed.status == "in_progress"
         assert refreshed.running_pid == 12345
 
+    def test_cmd_attach_tmux_creation_failure_sanitizes_runtime_secrets_and_keeps_env_handoff(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        capsys,
+    ):
+        """Attach tmux failures must not disclose runtime env values in output or argv."""
+        self._setup_running_worker(
+            tmp_path,
+            task_id=1,
+            provider="claude",
+            session_id="ses_attach_123",
+        )
+        (tmp_path / ".env").write_text(
+            "\n".join(
+                [
+                    "PATH=/owned/bin",
+                    "ANTHROPIC_API_KEY=anthropic-poison",
+                    "CODEX_API_KEY=codex-poison",
+                    "GEMINI_API_KEY=gemini-poison",
+                    "PROJECT_ONLY_TOKEN=arbitrary-poison",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+        call_state = {"new_session_calls": 0}
+        new_session_calls: list[tuple[list[str], dict]] = []
+
+        def fake_tmux_run(cmd, **kwargs):
+            if cmd[:2] == ["tmux", "new-session"]:
+                call_state["new_session_calls"] += 1
+                new_session_calls.append((cmd, kwargs))
+                if call_state["new_session_calls"] == 1:
+                    return MagicMock(returncode=0, stderr="")
+                return MagicMock(
+                    returncode=1,
+                    stderr="create failed: anthropic-poison codex-poison gemini-poison arbitrary-poison",
+                )
+            return MagicMock(returncode=0, stderr="")
+
+        def fake_kill(_pid: int, sig: int):
+            if sig == 0:
+                raise OSError("no such process")
+            return None
+
+        with (
+            patch("gza.cli.query.subprocess.run", side_effect=fake_tmux_run),
+            patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"),
+            patch("gza.cli.query.os.kill", side_effect=fake_kill),
+            patch("gza.cli.query._infer_resume_overrides_from_worker") as mock_infer,
+            patch("gza.cli.query._spawn_background_worker", return_value=0),
+        ):
+            from gza.cli.query import ResumeOverrideInference, cmd_attach
+
+            mock_infer.return_value = ResumeOverrideInference(no_docker=True)
+            result = cmd_attach(args)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        output_text = captured.out + captured.err
+        for secret in ("anthropic-poison", "codex-poison", "gemini-poison", "arbitrary-poison"):
+            assert secret not in output_text
+        assert "[redacted]" in output_text
+        assert len(new_session_calls) == 2
+        create_cmd, create_kwargs = new_session_calls[1]
+        assert "-e" not in create_cmd
+        argv_text = "\0".join(create_cmd)
+        for secret in ("anthropic-poison", "codex-poison", "gemini-poison", "arbitrary-poison"):
+            assert secret not in argv_text
+        create_env = create_kwargs["env"]
+        assert create_env["PATH"] == "/owned/bin"
+        assert create_env["PWD"] == str(tmp_path.resolve())
+        assert create_env["GZA_DB_PATH"] == str((tmp_path / ".gza" / "gza.db").resolve())
+        assert create_env["ANTHROPIC_API_KEY"] == "anthropic-poison"
+        assert create_env["CODEX_API_KEY"] == "codex-poison"
+        assert create_env["GEMINI_API_KEY"] == "gemini-poison"
+        assert create_env["PROJECT_ONLY_TOKEN"] == "arbitrary-poison"
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            "timed out while inspecting worker w-20260301-1 command line",
+            "'ps' command was not found in the runtime PATH",
+            "ps failed while inspecting worker w-20260301-1: denied",
+            "ps returned no command line for worker w-20260301-1",
+            "worker w-20260301-1 has malformed --max-turns value",
+        ],
+    )
+    def test_cmd_attach_claude_refuses_when_launch_parity_cannot_be_proven(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        capsys,
+        error: str,
+    ):
+        """Attach must fail closed when worker CLI override introspection is inconclusive."""
+        self._setup_running_worker(
+            tmp_path,
+            task_id=1,
+            provider="claude",
+            session_id="ses_attach_123",
+        )
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+
+        with (
+            patch("gza.cli.query._infer_resume_overrides_from_worker") as mock_infer,
+            patch("gza.cli.query._stop_worker_for_attach") as mock_stop,
+            patch("gza.cli.query.subprocess.run") as mock_run,
+            patch("gza.cli.query.os.execvpe") as mock_execvpe,
+        ):
+            from gza.cli.query import ResumeOverrideInference, cmd_attach
+
+            mock_infer.return_value = ResumeOverrideInference(error=error)
+            result = cmd_attach(args)
+
+        assert result == 1
+        assert "cannot prove attach handoff launch parity" in capsys.readouterr().out
+        mock_stop.assert_not_called()
+        mock_run.assert_not_called()
+        mock_execvpe.assert_not_called()
+
+    def test_cmd_attach_claude_ps_uses_project_runtime_context_with_poisoned_supervisor(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        """Interactive attach must inspect the worker from the owning project runtime."""
+        project = tmp_path / "project"
+        project.mkdir()
+        self._setup_running_worker(
+            project,
+            task_id=1,
+            provider="claude",
+            session_id="ses_attach_123",
+        )
+        (project / ".env").write_text("PATH=/project/bin\nPWD=/dotenv-pwd\n", encoding="utf-8")
+        supervisor_pwd = tmp_path / "supervisor"
+        supervisor_pwd.mkdir()
+        monkeypatch.chdir(supervisor_pwd)
+        monkeypatch.setenv("PATH", "/supervisor/bin")
+        monkeypatch.setenv("PWD", str(supervisor_pwd))
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(project, worker_id="w-20260301-1")
+
+        observed_ps: dict[str, object] = {}
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["ps", "-p"]:
+                observed_ps["cwd"] = kwargs.get("cwd")
+                observed_ps["env"] = kwargs.get("env")
+                return MagicMock(
+                    returncode=0,
+                    stdout="gza implement --no-docker --max-turns 9 --force task\n",
+                    stderr="",
+                )
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        def fake_kill(_pid: int, sig: int):
+            if sig == 0:
+                raise OSError("no such process")
+            return None
+
+        with (
+            patch("gza.cli.query.subprocess.run", side_effect=fake_run),
+            patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"),
+            patch("gza.cli.query.os.kill", side_effect=fake_kill),
+            patch("gza.cli.query.os.execvpe"),
+        ):
+            from gza.cli.query import cmd_attach
+
+            result = cmd_attach(args)
+
+        assert result == 0
+        assert observed_ps["cwd"] == project
+        ps_env = observed_ps["env"]
+        assert isinstance(ps_env, dict)
+        assert ps_env["PATH"] == "/project/bin"
+        assert ps_env["PWD"] == str(project.resolve())
+
     def test_cmd_attach_claude_restarts_background_worker_if_session_create_fails(self, tmp_path: Path, monkeypatch):
         """If real attach-session creation fails after stop, cmd_attach should auto-recover by restarting worker."""
         self._setup_running_worker(
@@ -410,8 +828,10 @@ class TestCmdAttach:
         with patch("gza.cli.query.subprocess.run", side_effect=fake_tmux_run), \
              patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"), \
              patch("gza.cli.query.os.kill", side_effect=fake_kill), \
-             patch("gza.cli.query._infer_resume_overrides_from_worker", return_value=(True, 77, True)), \
+             patch("gza.cli.query._infer_resume_overrides_from_worker") as mock_infer, \
              patch("gza.cli.query._spawn_background_worker", return_value=0) as mock_spawn_bg:
+            from gza.cli.query import ResumeOverrideInference
+            mock_infer.return_value = ResumeOverrideInference(no_docker=True, max_turns=77, force=True)
             from gza.cli.query import cmd_attach
             result = cmd_attach(args)
 
@@ -422,6 +842,319 @@ class TestCmdAttach:
         assert recovery_args.no_docker is True
         assert recovery_args.max_turns == 77
         assert recovery_args.force is True
+
+    def test_cmd_attach_recovers_when_second_env_file_write_raises(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        capsys,
+    ):
+        """Post-stop env handoff exceptions must sanitize output and restart the worker."""
+        from gza.config import Config
+        from gza.runtime_context import RuntimeExecutionContext
+
+        self._setup_running_worker(
+            tmp_path,
+            task_id=1,
+            provider="claude",
+            session_id="ses_attach_123",
+        )
+        (tmp_path / ".env").write_text(
+            "PATH=/owned/bin\nANTHROPIC_API_KEY=anthropic-poison\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+
+        write_calls = {"count": 0}
+
+        def fake_write_env_file(**_kwargs):
+            write_calls["count"] += 1
+            if write_calls["count"] == 1:
+                path = tmp_path / ".gza" / "tmp" / "probe.sh"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("probe\n", encoding="utf-8")
+                return path
+            raise OSError("env write failed: anthropic-poison")
+
+        def fake_tmux_run(cmd, **_kwargs):
+            if cmd[:2] == ["tmux", "new-session"]:
+                return MagicMock(returncode=0, stderr="")
+            return MagicMock(returncode=0, stderr="")
+
+        def fake_kill(_pid: int, sig: int):
+            if sig == 0:
+                raise OSError("no such process")
+            return None
+
+        with (
+            patch("gza.cli.query.write_tmux_environment_file", side_effect=fake_write_env_file),
+            patch("gza.cli.query.subprocess.run", side_effect=fake_tmux_run) as mock_run,
+            patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"),
+            patch("gza.cli.query.os.kill", side_effect=fake_kill),
+            patch("gza.cli.query._infer_resume_overrides_from_worker") as mock_infer,
+            patch("gza.cli.query._spawn_background_worker", return_value=0) as mock_spawn_bg,
+        ):
+            from gza.cli.query import ResumeOverrideInference, cmd_attach
+
+            mock_infer.return_value = ResumeOverrideInference(no_docker=True, max_turns=77, force=True)
+            result = cmd_attach(args)
+
+        assert result == 1
+        assert write_calls["count"] == 2
+        output_text = capsys.readouterr().out
+        assert "anthropic-poison" not in output_text
+        assert "[redacted]" in output_text
+        mock_spawn_bg.assert_called_once()
+        recovery_args = mock_spawn_bg.call_args.args[0]
+        assert recovery_args.no_docker is True
+        assert recovery_args.max_turns == 77
+        assert recovery_args.force is True
+        runtime_context = mock_spawn_bg.call_args.kwargs["runtime_context"]
+        assert isinstance(runtime_context, RuntimeExecutionContext)
+        assert runtime_context.cwd == tmp_path
+        assert runtime_context.db_path == Config.load(tmp_path).db_path
+        kill_sessions = [
+            call.args[0]
+            for call in mock_run.call_args_list
+            if call.args and call.args[0][:3] == ["tmux", "kill-session", "-t"]
+        ]
+        assert len(kill_sessions) >= 2
+
+    def test_cmd_attach_recovers_when_post_stop_tmux_run_raises_oserror(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        capsys,
+    ):
+        """Post-stop tmux OSError must clean env/session state and restart with the same runtime context."""
+        from gza.config import Config
+        from gza.runtime_context import RuntimeExecutionContext
+
+        self._setup_running_worker(
+            tmp_path,
+            task_id=1,
+            provider="claude",
+            session_id="ses_attach_123",
+        )
+        (tmp_path / ".env").write_text("PATH=/owned/bin\nCODEX_API_KEY=codex-poison\n", encoding="utf-8")
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+        preflight_env = tmp_path / ".gza" / "tmp" / "preflight.sh"
+        create_env = tmp_path / ".gza" / "tmp" / "create.sh"
+        write_paths = [preflight_env, create_env]
+
+        def fake_write_env_file(**_kwargs):
+            path = write_paths.pop(0)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("secret handoff\n", encoding="utf-8")
+            return path
+
+        new_session_calls = {"count": 0}
+
+        def fake_tmux_run(cmd, **_kwargs):
+            if cmd[:2] == ["tmux", "new-session"]:
+                new_session_calls["count"] += 1
+                if new_session_calls["count"] == 1:
+                    return MagicMock(returncode=0, stderr="")
+                raise OSError("tmux spawn failed: codex-poison")
+            return MagicMock(returncode=0, stderr="")
+
+        def fake_kill(_pid: int, sig: int):
+            if sig == 0:
+                raise OSError("no such process")
+            return None
+
+        with (
+            patch("gza.cli.query.write_tmux_environment_file", side_effect=fake_write_env_file),
+            patch("gza.cli.query.subprocess.run", side_effect=fake_tmux_run) as mock_run,
+            patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"),
+            patch("gza.cli.query.os.kill", side_effect=fake_kill),
+            patch("gza.cli.query._infer_resume_overrides_from_worker") as mock_infer,
+            patch("gza.cli.query._spawn_background_worker", return_value=0) as mock_spawn_bg,
+        ):
+            from gza.cli.query import ResumeOverrideInference, cmd_attach
+
+            mock_infer.return_value = ResumeOverrideInference(no_docker=True, max_turns=77, force=True)
+            result = cmd_attach(args)
+
+        assert result == 1
+        assert new_session_calls["count"] == 2
+        assert not create_env.exists()
+        output_text = capsys.readouterr().out
+        assert "codex-poison" not in output_text
+        assert "[redacted]" in output_text
+        mock_spawn_bg.assert_called_once()
+        recovery_args = mock_spawn_bg.call_args.args[0]
+        assert recovery_args.no_docker is True
+        assert recovery_args.max_turns == 77
+        assert recovery_args.force is True
+        runtime_context = mock_spawn_bg.call_args.kwargs["runtime_context"]
+        assert isinstance(runtime_context, RuntimeExecutionContext)
+        assert runtime_context.cwd == tmp_path
+        assert runtime_context.db_path == Config.load(tmp_path).db_path
+        kill_sessions = [
+            call.args[0]
+            for call in mock_run.call_args_list
+            if call.args and call.args[0][:3] == ["tmux", "kill-session", "-t"]
+        ]
+        assert len(kill_sessions) >= 2
+
+    def test_cmd_attach_recovers_with_prepared_task_when_post_stop_store_update_fails(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+        capsys,
+    ):
+        """A stale in-progress DB row after worker stop must not defeat recovery."""
+        self._setup_running_worker(
+            tmp_path,
+            task_id=1,
+            provider="claude",
+            session_id="ses_attach_123",
+        )
+        (tmp_path / ".env").write_text("PATH=/owned/bin\nGEMINI_API_KEY=gemini-poison\n", encoding="utf-8")
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        task_id = task.id
+
+        def fake_tmux_run(cmd, **_kwargs):
+            if cmd[:2] == ["tmux", "new-session"]:
+                return MagicMock(returncode=0, stderr="")
+            return MagicMock(returncode=0, stderr="")
+
+        def fake_kill(_pid: int, sig: int):
+            if sig == 0:
+                raise OSError("no such process")
+            return None
+
+        with (
+            patch("gza.cli.query.subprocess.run", side_effect=fake_tmux_run),
+            patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"),
+            patch("gza.cli.query.os.kill", side_effect=fake_kill),
+            patch("gza.cli.query._infer_resume_overrides_from_worker") as mock_infer,
+            patch("gza.cli.query.SqliteTaskStore.update", side_effect=OSError("update failed: gemini-poison")),
+            patch("gza.cli.query._spawn_background_worker", return_value=0) as mock_spawn_bg,
+        ):
+            from gza.cli.query import ResumeOverrideInference, cmd_attach
+
+            mock_infer.return_value = ResumeOverrideInference(no_docker=True, max_turns=77, force=True)
+            result = cmd_attach(args)
+
+        assert result == 1
+        output_text = capsys.readouterr().out
+        assert "gemini-poison" not in output_text
+        assert "[redacted]" in output_text
+        mock_spawn_bg.assert_called_once()
+        prepared_task = mock_spawn_bg.call_args.kwargs["prepared_task"]
+        assert prepared_task.id == task_id
+        assert prepared_task.status == "pending"
+        assert prepared_task.running_pid is None
+        recovery_args = mock_spawn_bg.call_args.args[0]
+        assert recovery_args.no_docker is True
+        assert recovery_args.max_turns == 77
+        assert recovery_args.force is True
+
+        stale_row = make_store(tmp_path).get(task_id)
+        assert stale_row is not None
+        assert stale_row.status == "in_progress"
+        assert stale_row.running_pid == 12345
+
+    def test_cmd_attach_exception_recovery_failure_marks_failed_and_logs_sanitized_handoff(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ):
+        """If exception recovery cannot restart the worker, the task is durably failed and logged."""
+        self._setup_running_worker(
+            tmp_path,
+            task_id=1,
+            provider="claude",
+            session_id="ses_attach_123",
+        )
+        (tmp_path / ".env").write_text("PATH=/owned/bin\nCODEX_API_KEY=codex-poison\n", encoding="utf-8")
+        monkeypatch.delenv("TMUX", raising=False)
+        args = _make_args(tmp_path, worker_id="w-20260301-1")
+
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        task_id = task.id
+        log_path = tmp_path / task.log_file
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        create_env = tmp_path / ".gza" / "tmp" / "create.sh"
+        write_calls = {"count": 0}
+        new_session_calls = {"count": 0}
+
+        def fake_write_env_file(**_kwargs):
+            write_calls["count"] += 1
+            if write_calls["count"] == 2:
+                path = create_env
+            else:
+                path = tmp_path / ".gza" / "tmp" / f"env-{write_calls['count']}.sh"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("secret handoff\n", encoding="utf-8")
+            return path
+
+        def fake_tmux_run(cmd, **_kwargs):
+            if cmd[:2] == ["tmux", "new-session"]:
+                new_session_calls["count"] += 1
+                if new_session_calls["count"] == 1:
+                    return MagicMock(returncode=0, stderr="")
+                raise OSError("tmux spawn failed: codex-poison")
+            return MagicMock(returncode=0, stderr="")
+
+        def fake_kill(_pid: int, sig: int):
+            if sig == 0:
+                raise OSError("no such process")
+            return None
+
+        with (
+            patch("gza.cli.query.write_tmux_environment_file", side_effect=fake_write_env_file),
+            patch("gza.cli.query.subprocess.run", side_effect=fake_tmux_run),
+            patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"),
+            patch("gza.cli.query.os.kill", side_effect=fake_kill),
+            patch("gza.cli.query._infer_resume_overrides_from_worker") as mock_infer,
+            patch("gza.cli.query._spawn_background_worker", return_value=9) as mock_spawn_bg,
+        ):
+            from gza.cli.query import ResumeOverrideInference, cmd_attach
+
+            mock_infer.return_value = ResumeOverrideInference(no_docker=True, max_turns=77, force=True)
+            result = cmd_attach(args)
+
+        assert result == 1
+        assert not create_env.exists()
+        mock_spawn_bg.assert_called_once()
+        recovery_args = mock_spawn_bg.call_args.args[0]
+        assert recovery_args.no_docker is True
+        assert recovery_args.max_turns == 77
+        assert recovery_args.force is True
+
+        refreshed = make_store(tmp_path).get(task_id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+
+        import json as _json
+
+        from gza.log_paths import ops_log_path_for
+
+        events = [
+            _json.loads(line)
+            for line in ops_log_path_for(log_path).read_text().splitlines()
+            if line.strip()
+        ]
+        handoff_events = [
+            e for e in events
+            if e.get("subtype") == "worker_lifecycle" and e.get("event") == "handoff_failed"
+        ]
+        assert handoff_events
+        assert handoff_events[-1]["reason"] == "WORKER_DIED"
+        assert handoff_events[-1]["recovery_exit_code"] == 9
+        assert "codex-poison" not in handoff_events[-1]["tmux_error"]
+        assert "[redacted]" in handoff_events[-1]["tmux_error"]
 
     def test_cmd_attach_claude_marks_failed_when_session_and_recovery_both_fail(self, tmp_path: Path, monkeypatch):
         """If post-stop session create fails AND recovery also fails, task must end in failed/WORKER_DIED with a handoff log."""
@@ -459,8 +1192,10 @@ class TestCmdAttach:
         with patch("gza.cli.query.subprocess.run", side_effect=fake_tmux_run), \
              patch("gza.cli.query.shutil.which", return_value="/usr/bin/tmux"), \
              patch("gza.cli.query.os.kill", side_effect=fake_kill), \
-             patch("gza.cli.query._infer_resume_overrides_from_worker", return_value=(False, None, False)), \
+             patch("gza.cli.query._infer_resume_overrides_from_worker") as mock_infer, \
              patch("gza.cli.query._spawn_background_worker", return_value=1) as mock_spawn_bg:
+            from gza.cli.query import ResumeOverrideInference
+            mock_infer.return_value = ResumeOverrideInference()
             from gza.cli.query import cmd_attach
             result = cmd_attach(args)
 
@@ -552,77 +1287,122 @@ class TestCmdAttach:
 class TestInferResumeOverrides:
     """Tests for _infer_resume_overrides_from_worker (cross-platform ps-based)."""
 
-    def test_parses_no_docker_and_max_turns(self):
+    def _runtime_context(self, tmp_path: Path):
+        from gza.runtime_context import RuntimeExecutionContext
+
+        project = tmp_path / "runtime-project"
+        project.mkdir()
+        return RuntimeExecutionContext(
+            cwd=project,
+            env={"PATH": "/runtime/bin", "PWD": "/supervisor-pwd"},
+            project_id="runtime",
+            db_path=project / ".gza" / "gza.db",
+        )
+
+    def test_parses_no_docker_and_max_turns(self, tmp_path: Path):
         from gza.cli.query import _infer_resume_overrides_from_worker
         from gza.workers import WorkerMetadata
 
         worker = MagicMock(spec=WorkerMetadata)
+        worker.worker_id = "w-1"
         worker.pid = 99999
+        runtime_context = self._runtime_context(tmp_path)
 
         fake_result = MagicMock(
             returncode=0,
             stdout="gza implement --no-docker --max-turns 42 --force some-task\n",
         )
         with patch("gza.cli.query.subprocess.run", return_value=fake_result) as mock_run:
-            no_docker, max_turns, force = _infer_resume_overrides_from_worker(worker)
+            result = _infer_resume_overrides_from_worker(worker, runtime_context=runtime_context)
 
-        assert no_docker is True
-        assert max_turns == 42
-        assert force is True
+        assert result.error is None
+        assert result.no_docker is True
+        assert result.max_turns == 42
+        assert result.force is True
         mock_run.assert_called_once()
         cmd = mock_run.call_args[0][0]
         assert cmd == ["ps", "-p", "99999", "-o", "args="]
+        assert mock_run.call_args.kwargs["cwd"] == runtime_context.cwd
+        assert mock_run.call_args.kwargs["env"]["PATH"] == "/runtime/bin"
+        assert mock_run.call_args.kwargs["env"]["PWD"] == str(runtime_context.cwd.resolve())
 
-    def test_returns_defaults_when_ps_fails(self):
+    @pytest.mark.parametrize(
+        ("side_effect", "fake_result", "expected_error"),
+        [
+            (subprocess.TimeoutExpired(cmd="ps", timeout=5), None, "timed out"),
+            (FileNotFoundError(), None, "not found"),
+            (None, MagicMock(returncode=1, stdout="", stderr="denied"), "ps failed"),
+            (None, MagicMock(returncode=0, stdout="", stderr=""), "returned no command line"),
+            (None, MagicMock(returncode=0, stdout="gza implement --max-turns nope task\n", stderr=""), "malformed"),
+            (None, MagicMock(returncode=0, stdout="gza implement --max-turns=NaN task\n", stderr=""), "malformed"),
+        ],
+    )
+    def test_reports_introspection_failures_without_downgrading_overrides(
+        self,
+        tmp_path: Path,
+        side_effect,
+        fake_result,
+        expected_error: str,
+    ):
         from gza.cli.query import _infer_resume_overrides_from_worker
         from gza.workers import WorkerMetadata
 
         worker = MagicMock(spec=WorkerMetadata)
+        worker.worker_id = "w-1"
         worker.pid = 99999
+        runtime_context = self._runtime_context(tmp_path)
 
-        fake_result = MagicMock(returncode=1, stdout="")
-        with patch("gza.cli.query.subprocess.run", return_value=fake_result):
-            no_docker, max_turns, force = _infer_resume_overrides_from_worker(worker)
+        kwargs = {"side_effect": side_effect} if side_effect is not None else {"return_value": fake_result}
+        with patch("gza.cli.query.subprocess.run", **kwargs):
+            result = _infer_resume_overrides_from_worker(worker, runtime_context=runtime_context)
 
-        assert no_docker is False
-        assert max_turns is None
-        assert force is False
+        assert result.error is not None
+        assert expected_error in result.error
+        assert result.no_docker is False
+        assert result.max_turns is None
+        assert result.force is False
 
-    def test_returns_defaults_when_no_overrides_in_cmdline(self):
+    def test_returns_defaults_when_no_overrides_in_cmdline(self, tmp_path: Path):
         from gza.cli.query import _infer_resume_overrides_from_worker
         from gza.workers import WorkerMetadata
 
         worker = MagicMock(spec=WorkerMetadata)
+        worker.worker_id = "w-1"
         worker.pid = 99999
+        runtime_context = self._runtime_context(tmp_path)
 
         fake_result = MagicMock(
             returncode=0,
             stdout="gza implement some-task\n",
         )
         with patch("gza.cli.query.subprocess.run", return_value=fake_result):
-            no_docker, max_turns, force = _infer_resume_overrides_from_worker(worker)
+            result = _infer_resume_overrides_from_worker(worker, runtime_context=runtime_context)
 
-        assert no_docker is False
-        assert max_turns is None
-        assert force is False
+        assert result.error is None
+        assert result.no_docker is False
+        assert result.max_turns is None
+        assert result.force is False
 
-    def test_parses_max_turns_equals_format(self):
+    def test_parses_max_turns_equals_format(self, tmp_path: Path):
         from gza.cli.query import _infer_resume_overrides_from_worker
         from gza.workers import WorkerMetadata
 
         worker = MagicMock(spec=WorkerMetadata)
+        worker.worker_id = "w-1"
         worker.pid = 99999
+        runtime_context = self._runtime_context(tmp_path)
 
         fake_result = MagicMock(
             returncode=0,
             stdout="gza implement --max-turns=77 some-task\n",
         )
         with patch("gza.cli.query.subprocess.run", return_value=fake_result):
-            no_docker, max_turns, force = _infer_resume_overrides_from_worker(worker)
+            result = _infer_resume_overrides_from_worker(worker, runtime_context=runtime_context)
 
-        assert no_docker is False
-        assert max_turns == 77
-        assert force is False
+        assert result.error is None
+        assert result.no_docker is False
+        assert result.max_turns == 77
+        assert result.force is False
 
 
 class TestSpawnBackgroundWorkerTmux:
@@ -638,6 +1418,130 @@ class TestSpawnBackgroundWorkerTmux:
         (tmp_path / "gza.yaml").write_text(config_content)
         (tmp_path / ".gza").mkdir(parents=True, exist_ok=True)
         return Config.load(tmp_path)
+
+    def _make_same_identity_config(self, project_dir: Path, db_path: Path):
+        from gza.config import Config
+
+        project_dir.mkdir(parents=True)
+        (project_dir / ".gza").mkdir(parents=True, exist_ok=True)
+        (project_dir / ".env").write_text("PROJECT_TOKEN=owned\n", encoding="utf-8")
+        (project_dir / "gza.yaml").write_text(
+            "\n".join(
+                [
+                    "project_name: same",
+                    "project_id: sameproj",
+                    "project_prefix: same",
+                    f"db_path: {db_path}",
+                    "provider: codex",
+                    "model: gpt-5.5",
+                    "tmux:",
+                    "  enabled: true",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return Config.load(project_dir)
+
+    def test_tmux_launch_names_are_distinct_for_same_task_id_in_different_databases(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Tmux launch identity includes project/database identity, not just task ID."""
+        from gza.cli._common import _spawn_background_worker
+        from gza.db import SqliteTaskStore
+
+        config_a = self._make_same_identity_config(tmp_path / "a", tmp_path / "a.db")
+        config_b = self._make_same_identity_config(tmp_path / "b", tmp_path / "b.db")
+        store_a = SqliteTaskStore.from_config(config_a)
+        store_b = SqliteTaskStore.from_config(config_b)
+        task_a = store_a.add("test task")
+        task_b = store_b.add("test task")
+        assert task_a.id == task_b.id
+        for task, store in ((task_a, store_a), (task_b, store_b)):
+            task.provider = "codex"
+            task.provider_is_explicit = True
+            store.update(task)
+
+        run_calls: list[tuple[list[str], dict]] = []
+
+        def fake_run(cmd, **kwargs):
+            run_calls.append((cmd, kwargs))
+            return MagicMock(returncode=0)
+
+        stores_by_dir = {config_a.project_dir: store_a, config_b.project_dir: store_b}
+
+        with (
+            patch("gza.cli._common.subprocess.run", side_effect=fake_run),
+            patch("gza.cli._common.get_tmux_session_pid", side_effect=[1111, 2222]),
+            patch("gza.cli._common.prepare_task_startup_phase", side_effect=lambda _c, _s, prepared_task: prepared_task),
+            patch("gza.cli._common.shutil.which", return_value="/usr/bin/tmux"),
+            patch("gza.cli._common.get_store", side_effect=lambda cfg: stores_by_dir[cfg.project_dir]),
+        ):
+            assert _spawn_background_worker(_make_args(config_a.project_dir), config_a, task_id=task_a.id) == 0
+            assert _spawn_background_worker(_make_args(config_b.project_dir), config_b, task_id=task_b.id) == 0
+
+        new_session_names = [
+            cmd[cmd.index("-s") + 1]
+            for cmd, _kwargs in run_calls
+            if cmd[:2] == ["tmux", "new-session"]
+        ]
+        kill_session_names = [
+            cmd[cmd.index("-t") + 1]
+            for cmd, _kwargs in run_calls
+            if cmd[:2] == ["tmux", "kill-session"]
+        ]
+
+        assert len(new_session_names) == 2
+        assert new_session_names[0] != new_session_names[1]
+        assert f"gza-{task_a.id}" not in new_session_names
+        assert kill_session_names == new_session_names
+
+    def test_tmux_failed_launch_rollback_uses_owning_session_cwd_and_env(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Rollback after a post-session failure must kill only the owning session."""
+        from gza.cli._common import _spawn_background_worker
+        from gza.db import SqliteTaskStore
+
+        config = self._make_same_identity_config(tmp_path / "project", tmp_path / "project.db")
+        store = SqliteTaskStore.from_config(config)
+        task = store.add("test task")
+        task.provider = "codex"
+        task.provider_is_explicit = True
+        store.update(task)
+        run_calls: list[tuple[list[str], dict]] = []
+
+        def fake_run(cmd, **kwargs):
+            run_calls.append((cmd, kwargs))
+            if cmd[:2] == ["tmux", "set-option"]:
+                raise RuntimeError("post-session failure")
+            return MagicMock(returncode=0)
+
+        with (
+            patch("gza.cli._common.subprocess.run", side_effect=fake_run),
+            patch("gza.cli._common.get_tmux_session_pid", return_value=9999),
+            patch("gza.cli._common.prepare_task_startup_phase", side_effect=lambda _c, _s, prepared_task: prepared_task),
+            patch("gza.cli._common.shutil.which", return_value="/usr/bin/tmux"),
+            patch("gza.cli._common.get_store", return_value=store),
+        ):
+            assert _spawn_background_worker(_make_args(config.project_dir), config, task_id=task.id) == 1
+
+        new_session = next(
+            cmd[cmd.index("-s") + 1]
+            for cmd, _kwargs in run_calls
+            if cmd[:2] == ["tmux", "new-session"]
+        )
+        rollback_kill_cmd, rollback_kill_kwargs = [
+            (cmd, kwargs)
+            for cmd, kwargs in run_calls
+            if cmd[:2] == ["tmux", "kill-session"]
+        ][-1]
+
+        assert rollback_kill_cmd[rollback_kill_cmd.index("-t") + 1] == new_session
+        assert rollback_kill_kwargs["cwd"] == config.project_dir
+        assert rollback_kill_kwargs["env"]["PROJECT_TOKEN"] == "owned"
 
     def test_spawn_background_worker_uses_tmux_when_enabled(self, tmp_path: Path):
         """_spawn_background_worker calls tmux new-session when config.tmux.enabled is True."""
@@ -673,9 +1577,85 @@ class TestSpawnBackgroundWorkerTmux:
         new_args = tmux_calls[1][0][0]
         assert "new-session" in new_args
         assert "-d" in new_args
+        assert new_args[new_args.index("-c") + 1] == str(tmp_path.resolve())
+        assert "-e" not in new_args
+        assert str(config.db_path.resolve()) not in "\0".join(new_args)
+        env_file = Path(new_args[new_args.index("gza-tmux-env") + 1])
+        env_file_text = env_file.read_text(encoding="utf-8")
+        assert f"export GZA_DB_PATH={config.db_path.resolve()}" in env_file_text
+        assert f"export PWD={tmp_path.resolve()}" in env_file_text
         set_args = tmux_calls[2][0][0]
         assert "set-option" in set_args
         assert "remain-on-exit" in set_args
+
+    def test_spawn_background_worker_tmux_failure_sanitizes_runtime_secrets_and_keeps_env_handoff(
+        self,
+        tmp_path: Path,
+        capsys,
+    ):
+        """Background tmux launch failures must not disclose runtime env values."""
+        config = self._make_config(tmp_path, tmux_enabled=True)
+        (tmp_path / ".env").write_text(
+            "\n".join(
+                [
+                    "PATH=/owned/bin",
+                    "ANTHROPIC_API_KEY=anthropic-poison",
+                    "CODEX_API_KEY=codex-poison",
+                    "GEMINI_API_KEY=gemini-poison",
+                    "PROJECT_ONLY_TOKEN=arbitrary-poison",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        store = make_store(tmp_path)
+        task = store.add("test task")
+        task.provider = "codex"
+        task.provider_is_explicit = True
+        store.update(task)
+        args = _make_args(tmp_path)
+        new_session_calls: list[tuple[list[str], dict]] = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["tmux", "new-session"]:
+                new_session_calls.append((cmd, kwargs))
+                raise subprocess.CalledProcessError(
+                    1,
+                    cmd,
+                    stderr="anthropic-poison codex-poison gemini-poison arbitrary-poison",
+                )
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("gza.cli._common.subprocess.run", side_effect=fake_run),
+            patch("gza.cli._common.get_tmux_session_pid", return_value=9999),
+            patch("gza.cli._common.prepare_task_startup_phase", side_effect=lambda _c, _s, prepared_task: prepared_task),
+            patch("gza.cli._common.shutil.which", return_value="/usr/bin/tmux"),
+            patch("gza.cli._common.get_store", return_value=store),
+        ):
+            from gza.cli._common import _spawn_background_worker
+
+            result = _spawn_background_worker(args, config, task_id=task.id)
+
+        assert result == 1
+        captured = capsys.readouterr()
+        output_text = captured.out + captured.err
+        for secret in ("anthropic-poison", "codex-poison", "gemini-poison", "arbitrary-poison"):
+            assert secret not in output_text
+        assert new_session_calls
+        new_cmd, new_kwargs = new_session_calls[0]
+        assert "-e" not in new_cmd
+        argv_text = "\0".join(new_cmd)
+        for secret in ("anthropic-poison", "codex-poison", "gemini-poison", "arbitrary-poison"):
+            assert secret not in argv_text
+        tmux_env = new_kwargs["env"]
+        assert tmux_env["PATH"] == "/owned/bin"
+        assert tmux_env["PWD"] == str(tmp_path.resolve())
+        assert tmux_env["GZA_DB_PATH"] == str(config.db_path.resolve())
+        assert tmux_env["ANTHROPIC_API_KEY"] == "anthropic-poison"
+        assert tmux_env["CODEX_API_KEY"] == "codex-poison"
+        assert tmux_env["GEMINI_API_KEY"] == "gemini-poison"
+        assert tmux_env["PROJECT_ONLY_TOKEN"] == "arbitrary-poison"
 
     def test_spawn_warns_on_remain_on_exit_failure(self, tmp_path: Path, capsys):
         """_spawn_background_worker warns when remain-on-exit set-option fails."""
@@ -926,10 +1906,14 @@ class TestClaudeProviderTmuxMode:
         assert "claude" in cmd[0], "Claude must still be invoked"
 
     def test_tmux_pipe_pane_captures_raw_output(self, tmp_path: Path):
-        """_run_direct_tmux sets up tmux pipe-pane to capture raw terminal output (M2)."""
+        """_run_direct_tmux sets up tmux pipe-pane using the runtime cwd/env."""
         from gza.providers.claude import ClaudeProvider
 
         config = self._make_config(tmp_path, tmux_session="gza-42")
+        runtime_cwd = tmp_path / "runtime-cwd"
+        runtime_cwd.mkdir()
+        config.provider_cwd = runtime_cwd
+        runtime_env = {"PATH": "/runtime/bin", "TMUX_TMPDIR": "/runtime-tmux", "PWD": "/poisoned"}
         log_file = tmp_path / ".gza" / "logs" / "42.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -937,19 +1921,24 @@ class TestClaudeProviderTmuxMode:
         fake_result = MagicMock()
         fake_result.returncode = 0
 
-        pipe_pane_called = [False]
+        pipe_pane_call = {}
 
         def fake_run(cmd, *args, **kwargs):
             if cmd[0] == "tmux" and "pipe-pane" in cmd:
-                pipe_pane_called[0] = True
+                pipe_pane_call["kwargs"] = kwargs
             return fake_result
 
         with patch("gza.providers.claude.subprocess.run", side_effect=fake_run):
-            provider._run_direct_tmux(config, "test prompt", log_file, tmp_path)
+            provider._run_direct_tmux(config, "test prompt", log_file, tmp_path, env=runtime_env)
 
-        assert pipe_pane_called[0], (
+        assert pipe_pane_call, (
             "tmux pipe-pane must be called to capture raw terminal output to the main log file"
         )
+        assert pipe_pane_call["kwargs"]["cwd"] == runtime_cwd
+        assert pipe_pane_call["kwargs"]["env"] == {
+            **runtime_env,
+            "PWD": str(runtime_cwd.resolve()),
+        }
 
     def test_proxy_events_written_to_separate_log(self, tmp_path: Path):
         """Proxy JSONL events go to a separate *-proxy.log file, not the main log (M2)."""

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -242,6 +243,45 @@ def test_get_usage_refreshes_when_stale(tmp_path: Path, monkeypatch) -> None:
     assert snapshot.primary_window.used_percent == 45
 
 
+def test_get_usage_fetch_uses_selected_runtime_context_and_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store_a = SqliteTaskStore(tmp_path / "runtime-a" / "test.db")
+    store_b = SqliteTaskStore(tmp_path / "runtime-b" / "test.db")
+    env_a = {
+        "HOME": str(tmp_path / "runtime-a" / "home"),
+        "PATH": "/runtime-a/bin",
+        "CODEX_HOME": str(tmp_path / "runtime-a" / "codex-home"),
+    }
+    env_b = {
+        "HOME": str(tmp_path / "runtime-b" / "home"),
+        "PATH": "/runtime-b/bin",
+        "CODEX_HOME": str(tmp_path / "runtime-b" / "codex-home"),
+    }
+    cwd_a = tmp_path / "runtime-a" / "project"
+    cwd_b = tmp_path / "runtime-b" / "project"
+    monkeypatch.setenv("HOME", str(tmp_path / "ambient-home"))
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "ambient-codex"))
+    seen: list[tuple[dict[str, str] | None, Path | None]] = []
+
+    def fetch_spy(_provider: str, *, timeout_seconds: float, env=None, cwd=None) -> ProviderUsage:
+        seen.append((dict(env) if env is not None else None, cwd))
+        return _parse()
+
+    monkeypatch.setattr("gza.usage_service._fetch_usage", fetch_spy)
+    snapshot_a = get_usage(store_a, "codex", max_age=timedelta(0), env=env_a, cwd=cwd_a)
+    snapshot_b = get_usage(store_b, "codex", max_age=timedelta(0), env=env_b, cwd=cwd_b)
+
+    assert snapshot_a.source == "fetch"
+    assert snapshot_b.source == "fetch"
+    assert seen == [(env_a, cwd_a), (env_b, cwd_b)]
+    assert store_a.get_latest_provider_usage("codex") is not None
+    assert store_b.get_latest_provider_usage("codex") is not None
+    assert store_a.db_path != store_b.db_path
+
+
 def test_failed_fetch_serves_the_last_good_value_as_stale(tmp_path: Path, monkeypatch) -> None:
     """A failure must never read as zero usage."""
     store = SqliteTaskStore(tmp_path / "test.db")
@@ -335,6 +375,54 @@ def test_rpc_error_classification_is_actionable() -> None:
 
     other = _classify_usage_rpc_error({"message": "internal failure"})
     assert isinstance(other, UsageProtocolError)
+
+
+def test_codex_usage_launch_uses_runtime_path_cwd_and_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza.providers.codex import _read_codex_usage
+
+    runtime_cwd = tmp_path / "runtime-project"
+    runtime_cwd.mkdir()
+    env = {
+        "HOME": str(tmp_path / "runtime-home"),
+        "PATH": "/runtime/bin",
+        "CODEX_HOME": str(tmp_path / "runtime-codex"),
+        "GZA_DB_PATH": str(tmp_path / "runtime.db"),
+    }
+    monkeypatch.setenv("HOME", str(tmp_path / "ambient-home"))
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "ambient-codex"))
+    popen_calls: list[dict[str, object]] = []
+
+    class FakeProcess:
+        def __init__(self, *args, **kwargs) -> None:
+            popen_calls.append({"args": args, "kwargs": kwargs})
+            self.stdin = StringIO()
+            self.stdout = StringIO(json.dumps({"id": 1, "result": CODEX_PAYLOAD}) + "\n")
+            self.stderr = StringIO("")
+            self.returncode = 0
+
+        def poll(self):
+            return 0
+
+        def terminate(self) -> None:
+            raise AssertionError("completed usage process should not be terminated")
+
+    monkeypatch.setattr("gza.providers.codex.shutil.which", lambda name, path=None: "/runtime/bin/codex")
+    monkeypatch.setattr("gza.providers.codex.subprocess.Popen", FakeProcess)
+
+    usage = _read_codex_usage(timeout_seconds=10.0, gza_version="test", env=env, cwd=runtime_cwd)
+
+    assert usage.provider == "codex"
+    assert len(popen_calls) == 1
+    kwargs = popen_calls[0]["kwargs"]
+    assert popen_calls[0]["args"] == (["/runtime/bin/codex", "app-server"],)
+    assert kwargs["cwd"] == runtime_cwd
+    assert kwargs["env"]["PATH"] == "/runtime/bin"
+    assert kwargs["env"]["PWD"] == str(runtime_cwd.resolve())
+    assert kwargs["env"]["CODEX_HOME"] == str(tmp_path / "runtime-codex")
 
 
 def test_read_usage_is_unsupported_by_default() -> None:

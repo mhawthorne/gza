@@ -93,6 +93,56 @@ def _current_identity(
     )
 
 
+def test_run_main_integration_verify_passes_runtime_env_to_verify_command(tmp_path) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + "verify_command: ./bin/runtime-verify\n"
+        + "autonomous_verify_timeout_seconds: 12\n",
+        encoding="utf-8",
+    )
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    git = MagicMock()
+    git.repo_dir = tmp_path / "owned-checkout"
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "a" * 40
+    runtime_env = {"PATH": "/runtime/bin", "GZA_DB_PATH": str(config.db_path)}
+    captured: dict[str, object] = {}
+
+    def fake_run_verify(command: str, **kwargs: object):
+        captured["command"] = command
+        captured.update(kwargs)
+        return _make_review_verify_result(
+            command,
+            status="passed",
+            exit_status="0",
+            captured_at=datetime.now(UTC),
+            reviewed_branch=str(kwargs["reviewed_branch"]),
+            reviewed_head_sha=str(kwargs["reviewed_head_sha"]),
+            working_directory=str(kwargs["cwd"]),
+            output="passed\nTree fingerprint: fp-runtime\n",
+        )
+
+    with (
+        patch("gza.main_integration_verify._run_review_verify_command", side_effect=fake_run_verify),
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-runtime"),
+    ):
+        state = run_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="unit-runtime-env",
+            env=runtime_env,
+        )
+
+    assert state.verify_status == "passed"
+    assert captured["command"] == "./bin/runtime-verify"
+    assert captured["cwd"] == git.repo_dir
+    assert captured["env"] is runtime_env
+
+
 def test_main_verify_remediation_pending_reuse_requires_resolved_route_before_mutation(tmp_path) -> None:
     config = _setup_plan_only_model_config(tmp_path)
     store = make_store(tmp_path)
@@ -1875,6 +1925,7 @@ def test_check_candidate_integration_verify_pass_returns_structured_evidence_wit
     run_verify.assert_called_once_with(
         "./bin/tests",
         cwd=tmp_path,
+        env=None,
         reviewed_branch="candidate-main",
         reviewed_head_sha="def456",
         timeout_seconds=120,
@@ -1893,6 +1944,115 @@ def test_check_candidate_integration_verify_pass_returns_structured_evidence_wit
     assert check.evidence.verify_status == "passed"
     assert check.evidence.failing_phase is None
     assert load_main_integration_verify_state(store) is None
+
+
+def test_check_candidate_integration_verify_uses_owning_runtime_env_for_initial_and_rerun(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alpha_dir = tmp_path / "alpha"
+    beta_dir = tmp_path / "beta"
+    alpha_dir.mkdir()
+    beta_dir.mkdir()
+    setup_config(alpha_dir, project_name="alpha")
+    setup_config(beta_dir, project_name="beta")
+    (alpha_dir / "gza.yaml").write_text(
+        (alpha_dir / "gza.yaml").read_text(encoding="utf-8")
+        + "verify_command: ./bin/verify-alpha\n"
+        + "autonomous_verify_timeout_seconds: 120\n",
+        encoding="utf-8",
+    )
+    (beta_dir / "gza.yaml").write_text(
+        (beta_dir / "gza.yaml").read_text(encoding="utf-8")
+        + "verify_command: ./bin/verify-beta\n"
+        + "autonomous_verify_timeout_seconds: 120\n",
+        encoding="utf-8",
+    )
+    (alpha_dir / ".env").write_text("PATH=/alpha/bin\nPROJECT_TOKEN=alpha-token\n", encoding="utf-8")
+    (beta_dir / ".env").write_text("PATH=/beta/bin\nPROJECT_TOKEN=beta-token\n", encoding="utf-8")
+    alpha_config = Config.load(alpha_dir)
+    beta_config = Config.load(beta_dir)
+
+    from gza.runtime_context import RuntimeExecutionContext
+
+    alpha_env = RuntimeExecutionContext.from_config(alpha_config).env
+    beta_env = RuntimeExecutionContext.from_config(beta_config).env
+    monkeypatch.setenv("PATH", "/poison/bin")
+    monkeypatch.setenv("PROJECT_TOKEN", "poison-token")
+    monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "poison.db"))
+
+    alpha_git = MagicMock()
+    alpha_git.repo_dir = alpha_dir
+    alpha_git.current_branch.return_value = "candidate-main"
+    alpha_git.rev_parse_if_exists.return_value = "alpha-head"
+    beta_git = MagicMock()
+    beta_git.repo_dir = beta_dir
+    beta_git.current_branch.return_value = "candidate-main"
+    beta_git.rev_parse_if_exists.return_value = "beta-head"
+
+    red_result = _make_review_verify_result(
+        "./bin/verify-alpha",
+        status="failed",
+        exit_status="1",
+        captured_at=datetime(2026, 8, 24, 12, 0, tzinfo=UTC),
+        reviewed_branch="candidate-main",
+        reviewed_head_sha="alpha-head",
+        working_directory=str(alpha_dir),
+        failure="verify failed",
+        output="gza-verify phase=failed name=unit duration_seconds=1.0",
+    )
+    passed_result = _make_review_verify_result(
+        "./bin/verify-alpha",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 8, 24, 12, 1, tzinfo=UTC),
+        reviewed_branch="candidate-main",
+        reviewed_head_sha="alpha-head",
+        working_directory=str(alpha_dir),
+        output="all good",
+    )
+    beta_result = _make_review_verify_result(
+        "./bin/verify-beta",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 8, 24, 12, 2, tzinfo=UTC),
+        reviewed_branch="candidate-main",
+        reviewed_head_sha="beta-head",
+        working_directory=str(beta_dir),
+        output="all good",
+    )
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch(
+            "gza.main_integration_verify._run_review_verify_command",
+            side_effect=[red_result, passed_result, beta_result],
+        ) as run_verify,
+    ):
+        check_candidate_integration_verify(
+            alpha_config,
+            alpha_git,
+            reason="alpha-candidate",
+            red_reruns=1,
+            env=alpha_env,
+        )
+        check_candidate_integration_verify(
+            beta_config,
+            beta_git,
+            reason="beta-candidate",
+            red_reruns=1,
+            env=beta_env,
+        )
+
+    envs = [call_kwargs.kwargs["env"] for call_kwargs in run_verify.call_args_list]
+    assert envs == [alpha_env, alpha_env, beta_env]
+    assert all(env["PATH"] != "/poison/bin" for env in envs)
+    assert [env["PROJECT_TOKEN"] for env in envs] == ["alpha-token", "alpha-token", "beta-token"]
+    assert [env["GZA_DB_PATH"] for env in envs] == [
+        str(alpha_config.db_path.resolve()),
+        str(alpha_config.db_path.resolve()),
+        str(beta_config.db_path.resolve()),
+    ]
 
 
 def test_check_candidate_integration_verify_returns_container_runner_class(tmp_path) -> None:

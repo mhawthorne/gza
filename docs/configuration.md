@@ -149,6 +149,8 @@ db_path: ~/.gza/gza.db
 GZA_DB_PATH=~/.gza/gza.db gza next
 ```
 
+In multi-project execution, the supervisor owns `GZA_DB_PATH` per selected runtime. Explicit path selections load their configured `db_path` and ignore any ambient `GZA_DB_PATH`; registry-ID selections assert the anchor registry DB deliberately. Child workers receive a runtime environment with `GZA_DB_PATH` set to their owning project DB.
+
 Example:
 
 ```yaml

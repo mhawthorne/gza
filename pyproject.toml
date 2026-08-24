@@ -72,6 +72,7 @@ markers = [
     "cpu_budget: override the per-test CPU-time latency budget (kwarg ms=<int>)",
     "functional: mark test as subprocess or git-shell functional coverage",
     "integration: mark test as integration test (requires credentials and Docker)",
+    "uses_darwin_worker_death_hint: opt into the real Darwin worker-death hint helper with subprocesses mocked",
 ]
 
 [tool.mypy]

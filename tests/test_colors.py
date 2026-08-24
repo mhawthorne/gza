@@ -765,6 +765,39 @@ class TestConfigThemeIntegration:
         Config.load(tmp_path)
         assert c.TASK_COLORS.task_id == "#deadbe"
 
+    def test_config_load_can_validate_without_applying_presentation(
+        self,
+        tmp_path: "pytest.TempdirFactory",
+    ) -> None:  # type: ignore[name-defined]
+        """Execution-only loads should still parse config without changing global theme state."""
+        import gza.colors as c
+        from gza.config import Config
+
+        anchor_dir = tmp_path / "anchor"
+        runtime_dir = tmp_path / "runtime"
+        anchor_dir.mkdir()
+        runtime_dir.mkdir()
+        (anchor_dir / "gza.yaml").write_text(
+            "project_name: anchor\nprovider: codex\nmodel: gpt-5.5\n"
+            "colors:\n  task_id: '#010203'\n",
+            encoding="utf-8",
+        )
+        (runtime_dir / "gza.yaml").write_text(
+            "project_name: runtime\nprovider: claude\nmodel: claude-sonnet-4\n"
+            "colors:\n  task_id: '#aabbcc'\n",
+            encoding="utf-8",
+        )
+
+        Config.load(anchor_dir)
+        assert c.TASK_COLORS.task_id == "#010203"
+
+        runtime_config = Config.load(runtime_dir, apply_presentation=False)
+
+        assert runtime_config.provider == "claude"
+        assert runtime_config.model == "claude-sonnet-4"
+        assert runtime_config.colors == {"task_id": "#aabbcc"}
+        assert c.TASK_COLORS.task_id == "#010203"
+
     def test_config_with_no_color_stored_on_config_object(self, tmp_path: "pytest.TempdirFactory") -> None:  # type: ignore[name-defined]
         from gza.config import Config
 

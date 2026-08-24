@@ -1,6 +1,9 @@
 """Functional regressions for CLI subprocess and real git shell-command flows."""
 
 import argparse
+import json
+import os
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -9,7 +12,7 @@ import pytest
 
 from gza import advance_engine as advance_engine_module
 from gza.advance_engine import evaluate_advance_rules, resolve_advance_context
-from gza.cli._common import run_with_recovery
+from gza.cli._common import _spawn_detached_worker_process, run_with_recovery
 from gza.cli.advance_engine import determine_next_action
 from gza.cli.advance_executor import (
     AdvanceActionExecutionContext,
@@ -25,6 +28,7 @@ from gza.log_paths import ops_log_path_for
 from gza.recovery_engine import FailedRecoveryDecision
 from gza.review_verdict import ParsedReviewReport
 from gza.review_verify_state import persist_verify_gate_artifact
+from gza.runtime_context import RuntimeExecutionContext
 from gza.runner import (
     WIP_DIR,
     _complete_code_task,
@@ -60,6 +64,143 @@ class _FakeAvailableGitHub:
     def create_pr(self, head: str, base: str, title: str, body: str, draft: bool = False) -> PullRequest:
         self._create_calls.append((head, base, title, body, draft))
         return PullRequest(url=f"https://example.test/{head}", number=len(self._create_calls))
+
+
+def test_git_handle_ignores_ambient_and_dotenv_repository_selectors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo_a = tmp_path / "repo-a"
+    repo_b = tmp_path / "repo-b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+
+    def init_repo(repo: Path, branch: str) -> None:
+        git = Git(repo)
+        git._run("init")
+        git._run("config", "user.email", f"{branch}@example.com")
+        git._run("config", "user.name", branch)
+        (repo / "tracked.txt").write_text(f"{branch}\n", encoding="utf-8")
+        git.add("tracked.txt")
+        git.commit(f"init {branch}")
+        git.create_branch(branch)
+
+    init_repo(repo_a, "project-a")
+    init_repo(repo_b, "project-b")
+    (repo_a / "gza.yaml").write_text(
+        "project_name: repo-a\nproject_id: repoa\nprovider: codex\nmodel: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    (repo_b / "gza.yaml").write_text(
+        "project_name: repo-b\nproject_id: repob\nprovider: codex\nmodel: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    poison_env = {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(repo_a / ".git" / "objects"),
+        "GIT_COMMON_DIR": str(repo_a / ".git"),
+        "GIT_DIR": str(repo_a / ".git"),
+        "GIT_GRAFT_FILE": str(repo_a / ".git" / "info" / "grafts"),
+        "GIT_INDEX_FILE": str(repo_a / ".git" / "index"),
+        "GIT_NAMESPACE": "poisoned-namespace",
+        "GIT_OBJECT_DIRECTORY": str(repo_a / ".git" / "objects"),
+        "GIT_REPLACE_REF_BASE": "refs/replace-poisoned",
+        "GIT_SHALLOW_FILE": str(repo_a / ".git" / "shallow"),
+        "GIT_WORK_TREE": str(repo_a),
+    }
+    (repo_b / ".env").write_text(
+        "\n".join(
+            [f"{key}={value}" for key, value in poison_env.items()]
+            + [f"PWD={repo_a}"]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    for key, value in poison_env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("PWD", str(repo_a))
+
+    runtime_env_a = RuntimeExecutionContext.from_config(Config.load(repo_a)).env
+    runtime_env = RuntimeExecutionContext.from_config(Config.load(repo_b)).env
+    git_a = Git(repo_a, env=runtime_env_a)
+    (repo_b / "b-only.txt").write_text("repo-b\n", encoding="utf-8")
+    git_b = Git(repo_b, env=runtime_env)
+
+    assert git_a.current_branch() == "project-a"
+    assert git_b.current_branch() == "project-b"
+    assert git_a.merge_base("HEAD", "HEAD") == git_a.rev_parse("HEAD")
+    assert git_b.merge_base("HEAD", "HEAD") == git_b.rev_parse("HEAD")
+    assert ("??", "b-only.txt") in git_b.status_porcelain()
+    assert runtime_env_a["PWD"] == str(repo_a.resolve())
+    assert runtime_env["PWD"] == str(repo_b.resolve())
+    for key in poison_env:
+        assert key not in runtime_env_a
+        assert key not in runtime_env
+        assert os.environ[key] == poison_env[key]
+
+
+def test_detached_worker_child_normalizes_pwd_without_mutating_supervisor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_a = tmp_path / "a"
+    project_b = tmp_path / "b"
+    dotenv_pwd = tmp_path / "dotenv-pwd"
+    project_a.mkdir()
+    project_b.mkdir()
+    dotenv_pwd.mkdir()
+    setup_config(project_b)
+    (project_b / ".env").write_text(
+        "\n".join(
+            [
+                f"PWD={dotenv_pwd}",
+                f"GIT_DIR={project_a / '.git'}",
+                f"GIT_WORK_TREE={project_a}",
+                f"GIT_COMMON_DIR={project_a / '.git'}",
+                f"GIT_INDEX_FILE={project_a / '.git' / 'index'}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PWD", str(project_a))
+    monkeypatch.setenv("GIT_DIR", str(project_a / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(project_a))
+
+    config_b = Config.load(project_b)
+    output_path = tmp_path / "child-env.json"
+    proc, _startup_log = _spawn_detached_worker_process(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, os, pathlib, sys; "
+                "pathlib.Path(sys.argv[1]).write_text(json.dumps({"
+                "'cwd': os.getcwd(), "
+                "'PWD': os.environ.get('PWD'), "
+                "'GIT_DIR': os.environ.get('GIT_DIR'), "
+                "'GIT_WORK_TREE': os.environ.get('GIT_WORK_TREE'), "
+                "'GIT_COMMON_DIR': os.environ.get('GIT_COMMON_DIR'), "
+                "'GIT_INDEX_FILE': os.environ.get('GIT_INDEX_FILE')"
+                "}))"
+            ),
+            str(output_path),
+        ],
+        config_b,
+        "w-pwd-test",
+    )
+    assert proc.wait(timeout=5) == 0
+
+    child = json.loads(output_path.read_text(encoding="utf-8"))
+    assert child == {
+        "cwd": str(project_b.resolve()),
+        "PWD": str(project_b.resolve()),
+        "GIT_DIR": None,
+        "GIT_WORK_TREE": None,
+        "GIT_COMMON_DIR": None,
+        "GIT_INDEX_FILE": None,
+    }
+    assert os.environ["PWD"] == str(project_a)
+    assert os.environ["GIT_DIR"] == str(project_a / ".git")
 
 
 def _init_repo_with_origin(tmp_path: Path) -> tuple[Config, SqliteTaskStore, Git, Path]:

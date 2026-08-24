@@ -181,6 +181,7 @@ from .review_verify_state import (
     resolve_verify_owner_task,
     verify_result_is_timeout_origin,
 )
+from .runtime_context import RuntimeExecutionContext, build_dotenv_runtime_env, normalize_subprocess_env
 from .sync_ops import resolve_branch_pr
 from .task_slug import (
     extract_task_id_suffix,
@@ -885,6 +886,17 @@ def _provider_accepts_ops_log_file(provider: Provider) -> bool:
     )
 
 
+def _call_accepts_keyword(callable_obj: Callable[..., Any], keyword: str) -> bool:
+    """Return whether a provider method accepts an explicit keyword."""
+    side_effect = getattr(callable_obj, "side_effect", None)
+    inspected_obj = side_effect if callable(side_effect) else callable_obj
+    params = inspect.signature(inspected_obj).parameters.values()
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == keyword
+        for parameter in params
+    )
+
+
 def _call_provider_run(
     provider: Provider,
     config: Config,
@@ -893,28 +905,50 @@ def _call_provider_run(
     work_dir: Path,
     *,
     provider_run_kwargs: dict[str, Any],
+    runtime_env: Mapping[str, str],
 ) -> RunResult:
-    """Run a provider while tolerating legacy test doubles without ops_log_file."""
-    try:
-        return provider.run(
-            config,
-            prompt,
-            log_file,
-            work_dir,
-            **provider_run_kwargs,
-        )
-    except TypeError as exc:
-        if "unexpected keyword argument 'ops_log_file'" not in str(exc):
-            raise
-        fallback_kwargs = dict(provider_run_kwargs)
-        fallback_kwargs.pop("ops_log_file", None)
-        return provider.run(
-            config,
-            prompt,
-            log_file,
-            work_dir,
-            **fallback_kwargs,
-        )
+    """Run a provider with only the keywords its signature advertises."""
+    run_kwargs = dict(provider_run_kwargs)
+    if not _call_accepts_keyword(provider.run, "ops_log_file"):
+        run_kwargs.pop("ops_log_file", None)
+    if _call_accepts_keyword(provider.run, "env"):
+        run_kwargs["env"] = normalize_subprocess_env(runtime_env, work_dir)
+    return provider.run(
+        config,
+        prompt,
+        log_file,
+        work_dir,
+        **run_kwargs,
+    )
+
+
+def _call_provider_check_credentials(
+    provider: Provider,
+    *,
+    runtime_env: Mapping[str, str],
+    runtime_cwd: Path | None = None,
+) -> bool:
+    """Run provider credential discovery against one runtime environment."""
+    if _call_accepts_keyword(provider.check_credentials, "env"):
+        return provider.check_credentials(env=normalize_subprocess_env(runtime_env, runtime_cwd))
+    return provider.check_credentials()
+
+
+def _call_provider_verify_credentials(
+    provider: Provider,
+    config: Config,
+    *,
+    log_file: Path | None,
+    runtime_env: Mapping[str, str],
+    runtime_cwd: Path | None = None,
+) -> PreflightCheckResult:
+    """Run provider credential verification against one runtime environment."""
+    kwargs: dict[str, Any] = {}
+    if _call_accepts_keyword(provider.verify_credentials, "env"):
+        kwargs["env"] = normalize_subprocess_env(runtime_env, runtime_cwd)
+    if runtime_cwd is not None and _call_accepts_keyword(provider.verify_credentials, "cwd"):
+        kwargs["cwd"] = runtime_cwd
+    return provider.verify_credentials(config, log_file=log_file, **kwargs)
 
 
 def _interruption_metadata() -> dict[str, str]:
@@ -1574,6 +1608,7 @@ def _complete_failed_code_task_after_pr_publication(
                 branch_name=branch_name,
                 head_sha=head_sha,
                 verify_epoch=verify_epoch,
+                env=getattr(canonical_git, "env", None),
             )
             if resolved_verification_git is None:
                 return 1
@@ -2032,12 +2067,14 @@ def prepare_task_startup_phase(
     task: Task,
     *,
     resume_mode: bool = False,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> Task:
     """Synchronously materialize task startup metadata before execution detaches."""
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     require_execution_route_for_task(task, config)
     _ensure_task_dispatchable_for_startup(task, store, resume_mode=resume_mode)
     if task.slug is None:
-        git = Git(config.project_dir)
+        git = Git(config.project_dir, env=runtime_context.env)
         slug_override = _compute_slug_override(task, store)
         task.slug = generate_slug(
             task.prompt,
@@ -2835,31 +2872,9 @@ def load_dotenv(project_dir: Path) -> None:
     Shell environment variables are preserved unless overridden by sources loaded
     with override=True (i.e., project .env and .gza/.env).
     """
-    def _load(path: Path, override: bool) -> None:
-        if not path.exists():
-            return
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if "=" in line:
-                    key, value = line.split("=", 1)
-                    k = key.strip()
-                    v = value.strip()
-                    if override:
-                        os.environ[k] = v
-                    else:
-                        os.environ.setdefault(k, v)
-
-    # Lowest priority: home ~/.{APP_NAME}/.env (does not override shell or project values)
-    _load(Path.home() / f".{APP_NAME}" / ".env", override=False)
-
-    # Mid priority: project root .env (overrides shell and home; backwards compat)
-    _load(project_dir / ".env", override=True)
-
-    # Highest priority: project .gza/.env (shared across worktrees via symlink)
-    _load(project_dir / f".{APP_NAME}" / ".env", override=True)
+    runtime_env = build_dotenv_runtime_env(project_dir)
+    os.environ.clear()
+    os.environ.update(runtime_env)
 
 
 def slugify(text: str, max_length: int = 50) -> str:
@@ -4409,6 +4424,7 @@ def _run_review_verify_command_with_timeout_diagnostics(
     verify_command: str,
     *,
     cwd: Path,
+    env: Mapping[str, str] | None = None,
     timeout_seconds: int,
     termination_grace_seconds: float,
 ) -> _ReviewVerifyCommandRun:
@@ -4424,6 +4440,7 @@ def _run_review_verify_command_with_timeout_diagnostics(
         text=False,
         bufsize=0,
         start_new_session=(os.name == "posix"),
+        env=normalize_subprocess_env(env, cwd),
     )
     try:
         completed_stdout, completed_stderr = process.communicate(timeout=timeout_seconds)
@@ -4479,6 +4496,7 @@ def _run_verify_command(
     verify_command: str,
     *,
     cwd: Path,
+    env: Mapping[str, str] | None = None,
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
     reviewed_base_sha: str | None = None,
@@ -4492,6 +4510,7 @@ def _run_verify_command(
         result = _run_review_verify_command_with_timeout_diagnostics(
             verify_command,
             cwd=cwd,
+            env=env,
             timeout_seconds=timeout_seconds,
             termination_grace_seconds=timeout_grace_seconds,
         )
@@ -4554,6 +4573,7 @@ def _run_review_verify_command(
     verify_command: str,
     *,
     cwd: Path,
+    env: Mapping[str, str] | None = None,
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
     reviewed_base_sha: str | None = None,
@@ -4564,6 +4584,7 @@ def _run_review_verify_command(
     return _run_verify_command(
         verify_command,
         cwd=cwd,
+        env=env,
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
         reviewed_base_sha=reviewed_base_sha,
@@ -4609,6 +4630,7 @@ def _verification_worktree_git_for_timeout_rerun(
     branch_name: str,
     head_sha: str | None,
     verify_epoch: VerifyEpoch,
+    env: Mapping[str, str] | None = None,
 ) -> Git | None:
     """Construct a Git handle rooted at the managed verification worktree and prove its head."""
     if not worktree_path.exists():
@@ -4617,7 +4639,7 @@ def _verification_worktree_git_for_timeout_rerun(
         )
         return None
     try:
-        worktree_git = Git(worktree_path)
+        worktree_git = Git(worktree_path, env=env)
         proven_head = _prove_verify_fix_rerun_head(
             task=task,
             worktree_git=worktree_git,
@@ -4875,6 +4897,7 @@ def _run_verify_commands_for_projects(
     task: Task,
     worktree_git: Git,
     worktree_path: Path,
+    runtime_context: RuntimeExecutionContext | None = None,
     timeout_seconds: int,
     timeout_grace_seconds: float,
     reviewed_branch: str | None = None,
@@ -4903,9 +4926,11 @@ def _run_verify_commands_for_projects(
 
     project_results: list[ProjectReviewVerifyResult] = []
     section_entries: list[str] = []
+    owning_scope_root = _project_boundary(config).scope_root
     for project in affected.projects:
         scope = _format_repo_project_scope(project.scope_root)
         project_cwd = worktree_path if project.scope_root == Path(".") else worktree_path / project.scope_root
+        project_timeout_seconds, project_timeout_grace_seconds = _resolve_review_verify_timeout_settings(project.config)
         if not project.verify_command:
             project_results.append(
                 ProjectReviewVerifyResult(
@@ -4930,11 +4955,21 @@ def _run_verify_commands_for_projects(
         result = _run_review_verify_command(
             project.verify_command,
             cwd=project_cwd,
+            env=normalize_subprocess_env(
+                (
+                    runtime_context.env
+                    if runtime_context is not None
+                    and project.config.project_id == config.project_id
+                    and project.scope_root == owning_scope_root
+                    else project.runtime_context.env
+                ),
+                project_cwd,
+            ),
             reviewed_branch=reviewed_branch,
             reviewed_head_sha=reviewed_head_sha,
             reviewed_base_sha=reviewed_base_sha,
-            timeout_seconds=timeout_seconds,
-            timeout_grace_seconds=timeout_grace_seconds,
+            timeout_seconds=project_timeout_seconds,
+            timeout_grace_seconds=project_timeout_grace_seconds,
         )
         project_results.append(
             ProjectReviewVerifyResult(
@@ -4991,6 +5026,7 @@ def _run_review_verify_commands_for_projects(
     task: Task,
     worktree_git: Git,
     worktree_path: Path,
+    runtime_context: RuntimeExecutionContext | None = None,
     timeout_seconds: int,
     timeout_grace_seconds: float,
     reviewed_branch: str | None = None,
@@ -5003,6 +5039,7 @@ def _run_review_verify_commands_for_projects(
         task=task,
         worktree_git=worktree_git,
         worktree_path=worktree_path,
+        runtime_context=runtime_context,
         timeout_seconds=timeout_seconds,
         timeout_grace_seconds=timeout_grace_seconds,
         reviewed_branch=reviewed_branch,
@@ -5018,6 +5055,7 @@ def _run_lifecycle_verify(
     worktree_git: Git,
     worktree_path: Path,
     cwd: Path,
+    runtime_context: RuntimeExecutionContext | None = None,
     timeout_seconds: int,
     timeout_grace_seconds: float,
     reviewed_branch: str | None = None,
@@ -5031,6 +5069,7 @@ def _run_lifecycle_verify(
             task=task,
             worktree_git=worktree_git,
             worktree_path=worktree_path,
+            runtime_context=runtime_context,
             timeout_seconds=timeout_seconds,
             timeout_grace_seconds=timeout_grace_seconds,
             reviewed_branch=reviewed_branch,
@@ -5048,9 +5087,11 @@ def _run_lifecycle_verify(
     verify_command = normalized_verify_command(config.verify_command if isinstance(config.verify_command, str) else "")
     if verify_command is None:
         return None
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     result = _run_review_verify_command(
         verify_command,
         cwd=cwd,
+        env=normalize_subprocess_env(runtime_context.env, cwd),
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
         reviewed_base_sha=reviewed_base_sha,
@@ -5129,12 +5170,21 @@ def _capture_noop_verify_fix_timeout_rerun(
         return False
     timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(config)
     rerun_cwd = _worktree_execution_dir(worktree_path, boundary)
+    worktree_git_env = getattr(worktree_git, "env", None)
+    if worktree_git_env is None:
+        worktree_git_env = RuntimeExecutionContext.from_config(config).env
     execution = _run_lifecycle_verify(
         config=config,
         task=task,
         worktree_git=worktree_git,
         worktree_path=worktree_path,
         cwd=rerun_cwd,
+        runtime_context=RuntimeExecutionContext(
+            cwd=rerun_cwd,
+            env=dict(worktree_git_env),
+            project_id=config.project_id,
+            db_path=config.db_path.resolve(),
+        ),
         timeout_seconds=timeout_seconds,
         timeout_grace_seconds=timeout_grace_seconds,
         reviewed_branch=branch_name,
@@ -8029,6 +8079,7 @@ def run(
     on_task_claimed: Callable[[Task], None] | None = None,
     create_pr: bool = False,
     invocation: RunInvocationContext | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> int:
     """Run Gza on the next pending task or a specific task.
 
@@ -8045,9 +8096,8 @@ def run(
         on_task_claimed: Optional callback invoked after task ownership is established.
         create_pr: If True, create/reuse a PR after successful code-task completion.
         invocation: Optional execution invocation context for UX/provenance.
+        runtime_context: Optional captured runtime cwd/env/identity bundle.
     """
-    load_dotenv(config.project_dir)
-
     # Create hourly backup before running
     backup_database(config.db_path, config.project_dir)
 
@@ -8197,7 +8247,8 @@ def run(
     if on_task_claimed is not None:
         on_task_claimed(task)
     if pr_retry_mode:
-        return _retry_pr_required_code_task_completion(task, config, store)
+        runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
+        return _retry_pr_required_code_task_completion(task, config, store, runtime_context=runtime_context)
 
     # Persist resolved model/provider to the task DB row immediately so analytics
     # can track which configuration actually ran, even if it crashes before completion.
@@ -8236,12 +8287,16 @@ def run(
     task_config.max_turns = effective_max_steps
     task_config.timeout_minutes = config.get_timeout_minutes_for_task(task.task_type, effective_provider)
 
-    # Get the provider for this task
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     provider = get_provider(task_config)
     resolved_interaction_mode = _resolve_interaction_mode(invocation_context, provider)
     preflight_logs = ensure_task_log_paths(config, store, task)
 
-    if not provider.check_credentials():
+    if not _call_provider_check_credentials(
+        provider,
+        runtime_env=runtime_context.env,
+        runtime_cwd=runtime_context.cwd,
+    ):
         error_message(f"Error: No {provider.name} credentials found")
         console.print(f"  {provider.credential_setup_hint}")
         _mark_preflight_provider_unavailable(
@@ -8256,10 +8311,16 @@ def run(
         )
         return 1
 
-    # Verify credentials work before proceeding
+    # Verify credentials work before proceeding.
     console.print(f"Verifying {provider.name} credentials...")
     preflight_result = _normalize_preflight_result(
-        provider.verify_credentials(task_config, log_file=preflight_logs.ops)
+        _call_provider_verify_credentials(
+            provider,
+            task_config,
+            log_file=preflight_logs.ops,
+            runtime_env=runtime_context.env,
+            runtime_cwd=runtime_context.cwd,
+        )
     )
     if not preflight_result.ok:
         _mark_preflight_failure(
@@ -8278,7 +8339,7 @@ def run(
     console.print(f"[{rc.success}]Credentials verified ✓[/{rc.success}]")
 
     # Setup git on the main repo (for worktree operations)
-    git = Git(config.project_dir)
+    git = Git(config.project_dir, env=runtime_context.env)
     try:
         default_branch = git.default_branch()
     except GitError as exc:
@@ -8387,6 +8448,7 @@ def run(
         create_pr=requested_create_pr,
         invocation=invocation_context,
         interaction_mode=resolved_interaction_mode,
+        runtime_context=runtime_context,
     )
 
 
@@ -9505,7 +9567,13 @@ def _create_fix_follow_up_review_task(task: Task, config: Config, store: SqliteT
     print(f"Created follow-up review task {review_task.id} for implementation {root_impl.id}")
 
 
-def _retry_pr_required_code_task_completion(task: Task, config: Config, store: SqliteTaskStore) -> int:
+def _retry_pr_required_code_task_completion(
+    task: Task,
+    config: Config,
+    store: SqliteTaskStore,
+    *,
+    runtime_context: RuntimeExecutionContext | None = None,
+) -> int:
     """Retry post-code PR/completion steps for tasks blocked on required PR creation."""
     if not task.branch:
         print(f"Error: Task {task.id} has no branch to create/reuse PR")
@@ -9521,7 +9589,8 @@ def _retry_pr_required_code_task_completion(task: Task, config: Config, store: S
         )
         return 1
 
-    git = Git(config.project_dir)
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
+    git = Git(config.project_dir, env=runtime_context.env)
     stats = TaskStats(
         duration_seconds=task.duration_seconds,
         num_steps_reported=task.num_steps_reported,
@@ -9654,11 +9723,14 @@ def _run_inner(
     create_pr: bool = False,
     invocation: RunInvocationContext | None = None,
     interaction_mode: str = "observe_only",
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> int:
     """Inner task execution logic, split out to allow foreground worker cleanup."""
     # For branchless task types, run without creating a branch.
     # Keep temporary "learn" compatibility for pre-migration rows.
     if not _is_code_task(task):
+        if runtime_context is None:
+            runtime_context = RuntimeExecutionContext.from_config(config)
         return _run_non_code_task(
             task,
             task_config,
@@ -9669,10 +9741,13 @@ def _run_inner(
             open_after=open_after,
             invocation=invocation,
             interaction_mode=interaction_mode,
+            runtime_context=runtime_context,
         )
 
     # Code tasks (implement/improve/verify_fix/fix/rebase) require git
     assert git is not None, "git is required for code tasks"
+    if runtime_context is None:
+        runtime_context = RuntimeExecutionContext.from_config(config)
     log_file = ensure_task_log_path(config, store, task)
     try:
         default_branch = git.default_branch()
@@ -9812,7 +9887,7 @@ def _run_inner(
             return 1
 
         # Create a Git instance for the worktree
-        worktree_git = Git(worktree_path)
+        worktree_git = Git(worktree_path, env=runtime_context.env)
 
     # Restore WIP changes if resuming
     if resume:
@@ -10138,6 +10213,7 @@ def _run_inner(
                 log_file,
                 worktree_path,
                 provider_run_kwargs=provider_run_kwargs,
+                runtime_env=runtime_context.env,
             )
         finally:
             _restore_validated_docker_worktree_git_metadata(
@@ -10377,6 +10453,7 @@ def _run_non_code_task(
     open_after: bool = False,
     invocation: RunInvocationContext | None = None,
     interaction_mode: str = "observe_only",
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> int:
     """Run a branchless task in a worktree without branch creation.
 
@@ -10389,6 +10466,8 @@ def _run_non_code_task(
         resume: If True, resume from previous session
         open_after: If True, open the report file in $EDITOR after completion
     """
+    if runtime_context is None:
+        runtime_context = RuntimeExecutionContext.from_config(config)
     if resume and task.session_id:
         console.print(f"Resuming with session: [dim]{task.session_id[:12]}...[/dim]")
 
@@ -10557,6 +10636,7 @@ def _run_non_code_task(
                 log_file,
                 worktree_path,
                 provider_run_kwargs=provider_run_kwargs,
+                runtime_env=runtime_context.env,
             )
             _apply_transcript_stats_fallback(
                 result,

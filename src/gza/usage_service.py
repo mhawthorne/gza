@@ -10,6 +10,7 @@ import logging
 import os
 import sqlite3
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -124,6 +125,8 @@ def get_usage(
     timeout_seconds: float = 10.0,
     retention_days: int = 30,
     now: datetime | None = None,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> UsageSnapshot:
     """Read usage for one provider, fetching only when the cache is stale.
 
@@ -161,7 +164,7 @@ def get_usage(
         return _snapshot_from_cache(store, provider, now=now, max_age=max_age, error=error, error_reason=reason)
 
     try:
-        usage = _fetch_usage(provider, timeout_seconds=timeout_seconds)
+        usage = _fetch_usage(provider, timeout_seconds=timeout_seconds, env=env, cwd=cwd)
     except UsageError as exc:
         logger.debug("usage fetch failed for %s: %s", provider, exc)
         store.record_provider_usage_failure(provider, error=str(exc), reason=exc.reason)
@@ -184,13 +187,19 @@ def get_usage(
     return UsageSnapshot(provider=provider, usage=usage, source="fetch", age=timedelta(0))
 
 
-def _fetch_usage(provider: str, *, timeout_seconds: float) -> ProviderUsage:
+def _fetch_usage(
+    provider: str,
+    *,
+    timeout_seconds: float,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+) -> ProviderUsage:
     from .providers import get_provider_by_name
 
     impl = get_provider_by_name(provider)
     if not impl.supports_usage():
         raise UsageUnsupported(f"{provider} does not report usage")
-    return impl.read_usage(timeout_seconds=timeout_seconds)
+    return impl.read_usage(timeout_seconds=timeout_seconds, env=env, cwd=cwd)
 
 
 def get_primary_usage(
@@ -199,6 +208,8 @@ def get_primary_usage(
     *,
     refresh: bool = True,
     now: datetime | None = None,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> UsageSnapshot | None:
     """Snapshot for the first usage-capable routed provider, or None."""
     providers = usage_providers(config)
@@ -212,4 +223,6 @@ def get_primary_usage(
         timeout_seconds=config.usage_timeout_seconds,
         retention_days=config.usage_retention_days,
         now=now,
+        env=env,
+        cwd=cwd,
     )

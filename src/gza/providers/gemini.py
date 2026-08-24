@@ -6,13 +6,14 @@ import json
 import os
 import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rich.markup import escape as rich_escape
 
+from ..runtime_context import normalize_subprocess_env
 from .base import (
     DEFAULT_PROVIDER_DOCKER_STARTUP_TIMEOUT,
     DockerConfig,
@@ -21,6 +22,7 @@ from .base import (
     RunResult,
     build_docker_cmd,
     ensure_docker_image,
+    provider_home_from_env,
     verify_docker_credentials,
     write_ops_event,
     write_preflight_entry,
@@ -275,7 +277,7 @@ class GeminiProvider(Provider):
     def credential_setup_hint(self) -> str:
         return "Set GEMINI_API_KEY or GOOGLE_API_KEY in ~/.gza/.env, or run 'gemini auth' to authenticate"
 
-    def check_credentials(self) -> bool:
+    def check_credentials(self, *, env: Mapping[str, str] | None = None) -> bool:
         """Check for Gemini credentials.
 
         Gemini CLI supports:
@@ -284,26 +286,41 @@ class GeminiProvider(Provider):
         - GOOGLE_APPLICATION_CREDENTIALS: Service account JSON file
         - OAuth login via 'gemini auth'
         """
+        env_source = os.environ if env is None else env
         # Check for API keys
-        if os.getenv("GEMINI_API_KEY"):
+        if env_source.get("GEMINI_API_KEY"):
             return True
-        if os.getenv("GOOGLE_API_KEY"):
+        if env_source.get("GOOGLE_API_KEY"):
             return True
-        if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        if env_source.get("GOOGLE_APPLICATION_CREDENTIALS"):
             return True
         # Check for OAuth credentials (stored after 'gemini auth')
-        gemini_config = Path.home() / ".gemini"
+        gemini_config = provider_home_from_env("gemini", env=env)
         if gemini_config.is_dir():
             return True
         return False
 
-    def verify_credentials(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
+    def verify_credentials(
+        self,
+        config: Config,
+        log_file: Path | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> PreflightCheckResult:
         """Verify Gemini credentials by testing the gemini command."""
         if config.use_docker:
-            return self._verify_docker(config, log_file=log_file)
-        return self._verify_direct(log_file=log_file)
+            return self._verify_docker(config, log_file=log_file, env=env, cwd=cwd or config.project_dir)
+        return self._verify_direct(log_file=log_file, env=env, cwd=cwd or config.project_dir)
 
-    def _verify_docker(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
+    def _verify_docker(
+        self,
+        config: Config,
+        log_file: Path | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> PreflightCheckResult:
         """Verify credentials work in Docker."""
         image_name = f"{config.docker_image}-gemini"
         docker_config = _get_docker_config(
@@ -315,6 +332,8 @@ class GeminiProvider(Provider):
             config.project_dir,
             log_file=log_file,
             provider_label="Gemini",
+            host_env=env,
+            host_cwd=cwd,
         ):
             print("Error: Failed to build Docker image")
             return PreflightCheckResult.failure(
@@ -330,6 +349,8 @@ class GeminiProvider(Provider):
                 "  Run 'gemini auth' or set GEMINI_API_KEY in .env"
             ),
             log_file=log_file,
+            env=env,
+            cwd=cwd,
         )
         if not result.ok and result.failure_reason == "PROVIDER_UNAVAILABLE":
             return PreflightCheckResult.failure(
@@ -338,7 +359,13 @@ class GeminiProvider(Provider):
             )
         return result
 
-    def _verify_direct(self, log_file: Path | None = None) -> PreflightCheckResult:
+    def _verify_direct(
+        self,
+        log_file: Path | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> PreflightCheckResult:
         """Verify credentials work directly."""
         cmd = ["gemini", "--version"]
         try:
@@ -347,6 +374,8 @@ class GeminiProvider(Provider):
                 capture_output=True,
                 timeout=5,
                 text=True,
+                env=normalize_subprocess_env(env, cwd),
+                cwd=cwd,
             )
             write_preflight_entry(
                 log_file,
@@ -422,6 +451,7 @@ class GeminiProvider(Provider):
         on_step_count: Callable[[int], None] | None = None,
         interactive: bool = False,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run Gemini to execute a task."""
         _ = interactive
@@ -437,6 +467,7 @@ class GeminiProvider(Provider):
                 work_dir,
                 on_step_count=on_step_count,
                 ops_log_file=ops_log_file,
+                env=env,
             )
         return self._run_direct(
             config,
@@ -445,6 +476,7 @@ class GeminiProvider(Provider):
             work_dir,
             on_step_count=on_step_count,
             ops_log_file=ops_log_file,
+            env=env,
         )
 
     def _run_docker(
@@ -455,6 +487,7 @@ class GeminiProvider(Provider):
         work_dir: Path,
         on_step_count: Callable[[int], None] | None = None,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run Gemini in Docker container."""
         conversation_log_file = log_file
@@ -466,7 +499,8 @@ class GeminiProvider(Provider):
             docker_startup_timeout=config.docker_startup_timeout,
         )
 
-        if not ensure_docker_image(docker_config, config.project_dir):
+        run_cwd = getattr(config, "provider_cwd", None) or work_dir
+        if not ensure_docker_image(docker_config, config.project_dir, host_env=env, host_cwd=run_cwd):
             print("Error: Failed to build Docker image")
             return RunResult(exit_code=1)
 
@@ -478,6 +512,7 @@ class GeminiProvider(Provider):
             config.docker_setup_command,
             getattr(config, "docker_env", None),
             getattr(config, "docker_workdir", "/workspace"),
+            host_env=env,
         )
         # Insert Gemini headless env before the image name (last element from build_docker_cmd).
         for env_value in ("GEMINI_SHELL_ENABLED=true", GEMINI_TRUST_WORKSPACE_ENV):
@@ -501,6 +536,8 @@ class GeminiProvider(Provider):
             max_steps=config.max_steps,
             on_step_count=on_step_count,
             ops_log_file=ops_log_file,
+            cwd=run_cwd,
+            env=env,
         )
 
     def _run_direct(
@@ -511,6 +548,7 @@ class GeminiProvider(Provider):
         work_dir: Path,
         on_step_count: Callable[[int], None] | None = None,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run Gemini directly."""
         conversation_log_file = log_file
@@ -538,6 +576,7 @@ class GeminiProvider(Provider):
             max_steps=config.max_steps,
             on_step_count=on_step_count,
             ops_log_file=ops_log_file,
+            env=env,
         )
 
     def _run_with_output_parsing(
@@ -551,6 +590,7 @@ class GeminiProvider(Provider):
         max_steps: int = 50,
         on_step_count: Callable[[int], None] | None = None,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run command and parse Gemini's stream-json output."""
         conversation_log_file = log_file
@@ -720,6 +760,7 @@ class GeminiProvider(Provider):
             cwd=cwd,
             parse_output=parse_gemini_output,
             ops_log_file=ops_log_file,
+            env=env,
         )
 
         # Extract stats from result event

@@ -30,6 +30,8 @@ class TestWorktreeAdd:
             branch_name = "test-branch"
 
             # Call worktree_add
+            git.env = {"PATH": "/owned/bin", "GZA_DB_PATH": "/owned.db"}
+
             result = git.worktree_add(worktree_path, branch_name, "main")
 
             # Verify worktree was created with correct args
@@ -42,6 +44,7 @@ class TestWorktreeAdd:
             mock_worktree_git.push_branch.assert_called_once_with(
                 branch_name, remote="origin", set_upstream=True
             )
+            mock_git_class.assert_called_once_with(worktree_path, env=git.env)
 
             assert result == worktree_path
 

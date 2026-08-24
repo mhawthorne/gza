@@ -17,6 +17,8 @@ import subprocess
 import sys
 import time
 
+from .runtime_context import normalize_subprocess_env
+
 logger = logging.getLogger(__name__)
 
 # Maximum bytes written to the PTY in a single chunk for prompt delivery.
@@ -409,12 +411,19 @@ def check_tmux_available() -> None:
         )
 
 
-def get_tmux_session_pid(session_name: str) -> int | None:
+def get_tmux_session_pid(
+    session_name: str,
+    *,
+    cwd: str | os.PathLike[str] | None = None,
+    env: dict[str, str] | None = None,
+) -> int | None:
     """Return the PID of the foreground process in the given tmux session pane."""
     result = subprocess.run(
         ["tmux", "display-message", "-p", "-t", session_name, "#{pane_pid}"],
         capture_output=True,
         text=True,
+        cwd=cwd,
+        env=normalize_subprocess_env(env, None if cwd is None else os.fspath(cwd)),
     )
     if result.returncode != 0 or not result.stdout.strip():
         return None

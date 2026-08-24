@@ -16,7 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
 from rich.console import Console
@@ -191,6 +191,7 @@ from gza.review_scope import (
 from gza.review_verdict import ParsedReviewReport
 from gza.review_verify_state import VERIFY_GATE_ARTIFACT_KIND, persist_verify_gate_artifact
 from gza.runner import _make_review_verify_result
+from gza.runtime_context import RuntimeExecutionContext
 from gza.unstick import VERIFY_FIX_FAILED_REASON, select_and_clear_parked_tasks
 from gza.watch_leases import (
     WATCH_SUPERVISOR_LEASE_NAME,
@@ -806,6 +807,126 @@ def test_watch_project_runtime_owns_project_local_state(tmp_path: Path) -> None:
     assert runtime.git_health_hold_active is False
 
 
+def test_watch_project_runtime_rejects_unrelated_db_store_swap(tmp_path: Path) -> None:
+    alpha_dir = tmp_path / "alpha"
+    beta_dir = tmp_path / "beta"
+    alpha_dir.mkdir()
+    beta_dir.mkdir()
+    setup_config(alpha_dir, project_name="alpha")
+    setup_config(beta_dir, project_name="beta")
+    alpha_config = Config.load(alpha_dir)
+    beta_config = Config.load(beta_dir)
+    alpha_store = SqliteTaskStore.from_config(alpha_config)
+    beta_store = SqliteTaskStore.from_config(beta_config)
+
+    with pytest.raises(ValueError, match="ownership mismatch"):
+        WatchProjectRuntime.create(
+            key="alpha",
+            config=alpha_config,
+            store=beta_store,
+            log=_WatchLog(alpha_dir / ".gza" / "watch.log", quiet=True),
+            tags=None,
+            any_tag=False,
+            git=_make_watch_git(),
+            runtime_context=RuntimeExecutionContext.from_config(alpha_config),
+        )
+
+    assert alpha_store.get_all() == []
+    assert beta_store.get_all() == []
+
+
+def test_watch_project_runtime_rejects_shared_db_context_project_swap(tmp_path: Path) -> None:
+    shared_db = tmp_path / "shared.db"
+    alpha_dir = tmp_path / "alpha"
+    beta_dir = tmp_path / "beta"
+    alpha_dir.mkdir()
+    beta_dir.mkdir()
+    (alpha_dir / "gza.yaml").write_text(
+        f"project_name: Alpha\nproject_id: alpha\nproject_prefix: alpha\ndb_path: {shared_db}\n"
+        "provider: codex\nmodel: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    (beta_dir / "gza.yaml").write_text(
+        f"project_name: Beta\nproject_id: beta\nproject_prefix: beta\ndb_path: {shared_db}\n"
+        "provider: codex\nmodel: gpt-5.5\n",
+        encoding="utf-8",
+    )
+    alpha_config = Config.load(alpha_dir)
+    beta_config = Config.load(beta_dir)
+    alpha_store = SqliteTaskStore.from_config(alpha_config)
+
+    with pytest.raises(ValueError, match="context project_id"):
+        WatchProjectRuntime.create(
+            key="alpha",
+            config=alpha_config,
+            store=alpha_store,
+            log=_WatchLog(alpha_dir / ".gza" / "watch.log", quiet=True),
+            tags=None,
+            any_tag=False,
+            git=_make_watch_git(),
+            runtime_context=RuntimeExecutionContext.from_config(beta_config),
+        )
+
+    assert alpha_store.get_all() == []
+
+
+def test_watch_project_runtime_rejects_real_git_from_unrelated_project_root(tmp_path: Path) -> None:
+    alpha_dir = tmp_path / "alpha"
+    beta_dir = tmp_path / "beta"
+    alpha_dir.mkdir()
+    beta_dir.mkdir()
+    setup_config(alpha_dir, project_name="alpha")
+    setup_config(beta_dir, project_name="beta")
+    alpha_config = Config.load(alpha_dir)
+    beta_config = Config.load(beta_dir)
+    alpha_store = SqliteTaskStore.from_config(alpha_config)
+    alpha_context = RuntimeExecutionContext.from_config(alpha_config)
+    beta_root_git = Git(beta_config.project_dir, env=alpha_context.env)
+
+    with pytest.raises(ValueError, match="git repo_dir"):
+        WatchProjectRuntime.create(
+            key="alpha",
+            config=alpha_config,
+            store=alpha_store,
+            log=_WatchLog(alpha_dir / ".gza" / "watch.log", quiet=True),
+            tags=None,
+            any_tag=False,
+            git=beta_root_git,
+            runtime_context=alpha_context,
+        )
+
+    assert alpha_store.get_all() == []
+
+
+def test_watch_project_runtime_rejects_real_git_with_unrelated_runtime_env(tmp_path: Path) -> None:
+    alpha_dir = tmp_path / "alpha"
+    beta_dir = tmp_path / "beta"
+    alpha_dir.mkdir()
+    beta_dir.mkdir()
+    setup_config(alpha_dir, project_name="alpha")
+    setup_config(beta_dir, project_name="beta")
+    alpha_config = Config.load(alpha_dir)
+    beta_config = Config.load(beta_dir)
+    alpha_store = SqliteTaskStore.from_config(alpha_config)
+    alpha_context = RuntimeExecutionContext.from_config(alpha_config)
+    beta_context = RuntimeExecutionContext.from_config(beta_config)
+    alpha_root_beta_env_git = Git(alpha_config.project_dir, env=beta_context.env)
+
+    with pytest.raises(ValueError, match="git env"):
+        WatchProjectRuntime.create(
+            key="alpha",
+            config=alpha_config,
+            store=alpha_store,
+            log=_WatchLog(alpha_dir / ".gza" / "watch.log", quiet=True),
+            tags=None,
+            any_tag=False,
+            git=alpha_root_beta_env_git,
+            runtime_context=alpha_context,
+        )
+
+    assert alpha_store.get_all() == []
+
+
 def test_watch_project_runtime_build_plan_uses_owned_git(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -871,7 +992,7 @@ def test_watch_project_runtime_reconcile_runtime_state_preserves_legacy_order(tm
     with (
         patch(
             "gza.cli._common.reconcile_in_progress_tasks",
-            side_effect=lambda cfg: calls.append("in_progress"),
+            side_effect=lambda cfg, **kwargs: calls.append("in_progress"),
         ) as reconcile_in_progress,
         patch(
             "gza.cli._common.prune_terminal_dead_workers",
@@ -879,7 +1000,7 @@ def test_watch_project_runtime_reconcile_runtime_state_preserves_legacy_order(tm
         ) as prune_dead,
         patch(
             "gza.cli._common.reconcile_dead_pending_recovery_tasks",
-            side_effect=lambda cfg: calls.append("pending_recovery"),
+            side_effect=lambda cfg, **kwargs: calls.append("pending_recovery"),
         ) as reconcile_recovery,
         patch(
             "gza.cli.watch._collect_live_running_state",
@@ -896,9 +1017,9 @@ def test_watch_project_runtime_reconcile_runtime_state_preserves_legacy_order(tm
     assert result.running == 1
     assert result.anonymous_worker_count == 2
     assert result.starting_worker_count == 1
-    reconcile_in_progress.assert_called_once_with(config)
+    reconcile_in_progress.assert_called_once_with(config, store=store, runtime_context=runtime.runtime_context)
     prune_dead.assert_called_once_with(config)
-    reconcile_recovery.assert_called_once_with(config)
+    reconcile_recovery.assert_called_once_with(config, store=store, runtime_context=runtime.runtime_context)
     collect_live.assert_called_once_with(config, store)
 
 
@@ -1134,6 +1255,123 @@ def test_run_cycle_direct_phase_only_stops_before_worker_dispatch(tmp_path: Path
     assert result.needs_replan is False
     assert result.pending == 1
     assert store.get(queued.id).status == "pending"
+
+
+def test_run_cycle_direct_phase_only_scoped_completion_reuses_runtime_context_and_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    (tmp_path / ".env").write_text("PATH=/captured/bin\nPROJECT_TOKEN=captured\n", encoding="utf-8")
+    store = make_store(tmp_path)
+    scoped = store.add("Scoped owner", task_type="implement")
+    assert scoped.id is not None
+    config = Config.load(tmp_path)
+    runtime_context = RuntimeExecutionContext.from_config(config)
+    sentinel_git = _make_watch_git()
+    plan = _empty_scoped_watch_plan_with_effective_scope((scoped.id,))
+
+    (tmp_path / ".env").write_text("PATH=/mutated/bin\nPROJECT_TOKEN=mutated\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("PWD", str(tmp_path / "ambient-cwd"))
+    monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "ambient.git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "ambient-worktree"))
+
+    def scoped_active_spy(**kwargs: object) -> int:
+        assert kwargs["git"] is sentinel_git
+        assert kwargs["runtime_context"] is runtime_context
+        return 0
+
+    with (
+        patch(
+            "gza.cli.watch._run_watch_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+        patch("gza.cli.watch._scoped_watch_active_count", side_effect=scoped_active_spy) as scoped_active,
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("pending worker started")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("pending worker started")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            direct_phase_only=True,
+            scoped_owner_ids=(scoped.id,),
+            scoped_task_ids=(scoped.id,),
+            git=sentinel_git,
+            runtime_context=runtime_context,
+            precomputed_plan=plan,
+        )
+
+    assert result.scoped_done is True
+    assert scoped_active.call_count == 1
+    assert runtime_context.env["PATH"] == "/captured/bin"
+    assert runtime_context.env["PROJECT_TOKEN"] == "captured"
+    assert os.environ["PATH"] == "/ambient/bin"
+    assert os.environ["GZA_DB_PATH"] == str(tmp_path / "ambient.db")
+
+
+def test_run_cycle_normal_scoped_completion_reuses_runtime_context_and_git(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    (tmp_path / ".env").write_text("PATH=/captured/bin\nPROJECT_TOKEN=captured\n", encoding="utf-8")
+    store = make_store(tmp_path)
+    scoped = store.add("Scoped owner", task_type="implement")
+    assert scoped.id is not None
+    config = Config.load(tmp_path)
+    runtime_context = RuntimeExecutionContext.from_config(config)
+    sentinel_git = _make_watch_git()
+    plan = _empty_scoped_watch_plan_with_effective_scope((scoped.id,))
+
+    (tmp_path / ".env").write_text("PATH=/mutated/bin\nPROJECT_TOKEN=mutated\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("PWD", str(tmp_path / "ambient-cwd"))
+    monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "ambient-gitconfig"))
+
+    def scoped_active_spy(**kwargs: object) -> int:
+        assert kwargs["git"] is sentinel_git
+        assert kwargs["runtime_context"] is runtime_context
+        return 0
+
+    with (
+        patch(
+            "gza.cli.watch._run_watch_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+        patch("gza.cli.watch._scoped_watch_active_count", side_effect=scoped_active_spy) as scoped_active,
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("pending worker started")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("pending worker started")),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            scoped_owner_ids=(scoped.id,),
+            scoped_task_ids=(scoped.id,),
+            git=sentinel_git,
+            runtime_context=runtime_context,
+            precomputed_plan=plan,
+        )
+
+    assert result.scoped_done is True
+    assert scoped_active.call_count == 1
+    assert runtime_context.env["PATH"] == "/captured/bin"
+    assert os.environ["PATH"] == "/ambient/bin"
+    assert os.environ["GZA_DB_PATH"] == str(tmp_path / "ambient.db")
 
 
 def test_run_cycle_direct_phase_only_replans_after_red_main_verify_remediation_reuse(
@@ -1737,7 +1975,7 @@ def test_run_cycle_uses_reconciled_occupancy_for_legacy_capacity_snapshot(tmp_pa
         return plan
 
     with (
-        patch("gza.cli._common.reconcile_in_progress_tasks", side_effect=lambda cfg: calls.append("reconcile")),
+        patch("gza.cli._common.reconcile_in_progress_tasks", side_effect=lambda cfg, **kwargs: calls.append("reconcile")),
         patch("gza.cli._common.prune_terminal_dead_workers", return_value=None),
         patch("gza.cli._common.reconcile_dead_pending_recovery_tasks", return_value=None),
         patch("gza.cli.watch._collect_live_running_state", side_effect=collect_live_once),
@@ -29086,7 +29324,11 @@ def test_watch_cycle_with_isolation_enabled_merge_conflict_spawns_prepared_rebas
         config,
         created_rebase,
         rollback_on_failure=True,
+        store=store,
+        runtime_context=ANY,
     )
+    assert prepare_task.call_args.kwargs["runtime_context"].cwd == config.project_dir
+    assert prepare_task.call_args.kwargs["runtime_context"].db_path == config.db_path.resolve()
     assert spawn_worker.call_count == 1
     assert spawn_worker.call_args.kwargs["task_id"] == prepared_rebase.id
     assert spawn_worker.call_args.kwargs["prepared_task"] is prepared_rebase
@@ -31685,7 +31927,10 @@ def test_watch_cycle_selected_unmaterialized_create_review_skip_does_not_no_prog
     assert "watch selected the same create review action without durable progress" not in text
 
 
-def test_watch_cycle_verify_gate_followup_progress_does_not_trigger_no_progress_backstop(tmp_path: Path) -> None:
+def test_watch_cycle_verify_gate_followup_progress_does_not_trigger_no_progress_backstop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
     _append_watch_config(
         tmp_path,
@@ -31696,6 +31941,8 @@ def test_watch_cycle_verify_gate_followup_progress_does_not_trigger_no_progress_
         "watch:\n"
         "  no_progress_cycles: 2\n",
     )
+    (tmp_path / ".env").write_text("PROJECT_ONLY_TOKEN=captured-token\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "/captured/bin")
     store = make_store(tmp_path)
     shared_branch = "gza/gza-work"
 
@@ -31722,6 +31969,10 @@ def test_watch_cycle_verify_gate_followup_progress_does_not_trigger_no_progress_
     store.set_merge_status(followup.id, "unmerged")
 
     config = Config.load(tmp_path)
+    runtime_context = RuntimeExecutionContext.from_config(config)
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("PROJECT_ONLY_TOKEN", "ambient-token")
+    monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
     log_path = tmp_path / ".gza" / "watch.log"
     git = _make_watch_git()
     git.repo_dir = tmp_path
@@ -31751,7 +32002,12 @@ def test_watch_cycle_verify_gate_followup_progress_does_not_trigger_no_progress_
         datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
     ]
 
-    def lifecycle_verify_result(**_kwargs: object) -> SimpleNamespace:
+    lifecycle_verify_contexts: list[RuntimeExecutionContext | None] = []
+    lifecycle_verify_cwds: list[Path] = []
+
+    def lifecycle_verify_result(**kwargs: object) -> SimpleNamespace:
+        lifecycle_verify_contexts.append(kwargs.get("runtime_context"))  # type: ignore[arg-type]
+        lifecycle_verify_cwds.append(kwargs["cwd"])  # type: ignore[arg-type]
         return SimpleNamespace(
             markdown="verify markdown",
             aggregate_result=_make_review_verify_result(
@@ -31785,18 +32041,20 @@ def test_watch_cycle_verify_gate_followup_progress_does_not_trigger_no_progress_
             max_iterations=1,
             dry_run=False,
             log=_WatchLog(log_path, quiet=True),
+            runtime_context=runtime_context,
         )
         heads[shared_branch] = "followup-head-2"
         _run_cycle(
-            config=Config.load(tmp_path),
-            store=make_store(tmp_path),
+            config=config,
+            store=store,
             batch=1,
             max_iterations=1,
             dry_run=False,
             log=_WatchLog(log_path, quiet=True),
+            runtime_context=runtime_context,
         )
 
-    final_store = make_store(tmp_path)
+    final_store = store
     refreshed_followup = final_store.get(followup.id)
     assert refreshed_followup is not None
     observations = final_store.list_all_watch_progress_observations(parked_reason=WATCH_NO_PROGRESS_BACKSTOP_REASON)
@@ -31805,6 +32063,11 @@ def test_watch_cycle_verify_gate_followup_progress_does_not_trigger_no_progress_
     assert refreshed_followup.review_verify_branch == shared_branch
     assert refreshed_followup.review_verify_head_sha == "followup-head-2"
     assert captures == []
+    assert lifecycle_verify_contexts == [runtime_context, runtime_context]
+    assert lifecycle_verify_cwds == [worktree_git.repo_dir, worktree_git.repo_dir]
+    assert runtime_context.env["PATH"] == "/captured/bin"
+    assert runtime_context.env["PROJECT_ONLY_TOKEN"] == "captured-token"
+    assert runtime_context.env["GZA_DB_PATH"] == str(config.db_path.resolve())
     assert "watch-no-progress-backstop" not in log_path.read_text()
 
 
@@ -33101,6 +33364,89 @@ def test_watch_project_runtime_pending_dispatch_preserves_non_live_settlement_se
     assert result.slot_consuming is expected_slot_consuming
     assert permit.released is True
     assert expected_log_event in (tmp_path / ".gza" / "watch-runtime.log").read_text()
+
+
+def test_watch_project_runtime_dispatch_uses_activation_snapshot_after_env_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    config_path = tmp_path / "gza.yaml"
+    config_path.write_text(
+        config_path.read_text(encoding="utf-8")
+        + "project_id: runtimesnapshot\n"
+        + "project_prefix: runtimesnap\n",
+        encoding="utf-8",
+    )
+    (tmp_path / ".env").write_text("PATH=/activated/bin\nTOKEN=activated\n", encoding="utf-8")
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore.from_config(config)
+    pending = store.add("Pending implement dispatch", task_type="implement")
+    assert pending.id is not None
+    runtime = WatchProjectRuntime.create(
+        key="core",
+        config=config,
+        store=store,
+        log=_WatchLog(tmp_path / ".gza" / "watch-runtime.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+    captured_context = runtime.runtime_context
+    assert captured_context.env["PATH"] == "/activated/bin"
+    assert captured_context.env["TOKEN"] == "activated"
+    assert captured_context.db_path == runtime.config.db_path.resolve()
+    assert captured_context.project_id == runtime.config.project_id
+
+    (tmp_path / ".env").write_text("PATH=/mutated/bin\nTOKEN=mutated\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("TOKEN", "ambient")
+    monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+    candidate = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert candidate is not None
+    permit = _RuntimeDispatchPermit()
+    prepare_contexts: list[RuntimeExecutionContext | None] = []
+    spawn_contexts: list[RuntimeExecutionContext | None] = []
+
+    def prepare_spy(_config, _task, **kwargs):
+        prepare_contexts.append(kwargs.get("runtime_context"))
+        return _task
+
+    def spawn_spy(*_args, **kwargs) -> int:
+        spawn_contexts.append(kwargs.get("runtime_context"))
+        return 0
+
+    def settle_spy(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
+        [entry] = pending_starts
+        return [
+            watch_module._WatchDispatchSettleResult(
+                entry=entry,
+                status=watch_module._DispatchSettleStatus.NO_LIVE_PROOF,
+                reason=f"task {pending.id} did not occupy a live slot",
+                task=store.get(pending.id),
+            )
+        ]
+
+    with (
+        patch("gza.cli.watch.launch_permit", return_value=permit),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=prepare_spy),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=spawn_spy),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_spy),
+    ):
+        result = runtime.dispatch_pending_candidate(candidate, max_iterations=1)
+
+    assert result.status == "no_live_proof"
+    assert prepare_contexts == [captured_context]
+    assert spawn_contexts == [captured_context]
+    for context in [*prepare_contexts, *spawn_contexts]:
+        assert context is captured_context
+        assert context.env["PATH"] == "/activated/bin"
+        assert context.env["TOKEN"] == "activated"
+        assert context.env["GZA_DB_PATH"] == str(runtime.config.db_path.resolve())
+        assert context.db_path == runtime.store.db_path.resolve()
+        assert context.project_id == runtime.store.project_id
+    assert os.environ["PATH"] == "/ambient/bin"
+    assert os.environ["TOKEN"] == "ambient"
 
 
 def test_watch_project_runtime_live_pending_dispatch_excludes_confirmed_start_from_refreshed_head(
@@ -42753,7 +43099,9 @@ def test_cmd_watch_normal_cycle_uses_runtime_owned_git_without_replacement(tmp_p
 
     assert rc == 0
     assert build_plan.call_count == 1
-    git_ctor.assert_called_once_with(tmp_path)
+    git_ctor.assert_called_once()
+    assert git_ctor.call_args.args == (tmp_path,)
+    assert git_ctor.call_args.kwargs["env"]["GZA_DB_PATH"] == str((tmp_path / ".gza" / "gza.db").resolve())
 
 
 def test_cmd_watch_initial_preview_uses_runtime_owned_git_without_replacement(tmp_path: Path) -> None:
@@ -42776,7 +43124,9 @@ def test_cmd_watch_initial_preview_uses_runtime_owned_git_without_replacement(tm
 
     assert rc == 0
     assert preview.call_count == 1
-    git_ctor.assert_called_once_with(tmp_path)
+    git_ctor.assert_called_once()
+    assert git_ctor.call_args.args == (tmp_path,)
+    assert git_ctor.call_args.kwargs["env"]["GZA_DB_PATH"] == str((tmp_path / ".gza" / "gza.db").resolve())
 
 
 def test_cmd_watch_git_health_uses_runtime_owned_git_without_replacement(tmp_path: Path) -> None:
@@ -42802,7 +43152,9 @@ def test_cmd_watch_git_health_uses_runtime_owned_git_without_replacement(tmp_pat
 
     assert rc == 0
     assert check_health.call_count == 1
-    git_ctor.assert_called_once_with(tmp_path)
+    git_ctor.assert_called_once()
+    assert git_ctor.call_args.args == (tmp_path,)
+    assert git_ctor.call_args.kwargs["env"]["GZA_DB_PATH"] == str((tmp_path / ".gza" / "gza.db").resolve())
 
 
 def test_cmd_watch_scoped_activity_uses_runtime_owned_git_without_replacement(tmp_path: Path) -> None:
@@ -42829,7 +43181,9 @@ def test_cmd_watch_scoped_activity_uses_runtime_owned_git_without_replacement(tm
 
     assert rc == 0
     assert scoped_activity.call_count == 1
-    git_ctor.assert_called_once_with(tmp_path)
+    git_ctor.assert_called_once()
+    assert git_ctor.call_args.args == (tmp_path,)
+    assert git_ctor.call_args.kwargs["env"]["GZA_DB_PATH"] == str((tmp_path / ".gza" / "gza.db").resolve())
 
 
 def test_cmd_watch_scoped_planning_and_execution_use_runtime_owned_git_without_replacement(tmp_path: Path) -> None:
@@ -42862,7 +43216,78 @@ def test_cmd_watch_scoped_planning_and_execution_use_runtime_owned_git_without_r
     assert rc == 0
     assert build_plan.call_count == 1
     assert dispatch_once.call_count == 1
-    git_ctor.assert_called_once_with(tmp_path)
+    git_ctor.assert_called_once()
+    assert git_ctor.call_args.args == (tmp_path,)
+    assert git_ctor.call_args.kwargs["env"]["GZA_DB_PATH"] == str((tmp_path / ".gza" / "gza.db").resolve())
+
+
+def test_cmd_watch_scoped_confirmed_execution_reuses_preview_runtime_after_ambient_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    (tmp_path / ".env").write_text("PATH=/captured/bin\nPROJECT_TOKEN=captured\n", encoding="utf-8")
+    store = make_store(tmp_path)
+    scoped = store.add("Scoped owner", task_type="implement")
+    assert scoped.id is not None
+    sentinel_git = _make_watch_git()
+    args = _watch_args(tmp_path, [scoped.id], yes=False, max_idle=1)
+    plan = _empty_scoped_watch_plan_with_effective_scope((scoped.id,))
+    captured_contexts: list[RuntimeExecutionContext] = []
+
+    def fake_build_plan(**kwargs: object) -> _WatchCyclePlan:
+        assert kwargs["git"] is sentinel_git
+        runtime_context = kwargs["runtime_context"]
+        assert isinstance(runtime_context, RuntimeExecutionContext)
+        captured_contexts.append(runtime_context)
+        return plan
+
+    def confirm_after_poisoning() -> str:
+        (tmp_path / ".env").write_text("PATH=/mutated/bin\nPROJECT_TOKEN=mutated\n", encoding="utf-8")
+        monkeypatch.setenv("PATH", "/ambient/bin")
+        monkeypatch.setenv("PWD", str(tmp_path / "ambient-cwd"))
+        monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+        monkeypatch.setenv("GIT_DIR", str(tmp_path / "ambient.git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "ambient-worktree"))
+        return "y"
+
+    def fake_input(_prompt: str) -> str:
+        return confirm_after_poisoning()
+
+    def fake_dispatch(**kwargs: object) -> _CycleResult:
+        assert kwargs["git"] is sentinel_git
+        runtime_context = kwargs["runtime_context"]
+        assert isinstance(runtime_context, RuntimeExecutionContext)
+        captured_contexts.append(runtime_context)
+        assert runtime_context.env["PATH"] == "/captured/bin"
+        assert runtime_context.env["PROJECT_TOKEN"] == "captured"
+        assert runtime_context.env["GZA_DB_PATH"] == str((tmp_path / ".gza" / "gza.db").resolve())
+        assert runtime_context.cwd == tmp_path
+        assert kwargs["precomputed_plan"] is plan
+        return _CycleResult(True, 0, 0, scoped_done=True, effective_scoped_owner_ids=(scoped.id,))
+
+    with (
+        patch("gza.cli.watch.Git", side_effect=[sentinel_git]) as git_ctor,
+        patch("gza.cli.watch._resolve_watch_scope_owner_ids", return_value=(scoped.id,)),
+        patch("gza.cli.watch._build_watch_cycle_plan", side_effect=fake_build_plan) as build_plan,
+        patch("gza.cli.watch._dispatch_scoped_watch_once", side_effect=fake_dispatch) as dispatch_once,
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("builtins.input", side_effect=fake_input),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert build_plan.call_count == 1
+    assert dispatch_once.call_count == 2
+    assert len(captured_contexts) == 3
+    assert all(context is captured_contexts[0] for context in captured_contexts)
+    git_ctor.assert_called_once()
+    assert git_ctor.call_args.args == (tmp_path,)
+    assert git_ctor.call_args.kwargs["env"]["PATH"] == "/captured/bin"
+    assert os.environ["PATH"] == "/ambient/bin"
+    assert os.environ["PWD"] == str(tmp_path / "ambient-cwd")
+    assert os.environ["GZA_DB_PATH"] == str(tmp_path / "ambient.db")
 
 
 def test_watch_reexec_argv_scoped_pending_only_with_zero_recovery_slots_preserves_pending_only(
@@ -52163,7 +52588,9 @@ def test_system_can_run_tasks_waits_for_docker_when_required(tmp_path: Path) -> 
     with patch("gza.cli.watch.wait_for_docker_ready", return_value=False) as mock_wait:
         assert _system_can_run_tasks(config) is False
 
-    mock_wait.assert_called_once_with(17)
+    mock_wait.assert_called_once()
+    assert mock_wait.call_args.args == (17,)
+    assert mock_wait.call_args.kwargs["host_env"]["GZA_DB_PATH"] == str((tmp_path / ".gza" / "gza.db").resolve())
 
 
 def test_cmd_watch_holds_until_docker_returns_then_resumes(tmp_path: Path) -> None:

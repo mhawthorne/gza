@@ -388,7 +388,7 @@ def _restore_worker_liveness_seams():
 
 
 @pytest.fixture(autouse=True)
-def _stub_darwin_worker_death_hint():
+def _stub_darwin_worker_death_hint(request):
     """Keep best-effort macOS worker-death hints out of the unit suite.
 
     ``_darwin_worker_death_hint`` shells out to ``log show`` on Darwin to find a
@@ -397,5 +397,9 @@ def _stub_darwin_worker_death_hint():
     trip the unit-suite boundary guard -- and the hint is best-effort, not the
     unit under test. Functional coverage exercises the real hint.
     """
+    if request.node.get_closest_marker("uses_darwin_worker_death_hint"):
+        yield
+        return
+
     with patch("gza.cli._common._darwin_worker_death_hint", return_value=None):
         yield

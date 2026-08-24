@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..config import DEFAULT_DOCKER_STARTUP_TIMEOUT
+from ..runtime_context import normalize_subprocess_env
 from ..usage import ProviderUsage, UsageUnsupported
 
 if TYPE_CHECKING:
@@ -390,6 +391,7 @@ class DockerConfig:
     config_dir: str | None  # e.g., ".claude" or ".gemini", None to skip mount
     env_vars: list[str]  # e.g., ["ANTHROPIC_API_KEY", "GEMINI_API_KEY"]
     docker_startup_timeout: int = DEFAULT_PROVIDER_DOCKER_STARTUP_TIMEOUT
+    host_config_dir: Path | None = None
 
 
 def classify_provider_api_error(*, status: int | None, error_type: str | None, message: str | None) -> str | None:
@@ -432,7 +434,11 @@ class PreflightCheckResult:
         return cls(ok=False, failure_reason=failure_reason, message=message)
 
 
-def _get_config_dir_volume_args(docker_config: DockerConfig) -> list[str]:
+def _get_config_dir_volume_args(
+    docker_config: DockerConfig,
+    *,
+    host_env: Mapping[str, str] | None = None,
+) -> list[str]:
     """Return Docker -v args for mounting provider config dir and JSON file.
 
     Handles the shutil.copy2 workaround for Docker Desktop not sharing
@@ -441,11 +447,13 @@ def _get_config_dir_volume_args(docker_config: DockerConfig) -> list[str]:
     if not docker_config.config_dir:
         return []
     args: list[str] = []
-    config_dir = Path.home() / docker_config.config_dir
+    env_source = os.environ if host_env is None else host_env
+    home = Path(env_source.get("HOME", str(Path.home()))).expanduser()
+    config_dir = docker_config.host_config_dir or (home / docker_config.config_dir)
     args.extend(["-v", f"{config_dir}:/home/gza/{docker_config.config_dir}"])
     # Also mount the config file (e.g., ~/.claude.json) if it exists
     # Docker Desktop can't share individual files, so copy it into the config dir
-    config_file = Path.home() / f"{docker_config.config_dir}.json"
+    config_file = home / f"{docker_config.config_dir}.json"
     if config_file.exists():
         try:
             config_dir.mkdir(parents=True, exist_ok=True)
@@ -461,7 +469,32 @@ def _get_config_dir_volume_args(docker_config: DockerConfig) -> list[str]:
     return args
 
 
-def _get_image_created_time(image_name: str) -> float | None:
+def provider_home_from_env(
+    provider: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """Resolve a provider credential root from a captured runtime environment."""
+    env_source = os.environ if env is None else env
+    provider_name = provider.strip().lower()
+    env_var = f"{provider_name.upper()}_HOME"
+    default_dir = f".{provider_name}"
+    if env_source.get(env_var):
+        return Path(str(env_source[env_var])).expanduser()
+    runtime_home = (
+        Path(env_source.get("HOME", str(Path.home()))).expanduser()
+        if env is not None
+        else Path.home()
+    )
+    return runtime_home / default_dir
+
+
+def _get_image_created_time(
+    image_name: str,
+    *,
+    host_env: Mapping[str, str] | None = None,
+    host_cwd: Path | None = None,
+) -> float | None:
     """Get the creation timestamp of a Docker image.
 
     Returns:
@@ -472,6 +505,8 @@ def _get_image_created_time(image_name: str) -> float | None:
         ["docker", "image", "inspect", image_name, "--format", "{{.Created}}"],
         capture_output=True,
         text=True,
+        cwd=host_cwd,
+        env=normalize_subprocess_env(host_env, host_cwd),
     )
     if result.returncode != 0:
         return None
@@ -492,7 +527,13 @@ def _get_image_created_time(image_name: str) -> float | None:
         return None
 
 
-def _get_image_label(image_name: str, label_key: str) -> str | None:
+def _get_image_label(
+    image_name: str,
+    label_key: str,
+    *,
+    host_env: Mapping[str, str] | None = None,
+    host_cwd: Path | None = None,
+) -> str | None:
     """Get a specific label value from a Docker image.
 
     Returns:
@@ -509,6 +550,8 @@ def _get_image_label(image_name: str, label_key: str) -> str | None:
         ],
         capture_output=True,
         text=True,
+        cwd=host_cwd,
+        env=normalize_subprocess_env(host_env, host_cwd),
     )
     if result.returncode != 0:
         return None
@@ -539,6 +582,8 @@ def ensure_docker_image(
     project_dir: Path,
     log_file: Path | None = None,
     provider_label: str = "Docker",
+    host_env: Mapping[str, str] | None = None,
+    host_cwd: Path | None = None,
 ) -> bool:
     """Ensure Docker image exists, building if needed.
 
@@ -553,7 +598,13 @@ def ensure_docker_image(
     Returns:
         True if image is available, False on failure
     """
-    if not wait_for_docker_ready(docker_config.docker_startup_timeout):
+    host_cwd = project_dir if host_cwd is None else host_cwd
+    docker_ready = wait_for_docker_ready(
+        docker_config.docker_startup_timeout,
+        host_env=host_env,
+        host_cwd=host_cwd,
+    )
+    if not docker_ready:
         print("Error: Docker daemon is not running")
         print("  Start Docker Desktop or use --no-docker flag")
         write_preflight_entry(
@@ -578,13 +629,18 @@ def ensure_docker_image(
 
     # Check if image exists and is up-to-date
     rebuild_reason: str | None = None
-    image_time = _get_image_created_time(docker_config.image_name)
+    image_time = _get_image_created_time(docker_config.image_name, host_env=host_env, host_cwd=host_cwd)
     if image_time is not None:
         # Image exists - prefer exact Dockerfile content comparison. Timestamp
         # comparison is not reliable for temp-project Dockerfiles generated
         # after an older named image already exists.
         dockerfile_digest = _get_file_sha256(dockerfile_path)
-        image_digest = _get_image_label(docker_config.image_name, "gza.dockerfile_sha256")
+        image_digest = _get_image_label(
+            docker_config.image_name,
+            "gza.dockerfile_sha256",
+            host_env=host_env,
+            host_cwd=host_cwd,
+        )
         if image_digest == dockerfile_digest:
             print(
                 f"Using Docker image {docker_config.image_name} "
@@ -615,7 +671,13 @@ def ensure_docker_image(
         str(dockerfile_path),
         str(etc_dir),
     ]
-    result = subprocess.run(build_cmd, capture_output=True, text=True)
+    result = subprocess.run(
+        build_cmd,
+        capture_output=True,
+        text=True,
+        cwd=host_cwd,
+        env=normalize_subprocess_env(host_env, host_cwd),
+    )
     if result.returncode != 0:
         if result.stdout:
             print(result.stdout, end="")
@@ -642,6 +704,7 @@ def build_docker_cmd(
     docker_env: list[str] | None = None,
     docker_workdir: str = "/workspace",
     interactive: bool = False,
+    host_env: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Build the base Docker run command.
 
@@ -659,6 +722,7 @@ def build_docker_cmd(
     Returns:
         List of command arguments (without the actual CLI command)
     """
+    env_source = os.environ if host_env is None else host_env
     stdio_flag = "-it" if interactive else "-i"
     venv_tmpfs_target = posixpath.join(docker_workdir or "/workspace", ".venv")
     cmd = [
@@ -673,7 +737,7 @@ def build_docker_cmd(
     ]
 
     # Mount config directory if specified (for OAuth credentials)
-    for arg in _get_config_dir_volume_args(docker_config):
+    for arg in _get_config_dir_volume_args(docker_config, host_env=host_env):
         cmd.insert(-2, arg)
 
     # Add custom volume mounts
@@ -683,7 +747,7 @@ def build_docker_cmd(
 
     # Pass environment variables if set
     for env_var in docker_config.env_vars:
-        if os.getenv(env_var):
+        if env_source.get(env_var):
             cmd.extend(["-e", env_var])
 
     # Pass git identity into the container so git commit/rebase works.
@@ -694,13 +758,16 @@ def build_docker_cmd(
         ("GIT_COMMITTER_NAME", "user.name"),
         ("GIT_COMMITTER_EMAIL", "user.email"),
     ]:
-        if os.getenv(env_var):
+        env_value = env_source.get(env_var)
+        if env_value:
             cmd.extend(["-e", env_var])
         else:
             try:
                 result = subprocess.run(
                     ["git", "config", git_key],
+                    cwd=work_dir,
                     capture_output=True, text=True, timeout=5,
+                    env=normalize_subprocess_env(env_source, work_dir),
                 )
                 if result.returncode == 0 and result.stdout.strip():
                     cmd.extend(["-e", f"{env_var}={result.stdout.strip()}"])
@@ -725,20 +792,28 @@ def build_docker_cmd(
     return cmd
 
 
-def is_docker_running() -> bool:
+def is_docker_running(*, host_env: Mapping[str, str] | None = None, host_cwd: Path | None = None) -> bool:
     """Check if Docker daemon is running."""
     try:
         result = subprocess.run(
             ["docker", "info"],
             capture_output=True,
             timeout=5,
+            cwd=host_cwd,
+            env=normalize_subprocess_env(host_env, host_cwd),
         )
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return False
 
 
-def wait_for_docker_ready(total_timeout: int, *, probe_timeout: int = 5) -> bool:
+def wait_for_docker_ready(
+    total_timeout: int,
+    *,
+    probe_timeout: int = 5,
+    host_env: Mapping[str, str] | None = None,
+    host_cwd: Path | None = None,
+) -> bool:
     """Wait for Docker to become responsive within a bounded timeout budget."""
     deadline = time.monotonic() + max(total_timeout, 0)
     while True:
@@ -750,6 +825,8 @@ def wait_for_docker_ready(total_timeout: int, *, probe_timeout: int = 5) -> bool
                 ["docker", "info"],
                 capture_output=True,
                 timeout=min(probe_timeout, remaining),
+                cwd=host_cwd,
+                env=normalize_subprocess_env(host_env, host_cwd),
             )
         except FileNotFoundError:
             return False
@@ -874,6 +951,8 @@ def verify_docker_credentials(
     error_patterns: list[str],
     error_message: str,
     log_file: Path | None = None,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
 ) -> PreflightCheckResult:
     """Verify credentials work in Docker by running a version check.
 
@@ -886,7 +965,12 @@ def verify_docker_credentials(
     Returns:
         Structured result describing whether preflight succeeded
     """
-    if not wait_for_docker_ready(docker_config.docker_startup_timeout):
+    docker_ready = wait_for_docker_ready(
+        docker_config.docker_startup_timeout,
+        host_env=env,
+        host_cwd=cwd,
+    )
+    if not docker_ready:
         write_preflight_entry(
             log_file,
             event="docker_daemon_missing",
@@ -906,9 +990,10 @@ def verify_docker_credentials(
     try:
         cmd = ["docker", "run", "--rm"]
         # Mount config directory if specified (for OAuth credentials)
-        cmd.extend(_get_config_dir_volume_args(docker_config))
+        cmd.extend(_get_config_dir_volume_args(docker_config, host_env=env))
+        env_source = os.environ if env is None else env
         for env_var in docker_config.env_vars:
-            if os.getenv(env_var):
+            if env_source.get(env_var):
                 cmd.extend(["-e", env_var])
         cmd.append(docker_config.image_name)
         cmd.extend(version_cmd)
@@ -918,6 +1003,8 @@ def verify_docker_credentials(
             capture_output=True,
             timeout=30,
             text=True,
+            env=normalize_subprocess_env(env_source, cwd),
+            cwd=cwd,
         )
         output = result.stdout + result.stderr
         write_preflight_entry(
@@ -959,7 +1046,9 @@ def verify_docker_credentials(
 
         # Check if config directory doesn't exist
         if docker_config.config_dir:
-            config_path = Path.home() / docker_config.config_dir
+            config_path = docker_config.host_config_dir or (
+                Path(env_source.get("HOME", str(Path.home()))).expanduser() / docker_config.config_dir
+            )
             if not config_path.exists():
                 print(f"\n  Hint: {config_path} directory not found")
                 print("  You may need to set the API key environment variable or run the login command")
@@ -1050,7 +1139,13 @@ class Provider(ABC):
         """Whether this provider can report account quota usage."""
         return False
 
-    def read_usage(self, *, timeout_seconds: float = 10.0) -> ProviderUsage:
+    def read_usage(
+        self,
+        *,
+        timeout_seconds: float = 10.0,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> ProviderUsage:
         """Read current quota usage for this provider.
 
         Optional capability: providers that cannot report usage inherit this
@@ -1059,12 +1154,19 @@ class Provider(ABC):
         raise UsageUnsupported(f"{self.name} does not report usage")
 
     @abstractmethod
-    def check_credentials(self) -> bool:
+    def check_credentials(self, *, env: Mapping[str, str] | None = None) -> bool:
         """Check if credentials are configured (quick check)."""
         ...
 
     @abstractmethod
-    def verify_credentials(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
+    def verify_credentials(
+        self,
+        config: Config,
+        log_file: Path | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> PreflightCheckResult:
         """Verify credentials work by testing the command.
 
         If ``log_file`` is provided, implementations should append a JSONL
@@ -1085,6 +1187,7 @@ class Provider(ABC):
         on_step_count: Callable[[int], None] | None = None,
         interactive: bool = False,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run the provider to execute a task.
 
@@ -1120,6 +1223,7 @@ class Provider(ABC):
         parse_output: Callable[[str, dict[str, Any], Any], None] | None = None,
         stdin_input: str | None = None,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run command with output to both console and log file.
 
@@ -1175,8 +1279,8 @@ class Provider(ABC):
 
         with open(conversation_log_file, "a") as conversation_log, open(ops_log_file, "a") as ops_log:
             stdin_target = subprocess.PIPE if stdin_input is not None else subprocess.DEVNULL
-            env = os.environ.copy()
-            env.setdefault("RUST_BACKTRACE", "1")
+            process_env = normalize_subprocess_env(env, cwd)
+            process_env.setdefault("RUST_BACKTRACE", "1")
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -1184,7 +1288,7 @@ class Provider(ABC):
                 stdin=stdin_target,
                 text=True,
                 cwd=cwd,
-                env=env,
+                env=process_env,
             )
 
             # Write stdin if provided
@@ -1307,10 +1411,17 @@ def _ensure_provider_docker_image_for_task(
     config: Config,
     *,
     task_type: str,
+    runtime_env: Mapping[str, str] | None = None,
+    runtime_cwd: Path | None = None,
 ) -> DockerConfig | None:
     """Return the provider Docker config after ensuring the task image is available."""
     docker_config = _provider_docker_config_for_task(config, task_type=task_type)
-    if not ensure_docker_image(docker_config, config.project_dir):
+    if not ensure_docker_image(
+        docker_config,
+        config.project_dir,
+        host_env=runtime_env,
+        host_cwd=runtime_cwd or config.project_dir,
+    ):
         return None
     return docker_config
 
@@ -1319,6 +1430,8 @@ def resolve_docker_worker_environment_identity(
     config: Config,
     *,
     task_type: str,
+    runtime_env: Mapping[str, str] | None = None,
+    runtime_cwd: Path | None = None,
 ) -> MainIntegrationVerifyEnvironmentIdentity | None:
     """Probe the configured Docker worker runtime identity for one task type.
 
@@ -1327,7 +1440,12 @@ def resolve_docker_worker_environment_identity(
     """
     from ..main_integration_verify import MainIntegrationVerifyEnvironmentIdentity
 
-    docker_config = _ensure_provider_docker_image_for_task(config, task_type=task_type)
+    docker_config = _ensure_provider_docker_image_for_task(
+        config,
+        task_type=task_type,
+        runtime_env=runtime_env,
+        runtime_cwd=runtime_cwd or config.project_dir,
+    )
     if docker_config is None:
         return None
 
@@ -1337,6 +1455,7 @@ def resolve_docker_worker_environment_identity(
         timeout_minutes=1,
         docker_volumes=list(config.docker_volumes),
         docker_setup_command=config.docker_setup_command,
+        host_env=runtime_env,
     )
     probe_cmd.extend(["python3", "-c", _DOCKER_WORKER_ENVIRONMENT_PROBE])
 
@@ -1346,6 +1465,8 @@ def resolve_docker_worker_environment_identity(
             capture_output=True,
             text=True,
             timeout=30,
+            cwd=runtime_cwd or config.project_dir,
+            env=normalize_subprocess_env(runtime_env, runtime_cwd or config.project_dir),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None

@@ -1,6 +1,7 @@
 """Git-related CLI commands: merge, rebase, checkout, diff, PR, advance."""
 
 import argparse
+import inspect
 import json
 import logging
 import os
@@ -111,6 +112,7 @@ from ..pickup import (
     is_worker_consuming_advance_action,
 )
 from ..pr_ops import build_task_pr_content, ensure_task_pr
+from ..providers.base import provider_home_from_env
 from ..rebase_checkout import StaleRebaseImportError, import_isolated_rebase_tip, isolated_rebase_checkout
 from ..rebase_diff import (
     build_rebase_diff_provenance,
@@ -142,16 +144,17 @@ from ..review_verify_state import refresh_preserved_rebase_review_verify_heads
 from ..runner import (
     WIP_INTERRUPTED_COMMIT_SUBJECT,
     TaskExecutionLogger,
+    _call_provider_run,
     _complete_failed_code_task_after_pr_publication,
     _compute_tree_fingerprint,
     _resolve_impl_ancestor,
     _resolve_root_implementation_for_fix,
     ensure_task_log_path,
     get_effective_config_for_task,
-    load_dotenv,
     task_log_storage_path,
     write_log_entry,
 )
+from ..runtime_context import RuntimeExecutionContext
 from ..source_followup import (
     SourceFollowupState,
     collect_non_dropped_implement_source_ids,
@@ -226,6 +229,34 @@ from .advance_executor import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _owned_git_env(git: Git) -> Mapping[str, str] | None:
+    env = getattr(git, "env", None)
+    return env if isinstance(env, Mapping) else None
+
+
+def _git_accepts_env() -> bool:
+    try:
+        parameters = inspect.signature(Git).parameters.values()
+    except (TypeError, ValueError):
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD or parameter.name == "env"
+        for parameter in parameters
+    )
+
+
+def _git_from_runtime_context(repo_dir: Path, runtime_context: RuntimeExecutionContext) -> Git:
+    if _git_accepts_env():
+        return Git(repo_dir, env=runtime_context.env)
+    return Git(repo_dir)
+
+
+def _git_with_env(repo_dir: Path, env: Mapping[str, str] | None) -> Git:
+    if env is not None and _git_accepts_env():
+        return Git(repo_dir, env=env)
+    return Git(repo_dir)
 
 
 def _build_advance_recovery_merge_context(git: Git, target_branch: str | None) -> _MergeContext:
@@ -655,7 +686,8 @@ def _reconcile_diverged_branch_with_origin(
                 shutil.rmtree(worktree_path, ignore_errors=True)
         worktree_path.parent.mkdir(parents=True, exist_ok=True)
         git.worktree_add_existing(worktree_path, branch)
-        worktree_git = Git(worktree_path)
+        parent_env = _owned_git_env(git)
+        worktree_git = Git(worktree_path, env=parent_env) if parent_env is not None else Git(worktree_path)
         baseline = capture_rebase_diff_baseline(
             worktree_git,
             branch=branch,
@@ -877,7 +909,8 @@ def ensure_watch_main_checkout(
         checkout_path.parent.mkdir(parents=True, exist_ok=True)
         git.worktree_add_existing(checkout_path, target_branch, detach=True)
 
-    workspace_git = Git(checkout_path)
+    parent_env = _owned_git_env(git)
+    workspace_git = Git(checkout_path, env=parent_env) if parent_env is not None else Git(checkout_path)
     workspace_git.checkout_detached(target_branch)
     workspace_git.reset_hard(target_branch)
     workspace_git.clean_force()
@@ -930,7 +963,14 @@ def _promote_isolated_merge_to_target_branch(
     previous_target_oid = repo_git.rev_parse(target_ref)
     merged_head_oid = merge_git.rev_parse("HEAD")
     attached_target_checkout = active_worktree_path_for_branch(repo_git, target_branch)
-    attached_target_git = Git(attached_target_checkout) if attached_target_checkout is not None else None
+    parent_env = _owned_git_env(repo_git)
+    attached_target_git = (
+        Git(attached_target_checkout, env=parent_env)
+        if attached_target_checkout is not None and parent_env is not None
+        else Git(attached_target_checkout)
+        if attached_target_checkout is not None
+        else None
+    )
     attached_stash_ref: str | None = None
     attached_stash_parked = False
     attached_stash_restored_cleanly = False
@@ -1759,8 +1799,9 @@ def cmd_merge(args: argparse.Namespace) -> int:
         return 1
 
     config = Config.load(args.project_dir)
+    runtime_context = RuntimeExecutionContext.from_config(config)
     store = get_store(config)
-    git = Git(config.project_dir)
+    git = _git_from_runtime_context(config.project_dir, runtime_context)
 
     # Get current branch once
     current_branch = git.current_branch()
@@ -1854,19 +1895,29 @@ def cmd_merge(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resolve_runtime_skill_dir(project_dir: Path, provider: str) -> tuple[str, Path] | None:
+def _resolve_runtime_skill_dir(
+    project_dir: Path,
+    provider: str,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> tuple[str, Path] | None:
     """Resolve runtime skill directory for a provider."""
-    codex_home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser()
-    gemini_home = Path(os.environ.get("GEMINI_HOME", str(Path.home() / ".gemini"))).expanduser()
+    runtime_env = os.environ if env is None else env
     target_map = {
         "claude": ("claude", project_dir / ".claude" / "skills"),
-        "codex": ("codex", codex_home / "skills"),
-        "gemini": ("gemini", gemini_home / "skills"),
+        "codex": ("codex", provider_home_from_env("codex", env=runtime_env) / "skills"),
+        "gemini": ("gemini", provider_home_from_env("gemini", env=runtime_env) / "skills"),
     }
     return target_map.get(provider)
 
 
-def ensure_skill(skill_name: str, provider: str, project_dir: Path) -> bool:
+def ensure_skill(
+    skill_name: str,
+    provider: str,
+    project_dir: Path,
+    *,
+    env: Mapping[str, str] | None = None,
+) -> bool:
     """Ensure a skill is available for the provider runtime, installing if missing.
 
     Resolves the runtime skill directory for the provider, checks whether the
@@ -1883,7 +1934,7 @@ def ensure_skill(skill_name: str, provider: str, project_dir: Path) -> bool:
     """
     from ..skills_utils import copy_skill
 
-    runtime = _resolve_runtime_skill_dir(project_dir, provider)
+    runtime = _resolve_runtime_skill_dir(project_dir, provider, env=env)
     if not runtime:
         return False
     _, runtime_dir = runtime
@@ -1901,12 +1952,29 @@ def _is_rebase_in_progress(worktree_path: Path) -> bool:
     return is_rebase_in_progress(worktree_path)
 
 
-def _branch_has_commits(config: Config, branch: str | None) -> bool:
+def _git_runtime_env(git: Any | None) -> Mapping[str, str] | None:
+    env = getattr(git, "env", None)
+    return env if isinstance(env, Mapping) else None
+
+
+def _check_main_integration_verify_with_git_env(
+    config: Config,
+    store: SqliteTaskStore,
+    git: Any,
+    **kwargs: Any,
+) -> Any:
+    runtime_env = _git_runtime_env(git)
+    if runtime_env is not None:
+        kwargs["env"] = runtime_env
+    return check_main_integration_verify(config, store, git, **kwargs)
+
+
+def _branch_has_commits(config: Config, branch: str | None, *, env: Mapping[str, str] | None = None) -> bool:
     """Return whether a branch is ahead of the default branch."""
     if not branch:
         return False
     try:
-        git = Git(config.project_dir)
+        git = _git_with_env(config.project_dir, env)
         default_branch = git.default_branch()
         return git.count_commits_ahead(branch, default_branch) > 0
     except (GitError, OSError, ValueError):
@@ -1922,6 +1990,7 @@ def invoke_provider_resolve(
     log_file: Path,
     logger: TaskExecutionLogger | None = None,
     worktree_path: Path | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> bool:
     """Invoke active provider runtime to resolve rebase conflicts via /gza-rebase.
 
@@ -1940,7 +2009,9 @@ def invoke_provider_resolve(
 
     effective_model, effective_provider, effective_max_steps = get_effective_config_for_task(task, config)
 
-    runtime = _resolve_runtime_skill_dir(config.project_dir, effective_provider)
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
+
+    runtime = _resolve_runtime_skill_dir(config.project_dir, effective_provider, env=runtime_context.env)
     if not runtime:
         task_logger.error(
             f"Error: Provider '{effective_provider}' does not support runtime skills for auto-resolve."
@@ -1948,7 +2019,7 @@ def invoke_provider_resolve(
         return False
 
     target_name, _runtime_dir = runtime
-    if not ensure_skill("gza-rebase", effective_provider, config.project_dir):
+    if not ensure_skill("gza-rebase", effective_provider, config.project_dir, env=runtime_context.env):
         task_logger.error(
             f"Error: Missing required 'gza-rebase' skill for provider '{effective_provider}'."
         )
@@ -1977,7 +2048,6 @@ def invoke_provider_resolve(
         max_turns=effective_max_steps,
     )
 
-    load_dotenv(config.project_dir)
     provider = get_provider(resolve_config)
     work_dir = worktree_path if worktree_path is not None else config.project_dir
 
@@ -1995,12 +2065,14 @@ def invoke_provider_resolve(
         extra={"provider": effective_provider, "command": skill_cmd},
     )
     try:
-        run_result = provider.run(
+        run_result = _call_provider_run(
+            provider,
             resolve_config,
             skill_cmd,
             log_file,
             work_dir,
-            ops_log_file=resolve_ops_log_path(config, log_file),
+            provider_run_kwargs={"ops_log_file": resolve_ops_log_path(config, log_file)},
+            runtime_env=runtime_context.env,
         )
     except Exception as exc:
         task_logger.error(f"Provider resolve failed with exception: {exc}")
@@ -2029,9 +2101,11 @@ def _run_task_backed_rebase(
     remote: bool = False,
     parent_task_id: str | None = None,
     failure_hint_lines: list[str] | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> int:
     """Execute a foreground rebase flow with single-task log/state ownership."""
-    git = Git(config.project_dir)
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
+    git = _git_from_runtime_context(config.project_dir, runtime_context)
     log_file = ensure_task_log_path(config, store, rebase_task)
     logger = TaskExecutionLogger(resolve_ops_log_path(config, log_file), echo=True)
     log_file_storage = task_log_storage_path(config, log_file)
@@ -2104,7 +2178,7 @@ def _run_task_backed_rebase(
         )
         return 1
 
-    worktree_git = Git(worktree_path)
+    worktree_git = _git_from_runtime_context(worktree_path, runtime_context)
     rebase_diff_baseline = capture_rebase_diff_baseline(
         worktree_git,
         branch=branch,
@@ -2143,6 +2217,7 @@ def _run_task_backed_rebase(
                     log_file=log_file,
                     logger=logger,
                     worktree_path=checkout.path,
+                    runtime_context=runtime_context,
                 )
                 if resolved:
                     try:
@@ -2222,7 +2297,7 @@ def _run_task_backed_rebase(
         else:
             output_content = f"Rebased '{branch}' onto '{rebase_target}'."
 
-        has_commits = _branch_has_commits(config, branch)
+        has_commits = _branch_has_commits(config, branch, env=_git_runtime_env(rebase_exec_git))
         head_ref = resolve_ref_if_possible(rebase_exec_git, branch)
         publish_result_local_sha = getattr(publish_result, "local_sha", None)
         if isinstance(publish_result_local_sha, str) and publish_result_local_sha:
@@ -2348,8 +2423,9 @@ def _execution_mode(args: argparse.Namespace) -> Literal["queue", "run", "backgr
 def cmd_rebase(args: argparse.Namespace) -> int:
     """Rebase a task's branch onto a target branch."""
     config = Config.load(args.project_dir)
+    runtime_context = RuntimeExecutionContext.from_config(config)
     task_id = resolve_id(config, args.task_id)
-    git = Git(config.project_dir)
+    git = _git_from_runtime_context(config.project_dir, runtime_context)
     execution_mode = _execution_mode(args)
 
     current_branch = git.current_branch()
@@ -2412,6 +2488,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
             config,
             rebase_task,
             rollback_on_failure=True,
+            runtime_context=runtime_context,
         )
         if prepared_rebase_task is None:
             permit.release()
@@ -2428,6 +2505,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
             config,
             task_id=prepared_rebase_task.id,
             prepared_task=prepared_rebase_task,
+            runtime_context=runtime_context,
         )
 
     try:
@@ -2462,6 +2540,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         target_branch=rebase_target,
         remote=bool(getattr(args, "remote", False)),
         parent_task_id=task.id,
+        runtime_context=runtime_context,
     )
 
 
@@ -3522,6 +3601,7 @@ def _execute_merge_action(
             execution_git,
             reason="merge-executor-pre-promotion",
             red_reruns=2,
+            env=_owned_git_env(execution_git),
         )
         proof = _candidate_verify_promotion_proof(execution_git, candidate_verify)
         if not proof.exact_match:
@@ -3650,6 +3730,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         print(f"Error: {exc}")
         return 1
     config = Config.load(args.project_dir)
+    runtime_context = RuntimeExecutionContext.from_config(config)
     store = get_store(config)
 
     # Themed work/advance colors — resolved once after Config.load() applies the theme.
@@ -3662,7 +3743,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # Prefix for advance lines: "  #NNN " — compute available prompt width per task.
     def _prompt_avail(task_id: str | None) -> int:
         return prompt_available_width(prefix=len(task_id or "") + 4)  # "  #NNN "
-    git = Git(config.project_dir)
+    git = _git_from_runtime_context(config.project_dir, runtime_context)
 
     dry_run: bool = args.dry_run
     auto: bool = getattr(args, 'auto', False)
@@ -3780,7 +3861,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             return None
         if not any(item_action["type"] in {"merge", "merge_with_followups"} for _, _, item_action in plan):
             return None
-        main_verify = check_main_integration_verify(
+        main_verify = _check_main_integration_verify_with_git_env(
             config,
             store,
             git,
@@ -4087,6 +4168,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     config,
                     task,
                     rollback_on_failure=rollback_on_failure,
+                    store=store,
+                    runtime_context=runtime_context,
                 ),
                 prepare_create_review=lambda t: _prepare_create_review_action(
                     store,
@@ -4124,10 +4207,20 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 ),
                 create_targeted_rebase_task=_create_targeted_rebase_from_task,
                 spawn_worker=lambda task_obj, _kind: _spawn_background_worker(
-                    _worker_args(), config, task_id=str(task_obj.id), quiet=True, prepared_task=task_obj
+                    _worker_args(),
+                    config,
+                    task_id=str(task_obj.id),
+                    quiet=True,
+                    prepared_task=task_obj,
+                    runtime_context=runtime_context,
                 ),
                 spawn_resume_worker=lambda task_obj, _kind: _spawn_background_resume_worker(
-                    _worker_args(), config, str(task_obj.id), quiet=True, prepared_task=task_obj
+                    _worker_args(),
+                    config,
+                    str(task_obj.id),
+                    quiet=True,
+                    prepared_task=task_obj,
+                    runtime_context=runtime_context,
                 ),
                 is_rebase_target_already_merged=(
                     lambda t: resolve_post_merge_rebase_state(
@@ -4161,6 +4254,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     prepared_task_id=str(prepared_task.id) if prepared_task is not None and prepared_task.id is not None else None,
                     prepared_phase=prepared_phase,
                     prepared_action_type=prepared_action_type,
+                    runtime_context=runtime_context,
                 ),
                 spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_background_iterate_worker(
                     argparse.Namespace(
@@ -4177,6 +4271,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     prepared_task_id=str(prepared_task.id),
                     prepared_resume=mode == "resume",
                     prepared_phase="preloop",
+                    runtime_context=runtime_context,
                 ),
                 reconcile_diverged_branch=lambda t: _reconcile_diverged_branch_with_origin(
                     config,
@@ -4184,6 +4279,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     t,
                     target_branch=target_branch,
                 ),
+                runtime_context=runtime_context,
             )
 
         def _build_repeat_action_context(*, dry_run_mode: bool) -> AdvanceActionExecutionContext:
@@ -4199,6 +4295,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     force=force,
                     phase1_args=args,
                     prepared_task=task_obj,
+                    runtime_context=context.runtime_context,
                 )
 
             def _resume_task_foreground(task_obj: DbTask, _kind: str) -> int:
@@ -4210,6 +4307,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     force=force,
                     phase1_args=args,
                     prepared_task=task_obj,
+                    runtime_context=context.runtime_context,
                 )
 
             return replace(
@@ -4336,7 +4434,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 merges_halted = main_verify_inspection.merges_halted
                 state = main_verify_inspection.state
             else:
-                main_verify_check = check_main_integration_verify(
+                main_verify_check = _check_main_integration_verify_with_git_env(
                     config,
                     store,
                     git,
@@ -4494,7 +4592,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             )
             if merge_result.rc == 0:
                 if target_branch == actual_current_branch:
-                    main_verify = check_main_integration_verify(
+                    main_verify = _check_main_integration_verify_with_git_env(
                         config,
                         store,
                         git,
@@ -5207,7 +5305,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if rc == 0:
                 console.print(f"      [{_c_ok}]✓ Merged[/{_c_ok}]")
                 success_count += 1
-                main_verify = check_main_integration_verify(
+                main_verify = _check_main_integration_verify_with_git_env(
                     config,
                     store,
                     git,

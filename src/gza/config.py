@@ -1965,6 +1965,7 @@ class Config:
         *,
         discover: bool = False,
         allow_derived_shared_project_id: bool = False,
+        apply_presentation: bool = True,
     ) -> "Config":
         """Load config from gza.yaml in project root.
 
@@ -1990,6 +1991,43 @@ class Config:
             local_override_path=local_override_path,
             local_overrides_active=local_overrides_active,
             allow_derived_shared_project_id=allow_derived_shared_project_id,
+            apply_presentation=apply_presentation,
+            use_env_db_path=True,
+        )
+
+    @classmethod
+    def load_execution(
+        cls,
+        project_dir: Path,
+        *,
+        discover: bool = False,
+        allow_derived_shared_project_id: bool = False,
+        db_path_override: str | Path | None = None,
+    ) -> "Config":
+        """Load and validate execution config without presentation or ambient DB state."""
+        if discover:
+            project_dir = discover_project_dir(project_dir)
+
+        (
+            data,
+            source_map,
+            user_config_path,
+            user_config_active,
+            local_override_path,
+            local_overrides_active,
+        ) = cls._load_merged_config_data(project_dir)
+        return cls._build_config_from_merged_data(
+            project_dir,
+            data,
+            source_map,
+            user_config_path=user_config_path,
+            user_config_active=user_config_active,
+            local_override_path=local_override_path,
+            local_overrides_active=local_overrides_active,
+            allow_derived_shared_project_id=allow_derived_shared_project_id,
+            apply_presentation=False,
+            use_env_db_path=False,
+            db_path_override=db_path_override,
         )
 
     @classmethod
@@ -2005,6 +2043,9 @@ class Config:
         local_overrides_active: bool,
         allow_derived_shared_project_id: bool = False,
         enforce_project_provider_model: bool = True,
+        apply_presentation: bool = True,
+        use_env_db_path: bool = True,
+        db_path_override: str | Path | None = None,
     ) -> "Config":
         """Build a Config from already-merged config data."""
         config_path = cls.config_path(project_dir)
@@ -2052,13 +2093,19 @@ class Config:
                 raise ConfigError(f"'provider' must be one of: {', '.join(KNOWN_PROVIDERS)}")
             if not _project_data_has_model_for_provider(project_data, project_provider):
                 raise ConfigError(_missing_project_model_error(config_path, project_provider))
-        db_path_raw = os.environ.get("GZA_DB_PATH")
-        if db_path_raw:
-            source_map["db_path"] = "env"
+        db_path_raw = ""
+        if db_path_override is not None:
+            db_path_raw = str(db_path_override)
+            source_map["db_path"] = "explicit"
         else:
-            db_path_raw = data.get("db_path", "")
-            if db_path_raw and not isinstance(db_path_raw, str):
-                raise ConfigError("'db_path' must be a string")
+            env_db_path = os.environ.get("GZA_DB_PATH") if use_env_db_path else None
+            if env_db_path:
+                db_path_raw = env_db_path
+                source_map["db_path"] = "env"
+            else:
+                db_path_raw = data.get("db_path", "")
+                if db_path_raw and not isinstance(db_path_raw, str):
+                    raise ConfigError("'db_path' must be a string")
 
         project_name_raw = data["project_name"]
         local_db_path = (project_dir / DEFAULT_DB_FILE).resolve()
@@ -3127,12 +3174,13 @@ class Config:
 
         from .console import set_config_no_color as _set_config_no_color  # noqa: PLC0415
 
-        # Apply theme to module-level color singletons so all subsequent code
-        # sees the correct themed values when accessing gza.colors.*.
-        _set_theme(theme_name, colors)
-        # Config no_color and NO_COLOR are a logical OR. Consoles consult the
-        # environment directly, so only the config bit needs to be persisted here.
-        _set_config_no_color(no_color)
+        if apply_presentation:
+            # Apply theme to module-level color singletons so all subsequent code
+            # sees the correct themed values when accessing gza.colors.*.
+            _set_theme(theme_name, colors)
+            # Config no_color and NO_COLOR are a logical OR. Consoles consult the
+            # environment directly, so only the config bit needs to be persisted here.
+            _set_config_no_color(no_color)
 
         return cls(
             project_dir=project_dir,

@@ -800,6 +800,87 @@ def test_run_with_recovery_reconcile_push_failure_does_not_spawn_retry(tmp_path:
     assert final_task.failure_reason == "BRANCH_UNPUSHABLE"
 
 
+def test_run_with_recovery_reconcile_uses_captured_runtime_context_after_ambient_poison(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza.cli._common import run_with_recovery
+    from gza.runtime_context import RuntimeExecutionContext
+
+    setup_config(tmp_path)
+    (tmp_path / ".env").write_text("PROJECT_ONLY_TOKEN=captured-token\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "/captured/bin")
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Recover PR-required with captured runtime", task_type="implement", create_pr=True)
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "PR_REQUIRED"
+    task.branch = "feature/reconcile-captured-runtime"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+    runtime_context = RuntimeExecutionContext.from_config(config)
+
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("PROJECT_ONLY_TOKEN", "ambient-token")
+    monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+
+    decision = _recovery_engine_module.FailedRecoveryDecision(
+        task_id=task.id,
+        action="reconcile",
+        reason_code="pr_required_retryable",
+        reason_text="reconcile diverged branch before completion retry",
+        launch_mode="none",
+        attempt_index=0,
+        attempt_limit=1,
+    )
+    captured_git_envs: list[dict[str, str] | None] = []
+
+    class _ReconcileGit:
+        def __init__(self, repo_dir: Path, *, env: dict[str, str] | None = None) -> None:
+            assert repo_dir == config.project_dir
+            captured_git_envs.append(dict(env) if env is not None else None)
+
+        def default_branch(self) -> str:
+            return "main"
+
+    def _run_task(_current_task, _resume):
+        return 1
+
+    def _complete_after_reconcile(*, config, store, git, task):
+        assert isinstance(git, _ReconcileGit)
+        store.mark_completed(task, branch=task.branch, has_commits=True)
+        return 0
+
+    with (
+        patch("gza.cli._common.decide_failed_task_recovery", return_value=decision),
+        patch("gza.git.Git", _ReconcileGit),
+        patch(
+            "gza.cli.git_ops._reconcile_diverged_branch_with_origin",
+            return_value=SimpleNamespace(status="reconciled", message="reconciled"),
+        ),
+        patch(
+            "gza.cli.git_ops.complete_branch_unpushable_after_reconcile",
+            side_effect=_complete_after_reconcile,
+        ),
+    ):
+        final_task, rc = run_with_recovery(
+            config,
+            store,
+            task,
+            run_task=_run_task,
+            max_resume_attempts=1,
+            runtime_context=runtime_context,
+        )
+
+    assert rc == 0
+    assert final_task.status == "completed"
+    assert captured_git_envs == [runtime_context.env]
+    assert captured_git_envs[0]["PATH"] == "/captured/bin"
+    assert captured_git_envs[0]["PROJECT_ONLY_TOKEN"] == "captured-token"
+    assert captured_git_envs[0]["GZA_DB_PATH"] == str(config.db_path.resolve())
+
+
 def test_run_with_recovery_stale_wip_reconcile_completes_without_manual_intervention(tmp_path: Path) -> None:
     from gza.cli._common import run_with_recovery
 
@@ -4918,6 +4999,59 @@ class TestWorkCommandMultiTask:
         assert rc == 0
         run_mock.assert_called_once()
 
+    def test_run_pr_required_retry_uses_captured_runtime_context_after_ambient_poison(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza.runner import run
+        from gza.runtime_context import RuntimeExecutionContext
+
+        setup_config(tmp_path)
+        (tmp_path / ".env").write_text("PROJECT_ONLY_TOKEN=captured-token\n", encoding="utf-8")
+        monkeypatch.setenv("PATH", "/captured/bin")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Retry PR-required with captured runtime", create_pr=True)
+        assert task.id is not None
+        task.status = "failed"
+        task.failure_reason = "PR_REQUIRED"
+        task.branch = "task-branch"
+        task.has_commits = False
+        store.update(task)
+        runtime_context = RuntimeExecutionContext.from_config(config)
+
+        monkeypatch.setenv("PATH", "/ambient/bin")
+        monkeypatch.setenv("PROJECT_ONLY_TOKEN", "ambient-token")
+        monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+
+        captured_git_envs: list[dict[str, str] | None] = []
+
+        class _RetryGit:
+            def __init__(self, repo_dir: Path, *, env: dict[str, str] | None = None) -> None:
+                assert repo_dir == config.project_dir
+                captured_git_envs.append(dict(env) if env is not None else None)
+
+        def _complete_after_publication(**kwargs):
+            retry_git = kwargs["git"]
+            assert isinstance(retry_git, _RetryGit)
+            return 0
+
+        with (
+            patch("gza.runner.Git", _RetryGit),
+            patch("gza.runner._complete_failed_code_task_after_pr_publication", side_effect=_complete_after_publication),
+        ):
+            rc = run(config, task_id=task.id, create_pr=True, runtime_context=runtime_context)
+
+        assert rc == 0
+        assert captured_git_envs == [runtime_context.env]
+        assert captured_git_envs[0]["PATH"] == "/captured/bin"
+        assert captured_git_envs[0]["PROJECT_ONLY_TOKEN"] == "captured-token"
+        assert captured_git_envs[0]["GZA_DB_PATH"] == str(config.db_path.resolve())
+        assert os.environ["PATH"] == "/ambient/bin"
+        assert os.environ["PROJECT_ONLY_TOKEN"] == "ambient-token"
+        assert os.environ["GZA_DB_PATH"] == str(tmp_path / "ambient.db")
+
 
 class TestBackgroundWorkerCommand:
     """Tests for background worker subprocess command construction."""
@@ -4958,6 +5092,227 @@ class TestBackgroundWorkerCommand:
         thread_cls.assert_not_called()
         mock_thread.start.assert_not_called()
 
+    def test_spawn_detached_worker_process_uses_project_env_without_mutating_supervisor(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Detached spawn receives dotenv values without leaking them to later projects."""
+        from gza.cli._common import _spawn_detached_worker_process
+
+        project_a = tmp_path / "a"
+        project_b = tmp_path / "b"
+        home = tmp_path / "home"
+        conflicting_home = tmp_path / "conflicting-home"
+        project_a.mkdir()
+        project_b.mkdir()
+        (home / ".gza").mkdir(parents=True)
+        (home / ".gza" / ".env").write_text("SHARED_HOME_TOKEN=home\n", encoding="utf-8")
+        setup_config(project_a)
+        setup_config(project_b)
+        config_text = (project_a / "gza.yaml").read_text(encoding="utf-8")
+        (project_a / "gza.yaml").write_text(
+            re.sub(
+                r"^project_name: .*$",
+                "project_name: test-project\nproject_id: envsafe",
+                re.sub(r"^db_path: .*$", "db_path: ~/.gza/parent.db", config_text, flags=re.MULTILINE),
+                flags=re.MULTILINE,
+            ),
+            encoding="utf-8",
+        )
+        leaked_db = tmp_path / "leaked.db"
+        (project_a / ".env").write_text(
+            f"PROJECT_ONLY_TOKEN=secret-a\nGZA_DB_PATH={leaked_db}\nHOME={conflicting_home}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("PROJECT_ONLY_TOKEN", raising=False)
+        monkeypatch.delenv("GZA_DB_PATH", raising=False)
+        config_a = Config.load(project_a)
+        config_b = Config.load(project_b)
+        mock_proc = MagicMock()
+        mock_proc.pid = 4321
+
+        with patch("gza.cli._common.subprocess.Popen", return_value=mock_proc) as mock_popen:
+            _spawn_detached_worker_process(["echo", "hi"], config_a, "w-env-test")
+
+        popen_kwargs = mock_popen.call_args.kwargs
+        assert popen_kwargs["cwd"] == project_a
+        assert popen_kwargs["env"]["PROJECT_ONLY_TOKEN"] == "secret-a"
+        assert popen_kwargs["env"]["GZA_DB_PATH"] == str(config_a.db_path)
+        assert popen_kwargs["env"]["HOME"] == str(home)
+        with patch.dict(os.environ, popen_kwargs["env"], clear=True):
+            child_config = Config.load(project_a)
+        assert (child_config.db_path.resolve(), child_config.project_id) == (
+            config_a.db_path.resolve(),
+            config_a.project_id,
+        )
+        assert os.environ.get("PROJECT_ONLY_TOKEN") is None
+        assert os.environ.get("GZA_DB_PATH") is None
+        assert Config.load(project_b).db_path == config_b.db_path
+
+    def test_spawn_detached_runtime_context_typeerror_after_side_effect_is_not_retried(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza.cli._common import _call_spawn_detached_worker_process
+        from gza.runtime_context import RuntimeExecutionContext
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        runtime_context = RuntimeExecutionContext.from_config(config)
+        calls: list[RuntimeExecutionContext | None] = []
+
+        def fake_spawn(_cmd, _config, _worker_id, *, runtime_context=None):
+            calls.append(runtime_context)
+            raise TypeError("unexpected keyword argument 'runtime_context'")
+
+        monkeypatch.setattr("gza.cli._common._spawn_detached_worker_process", fake_spawn)
+
+        with pytest.raises(TypeError, match="unexpected keyword argument 'runtime_context'"):
+            _call_spawn_detached_worker_process(
+                ["echo", "hi"],
+                config,
+                "w-typeerror",
+                runtime_context=runtime_context,
+            )
+
+        assert calls == [runtime_context]
+
+    def test_detached_spawn_and_rollback_keep_activated_runtime_context(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza.cli._common import _rollback_background_worker_launch, _spawn_detached_worker_process
+        from gza.runtime_context import RuntimeExecutionContext
+
+        project = tmp_path / "project"
+        project.mkdir()
+        setup_config(project)
+        (project / ".env").write_text("PATH=/activated/bin\nTOKEN=activated\n", encoding="utf-8")
+        config = Config.load(project)
+        runtime_context = RuntimeExecutionContext.from_config(config)
+        (project / ".env").write_text("PATH=/mutated/bin\nTOKEN=mutated\n", encoding="utf-8")
+        monkeypatch.setenv("PATH", "/ambient/bin")
+        monkeypatch.setenv("TOKEN", "ambient")
+        monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+        fake_proc = MagicMock()
+        fake_proc.pid = 4321
+        fake_proc.poll.return_value = 0
+
+        with patch("gza.cli._common.subprocess.Popen", return_value=fake_proc) as mock_popen:
+            proc, _startup_log_rel = _spawn_detached_worker_process(
+                ["echo", "hi"],
+                config,
+                "w-immutable",
+                runtime_context=runtime_context,
+            )
+
+        assert proc is fake_proc
+        launch_kwargs = mock_popen.call_args.kwargs
+        assert launch_kwargs["cwd"] == project
+        assert launch_kwargs["env"]["PATH"] == "/activated/bin"
+        assert launch_kwargs["env"]["TOKEN"] == "activated"
+        assert launch_kwargs["env"]["GZA_DB_PATH"] == str(config.db_path.resolve())
+
+        registry = WorkerRegistry(config.workers_path)
+        with patch("gza.cli._common.subprocess.run", return_value=MagicMock(returncode=0)) as mock_run:
+            _rollback_background_worker_launch(
+                registry=registry,
+                worker_id="w-immutable",
+                runtime_context=runtime_context,
+                tmux_session="gza-test-session",
+            )
+
+        rollback_kwargs = mock_run.call_args.kwargs
+        assert rollback_kwargs["cwd"] == project
+        assert rollback_kwargs["env"]["PATH"] == "/activated/bin"
+        assert rollback_kwargs["env"]["TOKEN"] == "activated"
+        assert rollback_kwargs["env"]["GZA_DB_PATH"] == str(config.db_path.resolve())
+        assert os.environ["PATH"] == "/ambient/bin"
+        assert os.environ["TOKEN"] == "ambient"
+        assert os.environ["GZA_DB_PATH"] == str(tmp_path / "ambient.db")
+
+    def test_tmux_background_worker_launch_env_preserves_child_config_identity(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Tmux launches must not let project dotenv change child bootstrap identity."""
+        from gza.cli import _spawn_background_worker
+        from gza.runtime_context import RuntimeExecutionContext
+
+        project = tmp_path / "project"
+        home = tmp_path / "home"
+        conflicting_home = tmp_path / "conflicting-home"
+        project.mkdir()
+        home.mkdir()
+        setup_config(project)
+        config_text = (project / "gza.yaml").read_text(encoding="utf-8")
+        (project / "gza.yaml").write_text(
+            re.sub(
+                r"^project_name: .*$",
+                "project_name: test-project\nproject_id: envsafe",
+                re.sub(r"^db_path: .*$", "db_path: ~/.gza/parent.db", config_text, flags=re.MULTILINE),
+                flags=re.MULTILINE,
+            ),
+            encoding="utf-8",
+        )
+        leaked_db = tmp_path / "leaked.db"
+        (project / ".env").write_text(
+            f"PROJECT_ONLY_TOKEN=secret-a\nGZA_DB_PATH={leaked_db}\nHOME={conflicting_home}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("GZA_DB_PATH", raising=False)
+        config = Config.load(project)
+        config.tmux.enabled = True
+        store = SqliteTaskStore.from_config(config)
+        task = store.add("tmux candidate")
+        task.provider = "codex"
+        store.update(task)
+        args = argparse.Namespace(
+            no_docker=True,
+            max_turns=None,
+            background=True,
+            worker_mode=False,
+            project_dir=str(project),
+            create_pr=False,
+            resume=False,
+            force=False,
+        )
+        tmux_calls: list[dict[str, object]] = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd and cmd[0] == "tmux":
+                tmux_calls.append({"cmd": cmd, **kwargs})
+            return MagicMock(returncode=0, stderr="")
+
+        with (
+            patch("gza.cli._common.shutil.which", return_value="/usr/bin/tmux") as mock_which,
+            patch("gza.cli._common.subprocess.run", side_effect=fake_run),
+            patch("gza.cli._common.get_tmux_session_pid", return_value=4321),
+        ):
+            rc = _spawn_background_worker(args, config, task_id=task.id)
+
+        assert rc == 0
+        expected_runtime_path = RuntimeExecutionContext.from_config(config).env.get("PATH")
+        mock_which.assert_called_once_with("tmux", path=expected_runtime_path)
+        new_session_call = next(call for call in tmux_calls if call["cmd"][1] == "new-session")
+        launch_env = new_session_call["env"]
+        assert isinstance(launch_env, dict)
+        assert launch_env["PROJECT_ONLY_TOKEN"] == "secret-a"
+        assert launch_env["GZA_DB_PATH"] == str(config.db_path)
+        assert launch_env["HOME"] == str(home)
+        with patch.dict(os.environ, launch_env, clear=True):
+            child_config = Config.load(project)
+        assert (child_config.db_path.resolve(), child_config.project_id) == (
+            config.db_path.resolve(),
+            config.project_id,
+        )
+
     def test_background_worker_arms_reaper_after_registry_registration(self, tmp_path: Path) -> None:
         """Shared background launch must register worker metadata before starting the reaper."""
         from gza.cli import _spawn_background_worker
@@ -4985,7 +5340,7 @@ class TestBackgroundWorkerCommand:
         events: list[str] = []
         original_ensure_running = WorkerRegistry.ensure_running
 
-        def capture_spawn(_cmd, _config, worker_id):
+        def capture_spawn(_cmd, _config, worker_id, **_kwargs):
             return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
         def capture_ensure_running(self, worker):
@@ -5253,7 +5608,7 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
 
-        def capture_spawn(cmd, _config, worker_id):
+        def capture_spawn(cmd, _config, worker_id, **_kwargs):
             nonlocal captured_cmd
             captured_cmd = cmd
             return mock_proc, f".gza/workers/{worker_id}-startup.log"
@@ -5304,7 +5659,7 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 11111
 
-        def capture_spawn(cmd, _config, worker_id):
+        def capture_spawn(cmd, _config, worker_id, **_kwargs):
             nonlocal captured_cmd
             captured_cmd = cmd
             return mock_proc, f".gza/workers/{worker_id}-startup.log"
@@ -5345,7 +5700,7 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
 
-        def capture_spawn(cmd, _config, worker_id):
+        def capture_spawn(cmd, _config, worker_id, **_kwargs):
             nonlocal captured_cmd
             captured_cmd = cmd
             return mock_proc, f".gza/workers/{worker_id}-startup.log"
@@ -5401,7 +5756,7 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
 
-        def capture_spawn(cmd, _config, worker_id):
+        def capture_spawn(cmd, _config, worker_id, **_kwargs):
             nonlocal captured_cmd
             captured_cmd = cmd
             return mock_proc, f".gza/workers/{worker_id}-startup.log"
@@ -5450,7 +5805,7 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 22222
 
-        def capture_spawn(_cmd, _config, worker_id):
+        def capture_spawn(_cmd, _config, worker_id, **_kwargs):
             return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
         with (
@@ -5494,7 +5849,7 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 33333
 
-        def capture_spawn(_cmd, _config, worker_id):
+        def capture_spawn(_cmd, _config, worker_id, **_kwargs):
             return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
         with (
@@ -5527,7 +5882,7 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 44444
 
-        def capture_spawn(_cmd, _config, worker_id):
+        def capture_spawn(_cmd, _config, worker_id, **_kwargs):
             return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
         args = argparse.Namespace(no_docker=True, force=False)
@@ -5565,7 +5920,7 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 45454
 
-        def capture_spawn(_cmd, _config, worker_id):
+        def capture_spawn(_cmd, _config, worker_id, **_kwargs):
             return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
         args = argparse.Namespace(no_docker=True, force=False)
@@ -5762,7 +6117,7 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
 
-        def capture_spawn(_cmd, _config, worker_id):
+        def capture_spawn(_cmd, _config, worker_id, **_kwargs):
             startup_log_rel = f".gza/workers/{worker_id}-startup.log"
             (tmp_path / startup_log_rel).touch()
             return mock_proc, startup_log_rel
@@ -5970,7 +6325,7 @@ class TestBackgroundWorkerCommand:
         mock_proc.pid = 55555
         prepared_ids: list[str] = []
 
-        def capture_spawn(cmd, _config, worker_id):
+        def capture_spawn(cmd, _config, worker_id, **_kwargs):
             nonlocal captured_cmd
             captured_cmd = cmd
             return mock_proc, f".gza/workers/{worker_id}-startup.log"
@@ -6016,7 +6371,7 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 42424
 
-        def fake_spawn(cmd: list[str], _config: Config, worker_id: str):
+        def fake_spawn(cmd: list[str], _config: Config, worker_id: str, **_kwargs):
             nonlocal captured_cmd
             captured_cmd = list(cmd)
             startup_log = f".gza/workers/{worker_id}-startup.log"
@@ -6071,7 +6426,7 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
 
-        def capture_spawn(_cmd, _config, worker_id):
+        def capture_spawn(_cmd, _config, worker_id, **_kwargs):
             return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
         with patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn) as mock_spawn:
@@ -6161,7 +6516,7 @@ class TestBackgroundWorkerCommand:
         mock_proc = MagicMock()
         mock_proc.pid = 99999
 
-        def capture_spawn(_cmd, _config, worker_id):
+        def capture_spawn(_cmd, _config, worker_id, **_kwargs):
             return mock_proc, f".gza/workers/{worker_id}-startup.log"
 
         with patch("gza.cli._spawn_detached_worker_process", side_effect=capture_spawn) as mock_spawn:
@@ -6224,10 +6579,10 @@ class TestBackgroundWorkerCommand:
         mock_run_result = MagicMock()
         mock_run_result.returncode = 0
 
-        subprocess_run_calls: list[list[str]] = []
+        subprocess_run_calls: list[tuple[list[str], dict[str, object]]] = []
 
         def capture_run(cmd, **kwargs):
-            subprocess_run_calls.append(list(cmd))
+            subprocess_run_calls.append((list(cmd), dict(kwargs)))
             return mock_run_result
 
         # Pretend tmux is available so the provider-specific use_tmux decision
@@ -6244,19 +6599,33 @@ class TestBackgroundWorkerCommand:
         # Global provider is claude (which forces use_tmux=False for worker plumbing),
         # but fix routes to codex where tmux stays enabled — a `tmux new-session`
         # invocation is the observable proof the worker picked routed-provider semantics.
-        new_session_calls = [c for c in subprocess_run_calls if len(c) >= 2 and c[0] == "tmux" and c[1] == "new-session"]
+        new_session_calls = [
+            cmd
+            for cmd, _kwargs in subprocess_run_calls
+            if len(cmd) >= 2 and cmd[0] == "tmux" and cmd[1] == "new-session"
+        ]
         assert new_session_calls, (
             "Fix task routed to codex via task_providers.fix should have kept tmux "
             f"enabled and launched a tmux session; subprocess.run calls were: {subprocess_run_calls}"
         )
+        tmux_run_cwds = [
+            kwargs.get("cwd")
+            for cmd, kwargs in subprocess_run_calls
+            if len(cmd) >= 2 and cmd[0] == "tmux"
+        ]
+        assert tmux_run_cwds
+        assert all(cwd == config.project_dir for cwd in tmux_run_cwds)
 
 
 class TestReconciliation:
     """Tests for in-progress reconciliation behavior."""
 
     @pytest.fixture(autouse=True)
-    def _stub_worker_death_os_hint(self):
+    def _stub_worker_death_os_hint(self, request):
         """Keep the dead-worker unit path on an in-process Darwin hint seam."""
+        if request.node.get_closest_marker("uses_darwin_worker_death_hint"):
+            yield
+            return
         with patch(
             "gza.cli._common._darwin_worker_death_hint",
             return_value="darwin log hint (best effort): mocked unit-test hint",
@@ -7162,6 +7531,47 @@ class TestReconciliation:
         assert "mocked unit-test hint" in log_result.stdout
         assert "fatal: worker vanished before claim" in log_result.stdout
 
+    @pytest.mark.uses_darwin_worker_death_hint
+    def test_darwin_worker_death_hint_uses_captured_runtime_cwd_and_normalized_env(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """macOS worker-death diagnostics must not inherit a later supervisor environment."""
+        from gza.cli._common import _darwin_worker_death_hint
+        from gza.config import Config
+        from gza.runtime_context import RuntimeExecutionContext
+
+        setup_config(tmp_path)
+        (tmp_path / ".env").write_text("PATH=/runtime-a/bin\nPROJECT_ONLY_TOKEN=A\nPWD=/wrong\n", encoding="utf-8")
+        config = Config.load(tmp_path)
+        runtime_context = RuntimeExecutionContext.from_config(config)
+        monkeypatch.setenv("PATH", "/ambient/bin")
+        monkeypatch.setenv("PROJECT_ONLY_TOKEN", "ambient")
+        monkeypatch.setenv("PWD", "/ambient-pwd")
+        monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+
+        with (
+            patch("gza.cli._common.platform.system", return_value="Darwin"),
+            patch(
+                "gza.cli._common.subprocess.run",
+                return_value=SimpleNamespace(returncode=0, stdout="kernel[123]: jetsam killed worker\n"),
+            ) as mock_run,
+        ):
+            hint = _darwin_worker_death_hint(
+                pid=123,
+                reference_time=datetime(2026, 6, 27, tzinfo=UTC),
+                runtime_context=runtime_context,
+            )
+
+        assert hint == "darwin log hint (best effort): kernel[123]: jetsam killed worker"
+        run_kwargs = mock_run.call_args.kwargs
+        assert run_kwargs["cwd"] == runtime_context.cwd
+        assert run_kwargs["env"]["PATH"] == "/runtime-a/bin"
+        assert run_kwargs["env"]["PROJECT_ONLY_TOKEN"] == "A"
+        assert run_kwargs["env"]["GZA_DB_PATH"] == str(config.db_path.resolve())
+        assert run_kwargs["env"]["PWD"] == str(runtime_context.cwd)
+
     def test_reconciliation_leaves_pending_task_with_clean_completed_worker_pending(
         self,
         tmp_path: Path,
@@ -7324,6 +7734,76 @@ class TestReconciliation:
         assert worker.completion_reason == "watch reconciliation detected dead pending worker with no activity"
         assert all(running.worker_id != "w-dead-pending" for running in registry.list_all())
 
+    def test_reconciliation_dead_pending_uses_supplied_store_and_captured_runtime_after_poison(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Dead pending failure proof must stay bound to the reconciliation runtime."""
+        import os
+        from datetime import timedelta
+        from unittest.mock import patch
+
+        from gza.cli._common import reconcile_in_progress_tasks
+        from gza.config import Config
+        from gza.runtime_context import RuntimeExecutionContext
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        (tmp_path / ".env").write_text("PATH=/runtime-a/bin\nPROJECT_ONLY_TOKEN=A\n", encoding="utf-8")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        task = store.add("Pending task with runtime-owned branch proof")
+        assert task.id is not None
+        task.branch = "feature/runtime-owned-pending"
+        store.update(task)
+        runtime_context = RuntimeExecutionContext.from_config(config)
+
+        (tmp_path / ".env").write_text("PATH=/runtime-b/bin\nPROJECT_ONLY_TOKEN=B\n", encoding="utf-8")
+        monkeypatch.setenv("PATH", "/ambient/bin")
+        monkeypatch.setenv("PROJECT_ONLY_TOKEN", "ambient")
+        monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-dead-pending-runtime",
+                task_id=task.id,
+                pid=os.getpid(),
+                started_at=(datetime.now(UTC) - timedelta(seconds=90)).isoformat(),
+                status="running",
+            )
+        )
+        config.watch.no_activity_timeout = 1
+        captured_git_envs: list[dict[str, str] | None] = []
+
+        class _ProofGit:
+            def __init__(self, repo_dir: Path, *, env: dict[str, str] | None = None) -> None:
+                assert repo_dir == config.project_dir
+                captured_git_envs.append(dict(env) if env is not None else None)
+
+            def default_branch(self) -> str:
+                return "main"
+
+            def count_commits_ahead(self, branch: str, default_branch: str) -> int:
+                assert branch == "feature/runtime-owned-pending"
+                assert default_branch == "main"
+                return 1 if captured_git_envs[-1] == runtime_context.env else 0
+
+        with (
+            patch("gza.cli._common.get_store", side_effect=AssertionError("must use supplied store")),
+            patch("gza.cli._common.WorkerRegistry.is_running", return_value=False),
+            patch("gza.git.Git", _ProofGit),
+        ):
+            reconcile_in_progress_tasks(config, store=store, runtime_context=runtime_context)
+
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "NO_ACTIVITY"
+        assert refreshed.has_commits is True
+        assert captured_git_envs == [runtime_context.env]
+
     def test_reconciliation_fails_silent_pending_recovery_task_with_stale_logs(self, tmp_path: Path):
         """Pending recovery rows with dead running workers and stale startup/task logs should fail NO_ACTIVITY."""
         import os
@@ -7391,6 +7871,83 @@ class TestReconciliation:
         assert worker is not None
         assert worker.status == "failed"
         assert worker.completion_reason == "watch reconciliation detected dead pending worker with no activity"
+
+    def test_pending_recovery_reconciliation_uses_supplied_store_and_captured_runtime_after_poison(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Pre-claim recovery failure proof must not reopen through later ambient state."""
+        from unittest.mock import patch
+
+        from gza.cli._common import reconcile_dead_pending_recovery_tasks
+        from gza.config import Config
+        from gza.runtime_context import RuntimeExecutionContext
+        from gza.workers import WorkerMetadata, WorkerRegistry
+
+        setup_config(tmp_path)
+        (tmp_path / ".env").write_text("PATH=/runtime-a/bin\nPROJECT_ONLY_TOKEN=A\n", encoding="utf-8")
+        config = Config.load(tmp_path)
+        store = make_store(tmp_path)
+        failed = store.add("Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+        retry_child = store.add(
+            failed.prompt,
+            task_type="implement",
+            based_on=failed.id,
+            recovery_origin="retry",
+        )
+        assert retry_child.id is not None
+        retry_child.branch = "feature/runtime-owned-recovery"
+        store.update(retry_child)
+        runtime_context = RuntimeExecutionContext.from_config(config)
+
+        (tmp_path / ".env").write_text("PATH=/runtime-b/bin\nPROJECT_ONLY_TOKEN=B\n", encoding="utf-8")
+        monkeypatch.setenv("PATH", "/ambient/bin")
+        monkeypatch.setenv("PROJECT_ONLY_TOKEN", "ambient")
+        monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+
+        registry = WorkerRegistry(config.workers_path)
+        registry.register(
+            WorkerMetadata(
+                worker_id="w-dead-pending-recovery-runtime",
+                task_id=retry_child.id,
+                pid=999999,
+                status="failed",
+                completion_reason="startup failure before task claim",
+            )
+        )
+        captured_git_envs: list[dict[str, str] | None] = []
+
+        class _ProofGit:
+            def __init__(self, repo_dir: Path, *, env: dict[str, str] | None = None) -> None:
+                assert repo_dir == config.project_dir
+                captured_git_envs.append(dict(env) if env is not None else None)
+
+            def default_branch(self) -> str:
+                return "main"
+
+            def count_commits_ahead(self, branch: str, default_branch: str) -> int:
+                assert branch == "feature/runtime-owned-recovery"
+                assert default_branch == "main"
+                return 1 if captured_git_envs[-1] == runtime_context.env else 0
+
+        with (
+            patch("gza.cli._common.get_store", side_effect=AssertionError("must use supplied store")),
+            patch("gza.git.Git", _ProofGit),
+        ):
+            reconcile_dead_pending_recovery_tasks(config, store=store, runtime_context=runtime_context)
+
+        refreshed = store.get(retry_child.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+        assert refreshed.has_commits is True
+        assert captured_git_envs == [runtime_context.env]
 
     def test_reconciliation_leaves_plain_pending_task_without_registered_worker_runnable(self, tmp_path: Path):
         """Ordinary pending queue items with no worker registry entry must remain pending."""
@@ -12231,7 +12788,9 @@ class TestIterateCommand:
             max_resume_attempts,
             on_recovery,
             on_terminal_skip,
+            runtime_context=None,
         ):
+            assert runtime_context is not None
             assert task_to_run.id == task.id
             assert max_resume_attempts == 2
             assert on_recovery is not None
@@ -26986,7 +27545,9 @@ class TestRunForeground:
             rc = _run_foreground(config, task_id=task.id, resume=True)
 
         assert rc == 0
-        mock_rebase.assert_called_once_with(config, task.id)
+        mock_rebase.assert_called_once()
+        assert mock_rebase.call_args.args == (config, task.id)
+        assert mock_rebase.call_args.kwargs["runtime_context"].db_path == config.db_path.resolve()
         mock_run.assert_called_once()
         assert mock_run.call_args.kwargs["task_id"] == task.id
         assert mock_run.call_args.kwargs["resume"] is True
@@ -27013,7 +27574,9 @@ class TestRunForeground:
             rc = _run_foreground(config, task_id=task.id, resume=True)
 
         assert rc == 1
-        mock_rebase.assert_called_once_with(config, task.id)
+        mock_rebase.assert_called_once()
+        assert mock_rebase.call_args.args == (config, task.id)
+        assert mock_rebase.call_args.kwargs["runtime_context"].db_path == config.db_path.resolve()
         mock_run.assert_not_called()
         registry = WorkerRegistry(workers_path)
         workers = registry.list_all(include_completed=True)
@@ -29121,6 +29684,71 @@ class TestRunAsWorker:
         assert worker.status == "failed"
         assert worker.exit_code == 7
 
+    def test_run_as_worker_exception_keeps_worker_entry_runtime_after_ambient_poison(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Worker exceptions must fail tasks using the runtime captured at worker entry."""
+        from gza.runtime_context import RuntimeExecutionContext
+
+        setup_config(tmp_path)
+        (tmp_path / ".env").write_text("PATH=/runtime-a/bin\nPROJECT_ONLY_TOKEN=A\n", encoding="utf-8")
+        config = Config.load(tmp_path)
+        store = SqliteTaskStore(config.db_path, prefix=config.project_prefix)
+        task = store.add("Worker exception runtime proof")
+        assert task.id is not None
+        task.branch = "feature/worker-entry-runtime"
+        store.update(task)
+        store.mark_in_progress(task)
+        task = store.get(task.id)
+        assert task is not None
+        runtime_context = RuntimeExecutionContext.from_config(config)
+        registry = self._register_current_worker(config, task.id, "w-worker-exception-runtime")
+        args = argparse.Namespace(task_ids=[task.id], resume=False)
+        captured_run_contexts: list[RuntimeExecutionContext | None] = []
+        captured_git_envs: list[dict[str, str] | None] = []
+
+        class _ProofGit:
+            def __init__(self, repo_dir: Path, *, env: dict[str, str] | None = None) -> None:
+                assert repo_dir == config.project_dir
+                captured_git_envs.append(dict(env) if env is not None else None)
+
+            def default_branch(self) -> str:
+                return "main"
+
+            def count_commits_ahead(self, branch: str, default_branch: str) -> int:
+                assert branch == "feature/worker-entry-runtime"
+                assert default_branch == "main"
+                return 1 if captured_git_envs[-1] == runtime_context.env else 0
+
+        def _crash_run(*_args, runtime_context=None, **_kwargs):
+            captured_run_contexts.append(runtime_context)
+            (tmp_path / ".env").write_text("PATH=/runtime-b/bin\nPROJECT_ONLY_TOKEN=B\n", encoding="utf-8")
+            monkeypatch.setenv("PATH", "/ambient/bin")
+            monkeypatch.setenv("PROJECT_ONLY_TOKEN", "ambient")
+            monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+            raise RuntimeError("worker boom")
+
+        with (
+            patch("gza.cli.signal.signal"),
+            patch("gza.cli._common.run", side_effect=_crash_run),
+            patch("gza.git.Git", _ProofGit),
+        ):
+            rc = _run_as_worker(args, config)
+
+        assert rc == 1
+        assert captured_run_contexts == [runtime_context]
+        assert captured_git_envs == [runtime_context.env]
+        refreshed = store.get(task.id)
+        assert refreshed is not None
+        assert refreshed.status == "failed"
+        assert refreshed.failure_reason == "WORKER_DIED"
+        assert refreshed.has_commits is True
+        worker = registry.get("w-worker-exception-runtime")
+        assert worker is not None
+        assert worker.status == "failed"
+
     def test_run_as_worker_resume_auto_rebases_before_run(self, tmp_path: Path):
         """Worker resume runs the automatic rebase step before run()."""
         setup_config(tmp_path)
@@ -29138,7 +29766,9 @@ class TestRunAsWorker:
             rc = _run_as_worker(args, config)
 
         assert rc == 0
-        mock_rebase.assert_called_once_with(config, task.id)
+        mock_rebase.assert_called_once()
+        assert mock_rebase.call_args.args == (config, task.id)
+        assert mock_rebase.call_args.kwargs["runtime_context"].db_path == config.db_path.resolve()
         mock_run.assert_called_once()
 
     def test_run_as_worker_resume_rebase_failure_skips_run(self, tmp_path: Path):
@@ -29158,7 +29788,9 @@ class TestRunAsWorker:
             rc = _run_as_worker(args, config)
 
         assert rc == 1
-        mock_rebase.assert_called_once_with(config, task.id)
+        mock_rebase.assert_called_once()
+        assert mock_rebase.call_args.args == (config, task.id)
+        assert mock_rebase.call_args.kwargs["runtime_context"].db_path == config.db_path.resolve()
         mock_run.assert_not_called()
         worker = registry.get("w-worker-resume-fail")
         assert worker is not None

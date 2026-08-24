@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .config import CONFIG_FILENAME, Config, ConfigError
+from .runtime_context import RuntimeExecutionContext
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -23,6 +24,8 @@ class RepoProjectConfig:
 
     project_dir: Path
     scope_root: Path
+    config: Config
+    runtime_context: RuntimeExecutionContext
     verify_command: str
     unit_verify_command: str
     inner_verify_command: str
@@ -164,10 +167,11 @@ def discover_repo_project_configs(
             continue
         seen.add(project_dir)
         try:
-            project_config = Config.load(project_dir)
+            project_config = Config.load_execution(project_dir)
         except (ConfigError, OSError) as exc:
             logger.warning("Skipping repo project config %s during discovery: %s", config_path, exc)
             continue
+        runtime_context = RuntimeExecutionContext.from_config(project_config)
         try:
             scope_root = project_dir.relative_to(discovery_root)
         except ValueError:
@@ -177,6 +181,8 @@ def discover_repo_project_configs(
             RepoProjectConfig(
                 project_dir=project_dir,
                 scope_root=normalized_scope_root,
+                config=project_config,
+                runtime_context=runtime_context,
                 verify_command=project_config.verify_command.strip(),
                 unit_verify_command=project_config.unit_verify_command.strip(),
                 inner_verify_command=project_config.inner_verify_command.strip(),

@@ -56,6 +56,7 @@ from ..learnings import DEFAULT_LEARNINGS_WINDOW, regenerate_learnings
 from ..log_paths import paired_log_paths, slug_from_log_path
 from ..merge_state import resolve_task_merge_state_for_target
 from ..report_sync import ReportSyncResult, synchronize_task_report
+from ..runtime_context import RuntimeExecutionContext
 from ..task_slug import get_slug_display_text
 from ..task_types import EXECUTABLE_TASK_TYPES
 from ..workers import WorkerMetadata, WorkerRegistry
@@ -3613,6 +3614,7 @@ def cmd_usage(args: argparse.Namespace) -> int:
 
     config = Config.load(args.project_dir)
     store = get_store(config)
+    runtime_context = RuntimeExecutionContext.from_config(config)
 
     show_all: bool = getattr(args, "all", False)
     output_json: bool = getattr(args, "json", False)
@@ -3649,6 +3651,8 @@ def cmd_usage(args: argparse.Namespace) -> int:
             timeout_seconds=config.usage_timeout_seconds,
             retention_days=config.usage_retention_days,
             now=now,
+            env=runtime_context.env,
+            cwd=runtime_context.cwd,
         )
         if output_json:
             usage = snapshot.usage

@@ -22,6 +22,7 @@ from gza.db import (
     DuplicateActiveChildError,
     ExecutionProjectDisabled,
     ExecutionProjectResolved,
+    ExecutionProjectRuntime,
     ExecutionProjectSelector,
     MainVerifyRemediationAttemptState,
     ManualMigrationRequired,
@@ -10242,8 +10243,191 @@ class TestExecutionProjectResolver:
         assert result.db_path == project_db.resolve()
         assert result.config.project_id == Config.load(project_dir).project_id
         assert not project_db.exists()
-        assert result.open_runtime_store().project_id == "execproj"
+        runtime = result.open_runtime_store()
+        assert isinstance(runtime, ExecutionProjectRuntime)
+        assert runtime.config.project_id == "execproj"
+        assert runtime.store.project_id == "execproj"
         assert project_db.exists()
+
+    def test_relative_explicit_path_resolves_against_anchor_project_not_process_cwd(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza.config import Config
+
+        anchor_dir = tmp_path / "anchor"
+        poison_cwd = tmp_path / "poison"
+        anchored_project = anchor_dir / "services" / "core"
+        poison_project = poison_cwd / "services" / "core"
+        anchor_db = tmp_path / "anchor.db"
+        anchored_db = tmp_path / "anchored.db"
+        poison_db = tmp_path / "poison.db"
+        _write_project_config(anchor_dir, project_name="Anchor", project_id="anchor", db_path=anchor_db)
+        _write_project_config(anchored_project, project_name="Core", project_id="core", db_path=anchored_db)
+        _write_project_config(poison_project, project_name="Poison", project_id="poison", db_path=poison_db)
+        anchor = SqliteTaskStore.from_config(Config.load(anchor_dir))
+        monkeypatch.chdir(poison_cwd)
+
+        (result,) = resolve_execution_projects(
+            anchor,
+            (ExecutionProjectSelector("core", "path", "services/core"),),
+        )
+
+        assert isinstance(result, ExecutionProjectResolved)
+        assert result.root_path == anchored_project.resolve()
+        assert result.project_id == "core"
+        assert result.db_path == anchored_db.resolve()
+
+    def test_execution_path_selection_ignores_ambient_db_override(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        anchor_db = tmp_path / "anchor.db"
+        anchor = SqliteTaskStore(anchor_db, prefix="gza", project_id="anchor")
+        alpha_dir = tmp_path / "alpha"
+        beta_dir = tmp_path / "beta"
+        alpha_db = tmp_path / "alpha.db"
+        beta_db = tmp_path / "beta.db"
+        _write_project_config(alpha_dir, project_name="Alpha", project_id="alpha", db_path=alpha_db)
+        _write_project_config(beta_dir, project_name="Beta", project_id="beta", db_path=beta_db)
+        monkeypatch.setenv("GZA_DB_PATH", str(anchor_db))
+
+        alpha_result, beta_result = resolve_execution_projects(
+            anchor,
+            (
+                ExecutionProjectSelector("alpha", "path", alpha_dir),
+                ExecutionProjectSelector("beta", "path", beta_dir),
+            ),
+        )
+
+        assert isinstance(alpha_result, ExecutionProjectResolved)
+        assert isinstance(beta_result, ExecutionProjectResolved)
+        assert (alpha_result.db_path, alpha_result.project_id) == (alpha_db.resolve(), "alpha")
+        assert (beta_result.db_path, beta_result.project_id) == (beta_db.resolve(), "beta")
+
+        alpha_runtime = alpha_result.open_runtime_store()
+        beta_runtime = beta_result.open_runtime_store()
+        assert (alpha_runtime.config.db_path.resolve(), alpha_runtime.config.project_id) == (
+            alpha_db.resolve(),
+            "alpha",
+        )
+        assert (alpha_runtime.store.db_path.resolve(), alpha_runtime.store.project_id) == (
+            alpha_db.resolve(),
+            "alpha",
+        )
+        assert (beta_runtime.config.db_path.resolve(), beta_runtime.config.project_id) == (
+            beta_db.resolve(),
+            "beta",
+        )
+        assert (beta_runtime.store.db_path.resolve(), beta_runtime.store.project_id) == (
+            beta_db.resolve(),
+            "beta",
+        )
+
+    def test_registry_id_selection_asserts_anchor_db_under_ambient_override(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza.config import Config
+
+        anchor_dir = tmp_path / "anchor"
+        shared_dir = tmp_path / "shared"
+        anchor_db = tmp_path / "anchor.db"
+        leaked_db = tmp_path / "leaked.db"
+        _write_project_config(anchor_dir, project_name="Anchor", project_id="anchor", db_path=anchor_db)
+        _write_project_config(shared_dir, project_name="Shared", project_id="shared", db_path=anchor_db)
+        anchor_store = SqliteTaskStore.from_config(Config.load(anchor_dir))
+        SqliteTaskStore.from_config(Config.load(shared_dir))
+        monkeypatch.setenv("GZA_DB_PATH", str(leaked_db))
+
+        (result,) = resolve_execution_projects(
+            anchor_store,
+            (ExecutionProjectSelector("shared", "registry_id", "shared"),),
+        )
+
+        assert isinstance(result, ExecutionProjectResolved)
+        assert (result.db_path, result.project_id) == (anchor_db.resolve(), "shared")
+        runtime = result.open_runtime_store()
+        assert (runtime.config.db_path.resolve(), runtime.store.db_path.resolve()) == (
+            anchor_db.resolve(),
+            anchor_db.resolve(),
+        )
+
+    def test_execution_runtime_activation_uses_fresh_execution_settings(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
+        project_dir = tmp_path / "project"
+        project_db = tmp_path / "runtime.db"
+        first_worktrees = tmp_path / "first-worktrees"
+        fresh_worktrees = tmp_path / "fresh-worktrees"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        config_path = project_dir / "gza.yaml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    "project_name: Runtime",
+                    "project_id: runtime",
+                    "project_prefix: runtime",
+                    f"db_path: {project_db}",
+                    "provider: codex",
+                    "model: gpt-5.5",
+                    "verify_command: ./bin/old-verify",
+                    "unit_verify_command: ./bin/old-unit",
+                    "use_docker: false",
+                    "timeout_minutes: 11",
+                    "autonomous_verify_timeout_seconds: 111",
+                    f"worktree_dir: {first_worktrees}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        (result,) = resolve_execution_projects(anchor, (ExecutionProjectSelector("runtime", "path", project_dir),))
+        assert isinstance(result, ExecutionProjectResolved)
+        assert result.config.provider == "codex"
+        assert result.config.verify_command == "./bin/old-verify"
+        monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient-anchor.db"))
+
+        config_path.write_text(
+            "\n".join(
+                [
+                    "project_name: Runtime",
+                    "project_id: runtime",
+                    "project_prefix: runtime",
+                    f"db_path: {project_db}",
+                    "provider: gemini",
+                    "model: gemini-3-pro",
+                    "verify_command: ./bin/fresh-verify",
+                    "unit_verify_command: ./bin/fresh-unit",
+                    "use_docker: true",
+                    "timeout_minutes: 22",
+                    "autonomous_verify_timeout_seconds: 222",
+                    f"worktree_dir: {fresh_worktrees}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        runtime = result.open_runtime_store()
+
+        assert runtime.config.provider == "gemini"
+        assert runtime.config.model == "gemini-3-pro"
+        assert runtime.config.verify_command == "./bin/fresh-verify"
+        assert runtime.config.unit_verify_command == "./bin/fresh-unit"
+        assert runtime.config.use_docker is True
+        assert runtime.config.timeout_minutes == 22
+        assert runtime.config.autonomous_verify_timeout_seconds == 222
+        assert runtime.config.worktree_dir == str(fresh_worktrees)
+        assert runtime.store.db_path.resolve() == runtime.config.db_path.resolve()
+        assert runtime.config.db_path.resolve() == project_db.resolve()
 
     def test_registry_id_resolves_shared_db_projects(self, tmp_path: Path) -> None:
         from gza.config import Config
@@ -10268,6 +10452,292 @@ class TestExecutionProjectResolver:
             ("alpha", "alpha", shared_db.resolve()),
             ("beta", "beta", shared_db.resolve()),
         ]
+
+    def test_ambient_db_override_registers_executable_canonical_registry_row(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza.config import Config
+
+        shared_db = tmp_path / "ambient-shared.db"
+        project_dir = tmp_path / "ambient-project"
+        _write_project_config(project_dir, project_name="Ambient", project_id="ambient", project_prefix="amb")
+        (project_dir / ".git").mkdir()
+        monkeypatch.setenv("GZA_DB_PATH", str(shared_db))
+
+        store = SqliteTaskStore.from_config(Config.load(project_dir))
+
+        entry = store.get_project_registry_entry("ambient")
+        assert entry is not None
+        assert entry.root_path == str(project_dir.resolve())
+        assert entry.config_path == str((project_dir / "gza.yaml").resolve())
+
+        monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "unrelated.db"))
+        (result,) = resolve_execution_projects(
+            store,
+            (ExecutionProjectSelector("ambient", "registry_id", "ambient"),),
+        )
+
+        assert isinstance(result, ExecutionProjectResolved)
+        assert result.db_path == shared_db.resolve()
+        runtime = result.open_runtime_store()
+        assert runtime.config.db_path.resolve() == shared_db.resolve()
+        assert runtime.store.db_path.resolve() == shared_db.resolve()
+        assert runtime.runtime_context.env["GZA_DB_PATH"] == str(shared_db.resolve())
+
+    @pytest.mark.parametrize("mutation", ["explicit_other_db", "invalid_db_path"])
+    def test_registry_anchor_fallback_activation_fails_closed_after_db_path_drift(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        mutation: str,
+    ) -> None:
+        from gza.config import Config
+
+        shared_db = tmp_path / "anchor-shared.db"
+        project_dir = tmp_path / "fallback-project"
+        local_db = project_dir / ".gza" / "gza.db"
+        redirected_db = tmp_path / "redirected.db"
+        _write_project_config(
+            project_dir,
+            project_name="Fallback",
+            project_id="fallback",
+            project_prefix="fall",
+        )
+        (project_dir / ".git").mkdir()
+        monkeypatch.setenv("GZA_DB_PATH", str(shared_db))
+        anchor_store = SqliteTaskStore.from_config(Config.load(project_dir))
+        before_anchor = self._sqlite_user_schema_and_rows(shared_db)
+
+        monkeypatch.delenv("GZA_DB_PATH", raising=False)
+        (result,) = resolve_execution_projects(
+            anchor_store,
+            (ExecutionProjectSelector("fallback", "registry_id", "fallback"),),
+        )
+        assert isinstance(result, ExecutionProjectResolved)
+        assert result.db_path == shared_db.resolve()
+        assert result.db_path_override == shared_db.resolve()
+        assert not local_db.exists()
+        assert not redirected_db.exists()
+
+        if mutation == "explicit_other_db":
+            _write_project_config(
+                project_dir,
+                project_name="Fallback",
+                project_id="fallback",
+                project_prefix="fall",
+                db_path=redirected_db,
+            )
+            match = "Execution project DB path changed at activation"
+        else:
+            (project_dir / "gza.yaml").write_text(
+                "project_name: Fallback\n"
+                "project_id: fallback\n"
+                "project_prefix: fall\n"
+                "provider: codex\n"
+                "model: gpt-5.5\n"
+                "db_path: 123\n",
+                encoding="utf-8",
+            )
+            match = "Execution project config is invalid at activation"
+
+        with pytest.raises(SchemaIntegrityError, match=match):
+            result.open_runtime_store()
+
+        assert self._sqlite_user_schema_and_rows(shared_db) == before_anchor
+        assert not local_db.exists()
+        assert not redirected_db.exists()
+
+    def test_registry_anchor_fallback_activation_accepts_unchanged_omitted_db_path(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza.config import Config
+
+        shared_db = tmp_path / "anchor-shared.db"
+        project_dir = tmp_path / "fallback-project"
+        local_db = project_dir / ".gza" / "gza.db"
+        _write_project_config(
+            project_dir,
+            project_name="Fallback",
+            project_id="fallback",
+            project_prefix="fall",
+        )
+        (project_dir / ".git").mkdir()
+        monkeypatch.setenv("GZA_DB_PATH", str(shared_db))
+        anchor_store = SqliteTaskStore.from_config(Config.load(project_dir))
+
+        monkeypatch.delenv("GZA_DB_PATH", raising=False)
+        (result,) = resolve_execution_projects(
+            anchor_store,
+            (ExecutionProjectSelector("fallback", "registry_id", "fallback"),),
+        )
+
+        assert isinstance(result, ExecutionProjectResolved)
+        runtime = result.open_runtime_store()
+        assert runtime.config.db_path.resolve() == shared_db.resolve()
+        assert runtime.store.db_path.resolve() == shared_db.resolve()
+        assert runtime.runtime_context.db_path == shared_db.resolve()
+        assert not local_db.exists()
+
+    def test_direct_mismatched_store_cannot_register_canonical_paths(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        project_dir = tmp_path / "direct-project"
+        shared_db = tmp_path / "direct-shared.db"
+        _write_project_config(project_dir, project_name="Direct", project_id="direct", project_prefix="dir")
+        (project_dir / ".git").mkdir()
+
+        store = SqliteTaskStore(
+            shared_db,
+            prefix="dir",
+            project_id="direct",
+            project_root=project_dir,
+            config_path=project_dir / "gza.yaml",
+            project_name="Direct",
+        )
+
+        entry = store.get_project_registry_entry("direct")
+        assert entry is not None
+        assert entry.root_path == ""
+        assert entry.config_path == ""
+
+    def test_execution_project_resolution_preserves_supervisor_presentation_and_runtime_settings(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        import gza.colors as colors
+        from gza.config import Config
+
+        anchor_dir = tmp_path / "anchor"
+        alpha_dir = tmp_path / "alpha"
+        beta_dir = tmp_path / "beta"
+        anchor_db = tmp_path / "anchor.db"
+        alpha_db = tmp_path / "alpha.db"
+        beta_db = tmp_path / "beta.db"
+        for project_dir in (anchor_dir, alpha_dir, beta_dir):
+            project_dir.mkdir()
+        (anchor_dir / "gza.yaml").write_text(
+            "project_name: Anchor\n"
+            "project_id: anchor\n"
+            f"db_path: {anchor_db}\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "colors:\n"
+            "  task_id: '#010203'\n",
+            encoding="utf-8",
+        )
+        (alpha_dir / "gza.yaml").write_text(
+            "project_name: Alpha\n"
+            "project_id: alpha\n"
+            "project_prefix: alp\n"
+            f"db_path: {alpha_db}\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: alpha-verify\n"
+            "unit_verify_command: alpha-unit\n"
+            "autonomous_verify_timeout_seconds: 17\n"
+            "use_docker: false\n"
+            "docker_startup_timeout: 31\n"
+            "docker_setup_command: alpha-setup\n"
+            f"docker_volumes:\n  - {tmp_path}/alpha-cache:/cache:ro\n"
+            f"worktree_dir: {tmp_path}/alpha-worktrees\n"
+            f"interactive_worktree_dir: {tmp_path}/alpha-interactive\n"
+            "advance_mode: default\n"
+            "quiet_period_seconds: 41\n"
+            "max_concurrent: 2\n"
+            "watch:\n"
+            "  batch: 3\n"
+            "  poll: 43\n"
+            "colors:\n"
+            "  task_id: '#aabbcc'\n",
+            encoding="utf-8",
+        )
+        (beta_dir / "gza.yaml").write_text(
+            "project_name: Beta\n"
+            "project_id: beta\n"
+            "project_prefix: bet\n"
+            f"db_path: {beta_db}\n"
+            "provider: claude\n"
+            "model: claude-sonnet-4\n"
+            "verify_command: beta-verify\n"
+            "unit_verify_command: beta-unit\n"
+            "autonomous_verify_timeout_seconds: 29\n"
+            "use_docker: true\n"
+            "docker_startup_timeout: 37\n"
+            "docker_setup_command: beta-setup\n"
+            f"docker_volumes:\n  - {tmp_path}/beta-cache:/cache:rw\n"
+            f"worktree_dir: {tmp_path}/beta-worktrees\n"
+            f"interactive_worktree_dir: {tmp_path}/beta-interactive\n"
+            "advance_mode: iterate\n"
+            "quiet_period_seconds: 53\n"
+            "max_concurrent: 5\n"
+            "watch:\n"
+            "  batch: 7\n"
+            "  poll: 59\n"
+            "colors:\n"
+            "  task_id: '#ddeeff'\n",
+            encoding="utf-8",
+        )
+
+        try:
+            anchor_config = Config.load(anchor_dir)
+            anchor_store = SqliteTaskStore.from_config(anchor_config)
+            assert colors.TASK_COLORS.task_id == "#010203"
+
+            results = resolve_execution_projects(
+                anchor_store,
+                (
+                    ExecutionProjectSelector("alpha-runtime", "path", alpha_dir),
+                    ExecutionProjectSelector("beta-runtime", "path", beta_dir),
+                ),
+            )
+
+            assert colors.TASK_COLORS.task_id == "#010203"
+            alpha_result, beta_result = results
+            assert isinstance(alpha_result, ExecutionProjectResolved)
+            assert isinstance(beta_result, ExecutionProjectResolved)
+            assert alpha_result.config.provider == "codex"
+            assert alpha_result.config.model == "gpt-5.5"
+            assert alpha_result.config.verify_command == "alpha-verify"
+            assert alpha_result.config.unit_verify_command == "alpha-unit"
+            assert alpha_result.config.autonomous_verify_timeout_seconds == 17
+            assert alpha_result.config.use_docker is False
+            assert alpha_result.config.docker_startup_timeout == 31
+            assert alpha_result.config.docker_setup_command == "alpha-setup"
+            assert alpha_result.config.docker_volumes == [f"{tmp_path}/alpha-cache:/cache:ro"]
+            assert alpha_result.config.advance_mode == "default"
+            assert alpha_result.config.worktree_path == tmp_path / "alpha-worktrees" / "Alpha"
+            assert alpha_result.config.interactive_worktree_dir == f"{tmp_path}/alpha-interactive"
+            assert alpha_result.config.quiet_period_seconds == 41
+            assert alpha_result.config.max_concurrent == 2
+            assert alpha_result.config.watch.batch == 3
+            assert alpha_result.config.watch.poll == 43
+
+            assert beta_result.config.provider == "claude"
+            assert beta_result.config.model == "claude-sonnet-4"
+            assert beta_result.config.verify_command == "beta-verify"
+            assert beta_result.config.unit_verify_command == "beta-unit"
+            assert beta_result.config.autonomous_verify_timeout_seconds == 29
+            assert beta_result.config.use_docker is True
+            assert beta_result.config.docker_startup_timeout == 37
+            assert beta_result.config.docker_setup_command == "beta-setup"
+            assert beta_result.config.docker_volumes == [f"{tmp_path}/beta-cache:/cache:rw"]
+            assert beta_result.config.advance_mode == "iterate"
+            assert beta_result.config.worktree_path == tmp_path / "beta-worktrees" / "Beta"
+            assert beta_result.config.interactive_worktree_dir == f"{tmp_path}/beta-interactive"
+            assert beta_result.config.quiet_period_seconds == 53
+            assert beta_result.config.max_concurrent == 5
+            assert beta_result.config.watch.batch == 7
+            assert beta_result.config.watch.poll == 59
+
+            assert beta_result.open_runtime_store().project_id == "beta"
+            assert colors.TASK_COLORS.task_id == "#010203"
+        finally:
+            colors.set_theme(None)
 
     def test_resolution_through_linked_worktree_preserves_canonical_registry_metadata(
         self,
@@ -11619,6 +12089,37 @@ class TestExecutionProjectResolver:
             "empty_config_path",
         ]
 
+    def test_relative_registry_paths_fail_closed_instead_of_using_process_cwd(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
+        poison_cwd = tmp_path / "poison"
+        poison_project = poison_cwd / "services" / "core"
+        _write_project_config(poison_project, project_name="Poison", project_id="core", db_path=tmp_path / "poison.db")
+        with sqlite3.connect(anchor.db_path) as conn:
+            now = "2026-08-21T00:00:00+00:00"
+            conn.execute(
+                """
+                INSERT INTO projects (
+                    id, root_path, config_path, project_name, project_prefix,
+                    db_layout_version, created_at, last_seen_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                ("core", "services/core", "services/core/gza.yaml", "core", "gza", SCHEMA_VERSION, now, now),
+            )
+        monkeypatch.chdir(poison_cwd)
+
+        (result,) = resolve_execution_projects(
+            anchor,
+            (ExecutionProjectSelector("core", "registry_id", "core"),),
+        )
+
+        assert isinstance(result, ExecutionProjectDisabled)
+        assert result.reason == "missing_root"
+        assert "root_path must be absolute" in result.message
+
     def test_missing_explicit_root_and_config_are_disabled(self, tmp_path: Path) -> None:
         anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
         root_without_config = tmp_path / "no-config"
@@ -11845,7 +12346,7 @@ class TestExecutionProjectResolver:
         project_db = tmp_path / "project.db"
         _write_project_config(project_dir, project_name="Bug", project_id="bug", db_path=project_db)
 
-        with patch.object(Config, "load", side_effect=exc):
+        with patch.object(Config, "load_execution", side_effect=exc):
             with pytest.raises(type(exc), match="config invariant failed"):
                 resolve_execution_projects(anchor, (ExecutionProjectSelector("bug", "path", project_dir),))
 
@@ -11866,7 +12367,7 @@ class TestExecutionProjectResolver:
         (result,) = resolve_execution_projects(anchor, (ExecutionProjectSelector("bug", "path", project_dir),))
         assert isinstance(result, ExecutionProjectResolved)
 
-        with patch.object(Config, "load", side_effect=exc):
+        with patch.object(Config, "load_execution", side_effect=exc):
             with pytest.raises(type(exc), match="config invariant failed"):
                 result.open_runtime_store()
 
@@ -11885,7 +12386,7 @@ class TestExecutionProjectResolver:
         (result,) = resolve_execution_projects(anchor, (ExecutionProjectSelector("loop", "path", project_dir),))
         assert isinstance(result, ExecutionProjectResolved)
 
-        with patch.object(Config, "load", side_effect=RuntimeError("Symlink loop from '/tmp/loop'")):
+        with patch.object(Config, "load_execution", side_effect=RuntimeError("Symlink loop from '/tmp/loop'")):
             with pytest.raises(SchemaIntegrityError, match="invalid at activation"):
                 result.open_runtime_store()
 
@@ -11905,7 +12406,7 @@ class TestExecutionProjectResolver:
         (project_dir / ".git").mkdir()
         config = Config.load(project_dir)
 
-        with patch.object(Config, "load", side_effect=exc):
+        with patch.object(Config, "load_execution", side_effect=exc):
             with pytest.raises(type(exc), match="config invariant failed"):
                 SqliteTaskStore.from_config(config)
 

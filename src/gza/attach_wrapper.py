@@ -23,7 +23,8 @@ from .config import Config, ConfigError
 from .providers.base import build_docker_cmd, ensure_docker_image
 from .providers.claude import _get_docker_config, sync_keychain_credentials
 from .recovery_engine import decide_failed_task_recovery
-from .runner import load_dotenv, write_log_entry
+from .runner import _call_accepts_keyword, write_log_entry
+from .runtime_context import RuntimeExecutionContext, normalize_subprocess_env
 
 
 def _task_log_path(config: Config, task) -> Path | None:
@@ -58,20 +59,27 @@ def _build_docker_interactive_cmd(
     session_id: str,
     *,
     max_turns: int | None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> list[str]:
     """Build a Docker-backed interactive claude --resume command.
 
     Mirrors the direct-mode args used by ``ClaudeProvider._run_docker`` but with
     a TTY-allocated container and the interactive (non-pipe) argument list.
     """
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     if config.claude.fetch_auth_token_from_keychain:
-        sync_keychain_credentials()
+        sync_keychain_credentials(env=runtime_context.env, cwd=runtime_context.cwd)
     docker_config = _get_docker_config(
         f"{config.docker_image}-claude",
         docker_startup_timeout=config.docker_startup_timeout,
     )
     work_dir = _resolve_work_dir(config, task)
-    if not ensure_docker_image(docker_config, config.project_dir):
+    if not ensure_docker_image(
+        docker_config,
+        config.project_dir,
+        host_env=runtime_context.env,
+        host_cwd=runtime_context.cwd,
+    ):
         raise RuntimeError("failed to build Docker image for interactive attach")
     cmd = build_docker_cmd(
         docker_config,
@@ -81,10 +89,38 @@ def _build_docker_interactive_cmd(
         config.docker_setup_command,
         getattr(config, "docker_env", None),
         interactive=True,
+        host_env=runtime_context.env,
     )
     cmd.append("claude")
     cmd.extend(_build_interactive_claude_args(config, session_id, max_turns=max_turns))
     return cmd
+
+
+def _call_run_interactive_claude(
+    config: Config,
+    session_id: str,
+    *,
+    max_turns: int | None,
+    task,
+    no_docker: bool,
+    runtime_context: RuntimeExecutionContext,
+) -> int:
+    if _call_accepts_keyword(_run_interactive_claude, "runtime_context"):
+        return _run_interactive_claude(
+            config,
+            session_id,
+            max_turns=max_turns,
+            task=task,
+            no_docker=no_docker,
+            runtime_context=runtime_context,
+        )
+    return _run_interactive_claude(
+        config,
+        session_id,
+        max_turns=max_turns,
+        task=task,
+        no_docker=no_docker,
+    )
 
 
 def _run_interactive_claude(
@@ -94,20 +130,28 @@ def _run_interactive_claude(
     max_turns: int | None = None,
     task=None,
     no_docker: bool = False,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> int:
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     use_docker = bool(config.use_docker) and not no_docker and task is not None
     if use_docker:
         try:
-            cmd = _build_docker_interactive_cmd(config, task, session_id, max_turns=max_turns)
+            cmd = _build_docker_interactive_cmd(
+                config,
+                task,
+                session_id,
+                max_turns=max_turns,
+                runtime_context=runtime_context,
+            )
         except RuntimeError as exc:
             print(f"Error: {exc}")
             return 1
-        cwd: Path | None = None
+        cwd: Path | None = runtime_context.cwd
     else:
         cmd = ["claude", *_build_interactive_claude_args(config, session_id, max_turns=max_turns)]
-        cwd = config.project_dir
+        cwd = runtime_context.cwd
 
-    child = subprocess.Popen(cmd, cwd=cwd)
+    child = subprocess.Popen(cmd, cwd=cwd, env=normalize_subprocess_env(runtime_context.env, cwd))
     original_sigint = signal.getsignal(signal.SIGINT)
 
     def _forward_sigint(_signum, _frame):
@@ -270,7 +314,7 @@ def main() -> int:
     args = parser.parse_args()
 
     config = Config.load(Path(args.project))
-    load_dotenv(config.project_dir)
+    runtime_context = RuntimeExecutionContext.from_config(config)
     store = get_store(config)
     task = store.get(args.task_id)
     if task is None:
@@ -307,12 +351,13 @@ def main() -> int:
 
     exit_code = 1
     try:
-        exit_code = _run_interactive_claude(
+        exit_code = _call_run_interactive_claude(
             config,
             args.session_id,
             max_turns=args.max_turns,
             task=task,
             no_docker=args.no_docker,
+            runtime_context=runtime_context,
         )
     except SystemExit as exc:
         exit_code = int(exc.code) if isinstance(exc.code, int) else 1
@@ -378,6 +423,7 @@ def main() -> int:
                         config,
                         task_id=handoff_task_id,
                         quiet=True,
+                        runtime_context=runtime_context,
                     )
                 else:
                     assert handoff.iterate_task_id is not None
@@ -395,6 +441,8 @@ def main() -> int:
                             config,
                             recovery_task,
                             rollback_on_failure=handoff.recovery_task_freshly_created,
+                            store=store,
+                            runtime_context=runtime_context,
                         )
                         if prepared_recovery is None or prepared_recovery.id is None:
                             spawn_rc = 1
@@ -414,6 +462,7 @@ def main() -> int:
                                 prepared_task_id=str(prepared_recovery.id),
                                 prepared_resume=handoff_resume_mode,
                                 prepared_phase="preloop",
+                                runtime_context=runtime_context,
                             )
                 if log_file is not None:
                     handoff_event = "resume" if handoff_resume_mode else "retry"

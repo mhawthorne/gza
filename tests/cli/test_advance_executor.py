@@ -75,6 +75,7 @@ from gza.review_verify_state import (
     persist_recredited_verify_gate_artifact,
     persist_verify_gate_artifact,
 )
+from gza.runtime_context import RuntimeExecutionContext
 from gza.runner import CROSS_PROJECT_TAG, _make_review_verify_result
 from gza.verify_fix_outcome import effective_verify_fix_completion_outcome
 
@@ -1128,10 +1129,11 @@ def test_recover_verify_only_noop_review_persists_clearance_without_creating_rev
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
-        patch("gza.cli.advance_executor.Git", side_effect=lambda path: SimpleNamespace(repo_dir=Path(path), default_branch=lambda: "main", rev_parse_if_exists=lambda ref: "same-head")),
+        patch("gza.cli.advance_executor.Git", side_effect=lambda path, **_kwargs: SimpleNamespace(repo_dir=Path(path), default_branch=lambda: "main", rev_parse_if_exists=lambda ref: "same-head")),
         patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-sha"),
         patch(
             "gza.cli.advance_executor._run_review_verify_command",
@@ -1187,6 +1189,218 @@ def test_recover_verify_only_noop_review_persists_clearance_without_creating_rev
     assert lookup.result.reviewed_head_sha == "same-head"
 
 
+def test_recover_verify_only_noop_review_uses_runtime_env_for_direct_verify(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/unit -q"
+    selected_db = tmp_path / ".gza" / "selected.db"
+    runtime_context = RuntimeExecutionContext(
+        cwd=tmp_path,
+        env={
+            "PATH": "/selected/bin",
+            "PWD": "/stale-runtime-pwd",
+            "GZA_DB_PATH": str(selected_db),
+            "PROJECT_ONLY_TOKEN": "selected-token",
+            "GIT_DIR": "/selected-must-be-stripped",
+        },
+        project_id=config.project_id,
+        db_path=selected_db,
+    )
+    supervisor_cwd = tmp_path / "supervisor"
+    supervisor_cwd.mkdir()
+    monkeypatch.chdir(supervisor_cwd)
+    monkeypatch.setenv("PWD", str(supervisor_cwd))
+    monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+    monkeypatch.setenv("PROJECT_ONLY_TOKEN", "ambient-token")
+    monkeypatch.setenv("GIT_DIR", "/ambient-git-dir")
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-only-noop-runtime-env")
+    store.update(impl)
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head"
+    store.update(review)
+    improve = store.add("Improve attempt", task_type="improve", depends_on=review.id, based_on=impl.id, same_branch=True)
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime.now(UTC)
+    improve.branch = impl.branch
+    improve.changed_diff = False
+    store.update(improve)
+
+    git = _VerifyOnlyNoopGit(impl.branch or "", "same-head")
+    context = _base_executor_context(
+        store=store,
+        config=config,
+        trigger_source="advance",
+        git=git,
+        runtime_context=runtime_context,
+    )
+    observed_git_envs: list[dict[str, str] | None] = []
+
+    def fake_git(path: Path, **kwargs: Any) -> SimpleNamespace:
+        observed_git_envs.append(kwargs.get("env"))
+        return SimpleNamespace(
+            repo_dir=Path(path),
+            default_branch=lambda: "main",
+            rev_parse_if_exists=lambda ref: "same-head",
+        )
+
+    with (
+        patch("gza.cli.advance_executor.Git", side_effect=fake_git),
+        patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-sha"),
+        patch(
+            "gza.cli.advance_executor._run_review_verify_command",
+            return_value=_make_review_verify_result(
+                "uv run pytest tests/unit -q",
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 6, 27, 12, 0, tzinfo=UTC),
+                reviewed_branch=impl.branch,
+                reviewed_head_sha="same-head",
+                reviewed_base_sha="base-sha",
+                working_directory=str(tmp_path),
+            ),
+        ) as run_verify,
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "recover_verify_only_noop_review",
+                "review_task": review,
+                "latest_noop_improve_task": improve,
+                "current_branch_head_sha": "same-head",
+            },
+            context=context,
+        )
+
+    assert result.status == "success"
+    assert observed_git_envs == [runtime_context.env]
+    verify_env = run_verify.call_args.kwargs["env"]
+    provider_cwd = Path(run_verify.call_args.kwargs["cwd"])
+    assert verify_env["PATH"] == "/selected/bin"
+    assert verify_env["PWD"] == str(provider_cwd.resolve())
+    assert verify_env["GZA_DB_PATH"] == str(selected_db)
+    assert verify_env["PROJECT_ONLY_TOKEN"] == "selected-token"
+    assert "GIT_DIR" not in verify_env
+    assert os.environ["PWD"] == str(supervisor_cwd)
+    assert os.environ["GZA_DB_PATH"] == str(tmp_path / "ambient.db")
+    assert os.environ["PROJECT_ONLY_TOKEN"] == "ambient-token"
+    assert os.environ["GIT_DIR"] == "/ambient-git-dir"
+
+
+def test_recover_verify_only_noop_review_passes_runtime_context_to_cross_project_verify(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "uv run pytest tests/unit -q"
+    runtime_context = RuntimeExecutionContext(
+        cwd=tmp_path,
+        env={
+            "PATH": "/selected/bin",
+            "PWD": "/stale-runtime-pwd",
+            "GZA_DB_PATH": str(tmp_path / ".gza" / "selected-cross.db"),
+            "PROJECT_ONLY_TOKEN": "selected-cross-token",
+        },
+        project_id=config.project_id,
+        db_path=tmp_path / ".gza" / "selected-cross.db",
+    )
+    supervisor_cwd = tmp_path / "supervisor"
+    supervisor_cwd.mkdir()
+    monkeypatch.chdir(supervisor_cwd)
+    monkeypatch.setenv("PWD", str(supervisor_cwd))
+    monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient-cross.db"))
+    monkeypatch.setenv("PROJECT_ONLY_TOKEN", "ambient-cross-token")
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-only-noop-cross-runtime")
+    store.update(impl)
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head"
+    store.update(review)
+    improve = store.add("Improve attempt", task_type="improve", depends_on=review.id, based_on=impl.id, same_branch=True)
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime.now(UTC)
+    improve.branch = impl.branch
+    improve.changed_diff = False
+    improve.tags = (CROSS_PROJECT_TAG,)
+    store.update(improve)
+
+    git = _VerifyOnlyNoopGit(impl.branch or "", "same-head")
+    context = _base_executor_context(
+        store=store,
+        config=config,
+        trigger_source="advance",
+        git=git,
+        runtime_context=runtime_context,
+    )
+    cross_result = _make_review_verify_result(
+        "(per-project verify_command)",
+        status="passed",
+        exit_status="1 passed",
+        captured_at=datetime(2026, 6, 27, 12, 0, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="same-head",
+        reviewed_base_sha="base-sha",
+        working_directory="(per-project; see artifact)",
+    )
+    from gza.runner import CrossProjectReviewVerifyResult
+
+    with (
+        patch(
+            "gza.cli.advance_executor.Git",
+            side_effect=lambda path, **kwargs: SimpleNamespace(
+                repo_dir=Path(path),
+                default_branch=lambda: "main",
+                rev_parse_if_exists=lambda ref: "same-head",
+            ),
+        ),
+        patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-sha"),
+        patch(
+            "gza.cli.advance_executor._run_review_verify_commands_for_projects",
+            return_value=CrossProjectReviewVerifyResult(
+                markdown="## verify_command result\n\n- Status: passed",
+                aggregate_result=cross_result,
+                project_results=(),
+            ),
+        ) as cross_verify,
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "recover_verify_only_noop_review",
+                "review_task": review,
+                "latest_noop_improve_task": improve,
+                "current_branch_head_sha": "same-head",
+            },
+            context=context,
+        )
+
+    assert result.status == "success"
+    assert cross_verify.call_args.kwargs["runtime_context"] is runtime_context
+    assert os.environ["PWD"] == str(supervisor_cwd)
+    assert os.environ["GZA_DB_PATH"] == str(tmp_path / "ambient-cross.db")
+    assert os.environ["PROJECT_ONLY_TOKEN"] == "ambient-cross-token"
+
+
 def test_recover_verify_only_noop_review_failed_verify_returns_attention(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -1232,10 +1446,11 @@ def test_recover_verify_only_noop_review_failed_verify_returns_attention(tmp_pat
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
-        patch("gza.cli.advance_executor.Git", side_effect=lambda path: SimpleNamespace(repo_dir=Path(path), default_branch=lambda: "main", rev_parse_if_exists=lambda ref: "same-head")),
+        patch("gza.cli.advance_executor.Git", side_effect=lambda path, **_kwargs: SimpleNamespace(repo_dir=Path(path), default_branch=lambda: "main", rev_parse_if_exists=lambda ref: "same-head")),
         patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-sha"),
         patch(
             "gza.cli.advance_executor._run_review_verify_command",
@@ -1318,6 +1533,7 @@ def test_recover_verify_only_noop_review_head_mismatch_fails_closed(tmp_path: Pa
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     result = execute_advance_action(
@@ -1384,6 +1600,7 @@ def test_recover_verify_only_noop_review_setup_failure_returns_attention(tmp_pat
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with patch.object(git, "worktree_add_existing", side_effect=RuntimeError("boom during add")):
@@ -1453,10 +1670,11 @@ def test_recover_verify_only_noop_review_cleanup_failure_returns_attention(tmp_p
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
-        patch("gza.cli.advance_executor.Git", side_effect=lambda path: SimpleNamespace(repo_dir=Path(path), default_branch=lambda: "main", rev_parse_if_exists=lambda ref: "same-head")),
+        patch("gza.cli.advance_executor.Git", side_effect=lambda path, **_kwargs: SimpleNamespace(repo_dir=Path(path), default_branch=lambda: "main", rev_parse_if_exists=lambda ref: "same-head")),
         patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-sha"),
         patch(
             "gza.cli.advance_executor._run_review_verify_command",
@@ -1554,12 +1772,13 @@ def test_recover_verify_only_noop_review_cross_project_cleanup_failure_returns_a
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
         patch(
             "gza.cli.advance_executor.Git",
-            side_effect=lambda path: SimpleNamespace(
+            side_effect=lambda path, **_kwargs: SimpleNamespace(
                 repo_dir=Path(path),
                 default_branch=lambda: "main",
                 rev_parse_if_exists=lambda ref: "same-head",
@@ -1642,12 +1861,13 @@ def test_recover_verify_only_noop_review_clearance_persistence_failure_returns_s
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
         patch(
             "gza.cli.advance_executor.Git",
-            side_effect=lambda path: SimpleNamespace(
+            side_effect=lambda path, **_kwargs: SimpleNamespace(
                 repo_dir=Path(path),
                 default_branch=lambda: "main",
                 rev_parse_if_exists=lambda ref: "same-head",
@@ -3660,13 +3880,22 @@ def test_execute_advance_action_rejects_retired_noop_verify_action(tmp_path: Pat
     assert result.message == "unsupported action: verify_" "noop_improve_then_review"
 
 
-def test_verify_gate_execution_persists_current_passing_owner_artifact(tmp_path: Path) -> None:
+def test_verify_gate_execution_persists_current_passing_owner_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup_config(tmp_path)
+    (tmp_path / ".env").write_text("PROJECT_ONLY_TOKEN=captured-token\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "/captured/bin")
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
     config.verify_command = "./bin/tests"
     config.autonomous_verify_timeout_seconds = 120
     config.review_verify_timeout_grace_seconds = 5.0
+    runtime_context = RuntimeExecutionContext.from_config(config)
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("PROJECT_ONLY_TOKEN", "ambient-token")
+    monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
 
     impl = store.add("Implement verify gate", task_type="implement")
     assert impl.id is not None
@@ -3711,6 +3940,7 @@ def test_verify_gate_execution_persists_current_passing_owner_artifact(tmp_path:
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=runtime_context,
     )
 
     with (
@@ -3722,7 +3952,7 @@ def test_verify_gate_execution_persists_current_passing_owner_artifact(tmp_path:
                 aggregate_result=verify_result,
                 project_results=(),
             ),
-        ),
+        ) as run_verify,
     ):
         result = execute_advance_action(
             task=impl,
@@ -3746,6 +3976,12 @@ def test_verify_gate_execution_persists_current_passing_owner_artifact(tmp_path:
     assert lookup.is_current is True
     assert lookup.result is not None
     assert lookup.result.status == "passed"
+    run_verify.assert_called_once()
+    assert run_verify.call_args.kwargs["cwd"] == worktree_git.repo_dir
+    assert run_verify.call_args.kwargs["runtime_context"] is runtime_context
+    assert runtime_context.env["PATH"] == "/captured/bin"
+    assert runtime_context.env["PROJECT_ONLY_TOKEN"] == "captured-token"
+    assert runtime_context.env["GZA_DB_PATH"] == str(config.db_path.resolve())
 
 
 def test_verify_gate_owner_for_review_followup_implement_stops_at_same_branch_owner(tmp_path: Path) -> None:
@@ -3861,6 +4097,7 @@ def test_verify_gate_recredits_same_branch_failed_parent_pass_to_live_owner(tmp_
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with patch("gza.cli.advance_executor._run_lifecycle_verify") as run_verify:
@@ -4025,6 +4262,7 @@ def test_verify_gate_recredits_failed_holder_evidence_without_rewriting_source_o
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with patch("gza.cli.advance_executor._run_lifecycle_verify") as run_verify:
@@ -4160,6 +4398,7 @@ def test_verify_gate_no_merge_unit_compat_copy_preserves_source_and_epoch(
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with patch("gza.cli.advance_executor._run_lifecycle_verify") as run_verify:
@@ -4368,6 +4607,7 @@ def test_verify_gate_review_followup_same_branch_runs_live_head_and_persists_to_
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
@@ -4500,6 +4740,7 @@ def test_verify_gate_same_branch_ancestor_cached_pass_does_not_short_circuit_fol
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
@@ -4602,6 +4843,7 @@ def test_verify_gate_cached_pass_with_mismatched_subject_head_runs_verify(tmp_pa
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
@@ -4700,6 +4942,7 @@ def test_verify_gate_explicit_refresh_reruns_even_when_current_decision_already_
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
@@ -4797,6 +5040,7 @@ def test_verify_gate_execution_blocks_current_red_evidence_without_rerun(tmp_pat
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with patch("gza.cli.advance_executor._run_lifecycle_verify", side_effect=AssertionError("verify should not rerun")):
@@ -4851,6 +5095,7 @@ def _build_verify_gate_merge_unit_context(
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
 
@@ -5929,12 +6174,18 @@ def test_completed_legacy_timeout_verify_fix_dry_run_does_not_persist_upgrade(tm
     from gza import advance_engine as advance_engine_module
 
     setup_config(tmp_path)
+    (tmp_path / ".env").write_text("PROJECT_ONLY_TOKEN=captured-token\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "/captured/bin")
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
     config.verify_command = "./bin/tests"
     config.autonomous_verify_timeout_seconds = 120
     config.review_verify_timeout_grace_seconds = 5.0
     config.worktree_path.mkdir(parents=True, exist_ok=True)
+    runtime_context = RuntimeExecutionContext.from_config(config)
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("PROJECT_ONLY_TOKEN", "ambient-token")
+    monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
 
     impl = store.add("Implement timeout verify fix", task_type="implement")
     assert impl.id is not None
@@ -6049,12 +6300,18 @@ def test_completed_legacy_timeout_verify_fix_rerun_uses_managed_worktree_not_dir
     from gza import advance_engine as advance_engine_module
 
     setup_config(tmp_path)
+    (tmp_path / ".env").write_text("PROJECT_ONLY_TOKEN=captured-token\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "/captured/bin")
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
     config.verify_command = "./bin/tests"
     config.autonomous_verify_timeout_seconds = 120
     config.review_verify_timeout_grace_seconds = 5.0
     config.worktree_path.mkdir(parents=True, exist_ok=True)
+    runtime_context = RuntimeExecutionContext.from_config(config)
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("PROJECT_ONLY_TOKEN", "ambient-token")
+    monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
 
     impl = store.add("Implement timeout verify fix", task_type="implement")
     assert impl.id is not None
@@ -6130,6 +6387,7 @@ def test_completed_legacy_timeout_verify_fix_rerun_uses_managed_worktree_not_dir
     lifecycle_git.get_diff_name_status.return_value = ""
     lifecycle_git.resolve_fresh_merge_source.side_effect = lambda branch: ResolvedMergeSourceRef(branch)
     lifecycle_git.status_porcelain.return_value = {("M", "src/local.py")}
+    lifecycle_git.env = runtime_context.env
 
     action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
     assert action["type"] == "rerun_completed_verify_fix"
@@ -6152,6 +6410,7 @@ def test_completed_legacy_timeout_verify_fix_rerun_uses_managed_worktree_not_dir
         spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
         config=config,
         git=lifecycle_git,
+        runtime_context=runtime_context,
     )
     worktree_git = MagicMock()
     worktree_git.repo_dir = worktree_path
@@ -6172,8 +6431,15 @@ def test_completed_legacy_timeout_verify_fix_rerun_uses_managed_worktree_not_dir
         working_directory=str(worktree_path),
     )
 
+    proof_git_envs: list[dict[str, str] | None] = []
+
+    def _proof_git_factory(repo_dir: Path, *, env: dict[str, str] | None = None):
+        assert repo_dir == worktree_path
+        proof_git_envs.append(dict(env) if env is not None else None)
+        return worktree_git
+
     with (
-        patch("gza.cli.advance_executor.Git", return_value=worktree_git),
+        patch("gza.cli.advance_executor.Git", side_effect=_proof_git_factory),
         patch(
             "gza.runner._run_lifecycle_verify",
             return_value=SimpleNamespace(markdown="verify", aggregate_result=rerun_result, project_results=()),
@@ -6187,6 +6453,11 @@ def test_completed_legacy_timeout_verify_fix_rerun_uses_managed_worktree_not_dir
     outcome = effective_verify_fix_completion_outcome(refreshed_fix)
     assert outcome is not None
     assert outcome.recovery_rerun_attempted is True
+    assert proof_git_envs
+    assert all(env == runtime_context.env for env in proof_git_envs)
+    assert proof_git_envs[0]["PATH"] == "/captured/bin"
+    assert proof_git_envs[0]["PROJECT_ONLY_TOKEN"] == "captured-token"
+    assert proof_git_envs[0]["GZA_DB_PATH"] == str(config.db_path.resolve())
     next_action = evaluate_advance_rules(config, store, lifecycle_git, impl, "main")
     assert next_action["type"] == "merge"
 
@@ -7894,6 +8165,7 @@ def test_reconcile_branch_divergence_reports_direct_success(tmp_path: Path) -> N
         ),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
@@ -7966,6 +8238,7 @@ def test_reconcile_branch_divergence_completes_failed_branch_unpushable_task(tmp
         ),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
@@ -8049,6 +8322,7 @@ def test_reconcile_branch_divergence_skips_pr_publication_when_open_pr_known(tmp
         ),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
@@ -8152,6 +8426,7 @@ def test_reconcile_branch_divergence_stale_wip_savepoint_becomes_pushable_and_co
         ),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
@@ -8252,6 +8527,7 @@ def test_reconcile_branch_divergence_completes_with_nonfatal_pr_creation_note(tm
         ),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
@@ -8337,6 +8613,7 @@ def test_reconcile_branch_divergence_push_still_failing_keeps_branch_unpushable(
         ),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
@@ -8454,6 +8731,7 @@ def test_reconcile_branch_divergence_fix_continuation_preserves_follow_up_review
         ),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
@@ -8571,6 +8849,7 @@ def test_reconcile_branch_divergence_fix_continuation_restores_merged_state_with
         ),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (
@@ -8877,6 +9156,7 @@ def test_reconcile_branch_divergence_non_benign_remote_conflict_parks_without_pr
         ),
         config=config,
         git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
     with (

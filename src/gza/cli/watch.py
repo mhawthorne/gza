@@ -48,6 +48,7 @@ from ..console import console, prompt_available_width, shorten_prompt
 from ..db import (
     MERGE_SOURCE_WATCH,
     DuplicateActiveChildError,
+    ExecutionProjectRuntime,
     MainVerifyRemediationAttemptState,
     SqliteTaskStore,
     Task as DbTask,
@@ -65,7 +66,7 @@ from ..dispatch_preview import (
     plan_watch_dispatch_entries,
 )
 from ..failure_reasons import mark_task_failed_from_cause
-from ..git import Git, GitError, resolve_ref_if_possible
+from ..git import Git, Git as ProductionGit, GitError, resolve_ref_if_possible
 from ..git_health import GIT_HEALTH_PROMPT, GIT_HEALTH_REASON, check_git_health
 from ..lifecycle_completion import (
     merge_state_is_terminal_for_lifecycle,
@@ -131,6 +132,7 @@ from ..recovery_transients import (
     compute_transient_recovery_backoff_seconds,
 )
 from ..runner import require_execution_route_for_task
+from ..runtime_context import RuntimeExecutionContext
 from ..source_followup import collect_non_dropped_implement_source_ids
 from ..status_ops import apply_manual_task_status
 from ..sync_ops import reconcile_task_branch_merge_truth
@@ -4013,7 +4015,12 @@ def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
     return argv
 
 
-def start_usage_warmer(config: Config, store: SqliteTaskStore) -> threading.Event:
+def start_usage_warmer(
+    config: Config,
+    store: SqliteTaskStore,
+    *,
+    runtime_context: RuntimeExecutionContext | None = None,
+) -> threading.Event:
     """Refresh provider usage out of band for the duration of a watch run.
 
     Kept off the cycle path deliberately: the header renders from cache, so a
@@ -4022,13 +4029,20 @@ def start_usage_warmer(config: Config, store: SqliteTaskStore) -> threading.Even
     stop = threading.Event()
     if not config.usage:
         return stop
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
 
     def _loop() -> None:
         from ..usage_service import get_primary_usage
 
         while not stop.is_set():
             try:
-                get_primary_usage(store, config, refresh=True)
+                get_primary_usage(
+                    store,
+                    config,
+                    refresh=True,
+                    env=runtime_context.env,
+                    cwd=runtime_context.cwd,
+                )
             except Exception:  # noqa: BLE001 - usage never breaks watch
                 pass
             stop.wait(max(60, config.usage_ttl_seconds))
@@ -4037,7 +4051,12 @@ def start_usage_warmer(config: Config, store: SqliteTaskStore) -> threading.Even
     return stop
 
 
-def _format_watch_usage_message(config: Config, store: SqliteTaskStore) -> str | None:
+def _format_watch_usage_message(
+    config: Config,
+    store: SqliteTaskStore,
+    *,
+    runtime_context: RuntimeExecutionContext | None = None,
+) -> str | None:
     """Usage line for the cycle header, refreshed through the TTL cache.
 
     Usage is decoration: any failure here degrades to a stale reading or to no
@@ -4045,13 +4064,20 @@ def _format_watch_usage_message(config: Config, store: SqliteTaskStore) -> str |
     """
     if not config.usage:
         return None
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     try:
         from ..usage import format_usage_line
         from ..usage_service import get_primary_usage
 
         # Cache-only: a cycle header must never block on a provider
         # subprocess. `start_usage_warmer` keeps the value fresh out of band.
-        snapshot = get_primary_usage(store, config, refresh=False)
+        snapshot = get_primary_usage(
+            store,
+            config,
+            refresh=False,
+            env=runtime_context.env,
+            cwd=runtime_context.cwd,
+        )
     except Exception:  # noqa: BLE001 - a usage bug must not stop watch
         return None
     if snapshot is None:
@@ -4749,6 +4775,7 @@ def _run_isolated_merge_batch(
     log: "_WatchLog",
     tags: tuple[str, ...] | None,
     any_tag: bool,
+    env: Mapping[str, str] | None,
     reserve_rebase_launch: Callable[[str], LaunchPermit | None],
     create_rebase_task: Callable[[DbTask], DbTask],
     prepare_rebase_task: Callable[[DbTask, LaunchPermit], DbTask | None],
@@ -4991,6 +5018,7 @@ def _run_isolated_merge_batch(
             merge_git,
             reason="watch-pre-merge-batch",
             red_reruns=2,
+            env=env,
         ),
     )
     if combined_candidate.evidence.verify_status == "passed":
@@ -5128,6 +5156,7 @@ def _run_isolated_merge_batch(
                 merge_git,
                 reason=f"watch-pre-merge-prefix-{staged_entry.display_task.id}",
                 red_reruns=2,
+                env=env,
             ),
         )
         if prefix_check.evidence.verify_status != "passed":
@@ -5588,6 +5617,7 @@ def _reconcile_watch_runtime_state(
     config: Config,
     store: SqliteTaskStore,
     runtime_key: str,
+    runtime_context: RuntimeExecutionContext,
     dry_run: bool,
 ) -> "ProjectRuntimeReconcileResult":
     from ._common import (
@@ -5597,9 +5627,9 @@ def _reconcile_watch_runtime_state(
     )
 
     if not dry_run:
-        reconcile_in_progress_tasks(config)
+        reconcile_in_progress_tasks(config, store=store, runtime_context=runtime_context)
         prune_terminal_dead_workers(config)
-        reconcile_dead_pending_recovery_tasks(config)
+        reconcile_dead_pending_recovery_tasks(config, store=store, runtime_context=runtime_context)
     live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = _collect_live_running_state(
         config,
         store,
@@ -5826,6 +5856,7 @@ def _run_watch_main_integration_verify(
     reason: str,
     red_reruns: int,
     suppress_verify_stdout: bool = False,
+    env: Mapping[str, str] | None = None,
 ) -> MainIntegrationVerifyCheck:
     head_sha = _resolve_main_verify_target_head(git, target_branch, log)
     target = _format_main_verify_target(target_branch, head_sha)
@@ -5868,6 +5899,7 @@ def _run_watch_main_integration_verify(
             reason=reason,
             red_reruns=red_reruns,
             resolved_head_sha=head_sha,
+            env=env or getattr(git, "env", None) or RuntimeExecutionContext.from_config(config).env,
             on_initial_run_start=log_initial_run,
             on_red_rerun_start=log_red_rerun,
         ),
@@ -6759,6 +6791,7 @@ class WatchProjectRuntime:
     selection: WatchProjectSelection
     config: Config
     store: SqliteTaskStore
+    runtime_context: RuntimeExecutionContext
     git: Git
     log: "_WatchLog"
     runtime_identity: WatchRuntimeIdentity
@@ -6771,6 +6804,70 @@ class WatchProjectRuntime:
     _confirmed_started_task_ids: set[str] = field(default_factory=set)
     _attempted_dispatch_task_ids: set[str] = field(default_factory=set)
 
+    @staticmethod
+    def _validate_runtime_ownership(
+        *,
+        key: str,
+        config: Config,
+        store: SqliteTaskStore,
+        runtime_context: RuntimeExecutionContext,
+        git: Git | None = None,
+    ) -> None:
+        try:
+            config_db_path = config.db_path.resolve()
+            store_db_path = store.db_path.resolve()
+            context_db_path = runtime_context.db_path.resolve()
+            config_project_dir = config.project_dir.resolve()
+            context_cwd = runtime_context.cwd.resolve()
+            git_repo_dir = git.repo_dir.resolve() if type(git) is ProductionGit else None
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"watch runtime {key!r} has unresolved ownership paths: {exc}") from exc
+        mismatches: list[str] = []
+        if store_db_path != config_db_path:
+            mismatches.append(f"store db_path {store_db_path} != config db_path {config_db_path}")
+        if context_db_path != config_db_path:
+            mismatches.append(f"context db_path {context_db_path} != config db_path {config_db_path}")
+        if store.project_id != config.project_id:
+            mismatches.append(f"store project_id {store.project_id!r} != config project_id {config.project_id!r}")
+        if runtime_context.project_id != config.project_id:
+            mismatches.append(
+                f"context project_id {runtime_context.project_id!r} != config project_id {config.project_id!r}"
+            )
+        if context_cwd != config_project_dir:
+            mismatches.append(f"context cwd {context_cwd} != project root {config_project_dir}")
+        if git_repo_dir is not None and git_repo_dir != config_project_dir:
+            mismatches.append(f"git repo_dir {git_repo_dir} != project root {config_project_dir}")
+        if type(git) is ProductionGit:
+            git_env = getattr(git, "env", None)
+            if git_env is None:
+                mismatches.append("git env is not explicit")
+            elif dict(git_env) != runtime_context.env:
+                mismatches.append("git env does not match runtime context env")
+        if mismatches:
+            raise ValueError(f"watch runtime {key!r} ownership mismatch: {'; '.join(mismatches)}")
+
+    @classmethod
+    def from_execution_runtime(
+        cls,
+        *,
+        key: str,
+        runtime: ExecutionProjectRuntime,
+        log: "_WatchLog",
+        tags: tuple[str, ...] | None,
+        any_tag: bool,
+        git: Git | None = None,
+    ) -> "WatchProjectRuntime":
+        return cls.create(
+            key=key,
+            config=runtime.config,
+            store=runtime.store,
+            log=log,
+            tags=tags,
+            any_tag=any_tag,
+            git=git,
+            runtime_context=runtime.runtime_context,
+        )
+
     @classmethod
     def create(
         cls,
@@ -6782,7 +6879,16 @@ class WatchProjectRuntime:
         tags: tuple[str, ...] | None,
         any_tag: bool,
         git: Git | None = None,
+        runtime_context: RuntimeExecutionContext | None = None,
     ) -> "WatchProjectRuntime":
+        runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
+        cls._validate_runtime_ownership(
+            key=key,
+            config=config,
+            store=store,
+            runtime_context=runtime_context,
+            git=git,
+        )
         identity = WatchRuntimeIdentity.create(selector_key=key, config=config, store=store)
         return cls(
             selection=WatchProjectSelection(
@@ -6793,7 +6899,8 @@ class WatchProjectRuntime:
             ),
             config=config,
             store=store,
-            git=git if git is not None else Git(config.project_dir),
+            runtime_context=runtime_context,
+            git=git if git is not None else Git(config.project_dir, env=runtime_context.env),
             log=log,
             runtime_identity=identity,
         )
@@ -6824,6 +6931,7 @@ class WatchProjectRuntime:
             config=self.config,
             store=self.store,
             runtime_key=self.key,
+            runtime_context=self.runtime_context,
             dry_run=dry_run,
         )
 
@@ -6853,6 +6961,7 @@ class WatchProjectRuntime:
             known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
             excluded_owner_ids=excluded_owner_ids,
             git=self.git,
+            runtime_context=self.runtime_context,
         )
         return ProjectCycleAnalysis(
             runtime_key=self.key,
@@ -6872,6 +6981,7 @@ class WatchProjectRuntime:
             tags=self.tags,
             any_tag=self.any_tag,
             git=self.git,
+            runtime_context=self.runtime_context,
             **kwargs,
         )
 
@@ -7378,6 +7488,8 @@ class WatchProjectRuntime:
                 self.config,
                 task,
                 rollback_on_failure=False,
+                store=self.store,
+                runtime_context=self.runtime_context,
             )
             if prepared_task is None:
                 permit.release()
@@ -7423,6 +7535,7 @@ class WatchProjectRuntime:
                     prepared_resume=pending_recovery_mode == "resume",
                     prepared_phase="preloop",
                     startup_quiet=True,
+                    runtime_context=self.runtime_context,
                 ),
             )
             release_task_launch_permit(str(prepared_task.id))
@@ -7445,6 +7558,7 @@ class WatchProjectRuntime:
                     task_id=task.id,
                     quiet=quiet,
                     startup_quiet=True,
+                    runtime_context=self.runtime_context,
                 ),
             )
             permit.release()
@@ -9338,6 +9452,7 @@ def _scoped_watch_active_count(
     scoped_task_ids: tuple[str, ...] | None = None,
     known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
     git: Git | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> int:
     return _scoped_watch_activity(
         config=config,
@@ -9352,6 +9467,7 @@ def _scoped_watch_active_count(
         scoped_task_ids=scoped_task_ids,
         known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
         git=git,
+        runtime_context=runtime_context,
     ).active_count
 
 
@@ -9369,7 +9485,9 @@ def _scoped_watch_activity(
     scoped_task_ids: tuple[str, ...] | None = None,
     known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
     git: Git | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> _ScopedWatchActivity:
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     plan = _build_watch_cycle_plan(
         config=config,
         store=store,
@@ -9383,10 +9501,11 @@ def _scoped_watch_activity(
         scoped_task_ids=scoped_task_ids,
         known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
         git=git,
+        runtime_context=runtime_context,
     )
     planned_active_owner_ids = _collect_planned_active_owner_ids(plan.analysis)
     effective_scoped_owner_ids = getattr(plan.analysis, "effective_scoped_owner_ids", None) or scoped_owner_ids
-    scoped_git = git if git is not None else Git(config.project_dir)
+    scoped_git = git if git is not None else Git(config.project_dir, env=runtime_context.env)
     selector_closure_by_owner = _scoped_selector_recovery_closure_by_owner(
         store=store,
         scoped_owner_ids=scoped_owner_ids,
@@ -9487,8 +9606,10 @@ def _build_watch_cycle_plan(
     known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
     excluded_owner_ids: frozenset[str] = frozenset(),
     git: Git | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
     reconciled_runtime_state: ProjectRuntimeReconcileResult | None = None,
 ) -> _WatchCyclePlan:
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     if reconciled_runtime_state is None:
         snapshot = get_concurrency_snapshot(config, store, cleanup_stale=False)
         running_task_ids = snapshot.running_task_ids
@@ -9529,7 +9650,7 @@ def _build_watch_cycle_plan(
     )
     effective_batch = min(batch, config.max_concurrent)
     slots = max(0, effective_batch - running)
-    cycle_git = git if git is not None else Git(config.project_dir)
+    cycle_git = git if git is not None else Git(config.project_dir, env=runtime_context.env)
     analysis = _analyze_watch_cycle(
         config=config,
         store=store,
@@ -9589,6 +9710,7 @@ def _dispatch_scoped_watch_once(
     excluded_owner_ids: frozenset[str] = frozenset(),
     seen_active_recovery_subject_ids: frozenset[str] = frozenset(),
     git: Git | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
     direct_phase_only: bool = False,
     skip_runtime_reconcile: bool = False,
     skip_stale_no_progress_reconcile: bool = False,
@@ -9624,6 +9746,7 @@ def _dispatch_scoped_watch_once(
         excluded_owner_ids=excluded_owner_ids,
         seen_active_recovery_subject_ids=seen_active_recovery_subject_ids,
         git=git,
+        runtime_context=runtime_context,
         direct_phase_only=direct_phase_only,
         skip_runtime_reconcile=skip_runtime_reconcile,
         skip_stale_no_progress_reconcile=skip_stale_no_progress_reconcile,
@@ -9663,10 +9786,12 @@ def _run_cycle(
     excluded_owner_ids: frozenset[str] = frozenset(),
     seen_active_recovery_subject_ids: frozenset[str] = frozenset(),
     git: Git | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
     direct_phase_only: bool = False,
     skip_runtime_reconcile: bool = False,
     skip_stale_no_progress_reconcile: bool = False,
 ) -> _CycleResult:
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     tags = normalize_tag_filters(tags)
     scoped_mode = scoped_owner_ids is not None
     if restart_failed:
@@ -9693,6 +9818,7 @@ def _run_cycle(
             config=config,
             store=store,
             runtime_key=config.project_name,
+            runtime_context=runtime_context,
             dry_run=dry_run,
         )
 
@@ -9716,6 +9842,7 @@ def _run_cycle(
         known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
         excluded_owner_ids=excluded_owner_ids,
         git=git,
+        runtime_context=runtime_context,
         reconciled_runtime_state=reconciled_runtime_state,
     )
     running_task_ids = list(plan.running_task_ids)
@@ -9793,7 +9920,7 @@ def _run_cycle(
         scope_message = _format_scope_message(tags, any_tag=any_tag, scoped_owner_ids=effective_scoped_owner_ids)
         if scope_message is not None:
             log.emit("INFO", scope_message)
-        usage_message = _format_watch_usage_message(config, store)
+        usage_message = _format_watch_usage_message(config, store, runtime_context=runtime_context)
         if usage_message is not None:
             log.emit("INFO", usage_message)
 
@@ -9818,6 +9945,8 @@ def _run_cycle(
             config,
             task,
             rollback_on_failure=rollback_on_failure,
+            store=store,
+            runtime_context=runtime_context,
         )
         if prepared_task is None:
             permit.release()
@@ -9954,7 +10083,7 @@ def _run_cycle(
     # with no implement child, aligned with gza advance).
     # Merges run first; worker-spawning actions consume available slots.
     isolation_enabled = bool(getattr(config, "main_checkout_isolate", False))
-    git = git if git is not None else Git(config.project_dir)
+    git = git if git is not None else Git(config.project_dir, env=runtime_context.env)
     analysis = plan.analysis
     target_branch = analysis.target_branch
     _check_canonical_checkout_boundary("watch-pass-start")
@@ -9982,6 +10111,7 @@ def _run_cycle(
                 quiet=quiet,
                 prepared_task=task_obj,
                 startup_quiet=True,
+                runtime_context=runtime_context,
             ),
         )
 
@@ -10000,6 +10130,7 @@ def _run_cycle(
                 quiet=quiet,
                 prepared_task=task_obj,
                 startup_quiet=True,
+                runtime_context=runtime_context,
             ),
         )
 
@@ -10021,6 +10152,7 @@ def _run_cycle(
                 config,
                 task_obj,
                 startup_quiet=True,
+                runtime_context=runtime_context,
             ),
         )
 
@@ -10092,6 +10224,8 @@ def _run_cycle(
             config,
             task,
             rollback_on_failure=rollback_on_failure,
+            store=store,
+            runtime_context=runtime_context,
         ),
         prepare_create_review=lambda t: _prepare_create_review_action(
             store,
@@ -10161,6 +10295,7 @@ def _run_cycle(
                 prepared_resume=mode == "resume",
                 prepared_phase="preloop",
                 startup_quiet=True,
+                runtime_context=runtime_context,
             ),
         ),
         prefer_iterate_for_action=lambda task, action: _watch_iterate_impl_target(
@@ -10178,6 +10313,7 @@ def _run_cycle(
             t,
             target_branch=target_branch,
         ),
+        runtime_context=runtime_context,
     )
     current_branch = git.current_branch()
     merge_git: Git | None = None
@@ -10257,6 +10393,7 @@ def _run_cycle(
             target_branch=target_branch,
             reason="watch-main-verify",
             red_reruns=2,
+            env=runtime_context.env,
         )
         main_verify_dispatch_state_changed = _retire_cleared_main_verify_remediations(
             store=store,
@@ -10488,6 +10625,7 @@ def _run_cycle(
                         log=log,
                         tags=tags,
                         any_tag=any_tag,
+                        env=runtime_context.env,
                         reserve_rebase_launch=lambda subject_id: _reserve_watch_launch("rebase", subject_id),
                         create_rebase_task=_create_rebase_from_task,
                         prepare_rebase_task=lambda rebase_task, permit: _prepare_watch_reserved_task(
@@ -10772,6 +10910,7 @@ def _run_cycle(
                         target_branch=target_branch,
                         reason="watch-post-merge",
                         red_reruns=2,
+                        env=runtime_context.env,
                     )
                     main_verify_dispatch_state_changed = _retire_cleared_main_verify_remediations(
                         store=store,
@@ -11344,6 +11483,8 @@ def _run_cycle(
                 scoped_owner_ids=scoped_owner_ids,
                 scoped_task_ids=scoped_task_ids,
                 known_effective_scoped_owner_ids=effective_scoped_owner_ids,
+                git=git,
+                runtime_context=runtime_context,
             )
             if scoped_mode and scoped_owner_ids is not None
             else 0
@@ -12146,6 +12287,7 @@ def _run_cycle(
                             quiet=quiet,
                             prepared_task=prepared_recovered_task,
                             startup_quiet=True,
+                            runtime_context=runtime_context,
                         ),
                     )
                     _release_watch_reserved_task(recovered_task_id)
@@ -12228,6 +12370,7 @@ def _run_cycle(
                             prepared_resume=True,
                             prepared_phase="preloop",
                             startup_quiet=True,
+                            runtime_context=runtime_context,
                         ),
                     )
                     _release_watch_reserved_task(recovered_task_id)
@@ -12330,6 +12473,7 @@ def _run_cycle(
                             quiet=quiet,
                             prepared_task=prepared_recovered_task,
                             startup_quiet=True,
+                            runtime_context=runtime_context,
                         ),
                     )
                     if decision.launch_mode == "worker"
@@ -12352,6 +12496,7 @@ def _run_cycle(
                             prepared_resume=False,
                             prepared_phase="preloop",
                             startup_quiet=True,
+                            runtime_context=runtime_context,
                         ),
                     )
                 )
@@ -12836,6 +12981,7 @@ def _run_cycle(
                             prepared_resume=pending_recovery_mode == "resume",
                             prepared_phase="preloop",
                             startup_quiet=True,
+                            runtime_context=runtime_context,
                         ),
                     )
                     _release_watch_reserved_task(str(prepared_pending_task.id))
@@ -12929,6 +13075,7 @@ def _run_cycle(
                         task_id=task.id,
                         quiet=quiet,
                         startup_quiet=True,
+                        runtime_context=runtime_context,
                     ),
                 )
                 if rc != 0:
@@ -12980,6 +13127,8 @@ def _run_cycle(
             scoped_owner_ids=scoped_owner_ids,
             scoped_task_ids=scoped_task_ids,
             known_effective_scoped_owner_ids=effective_scoped_owner_ids,
+            git=git,
+            runtime_context=runtime_context,
         )
         if scoped_mode and scoped_owner_ids is not None
         else 0
@@ -13033,7 +13182,9 @@ def _preview_initial_watch_cycle(
     known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
     excluded_owner_ids: frozenset[str] = frozenset(),
     git: Git | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> tuple[_CycleResult, _WatchCyclePlan]:
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     plan = _build_watch_cycle_plan(
         config=config,
         store=store,
@@ -13048,6 +13199,7 @@ def _preview_initial_watch_cycle(
         known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
         excluded_owner_ids=excluded_owner_ids,
         git=git,
+        runtime_context=runtime_context,
     )
     log.begin_cycle()
     if scoped_owner_ids is not None:
@@ -13075,6 +13227,7 @@ def _preview_initial_watch_cycle(
             known_effective_scoped_owner_ids=plan.analysis.effective_scoped_owner_ids,
             excluded_owner_ids=excluded_owner_ids,
             git=git,
+            runtime_context=runtime_context,
         )
     else:
         result = _run_cycle(
@@ -13101,6 +13254,7 @@ def _preview_initial_watch_cycle(
             known_effective_scoped_owner_ids=plan.analysis.effective_scoped_owner_ids,
             excluded_owner_ids=excluded_owner_ids,
             git=git,
+            runtime_context=runtime_context,
         )
     return result, plan
 
@@ -13109,10 +13263,15 @@ def _has_explicit_max_concurrent(config: Config) -> bool:
     return "max_concurrent" in config.source_map
 
 
-def _system_can_run_tasks(config: Config) -> bool:
+def _system_can_run_tasks(config: Config, *, runtime_context: RuntimeExecutionContext | None = None) -> bool:
     if not config.use_docker:
         return True
-    return wait_for_docker_ready(config.docker_startup_timeout)
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
+    return wait_for_docker_ready(
+        config.docker_startup_timeout,
+        host_env=runtime_context.env,
+        host_cwd=runtime_context.cwd,
+    )
 
 
 def _emit_git_health_hold(
@@ -13123,11 +13282,13 @@ def _emit_git_health_hold(
     persist: bool,
     hold_active: bool,
     git: Git | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> bool:
     """Check shared git health and emit HOLD/ATTENTION when dispatch must pause."""
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     git_health_check = check_git_health(
         store,
-        git if git is not None else Git(config.project_dir),
+        git if git is not None else Git(config.project_dir, env=runtime_context.env),
         persist=persist,
     )
     if not git_health_check.dispatch_halted:
@@ -13302,8 +13463,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     store = get_store(config, open_mode="watch_lease_activation")
     log = _WatchLog(config.project_dir / ".gza" / "watch.log", quiet=quiet)
+    runtime_context = RuntimeExecutionContext.from_config(config)
     # Warms the usage cache for the whole run; the cycle header only reads it.
-    start_usage_warmer(config, store)
+    start_usage_warmer(config, store, runtime_context=runtime_context)
     if startup_cap_warning is not None:
         log.emit("WARN", startup_cap_warning)
     runtime = WatchProjectRuntime.create(
@@ -13313,6 +13475,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         log=log,
         tags=tag_filters,
         any_tag=any_tag,
+        runtime_context=runtime_context,
     )
     installed_package_drift = _InstalledPackageDriftState(startup_fingerprint=_installed_gza_package_fingerprint())
     if raw_task_ids:
@@ -13419,6 +13582,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 persist=False,
                 hold_active=runtime.git_health_hold_active,
                 git=runtime.git,
+                runtime_context=runtime.runtime_context,
             ):
                 result_code = 0
             else:
@@ -13522,6 +13686,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 known_effective_scoped_owner_ids=effective_scoped_owner_ids,
                 excluded_owner_ids=_active_failure_owner_ids(),
                 git=runtime.git,
+                runtime_context=runtime.runtime_context,
             )
             needs_initial_preview = False
             if preview_plan is not None:
@@ -13587,7 +13752,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
             if watch_session_recorded:
                 _heartbeat_watch_session(store=runtime.store, log=runtime.log, owner_pid=watch_pid)
 
-            if not _system_can_run_tasks(runtime.config):
+            if not _system_can_run_tasks(runtime.config, runtime_context=runtime.runtime_context):
                 if preview_cycle_open:
                     runtime.log.end_cycle()
                     preview_cycle_open = False
@@ -13606,6 +13771,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         scoped_task_ids=raw_task_ids,
                         known_effective_scoped_owner_ids=effective_scoped_owner_ids,
                         git=runtime.git,
+                        runtime_context=runtime.runtime_context,
                     )
                     effective_scoped_owner_ids = scoped_activity.effective_scoped_owner_ids
                     scope_message = _format_scope_message(
@@ -13660,6 +13826,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 persist=not dry_run,
                 hold_active=runtime.git_health_hold_active,
                 git=runtime.git,
+                runtime_context=runtime.runtime_context,
             ):
                 if preview_cycle_open:
                     runtime.log.end_cycle()
@@ -13751,6 +13918,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     excluded_owner_ids=excluded_owner_ids,
                     seen_active_recovery_subject_ids=runtime.seen_active_recovery_subject_ids,
                     git=runtime.git,
+                    runtime_context=runtime.runtime_context,
                 )
             else:
                 cycle_result = runtime.run_cycle(
@@ -13926,7 +14094,8 @@ def cmd_main_verify(args: argparse.Namespace) -> int:
     """Force or inspect the canonical local-target integration verify gate."""
     config = Config.load(args.project_dir)
     store = get_store(config)
-    git = Git(config.project_dir)
+    runtime_context = RuntimeExecutionContext.from_config(config)
+    git = Git(config.project_dir, env=runtime_context.env)
     verify_git = git
     target_branch = git.default_branch()
     if config.main_checkout_isolate:
@@ -13939,6 +14108,7 @@ def cmd_main_verify(args: argparse.Namespace) -> int:
         reason="operator-main-verify",
         force=bool(getattr(args, "force", False)),
         red_reruns=2 if bool(getattr(args, "force", False)) else 0,
+        env=runtime_context.env,
     )
     verify_status = getattr(check.state, "verify_status", None)
     status = verify_status if isinstance(verify_status, str) and verify_status else "unknown"

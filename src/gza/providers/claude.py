@@ -12,13 +12,14 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from rich.markup import escape as rich_escape
 
+from ..runtime_context import normalize_subprocess_env
 from .base import (
     DEFAULT_PROVIDER_DOCKER_STARTUP_TIMEOUT,
     DockerConfig,
@@ -625,7 +626,11 @@ class ClaudeLogRenderer:
             )
         return self._render_unknown(entry, tv=tv)
 
-def sync_keychain_credentials() -> bool:
+def sync_keychain_credentials(
+    *,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+) -> bool:
     """Extract Claude OAuth credentials from macOS Keychain and write to ~/.claude/.credentials.json.
 
     Returns True if credentials were written, False otherwise.
@@ -634,16 +639,20 @@ def sync_keychain_credentials() -> bool:
         logger.warning("sync_keychain_credentials: not on macOS, skipping")
         return False
 
-    if not shutil.which("security"):
+    keychain_env = normalize_subprocess_env(env, cwd)
+    security_path = shutil.which("security", path=keychain_env.get("PATH"))
+    if security_path is None:
         logger.warning("sync_keychain_credentials: 'security' command not found, skipping")
         return False
 
     try:
         result = subprocess.run(
-            ["security", "find-generic-password", "-l", "Claude Code-credentials", "-w"],
+            [security_path, "find-generic-password", "-l", "Claude Code-credentials", "-w"],
             capture_output=True,
             text=True,
             timeout=10,
+            cwd=cwd,
+            env=keychain_env,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError):
         logger.warning("sync_keychain_credentials: failed to run security command")
@@ -668,7 +677,8 @@ def sync_keychain_credentials() -> bool:
         logger.warning("sync_keychain_credentials: keychain entry missing 'claudeAiOauth' key")
         return False
 
-    claude_dir = Path.home() / ".claude"
+    home = Path(keychain_env.get("HOME", str(Path.home()))).expanduser()
+    claude_dir = home / ".claude"
     claude_dir.mkdir(exist_ok=True)
     creds_path = claude_dir / ".credentials.json"
     creds_path.write_text(json.dumps(creds, indent=2) + "\n")
@@ -709,25 +719,41 @@ class ClaudeProvider(Provider):
     def credential_setup_hint(self) -> str:
         return "Set ANTHROPIC_API_KEY in ~/.gza/.env or run 'claude login' to authenticate via OAuth"
 
-    def check_credentials(self) -> bool:
+    def check_credentials(self, *, env: Mapping[str, str] | None = None) -> bool:
         """Check for Claude credentials (OAuth or API key)."""
-        claude_config = Path.home() / ".claude"
+        env_source = os.environ if env is None else env
+        home = Path.home() if env is None else Path(env_source.get("HOME", str(Path.home()))).expanduser()
+        claude_config = home / ".claude"
         if claude_config.is_dir():
             return True
-        if os.getenv("ANTHROPIC_API_KEY"):
+        if env_source.get("ANTHROPIC_API_KEY"):
             return True
         return False
 
-    def verify_credentials(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
+    def verify_credentials(
+        self,
+        config: Config,
+        log_file: Path | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> PreflightCheckResult:
         """Verify Claude credentials by testing the claude command."""
         if config.use_docker:
-            return self._verify_docker(config, log_file=log_file)
-        return self._verify_direct(log_file=log_file)
+            return self._verify_docker(config, log_file=log_file, env=env, cwd=cwd or config.project_dir)
+        return self._verify_direct(log_file=log_file, env=env, cwd=cwd or config.project_dir)
 
-    def _verify_docker(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
+    def _verify_docker(
+        self,
+        config: Config,
+        log_file: Path | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> PreflightCheckResult:
         """Verify credentials work in Docker."""
         if config.claude.fetch_auth_token_from_keychain:
-            sync_keychain_credentials()
+            sync_keychain_credentials(env=env, cwd=cwd)
         docker_config = _get_docker_config(
             f"{config.docker_image}-claude",
             docker_startup_timeout=config.docker_startup_timeout,
@@ -737,6 +763,8 @@ class ClaudeProvider(Provider):
             config.project_dir,
             log_file=log_file,
             provider_label="Claude",
+            host_env=env,
+            host_cwd=cwd,
         ):
             print("Error: Failed to build Docker image")
             return PreflightCheckResult.failure(
@@ -752,6 +780,8 @@ class ClaudeProvider(Provider):
                 "  Run 'claude login' or set ANTHROPIC_API_KEY in .env"
             ),
             log_file=log_file,
+            env=env,
+            cwd=cwd,
         )
         if not result.ok and result.failure_reason == "PROVIDER_UNAVAILABLE":
             return PreflightCheckResult.failure(
@@ -760,7 +790,13 @@ class ClaudeProvider(Provider):
             )
         return result
 
-    def _verify_direct(self, log_file: Path | None = None) -> PreflightCheckResult:
+    def _verify_direct(
+        self,
+        log_file: Path | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> PreflightCheckResult:
         """Verify credentials work directly."""
         cmd = ["claude", "--version"]
         try:
@@ -769,6 +805,8 @@ class ClaudeProvider(Provider):
                 capture_output=True,
                 timeout=5,
                 text=True,
+                env=normalize_subprocess_env(env, cwd),
+                cwd=cwd,
             )
             output = result.stdout + result.stderr
             write_preflight_entry(
@@ -836,6 +874,7 @@ class ClaudeProvider(Provider):
         on_step_count: Callable[[int], None] | None = None,
         interactive: bool = False,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run Claude to execute a task."""
         conversation_log_file = log_file
@@ -851,6 +890,7 @@ class ClaudeProvider(Provider):
                 on_session_id=on_session_id,
                 on_step_count=on_step_count,
                 ops_log_file=ops_log_file,
+                env=env,
             )
         if config.use_docker:
             return self._run_docker(
@@ -862,6 +902,7 @@ class ClaudeProvider(Provider):
                 on_session_id,
                 on_step_count,
                 ops_log_file=ops_log_file,
+                env=env,
             )
         return self._run_direct(
             config,
@@ -872,6 +913,7 @@ class ClaudeProvider(Provider):
             on_session_id,
             on_step_count,
             ops_log_file=ops_log_file,
+            env=env,
         )
 
     def _run_interactive(
@@ -884,6 +926,7 @@ class ClaudeProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run Claude in foreground mode while preserving runner telemetry callbacks."""
         conversation_log_file = log_file
@@ -899,6 +942,7 @@ class ClaudeProvider(Provider):
                 on_session_id=on_session_id,
                 on_step_count=on_step_count,
                 ops_log_file=ops_log_file,
+                env=env,
             )
         return self._run_direct_interactive(
             config,
@@ -909,6 +953,7 @@ class ClaudeProvider(Provider):
             on_session_id=on_session_id,
             on_step_count=on_step_count,
             ops_log_file=ops_log_file,
+            env=env,
         )
 
     @staticmethod
@@ -972,19 +1017,21 @@ class ClaudeProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run Claude in foreground interactive mode in Docker."""
         conversation_log_file = log_file
         if ops_log_file is None:
             ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
+        run_cwd = getattr(config, "provider_cwd", None) or work_dir
         if config.claude.fetch_auth_token_from_keychain:
-            sync_keychain_credentials()
+            sync_keychain_credentials(env=env, cwd=run_cwd)
         docker_config = _get_docker_config(
             f"{config.docker_image}-claude",
             docker_startup_timeout=config.docker_startup_timeout,
         )
 
-        if not ensure_docker_image(docker_config, config.project_dir):
+        if not ensure_docker_image(docker_config, config.project_dir, host_env=env, host_cwd=run_cwd):
             print("Error: Failed to build Docker image")
             return RunResult(exit_code=1)
 
@@ -997,6 +1044,7 @@ class ClaudeProvider(Provider):
             getattr(config, "docker_env", None),
             getattr(config, "docker_workdir", "/workspace"),
             interactive=True,
+            host_env=env,
         )
         cmd.append("claude")
         cmd.extend(self._build_claude_interactive_args(config, resume_session_id))
@@ -1004,11 +1052,13 @@ class ClaudeProvider(Provider):
             cmd,
             conversation_log_file,
             ops_log_file,
+            cwd=run_cwd,
             timeout_minutes=config.timeout_minutes,
             on_session_id=on_session_id,
             on_step_count=on_step_count,
             stdin_input=prompt,
             resume_session_id=resume_session_id,
+            env=env,
         )
 
     def _run_direct_interactive(
@@ -1021,6 +1071,7 @@ class ClaudeProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run Claude in foreground interactive mode on host."""
         conversation_log_file = log_file
@@ -1038,6 +1089,7 @@ class ClaudeProvider(Provider):
             on_step_count=on_step_count,
             stdin_input=prompt,
             resume_session_id=resume_session_id,
+            env=env,
         )
 
     def _run_docker(
@@ -1050,19 +1102,21 @@ class ClaudeProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run Claude in Docker container."""
         conversation_log_file = log_file
         if ops_log_file is None:
             ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
+        run_cwd = getattr(config, "provider_cwd", None) or work_dir
         if config.claude.fetch_auth_token_from_keychain:
-            sync_keychain_credentials()
+            sync_keychain_credentials(env=env, cwd=run_cwd)
         docker_config = _get_docker_config(
             f"{config.docker_image}-claude",
             docker_startup_timeout=config.docker_startup_timeout,
         )
 
-        if not ensure_docker_image(docker_config, config.project_dir):
+        if not ensure_docker_image(docker_config, config.project_dir, host_env=env, host_cwd=run_cwd):
             print("Error: Failed to build Docker image")
             return RunResult(exit_code=1)
 
@@ -1074,6 +1128,7 @@ class ClaudeProvider(Provider):
             config.docker_setup_command,
             getattr(config, "docker_env", None),
             getattr(config, "docker_workdir", "/workspace"),
+            host_env=env,
         )
         cmd.append("claude")
         cmd.extend(self._build_claude_args(config, resume_session_id))
@@ -1084,6 +1139,8 @@ class ClaudeProvider(Provider):
             on_session_id=on_session_id,
             on_step_count=on_step_count,
             ops_log_file=ops_log_file,
+            cwd=run_cwd,
+            env=env,
         )
 
     def _run_direct(
@@ -1096,6 +1153,7 @@ class ClaudeProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run Claude directly (no Docker)."""
         conversation_log_file = log_file
@@ -1110,6 +1168,7 @@ class ClaudeProvider(Provider):
                 conversation_log_file,
                 work_dir,
                 ops_log_file=ops_log_file,
+                env=env,
             )
 
         cmd = self.build_noninteractive_command(config, work_dir, resume_session_id)
@@ -1125,6 +1184,7 @@ class ClaudeProvider(Provider):
             on_session_id=on_session_id,
             on_step_count=on_step_count,
             ops_log_file=ops_log_file,
+            env=env,
         )
 
     def _run_direct_tmux(
@@ -1134,6 +1194,7 @@ class ClaudeProvider(Provider):
         log_file: Path,
         work_dir: Path,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run Claude in interactive mode for tmux sessions.
 
@@ -1175,12 +1236,15 @@ class ClaudeProvider(Provider):
         # This mirrors the output that humans see when they attach, and is what
         # ``gza log -f`` reads in tmux mode.
         if config.tmux.session_name:
+            run_cwd = getattr(config, "provider_cwd", None) or work_dir
             subprocess.run(
                 [
                     "tmux", "pipe-pane", "-t", config.tmux.session_name,
                     f"cat >> {_shlex.quote(str(conversation_log_file))}",
                 ],
                 check=False,
+                cwd=run_cwd,
+                env=normalize_subprocess_env(env, run_cwd),
             )
 
         # Run Claude in interactive mode — the proxy delivers the prompt via the
@@ -1189,7 +1253,12 @@ class ClaudeProvider(Provider):
         cmd.extend(config.claude.args)
 
         # Run with inherited stdin/stdout/stderr (connected to the PTY via the proxy)
-        result = subprocess.run(cmd, cwd=(getattr(config, "provider_cwd", None) or work_dir))
+        run_cwd = getattr(config, "provider_cwd", None) or work_dir
+        result = subprocess.run(
+            cmd,
+            cwd=run_cwd,
+            env=normalize_subprocess_env(env, run_cwd),
+        )
 
         with open(proxy_log_file, "a") as f:
             f.write(_json.dumps({
@@ -1236,6 +1305,7 @@ class ClaudeProvider(Provider):
         on_step_count: Callable[[int], None] | None = None,
         stdin_input: str | None = None,
         resume_session_id: str | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run an interactive Claude command in the foreground terminal."""
         conversation_log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1316,7 +1386,7 @@ class ClaudeProvider(Provider):
                 stderr=slave_fd,
                 text=False,
                 bufsize=0,
-                env=os.environ.copy(),
+                env=normalize_subprocess_env(env, cwd),
             )
             os.close(slave_fd)
             slave_fd = None
@@ -1455,6 +1525,7 @@ class ClaudeProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run command and parse Claude's stream-json output."""
         conversation_log_file = log_file
@@ -1512,6 +1583,7 @@ class ClaudeProvider(Provider):
             parse_output=parse_claude_output,
             stdin_input=stdin_input,
             ops_log_file=ops_log_file,
+            env=env,
         )
 
         # Extract stats and error info from result event

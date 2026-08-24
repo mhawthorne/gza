@@ -13,6 +13,7 @@ from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.log_paths import ops_log_path_for
 from gza.recovery_engine import decide_failed_task_recovery
+from gza.runtime_context import RuntimeExecutionContext
 
 
 def _setup_task_with_log(project_dir: Path, *, task_type: str = "implement") -> tuple[str, Path]:
@@ -62,6 +63,36 @@ def test_attach_wrapper_normal_exit_auto_resumes_when_task_incomplete(tmp_path: 
     assert detach_events
     assert detach_events[-1]["reason"] == "exited_ok"
     assert "resume" in names
+
+
+def test_attach_wrapper_handoff_uses_activated_runtime_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_id, _ = _setup_task_with_log(tmp_path)
+
+    def fake_interactive(_config, _session_id, **_kwargs):
+        monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient-after-attach.db"))
+        return 0
+
+    with (
+        patch.object(sys, "argv", [
+            "gza.attach_wrapper",
+            "--task-id", task_id,
+            "--session-id", "sess-123",
+            "--project", str(tmp_path),
+        ]),
+        patch("gza.attach_wrapper._run_interactive_claude", side_effect=fake_interactive),
+        patch("gza.attach_wrapper._spawn_background_worker", return_value=0) as mock_spawn,
+    ):
+        rc = main()
+
+    assert rc == 0
+    runtime_context = mock_spawn.call_args.kwargs["runtime_context"]
+    assert isinstance(runtime_context, RuntimeExecutionContext)
+    assert runtime_context.cwd == tmp_path
+    assert runtime_context.db_path == (tmp_path / ".gza" / "gza.db").resolve()
+    assert runtime_context.env["GZA_DB_PATH"] == str((tmp_path / ".gza" / "gza.db").resolve())
 
 
 def test_attach_wrapper_sets_foreground_attach_resume_execution_mode(tmp_path: Path) -> None:
@@ -701,17 +732,20 @@ def test_attach_wrapper_sigint_during_interactive_forwarded_to_child_without_det
     assert detach_events[-1]["reason"] == "exited_ok"
 
 
-def test_attach_wrapper_calls_load_dotenv_before_interactive_claude(tmp_path: Path) -> None:
-    """Attach wrapper must load .env files so API keys are available during interactive session."""
+def test_attach_wrapper_builds_runtime_context_before_interactive_claude(tmp_path: Path) -> None:
+    """Attach wrapper must build explicit runtime env before interactive session."""
     task_id, _ = _setup_task_with_log(tmp_path)
 
     call_order: list[str] = []
+    original_from_config = RuntimeExecutionContext.from_config
 
-    def track_dotenv(project_dir):
-        call_order.append("load_dotenv")
+    def track_runtime_context(config):
+        call_order.append("runtime_context")
+        return original_from_config(config)
 
     def track_interactive(*args, **kwargs):
         call_order.append("interactive_claude")
+        assert "runtime_context" in kwargs
         return 0
 
     with (
@@ -721,16 +755,75 @@ def test_attach_wrapper_calls_load_dotenv_before_interactive_claude(tmp_path: Pa
             "--session-id", "sess-123",
             "--project", str(tmp_path),
         ]),
-        patch("gza.attach_wrapper.load_dotenv", side_effect=track_dotenv) as mock_dotenv,
+        patch("gza.attach_wrapper.RuntimeExecutionContext.from_config", side_effect=track_runtime_context) as mock_context,
         patch("gza.attach_wrapper._run_interactive_claude", side_effect=track_interactive),
         patch("gza.attach_wrapper._spawn_background_worker", return_value=0),
     ):
         rc = main()
 
     assert rc == 0
-    mock_dotenv.assert_called_once_with(tmp_path)
-    assert call_order.index("load_dotenv") < call_order.index("interactive_claude"), \
-        "load_dotenv must be called before _run_interactive_claude"
+    mock_context.assert_called_once()
+    assert call_order.index("runtime_context") < call_order.index("interactive_claude"), \
+        "runtime context must be built before _run_interactive_claude"
+
+
+def test_interactive_claude_runtime_context_typeerror_after_side_effect_is_not_retried(tmp_path: Path) -> None:
+    from gza.attach_wrapper import _call_run_interactive_claude
+
+    task_id, _ = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore.from_config(config)
+    task = store.get(task_id)
+    assert task is not None
+    runtime_context = RuntimeExecutionContext.from_config(config)
+    calls: list[RuntimeExecutionContext | None] = []
+
+    def fake_interactive(*_args, runtime_context=None, **_kwargs):
+        calls.append(runtime_context)
+        raise TypeError("unexpected keyword argument 'runtime_context'")
+
+    with patch("gza.attach_wrapper._run_interactive_claude", side_effect=fake_interactive):
+        with pytest.raises(TypeError, match="unexpected keyword argument 'runtime_context'"):
+            _call_run_interactive_claude(
+                config,
+                "sess-123",
+                max_turns=None,
+                task=task,
+                no_docker=True,
+                runtime_context=runtime_context,
+            )
+
+    assert calls == [runtime_context]
+
+
+def test_docker_interactive_attach_prepares_image_with_runtime_env(tmp_path: Path) -> None:
+    from gza.attach_wrapper import _build_docker_interactive_cmd
+
+    task_id, _ = _setup_task_with_log(tmp_path)
+    config = Config.load(tmp_path)
+    config.use_docker = True
+    store = SqliteTaskStore.from_config(config)
+    task = store.get(task_id)
+    assert task is not None
+    runtime_context = RuntimeExecutionContext.from_config(config)
+    seen: list[dict[str, object]] = []
+
+    def fake_ensure(*_args, **kwargs):
+        seen.append(kwargs)
+        return True
+
+    with patch("gza.attach_wrapper.ensure_docker_image", side_effect=fake_ensure), \
+         patch("gza.attach_wrapper.build_docker_cmd", return_value=["docker"]):
+        cmd = _build_docker_interactive_cmd(
+            config,
+            task,
+            "sess-123",
+            max_turns=None,
+            runtime_context=runtime_context,
+        )
+
+    assert cmd[0] == "docker"
+    assert seen[0]["host_env"] == runtime_context.env
 
 
 def _setup_docker_task(project_dir: Path) -> tuple[str, Path]:
@@ -795,7 +888,8 @@ def test_attach_wrapper_docker_task_launches_via_docker(tmp_path: Path) -> None:
     mock_popen.assert_called_once()
     cmd = mock_popen.call_args[0][0]
     assert cmd is docker_cmd_stub
-    assert mock_popen.call_args.kwargs.get("cwd") is None
+    assert mock_popen.call_args.kwargs.get("cwd") == tmp_path
+    assert mock_popen.call_args.kwargs["env"]["GZA_DB_PATH"] == str((tmp_path / ".gza" / "gza.db").resolve())
 
 
 def test_build_docker_interactive_cmd_uses_it_and_claude_resume(tmp_path: Path) -> None:

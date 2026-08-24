@@ -215,6 +215,47 @@ def test_invoke_provider_resolve_does_not_create_internal_tasks_and_logs_to_pare
     assert "Running provider command: /gza-rebase --auto --continue" in log_text
 
 
+def test_invoke_provider_resolve_uses_runtime_home_for_skill_preflight_and_provider_env(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza.cli import invoke_provider_resolve
+
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    owned_home = tmp_path / "owned-codex"
+    poison_home = tmp_path / "poison-codex"
+    (project_dir / ".env").write_text(f"CODEX_HOME={owned_home}\n", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(poison_home))
+    config = _new_config(project_dir, provider="codex")
+    task = _new_task()
+    copied_targets: list[Path] = []
+
+    def fake_copy(name: str, target: Path):
+        copied_targets.append(target)
+        skill_path = target / name / "SKILL.md"
+        skill_path.parent.mkdir(parents=True, exist_ok=True)
+        skill_path.write_text("---\nname: gza-rebase\n---\n", encoding="utf-8")
+        return True, "installed"
+
+    with (
+        patch("gza.skills_utils.copy_skill", side_effect=fake_copy),
+        patch("gza.providers.get_provider") as mock_get_provider,
+        patch("gza.cli.git_ops._is_rebase_in_progress", return_value=False),
+    ):
+        mock_provider = Mock()
+        mock_provider.run.return_value = RunResult(exit_code=0)
+        mock_get_provider.return_value = mock_provider
+
+        result = invoke_provider_resolve(task, "feature", "main", config, log_file=_new_log_file(project_dir))
+
+    assert result is True
+    assert copied_targets == [owned_home / "skills"]
+    assert (owned_home / "skills" / "gza-rebase" / "SKILL.md").exists()
+    assert not (poison_home / "skills" / "gza-rebase" / "SKILL.md").exists()
+    assert mock_provider.run.call_args.kwargs["env"]["CODEX_HOME"] == str(owned_home)
+
+
 def test_create_rebase_task_prompt_preserves_caller_target_branch_and_forbids_remote_git_fallbacks(tmp_path: Path) -> None:
     from gza.cli import _create_rebase_task
 

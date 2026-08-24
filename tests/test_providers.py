@@ -27,6 +27,7 @@ from gza.providers.base import (
     DOCKERFILE_TEMPLATE,
     GZA_GIT_GUARD_SETUP_COMMAND,
     GZA_SHIM_SETUP_COMMAND,
+    RunResult,
     _extract_startup_log_line,
     _format_command_for_log,
     _get_default_dockerfile_content,
@@ -108,6 +109,116 @@ class TestGetProvider:
             get_provider(config)
 
 
+@pytest.mark.parametrize(
+    ("provider_cls", "provider_name", "module_path"),
+    [
+        (ClaudeProvider, "claude", "gza.providers.claude.subprocess.run"),
+        (CodexProvider, "codex", "gza.providers.codex.subprocess.run"),
+        (GeminiProvider, "gemini", "gza.providers.gemini.subprocess.run"),
+    ],
+)
+def test_provider_direct_preflight_uses_runtime_cwd_and_env(
+    provider_cls, provider_name: str, module_path: str, tmp_path: Path
+) -> None:
+    project_dir = tmp_path / provider_name
+    project_dir.mkdir()
+    runtime_env = {"PATH": f"/{provider_name}/bin", "TOKEN": f"{provider_name}-token"}
+    runtime_cwd = project_dir
+    config = Config(project_dir=project_dir, project_name=provider_name, provider=provider_name, use_docker=False)
+
+    with patch(module_path, return_value=MagicMock(returncode=0, stdout="", stderr="")) as mock_run:
+        result = provider_cls().verify_credentials(config, env=runtime_env, cwd=runtime_cwd)
+
+    assert result.ok
+    mock_run.assert_called_once()
+    assert mock_run.call_args.kwargs["cwd"] == runtime_cwd
+    assert mock_run.call_args.kwargs["env"] == {
+        **runtime_env,
+        "PWD": str(runtime_cwd.resolve()),
+    }
+
+
+@pytest.mark.parametrize(
+    ("provider_cls", "provider_name"),
+    [
+        (ClaudeProvider, "claude"),
+        (CodexProvider, "codex"),
+        (GeminiProvider, "gemini"),
+    ],
+)
+def test_provider_docker_preflight_uses_runtime_cwd_and_env(provider_cls, provider_name: str, tmp_path: Path) -> None:
+    project_dir = tmp_path / provider_name
+    project_dir.mkdir()
+    runtime_env = {"PATH": f"/{provider_name}/bin", "TOKEN": f"{provider_name}-token"}
+    runtime_cwd = project_dir
+    config = Config(
+        project_dir=project_dir,
+        project_name=provider_name,
+        provider=provider_name,
+        use_docker=True,
+        docker_image="test-gza",
+    )
+
+    with (
+        patch("gza.providers.base.wait_for_docker_ready", return_value=True) as mock_ready,
+        patch("gza.providers.base.subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")) as mock_run,
+        patch(f"gza.providers.{provider_name}.ensure_docker_image", return_value=True) as mock_ensure,
+    ):
+        result = provider_cls().verify_credentials(config, env=runtime_env, cwd=runtime_cwd)
+
+    assert result.ok
+    mock_ensure.assert_called_once()
+    assert mock_ensure.call_args.kwargs["host_env"] == runtime_env
+    assert mock_ensure.call_args.kwargs["host_cwd"] == runtime_cwd
+    mock_ready.assert_called_once_with(config.docker_startup_timeout, host_env=runtime_env, host_cwd=runtime_cwd)
+    mock_run.assert_called_once()
+    assert mock_run.call_args.kwargs["cwd"] == runtime_cwd
+    assert mock_run.call_args.kwargs["env"] == {
+        **runtime_env,
+        "PWD": str(runtime_cwd.resolve()),
+    }
+
+
+@pytest.mark.parametrize(
+    ("provider_cls", "provider_name"),
+    [
+        (ClaudeProvider, "claude"),
+        (CodexProvider, "codex"),
+        (GeminiProvider, "gemini"),
+    ],
+)
+def test_provider_docker_execution_uses_runtime_host_cwd_and_env(provider_cls, provider_name: str, tmp_path: Path) -> None:
+    project_dir = tmp_path / provider_name
+    work_dir = tmp_path / f"{provider_name}-worktree"
+    provider_cwd = work_dir / "subproject"
+    project_dir.mkdir()
+    provider_cwd.mkdir(parents=True)
+    runtime_env = {"PATH": f"/{provider_name}/bin", "TOKEN": f"{provider_name}-token"}
+    config = Config(
+        project_dir=project_dir,
+        project_name=provider_name,
+        provider=provider_name,
+        use_docker=True,
+        docker_image="test-gza",
+    )
+    config.provider_cwd = provider_cwd
+    provider = provider_cls()
+
+    with (
+        patch(f"gza.providers.{provider_name}.ensure_docker_image", return_value=True) as mock_ensure,
+        patch(f"gza.providers.{provider_name}.build_docker_cmd", return_value=["docker", "run", "image"]),
+        patch.object(provider, "_run_with_output_parsing", return_value=RunResult(exit_code=0)) as mock_run,
+    ):
+        provider._run_docker(config, "prompt", project_dir / "task.log", work_dir, env=runtime_env)
+
+    mock_ensure.assert_called_once()
+    assert mock_ensure.call_args.kwargs["host_env"] == runtime_env
+    assert mock_ensure.call_args.kwargs["host_cwd"] == provider_cwd
+    mock_run.assert_called_once()
+    assert mock_run.call_args.kwargs["cwd"] == provider_cwd
+    assert mock_run.call_args.kwargs["env"] == runtime_env
+
+
 class TestResolveDockerWorkerEnvironmentIdentity:
     """Tests for probing the configured Docker worker runtime."""
 
@@ -123,6 +234,13 @@ class TestResolveDockerWorkerEnvironmentIdentity:
             docker_setup_command="uv sync",
             docker_volumes=["/host/cache:/cache:ro"],
         )
+        runtime_cwd = tmp_path / "runtime-cwd"
+        runtime_cwd.mkdir()
+        runtime_env = {
+            "PATH": "/runtime/bin",
+            "DOCKER_HOST": "unix:///runtime.sock",
+            "PWD": "/poisoned",
+        }
 
         probe_identity = {
             "runner_class": "container",
@@ -158,17 +276,29 @@ class TestResolveDockerWorkerEnvironmentIdentity:
                 )[1],
             ) as mock_run,
         ):
-            identity = resolve_docker_worker_environment_identity(config, task_type="implement")
+            identity = resolve_docker_worker_environment_identity(
+                config,
+                task_type="implement",
+                runtime_env=runtime_env,
+                runtime_cwd=runtime_cwd,
+            )
 
         assert identity == MainIntegrationVerifyEnvironmentIdentity.from_payload(probe_identity)
         assert call_order == ["ensure", "probe"]
         mock_ensure.assert_called_once()
+        assert mock_ensure.call_args.kwargs["host_env"] == runtime_env
+        assert mock_ensure.call_args.kwargs["host_cwd"] == runtime_cwd
         build_args = mock_build.call_args.args
         build_kwargs = mock_build.call_args.kwargs
         assert build_args[0].image_name == "test-project-gza-codex"
         assert build_kwargs["docker_setup_command"] == "uv sync"
         assert build_kwargs["docker_volumes"] == ["/host/cache:/cache:ro"]
         assert mock_run.call_args[0][0][-3:-1] == ["python3", "-c"]
+        assert mock_run.call_args.kwargs["cwd"] == runtime_cwd
+        assert mock_run.call_args.kwargs["env"] == {
+            **runtime_env,
+            "PWD": str(runtime_cwd.resolve()),
+        }
 
     def test_returns_none_when_ensuring_probe_image_fails(self, tmp_path):
         """Docker runtime probing should fail closed when the task image cannot be ensured."""
@@ -762,6 +892,31 @@ class TestBuildDockerCmd:
         assert "run" in cmd
         assert "--rm" in cmd
         assert cmd[-1] == "test-image"
+
+    def test_git_identity_is_read_from_work_dir_with_runtime_env(self, tmp_path):
+        """Host git identity for container env must use the owning work directory/env."""
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+        runtime_env = {"PATH": "/runtime/bin", "HOME": str(tmp_path / "home")}
+        calls: list[dict[str, object]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append({"cmd": cmd, **kwargs})
+            return MagicMock(returncode=0, stdout="Runtime User\n")
+
+        with patch("gza.providers.base.subprocess.run", side_effect=fake_run):
+            cmd = build_docker_cmd(docker_config, tmp_path, timeout_minutes=10, host_env=runtime_env)
+
+        git_calls = [call for call in calls if call["cmd"][:2] == ["git", "config"]]
+        assert len(git_calls) == 4
+        assert {call["cwd"] for call in git_calls} == {tmp_path}
+        assert {call["env"]["PATH"] for call in git_calls} == {"/runtime/bin"}
+        assert "-e" in cmd
 
     def test_worktree_git_file_does_not_mount_shared_git_dir(self, tmp_path):
         """A worktree .git file must not add an implicit shared host .git mount."""
@@ -1500,6 +1655,45 @@ class TestCredentialChecks:
             (tmp_path / ".gemini").mkdir()
             assert provider.check_credentials() is True
 
+    def test_codex_and_gemini_credentials_use_runtime_vendor_home_not_ambient_or_sibling(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Provider OAuth checks must use the supplied runtime environment."""
+        codex_provider = CodexProvider()
+        gemini_provider = GeminiProvider()
+        ambient_home = tmp_path / "ambient-home"
+        runtime_a_codex = tmp_path / "runtime-a" / "codex-home"
+        runtime_a_gemini = tmp_path / "runtime-a" / "gemini-home"
+        runtime_b_codex = tmp_path / "runtime-b" / "codex-home"
+        runtime_b_gemini = tmp_path / "runtime-b" / "gemini-home"
+        (ambient_home / ".codex").mkdir(parents=True)
+        (ambient_home / ".gemini").mkdir(parents=True)
+        runtime_b_codex.mkdir(parents=True)
+        runtime_b_gemini.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(ambient_home))
+        monkeypatch.setenv("CODEX_HOME", str(ambient_home / "poison-codex"))
+        monkeypatch.setenv("GEMINI_HOME", str(ambient_home / "poison-gemini"))
+
+        runtime_a_env = {
+            "HOME": str(tmp_path / "runtime-a" / "home"),
+            "PATH": "/runtime-a/bin",
+            "CODEX_HOME": str(runtime_a_codex),
+            "GEMINI_HOME": str(runtime_a_gemini),
+        }
+        runtime_b_env = {
+            "HOME": str(tmp_path / "runtime-b" / "home"),
+            "PATH": "/runtime-b/bin",
+            "CODEX_HOME": str(runtime_b_codex),
+            "GEMINI_HOME": str(runtime_b_gemini),
+        }
+
+        assert codex_provider.check_credentials(env=runtime_a_env) is False
+        assert gemini_provider.check_credentials(env=runtime_a_env) is False
+        assert codex_provider.check_credentials(env=runtime_b_env) is True
+        assert gemini_provider.check_credentials(env=runtime_b_env) is True
+
 
 class TestProviderRunMethods:
     """Tests for provider run method routing."""
@@ -1737,13 +1931,20 @@ class TestDockerDaemonCheck:
 
     def test_is_docker_running_returns_true_when_daemon_available(self):
         """Should return True when docker info succeeds."""
+        runtime_cwd = Path("/runtime/project")
+        runtime_env = {"PATH": "/runtime/bin", "PWD": "/poisoned"}
         with patch("gza.providers.base.subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0)
-            assert is_docker_running() is True
+            assert is_docker_running(host_env=runtime_env, host_cwd=runtime_cwd) is True
             mock_run.assert_called_once()
             # Verify it called docker info
             call_args = mock_run.call_args[0][0]
             assert call_args == ["docker", "info"]
+            assert mock_run.call_args.kwargs["cwd"] == runtime_cwd
+            assert mock_run.call_args.kwargs["env"] == {
+                **runtime_env,
+                "PWD": str(runtime_cwd.resolve()),
+            }
 
     def test_is_docker_running_returns_false_when_daemon_not_available(self):
         """Should return False when docker info fails."""
@@ -1784,11 +1985,24 @@ class TestDockerDaemonCheck:
                 MagicMock(returncode=0),
             ]
 
-            assert wait_for_docker_ready(3, probe_timeout=2) is True
+            runtime_cwd = Path("/runtime/project")
+            runtime_env = {"PATH": "/runtime/bin", "PWD": "/poisoned"}
+            assert wait_for_docker_ready(
+                3,
+                probe_timeout=2,
+                host_env=runtime_env,
+                host_cwd=runtime_cwd,
+            ) is True
 
         assert mock_run.call_count == 2
         assert mock_run.call_args_list[0].kwargs["timeout"] == 2
         assert mock_run.call_args_list[1].kwargs["timeout"] == 2
+        for call in mock_run.call_args_list:
+            assert call.kwargs["cwd"] == runtime_cwd
+            assert call.kwargs["env"] == {
+                **runtime_env,
+                "PWD": str(runtime_cwd.resolve()),
+            }
 
     def test_wait_for_docker_ready_returns_false_after_timeout_budget(self):
         """Should stop retrying once the total timeout budget is exhausted."""
@@ -1843,7 +2057,11 @@ class TestDockerDaemonCheck:
             )
 
         assert result.ok is False
-        mock_wait.assert_called_once_with(docker_config.docker_startup_timeout)
+        mock_wait.assert_called_once_with(
+            docker_config.docker_startup_timeout,
+            host_env=None,
+            host_cwd=None,
+        )
         assert result.failure_reason == "INFRASTRUCTURE_ERROR"
         assert result.message == "Preflight failed: Docker daemon is not running"
         captured = capsys.readouterr()
@@ -3989,8 +4207,141 @@ class TestEnsureDockerImage:
                 result = ensure_docker_image(docker_config, tmp_path)
 
         assert result is False
-        mock_wait.assert_called_once_with(docker_config.docker_startup_timeout)
+        mock_wait.assert_called_once_with(
+            docker_config.docker_startup_timeout,
+            host_env=None,
+            host_cwd=tmp_path,
+        )
         mock_run.assert_not_called()
+
+    def test_runtime_env_is_used_for_docker_readiness_and_build(self, tmp_path):
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+        runtime_env = {"PATH": "/runtime/bin", "DOCKER_HOST": "unix:///runtime.sock"}
+        build_envs: list[dict[str, str] | None] = []
+        build_cwds: list[Path | None] = []
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["docker", "build"]:
+                build_envs.append(kwargs.get("env"))
+                build_cwds.append(kwargs.get("cwd"))
+                return MagicMock(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected subprocess: {cmd}")
+
+        with patch("gza.providers.base.wait_for_docker_ready", return_value=True) as mock_wait, \
+             patch("gza.providers.base._get_image_created_time", return_value=None), \
+             patch("gza.providers.base.subprocess.run", side_effect=fake_run):
+            result = ensure_docker_image(docker_config, tmp_path, host_env=runtime_env)
+
+        assert result is True
+        mock_wait.assert_called_once_with(docker_config.docker_startup_timeout, host_env=runtime_env, host_cwd=tmp_path)
+        assert build_cwds == [tmp_path]
+        assert build_envs == [{**runtime_env, "PWD": str(tmp_path.resolve())}]
+
+    def test_docker_image_helpers_interleave_runtime_cwd_env_without_supervisor_state(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        docker_config = DockerConfig(
+            image_name="test-image",
+            npm_package="@test/cli",
+            cli_command="testcli",
+            config_dir=None,
+            env_vars=[],
+        )
+        runtime_a = tmp_path / "runtime-a"
+        runtime_b = tmp_path / "runtime-b"
+        runtime_a.mkdir()
+        runtime_b.mkdir()
+        env_a = {"PATH": "/a/bin", "DOCKER_HOST": "unix:///a.sock", "DOCKER_CONFIG": "a-docker", "PWD": "/poison-a"}
+        env_b = {"PATH": "/b/bin", "DOCKER_HOST": "unix:///b.sock", "DOCKER_CONFIG": "b-docker", "PWD": "/poison-b"}
+        supervisor_cwd = tmp_path / "supervisor"
+        supervisor_cwd.mkdir()
+        monkeypatch.chdir(supervisor_cwd)
+        monkeypatch.setenv("PATH", "/supervisor/bin")
+        monkeypatch.setenv("DOCKER_HOST", "unix:///supervisor.sock")
+        monkeypatch.setenv("PWD", str(supervisor_cwd))
+
+        calls: list[tuple[list[str], Path | None, dict[str, str]]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs.get("cwd"), kwargs["env"]))
+            if cmd[:3] == ["docker", "image", "inspect"]:
+                return MagicMock(returncode=1, stdout="", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("gza.providers.base.subprocess.run", side_effect=fake_run):
+            assert ensure_docker_image(docker_config, runtime_a, host_env=env_a, host_cwd=runtime_a)
+            assert ensure_docker_image(docker_config, runtime_b, host_env=env_b, host_cwd=runtime_b)
+
+        assert [call[1] for call in calls] == [runtime_a, runtime_a, runtime_a, runtime_b, runtime_b, runtime_b]
+        assert [call[2]["PATH"] for call in calls] == ["/a/bin", "/a/bin", "/a/bin", "/b/bin", "/b/bin", "/b/bin"]
+        assert [call[2]["DOCKER_HOST"] for call in calls] == [
+            "unix:///a.sock",
+            "unix:///a.sock",
+            "unix:///a.sock",
+            "unix:///b.sock",
+            "unix:///b.sock",
+            "unix:///b.sock",
+        ]
+        assert [call[2]["PWD"] for call in calls] == [
+            str(runtime_a.resolve()),
+            str(runtime_a.resolve()),
+            str(runtime_a.resolve()),
+            str(runtime_b.resolve()),
+            str(runtime_b.resolve()),
+            str(runtime_b.resolve()),
+        ]
+        assert os.environ["PATH"] == "/supervisor/bin"
+        assert os.environ["DOCKER_HOST"] == "unix:///supervisor.sock"
+        assert os.environ["PWD"] == str(supervisor_cwd)
+
+    def test_provider_docker_run_entry_points_pass_runtime_env_to_image_prepare(self, tmp_path):
+        from gza.providers.base import RunResult
+
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "gza.yaml").write_text(
+            "project_name: dockerproj\nproject_id: dockerproj\nprovider: codex\nmodel: gpt-5.5\nuse_docker: true\n",
+            encoding="utf-8",
+        )
+        config = Config.load(project)
+        runtime_env = {"PATH": "/runtime/bin", "GZA_DB_PATH": str(config.db_path)}
+        log_file = project / "task.log"
+        log_file.write_text("", encoding="utf-8")
+
+        cases = [
+            ("gza.providers.claude.ensure_docker_image", ClaudeProvider(), "claude"),
+            ("gza.providers.codex.ensure_docker_image", CodexProvider(), "codex"),
+            ("gza.providers.gemini.ensure_docker_image", GeminiProvider(), "gemini"),
+        ]
+        for patch_target, provider, expected_name in cases:
+            seen: list[dict[str, object]] = []
+
+            def fake_ensure(*args, **kwargs):
+                seen.append(kwargs)
+                return True
+
+            with patch(patch_target, side_effect=fake_ensure), \
+                 patch.object(provider, "_run_with_output_parsing", return_value=RunResult(exit_code=0)):
+                result = provider._run_docker(
+                    config,
+                    "prompt",
+                    log_file,
+                    project,
+                    env=runtime_env,
+                )
+
+            assert result.exit_code == 0
+            assert seen, expected_name
+            assert seen[0]["host_env"] == runtime_env
+            assert seen[0]["host_cwd"] == project
 
     def test_logs_daemon_unavailable_to_task_log(self, tmp_path):
         """Docker preflight should persist daemon-unavailable failures to the task log."""
@@ -4286,6 +4637,36 @@ class TestCodexProvider:
                 assert config.cli_command == "codex"
                 assert config.config_dir == ".codex"
                 assert config.env_vars == []
+
+    def test_codex_docker_config_mounts_runtime_codex_home_not_ambient_or_sibling(self, tmp_path):
+        """OAuth Docker mount should use the selected runtime's CODEX_HOME."""
+        from gza.providers.base import build_docker_cmd
+        from gza.providers.codex import _get_docker_config
+
+        ambient_home = tmp_path / "ambient-home"
+        sibling_home = tmp_path / "sibling-codex"
+        runtime_home = tmp_path / "runtime-codex"
+        for path in (ambient_home / ".codex", sibling_home, runtime_home):
+            path.mkdir(parents=True)
+        (runtime_home / "auth.json").write_text("{}", encoding="utf-8")
+        env = {
+            "HOME": str(ambient_home),
+            "PATH": "/runtime/bin",
+            "CODEX_HOME": str(runtime_home),
+            "GIT_AUTHOR_NAME": "Runtime User",
+            "GIT_AUTHOR_EMAIL": "runtime@example.com",
+            "GIT_COMMITTER_NAME": "Runtime User",
+            "GIT_COMMITTER_EMAIL": "runtime@example.com",
+        }
+
+        config = _get_docker_config("my-project-gza", env=env)
+        assert config.config_dir == ".codex"
+        assert config.host_config_dir == runtime_home
+        cmd = build_docker_cmd(config, tmp_path, timeout_minutes=10, host_env=env)
+        mounts = [cmd[index + 1] for index, value in enumerate(cmd) if value == "-v"]
+        assert f"{runtime_home}:/home/gza/.codex" in mounts
+        assert all(str(ambient_home / ".codex") not in mount for mount in mounts)
+        assert all(str(sibling_home) not in mount for mount in mounts)
 
     def test_codex_docker_config_with_codex_api_key(self):
         """Codex should use CODEX_API_KEY (canonical) when no OAuth credentials exist."""
@@ -5628,25 +6009,54 @@ class TestSyncKeychainCredentials:
             assert sync_keychain_credentials() is False
 
     def test_writes_credentials_file(self, tmp_path):
-        """Should write credentials to ~/.claude/.credentials.json."""
+        """Should write credentials to the runtime HOME, not the supervisor home."""
         from gza.providers.claude import sync_keychain_credentials
         creds = {"claudeAiOauth": {"accessToken": "test-token", "refreshToken": "test-refresh"}}
         mock_result = MagicMock()
         mock_result.returncode = 0
         mock_result.stdout = json.dumps(creds)
 
-        fake_home = tmp_path / "home"
-        fake_home.mkdir()
+        supervisor_home = tmp_path / "supervisor-home"
+        runtime_home = tmp_path / "runtime-home"
+        runtime_home_b = tmp_path / "runtime-home-b"
+        runtime_cwd = tmp_path / "runtime-project"
+        runtime_cwd_b = tmp_path / "runtime-project-b"
+        supervisor_home.mkdir()
+        runtime_home.mkdir()
+        runtime_home_b.mkdir()
+        runtime_cwd.mkdir()
+        runtime_cwd_b.mkdir()
+        runtime_env = {"HOME": str(runtime_home), "PATH": "/runtime/bin", "PWD": "/poisoned"}
+        runtime_env_b = {"HOME": str(runtime_home_b), "PATH": "/runtime-b/bin", "PWD": "/poisoned-b"}
 
         with patch("gza.providers.claude.sys") as mock_sys, \
-             patch("gza.providers.claude.shutil.which", return_value="/usr/bin/security"), \
-             patch("gza.providers.claude.subprocess.run", return_value=mock_result), \
-             patch("gza.providers.claude.Path.home", return_value=fake_home):
+             patch("gza.providers.claude.shutil.which", side_effect=["/runtime/bin/security", "/runtime-b/bin/security"]) as mock_which, \
+             patch("gza.providers.claude.subprocess.run", return_value=mock_result) as mock_run, \
+             patch("gza.providers.claude.Path.home", return_value=supervisor_home):
             mock_sys.platform = "darwin"
-            assert sync_keychain_credentials() is True
+            assert sync_keychain_credentials(env=runtime_env, cwd=runtime_cwd) is True
+            assert sync_keychain_credentials(env=runtime_env_b, cwd=runtime_cwd_b) is True
 
-        creds_path = fake_home / ".claude" / ".credentials.json"
+        assert [call.kwargs["path"] for call in mock_which.call_args_list] == ["/runtime/bin", "/runtime-b/bin"]
+        assert [call.args[0][0] for call in mock_run.call_args_list] == [
+            "/runtime/bin/security",
+            "/runtime-b/bin/security",
+        ]
+        assert mock_run.call_args_list[0].kwargs["cwd"] == runtime_cwd
+        assert mock_run.call_args_list[0].kwargs["env"] == {
+            **runtime_env,
+            "PWD": str(runtime_cwd.resolve()),
+        }
+        assert mock_run.call_args_list[1].kwargs["cwd"] == runtime_cwd_b
+        assert mock_run.call_args_list[1].kwargs["env"] == {
+            **runtime_env_b,
+            "PWD": str(runtime_cwd_b.resolve()),
+        }
+        creds_path = runtime_home / ".claude" / ".credentials.json"
+        creds_path_b = runtime_home_b / ".claude" / ".credentials.json"
         assert creds_path.exists()
+        assert creds_path_b.exists()
+        assert not (supervisor_home / ".claude" / ".credentials.json").exists()
         written = json.loads(creds_path.read_text())
         assert written["claudeAiOauth"]["accessToken"] == "test-token"
         # Check file permissions (owner read/write only)

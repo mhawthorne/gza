@@ -118,6 +118,7 @@ from ..runner import (
     remove_task_startup_artifacts,
     require_execution_route_for_task,
 )
+from ..runtime_context import RuntimeExecutionContext
 from ..status_ops import apply_manual_task_status
 from ..task_query import TaskQuery, TaskQueryService, TaskRow, parse_csv
 from ..task_types import CLI_ADD_TASK_TYPES
@@ -340,8 +341,10 @@ def _run_iterate_task_with_recovery(
     invocation_name: str = "iterate",
     on_recovery: Callable[[DbTask, DbTask, FailedRecoveryDecision], None] | None = None,
     on_terminal_skip: Callable[[DbTask, FailedRecoveryDecision, int], None] | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> tuple[DbTask, int, FailedRecoveryDecision | None]:
     terminal_skip_decision: FailedRecoveryDecision | None = None
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
 
     def _run_one(task: DbTask, resume_flag: bool) -> int:
         assert task.id is not None
@@ -353,12 +356,14 @@ def _run_iterate_task_with_recovery(
                 resume=True,
                 force=force,
                 invocation=_foreground_command_invocation(invocation_name),
+                runtime_context=runtime_context,
             )
         return _run_foreground(
             config,
             task_id=task.id,
             force=force,
             invocation=_foreground_command_invocation(invocation_name),
+            runtime_context=runtime_context,
         )
 
     def _default_on_recovery(
@@ -392,6 +397,7 @@ def _run_iterate_task_with_recovery(
         max_resume_attempts=max_resume_attempts,
         on_recovery=on_recovery or _default_on_recovery,
         on_terminal_skip=_capture_terminal_skip,
+        runtime_context=runtime_context,
     )
     return final_task, rc, terminal_skip_decision
 
@@ -4226,6 +4232,7 @@ def _spawn_background_iterate(
     prepared_verify_owner_task_id: str | None = None,
     prepared_review_task_id: str | None = None,
     startup_quiet: bool = False,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
     effective_max_iterations = max_iterations
@@ -4249,6 +4256,7 @@ def _spawn_background_iterate(
         prepared_verify_owner_task_id=prepared_verify_owner_task_id,
         prepared_review_task_id=prepared_review_task_id,
         startup_quiet=startup_quiet,
+        runtime_context=runtime_context,
     )
 
 

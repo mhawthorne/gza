@@ -37,6 +37,7 @@ _SQLITE_CLOSE_LABELS = {"operation": "close"}
 
 if TYPE_CHECKING:
     from gza.config import Config
+    from gza.runtime_context import RuntimeExecutionContext
     from gza.usage import ProviderUsage
 
 
@@ -52,6 +53,7 @@ __all__ = [
     "DuplicateActiveChildError",
     "ExecutionProjectDisabled",
     "ExecutionProjectResolved",
+    "ExecutionProjectRuntime",
     "ExecutionProjectSelector",
     "KNOWN_FAILURE_REASONS",
     "KNOWN_EXECUTION_MODES",
@@ -244,6 +246,18 @@ class RebaseBranchResolutionError(ValueError):
 
 
 @dataclass(frozen=True)
+class ExecutionProjectRuntime:
+    """Activated execution project state built from one freshly loaded config."""
+
+    config: "Config"
+    store: "SqliteTaskStore"
+    runtime_context: "RuntimeExecutionContext"
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.store, name)
+
+
+@dataclass(frozen=True)
 class ExecutionProjectSelector:
     """One explicit watch execution project selection."""
 
@@ -264,13 +278,21 @@ class ExecutionProjectResolved:
     config_path: Path
     db_path: Path
     config: "Config"
+    db_path_override: Path | None = None
 
-    def open_runtime_store(self) -> "SqliteTaskStore":
+    def open_runtime_store(self) -> ExecutionProjectRuntime:
         """Open the read-write runtime store after the caller owns the project lease."""
         from .config import Config, ConfigError
+        from .runtime_context import RuntimeExecutionContext
 
         try:
-            current_config = Config.load(self.root_path)
+            current_config = Config.load_execution(self.root_path)
+            if self.db_path_override is not None:
+                current_db_source = getattr(current_config, "source_map", {}).get("db_path")
+                current_local_db_path = _legacy_local_db_path(self.root_path).resolve()
+                current_db_path = current_config.db_path.resolve()
+                if current_db_path == current_local_db_path and not current_db_source:
+                    current_config = Config.load_execution(self.root_path, db_path_override=self.db_path_override)
         except (RuntimeError, ValueError) as exc:
             if not _is_expected_config_load_path_error(exc):
                 raise
@@ -337,10 +359,12 @@ class ExecutionProjectResolved:
                     ) from exc
                 raise ManualMigrationRequired(pending_versions or sorted(_MANUAL_MIGRATION_VERSIONS))
             raise SchemaIntegrityError(message)
+        runtime_context = RuntimeExecutionContext.from_config(current_config)
         try:
-            return SqliteTaskStore.from_config(current_config)
+            store = SqliteTaskStore.from_config(current_config)
         except ConfigError as exc:
             raise SchemaIntegrityError(f"Execution project config is invalid at activation: {exc}") from exc
+        return ExecutionProjectRuntime(config=current_config, store=store, runtime_context=runtime_context)
 
 
 @dataclass(frozen=True)
@@ -376,6 +400,7 @@ class _ExecutionProjectCandidate:
     config_path: Path
     db_path: Path
     config: "Config"
+    db_path_override: Path | None = None
 
 
 def _observe_sqlite_latency(seconds: float, *, labels: dict[str, str]) -> None:
@@ -404,11 +429,28 @@ def _disabled_execution_project(
     )
 
 
-def _resolve_execution_filesystem_path(raw_path: str | Path) -> tuple[Path | None, str | None]:
+def _resolve_execution_filesystem_path(
+    raw_path: str | Path,
+    *,
+    base: Path | None = None,
+) -> tuple[Path | None, str | None]:
     try:
-        return Path(os.path.expanduser(str(raw_path))).resolve(), None
+        path = Path(os.path.expanduser(str(raw_path)))
+        if not path.is_absolute() and base is not None:
+            path = base / path
+        return path.resolve(), None
     except (OSError, RuntimeError, ValueError) as exc:
         return None, str(exc)
+
+
+def _raw_path_has_embedded_nul(raw_path: str) -> bool:
+    return "\x00" in raw_path
+
+
+def _anchor_execution_project_base(anchor_store: "SqliteTaskStore") -> Path:
+    if anchor_store.project_root is not None:
+        return anchor_store.project_root
+    return anchor_store.db_path.resolve().parent
 
 
 def _is_expected_config_load_path_error(exc: RuntimeError | ValueError) -> bool:
@@ -813,7 +855,10 @@ def _execution_project_paths_from_selector(
                     "Execution project root path is empty.",
                 ),
             )
-        root_path, path_error = _resolve_execution_filesystem_path(raw_root)
+        root_path, path_error = _resolve_execution_filesystem_path(
+            raw_root,
+            base=_anchor_execution_project_base(anchor_store),
+        )
         if path_error is not None or root_path is None:
             return (
                 "",
@@ -859,6 +904,74 @@ def _execution_project_paths_from_selector(
 
     root_raw = str(row["root_path"] or "")
     config_raw = str(row["config_path"] or "")
+    if root_raw.strip() and _raw_path_has_embedded_nul(root_raw):
+        registry_config_path, _config_path_error = (
+            _resolve_execution_filesystem_path(config_raw) if config_raw.strip() else (None, None)
+        )
+        return (
+            project_id,
+            None,
+            registry_config_path,
+            project_id,
+            _disabled_execution_project(
+                selector.selector_key,
+                "missing_root",
+                f"Registry project {project_id} root_path is invalid or inaccessible: {root_raw!r} (embedded null byte)",
+                project_id=project_id,
+                config_path=registry_config_path,
+                db_path=anchor_store.db_path.resolve(),
+            ),
+        )
+    if config_raw.strip() and _raw_path_has_embedded_nul(config_raw):
+        registry_root_path, _root_path_error = (
+            _resolve_execution_filesystem_path(root_raw) if root_raw.strip() else (None, None)
+        )
+        return (
+            project_id,
+            registry_root_path,
+            None,
+            project_id,
+            _disabled_execution_project(
+                selector.selector_key,
+                "missing_config",
+                f"Registry project {project_id} config_path is invalid or inaccessible: {config_raw!r} (embedded null byte)",
+                project_id=project_id,
+                root_path=registry_root_path,
+                db_path=anchor_store.db_path.resolve(),
+            ),
+        )
+    if root_raw.strip() and not Path(os.path.expanduser(root_raw)).is_absolute():
+        return (
+            project_id,
+            None,
+            None,
+            project_id,
+            _disabled_execution_project(
+                selector.selector_key,
+                "missing_root",
+                f"Registry project {project_id} root_path must be absolute for execution: {root_raw!r}",
+                project_id=project_id,
+                db_path=anchor_store.db_path.resolve(),
+            ),
+        )
+    if config_raw.strip() and not Path(os.path.expanduser(config_raw)).is_absolute():
+        registry_root_path, _root_path_error = (
+            _resolve_execution_filesystem_path(root_raw) if root_raw.strip() else (None, None)
+        )
+        return (
+            project_id,
+            registry_root_path,
+            None,
+            project_id,
+            _disabled_execution_project(
+                selector.selector_key,
+                "missing_config",
+                f"Registry project {project_id} config_path must be absolute for execution: {config_raw!r}",
+                project_id=project_id,
+                root_path=registry_root_path,
+                db_path=anchor_store.db_path.resolve(),
+            ),
+        )
     registry_root_path, root_path_error = (
         _resolve_execution_filesystem_path(root_raw) if root_raw.strip() else (None, None)
     )
@@ -984,8 +1097,16 @@ def _preflight_execution_project(
             db_path=anchor_store.db_path.resolve(),
         )
 
+    db_path_override: Path | None = None
     try:
-        config = Config.load(root_path)
+        config = Config.load_execution(root_path)
+        if selector.kind == "registry_id":
+            anchor_db_path = anchor_store.db_path.resolve()
+            local_db_path = _legacy_local_db_path(root_path).resolve()
+            configured_db_source = getattr(config, "source_map", {}).get("db_path")
+            if config.db_path.resolve() == local_db_path and anchor_db_path != local_db_path and not configured_db_source:
+                db_path_override = anchor_db_path
+                config = Config.load_execution(root_path, db_path_override=db_path_override)
     except (RuntimeError, ValueError) as exc:
         if not _is_expected_config_load_path_error(exc):
             raise
@@ -1073,6 +1194,7 @@ def _preflight_execution_project(
         config_path=config_path,
         db_path=resolved_db_path,
         config=config,
+        db_path_override=db_path_override,
     )
 
 
@@ -1104,6 +1226,7 @@ def _resolve_preflighted_execution_project(
         config_path=candidate.config_path,
         db_path=resolved_db_path,
         config=config,
+        db_path_override=candidate.db_path_override,
     )
 
 
@@ -5511,6 +5634,7 @@ class SqliteTaskStore:
         project_root: Path | None = None,
         config_path: Path | None = None,
         project_name: str | None = None,
+        registration_db_path_override: Path | None = None,
         open_mode: StoreOpenMode = "readwrite",
     ):
         self.db_path = db_path
@@ -5519,6 +5643,7 @@ class SqliteTaskStore:
         self._project_root = project_root
         self._config_path = config_path
         self._project_name = project_name
+        self._registration_db_path_override = registration_db_path_override
         self._open_mode = open_mode
         self._startup_warnings: list[str] = []
         self._query_only_empty_db = False
@@ -5596,6 +5721,9 @@ class SqliteTaskStore:
         project_name = getattr(config, "project_name", None)
         if not isinstance(project_name, str):
             project_name = None
+        registration_db_path_override = None
+        if getattr(config, "source_map", {}).get("db_path") in {"env", "explicit"}:
+            registration_db_path_override = config.db_path
         return cls(
             config.db_path,
             prefix=project_prefix,
@@ -5603,6 +5731,7 @@ class SqliteTaskStore:
             project_root=project_dir if isinstance(project_dir, Path) else None,
             config_path=resolved_config_path,
             project_name=project_name,
+            registration_db_path_override=registration_db_path_override,
             open_mode=open_mode,
         )
 
@@ -6704,7 +6833,7 @@ class SqliteTaskStore:
         try:
             from .config import Config, ConfigError
 
-            config = Config.load(root_path)
+            config = Config.load_execution(root_path, db_path_override=self._registration_db_path_override)
         except (RuntimeError, ValueError) as exc:
             if not _is_expected_config_load_path_error(exc):
                 raise

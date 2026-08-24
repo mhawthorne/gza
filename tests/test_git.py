@@ -30,6 +30,32 @@ class TestGitInit:
         git = Git(repo_dir)
         assert git.repo_dir == repo_dir
 
+    def test_interleaved_git_instances_use_owning_env_and_cwd(self, tmp_path: Path):
+        repo_a = tmp_path / "repo-a"
+        repo_b = tmp_path / "repo-b"
+        repo_a.mkdir()
+        repo_b.mkdir()
+        env_a = {"PATH": "/a/bin", "GZA_DB_PATH": "/a.db"}
+        env_b = {"PATH": "/b/bin", "GZA_DB_PATH": "/b.db"}
+        calls: list[dict[str, object]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append({"cmd": cmd, **kwargs})
+            return MagicMock(returncode=0, stdout="main\n", stderr="")
+
+        with patch("gza.git.shutil.which", side_effect=lambda _name, path=None: f"{path}/git"), \
+             patch("gza.git.subprocess.run", side_effect=fake_run):
+            Git(repo_a, env=env_a).current_branch()
+            Git(repo_b, env=env_b).current_branch()
+            Git(repo_a, env=env_a).current_branch()
+
+        assert [(call["cwd"], call["env"]["GZA_DB_PATH"]) for call in calls] == [
+            (repo_a, "/a.db"),
+            (repo_b, "/b.db"),
+            (repo_a, "/a.db"),
+        ]
+        assert [call["cmd"][0] for call in calls] == ["/a/bin/git", "/b/bin/git", "/a/bin/git"]
+
 
 class TestCleanupWorktreeForBranch:
     """Tests for cleanup_worktree_for_branch helper."""
@@ -76,6 +102,25 @@ class TestCleanupWorktreeForBranch:
                 cleanup_worktree_for_branch(git, "feature/test", force=True)
 
             mock_remove.assert_called_once_with(worktree_path.resolve(strict=False), force=True)
+
+    def test_cleanup_dirty_state_uses_parent_git_environment(self, tmp_path: Path):
+        git = Git(tmp_path, env={"PATH": "/owned/bin", "GZA_DB_PATH": "/owned.db", "GIT_SSH_COMMAND": "ssh owned"})
+        worktree_path = tmp_path / "worktrees" / "branch"
+
+        with patch.object(git, "worktree_list") as mock_list, \
+             patch.object(git, "worktree_remove") as mock_remove, \
+             patch("gza.git._worktree_registration_dir_for_branch", return_value=None), \
+             patch("gza.git.Git") as mock_git_class:
+            mock_list.side_effect = [
+                [{"path": str(worktree_path), "branch": "refs/heads/feature/test"}],
+                [],
+            ]
+            mock_remove.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            mock_git_class.return_value.has_changes.return_value = False
+
+            cleanup_worktree_for_branch(git, "feature/test", force=True)
+
+        mock_git_class.assert_called_once_with(worktree_path.resolve(strict=False), env=git.env)
 
     def test_removes_targeted_registration_after_remove(self, tmp_path: Path):
         """A stale registration for the same branch is removed directly."""

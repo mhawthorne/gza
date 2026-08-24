@@ -7,6 +7,7 @@ import os
 import sqlite3
 import stat
 import subprocess
+import sys
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -41,6 +42,7 @@ from gza.review_verify_state import (
     latest_verify_result_for_epoch,
     persist_verify_gate_artifact,
 )
+from gza.runtime_context import RuntimeExecutionContext
 from gza.runner import (
     BACKUP_DIR,
     BRANCH_UNPUSHABLE_FAILURE_REASON,
@@ -2006,14 +2008,48 @@ class TestReviewContextFromChain:
         worktree_project_dir.mkdir(parents=True)
         worktree_sibling_dir.mkdir(parents=True)
         worktree_skipped_dir.mkdir(parents=True)
-        (project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-        (sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
+        (project_dir / "gza.yaml").write_text(
+            "project_name: foo\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/foo-verify\n"
+            "autonomous_verify_timeout_seconds: 101\n"
+            "review_verify_timeout_grace_seconds: 11\n"
+        )
+        (sibling_dir / "gza.yaml").write_text(
+            "project_name: bar\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/bar-verify\n"
+            "autonomous_verify_timeout_seconds: 202\n"
+            "review_verify_timeout_grace_seconds: 22\n"
+        )
         (skipped_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\n")
-        (worktree_project_dir / "gza.yaml").write_text("project_name: foo\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/foo-verify\n")
-        (worktree_sibling_dir / "gza.yaml").write_text("project_name: bar\nprovider: codex\nmodel: gpt-5.5\nverify_command: ./bin/bar-verify\n")
+        (worktree_project_dir / "gza.yaml").write_text(
+            "project_name: foo\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/foo-verify\n"
+            "autonomous_verify_timeout_seconds: 101\n"
+            "review_verify_timeout_grace_seconds: 11\n"
+        )
+        (worktree_sibling_dir / "gza.yaml").write_text(
+            "project_name: bar\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "verify_command: ./bin/bar-verify\n"
+            "autonomous_verify_timeout_seconds: 202\n"
+            "review_verify_timeout_grace_seconds: 22\n"
+        )
         (worktree_skipped_dir / "gza.yaml").write_text("project_name: baz\nprovider: codex\nmodel: gpt-5.5\n")
 
-        config = Config(project_dir=project_dir, project_name="foo", verify_command="./bin/foo-verify")
+        config = Config(
+            project_dir=project_dir,
+            project_name="foo",
+            verify_command="./bin/foo-verify",
+            autonomous_verify_timeout_seconds=303,
+            review_verify_timeout_grace_seconds=33.0,
+        )
         config._project_boundary_cache = ProjectBoundary(
             repo_root=tmp_path,
             scope_root=Path("services/foo"),
@@ -2054,8 +2090,8 @@ class TestReviewContextFromChain:
                 task=task,
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
-                timeout_seconds=120,
-                timeout_grace_seconds=5.0,
+                timeout_seconds=303,
+                timeout_grace_seconds=33.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
                 reviewed_base_sha="cafebabe",
@@ -2076,11 +2112,140 @@ class TestReviewContextFromChain:
         assert len(verify_calls) == 2
         assert verify_calls[0].kwargs["cwd"] == worktree_path / "services" / "foo"
         assert verify_calls[1].kwargs["cwd"] == worktree_path / "libs" / "bar"
-        assert verify_calls[0].kwargs["timeout_grace_seconds"] == 5.0
-        assert verify_calls[1].kwargs["timeout_grace_seconds"] == 5.0
+        assert verify_calls[0].kwargs["timeout_seconds"] == 101
+        assert verify_calls[0].kwargs["timeout_grace_seconds"] == 11.0
+        assert verify_calls[1].kwargs["timeout_seconds"] == 202
+        assert verify_calls[1].kwargs["timeout_grace_seconds"] == 22.0
         assert verify_calls[0].kwargs["reviewed_branch"] == "feature/cross-project"
         assert verify_calls[0].kwargs["reviewed_head_sha"] == "deadbeef"
         assert verify_calls[0].kwargs["reviewed_base_sha"] == "cafebabe"
+
+    def test_cross_project_verify_uses_discovered_execution_context_without_presentation_bleed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import gza.colors as color_state
+        import gza.console as console_state
+
+        repo_root = tmp_path / "repo"
+        worktree_path = tmp_path / "worktree"
+        anchor_dir = repo_root / "services" / "anchor"
+        project_a = worktree_path / "services" / "anchor"
+        project_b = worktree_path / "libs" / "other"
+        anchor_dir.mkdir(parents=True)
+        project_a.mkdir(parents=True)
+        project_b.mkdir(parents=True)
+        monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+        monkeypatch.setenv("PATH", "/ambient/bin")
+        monkeypatch.setenv("TOKEN", "ambient-token")
+
+        (anchor_dir / "gza.yaml").write_text(
+            "project_name: anchor\n"
+            "project_id: anchor\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "theme: minimal\n"
+            "no_color: false\n"
+            "colors:\n"
+            "  task_id: '#abcdef'\n"
+            "verify_command: ./bin/anchor-verify\n"
+        )
+        (project_a / "gza.yaml").write_text(
+            "project_name: anchor\n"
+            "project_id: anchor\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "theme: blue\n"
+            "no_color: true\n"
+            "db_path: .gza/anchor-runtime.db\n"
+            "verify_command: ./bin/anchor-verify\n"
+        )
+        (project_b / "gza.yaml").write_text(
+            "project_name: other\n"
+            "project_id: other\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            "theme: selective_neon\n"
+            "no_color: true\n"
+            "db_path: .gza/other-runtime.db\n"
+            "verify_command: ./bin/other-verify\n"
+        )
+        (project_a / ".env").write_text("PATH=/project-a/bin\nTOKEN=project-a-token\n")
+        (project_b / ".env").write_text("PATH=/project-b/bin\nTOKEN=project-b-token\n")
+
+        config = Config.load(anchor_dir)
+        anchor_task_color = color_state.TASK_COLORS.task_id
+        anchor_no_color = console_state.colors_disabled()
+        task = Task(id="gza-1", prompt="Review cross-project", status="pending", task_type="review")
+        task.tags = ("cross-project",)
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=repo_root,
+            scope_root=Path("services/anchor"),
+            local_dependencies=(),
+        )
+        selected_runtime = RuntimeExecutionContext(
+            cwd=anchor_dir,
+            env={
+                "PATH": "/selected-anchor/bin",
+                "PWD": "/selected-stale-pwd",
+                "TOKEN": "selected-anchor-token",
+                "GZA_DB_PATH": str(anchor_dir / ".gza" / "selected-runtime.db"),
+                "GIT_DIR": "/selected-git-dir",
+            },
+            project_id=config.project_id,
+            db_path=anchor_dir / ".gza" / "selected-runtime.db",
+        )
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = (
+            "M\tservices/anchor/app.py\n"
+            "M\tlibs/other/lib.py\n"
+        )
+        calls: list[dict[str, object]] = []
+
+        def fake_verify(command: str, **kwargs: object) -> ReviewVerifyResult:
+            env = kwargs["env"]
+            assert isinstance(env, dict)
+            calls.append({"command": command, **kwargs})
+            return ReviewVerifyResult(
+                command=command,
+                status="passed",
+                exit_status="0",
+                captured_at=datetime(2026, 1, 1, tzinfo=UTC),
+            )
+
+        with patch("gza.runner._run_review_verify_command", side_effect=fake_verify):
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                runtime_context=selected_runtime,
+                timeout_seconds=120,
+                timeout_grace_seconds=5.0,
+            )
+
+        assert outcome is not None
+        assert color_state.TASK_COLORS.task_id == anchor_task_color
+        assert console_state.colors_disabled() is anchor_no_color
+        assert os.environ["GZA_DB_PATH"] == str(tmp_path / "ambient.db")
+        assert os.environ["PATH"] == "/ambient/bin"
+        assert os.environ["TOKEN"] == "ambient-token"
+        assert [(call["command"], call["cwd"]) for call in calls] == [
+            ("./bin/anchor-verify", project_a),
+            ("./bin/other-verify", project_b),
+        ]
+        env_a = calls[0]["env"]
+        env_b = calls[1]["env"]
+        assert isinstance(env_a, dict)
+        assert isinstance(env_b, dict)
+        assert env_a["PATH"] == "/selected-anchor/bin"
+        assert env_b["PATH"] == "/project-b/bin"
+        assert env_a["TOKEN"] == "selected-anchor-token"
+        assert env_b["TOKEN"] == "project-b-token"
+        assert env_a["GZA_DB_PATH"] == str(anchor_dir / ".gza" / "selected-runtime.db")
+        assert env_b["GZA_DB_PATH"] == str((project_b / ".gza" / "other-runtime.db").resolve())
+        assert env_a["PWD"] == str(project_a.resolve())
+        assert "GIT_DIR" not in env_a
 
     def test_default_cross_project_runs_verify_for_current_and_parent_projects(self, tmp_path: Path):
         repo_root = tmp_path / "repo"
@@ -4362,6 +4527,7 @@ class TestReviewTaskSlugGeneration:
         # Create a mock config and run function that captures the review task
         config = Mock(spec=Config)
         config.project_dir = tmp_path
+        config.db_path = db_path
         config.log_path = tmp_path / "logs"
 
         # Capture the review task that gets created
@@ -4410,6 +4576,7 @@ class TestReviewTaskSlugGeneration:
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path
+        config.db_path = db_path
         config.log_path = tmp_path / "logs"
 
         def mock_run(config, task_id):
@@ -6763,6 +6930,76 @@ class TestFailureReasonGroundTruth:
         assert decision.launch_mode == "iterate"
         assert decision.reason_code == "TIMEOUT"
 
+    def test_code_task_sigterm_interrupt_marks_terminated_after_provider_unwind(self, tmp_path: Path):
+        """Code-task provider KeyboardInterrupt must preserve signal-qualified failure state."""
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+        task = store.add(prompt="Implement interruptible feature", task_type="implement")
+        task.slug = "20260824-implement-sigterm-interrupt"
+        store.update(task)
+        config = self._make_config(tmp_path, db_path)
+
+        provider_seen: dict[str, str] = {}
+
+        def provider_run(_config, _prompt, _log_file, _work_dir, **kwargs):
+            provider_seen["interrupt_source"] = os.environ["GZA_INTERRUPT_SOURCE"]
+            provider_seen["interrupt_detail"] = os.environ["GZA_INTERRUPT_DETAIL"]
+            provider_seen["db_path"] = kwargs["env"]["GZA_DB_PATH"]
+            raise KeyboardInterrupt
+
+        mock_provider = Mock()
+        mock_provider.name = "MockProvider"
+        mock_provider.check_credentials.return_value = True
+        mock_provider.verify_credentials.return_value = True
+        mock_provider.run.side_effect = provider_run
+
+        mock_main_git = Mock()
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.worktree_list.return_value = []
+        mock_main_git.worktree_add.return_value = config.worktree_path / task.slug
+        mock_main_git.branch_exists.return_value = False
+        mock_main_git.count_commits_ahead.return_value = 0
+        mock_main_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+
+        mock_worktree_git = Mock()
+        mock_worktree_git.status_porcelain.return_value = set()
+        mock_worktree_git.has_changes.return_value = False
+        mock_worktree_git.default_branch.return_value = "main"
+        mock_worktree_git.count_commits_ahead.return_value = 0
+        mock_worktree_git.get_diff_numstat.return_value = ""
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GZA_INTERRUPT_SIGNAL": "SIGTERM",
+                    "GZA_INTERRUPT_SOURCE": "watch_reconcile_no_activity",
+                    "GZA_INTERRUPT_DETAIL": "watch reconciliation detected no recent task log activity",
+                },
+                clear=False,
+            ),
+            patch("gza.runner.get_provider", return_value=mock_provider),
+            patch("gza.runner.get_effective_config_for_task", return_value=("", "claude", 50)),
+            patch("gza.runner.Git", side_effect=[mock_main_git, mock_worktree_git]),
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner.console"),
+        ):
+            exit_status = run(config, task_id=task.id)
+
+        assert exit_status == 130
+        failed = store.get(task.id)
+        assert failed is not None
+        assert failed.status == "failed"
+        assert failed.failure_reason == "TERMINATED"
+        assert provider_seen["interrupt_source"] == "watch_reconcile_no_activity"
+        assert provider_seen["interrupt_detail"] == "watch reconciliation detected no recent task log activity"
+        assert provider_seen["db_path"] == str(db_path.resolve())
+        assert failed.log_file is not None
+        ops_text = ops_log_path_for(tmp_path / failed.log_file).read_text()
+        assert '"subtype": "interrupt"' in ops_text
+        assert '"source": "watch_reconcile_no_activity"' in ops_text
+
     def test_run_uses_loaded_legacy_task_type_timeout_for_provider_handoff(self, tmp_path: Path):
         """A valid task_types.<type>.timeout_minutes should reach provider.run unchanged."""
         (tmp_path / "gza.yaml").write_text(
@@ -7425,6 +7662,7 @@ class TestRunStepPersistenceIntegration:
 
         config = Mock(spec=Config)
         config.project_dir = tmp_path
+        config.db_path = db_path
         config.log_path = tmp_path / "logs"
         config.log_path.mkdir(parents=True, exist_ok=True)
         config.worktree_path = tmp_path / "worktrees"
@@ -7437,6 +7675,8 @@ class TestRunStepPersistenceIntegration:
         config.claude = Mock(args=[])
         config.tmux = Mock(session_name=None)
 
+        provider_seen: dict[str, str] = {}
+
         def _interrupting_run(
             _config,
             _prompt,
@@ -7446,10 +7686,16 @@ class TestRunStepPersistenceIntegration:
             on_session_id=None,
             on_step_count=None,
             interactive=False,
+            ops_log_file=None,
+            env=None,
         ):
-            del resume_session_id, on_step_count, interactive
+            del resume_session_id, on_step_count, interactive, ops_log_file
             assert on_session_id is not None
             on_session_id("sess-terminated-inline")
+            assert env is not None
+            provider_seen["interrupt_source"] = os.environ["GZA_INTERRUPT_SOURCE"]
+            provider_seen["interrupt_detail"] = os.environ["GZA_INTERRUPT_DETAIL"]
+            provider_seen["db_path"] = env["GZA_DB_PATH"]
             raise KeyboardInterrupt
 
         mock_provider = Mock()
@@ -7492,6 +7738,9 @@ class TestRunStepPersistenceIntegration:
         assert refreshed.failure_reason == "TERMINATED"
         assert refreshed.session_id == "sess-terminated-inline"
         assert refreshed.log_file is not None
+        assert provider_seen["interrupt_source"] == "watch_reconcile_no_activity"
+        assert provider_seen["interrupt_detail"] == "watch reconciliation detected no recent task log activity"
+        assert provider_seen["db_path"] == str(db_path.resolve())
 
         log_path = tmp_path / refreshed.log_file
         log_text = ops_log_path_for(log_path).read_text()
@@ -8717,6 +8966,102 @@ class TestNoChangesWithExistingCommits:
         config.learnings_interval = 0
         config.learnings_window = 25
         return config
+
+    def test_run_uses_captured_runtime_context_after_env_mutation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from gza.runtime_context import RuntimeExecutionContext
+
+        project = tmp_path / "project"
+        db_path = project / ".gza" / "gza.db"
+        project.mkdir()
+        (project / "gza.yaml").write_text(
+            f"project_name: scoped\nproject_id: scoped\nprovider: codex\nmodel: gpt-5.5\ndb_path: {db_path}\n",
+            encoding="utf-8",
+        )
+        (project / ".env").write_text("PATH=/captured/bin\nPROJECT_TOKEN=captured-token\n", encoding="utf-8")
+        config = Config.load(project)
+        store = SqliteTaskStore.from_config(config)
+        task = store.add(prompt="Implement with captured runtime", task_type="implement")
+        task.slug = "20260824-scoped-captured-runtime"
+        store.update(task)
+        runtime_context = RuntimeExecutionContext.from_config(config)
+
+        (project / ".env").write_text("PATH=/mutated/bin\nPROJECT_TOKEN=mutated-token\n", encoding="utf-8")
+        monkeypatch.setenv("PATH", "/ambient/bin")
+        monkeypatch.setenv("PROJECT_TOKEN", "ambient-token")
+        monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
+
+        seen: dict[str, Any] = {}
+
+        class CapturingProvider:
+            name = "CapturingProvider"
+            credential_setup_hint = "set credentials"
+
+            def check_credentials(self, *, env=None):
+                seen["check_env"] = dict(env)
+                return True
+
+            def verify_credentials(self, _config, *, log_file=None, env=None, cwd=None):
+                del log_file
+                seen["verify_env"] = dict(env)
+                seen["verify_cwd"] = cwd
+                return PreflightCheckResult.success()
+
+            def run(self, _config, _prompt, log_file, work_dir, *, env=None, **_kwargs):
+                log_file.write_text("provider completed\n", encoding="utf-8")
+                seen["run_env"] = dict(env)
+                seen["run_work_dir"] = work_dir
+                return RunResult(exit_code=0, duration_seconds=1.0)
+
+        git_calls: list[tuple[Path, dict[str, str] | None]] = []
+        mock_main_git = Mock()
+        mock_main_git.default_branch.return_value = "main"
+        mock_main_git.worktree_list.return_value = []
+        mock_main_git.worktree_add.return_value = config.worktree_path / task.slug
+        mock_main_git.branch_exists.return_value = False
+        mock_main_git.count_commits_ahead.return_value = 0
+        mock_main_git._run.return_value = Mock(returncode=0, stdout="", stderr="")
+
+        mock_worktree_git = Mock()
+        mock_worktree_git.status_porcelain.return_value = set()
+        mock_worktree_git.has_changes.return_value = False
+        mock_worktree_git.default_branch.return_value = "main"
+        mock_worktree_git.count_commits_ahead.return_value = 1
+        mock_worktree_git.get_diff_numstat.return_value = ""
+
+        def git_factory(repo_dir, *, env=None):
+            git_calls.append((Path(repo_dir), dict(env) if env is not None else None))
+            return mock_main_git if len(git_calls) == 1 else mock_worktree_git
+
+        with (
+            patch("gza.runner.get_provider", return_value=CapturingProvider()),
+            patch("gza.runner.Git", side_effect=git_factory),
+            patch("gza.git.Git") as db_git_class,
+            patch("gza.runner.load_dotenv"),
+            patch("gza.runner.backup_database"),
+            patch("gza.runner.build_prompt", return_value="prompt"),
+            patch("gza.runner.task_footer"),
+        ):
+            db_git_class.return_value.default_branch.return_value = "main"
+            result = run(config, task_id=task.id, runtime_context=runtime_context)
+
+        assert result == 0
+        expected_env = runtime_context.env
+        assert seen["check_env"] == expected_env
+        assert seen["verify_env"] == expected_env
+        assert seen["verify_cwd"] == runtime_context.cwd
+        assert seen["run_env"] == {
+            **expected_env,
+            "PWD": str((config.worktree_path / task.slug).resolve()),
+        }
+        assert seen["run_work_dir"] == config.worktree_path / task.slug
+        assert git_calls[0] == (runtime_context.cwd, expected_env)
+        assert runtime_context.env["PATH"] == "/captured/bin"
+        assert runtime_context.env["PROJECT_TOKEN"] == "captured-token"
+        assert runtime_context.env["GZA_DB_PATH"] == str(db_path.resolve())
 
     def test_resume_with_existing_commits_and_no_new_changes_succeeds(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]):
         """When resuming, if there are no uncommitted changes but the branch already has
@@ -20736,6 +21081,286 @@ class TestLoadDotenv:
         load_dotenv(project_dir)
 
         assert os.environ["MY_TEST_KEY"] == "from_project"
+
+    def test_provider_run_uses_scoped_project_env_without_leaking_to_next_config(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """Provider execution sees project dotenv values without mutating supervisor env."""
+        from gza.providers import RunResult
+        from gza.runtime_context import RuntimeExecutionContext
+        from gza.runner import _call_provider_run
+
+        project_a = tmp_path / "a"
+        project_b = tmp_path / "b"
+        db_a = tmp_path / "a.db"
+        leaked_db = tmp_path / "leaked.db"
+        for project, db_path in ((project_a, db_a), (project_b, tmp_path / "b.db")):
+            project.mkdir()
+            (project / "gza.yaml").write_text(
+                "\n".join(
+                    [
+                        "project_name: scoped",
+                        "project_id: scoped",
+                        f"db_path: {db_path}",
+                        "provider: codex",
+                        "model: gpt-5.5",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        (project_a / ".env").write_text(
+            f"PROJECT_ONLY_TOKEN=secret-a\nGZA_DB_PATH={leaked_db}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("PROJECT_ONLY_TOKEN", raising=False)
+        monkeypatch.delenv("GZA_DB_PATH", raising=False)
+        config_a = Config.load(project_a)
+        config_b = Config.load(project_b)
+        seen_env: dict[str, str | None] = {}
+
+        class FakeProvider:
+            def run(self, *_args, env=None, **_kwargs):
+                seen_env["PROJECT_ONLY_TOKEN"] = env.get("PROJECT_ONLY_TOKEN") if env else None
+                seen_env["GZA_DB_PATH"] = env.get("GZA_DB_PATH") if env else None
+                return RunResult(exit_code=0)
+
+        result = _call_provider_run(
+            FakeProvider(),
+            config_a,
+            "prompt",
+            project_a / "task.log",
+            project_a,
+            provider_run_kwargs={},
+            runtime_env=RuntimeExecutionContext.from_config(config_a).env,
+        )
+
+        assert result.exit_code == 0
+        assert seen_env == {"PROJECT_ONLY_TOKEN": "secret-a", "GZA_DB_PATH": str(config_a.db_path)}
+        assert os.environ.get("PROJECT_ONLY_TOKEN") is None
+        assert os.environ.get("GZA_DB_PATH") is None
+        assert Config.load(project_b).db_path == config_b.db_path
+
+    def test_provider_run_interleaved_runtime_envs_do_not_cross_observe_supervisor(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """Explicit provider envs isolate interleaved runtime calls from supervisor state."""
+        from gza.providers import RunResult
+        from gza.runtime_context import RuntimeExecutionContext
+        from gza.runner import _call_provider_run
+
+        project_a = tmp_path / "a"
+        project_b = tmp_path / "b"
+        ambient_pwd = tmp_path / "ambient-pwd"
+        dotenv_pwd = tmp_path / "dotenv-pwd"
+        ambient_pwd.mkdir()
+        dotenv_pwd.mkdir()
+        for project, token in ((project_a, "token-a"), (project_b, "token-b")):
+            project.mkdir()
+            (project / "gza.yaml").write_text(
+                "\n".join(
+                    [
+                        f"project_name: {project.name}",
+                        f"project_id: {project.name}",
+                        f"db_path: {project / '.gza' / 'gza.db'}",
+                        "provider: codex",
+                        "model: gpt-5.5",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (project / ".env").write_text(
+                f"PROJECT_TOKEN={token}\nPWD={dotenv_pwd}\nGIT_DIR={ambient_pwd / '.git'}\n",
+                encoding="utf-8",
+            )
+        monkeypatch.setenv("PROJECT_TOKEN", "supervisor")
+        monkeypatch.setenv("PWD", str(ambient_pwd))
+        monkeypatch.setenv("GIT_DIR", str(ambient_pwd / ".git"))
+        config_a = Config.load(project_a)
+        config_b = Config.load(project_b)
+        seen: list[tuple[str | None, str | None, str | None, str | None]] = []
+
+        class FakeProvider:
+            def run(self, *_args, env=None, **_kwargs):
+                seen.append(
+                    (
+                        env.get("PROJECT_TOKEN") if env else None,
+                        env.get("PWD") if env else None,
+                        env.get("GIT_DIR") if env else None,
+                        os.environ.get("PROJECT_TOKEN"),
+                    )
+                )
+                return RunResult(exit_code=0)
+
+        for config in (config_a, config_b, config_a):
+            result = _call_provider_run(
+                FakeProvider(),
+                config,
+                "prompt",
+                config.project_dir / "task.log",
+                config.project_dir,
+                provider_run_kwargs={},
+                runtime_env=RuntimeExecutionContext.from_config(config).env,
+            )
+            assert result.exit_code == 0
+
+        assert seen == [
+            ("token-a", str(project_a.resolve()), None, "supervisor"),
+            ("token-b", str(project_b.resolve()), None, "supervisor"),
+            ("token-a", str(project_a.resolve()), None, "supervisor"),
+        ]
+        assert os.environ["PROJECT_TOKEN"] == "supervisor"
+        assert os.environ["PWD"] == str(ambient_pwd)
+        assert os.environ["GIT_DIR"] == str(ambient_pwd / ".git")
+
+    def test_provider_run_typeerror_after_side_effect_is_not_retried(self, tmp_path: Path) -> None:
+        from gza.runtime_context import RuntimeExecutionContext
+        from gza.runner import _call_provider_run
+
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "gza.yaml").write_text(
+            "project_name: scoped\nproject_id: scoped\nprovider: codex\nmodel: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        config = Config.load(project)
+        calls: list[dict[str, str] | None] = []
+
+        class FakeProvider:
+            def run(self, *_args, env=None, **_kwargs):
+                calls.append(dict(env) if env is not None else None)
+                raise TypeError("unexpected keyword argument 'env'")
+
+        with pytest.raises(TypeError, match="unexpected keyword argument 'env'"):
+            _call_provider_run(
+                FakeProvider(),
+                config,
+                "prompt",
+                project / "task.log",
+                project,
+                provider_run_kwargs={"ops_log_file": project / "task.ops.jsonl"},
+                runtime_env=RuntimeExecutionContext.from_config(config).env,
+            )
+
+        assert len(calls) == 1
+        assert calls[0] is not None
+        assert calls[0]["GZA_DB_PATH"] == str(config.db_path)
+
+    def test_provider_credential_typeerrors_after_side_effect_are_not_retried(self, tmp_path: Path) -> None:
+        from gza.runner import _call_provider_check_credentials, _call_provider_verify_credentials
+
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "gza.yaml").write_text(
+            "project_name: scoped\nproject_id: scoped\nprovider: codex\nmodel: gpt-5.5\n",
+            encoding="utf-8",
+        )
+        config = Config.load(project)
+        runtime_env = {"GZA_DB_PATH": str(config.db_path), "TOKEN": "runtime"}
+        calls: list[tuple[str, dict[str, str] | None]] = []
+
+        class FakeProvider:
+            def check_credentials(self, *, env=None):
+                calls.append(("check", dict(env) if env is not None else None))
+                raise TypeError("unexpected keyword argument 'env'")
+
+            def verify_credentials(self, _config, *, log_file=None, env=None):
+                calls.append(("verify", dict(env) if env is not None else None))
+                raise TypeError("unexpected keyword argument 'env'")
+
+        provider = FakeProvider()
+        with pytest.raises(TypeError, match="unexpected keyword argument 'env'"):
+            _call_provider_check_credentials(provider, runtime_env=runtime_env, runtime_cwd=project)
+        with pytest.raises(TypeError, match="unexpected keyword argument 'env'"):
+            _call_provider_verify_credentials(
+                provider,
+                config,
+                log_file=project / "ops.jsonl",
+                runtime_env=runtime_env,
+                runtime_cwd=project,
+            )
+
+        expected_env = {**runtime_env, "PWD": str(project.resolve())}
+        assert calls == [
+            ("check", expected_env),
+            ("verify", expected_env),
+        ]
+
+    def test_lifecycle_verify_uses_runtime_cwd_and_env_without_mutating_supervisor(
+        self,
+        tmp_path: Path,
+        monkeypatch,
+    ) -> None:
+        """Lifecycle verify subprocesses run under the owning cwd and runtime dotenv env."""
+        from gza.runner import _run_lifecycle_verify
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        verify_cwd = project_dir / "scoped"
+        verify_cwd.mkdir()
+        (project_dir / "gza.yaml").write_text(
+            "\n".join(
+                [
+                    "project_name: verify-env",
+                    "project_id: verifyenv",
+                    f"db_path: {project_dir / '.gza' / 'gza.db'}",
+                    "provider: codex",
+                    "model: gpt-5.5",
+                    "verify_command: unused",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        poisoned_pwd = tmp_path / "poisoned-pwd"
+        poisoned_pwd.mkdir()
+        (project_dir / ".env").write_text(
+            f"PROJECT_VERIFY_TOKEN=from-project\nPWD={poisoned_pwd}\nGIT_WORK_TREE={tmp_path / 'other'}\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("PROJECT_VERIFY_TOKEN", "supervisor")
+        monkeypatch.setenv("PWD", str(tmp_path / "ambient-pwd"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "ambient-worktree"))
+        config = Config.load(project_dir)
+        config.verify_command = (
+            f"{sys.executable} -c \"import os, pathlib; "
+            "print(pathlib.Path.cwd()); "
+            "print(os.environ.get('PWD')); "
+            "print(os.environ.get('PROJECT_VERIFY_TOKEN')); "
+            "print(os.environ.get('GIT_WORK_TREE'))\""
+        )
+        runtime_context = RuntimeExecutionContext.from_config(config)
+        monkeypatch.setenv("PROJECT_VERIFY_TOKEN", "ambient-after-capture")
+        store = SqliteTaskStore.from_config(config)
+        task = store.add("verify env", task_type="implement")
+        worktree_git = Mock(spec=Git)
+
+        execution = _run_lifecycle_verify(
+            config=config,
+            task=task,
+            worktree_git=worktree_git,
+            worktree_path=project_dir,
+            cwd=verify_cwd,
+            runtime_context=runtime_context,
+            timeout_seconds=10,
+            timeout_grace_seconds=1,
+        )
+
+        assert execution is not None
+        assert execution.aggregate_result.status == "passed"
+        assert str(verify_cwd) in (execution.aggregate_result.output or "")
+        assert str(verify_cwd.resolve()) in (execution.aggregate_result.output or "")
+        assert "from-project" in (execution.aggregate_result.output or "")
+        assert "ambient-after-capture" not in (execution.aggregate_result.output or "")
+        assert "ambient-worktree" not in (execution.aggregate_result.output or "")
+        assert str(poisoned_pwd) not in (execution.aggregate_result.output or "")
+        assert os.environ["PROJECT_VERIFY_TOKEN"] == "ambient-after-capture"
+        assert os.environ["GIT_WORK_TREE"] == str(tmp_path / "ambient-worktree")
 
 
 class TestDependencyMergePrecondition:

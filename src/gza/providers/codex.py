@@ -11,13 +11,14 @@ import shutil
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rich.markup import escape as rich_escape
 
+from ..runtime_context import normalize_subprocess_env
 from ..usage import (
     ProviderUsage,
     UsageCliMissing,
@@ -37,6 +38,7 @@ from .base import (
     build_docker_cmd,
     classify_provider_api_error,
     ensure_docker_image,
+    provider_home_from_env,
     verify_docker_credentials,
     write_ops_event,
     write_preflight_entry,
@@ -664,25 +666,31 @@ def build_headless_exec_args(work_dir: str | Path) -> list[str]:
     ]
 
 
-def _has_codex_oauth() -> bool:
-    """Check if OAuth credentials exist in ~/.codex."""
-    auth_file = Path.home() / ".codex" / "auth.json"
+def _codex_home(env: Mapping[str, str] | None = None) -> Path:
+    return provider_home_from_env("codex", env=env)
+
+
+def _has_codex_oauth(env: Mapping[str, str] | None = None) -> bool:
+    """Check if OAuth credentials exist in the runtime Codex home."""
+    auth_file = _codex_home(env) / "auth.json"
     return auth_file.exists()
 
 
-def _has_api_key() -> bool:
+def _has_api_key(env: Mapping[str, str] | None = None) -> bool:
     """Check if an API key is configured.
 
     CODEX_API_KEY is the canonical variable; OPENAI_API_KEY is supported as a
     backward-compatible alias (the underlying Codex CLI also reads this variable).
     """
-    return bool(os.getenv("CODEX_API_KEY") or os.getenv("OPENAI_API_KEY"))
+    env_source = os.environ if env is None else env
+    return bool(env_source.get("CODEX_API_KEY") or env_source.get("OPENAI_API_KEY"))
 
 
 def _get_docker_config(
     image_name: str,
     *,
     docker_startup_timeout: int = DEFAULT_PROVIDER_DOCKER_STARTUP_TIMEOUT,
+    env: Mapping[str, str] | None = None,
 ) -> DockerConfig:
     """Get Docker configuration for Codex.
 
@@ -690,12 +698,13 @@ def _get_docker_config(
     over OAuth (~/.codex). Explicit API key credentials are deterministic and
     portable; OAuth is used as a fallback when no API key is configured.
     """
-    if _has_api_key():
+    env_source = os.environ if env is None else env
+    if _has_api_key(env_source):
         # API key takes precedence — pass through whichever key var(s) are set.
         env_vars: list[str] = []
-        if os.getenv("CODEX_API_KEY"):
+        if env_source.get("CODEX_API_KEY"):
             env_vars.append("CODEX_API_KEY")
-        if os.getenv("OPENAI_API_KEY"):
+        if env_source.get("OPENAI_API_KEY"):
             env_vars.append("OPENAI_API_KEY")
         return DockerConfig(
             image_name=image_name,
@@ -705,7 +714,7 @@ def _get_docker_config(
             env_vars=env_vars,
             docker_startup_timeout=docker_startup_timeout,
         )
-    elif _has_codex_oauth():
+    elif _has_codex_oauth(env_source):
         # Fall back to OAuth — mount ~/.codex into the container.
         return DockerConfig(
             image_name=image_name,
@@ -714,6 +723,7 @@ def _get_docker_config(
             config_dir=".codex",
             env_vars=[],
             docker_startup_timeout=docker_startup_timeout,
+            host_config_dir=_codex_home(env_source),
         )
     else:
         # No credentials found; default to API key mode (will fail at runtime
@@ -740,13 +750,22 @@ def _gza_version() -> str:
         return "0"
 
 
-def _read_codex_usage(*, timeout_seconds: float, gza_version: str) -> ProviderUsage:
+def _read_codex_usage(
+    *,
+    timeout_seconds: float,
+    gza_version: str,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+) -> ProviderUsage:
     """Query Codex quota via one short-lived `codex app-server` child process.
 
     Codex owns ChatGPT authentication throughout: we never read auth.json,
     cookies, or tokens, and never call undocumented HTTP endpoints.
     """
-    if shutil.which("codex") is None:
+    env_source = os.environ if env is None else env
+    subprocess_env = normalize_subprocess_env(env_source, cwd)
+    executable = shutil.which("codex", path=env_source.get("PATH"))
+    if executable is None:
         raise UsageCliMissing("codex CLI is not installed")
 
     messages = [
@@ -764,12 +783,14 @@ def _read_codex_usage(*, timeout_seconds: float, gza_version: str) -> ProviderUs
     deadline = time.monotonic() + timeout_seconds
     try:
         process = subprocess.Popen(
-            ["codex", "app-server"],
+            [executable, "app-server"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            cwd=cwd,
+            env=subprocess_env,
         )
     except OSError as exc:
         raise UsageCliMissing(f"could not start codex app-server: {exc}") from exc
@@ -894,40 +915,62 @@ class CodexProvider(Provider):
     def supports_usage(self) -> bool:
         return True
 
-    def read_usage(self, *, timeout_seconds: float = 10.0) -> ProviderUsage:
+    def read_usage(
+        self,
+        *,
+        timeout_seconds: float = 10.0,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> ProviderUsage:
         """Read ChatGPT-backed Codex quota windows."""
-        return _read_codex_usage(timeout_seconds=timeout_seconds, gza_version=_gza_version())
+        return _read_codex_usage(timeout_seconds=timeout_seconds, gza_version=_gza_version(), env=env, cwd=cwd)
 
-    def check_credentials(self) -> bool:
+    def check_credentials(self, *, env: Mapping[str, str] | None = None) -> bool:
         """Check for Codex credentials (API key or OAuth).
 
         API key (CODEX_API_KEY or OPENAI_API_KEY alias) takes precedence.
-        OAuth (~/.codex directory) is checked as a fallback.
+        OAuth (CODEX_HOME, or HOME/.codex) is checked as a fallback.
         """
-        if _has_api_key():
+        env_source = os.environ if env is None else env
+        if _has_api_key(env_source):
             return True
-        codex_config = Path.home() / ".codex"
-        if codex_config.is_dir():
+        if _codex_home(env).is_dir():
             return True
         return False
 
-    def verify_credentials(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
+    def verify_credentials(
+        self,
+        config: Config,
+        log_file: Path | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> PreflightCheckResult:
         """Verify Codex credentials by testing the codex command."""
         if config.use_docker:
-            return self._verify_docker(config, log_file=log_file)
-        return self._verify_direct(log_file=log_file)
+            return self._verify_docker(config, log_file=log_file, env=env, cwd=cwd or config.project_dir)
+        return self._verify_direct(log_file=log_file, env=env, cwd=cwd or config.project_dir)
 
-    def _verify_docker(self, config: Config, log_file: Path | None = None) -> PreflightCheckResult:
+    def _verify_docker(
+        self,
+        config: Config,
+        log_file: Path | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> PreflightCheckResult:
         """Verify credentials work in Docker."""
-        docker_config = _get_docker_config(
-            f"{config.docker_image}-codex",
-            docker_startup_timeout=config.docker_startup_timeout,
-        )
+        docker_config_kwargs: dict[str, Any] = {"docker_startup_timeout": config.docker_startup_timeout}
+        if env is not None:
+            docker_config_kwargs["env"] = env
+        docker_config = _get_docker_config(f"{config.docker_image}-codex", **docker_config_kwargs)
         if not ensure_docker_image(
             docker_config,
             config.project_dir,
             log_file=log_file,
             provider_label="Codex",
+            host_env=env,
+            host_cwd=cwd,
         ):
             print("Error: Failed to build Docker image")
             return PreflightCheckResult.failure(
@@ -943,6 +986,8 @@ class CodexProvider(Provider):
                 "  Run 'codex login' or set CODEX_API_KEY in .env"
             ),
             log_file=log_file,
+            env=env,
+            cwd=cwd,
         )
         if not result.ok and result.failure_reason == "PROVIDER_UNAVAILABLE":
             return PreflightCheckResult.failure(
@@ -951,7 +996,13 @@ class CodexProvider(Provider):
             )
         return result
 
-    def _verify_direct(self, log_file: Path | None = None) -> PreflightCheckResult:
+    def _verify_direct(
+        self,
+        log_file: Path | None = None,
+        *,
+        env: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> PreflightCheckResult:
         """Verify credentials work directly."""
         cmd = ["codex", "--version"]
         try:
@@ -960,6 +1011,8 @@ class CodexProvider(Provider):
                 capture_output=True,
                 timeout=5,
                 text=True,
+                env=normalize_subprocess_env(env, cwd),
+                cwd=cwd,
             )
             output = result.stdout + result.stderr
             write_preflight_entry(
@@ -1027,6 +1080,7 @@ class CodexProvider(Provider):
         on_step_count: Callable[[int], None] | None = None,
         interactive: bool = False,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run Codex to execute a task."""
         _ = interactive
@@ -1043,6 +1097,7 @@ class CodexProvider(Provider):
                 on_session_id,
                 on_step_count,
                 ops_log_file=ops_log_file,
+                env=env,
             )
         return self._run_direct(
             config,
@@ -1053,6 +1108,7 @@ class CodexProvider(Provider):
             on_session_id,
             on_step_count,
             ops_log_file=ops_log_file,
+            env=env,
         )
 
     def _run_docker(
@@ -1065,17 +1121,19 @@ class CodexProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run Codex in Docker container."""
         conversation_log_file = log_file
         if ops_log_file is None:
             ops_log_file = log_file.with_name(f"{log_file.stem}.ops.jsonl")
-        docker_config = _get_docker_config(
-            f"{config.docker_image}-codex",
-            docker_startup_timeout=config.docker_startup_timeout,
-        )
+        docker_config_kwargs: dict[str, Any] = {"docker_startup_timeout": config.docker_startup_timeout}
+        if env is not None:
+            docker_config_kwargs["env"] = env
+        docker_config = _get_docker_config(f"{config.docker_image}-codex", **docker_config_kwargs)
 
-        if not ensure_docker_image(docker_config, config.project_dir):
+        run_cwd = getattr(config, "provider_cwd", None) or work_dir
+        if not ensure_docker_image(docker_config, config.project_dir, host_env=env, host_cwd=run_cwd):
             print("Error: Failed to build Docker image")
             return RunResult(exit_code=1)
 
@@ -1087,6 +1145,7 @@ class CodexProvider(Provider):
             config.docker_setup_command,
             getattr(config, "docker_env", None),
             getattr(config, "docker_workdir", "/workspace"),
+            host_env=env,
         )
 
         if resume_session_id:
@@ -1123,6 +1182,8 @@ class CodexProvider(Provider):
             on_step_count=on_step_count,
             ops_log_file=ops_log_file,
             docker_backed=True,
+            cwd=run_cwd,
+            env=env,
         )
 
     def _run_direct(
@@ -1135,6 +1196,7 @@ class CodexProvider(Provider):
         on_session_id: Callable[[str], None] | None = None,
         on_step_count: Callable[[int], None] | None = None,
         ops_log_file: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run Codex directly (no Docker)."""
         conversation_log_file = log_file
@@ -1153,6 +1215,7 @@ class CodexProvider(Provider):
             on_session_id=on_session_id,
             on_step_count=on_step_count,
             ops_log_file=ops_log_file,
+            env=env,
         )
 
     @classmethod
@@ -1215,6 +1278,7 @@ class CodexProvider(Provider):
         on_step_count: Callable[[int], None] | None = None,
         ops_log_file: Path | None = None,
         docker_backed: bool = False,
+        env: Mapping[str, str] | None = None,
     ) -> RunResult:
         """Run command and parse Codex's JSON output."""
         conversation_log_file = log_file
@@ -1354,6 +1418,7 @@ class CodexProvider(Provider):
             parse_output=parse_codex_output,
             stdin_input=stdin_input,
             ops_log_file=ops_log_file,
+            env=env,
         )
 
         # Extract stats from accumulated data

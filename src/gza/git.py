@@ -6,13 +6,14 @@ import re
 import shutil
 import subprocess
 import threading
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import gza.metrics as metrics
+from gza.runtime_context import normalize_subprocess_env
 
 _GIT_RUN_COUNT_METRIC = "gza_git_run_total"
 _GIT_RUN_LATENCY_METRIC = "gza_git_run_latency_seconds"
@@ -299,8 +300,9 @@ def resolve_ref_if_possible(git: "Git", ref: str | None) -> ResolvedGitRef:
 class Git:
     """Git operations wrapper."""
 
-    def __init__(self, repo_dir: Path):
+    def __init__(self, repo_dir: Path, *, env: Mapping[str, str] | None = None):
         self.repo_dir = repo_dir
+        self.env = dict(env) if env is not None else None
         self._cache: dict[tuple[Any, ...], Any] | None = None
         self._cache_lock = threading.RLock()
 
@@ -338,7 +340,7 @@ class Git:
             return self._cache is not None
 
     @staticmethod
-    def _git_executable() -> str:
+    def _git_executable(env: Mapping[str, str] | None = None) -> str:
         """Resolve the real git binary instead of a provider shell shim.
 
         Functional tests and host-side maintenance flows create temporary repos
@@ -346,9 +348,8 @@ class Git:
         the `/tmp/gza-shims/git` guard exists for provider shell sessions, not
         for this trusted wrapper.
         """
-        filtered_path = ":".join(
-            entry for entry in os.environ.get("PATH", "").split(":") if entry != "/tmp/gza-shims"
-        )
+        path_value = (os.environ if env is None else env).get("PATH", "")
+        filtered_path = ":".join(entry for entry in path_value.split(":") if entry != "/tmp/gza-shims")
         return shutil.which("git", path=filtered_path) or "git"
 
     def _cache_key(
@@ -470,20 +471,23 @@ class Git:
             CompletedProcess result
         """
         git_input = stdin.decode() if stdin else None
+        git_env = normalize_subprocess_env(getattr(self, "env", None), self.repo_dir)
         if metrics.enabled():
             metrics.incr(_GIT_RUN_COUNT_METRIC, labels=_GIT_RUN_LABELS)
             with metrics.timer(_GIT_RUN_LATENCY_METRIC, labels=_GIT_RUN_LABELS):
                 result = subprocess.run(
-                    [self._git_executable(), *args],
+                    [self._git_executable(git_env), *args],
                     cwd=self.repo_dir,
+                    env=git_env,
                     capture_output=True,
                     text=True,
                     input=git_input,
                 )
         else:
             result = subprocess.run(
-                [self._git_executable(), *args],
+                [self._git_executable(git_env), *args],
                 cwd=self.repo_dir,
+                env=git_env,
                 capture_output=True,
                 text=True,
                 input=git_input,
@@ -700,7 +704,7 @@ class Git:
 
             # Push the new branch to origin with upstream tracking
             # This ensures git push works without errors later
-            worktree_git = Git(path)
+            worktree_git = Git(path, env=self.env)
             try:
                 worktree_git.push_branch(branch, remote="origin", set_upstream=True)
             except GitError:
@@ -1750,7 +1754,7 @@ def cleanup_worktree_for_branch(
             raise GitError(_format_foreign_worktree_error(branch, resolved_worktree_path, permitted_roots))
 
         # Check if worktree has uncommitted changes
-        worktree_git = Git(resolved_worktree_path)
+        worktree_git = Git(resolved_worktree_path, env=git.env)
         if worktree_git.has_changes(include_untracked=True) and not force:
             raise ValueError(
                 f"Worktree at {resolved_worktree_path} has uncommitted changes.\n"

@@ -6,7 +6,7 @@ import json
 import platform
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePath
@@ -1208,6 +1208,7 @@ def run_main_integration_verify(
     reason: str,
     runner_class: Literal["host", "container"] = "host",
     resolved_head_sha: str | None | object = _HEAD_SHA_UNSET,
+    env: Mapping[str, str] | None = None,
 ) -> MainIntegrationVerifyState:
     """Run the configured verify gate against the current local target checkout."""
     task = ensure_main_integration_verify_task(store)
@@ -1237,6 +1238,7 @@ def run_main_integration_verify(
         result = _run_review_verify_command(
             verify_command,
             cwd=git.repo_dir,
+            env=env,
             reviewed_branch=git.current_branch(),
             reviewed_head_sha=head_sha,
             timeout_seconds=gate.verify_timeout_seconds,
@@ -1443,6 +1445,7 @@ def _run_main_integration_verify_with_red_reruns(
     runner_class: Literal["host", "container"] = "host",
     prior_red_state: MainIntegrationVerifyState | None = None,
     resolved_head_sha: str | None | object = _HEAD_SHA_UNSET,
+    env: Mapping[str, str] | None = None,
     on_initial_run_start: Callable[[int, int], None] | None = None,
     on_red_rerun_start: Callable[[int, int, IntegrationVerifyEvidence], None] | None = None,
 ) -> tuple[MainIntegrationVerifyState, MainIntegrationVerifyRemediation | None, int]:
@@ -1456,6 +1459,7 @@ def _run_main_integration_verify_with_red_reruns(
             reason=run_reason,
             runner_class=runner_class,
             resolved_head_sha=resolved_head_sha,
+            env=env,
         ),
         reason=reason,
         red_reruns=red_reruns,
@@ -1493,6 +1497,7 @@ def check_main_integration_verify(
     red_reruns: int = 0,
     runner_class: Literal["host", "container"] = "host",
     resolved_head_sha: str | None | object = _HEAD_SHA_UNSET,
+    env: Mapping[str, str] | None = None,
     on_initial_run_start: Callable[[int, int], None] | None = None,
     on_red_rerun_start: Callable[[int, int, IntegrationVerifyEvidence], None] | None = None,
 ) -> MainIntegrationVerifyCheck:
@@ -1577,6 +1582,7 @@ def check_main_integration_verify(
         runner_class=runner_class,
         prior_red_state=state if checkpoint_is_current else None,
         resolved_head_sha=current_head_sha,
+        env=env,
         on_initial_run_start=on_initial_run_start,
         on_red_rerun_start=on_red_rerun_start,
     )
@@ -1667,6 +1673,7 @@ def run_candidate_integration_verify(
     *,
     reason: str,
     runner_class: Literal["host", "container"] = "host",
+    env: Mapping[str, str] | None = None,
 ) -> CandidateIntegrationVerifyEvidence:
     """Run the configured verify gate against an exact candidate checkout."""
     del reason
@@ -1695,6 +1702,7 @@ def run_candidate_integration_verify(
         result = _run_review_verify_command(
             verify_command,
             cwd=git.repo_dir,
+            env=env,
             reviewed_branch=current_branch,
             reviewed_head_sha=head_sha,
             timeout_seconds=gate.verify_timeout_seconds,
@@ -1769,6 +1777,7 @@ def check_candidate_integration_verify(
     reason: str,
     red_reruns: int = 0,
     runner_class: Literal["host", "container"] = "host",
+    env: Mapping[str, str] | None = None,
     on_red_rerun_start: Callable[[int, int, IntegrationVerifyEvidence], None] | None = None,
 ) -> CandidateIntegrationVerifyCheck:
     """Run candidate integration verify for an exact checkout without touching main state."""
@@ -1778,6 +1787,7 @@ def check_candidate_integration_verify(
             git,
             reason=run_reason,
             runner_class=runner_class,
+            env=env,
         ),
         reason=reason,
         red_reruns=red_reruns,

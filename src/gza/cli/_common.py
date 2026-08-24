@@ -98,6 +98,7 @@ from ..runner import (
     DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE,
     RunInvocationContext,
     TaskDispatchBlockedError,
+    _call_accepts_keyword,
     _ensure_task_dispatchable_for_startup,
     get_effective_config_for_task,
     prepare_task_startup_phase,
@@ -105,6 +106,14 @@ from ..runner import (
     require_execution_route_for_task,
     run,
     write_ops_entry,
+)
+from ..runtime_context import (
+    RuntimeExecutionContext,
+    build_tmux_new_session_command,
+    normalize_subprocess_env,
+    runtime_tmux_session_name,
+    sanitize_environment_values,
+    write_tmux_environment_file,
 )
 from ..status_ops import apply_manual_task_status
 from ..task_types import CLI_FILTER_TASK_TYPES
@@ -125,11 +134,15 @@ def _prepare_startup_phase(
     task: DbTask,
     *,
     resume_mode: bool = False,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> DbTask:
     """Call startup preparation without widening the default monkeypatch signature."""
+    kwargs: dict[str, Any] = {}
     if resume_mode:
-        return prepare_task_startup_phase(config, store, task, resume_mode=True)
-    return prepare_task_startup_phase(config, store, task)
+        kwargs["resume_mode"] = True
+    if _call_accepts_keyword(prepare_task_startup_phase, "runtime_context"):
+        kwargs["runtime_context"] = runtime_context or RuntimeExecutionContext.from_config(config)
+    return prepare_task_startup_phase(config, store, task, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -756,6 +769,7 @@ def _darwin_worker_death_hint(
     *,
     pid: int | None,
     reference_time: datetime | None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> str | None:
     """Return a best-effort macOS log hint for worker death root cause."""
     if platform.system() != "Darwin":
@@ -788,6 +802,12 @@ def _darwin_worker_death_hint(
             text=True,
             timeout=5,
             check=False,
+            cwd=runtime_context.cwd if runtime_context is not None else None,
+            env=(
+                normalize_subprocess_env(runtime_context.env, runtime_context.cwd)
+                if runtime_context is not None
+                else None
+            ),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -810,6 +830,8 @@ def _collect_worker_death_diagnostics(
     config: Config,
     task: DbTask,
     worker: WorkerMetadata | None,
+    *,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> WorkerDeathDiagnostics:
     """Collect best-effort diagnostics for a dead worker without raising."""
     log_path = _resolve_worker_log_path(config, task, worker)
@@ -875,6 +897,7 @@ def _collect_worker_death_diagnostics(
     os_hint = _darwin_worker_death_hint(
         pid=worker.pid if worker is not None else task.running_pid,
         reference_time=reference_time,
+        runtime_context=runtime_context,
     )
 
     return WorkerDeathDiagnostics(
@@ -929,6 +952,7 @@ def _capture_worker_death_best_effort(
     worker: WorkerMetadata | None,
     event: str,
     warning_context: str,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> WorkerDeathCaptureResult:
     """Capture worker-death diagnostics without letting capture failure block terminalization."""
     log_path: Path | None = None
@@ -943,7 +967,12 @@ def _capture_worker_death_best_effort(
         )
 
     try:
-        diagnostics = _collect_worker_death_diagnostics(config, task, worker)
+        diagnostics = _collect_worker_death_diagnostics(
+            config,
+            task,
+            worker,
+            runtime_context=runtime_context,
+        )
     except Exception as exc:
         print(
             f"Warning: Failed to collect worker-death diagnostics for {warning_context}: {exc}",
@@ -1031,9 +1060,10 @@ def _mark_pending_worker_failed(
     log_file: str | None,
     exit_code: int | None,
     completion_reason: str,
+    runtime_context: RuntimeExecutionContext,
 ) -> None:
     """Terminalize a pending task and retire its registered worker."""
-    has_commits = _branch_has_commits(config, task.branch)
+    has_commits = _branch_has_commits(config, task.branch, runtime_context=runtime_context)
     mark_task_failed_from_cause(
         task=task,
         config=config,
@@ -1112,7 +1142,12 @@ def _normalize_timestamp(value: datetime | str | None) -> datetime | None:
     return dt.astimezone(UTC)
 
 
-def _branch_has_commits(config: Config, branch: str | None) -> bool:
+def _branch_has_commits(
+    config: Config,
+    branch: str | None,
+    *,
+    runtime_context: RuntimeExecutionContext | None = None,
+) -> bool:
     """Check if a branch has commits beyond the default branch.
 
     Used during reconciliation to detect whether a WORKER_DIED task
@@ -1122,7 +1157,8 @@ def _branch_has_commits(config: Config, branch: str | None) -> bool:
         return False
     try:
         from ..git import Git  # lazy import to avoid circular: _common → git → config → _common
-        git = Git(config.project_dir)
+        context = runtime_context or RuntimeExecutionContext.from_config(config)
+        git = Git(config.project_dir, env=context.env)
         default_branch = git.default_branch()
         count = git.count_commits_ahead(branch, default_branch)
         return count > 0
@@ -1131,10 +1167,16 @@ def _branch_has_commits(config: Config, branch: str | None) -> bool:
         return False
 
 
-def reconcile_in_progress_tasks(config: Config) -> None:
+def reconcile_in_progress_tasks(
+    config: Config,
+    *,
+    store: SqliteTaskStore | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
+) -> None:
     """Best-effort reconciliation for orphaned/timed-out in-progress tasks."""
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     try:
-        store = get_store(config)
+        store = store or get_store(config)
         registry = WorkerRegistry(config.workers_path)
     except ManualMigrationRequired:
         # DB needs gza migrate — skip reconciliation silently
@@ -1155,13 +1197,14 @@ def reconcile_in_progress_tasks(config: Config) -> None:
             running_worker = running_workers_by_task_id.get(str(task.id)) if task.id is not None else None
             worker = latest_workers_by_task_id.get(str(task.id)) if task.id is not None else None
             if _task_worker_is_dead(task, running_worker, registry):
-                has_commits = _branch_has_commits(config, task.branch)
+                has_commits = _branch_has_commits(config, task.branch, runtime_context=runtime_context)
                 capture = _capture_worker_death_best_effort(
                     config=config,
                     task=task,
                     worker=worker,
                     event="death_detected",
                     warning_context=f"task {task_label}",
+                    runtime_context=runtime_context,
                 )
                 mark_task_failed_from_cause(
                     task=task,
@@ -1200,7 +1243,7 @@ def reconcile_in_progress_tasks(config: Config) -> None:
                         os.kill(task.running_pid, signal.SIGTERM)
                     except OSError:
                         pass
-                has_commits = _branch_has_commits(config, task.branch)
+                has_commits = _branch_has_commits(config, task.branch, runtime_context=runtime_context)
                 mark_task_failed_from_cause(
                     task=task,
                     config=config,
@@ -1243,6 +1286,7 @@ def reconcile_in_progress_tasks(config: Config) -> None:
                     worker=worker,
                     event="startup_abort_detected",
                     warning_context=f"pending task {task_label}",
+                    runtime_context=runtime_context,
                 )
                 _mark_pending_worker_failed(
                     config=config,
@@ -1254,6 +1298,7 @@ def reconcile_in_progress_tasks(config: Config) -> None:
                     log_file=capture.failure_log_file,
                     exit_code=capture.diagnostics.exit_code,
                     completion_reason="startup failure before task claim",
+                    runtime_context=runtime_context,
                 )
                 continue
 
@@ -1269,6 +1314,7 @@ def reconcile_in_progress_tasks(config: Config) -> None:
                 log_file=pending_task.log_file or worker.startup_log_file,
                 exit_code=worker.exit_code,
                 completion_reason="watch reconciliation detected dead pending worker with no activity",
+                runtime_context=runtime_context,
             )
         except (sqlite3.Error, OSError, ValueError) as exc:
             print(f"Warning: Failed to reconcile task {task_label}: {exc}", file=sys.stderr)
@@ -1276,10 +1322,16 @@ def reconcile_in_progress_tasks(config: Config) -> None:
             print(f"Warning: Unexpected reconciliation error for task {task_label}: {exc}", file=sys.stderr)
 
 
-def reconcile_dead_pending_recovery_tasks(config: Config) -> None:
+def reconcile_dead_pending_recovery_tasks(
+    config: Config,
+    *,
+    store: SqliteTaskStore | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
+) -> None:
     """Fail prepared recovery rows whose worker already recorded a pre-claim startup failure."""
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     try:
-        store = get_store(config)
+        store = store or get_store(config)
         registry = WorkerRegistry(config.workers_path)
     except ManualMigrationRequired:
         return
@@ -1310,6 +1362,7 @@ def reconcile_dead_pending_recovery_tasks(config: Config) -> None:
                 worker=worker,
                 event="startup_abort_detected",
                 warning_context=f"pending recovery task {task_label}",
+                runtime_context=runtime_context,
             )
             _mark_pending_worker_failed(
                 config=config,
@@ -1321,6 +1374,7 @@ def reconcile_dead_pending_recovery_tasks(config: Config) -> None:
                 log_file=capture.failure_log_file,
                 exit_code=capture.diagnostics.exit_code,
                 completion_reason="startup failure before task claim",
+                runtime_context=runtime_context,
             )
         except (sqlite3.Error, OSError, ValueError) as exc:
             print(
@@ -1539,10 +1593,14 @@ def _spawn_detached_worker_process(
     cmd: list[str],
     config: Config,
     worker_id: str,
+    *,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> tuple[subprocess.Popen, str]:
     """Spawn detached worker process and capture early output."""
+    context = runtime_context or RuntimeExecutionContext.from_config(config)
     startup_log_path = config.workers_path / f"{worker_id}-startup.log"
     startup_log_path.parent.mkdir(parents=True, exist_ok=True)
+    launch_env = normalize_subprocess_env(context.env, context.cwd)
     with open(startup_log_path, "ab") as startup_log:
         proc = subprocess.Popen(
             cmd,
@@ -1550,10 +1608,28 @@ def _spawn_detached_worker_process(
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
-            cwd=config.project_dir,
+            cwd=context.cwd,
+            env=launch_env,
         )
     startup_log_rel = str(startup_log_path.relative_to(config.project_dir))
     return proc, startup_log_rel
+
+
+def _call_spawn_detached_worker_process(
+    cmd: list[str],
+    config: Config,
+    worker_id: str,
+    *,
+    runtime_context: RuntimeExecutionContext,
+) -> tuple[subprocess.Popen, str]:
+    if _call_accepts_keyword(_spawn_detached_worker_process, "runtime_context"):
+        return _spawn_detached_worker_process(
+            cmd,
+            config,
+            worker_id,
+            runtime_context=runtime_context,
+        )
+    return _spawn_detached_worker_process(cmd, config, worker_id)
 
 
 def _start_detached_process_reaper(
@@ -1637,16 +1713,20 @@ def _rollback_background_worker_launch(
     *,
     registry: WorkerRegistry,
     worker_id: str,
+    runtime_context: RuntimeExecutionContext,
     proc: subprocess.Popen | None = None,
     tmux_session: str | None = None,
 ) -> None:
     """Best-effort cleanup when a detached worker launch fails mid-handoff."""
     if tmux_session:
         with contextlib.suppress(Exception):
+            cleanup_env = normalize_subprocess_env(runtime_context.env, runtime_context.cwd)
             subprocess.run(
                 ["tmux", "kill-session", "-t", tmux_session],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                cwd=runtime_context.cwd,
+                env=cleanup_env,
                 check=False,
             )
     if proc is not None:
@@ -1684,13 +1764,21 @@ def _prepare_task_for_immediate_execution(
     rollback_on_failure: bool,
     resume_mode: bool = False,
     rollback_cleanup: Callable[[], None] | None = None,
+    store: SqliteTaskStore | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> DbTask | None:
     """Run the synchronous creator phase on the caller's stdout/stderr."""
-    store = get_store(config)
+    store = store or get_store(config)
     original_slug = task.slug
     original_log_file = task.log_file
     try:
-        prepared = _prepare_startup_phase(config, store, task, resume_mode=resume_mode)
+        prepared = _prepare_startup_phase(
+            config,
+            store,
+            task,
+            resume_mode=resume_mode,
+            runtime_context=runtime_context,
+        )
     except Exception as exc:
         if rollback_on_failure and task.id is not None:
             remove_task_startup_artifacts(config, task)
@@ -1743,6 +1831,7 @@ def _prepare_task_for_reserved_launch(
     rollback_on_failure: bool,
     resume_mode: bool = False,
     rollback_cleanup: Callable[[], None] | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> DbTask | None:
     prepared = _prepare_task_for_immediate_execution(
         config,
@@ -1750,6 +1839,7 @@ def _prepare_task_for_reserved_launch(
         rollback_on_failure=rollback_on_failure,
         resume_mode=resume_mode,
         rollback_cleanup=rollback_cleanup,
+        runtime_context=runtime_context,
     )
     if prepared is None:
         permit.release()
@@ -1766,8 +1856,10 @@ def _prepare_task_for_launch(
     rollback_cleanup: Callable[[], None] | None = None,
     allow_same_pid_reentry: bool = False,
     permit: LaunchPermit | None = None,
+    store: SqliteTaskStore | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> tuple[DbTask, LaunchPermit] | None:
-    store = get_store(config)
+    store = store or get_store(config)
     original_slug = task.slug
     original_log_file = task.log_file
     acquired_permit = permit
@@ -1778,7 +1870,13 @@ def _prepare_task_for_launch(
                 store,
                 current_pid=os.getpid() if allow_same_pid_reentry else None,
             )
-        prepared = _prepare_startup_phase(config, store, task, resume_mode=resume_mode)
+        prepared = _prepare_startup_phase(
+            config,
+            store,
+            task,
+            resume_mode=resume_mode,
+            runtime_context=runtime_context,
+        )
     except Exception as exc:
         if acquired_permit is not None:
             acquired_permit.release()
@@ -1818,6 +1916,7 @@ def _run_foreground(
     phase1_args: argparse.Namespace | None = None,
     invocation: RunInvocationContext | None = None,
     prepared_task: DbTask | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> int:
     """Run a task in the foreground with worker registration.
 
@@ -1832,6 +1931,7 @@ def _run_foreground(
         force: Skip runner precondition checks
         invocation: Optional runner invocation context.
     """
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     registry = WorkerRegistry(config.workers_path)
     store = get_store(config)
     worker_id = os.environ.get("GZA_WORKER_ID")
@@ -1912,7 +2012,7 @@ def _run_foreground(
                     print(f"Error: {exc}", file=sys.stderr)
                 return DEPENDENCY_BLOCKED_NOT_RUN_EXIT_CODE
         if resume and task_id is not None:
-            rebase_exit_code = _auto_rebase_before_resume(config, task_id)
+            rebase_exit_code = _auto_rebase_before_resume(config, task_id, runtime_context=runtime_context)
             if rebase_exit_code != 0:
                 if not worker_registered and not reuse_existing_worker:
                     registry.register(worker)
@@ -1946,6 +2046,7 @@ def _run_foreground(
                     rollback_on_failure=False,
                     resume_mode=resume,
                     allow_same_pid_reentry=allow_registered_worker_reentry,
+                    runtime_context=runtime_context or RuntimeExecutionContext.from_config(config),
                 )
                 if prepared_launch is None:
                     return 1
@@ -1980,6 +2081,7 @@ def _run_foreground(
                 skip_precondition_check=force,
                 create_pr=create_pr,
                 on_task_claimed=_on_task_claimed,
+                runtime_context=runtime_context,
             )
         else:
             exit_code = run(
@@ -1991,6 +2093,7 @@ def _run_foreground(
                 create_pr=create_pr,
                 on_task_claimed=_on_task_claimed,
                 invocation=invocation,
+                runtime_context=runtime_context,
             )
         if permit is not None:
             permit.release()
@@ -2028,6 +2131,7 @@ def _spawn_background_worker(
     quiet: bool = False,
     prepared_task: DbTask | None = None,
     startup_quiet: bool = False,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> int:
     """Spawn a background worker process.
 
@@ -2123,6 +2227,8 @@ def _spawn_background_worker(
             rollback_on_failure=False,
             resume_mode=resume_mode,
             permit=permit,
+            store=store,
+            runtime_context=runtime_context,
         )
         if prepared_launch is None:
             return 1
@@ -2166,6 +2272,7 @@ def _spawn_background_worker(
 
     # Add project directory
     inner_cmd.extend(["--project", str(config.project_dir.absolute())])
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
 
     # Resolve provider the same way the runner will at execution time. This respects
     # task-type routing (task_providers.<type>) so the worker mode (tmux/attach) matches
@@ -2176,14 +2283,16 @@ def _spawn_background_worker(
     provider_name = (effective_provider or "claude").lower()
     # The proxy-based tmux auto-accept flow is superseded for Claude attach.
     # Keep a compatibility escape hatch for testing or emergency fallback.
-    legacy_tmux_proxy = os.environ.get("GZA_ENABLE_TMUX_PROXY", "").strip() == "1"
+    legacy_tmux_proxy = runtime_context.env.get("GZA_ENABLE_TMUX_PROXY", "").strip() == "1"
     use_tmux = config.tmux.enabled
     if use_tmux and provider_name == "claude" and not legacy_tmux_proxy:
         use_tmux = False
 
+    tmux_env = normalize_subprocess_env(runtime_context.env, runtime_context.cwd)
+
     if use_tmux:
         # Verify tmux binary is present; fall back to bare subprocess if not available
-        if shutil.which("tmux") is None:
+        if shutil.which("tmux", path=tmux_env.get("PATH")) is None:
             print(
                 "Warning: tmux not found; falling back to non-tmux execution. "
                 "Install tmux to enable interactive task attachment.",
@@ -2194,10 +2303,13 @@ def _spawn_background_worker(
     tmux_session: str | None = None
 
     if use_tmux:
-        # Use explicit task ID for session name when available; fall back to worker-based name
-        # (worker_id is generated below, so we use a placeholder key derived from the task)
         session_task_id = task_id_for_child if task_id_for_child is not None else selected_task.id
-        tmux_session = f"gza-{session_task_id}"
+        assert session_task_id is not None
+        tmux_session = runtime_tmux_session_name(
+            task_id=str(session_task_id),
+            project_id=config.project_id,
+            db_path=config.db_path,
+        )
         inner_cmd.extend(["--tmux-session", tmux_session])
 
     # Spawn detached process
@@ -2241,19 +2353,31 @@ def _spawn_background_worker(
             subprocess.run(
                 ["tmux", "kill-session", "-t", tmux_session],
                 stderr=subprocess.DEVNULL,
+                cwd=runtime_context.cwd,
+                env=tmux_env,
             )
-            tmux_cmd = [
-                "tmux", "new-session", "-d",
-                "-s", tmux_session,
-                "-x", str(cols), "-y", str(rows),
-                "--", *proxy_cmd,
-            ]
-            subprocess.run(tmux_cmd, check=True)
+            tmux_env_file = write_tmux_environment_file(cwd=runtime_context.cwd, env=tmux_env)
+            tmux_cmd = build_tmux_new_session_command(
+                tmux_session,
+                cwd=runtime_context.cwd,
+                env=tmux_env,
+                env_file=tmux_env_file,
+                cols=cols,
+                rows=rows,
+                pane_command=proxy_cmd,
+            )
+            try:
+                subprocess.run(tmux_cmd, check=True, cwd=runtime_context.cwd, env=tmux_env)
+            except Exception:
+                tmux_env_file.unlink(missing_ok=True)
+                raise
             # Ensure the session is destroyed when the command exits,
             # even if the user has remain-on-exit on globally.
             roi_result = subprocess.run(
                 ["tmux", "set-option", "-t", tmux_session, "remain-on-exit", "off"],
                 capture_output=True,
+                cwd=runtime_context.cwd,
+                env=tmux_env,
             )
             if roi_result.returncode != 0:
                 print(
@@ -2263,9 +2387,14 @@ def _spawn_background_worker(
                 )
 
             # Get PID of the proxy process from tmux
-            pid = get_tmux_session_pid(tmux_session) or 0
+            pid = get_tmux_session_pid(tmux_session, cwd=runtime_context.cwd, env=tmux_env) or 0
         else:
-            proc, _startup_log_rel = _spawn_detached_worker_process(inner_cmd, config, worker_id)
+            proc, _startup_log_rel = _call_spawn_detached_worker_process(
+                inner_cmd,
+                config,
+                worker_id,
+                runtime_context=runtime_context,
+            )
             pid = proc.pid
             startup_log_rel = _startup_log_rel
 
@@ -2306,15 +2435,19 @@ def _spawn_background_worker(
         _rollback_background_worker_launch(
             registry=registry,
             worker_id=worker_id,
+            runtime_context=runtime_context,
             proc=proc,
             tmux_session=tmux_session,
         )
-        _print_background_phase1_error(f"spawning background worker: {e}")
+        _print_background_phase1_error(
+            f"spawning background worker: {sanitize_environment_values(e, runtime_context.env)}"
+        )
         return 1
 
 
 def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
     """Run in worker mode (called internally by background workers)."""
+    runtime_context = RuntimeExecutionContext.from_config(config)
     registry = WorkerRegistry(config.workers_path)
     worker_id = None
 
@@ -2329,7 +2462,7 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
                 worker_id = w.worker_id
                 break
 
-    store = get_store(config)
+    store = SqliteTaskStore(runtime_context.db_path, prefix=config.project_prefix)
     task_claimed = False
 
     # Set up signal handlers for graceful shutdown
@@ -2440,7 +2573,11 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
         resume = hasattr(args, 'resume') and args.resume
         explicit_run_task_id = args.task_ids[0] if hasattr(args, 'task_ids') and args.task_ids else None
         if resume and explicit_run_task_id is not None:
-            rebase_exit_code = _auto_rebase_before_resume(config, explicit_run_task_id)
+            rebase_exit_code = _auto_rebase_before_resume(
+                config,
+                explicit_run_task_id,
+                runtime_context=runtime_context,
+            )
             if rebase_exit_code != 0:
                 if worker_id:
                     registry.mark_completed(
@@ -2460,6 +2597,8 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
         if hasattr(args, 'task_ids') and args.task_ids:
             # Worker mode only runs one task at a time
             run_kwargs["task_id"] = args.task_ids[0]
+        if _call_accepts_keyword(run, "runtime_context"):
+            run_kwargs["runtime_context"] = runtime_context
         exit_code = run(config, **run_kwargs)
         startup_failed_without_running = exit_code != 0 and _startup_failed_without_running()
         if startup_failed_without_running:
@@ -2491,7 +2630,7 @@ def _run_as_worker(args: argparse.Namespace, config: Config) -> int:
             if refreshed and refreshed.status == "in_progress":
                 in_progress = [refreshed]
         for task in in_progress:
-            has_commits = _branch_has_commits(config, task.branch)
+            has_commits = _branch_has_commits(config, task.branch, runtime_context=runtime_context)
             mark_task_failed_from_cause(
                 task=task,
                 config=config,
@@ -2532,6 +2671,7 @@ def _spawn_background_resume_worker(
     quiet: bool = False,
     prepared_task: DbTask | None = None,
     startup_quiet: bool = False,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> int:
     """Spawn a background worker to run a resume task.
 
@@ -2559,6 +2699,8 @@ def _spawn_background_resume_worker(
             task,
             rollback_on_failure=False,
             resume_mode=True,
+            store=store,
+            runtime_context=runtime_context,
         )
         if prepared_launch is None:
             return 1
@@ -2591,11 +2733,17 @@ def _spawn_background_resume_worker(
     cmd.extend(["--project", str(config.project_dir.absolute())])
 
     # Spawn detached process
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     worker_id = registry.generate_worker_id()
     proc: subprocess.Popen | None = None
     try:
         cmd.extend(["--worker-id", worker_id])
-        proc, startup_log_rel = _spawn_detached_worker_process(cmd, config, worker_id)
+        proc, startup_log_rel = _call_spawn_detached_worker_process(
+            cmd,
+            config,
+            worker_id,
+            runtime_context=runtime_context,
+        )
 
         # Register worker
         worker = WorkerMetadata(
@@ -2632,6 +2780,7 @@ def _spawn_background_resume_worker(
         _rollback_background_worker_launch(
             registry=registry,
             worker_id=worker_id,
+            runtime_context=runtime_context,
             proc=proc,
         )
         _print_background_phase1_error(f"spawning background worker: {e}")
@@ -2656,6 +2805,7 @@ def _spawn_background_iterate_worker(
     prepared_verify_owner_task_id: str | None = None,
     prepared_review_task_id: str | None = None,
     startup_quiet: bool = False,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> int:
     """Spawn the iterate loop as a detached background process."""
     registry = WorkerRegistry(config.workers_path)
@@ -2709,9 +2859,15 @@ def _spawn_background_iterate_worker(
 
     worker_id = registry.generate_worker_id()
     inner_cmd.extend(["--worker-id", worker_id])
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     proc: subprocess.Popen | None = None
     try:
-        proc, startup_log_rel = _spawn_detached_worker_process(inner_cmd, config, worker_id)
+        proc, startup_log_rel = _call_spawn_detached_worker_process(
+            inner_cmd,
+            config,
+            worker_id,
+            runtime_context=runtime_context,
+        )
         worker = WorkerMetadata(
             worker_id=worker_id,
             task_id=display_task.id,
@@ -2740,6 +2896,7 @@ def _spawn_background_iterate_worker(
         _rollback_background_worker_launch(
             registry=registry,
             worker_id=worker_id,
+            runtime_context=runtime_context,
             proc=proc,
         )
         _print_background_phase1_error(f"spawning background iterate worker: {e}")
@@ -4173,9 +4330,15 @@ def _resolve_retry_merge_unit(store: SqliteTaskStore, original_task: DbTask):
     return None
 
 
-def _auto_rebase_before_resume(config: Config, task_id: str) -> int:
+def _auto_rebase_before_resume(
+    config: Config,
+    task_id: str,
+    *,
+    runtime_context: RuntimeExecutionContext | None = None,
+) -> int:
     """Rebase resumable code-task branches onto their canonical local target before resuming."""
-    store = get_store(config)
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
+    store = SqliteTaskStore(runtime_context.db_path, prefix=config.project_prefix)
     task = store.get(task_id)
     if task is None or not task.branch or task.task_type not in {"task", "implement", "improve"}:
         return 0
@@ -4210,6 +4373,7 @@ def _auto_rebase_before_resume(config: Config, task_id: str) -> int:
         target_branch=target_branch,
         remote=False,
         parent_task_id=task.id,
+        runtime_context=runtime_context,
         failure_hint_lines=[
             "Use 'gza retry' to create a new retry attempt or run 'gza rebase' manually.",
         ],
@@ -4225,6 +4389,7 @@ def run_with_recovery(
     max_resume_attempts: int | None = None,
     on_recovery: Callable[[DbTask, DbTask, FailedRecoveryDecision], None] | None = None,
     on_terminal_skip: Callable[[DbTask, FailedRecoveryDecision, int], None] | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
 ) -> tuple[DbTask, int]:
     """Execute a task and apply the shared automatic recovery policy.
 
@@ -4242,10 +4407,13 @@ def run_with_recovery(
         on_terminal_skip: Optional callback invoked when recovery stops without
             creating a child. Signature:
             ``on_terminal_skip(failed_task, decision, exit_code)``.
+        runtime_context: Optional captured runtime cwd/env/identity bundle.
 
     Returns:
         Tuple of ``(final_task, exit_code)``.
     """
+    runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
+
     def _failure_exit_code(raw_rc: int) -> int:
         return raw_rc if raw_rc != 0 else 1
 
@@ -4298,7 +4466,7 @@ def run_with_recovery(
             from ..git import Git
             from .git_ops import _reconcile_diverged_branch_with_origin, complete_branch_unpushable_after_reconcile
 
-            git = Git(config.project_dir)
+            git = Git(config.project_dir, env=runtime_context.env)
             reconcile_outcome = _reconcile_diverged_branch_with_origin(
                 config,
                 git,
@@ -4370,6 +4538,7 @@ def run_with_resume(
         run_task=run_task,
         max_resume_attempts=max_resume_attempts,
         on_recovery=_on_recovery if on_resume is not None else None,
+        runtime_context=RuntimeExecutionContext.from_config(config),
     )
 
 

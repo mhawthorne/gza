@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import shutil
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -72,6 +72,7 @@ from ..runner import (
     _verify_fix_completion_worktree_path,
     _worktree_execution_dir,
 )
+from ..runtime_context import RuntimeExecutionContext, normalize_subprocess_env
 from ..verify_fix_outcome import (
     effective_verify_fix_completion_outcome,
     inspect_legacy_review_scope_completion_outcome,
@@ -83,6 +84,7 @@ from ._common import (
     PlanReviewMaterializationRepairBlocked,
     PlanReviewMaterializationRepairResult,
     PlanReviewMaterializationResult,
+    _call_accepts_keyword,
     _create_improve_task,
     _create_retry_task,
     _prepare_task_for_reserved_launch,
@@ -151,6 +153,7 @@ class AdvanceActionExecutionContext:
     reconcile_diverged_branch: Callable[[DbTask], BranchDivergenceReconcileResult] | None = None
     config: Any | None = None
     git: Any | None = None
+    runtime_context: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -189,6 +192,11 @@ class AdvanceActionExecutionResult:
     worker_label: str | None = None
     guarded_pending_task_id: str | None = None
     noop_improve_kind: str | None = None
+
+
+def _git_runtime_env(git: Any | None) -> Mapping[str, str] | None:
+    env = getattr(git, "env", None)
+    return env if isinstance(env, Mapping) else None
 
 
 @dataclass(frozen=True)
@@ -587,11 +595,19 @@ def _prepare_background_start(
     permit: LaunchPermit | None = None,
 ) -> tuple[DbTask | None, AdvanceActionExecutionResult | None]:
     if permit is not None and context.config is not None:
+        prepare_kwargs: dict[str, Any] = {
+            "permit": permit,
+            "rollback_on_failure": rollback_on_failure,
+        }
+        if context.runtime_context is not None and _call_accepts_keyword(
+            _prepare_task_for_reserved_launch,
+            "runtime_context",
+        ):
+            prepare_kwargs["runtime_context"] = context.runtime_context
         prepared_task = _prepare_task_for_reserved_launch(
             context.config,
             task,
-            permit=permit,
-            rollback_on_failure=rollback_on_failure,
+            **prepare_kwargs,
         )
         if prepared_task is not None and prepared_task.id is not None:
             reserve_task_launch_permit(str(prepared_task.id), permit)
@@ -1300,7 +1316,8 @@ def _execute_verify_gate(
         worktree_path = Path(tempfile.mkdtemp(prefix=f"verify-gate-{owner_task.id}-", dir=tmp_root))
         context.git.worktree_add_existing(worktree_path, current_epoch.reviewed_head_sha, detach=True)
         added_worktree = True
-        worktree_git = Git(worktree_path)
+        runtime_env = _git_runtime_env(context.git)
+        worktree_git = Git(worktree_path, env=runtime_env) if runtime_env is not None else Git(worktree_path)
     except (GitError, OSError, RuntimeError, ValueError) as exc:
         cleanup_failure = _cleanup_verify_only_noop_worktree(
             context=context,
@@ -1329,6 +1346,7 @@ def _execute_verify_gate(
             worktree_git=worktree_git,
             worktree_path=worktree_git.repo_dir,
             cwd=provider_cwd,
+            runtime_context=context.runtime_context,
             timeout_seconds=timeout_seconds,
             timeout_grace_seconds=timeout_grace_seconds,
             reviewed_branch=current_epoch.reviewed_branch,
@@ -1632,7 +1650,7 @@ def _execute_rerun_completed_verify_fix(
                 created_task=verify_fix_task,
             )
         try:
-            proof_git = Git(worktree_path)
+            proof_git = Git(worktree_path, env=getattr(context.git, "env", None))
             live_head = proof_git.rev_parse_if_exists(proof_branch_name)
             status_entries = proof_git.status_porcelain()
         except (GitError, OSError) as exc:
@@ -1762,7 +1780,8 @@ def _execute_rerun_completed_verify_fix(
         )
 
     try:
-        worktree_git = Git(worktree_path)
+        runtime_env = _git_runtime_env(context.git)
+        worktree_git = Git(worktree_path, env=runtime_env) if runtime_env is not None else Git(worktree_path)
         can_complete = _capture_noop_verify_fix_timeout_rerun(
             config=context.config,
             store=context.store,
@@ -1922,6 +1941,15 @@ def _execute_recover_verify_only_noop_review(
             work_done=True,
             handled_task_id=task.id,
         )
+    if not isinstance(context.runtime_context, RuntimeExecutionContext):
+        return AdvanceActionExecutionResult(
+            action_type=action_type,
+            status="error",
+            message="missing runtime ownership for verify-only no-op recovery",
+            error_message="missing runtime ownership for verify-only no-op recovery",
+            noop_improve_kind=NOOP_IMPROVE_KIND_VERIFY_ONLY,
+        )
+    runtime_context = context.runtime_context
 
     def _persist_attention(
         message: str,
@@ -1973,7 +2001,7 @@ def _execute_recover_verify_only_noop_review(
         )
         context.git.worktree_add_existing(worktree_path, current_branch_head_sha, detach=True)
         added_worktree = True
-        worktree_git = Git(worktree_path)
+        worktree_git = Git(worktree_path, env=runtime_context.env)
     except (GitError, OSError, RuntimeError, ValueError) as exc:
         cleanup_failure = _cleanup_verify_only_noop_worktree(
             context=context,
@@ -2027,6 +2055,7 @@ def _execute_recover_verify_only_noop_review(
                     task=noop_improve_task,
                     worktree_git=worktree_git,
                     worktree_path=worktree_git.repo_dir,
+                    runtime_context=runtime_context,
                     timeout_seconds=timeout_seconds,
                     timeout_grace_seconds=timeout_grace_seconds,
                     reviewed_branch=task.branch,
@@ -2057,6 +2086,7 @@ def _execute_recover_verify_only_noop_review(
                 result = _run_review_verify_command(
                     verify_command,
                     cwd=provider_cwd,
+                    env=normalize_subprocess_env(runtime_context.env, provider_cwd),
                     reviewed_branch=task.branch,
                     reviewed_head_sha=reviewed_head_sha,
                     reviewed_base_sha=reviewed_base_sha,

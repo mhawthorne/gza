@@ -56,6 +56,229 @@ def _write_project_config(
     )
 
 
+class _RecordingLifecycleGit:
+    calls: list[dict[str, object]] = []
+
+    def __init__(self, repo_dir: Path, *, env: dict[str, str] | None = None) -> None:
+        self.repo_dir = Path(repo_dir)
+        self.env = env
+        self.calls.append({"repo_dir": self.repo_dir, "env": env})
+
+    def current_branch(self) -> str:
+        return "main"
+
+    def default_branch(self) -> str:
+        return "main"
+
+    def branch_exists(self, _branch: str) -> bool:
+        return True
+
+    def is_merged(self, _branch: str, _target: str) -> bool:
+        return False
+
+
+def test_merge_entrypoint_builds_root_git_from_project_runtime_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza.cli.git_ops import cmd_merge
+
+    db_path = tmp_path / ".gza" / "gza.db"
+    _write_project_config(tmp_path, project_name="Runtime", project_id="runtime", db_path=db_path)
+    (tmp_path / ".env").write_text("PATH=/project/bin\nPROJECT_TOKEN=project-token\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("PROJECT_TOKEN", "ambient-token")
+    _RecordingLifecycleGit.calls = []
+    args = SimpleNamespace(project_dir=tmp_path, task_ids=[], all=False, mark_only=False)
+
+    with patch("gza.cli.git_ops.Git", _RecordingLifecycleGit):
+        rc = cmd_merge(args)
+
+    assert rc == 1
+    assert len(_RecordingLifecycleGit.calls) == 1
+    env = _RecordingLifecycleGit.calls[0]["env"]
+    assert isinstance(env, dict)
+    assert _RecordingLifecycleGit.calls[0]["repo_dir"] == tmp_path
+    assert env["PATH"] == "/project/bin"
+    assert env["PROJECT_TOKEN"] == "project-token"
+    assert env["GZA_DB_PATH"] == str(db_path.resolve())
+
+
+def test_advance_entrypoint_builds_root_git_from_project_runtime_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza.cli.git_ops import cmd_advance
+
+    db_path = tmp_path / ".gza" / "gza.db"
+    _write_project_config(tmp_path, project_name="Runtime", project_id="runtime", db_path=db_path)
+    (tmp_path / ".env").write_text("PATH=/project/bin\nPROJECT_TOKEN=project-token\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("PROJECT_TOKEN", "ambient-token")
+    _RecordingLifecycleGit.calls = []
+    args = SimpleNamespace(
+        project_dir=tmp_path,
+        task_id=None,
+        repeat=True,
+        max=None,
+        new=False,
+        unimplemented=False,
+        plans=False,
+        max_iterations=1,
+        dry_run=False,
+    )
+
+    with patch("gza.cli.git_ops.Git", _RecordingLifecycleGit):
+        rc = cmd_advance(args)
+
+    assert rc == 1
+    assert len(_RecordingLifecycleGit.calls) == 1
+    env = _RecordingLifecycleGit.calls[0]["env"]
+    assert isinstance(env, dict)
+    assert _RecordingLifecycleGit.calls[0]["repo_dir"] == tmp_path
+    assert env["PATH"] == "/project/bin"
+    assert env["PROJECT_TOKEN"] == "project-token"
+    assert env["GZA_DB_PATH"] == str(db_path.resolve())
+
+
+def test_task_backed_rebase_entrypoint_passes_captured_runtime_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza.cli.git_ops import cmd_rebase
+
+    db_path = tmp_path / ".gza" / "gza.db"
+    _write_project_config(tmp_path, project_name="Runtime", project_id="runtime", db_path=db_path)
+    (tmp_path / ".env").write_text("PATH=/project/bin\nPROJECT_TOKEN=project-token\n", encoding="utf-8")
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore.from_config(config)
+    task = store.add("completed task", task_type="implement")
+    task.status = "completed"
+    task.branch = "feature/completed"
+    task.completed_at = datetime.now(UTC)
+    store.update(task)
+    assert task.id is not None
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("PROJECT_TOKEN", "ambient-token")
+    _RecordingLifecycleGit.calls = []
+    args = SimpleNamespace(
+        project_dir=tmp_path,
+        task_id=task.id,
+        background=False,
+        run=True,
+        onto=None,
+        remote=False,
+    )
+
+    with (
+        patch("gza.cli.git_ops.Git", _RecordingLifecycleGit),
+        patch("gza.cli.git_ops._run_task_backed_rebase", return_value=0) as run_rebase,
+    ):
+        rc = cmd_rebase(args)
+
+    assert rc == 0
+    assert len(_RecordingLifecycleGit.calls) == 1
+    env = _RecordingLifecycleGit.calls[0]["env"]
+    assert isinstance(env, dict)
+    assert env["PATH"] == "/project/bin"
+    assert env["PROJECT_TOKEN"] == "project-token"
+    assert env["GZA_DB_PATH"] == str(db_path.resolve())
+    runtime_context = run_rebase.call_args.kwargs["runtime_context"]
+    assert runtime_context.cwd == tmp_path
+    assert runtime_context.env == env
+    assert runtime_context.db_path == db_path.resolve()
+
+
+def test_advance_repeat_foreground_callbacks_use_captured_runtime_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza.cli import git_ops
+    from gza.lineage_query import LineageOwnerRow
+
+    db_path = tmp_path / ".gza" / "gza.db"
+    _write_project_config(tmp_path, project_name="Runtime", project_id="runtime", db_path=db_path)
+    (tmp_path / ".env").write_text("PATH=/captured/bin\nPROJECT_TOKEN=captured-token\n", encoding="utf-8")
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore.from_config(config)
+    task = store.add("failed task", task_type="implement")
+    task.status = "failed"
+    task.branch = "feature/failed"
+    store.update(task)
+    assert task.id is not None
+    row = LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="actionable",
+        next_action={"type": "resume", "description": "resume failed task"},
+        next_action_reason="test",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+    )
+    monkeypatch.setenv("PATH", "/ambient/bin")
+    monkeypatch.setenv("PROJECT_TOKEN", "ambient-token")
+    _RecordingLifecycleGit.calls = []
+    captured_contexts = []
+
+    def fake_execute_advance_action(*, task, action, context):
+        del action
+        (tmp_path / ".env").write_text("PATH=/mutated/bin\nPROJECT_TOKEN=mutated-token\n", encoding="utf-8")
+        monkeypatch.setenv("PATH", "/ambient-after/bin")
+        monkeypatch.setenv("PROJECT_TOKEN", "ambient-after-token")
+        rc = context.spawn_resume_worker(task, "resume")
+        return git_ops.AdvanceActionExecutionResult(
+            action_type="resume",
+            status="success" if rc == 0 else "error",
+            message="done",
+        )
+
+    def fake_run_foreground(_config, task_id, **kwargs):
+        del task_id
+        captured_contexts.append(kwargs["runtime_context"])
+        return 0
+
+    args = SimpleNamespace(
+        project_dir=tmp_path,
+        task_id=task.id,
+        repeat=True,
+        max=None,
+        new=False,
+        unimplemented=False,
+        plans=False,
+        max_iterations=1,
+        dry_run=False,
+        auto=True,
+        batch=None,
+        force=False,
+        no_resume_failed=False,
+        max_resume_attempts=None,
+        advance_type=None,
+        create=False,
+        squash_threshold=None,
+    )
+
+    with (
+        patch("gza.cli.git_ops.Git", _RecordingLifecycleGit),
+        patch("gza.git.Git") as db_git_class,
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.cli.git_ops.determine_next_action", return_value=row.next_action),
+        patch("gza.cli.git_ops.execute_advance_action", side_effect=fake_execute_advance_action),
+        patch("gza.cli.git_ops._run_foreground", side_effect=fake_run_foreground),
+    ):
+        db_git_class.return_value.default_branch.return_value = "main"
+        rc = git_ops.cmd_advance(args)
+
+    assert rc == 0
+    assert len(captured_contexts) == 1
+    runtime_context = captured_contexts[0]
+    assert runtime_context.cwd == tmp_path
+    assert runtime_context.db_path == db_path.resolve()
+    assert runtime_context.env["PATH"] == "/captured/bin"
+    assert runtime_context.env["PROJECT_TOKEN"] == "captured-token"
+    assert runtime_context.env["GZA_DB_PATH"] == str(db_path.resolve())
+
+
 def test_get_store_warns_for_readwrite_canonical_registry_conflict(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

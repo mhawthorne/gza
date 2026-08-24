@@ -28,6 +28,7 @@ from gza.cli.git_ops import (
     _MergeSingleTaskResult,
     _prepare_create_review_action,
     _print_squash_reconcile_result,
+    _promote_isolated_merge_to_target_branch,
     _reconcile_diverged_branch_with_origin,
     _reconcile_squash_merged_branch_with_origin,
     _remove_watch_merge_checkout,
@@ -4774,6 +4775,31 @@ def test_ensure_watch_main_checkout_recreates_prunable_registration_without_prun
     workspace_git.clean_force.assert_called_once_with()
 
 
+def test_ensure_watch_main_checkout_builds_child_git_with_parent_env(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    checkout_path = config.main_checkout_integration_path
+    parent_env = {"PATH": "/project/bin", "TOKEN": "owned"}
+    git = MagicMock(spec=Git)
+    git.env = parent_env
+    git.worktree_list.side_effect = [
+        [],
+        [{"path": str(checkout_path), "branch": None, "detached": True}],
+    ]
+    workspace_git = MagicMock()
+    workspace_git.current_branch.return_value = "HEAD"
+    workspace_git.has_changes.return_value = False
+
+    with patch("gza.cli.git_ops.Git", return_value=workspace_git) as git_cls:
+        isolated_git = ensure_watch_main_checkout(config, git, "main")
+
+    assert isolated_git is workspace_git
+    git_cls.assert_called_once_with(checkout_path, env=parent_env)
+    workspace_git.checkout_detached.assert_called_once_with("main")
+    workspace_git.reset_hard.assert_called_once_with("main")
+    workspace_git.clean_force.assert_called_once_with()
+
+
 def test_run_task_backed_rebase_reconciles_parent_merge_status_when_rebased_branch_is_already_in_target(
     tmp_path,
     capsys,
@@ -5215,6 +5241,7 @@ def test_run_task_backed_rebase_provider_resolve_uses_isolated_checkout_and_guar
         log_file=ANY,
         logger=ANY,
         worktree_path=private_checkout_path,
+        runtime_context=ANY,
     )
     import_isolated_rebase_tip.assert_called_once_with(
         destination_git=repo_git,
@@ -8007,6 +8034,64 @@ def test_reconcile_diverged_branch_with_origin_rebases_after_remote_moves(tmp_pa
         target="main",
     )
     publish_rebased_branch.assert_called_once()
+
+
+def test_reconcile_diverged_branch_with_origin_builds_worktree_git_with_parent_env(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    task = SimpleNamespace(id="gza-env", branch="feature/env")
+    parent_env = {"PATH": "/project/bin", "TOKEN": "owned"}
+
+    git = MagicMock(spec=Git)
+    git.env = parent_env
+    git.branch_exists.return_value = True
+    git.rev_parse_if_exists.side_effect = ["remote-old", "local-tip", "remote-new"]
+    git.resolve_fresh_merge_source.return_value = ResolvedMergeSourceRef("feature/env")
+    git.count_commits_ahead.side_effect = [1, 0]
+    git.push_ref_force_with_lease.side_effect = GitError("stale info")
+
+    worktree_git = MagicMock(spec=Git)
+    worktree_git.rebase.return_value = None
+
+    with (
+        patch("gza.cli.git_ops.Git", return_value=worktree_git) as git_cls,
+        patch("gza.cli.git_ops.cleanup_worktree_for_branch", return_value=None),
+        patch(
+            "gza.cli.git_ops.capture_rebase_diff_baseline",
+            return_value=RebaseDiffBaseline("old", "target", "base"),
+        ),
+        patch("gza.cli.git_ops.publish_rebased_branch"),
+    ):
+        result = _reconcile_diverged_branch_with_origin(config, git, task, target_branch="main")
+
+    assert result.status == "reconciled"
+    expected_worktree = config.worktree_path / "advance-reconcile-gza-env"
+    git_cls.assert_called_once_with(expected_worktree, env=parent_env)
+    worktree_git.rebase.assert_called_once_with("main")
+
+
+def test_promote_isolated_merge_builds_attached_target_git_with_parent_env(tmp_path: Path) -> None:
+    parent_env = {"PATH": "/project/bin", "TOKEN": "owned"}
+    attached_checkout = tmp_path / "attached-main"
+    repo_git = MagicMock(spec=Git)
+    repo_git.env = parent_env
+    repo_git.rev_parse.return_value = "old-main"
+    merge_git = MagicMock(spec=Git)
+    merge_git.rev_parse.return_value = "new-main"
+    attached_git = MagicMock(spec=Git)
+    attached_git.has_changes.return_value = False
+
+    with (
+        patch("gza.cli.git_ops.active_worktree_path_for_branch", return_value=attached_checkout),
+        patch("gza.cli.git_ops.Git", return_value=attached_git) as git_cls,
+    ):
+        warnings = _promote_isolated_merge_to_target_branch(repo_git, merge_git, "main")
+
+    assert warnings == ()
+    git_cls.assert_called_once_with(attached_checkout, env=parent_env)
+    repo_git.update_ref.assert_called_once_with("refs/heads/main", "new-main", "old-main")
+    attached_git.reset_hard.assert_called_once_with("refs/heads/main")
+    merge_git.reset_hard.assert_called_once_with("refs/heads/main")
 
 
 def test_reconcile_diverged_branch_with_origin_routes_conflicts_to_rebase(tmp_path: Path) -> None:
