@@ -635,7 +635,12 @@ def test_recovery_preview_scoped_seed_ignores_large_non_recovery_descendant_hist
         state="unmerged",
     )
     store.attach_task_to_merge_unit(failed.id, failed_unit.id, "owner")
-    _bulk_insert_completed_history(store, count=9000, start=200000, based_on=failed.id)
+    non_recovery_descendant_ids = _bulk_insert_completed_history(
+        store,
+        count=3000,
+        start=200000,
+        based_on=failed.id,
+    )
 
     def fail_get_all():
         raise AssertionError("scoped recovery preview must not fall back to get_all()")
@@ -675,7 +680,36 @@ def test_recovery_preview_scoped_seed_ignores_large_non_recovery_descendant_hist
     assert [entry.task.id for entry in scoped_preview.recovery_entries] == [failed.id]
     assert [entry.task.id for entry in tagged_scoped_preview.recovery_entries] == [failed.id]
     assert failed.id in hydrated_ids
+    assert set(hydrated_ids).isdisjoint(non_recovery_descendant_ids)
     assert len(set(hydrated_ids)) < 50
+
+
+def test_recovery_children_query_rejects_unrelated_same_type_completed_descendants(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    failed = store.add("Failed seed", task_type="implement", tags=("alpha",))
+    assert failed.id is not None
+    failed.status = "failed"
+    failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed.branch = "feature/failed-seed"
+    failed.completed_at = datetime(2026, 4, 2, 8, 0, tzinfo=UTC)
+    store.update(failed)
+    descendant_ids = _bulk_insert_completed_history(
+        store,
+        count=3000,
+        start=210000,
+        based_on=failed.id,
+    )
+
+    recovery_children = store.get_recovery_children_for_parents((failed.id,))
+
+    assert recovery_children == []
+    assert {
+        task.id for task in recovery_children if task.id is not None
+    }.isdisjoint(descendant_ids)
 
 
 def test_recovery_preview_legacy_failed_recovery_child_uses_completed_sibling_evidence(
