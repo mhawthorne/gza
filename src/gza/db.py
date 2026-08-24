@@ -13899,6 +13899,7 @@ class SqliteTaskStore:
         unit_id: str,
         state: str,
         *,
+        expected_state: str | None | object = DB_UNSET,
         merged_by_task_id: str | None | object = DB_UNSET,
         merge_source: str | None | object = DB_UNSET,
         merged_at: datetime | None | object = DB_UNSET,
@@ -13907,14 +13908,15 @@ class SqliteTaskStore:
         pr_last_synced_at: datetime | None | object = DB_UNSET,
         sync_last_synced_at: datetime | None | object = DB_UNSET,
         diff_stats: tuple[int | None, int | None, int | None] | None = None,
-    ) -> None:
+    ) -> bool:
         """Update merge-unit state and dual-write compatibility task fields."""
         if not self.supports_merge_units():
-            return
+            return False
         now = datetime.now(UTC)
         current_unit = self.get_merge_unit(unit_id)
         if current_unit is None:
             raise ValueError(f"Merge unit {unit_id} not found")
+        typed_expected_state = cast("str | None", expected_state) if expected_state is not DB_UNSET else None
         owner = self.resolve_merge_unit_owner_task(current_unit)
         owner_task_id = owner.id if owner is not None else current_unit.owner_task_id
         typed_merged_by_task_id = cast("str | None", merged_by_task_id) if merged_by_task_id is not DB_UNSET else None
@@ -13985,12 +13987,21 @@ class SqliteTaskStore:
             )
             params.extend(diff_stats)
         params.extend([self._project_id, unit_id])
+        if expected_state is not DB_UNSET:
+            params.append(typed_expected_state)
+            expected_clause = " AND state = ?"
+        else:
+            expected_clause = ""
         with self._write_transaction() as conn:
-            conn.execute(
-                f"UPDATE merge_units SET {', '.join(updates)} WHERE project_id = ? AND id = ?",
+            cursor = conn.execute(
+                f"UPDATE merge_units SET {', '.join(updates)} WHERE project_id = ? AND id = ?{expected_clause}",
                 tuple(params),
             )
+            updated = cursor.rowcount > 0
+        if not updated:
+            return False
         self.dual_write_legacy_merge_status(unit_id)
+        return True
 
     def repair_inconsistent_unmerged_merge_units(self) -> int:
         """Clear merged provenance left behind on non-merged merge units."""

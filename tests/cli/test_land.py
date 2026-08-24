@@ -2,18 +2,19 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal
-from unittest.mock import MagicMock
+from typing import Any, Literal
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from gza.db import MergeUnit, SqliteTaskStore
 from gza.landing import (
-    LandRequest,
-    LandTerminalResult,
+    LandBlocked,
     LandingCollaborators,
     LandingCoordinator,
     LandingStore,
+    LandRequest,
+    LandTerminalResult,
 )
 from tests.cli.conftest import invoke_gza, make_store, setup_config
 
@@ -48,21 +49,54 @@ class CountingStore:
     def get_merge_unit(self, unit_id: str) -> MergeUnit | None:
         return self._store.get_merge_unit(unit_id)
 
-    def set_merge_unit_state(self, unit_id: str, state: str) -> None:
-        self.merge_unit_state_writes.append((unit_id, state))
-        self._store.set_merge_unit_state(unit_id, state)
+    def set_merge_unit_state(self, unit_id: str, state: str, **kwargs: Any) -> bool:
+        updated = self._store.set_merge_unit_state(unit_id, state, **kwargs)
+        if updated:
+            self.merge_unit_state_writes.append((unit_id, state))
+        return updated
+
+
+class TerminalProofGit:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def branch_exists(self, branch: str) -> bool:
+        self.calls.append(("branch_exists", branch))
+        return True
+
+    def is_merged(self, branch: str, into: str | None = None) -> bool:
+        self.calls.append(("is_merged", f"{branch}->{into}"))
+        return False
+
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        self.calls.append(("rev_parse_if_exists", ref))
+        return "a" * 40
+
+    def merge_base(self, ref1: str, ref2: str) -> str:
+        self.calls.append(("merge_base", f"{ref1}->{ref2}"))
+        return ref2
+
+    def count_commits_ahead(self, branch: str, base: str) -> int:
+        self.calls.append(("count_commits_ahead", f"{branch}->{base}"))
+        return 0
+
+    def has_non_empty_source_diff_against_target(self, source_ref: str, target_ref: str) -> bool | None:
+        self.calls.append(("has_non_empty_source_diff_against_target", f"{source_ref}->{target_ref}"))
+        return False
 
 
 def _task_with_unit(
     tmp_path: Path,
     *,
     state: str,
+    has_commits: bool = False,
 ) -> tuple[SqliteTaskStore, str, str]:
     setup_config(tmp_path)
     store = make_store(tmp_path)
     task = store.add("land terminal branch", task_type="implement")
     task.status = "completed"
     task.branch = f"feature/{state}-{task.id}"
+    task.has_commits = has_commits
     task.merge_status = "unmerged"
     store.update(task)
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -146,6 +180,56 @@ def test_land_reconciles_unmerged_to_terminal_no_work_with_only_allowed_write(
     _assert_zero_downstream_activity(collaborators)
 
 
+@pytest.mark.parametrize("concurrent_state", TERMINAL_STATES)
+def test_land_reconciliation_does_not_clobber_concurrent_terminal_state(
+    tmp_path: Path,
+    *,
+    concurrent_state: Literal["merged", "empty", "redundant"],
+) -> None:
+    store, task_id, unit_id = _task_with_unit(tmp_path, state="unmerged")
+    counting_store = CountingStore(store)
+
+    def _reconcile(_store: LandingStore, _unit: MergeUnit) -> Literal["empty"]:
+        if concurrent_state == "merged":
+            store.set_merge_unit_state(unit_id, concurrent_state, merged_by_task_id=task_id, merge_source="manual")
+        else:
+            store.set_merge_unit_state(unit_id, concurrent_state)
+        return "empty"
+
+    collaborators = _collaborators(_reconcile)
+
+    result = LandingCoordinator(counting_store, collaborators=collaborators).land(LandRequest(task_id=task_id))
+
+    assert isinstance(result, LandTerminalResult)
+    assert result.outcome == concurrent_state
+    assert result.reconciled is False
+    assert counting_store.merge_unit_state_writes == []
+    assert store.get_merge_unit(unit_id).state == concurrent_state  # type: ignore[union-attr]
+    collaborators.reconcile_terminal_state.assert_called_once()
+    _assert_zero_downstream_activity(collaborators)
+
+
+def test_land_reconciliation_fails_closed_for_concurrent_nonterminal_state(tmp_path: Path) -> None:
+    store, task_id, unit_id = _task_with_unit(tmp_path, state="unmerged")
+    counting_store = CountingStore(store)
+
+    def _reconcile(_store: LandingStore, _unit: MergeUnit) -> Literal["redundant"]:
+        store.set_merge_unit_state(unit_id, "blocked")
+        return "redundant"
+
+    collaborators = _collaborators(_reconcile)
+
+    result = LandingCoordinator(counting_store, collaborators=collaborators).land(LandRequest(task_id=task_id))
+
+    assert isinstance(result, LandBlocked)
+    assert result.reason_code == "merge-state-changed"
+    assert "changed from unmerged to blocked" in result.fact
+    assert counting_store.merge_unit_state_writes == []
+    assert store.get_merge_unit(unit_id).state == "blocked"  # type: ignore[union-attr]
+    collaborators.reconcile_terminal_state.assert_called_once()
+    _assert_zero_downstream_activity(collaborators)
+
+
 @pytest.mark.parametrize("state", TERMINAL_STATES)
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_land_cli_reports_initial_terminal_result(
@@ -169,3 +253,53 @@ def test_land_cli_reports_initial_terminal_result(
     else:
         assert f"terminal no-work state {state}" in result.stdout
         assert "already merged" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("state", "has_commits"),
+    [("empty", False), ("redundant", True)],
+)
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_land_cli_reconciles_unmerged_terminal_no_work_from_canonical_git_proof(
+    tmp_path: Path,
+    *,
+    state: Literal["empty", "redundant"],
+    has_commits: bool,
+    dry_run: bool,
+) -> None:
+    store, task_id, unit_id = _task_with_unit(tmp_path, state="unmerged", has_commits=has_commits)
+    proof_git = TerminalProofGit()
+    state_writes: list[tuple[str, str, str | None]] = []
+    original_set_merge_unit_state = SqliteTaskStore.set_merge_unit_state
+
+    def _record_set_merge_unit_state(
+        store_self: SqliteTaskStore,
+        unit_id_arg: str,
+        state_arg: str,
+        **kwargs: Any,
+    ) -> bool:
+        state_writes.append((unit_id_arg, state_arg, kwargs.get("expected_state")))
+        return original_set_merge_unit_state(store_self, unit_id_arg, state_arg, **kwargs)
+
+    args = ["land", task_id, "--project", str(tmp_path)]
+    if dry_run:
+        args.append("--dry-run")
+    with (
+        patch("gza.cli.land.Git", return_value=proof_git),
+        patch.object(SqliteTaskStore, "set_merge_unit_state", autospec=True, side_effect=_record_set_merge_unit_state),
+    ):
+        result = invoke_gza(*args, cwd=tmp_path)
+
+    assert result.returncode == 0
+    assert f"terminal no-work state {state}" in result.stdout
+    if dry_run:
+        assert result.stdout.startswith("Dry run: ")
+        assert "would reconcile" in result.stdout
+    else:
+        assert "reconciled" in result.stdout
+    expected_durable_state = "unmerged" if dry_run else state
+    expected_writes = [] if dry_run else [(unit_id, state, "unmerged")]
+    assert state_writes == expected_writes
+    assert store.get_merge_unit(unit_id).state == expected_durable_state  # type: ignore[union-attr]
+    assert ("branch_exists", store.get_merge_unit(unit_id).source_branch) in proof_git.calls  # type: ignore[union-attr]
+    assert any(call[0] == "count_commits_ahead" for call in proof_git.calls)
