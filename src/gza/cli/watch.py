@@ -6656,6 +6656,102 @@ class _WatchDispatchSuppressionContext:
         )
 
 
+@dataclass(frozen=True)
+class _PendingDispatchPreflightResult:
+    task: DbTask | None
+    dispatchable: bool
+    detail: str | None = None
+
+
+def _preflight_pending_dispatch_candidate(
+    *,
+    config: Config,
+    store: SqliteTaskStore,
+    log: "_WatchLog",
+    git: Git,
+    task: DbTask,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    max_recovery_attempts: int,
+    target_branch: str | None = None,
+    owner_rows: tuple[LineageOwnerRow, ...] | None = None,
+    read_context: RecoveryReadContext | None = None,
+    suppression_context: _WatchDispatchSuppressionContext,
+) -> _PendingDispatchPreflightResult:
+    if task.id is None:
+        return _PendingDispatchPreflightResult(
+            task=None,
+            dispatchable=False,
+            detail="candidate task has no id",
+        )
+    refreshed_task = store.get(str(task.id))
+    if refreshed_task is None:
+        return _PendingDispatchPreflightResult(
+            task=None,
+            dispatchable=False,
+            detail=f"task {task.id} is not present in runtime store",
+        )
+    if refreshed_task.status != "pending":
+        return _PendingDispatchPreflightResult(
+            task=refreshed_task,
+            dispatchable=False,
+            detail=f"task is {refreshed_task.status}, not pending",
+        )
+    started_ids, pending_recovery_ids, step1_handled_ids, excluded_ids = suppression_context.for_preview_filter()
+    pending_preview = build_dispatch_preview(
+        store,
+        config=config,
+        git=git,
+        target_branch=target_branch if target_branch is not None else git.default_branch(),
+        owner_rows=owner_rows,
+        read_context=read_context,
+        tags=tags,
+        any_tag=any_tag,
+        max_recovery_attempts=max_recovery_attempts,
+        selection_mode="pending_only",
+        pending_limit=None,
+        include_recovery=False,
+        include_pending=True,
+    )
+    current_pending_entries = tuple(entry for entry in pending_preview.runnable_entries if entry.lane == "pending")
+    current_pending_entries = _filter_watch_dispatch_preview_entries(
+        current_pending_entries,
+        store=store,
+        started_task_ids=started_ids,
+        pending_recovery_task_ids=pending_recovery_ids,
+        step1_handled_child_task_ids=step1_handled_ids,
+        excluded_owner_ids=excluded_ids,
+    )
+    current_head = next(iter(current_pending_entries), None)
+    if current_head is None or current_head.task.id != refreshed_task.id:
+        detail = (
+            f"task {refreshed_task.id} is not the current eligible pending dispatch head"
+            if current_head is not None
+            else f"task {refreshed_task.id} is no longer eligible for pending dispatch"
+        )
+        return _PendingDispatchPreflightResult(
+            task=refreshed_task,
+            dispatchable=False,
+            detail=detail,
+        )
+    task_type = refreshed_task.task_type or "implement"
+    try:
+        require_execution_route_for_task(refreshed_task, config)
+    except ConfigError as exc:
+        detail = f"execution route blocked: {exc}"
+        log.emit(
+            "BLOCKED",
+            f"{refreshed_task.id} {task_type}: {detail}",
+            dedupe_key=f"pending-route-blocked:{refreshed_task.id}",
+        )
+        return _PendingDispatchPreflightResult(
+            task=refreshed_task,
+            dispatchable=False,
+            detail=detail,
+        )
+    return _PendingDispatchPreflightResult(task=refreshed_task, dispatchable=True)
+
+
 @dataclass
 class WatchProjectRuntime:
     """Mutable state for one project's watch execution."""
@@ -7104,16 +7200,52 @@ class WatchProjectRuntime:
             excluded_owner_ids=excluded_owner_ids,
             step1_handled_child_task_ids=step1_handled_child_task_ids,
         )
-        if str(task.id) in suppression_context.started_task_ids:
+        preflight = _preflight_pending_dispatch_candidate(
+            config=self.config,
+            store=self.store,
+            log=self.log,
+            git=self.git,
+            task=task,
+            tags=self.tags,
+            any_tag=self.any_tag,
+            max_recovery_attempts=self.config.max_resume_attempts,
+            target_branch=(
+                analysis.analysis.target_branch
+                if analysis is not None and analysis.analysis.target_branch is not None
+                else None
+            ),
+            owner_rows=analysis.analysis.owner_rows if analysis is not None else None,
+            read_context=analysis.analysis.watch_read_context if analysis is not None else None,
+            suppression_context=suppression_context,
+        )
+        if not preflight.dispatchable:
+            self._exclude_pending_dispatch_candidate_for_pass(str(task.id))
             return ProjectDispatchResult(
                 runtime_key=self.key,
                 candidate=candidate,
                 status="not_dispatchable",
                 slot_consuming=False,
                 work_done=False,
-                detail=f"task {task.id} is already attempted in this runtime dispatch pass",
+                detail=preflight.detail,
+                task=preflight.task,
+            )
+        task = preflight.task
+        assert task is not None
+        task_type = task.task_type or "implement"
+
+        def reject_if_live_worker_proof() -> ProjectDispatchResult | None:
+            if not self._task_has_current_live_worker_proof(str(task.id)):
+                return None
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="not_dispatchable",
+                slot_consuming=False,
+                work_done=False,
+                detail=f"task {task.id} already has live worker proof",
                 task=task,
             )
+
         current_head = self._current_pending_dispatch_head_for_validation(suppression_context=suppression_context)
         if current_head is None or current_head.task.id != task.id:
             detail = (
@@ -7130,23 +7262,10 @@ class WatchProjectRuntime:
                 detail=detail,
                 task=task,
             )
-        task_type = task.task_type or "implement"
-        def reject_if_live_worker_proof() -> ProjectDispatchResult | None:
-            if not self._task_has_current_live_worker_proof(str(task.id)):
-                return None
-            return ProjectDispatchResult(
-                runtime_key=self.key,
-                candidate=candidate,
-                status="not_dispatchable",
-                slot_consuming=False,
-                work_done=False,
-                detail=f"task {task.id} already has live worker proof",
-                task=task,
-            )
-
         live_worker_rejection = reject_if_live_worker_proof()
         if live_worker_rejection is not None:
             return live_worker_rejection
+
         if dry_run:
             prompt = _format_prompt_for_width(
                 task.prompt,
@@ -9622,6 +9741,7 @@ def _run_cycle(
     confirmed_start_count = 0
     recovery_started_this_cycle = False
     started_task_ids: set[str] = set()
+    pending_preflight_rejected_task_ids: set[str] = set()
     expected_starts: dict[str, _ExpectedStart] = {}
     deferred_lifecycle_starts: list[_DeferredWatchDispatchStart] = []
     deferred_recovery_starts: list[_DeferredWatchDispatchStart] = []
@@ -10609,7 +10729,7 @@ def _run_cycle(
                         config,
                         store,
                         git,
-                        task,
+                        cast(DbTask, task),
                         action,
                         target_branch=target_branch,
                         current_branch=current_branch,
@@ -12434,9 +12554,9 @@ def _run_cycle(
             ),
         )
 
-    def _recompute_pending_dispatch() -> tuple[list[DbTask], int, bool]:
+    def _recompute_pending_dispatch() -> tuple[list[DbTask], int, bool, tuple[DispatchPreviewEntry, ...]]:
         if scoped_owner_ids is not None:
-            return [], 0, False
+            return [], 0, False, ()
         pending_preview = build_dispatch_preview(
             store,
             config=config,
@@ -12449,9 +12569,9 @@ def _run_cycle(
             include_recovery=False,
         )
         pending_entries = _filter_watch_dispatch_preview_entries(
-            pending_preview.runnable_entries,
+            tuple(entry for entry in pending_preview.runnable_entries if entry.lane == "pending"),
             store=store,
-            started_task_ids=started_task_ids,
+            started_task_ids=started_task_ids | pending_preflight_rejected_task_ids,
             pending_recovery_task_ids=pending_recovery_task_ids,
             step1_handled_child_task_ids=step1_handled_child_task_ids,
             excluded_owner_ids=excluded_owner_ids,
@@ -12474,16 +12594,20 @@ def _run_cycle(
         if unmapped_pending_entries:
             for entry in unmapped_pending_entries:
                 _fail_closed_for_planned_pending_entry(entry, reason="missing-pending-task")
-            return [], 0, True
-        return list(pending_tasks), pending_plan.pending_slots, False
+            return [], 0, True, ()
+        return list(pending_tasks), pending_plan.pending_slots, False, tuple(pending_entries)
 
     if planned_recovery_dispatch_failed_closed:
         pending_slots = 0
         pending_tasks = []
+        pending_entries_for_preflight: tuple[DispatchPreviewEntry, ...] = ()
         pending_dispatch_failed_closed = False
     elif scoped_owner_ids is None and recovery_mode != "recovery_only":
-        pending_tasks, pending_slots, pending_dispatch_failed_closed = _recompute_pending_dispatch()
+        pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight = (
+            _recompute_pending_dispatch()
+        )
     else:
+        pending_entries_for_preflight = ()
         pending_dispatch_failed_closed = False
 
     if (
@@ -12493,7 +12617,9 @@ def _run_cycle(
         and not recovery_started_this_cycle
     ):
         if not nonparked_recovery_subject_ids:
-            pending_tasks, pending_slots, pending_dispatch_failed_closed = _recompute_pending_dispatch()
+            pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight = (
+                _recompute_pending_dispatch()
+            )
 
     # 3) Start new queued tasks (consumes slots)
     def consume_pending_slot() -> None:
@@ -12560,6 +12686,17 @@ def _run_cycle(
         log.emit("QUEUE", "pending queue active")
     if pending_slots > 0 and not pending_dispatch_failed_closed:
         pending_task_index = 0
+
+        def _suppress_pending_candidate_and_recompute(task_id: str) -> bool:
+            nonlocal pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight
+            nonlocal pending_task_index
+            pending_preflight_rejected_task_ids.add(task_id)
+            pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight = (
+                _recompute_pending_dispatch()
+            )
+            pending_task_index = 0
+            return pending_dispatch_failed_closed
+
         while pending_slots > 0 and pending_task_index < len(pending_tasks):
             wave_budget = pending_slots
             wave_fill_count = 0
@@ -12574,6 +12711,32 @@ def _run_cycle(
                     continue
                 if str(task.id) in step1_handled_child_task_ids:
                     continue
+                preflight = _preflight_pending_dispatch_candidate(
+                    config=config,
+                    store=store,
+                    log=log,
+                    git=git,
+                    task=task,
+                    tags=tags,
+                    any_tag=any_tag,
+                    max_recovery_attempts=max_recovery_attempts,
+                    target_branch=target_branch,
+                    owner_rows=analysis.owner_rows,
+                    read_context=analysis.watch_read_context,
+                    suppression_context=_WatchDispatchSuppressionContext(
+                        started_task_ids=frozenset(started_task_ids | pending_preflight_rejected_task_ids),
+                        pending_recovery_task_ids=frozenset(pending_recovery_task_ids),
+                        step1_handled_child_task_ids=frozenset(step1_handled_child_task_ids),
+                        excluded_owner_ids=excluded_owner_ids,
+                    ),
+                )
+                if not preflight.dispatchable:
+                    if _suppress_pending_candidate_and_recompute(str(task.id)):
+                        break
+                    continue
+                refreshed_pending_task = preflight.task
+                assert refreshed_pending_task is not None
+                task = refreshed_pending_task
                 task_type = task.task_type or "implement"
                 pending_action = _pending_queue_dispatch_action(task)
                 if task_type == "implement":
@@ -12595,6 +12758,8 @@ def _run_cycle(
                         subject_task=task,
                         action=pending_action,
                     ):
+                        if _suppress_pending_candidate_and_recompute(str(task.id)):
+                            break
                         continue
                     if _watch_task_has_live_registered_worker(config, str(task.id)):
                         continue
@@ -12614,12 +12779,16 @@ def _run_cycle(
                             subject_task=task,
                             action=pending_action,
                         )
+                        if _suppress_pending_candidate_and_recompute(str(task.id)):
+                            break
                         continue
                     if no_progress_attention is not None:
                         log.emit_attention(
                             attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
                             message=_watch_needs_attention_message(task, no_progress_attention),
                         )
+                        if _suppress_pending_candidate_and_recompute(str(task.id)):
+                            break
                         continue
                     if _watch_task_has_live_registered_worker(config, str(task.id)):
                         continue
@@ -12689,6 +12858,7 @@ def _run_cycle(
                             start_message=_format_start_line(task),
                         )
                     )
+                    started_task_ids.add(str(task.id))
                     wave_fill_count += 1
                     continue
 
@@ -12710,6 +12880,8 @@ def _run_cycle(
                     subject_task=task,
                     action=pending_action,
                 ):
+                    if _suppress_pending_candidate_and_recompute(str(task.id)):
+                        break
                     continue
                 if _watch_task_has_live_registered_worker(config, str(task.id)):
                     continue
@@ -12729,12 +12901,16 @@ def _run_cycle(
                         subject_task=task,
                         action=pending_action,
                     )
+                    if _suppress_pending_candidate_and_recompute(str(task.id)):
+                        break
                     continue
                 if no_progress_attention is not None:
                     log.emit_attention(
                         attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
                         message=_watch_needs_attention_message(task, no_progress_attention),
                     )
+                    if _suppress_pending_candidate_and_recompute(str(task.id)):
+                        break
                     continue
                 if _watch_task_has_live_registered_worker(config, str(task.id)):
                     continue
@@ -12774,6 +12950,7 @@ def _run_cycle(
                         start_message=_format_start_line(task),
                     )
                 )
+                started_task_ids.add(str(task.id))
                 wave_fill_count += 1
             _settle_pending_dispatch_wave(deferred_pending_starts)
 

@@ -625,6 +625,14 @@ Each watch cycle MUST execute these phases in order:
    cycle. The dedupe identity for that quiet `SKIP` MUST include the task and its
    current hold-until time so a later meaningful edit that moves the quiet window causes
    exactly one new `SKIP`.
+   After stale-candidate and current-head validation, but before dry-run `START`
+   reporting, active-recovery-backoff checks, no-progress bookkeeping, launch-permit
+   acquisition, startup preparation, or worker spawn, watch MUST validate the refreshed
+   pending task's concrete provider/model execution route against the owning runtime's
+   current config. An invalid route MUST fail closed as an explicit non-dispatchable
+   result with an operator-visible reason and MUST NOT mutate the task row or persisted
+   watch-progress/backoff state. This ordering applies identically to `implement` and
+   non-`implement` pending candidates through the same pending-dispatch validation path.
 6. **Observe outcomes.** Emit operator-visible events for starts, merges, waits, skips,
    parked states, recovery decisions, and failures. Snapshot-based transition detection
    remains responsible for repaired or otherwise out-of-band merge transitions, but it
