@@ -146,7 +146,6 @@ LandingRebaseOutcomeKind = Literal[
     "resumed",
 ]
 LandTerminalState = Literal["merged", "empty", "redundant"]
-TerminalNoWorkState = Literal["empty", "redundant"]
 
 LANDING_PHASES: tuple[LandingPhaseName, ...] = (
     "resolve",
@@ -255,7 +254,7 @@ class LandBlocked:
         return f"Cannot land {task_id}: {self.fact}."
 
 
-TerminalReconciliation = TerminalNoWorkState | LandBlocked | None
+TerminalReconciliation = LandTerminalState | LandBlocked | None
 TerminalReconciler = Callable[[LandingStore, MergeUnit], TerminalReconciliation]
 
 
@@ -270,7 +269,7 @@ def _no_terminal_reconciliation(
 class LandingCollaborators:
     """Observable landing side-effect boundary.
 
-    Terminal resolution may query canonical merge truth and, for writable no-work
+    Terminal resolution may query canonical merge truth and, for writable terminal
     reconciliation, persist exactly one merge-unit state transition. Every other
     collaborator represents downstream landing activity that must remain untouched once
     a terminal result is known.
@@ -4954,7 +4953,7 @@ def _terminal_result_for_unit(
     )
 
 
-def _unit_with_state(unit: MergeUnit, state: TerminalNoWorkState) -> MergeUnit:
+def _unit_with_state(unit: MergeUnit, state: LandTerminalState) -> MergeUnit:
     return MergeUnit(
         id=unit.id,
         source_branch=unit.source_branch,
@@ -4965,9 +4964,9 @@ def _unit_with_state(unit: MergeUnit, state: TerminalNoWorkState) -> MergeUnit:
         base_sha=unit.base_sha,
         created_at=unit.created_at,
         updated_at=unit.updated_at,
-        merged_at=None,
-        merged_by_task_id=None,
-        merge_source=None,
+        merged_at=unit.merged_at,
+        merged_by_task_id=unit.merged_by_task_id,
+        merge_source=unit.merge_source,
         superseded_by_unit_id=unit.superseded_by_unit_id,
         pr_number=unit.pr_number,
         pr_state=unit.pr_state,
@@ -5024,8 +5023,8 @@ def reconcile_terminal_merge_truth(git: Git) -> TerminalReconciler:
                 fact=f"canonical merge-truth proof failed for merge unit {unit.id}: {exc}",
                 evidence_refs=(unit.id,),
             )
-        if classification.state in {"empty", "redundant"}:
-            return cast(TerminalNoWorkState, classification.state)
+        if classification.state in MERGE_UNIT_LANDED_OR_NO_WORK_STATES:
+            return cast(LandTerminalState, classification.state)
         if classification.state == "unknown":
             detail = warnings[0] if warnings else classification.reason
             return LandBlocked(

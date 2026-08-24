@@ -1005,16 +1005,17 @@ first handle the complete terminal-state branch before testing ordinary unmerged
 eligibility. The reconciliation boundary is explicit: if the active unit is already
 `merged`, `empty`, or `redundant`, writable and dry-run `land` MUST return that known
 terminal result without mutating merge state or running downstream landing activity. If
-canonical writable reconciliation of an active `unmerged` unit proves terminal no-work,
-it MAY persist exactly one merge-state transition from `unmerged` to `empty` or
-`redundant`; after that write, the known terminal result MUST be returned and all later
-landing activity in the invocation is prohibited. Dry-run MUST remain query-only and
-MUST NOT perform the reconciliation mutation, even when the query result proves
-`empty` or `redundant`. Once a terminal result is known, `land` MUST NOT rebase, run a
+canonical writable reconciliation of an active `unmerged` unit proves one of those three
+terminal states, it MAY persist exactly one merge-state transition from `unmerged` to the
+proven state; after that write, the authoritative row MUST be refreshed, the known
+terminal result MUST be returned, and all later landing activity in the invocation is
+prohibited. Dry-run MUST remain query-only and MUST NOT perform the reconciliation
+mutation, even when the query result proves `merged`, `empty`, or `redundant`. Once a
+terminal result is known, `land` MUST NOT rebase, run a
 provider, run source verify, refresh post-merge target verify, run spec-coherence
 review, run code or resolution review, run a landing judgment, create or reuse
 follow-up/deferred tasks, materialize artifacts, mark merged, perform a git merge, or
-perform any merge-state mutation beyond the single allowed writable no-work
+perform any merge-state mutation beyond the single allowed writable terminal
 reconciliation. The three terminal results are distinct: `merged` reports
 already-landed success, while `empty` and `redundant` report terminal no-work success and
 MUST NOT be described as landed, merged, or marked merged. Only after this terminal
