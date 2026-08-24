@@ -193,13 +193,10 @@ def _manual_merge_args(
     no_followups: bool = False,
 ) -> argparse.Namespace:
     return argparse.Namespace(
-        rebase=False,
         squash=False,
         delete=False,
         mark_only=False,
         force=force,
-        remote=False,
-        resolve=False,
         defer_blockers=defer_blockers,
         no_followups=no_followups,
     )
@@ -554,7 +551,7 @@ def test_merge_single_task_preflights_conflicts_before_merge(tmp_path, capsys) -
     git.merge.assert_not_called()
     output = capsys.readouterr().out
     assert "has conflicts against 'main'" in output
-    assert f"uv run gza rebase {task.id} --resolve" in output
+    assert f"uv run gza rebase {task.id} --run" in output
 
 
 def test_merge_single_task_does_not_classify_generic_merge_failure_as_conflict(tmp_path, capsys) -> None:
@@ -1568,55 +1565,6 @@ def test_merge_single_task_merge_failure_output_names_subject_task(
     assert f"Error during merge {subject}: {git_error}" in output
     assert f"Aborting merge {subject} and restoring clean state..." in output
     assert f"Warning: Could not abort merge {subject}: {abort_error}" in output
-
-
-def test_merge_single_task_removed_rebase_option_fails_before_git_work(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    task = store.add("Implement rebase failure output", task_type="implement")
-    assert task.id is not None
-    task.status = "completed"
-    task.completed_at = datetime.now(UTC)
-    task.branch = "feature/rebase-failure-output"
-    task.has_commits = True
-    task.merge_status = "unmerged"
-    store.update(task)
-
-    git = SimpleNamespace(
-        repo_dir=tmp_path,
-        branch_exists=MagicMock(return_value=True),
-        is_merged=MagicMock(return_value=False),
-        default_branch=MagicMock(return_value="main"),
-        has_changes=MagicMock(return_value=False),
-        can_merge=MagicMock(return_value=True),
-        rebase=MagicMock(),
-        rebase_abort=MagicMock(),
-        checkout=MagicMock(),
-        merge=MagicMock(),
-    )
-    args = argparse.Namespace(
-        rebase=True,
-        squash=False,
-        delete=False,
-        mark_only=False,
-        remote=False,
-        resolve=False,
-    )
-    config = Config.load(tmp_path)
-
-    with _force_merge_planner_action():
-        result = _merge_single_task(task.id, config, store, git, args, "main")
-
-    assert result.rc == 1
-    output = capsys.readouterr().out
-    assert "removed merge option(s) --rebase" in output
-    assert "gza rebase <task-id> --run" in output
-    git.checkout.assert_not_called()
-    git.rebase.assert_not_called()
-    git.merge.assert_not_called()
 
 
 def test_merge_single_task_quiet_mechanics_suppresses_default_success_output(
@@ -2786,85 +2734,6 @@ def test_merge_single_task_defer_blockers_prints_created_task_before_conflict_re
     assert output.count(f"DEFERRED-BLOCKER {blockers[0].id} created from {owner.id}") == 1
     assert f"DEFERRED-BLOCKER {blockers[0].id} reused from {owner.id}" not in output
     assert "has conflicts against 'main' and cannot be merged cleanly" in output
-
-
-def test_merge_single_task_defer_blockers_prints_reused_task_before_invalid_flag_refusal(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    setup_config(tmp_path)
-    store = make_store(tmp_path)
-    owner, representative, review = _add_same_merge_unit_owner_representative_with_review(
-        tmp_path,
-        store,
-        review_content=_changes_requested_review_with_blocker(
-            title="Missing data migration",
-            evidence="The representative branch adds a new column without a migration.",
-            required_fix="add the migration and backfill path.",
-        ),
-    )
-    config = Config.load(tmp_path)
-    deferred_task, created_now = _create_or_reuse_deferred_blocker_tasks(
-        store,
-        config=config,
-        review_task=review,
-        impl_task=owner,
-        findings=(
-            ReviewFinding(
-                id="B1",
-                severity="BLOCKER",
-                title="Missing data migration",
-                body="Evidence: The representative branch adds a new column without a migration.\n"
-                "Required fix: add the migration and backfill path.",
-                evidence="The representative branch adds a new column without a migration.",
-                impact="merge should stay blocked until handled.",
-                fix_or_followup="add the migration and backfill path.",
-                tests="add focused coverage.",
-                open_state_citation=None,
-            ),
-        ),
-        trigger_source="manual",
-    )
-    assert len(deferred_task) == 1
-    assert created_now == []
-
-    git = SimpleNamespace(
-        repo_dir=tmp_path,
-        branch_exists=MagicMock(return_value=True),
-        is_merged=MagicMock(return_value=False),
-        default_branch=MagicMock(return_value="main"),
-        has_changes=MagicMock(return_value=False),
-        can_merge=MagicMock(return_value=True),
-        merge=MagicMock(),
-    )
-    args = argparse.Namespace(
-        rebase=True,
-        squash=True,
-        delete=False,
-        mark_only=False,
-        force=False,
-        remote=False,
-        resolve=False,
-        defer_blockers=True,
-        no_followups=False,
-    )
-
-    with patch(
-        "gza.cli.git_ops.determine_next_action",
-        return_value={
-            "type": "improve",
-            "description": "Create improve task (review CHANGES_REQUESTED)",
-            "improve_reason": "review_changes_requested",
-            "review_task": review,
-        },
-    ):
-        result = _merge_single_task(representative.id, config, store, git, args, "main")
-
-    assert result.rc == 1
-    git.merge.assert_not_called()
-    output = capsys.readouterr().out
-    assert f"DEFERRED-BLOCKER {deferred_task[0].id}" not in output
-    assert "removed merge option(s) --rebase" in output
 
 
 def test_merge_single_task_defer_blockers_refuses_ambiguous_changes_requested_gate(

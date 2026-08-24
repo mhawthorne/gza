@@ -478,7 +478,7 @@ def check_manual_merge_preflight(
             message=(
                 f"Error: Branch '{merge_source_ref}' has conflicts against '{merge_preflight_target}' "
                 "and cannot be merged cleanly.\n"
-                f"Run: uv run gza rebase {merge_subject.id} --resolve\n"
+                f"Run: uv run gza rebase {merge_subject.id} --run\n"
                 f"Or preview the lifecycle action with: uv run gza advance {merge_subject.id} --dry-run"
             ),
             block_reason=f"branch '{merge_source_ref}' conflicts against '{merge_preflight_target}'",

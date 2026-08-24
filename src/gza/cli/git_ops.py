@@ -1479,17 +1479,6 @@ def _resolve_merge_subject_query_only(
 
 
 def _merge_option_relationship_error(args: argparse.Namespace) -> str | None:
-    removed_flags = [
-        flag
-        for flag in ("rebase", "remote", "resolve")
-        if bool(getattr(args, flag, False))
-    ]
-    if removed_flags:
-        rendered = ", ".join(f"--{flag}" for flag in removed_flags)
-        return (
-            f"Error: removed merge option(s) {rendered}; use `gza rebase <task-id> --run` "
-            "for standalone rebases or `gza land <task-id>` for full landing orchestration"
-        )
     if getattr(args, "ignore_verify_gate", False) and not getattr(args, "force", False):
         return "Error: --ignore-verify-gate requires --force"
     return None

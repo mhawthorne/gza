@@ -128,7 +128,7 @@ If an open (pending / in-flight) task already cites it, recommend **"tracked by 
 Action recipes by classification:
 
 - **moot — propose drop**: recommend `uv run gza set-status <leaf-id> dropped --reason "<short reason>"` for each dead leaf. Multiple drops = multiple commands. Don't drop the owner.
-- **manual rebase resolution** (`needs_rebase`): recommend the user run `uv run gza rebase --resolve <task-id>` themselves. Do not run it from this skill.
+- **manual rebase resolution** (`needs_rebase`): recommend the user run `uv run gza rebase <task-id> --run` themselves. Do not run it from this skill.
 - **failed rebase** (`needs_discussion / rebase-failed-needs-manual-resolution`): in Step 3 you already checked the target. If target is merged, treat as "moot — propose drop" of the failed rebase. Otherwise recommend manual resolution and surface the conflict details from `gza log` if helpful.
 - **review/improve churn** (`max_cycles_reached`): recommend `/gza-task-fix <implementation-task-id>` — the slash command, not a Bash invocation. Surface the latest review's blockers section from `review_verdict` so the user has context.
 - **failed-task recovery fix handoff**: first confirm the merge-unit owner implementation actually completed. If it never completed (`failed`, `dropped`, etc.), do not recommend `fix`; explicitly tell the user it never completed and recommend retrying or re-implementing instead. If it did complete, inspect the terminal failed task's `Failure Reason:`. Retryable infra deaths (`WORKER_DIED`, `INFRASTRUCTURE_ERROR`, `PROVIDER_UNAVAILABLE`, `PROVIDER_EMPTY_TURN`, `RETRYABLE_PROVIDER_ERROR`, `WORKSPACE_NOT_POPULATED`, `NO_ACTIVITY`) parked as `retry-limit-reached` or `retryable-provider-error` should be re-armed, not hand-rescued: recommend `uv run gza unstick <merge-unit-owner-id> --reason retry-limit --run`. Non-retryable/manual completed-implementation churn still gets `uv run gza fix <merge-unit-owner-id>`. Treat any `manual-review-required` wording as a legacy/non-recovery alias only; the current recovery slugs are `automatic-recovery-disabled`, `retry-limit-reached`, `retryable-provider-error`, `recovery-ambiguous`, `manual-failure-reason`, and `newer-recovery-descendant-needs-attention`.
@@ -168,6 +168,6 @@ The summary is for the user's audit log — they should be able to read it and k
 - Real review/improve churn that needs code → `/gza-task-fix`
 - Per-task root-cause analysis (loop detection, baseline comparison) → `/gza-task-debug`
 - Resuming a specific task → user runs `gza resume <id>` themselves
-- Manual rebase conflict resolution → user runs `gza rebase --resolve <id>` themselves
+- Manual rebase conflict resolution → user runs `gza rebase <id> --run` themselves
 
 This skill is the dispatch layer, not the worker.
