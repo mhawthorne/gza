@@ -32377,6 +32377,202 @@ def test_watch_cycle_pending_live_worker_emits_single_start_line(tmp_path: Path)
     assert start_lines[0].endswith(f'{pending.id} plan "Pending plan launch"')
 
 
+def _legacy_pending_live_proof_run_cycle(
+    *,
+    store: SqliteTaskStore,
+    config: Config,
+    pending: DbTask,
+    log: _WatchLog,
+) -> _CycleResult:
+    def build_preview(*_args: object, **kwargs: object) -> DispatchPreview:
+        include_recovery = bool(kwargs.get("include_recovery", False))
+        assert include_recovery is False
+        return DispatchPreview(
+            entries=(
+                DispatchPreviewEntry(
+                    lane="pending",
+                    task=pending,
+                    runnable=True,
+                    worker_consuming=True,
+                ),
+            )
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=build_preview),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=AssertionError("settled")),
+    ):
+        return _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+
+@pytest.mark.parametrize(
+    "task_type,spawn_patch",
+    [("implement", "_spawn_background_iterate"), ("plan", "_spawn_background_worker")],
+)
+def test_run_cycle_pending_dispatch_refreshes_live_proof_before_no_progress_mutation(
+    tmp_path: Path,
+    task_type: str,
+    spawn_patch: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pending = store.add(f"Pending {task_type} gains live proof before no-progress", task_type=task_type)
+    assert pending.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+
+    def backoff_then_register_live_worker(*_args: object, **_kwargs: object) -> bool:
+        _register_live_worker_for_task(config, pending.id)
+        return False
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", side_effect=backoff_then_register_live_worker),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", side_effect=AssertionError("no-progress mutated")),
+        patch("gza.cli.watch.launch_permit", side_effect=AssertionError("permit acquired")),
+        patch(f"gza.cli.watch.{spawn_patch}", side_effect=AssertionError("worker spawned")),
+    ):
+        result = _legacy_pending_live_proof_run_cycle(
+            store=store,
+            config=config,
+            pending=pending,
+            log=log,
+        )
+
+    assert result.work_done is False
+    assert store.get(pending.id).status == "pending"
+    assert store.list_watch_progress_observations(subject_kind="task", subject_id=pending.id) == []
+    assert "START " not in (tmp_path / ".gza" / "watch.log").read_text()
+
+
+def test_run_cycle_pending_implement_releases_permit_when_live_proof_appears_after_acquire(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pending = store.add("Pending implement gains live proof after permit", task_type="implement")
+    assert pending.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    permit = _RuntimeDispatchPermit()
+
+    def acquire_then_register_live_worker(
+        acquired_config: Config,
+        acquired_store: SqliteTaskStore,
+    ) -> _RuntimeDispatchPermit:
+        assert acquired_config is config
+        assert acquired_store is store
+        _register_live_worker_for_task(config, pending.id)
+        return permit
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None) as no_progress,
+        patch("gza.cli.watch.launch_permit", side_effect=acquire_then_register_live_worker) as acquire_permit,
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=AssertionError("task prepared")),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate spawned")),
+    ):
+        result = _legacy_pending_live_proof_run_cycle(
+            store=store,
+            config=config,
+            pending=pending,
+            log=log,
+        )
+
+    assert result.work_done is False
+    assert acquire_permit.call_count == 1
+    assert no_progress.call_count == 1
+    assert permit.released is True
+    assert store.get(pending.id).status == "pending"
+    assert "START " not in (tmp_path / ".gza" / "watch.log").read_text()
+
+
+def test_run_cycle_pending_implement_releases_prepared_reservation_when_live_proof_appears_before_spawn(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pending = store.add("Pending implement gains live proof after preparation", task_type="implement")
+    assert pending.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    permit = _RuntimeDispatchPermit()
+    release_reserved_task = watch_module.release_task_launch_permit
+
+    def prepare_then_register_live_worker(_config: Config, task: DbTask, **_kwargs: object) -> DbTask:
+        _register_live_worker_for_task(config, pending.id)
+        return task
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.launch_permit", return_value=permit),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=prepare_then_register_live_worker),
+        patch("gza.cli.watch.release_task_launch_permit", wraps=release_reserved_task) as release_reserved,
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate spawned")),
+    ):
+        result = _legacy_pending_live_proof_run_cycle(
+            store=store,
+            config=config,
+            pending=pending,
+            log=log,
+        )
+
+    assert result.work_done is False
+    release_reserved.assert_called_once_with(pending.id)
+    assert permit.released is True
+    assert store.get(pending.id).status == "pending"
+    assert "START " not in (tmp_path / ".gza" / "watch.log").read_text()
+
+
+def test_run_cycle_pending_non_implement_rechecks_live_proof_after_snapshot_before_spawn(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pending = store.add("Pending plan gains live proof before worker spawn", task_type="plan")
+    assert pending.id is not None
+
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    original_snapshot = watch_module._snapshot_watch_dispatch_task
+
+    def snapshot_then_register_live_worker(task: object | None) -> object | None:
+        snapshot = original_snapshot(task)
+        _register_live_worker_for_task(config, pending.id)
+        return snapshot
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.launch_permit", side_effect=AssertionError("permit acquired")),
+        patch("gza.cli.watch._snapshot_watch_dispatch_task", side_effect=snapshot_then_register_live_worker),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+    ):
+        result = _legacy_pending_live_proof_run_cycle(
+            store=store,
+            config=config,
+            pending=pending,
+            log=log,
+        )
+
+    assert result.work_done is False
+    assert store.get(pending.id).status == "pending"
+    assert "START " not in (tmp_path / ".gza" / "watch.log").read_text()
+
+
 class _RuntimeDispatchPermit:
     def __init__(self) -> None:
         self.released = False
