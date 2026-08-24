@@ -5,6 +5,7 @@ from __future__ import annotations
 from gza.landing import (
     LandBlocked,
     LandBlockedReasonCode,
+    LandingFollowupFinding,
     LandingJudge,
     LandingJudgeVerdict,
     LandingJudgment,
@@ -20,6 +21,7 @@ from gza.landing import (
 __all__ = [
     "LandBlocked",
     "LandBlockedReasonCode",
+    "LandingFollowupFinding",
     "LandingJudge",
     "LandingJudgment",
     "LandingJudgeVerdict",

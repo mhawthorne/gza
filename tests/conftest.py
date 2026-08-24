@@ -303,6 +303,12 @@ def _isolate_home_dir(tmp_path: Path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_shared_db_env(monkeypatch):
+    """Keep ambient shared-DB overrides out of temporary project tests."""
+    monkeypatch.delenv("GZA_DB_PATH", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_rich_console(monkeypatch):
     """Pin Rich console color and width so test assertions are deterministic.
 

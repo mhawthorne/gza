@@ -7,6 +7,8 @@ import pytest
 
 from gza.landing import (
     LANDING_PHASES,
+    LandingFollowupFinding,
+    LandingFollowupMaterializationIdentity,
     LandingOpenBlocker,
     LandingJudgment,
     LandingJudgeVerdict,
@@ -295,6 +297,298 @@ def test_landing_policy_preserves_non_escalated_review_disabled_path() -> None:
     assert blocked.blocked.reason_code == "policy-or-judge-refused"
 
 
+def test_review_disabled_approved_with_followups_without_findings_is_not_merge_permitting() -> None:
+    decision = evaluate_landing_policy(
+        policy="guarded",
+        facts=_green_facts(review=_review(required=False, verdict="APPROVED_WITH_FOLLOWUPS")),
+    )
+
+    assert decision.allowed is False
+    assert decision.blocked is not None
+    assert decision.blocked.reason_code == "required-review-unavailable"
+    assert "approved-with-followups review has no valid follow-up" in decision.blocked.fact
+    assert decision.followup_materialization_identities == ()
+
+
+def test_review_disabled_approved_with_malformed_followup_identity_is_not_merge_permitting() -> None:
+    decision = evaluate_landing_policy(
+        policy="guarded",
+        facts=_green_facts(
+            review=_review(
+                required=False,
+                verdict="APPROVED_WITH_FOLLOWUPS",
+                followup_findings=(
+                    LandingFollowupFinding("F1", fingerprint="followup:f1", source=None),
+                ),
+            )
+        ),
+    )
+
+    assert decision.allowed is False
+    assert decision.blocked is not None
+    assert decision.blocked.reason_code == "required-review-unavailable"
+    assert decision.followup_materialization_identities == ()
+
+
+def test_review_disabled_approved_with_followups_is_not_merge_permitting() -> None:
+    decision = evaluate_landing_policy(
+        policy="guarded",
+        facts=_green_facts(
+            review=_review(
+                required=False,
+                verdict="APPROVED",
+                followup_findings=(
+                    LandingFollowupFinding("F1", fingerprint="followup:f1", source="review:gza-200"),
+                ),
+            )
+        ),
+    )
+
+    assert decision.allowed is False
+    assert decision.blocked is not None
+    assert decision.blocked.reason_code == "required-review-unavailable"
+    assert "approved review contradicts parsed follow-up" in decision.blocked.fact
+
+
+def test_review_disabled_approved_with_followups_preserves_exact_identities_and_fingerprint() -> None:
+    facts_without_followups = _green_facts(review=_review(required=False))
+    facts_with_followups = _green_facts(
+        review=_review(
+            required=False,
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            followup_findings=(
+                LandingFollowupFinding("F2", fingerprint="followup:b", source="review:gza-200"),
+                LandingFollowupFinding("F1", fingerprint="followup:a", source="review:gza-200"),
+            ),
+        )
+    )
+
+    decision = evaluate_landing_policy(policy="guarded", facts=facts_with_followups)
+
+    assert decision.allowed is True
+    assert decision.blocked is None
+    assert decision.followup_materialization_identities == (
+        LandingFollowupMaterializationIdentity(
+            review_id="gza-200",
+            source="review:gza-200",
+            finding_id="F1",
+            fingerprint="followup:a",
+        ),
+        LandingFollowupMaterializationIdentity(
+            review_id="gza-200",
+            source="review:gza-200",
+            finding_id="F2",
+            fingerprint="followup:b",
+        ),
+    )
+    assert LandingStateFingerprint.from_facts(facts_with_followups) != LandingStateFingerprint.from_facts(
+        facts_without_followups
+    )
+
+
+def test_approved_with_followups_without_followup_evidence_is_not_merge_permitting() -> None:
+    decision = evaluate_landing_policy(
+        policy="guarded",
+        facts=_green_facts(review=_review(verdict="APPROVED_WITH_FOLLOWUPS")),
+    )
+
+    assert decision.allowed is False
+    assert decision.blocked is not None
+    assert decision.blocked.reason_code == "required-review-unavailable"
+    assert "approved-with-followups review has no valid follow-up" in decision.blocked.fact
+
+
+def test_approved_with_followups_with_valid_followup_evidence_is_merge_permitting() -> None:
+    decision = evaluate_landing_policy(
+        policy="guarded",
+        facts=_green_facts(
+            review=_review(
+                verdict="APPROVED_WITH_FOLLOWUPS",
+                followup_findings=(
+                    LandingFollowupFinding("F1", fingerprint="followup:f1", source="review:gza-200"),
+                ),
+            )
+        ),
+    )
+
+    assert decision.allowed is True
+    assert decision.blocked is None
+    assert decision.followup_materialization_identities == (
+        LandingFollowupMaterializationIdentity(
+            review_id="gza-200",
+            source="review:gza-200",
+            finding_id="F1",
+            fingerprint="followup:f1",
+        ),
+    )
+
+
+def test_approved_with_followups_exposes_multiple_exact_materialization_identities() -> None:
+    decision = evaluate_landing_policy(
+        policy="guarded",
+        facts=_green_facts(
+            review=_review(
+                verdict="APPROVED_WITH_FOLLOWUPS",
+                followup_findings=(
+                    LandingFollowupFinding("F2", fingerprint="same-content", source="review:gza-200"),
+                    LandingFollowupFinding("F1", fingerprint="same-content", source="review:gza-200"),
+                ),
+            )
+        ),
+    )
+
+    assert decision.allowed is True
+    assert decision.followup_materialization_identities == (
+        LandingFollowupMaterializationIdentity(
+            review_id="gza-200",
+            source="review:gza-200",
+            finding_id="F1",
+            fingerprint="same-content",
+        ),
+        LandingFollowupMaterializationIdentity(
+            review_id="gza-200",
+            source="review:gza-200",
+            finding_id="F2",
+            fingerprint="same-content",
+        ),
+    )
+
+
+def test_approved_with_followups_without_review_identity_is_not_merge_permitting() -> None:
+    decision = evaluate_landing_policy(
+        policy="guarded",
+        facts=_green_facts(
+            review=_review(
+                verdict="APPROVED_WITH_FOLLOWUPS",
+                review_id=None,
+                followup_findings=(
+                    LandingFollowupFinding("F1", fingerprint="followup:f1", source="review:gza-200"),
+                ),
+            )
+        ),
+    )
+
+    assert decision.allowed is False
+    assert decision.blocked is not None
+    assert decision.blocked.reason_code == "required-review-unavailable"
+
+
+@pytest.mark.parametrize(
+    "review",
+    (
+        _review(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            review_id="   ",
+            followup_findings=(LandingFollowupFinding("F1", fingerprint="followup:f1", source="review:gza-200"),),
+        ),
+        _review(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            followup_findings=(LandingFollowupFinding("F1", fingerprint="followup:f1", source=None),),
+        ),
+        _review(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            followup_findings=(LandingFollowupFinding("F1", fingerprint="followup:f1", source="   "),),
+        ),
+        _review(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            followup_findings=(LandingFollowupFinding("   ", fingerprint="followup:f1", source="review:gza-200"),),
+        ),
+        _review(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            followup_findings=(LandingFollowupFinding("F1", fingerprint=None, source="review:gza-200"),),
+        ),
+        _review(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            followup_findings=(LandingFollowupFinding("F1", fingerprint="   ", source="review:gza-200"),),
+        ),
+    ),
+)
+def test_approved_with_followups_with_malformed_identity_is_typed_refusal(
+    review: LandingReviewEvidence,
+) -> None:
+    decision = evaluate_landing_policy(
+        policy="guarded",
+        facts=_green_facts(review=review),
+    )
+
+    assert decision.allowed is False
+    assert decision.blocked is not None
+    assert decision.blocked.reason_code == "required-review-unavailable"
+
+
+def test_followup_identity_canonicalizes_normalization_equivalent_inputs() -> None:
+    decision_a = evaluate_landing_policy(
+        policy="guarded",
+        facts=_green_facts(
+            review=_review(
+                review_id=" gza-200 ",
+                verdict="APPROVED_WITH_FOLLOWUPS",
+                followup_findings=(
+                    LandingFollowupFinding(" F1 ", fingerprint=" followup:f1 ", source=" review:gza-200 "),
+                ),
+            )
+        ),
+    )
+    decision_b = evaluate_landing_policy(
+        policy="guarded",
+        facts=_green_facts(
+            review=_review(
+                review_id="gza-200",
+                verdict="APPROVED_WITH_FOLLOWUPS",
+                followup_findings=(
+                    LandingFollowupFinding("F1", fingerprint="followup:f1", source="review:gza-200"),
+                ),
+            )
+        ),
+    )
+
+    assert decision_a.allowed is True
+    assert decision_a.followup_materialization_identities == decision_b.followup_materialization_identities
+
+
+def test_approved_with_followups_with_duplicate_durable_finding_ids_is_not_merge_permitting() -> None:
+    for followups in (
+        (
+            LandingFollowupFinding("F1", fingerprint="followup:a", source="review:gza-200"),
+            LandingFollowupFinding("F1", fingerprint="followup:b", source="review:gza-200"),
+        ),
+        (
+            LandingFollowupFinding("F1", fingerprint="followup:a", source="source:a"),
+            LandingFollowupFinding("F1", fingerprint="followup:b", source="source:b"),
+        ),
+    ):
+        decision = evaluate_landing_policy(
+            policy="guarded",
+            facts=_green_facts(
+                review=_review(
+                    verdict="APPROVED_WITH_FOLLOWUPS",
+                    followup_findings=followups,
+                )
+            ),
+        )
+
+        assert decision.allowed is False
+        assert decision.blocked is not None
+        assert decision.blocked.reason_code == "required-review-unavailable"
+
+
+def test_approved_with_followup_evidence_is_rejected_as_inconsistent() -> None:
+    decision = evaluate_landing_policy(
+        policy="guarded",
+        facts=_green_facts(
+            review=_review(
+                verdict="APPROVED",
+                followup_findings=(LandingFollowupFinding("F1", fingerprint="followup:f1", source="review:gza-200"),),
+            )
+        ),
+    )
+
+    assert decision.allowed is False
+    assert decision.blocked is not None
+    assert decision.blocked.reason_code == "required-review-unavailable"
+    assert "approved review contradicts parsed follow-up" in decision.blocked.fact
+
+
 def test_guarded_allows_exact_review_churn_park_and_deferred_blocker_override() -> None:
     decision = evaluate_landing_policy(
         policy="guarded",
@@ -313,6 +607,110 @@ def test_guarded_allows_exact_review_churn_park_and_deferred_blocker_override() 
         "parked:review-max-cycles-reached",
     )
     assert decision.judgment_verdict == "LAND"
+
+
+def test_guarded_changes_requested_preserves_judgment_and_followup_identities() -> None:
+    decision = evaluate_landing_policy(
+        policy="guarded",
+        facts=_green_facts(
+            parked_reason="review-max-cycles-reached",
+            review=_review(
+                verdict="CHANGES_REQUESTED",
+                followup_findings=(
+                    LandingFollowupFinding("F2", fingerprint="followup:b", source="review:gza-200"),
+                    LandingFollowupFinding("F1", fingerprint="followup:a", source="review:gza-200"),
+                ),
+            ),
+            open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope"),),
+        ),
+        judge=_landing_judgment,
+    )
+
+    assert decision.allowed is True
+    assert decision.blocked is None
+    assert decision.allowed_overrides == (
+        "defer-review-blockers",
+        "parked:review-max-cycles-reached",
+    )
+    assert decision.judgment_verdict == "LAND"
+    assert decision.judgment_artifact_id == "judge-artifact"
+    assert decision.judgment_key == "judge-key"
+    assert decision.followup_materialization_identities == (
+        LandingFollowupMaterializationIdentity(
+            review_id="gza-200",
+            source="review:gza-200",
+            finding_id="F1",
+            fingerprint="followup:a",
+        ),
+        LandingFollowupMaterializationIdentity(
+            review_id="gza-200",
+            source="review:gza-200",
+            finding_id="F2",
+            fingerprint="followup:b",
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "review",
+    (
+        _review(
+            verdict="CHANGES_REQUESTED",
+            followup_findings=(LandingFollowupFinding("F1", fingerprint="followup:f1", source=None),),
+        ),
+        _review(
+            verdict="CHANGES_REQUESTED",
+            followup_findings=(LandingFollowupFinding("F1", fingerprint="followup:f1", source="   "),),
+        ),
+        _review(
+            verdict="CHANGES_REQUESTED",
+            followup_findings=(LandingFollowupFinding("F1", fingerprint=None, source="review:gza-200"),),
+        ),
+        _review(
+            verdict="CHANGES_REQUESTED",
+            followup_findings=(LandingFollowupFinding("F1", fingerprint="   ", source="review:gza-200"),),
+        ),
+        _review(
+            verdict="CHANGES_REQUESTED",
+            followup_findings=(LandingFollowupFinding("   ", fingerprint="followup:f1", source="review:gza-200"),),
+        ),
+        _review(
+            verdict="CHANGES_REQUESTED",
+            review_id=None,
+            followup_findings=(LandingFollowupFinding("F1", fingerprint="followup:f1", source="review:gza-200"),),
+        ),
+        _review(
+            verdict="CHANGES_REQUESTED",
+            followup_findings=(
+                LandingFollowupFinding("F1", fingerprint="followup:a", source="review:gza-200"),
+                LandingFollowupFinding("F1", fingerprint="followup:b", source="review:gza-200"),
+            ),
+        ),
+    ),
+)
+def test_guarded_changes_requested_with_malformed_followups_refuses_before_judge(
+    review: LandingReviewEvidence,
+) -> None:
+    calls: list[str] = []
+
+    decision = evaluate_landing_policy(
+        policy="guarded",
+        facts=_green_facts(
+            parked_reason="review-max-cycles-reached",
+            review=review,
+            open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope"),),
+        ),
+        judge=_recording_judge(calls, "LAND"),
+    )
+
+    assert decision.allowed is False
+    assert decision.blocked is not None
+    assert decision.blocked.reason_code == "required-review-unavailable"
+    assert calls == []
+    assert decision.judgment_verdict is None
+    assert decision.judgment_artifact_id is None
+    assert decision.judgment_key is None
+    assert decision.followup_materialization_identities == ()
 
 
 @pytest.mark.parametrize(
@@ -1017,6 +1415,128 @@ def test_landing_state_fingerprint_changes_when_same_finding_id_has_new_blocker_
     assert fingerprint_a != fingerprint_b
     assert fingerprint_a.blocker_fingerprints == ("normalized:old-evidence",)
     assert fingerprint_b.blocker_fingerprints == ("normalized:new-evidence",)
+
+
+def test_landing_state_fingerprint_includes_followup_finding_identities() -> None:
+    facts_a = _green_facts(
+        review=_review(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            followup_findings=(
+                LandingFollowupFinding("F2", fingerprint="followup:b", source="review:gza-200"),
+                LandingFollowupFinding("F1", fingerprint="followup:a", source="review:gza-200"),
+            ),
+        )
+    )
+    facts_b = _green_facts(
+        review=_review(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            followup_findings=(
+                LandingFollowupFinding("F1", fingerprint="followup:a", source="review:gza-200"),
+                LandingFollowupFinding("F2", fingerprint="followup:b", source="review:gza-200"),
+            ),
+        )
+    )
+    facts_c = _green_facts(
+        review=_review(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            followup_findings=(
+                LandingFollowupFinding("F1", fingerprint="followup:a", source="review:gza-200"),
+                LandingFollowupFinding("F3", fingerprint="followup:c", source="review:gza-200"),
+            ),
+        )
+    )
+    facts_d = _green_facts(
+        review=_review(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            followup_findings=(
+                LandingFollowupFinding("F1", fingerprint="followup:a", source="source:a"),
+                LandingFollowupFinding("F2", fingerprint="followup:b", source="review:gza-200"),
+            ),
+        )
+    )
+    facts_e = _green_facts(
+        review=_review(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            followup_findings=(
+                LandingFollowupFinding("F1", fingerprint="followup:z", source="review:gza-200"),
+                LandingFollowupFinding("F2", fingerprint="followup:b", source="review:gza-200"),
+            ),
+        )
+    )
+
+    fingerprint_a = LandingStateFingerprint.from_facts(facts_a)
+    fingerprint_b = LandingStateFingerprint.from_facts(facts_b)
+    fingerprint_c = LandingStateFingerprint.from_facts(facts_c)
+    fingerprint_d = LandingStateFingerprint.from_facts(facts_d)
+    fingerprint_e = LandingStateFingerprint.from_facts(facts_e)
+
+    assert fingerprint_a == fingerprint_b
+    assert fingerprint_a.review.followup_fingerprints == (
+        '{"content":"followup:a","finding":"F1","review":"gza-200","source":"review:gza-200"}',
+        '{"content":"followup:b","finding":"F2","review":"gza-200","source":"review:gza-200"}',
+    )
+    assert fingerprint_a != fingerprint_c
+    assert fingerprint_a != fingerprint_d
+    assert fingerprint_a != fingerprint_e
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("review_id", "gza-201"),
+        ("source", "review:gza-201"),
+        ("finding_id", "F2"),
+        ("fingerprint", "followup:f2"),
+    ),
+)
+def test_followup_identity_changes_materialization_inputs_and_landing_fingerprint(
+    field: str,
+    replacement: str,
+) -> None:
+    base_review = {
+        "review_id": "gza-200",
+        "verdict": "APPROVED_WITH_FOLLOWUPS",
+        "followup_findings": (
+            LandingFollowupFinding("F1", fingerprint="followup:f1", source="review:gza-200"),
+        ),
+    }
+    changed_review = dict(base_review)
+    if field == "review_id":
+        changed_review["review_id"] = replacement
+    else:
+        changed_review["followup_findings"] = (
+            LandingFollowupFinding(
+                replacement if field == "finding_id" else "F1",
+                fingerprint=replacement if field == "fingerprint" else "followup:f1",
+                source=replacement if field == "source" else "review:gza-200",
+            ),
+        )
+    facts_a = _green_facts(review=_review(**base_review))
+    facts_b = _green_facts(review=_review(**changed_review))
+    decision_a = evaluate_landing_policy(policy="guarded", facts=facts_a)
+    decision_b = evaluate_landing_policy(policy="guarded", facts=facts_b)
+
+    assert decision_a.allowed is True
+    assert decision_b.allowed is True
+    assert decision_a.followup_materialization_identities != decision_b.followup_materialization_identities
+    assert LandingStateFingerprint.from_facts(facts_a) != LandingStateFingerprint.from_facts(facts_b)
+
+
+def test_delimiter_bearing_followup_identities_do_not_collide() -> None:
+    identity_a = LandingFollowupMaterializationIdentity(
+        review_id="a|source=b",
+        source="c",
+        finding_id="d",
+        fingerprint="e",
+    )
+    identity_b = LandingFollowupMaterializationIdentity(
+        review_id="a",
+        source="source=b|finding=c",
+        finding_id="d",
+        fingerprint="e",
+    )
+
+    assert identity_a.fingerprint_key != identity_b.fingerprint_key
 
 
 @pytest.mark.parametrize(

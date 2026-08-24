@@ -33,3 +33,9 @@ def _isolate_home_dir(tmp_path: Path, monkeypatch):
     home_dir = tmp_path / ".isolated-home"
     home_dir.mkdir()
     monkeypatch.setenv("HOME", str(home_dir))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_shared_db_env(monkeypatch):
+    """Keep ambient shared-DB overrides out of temporary project tests."""
+    monkeypatch.delenv("GZA_DB_PATH", raising=False)

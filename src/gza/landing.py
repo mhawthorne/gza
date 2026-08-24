@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal, cast
@@ -119,6 +120,13 @@ NONDEFERRABLE_BLOCKER_CLASSES: frozenset[LandingBlockerClass] = frozenset(
 )
 
 
+def _normalize_optional_identity(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
 @dataclass(frozen=True)
 class LandRequest:
     """Operator request for a future landing coordinator invocation."""
@@ -228,6 +236,65 @@ class LandResult:
 
 
 @dataclass(frozen=True)
+class LandingFollowupFinding:
+    """A normalized FOLLOWUP finding that must be materialized before merge."""
+
+    finding_id: str
+    fingerprint: str | None = None
+    source: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "finding_id", self.finding_id.strip())
+        object.__setattr__(self, "fingerprint", _normalize_optional_identity(self.fingerprint))
+        object.__setattr__(self, "source", _normalize_optional_identity(self.source))
+
+
+@dataclass(frozen=True)
+class LandingFollowupMaterializationIdentity:
+    """Exact durable lookup identity for a mandatory FOLLOWUP finding."""
+
+    review_id: str
+    finding_id: str
+    source: str
+    fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        normalized_review_id = self.review_id.strip()
+        normalized_finding_id = self.finding_id.strip()
+        normalized_source = self.source.strip()
+        normalized_fingerprint = _normalize_optional_identity(self.fingerprint)
+        if not normalized_review_id:
+            raise ValueError("follow-up materialization identity requires a review ID")
+        if not normalized_finding_id:
+            raise ValueError("follow-up materialization identity requires a finding ID")
+        if not normalized_source:
+            raise ValueError("follow-up materialization identity requires a source identity")
+        if not normalized_fingerprint:
+            raise ValueError("follow-up materialization identity requires a normalized content fingerprint")
+        object.__setattr__(self, "review_id", normalized_review_id)
+        object.__setattr__(self, "finding_id", normalized_finding_id)
+        object.__setattr__(self, "source", normalized_source)
+        object.__setattr__(self, "fingerprint", normalized_fingerprint)
+
+    @property
+    def durable_key(self) -> tuple[str, str]:
+        return (self.review_id, self.finding_id)
+
+    @property
+    def fingerprint_key(self) -> str:
+        return json.dumps(
+            {
+                "review": self.review_id,
+                "source": self.source,
+                "finding": self.finding_id,
+                "content": self.fingerprint,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+
+@dataclass(frozen=True)
 class LandingReviewEvidence:
     """Decision-bearing review evidence after identity/currentness checks."""
 
@@ -240,6 +307,11 @@ class LandingReviewEvidence:
     identity_matched: bool = False
     review_id: str | None = None
     reviewed_head: str | None = None
+    followup_findings: tuple[LandingFollowupFinding, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "review_id", _normalize_optional_identity(self.review_id))
+        object.__setattr__(self, "reviewed_head", _normalize_optional_identity(self.reviewed_head))
 
 
 @dataclass(frozen=True)
@@ -333,6 +405,7 @@ class LandingPolicyDecision:
     judgment_verdict: LandingJudgeVerdict | None = None
     judgment_artifact_id: str | None = None
     judgment_key: str | None = None
+    followup_materialization_identities: tuple[LandingFollowupMaterializationIdentity, ...] = ()
 
     @property
     def reason_code(self) -> LandingPolicyReasonCode | None:
@@ -359,6 +432,8 @@ class LandingPolicyDecision:
             raise ValueError("landing judgment identity requires an allowed override")
         object.__setattr__(self, "judgment_artifact_id", judgment_refs[0] if judgment_refs else None)
         object.__setattr__(self, "judgment_key", judgment_refs[1] if judgment_refs else None)
+        if not self.allowed and self.followup_materialization_identities:
+            raise ValueError("denied landing policy decisions cannot carry follow-up materialization inputs")
 
 
 @dataclass(frozen=True)
@@ -384,6 +459,7 @@ class LandingReviewFingerprint:
     verdict: LandingReviewVerdict | None = None
     reviewed_head: str | None = None
     mode: LandingReviewMode = "unknown"
+    followup_fingerprints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -445,6 +521,12 @@ class LandingStateFingerprint:
                 verdict=review.verdict if review is not None else None,
                 reviewed_head=review.reviewed_head if review is not None else None,
                 mode=review.mode if review is not None else "unknown",
+                followup_fingerprints=tuple(
+                    identity.fingerprint_key
+                    for identity in _followup_materialization_identities(review)
+                )
+                if review is not None
+                else (),
             ),
             verify=LandingVerifyFingerprint(
                 epoch=verify.epoch if verify is not None else None,
@@ -575,6 +657,7 @@ def evaluate_landing_policy(
         judgment_verdict=review_decision.judgment_verdict,
         judgment_artifact_id=review_decision.judgment_artifact_id,
         judgment_key=review_decision.judgment_key,
+        followup_materialization_identities=review_decision.followup_materialization_identities,
     )
 
 
@@ -659,7 +742,16 @@ def _verify_evidence(verify: LandingVerifyEvidence | None, facts: LandingPolicyF
 def _review_evidence(review: LandingReviewEvidence | None, facts: LandingPolicyFacts) -> tuple[str, ...]:
     if review is None:
         return _identity_evidence(facts)
-    return _evidence_refs(facts.task_id, review.review_id, review.reviewed_head, facts.source_head)
+    return _evidence_refs(
+        facts.task_id,
+        review.review_id,
+        review.reviewed_head,
+        facts.source_head,
+        *(
+            identity.fingerprint_key
+            for identity in _followup_materialization_identities(review)
+        ),
+    )
 
 
 def _spec_coherence_evidence(
@@ -700,6 +792,48 @@ def _rebase_fingerprint_from_facts(facts: LandingPolicyFacts) -> LandingRebaseFi
         target_contained=facts.rebase_target_contained,
         provider_resolution_proof=facts.rebase_provider_resolution_proof,
     )
+
+
+def _followup_materialization_identities(
+    review: LandingReviewEvidence,
+) -> tuple[LandingFollowupMaterializationIdentity, ...]:
+    try:
+        return _validated_followup_materialization_identities(review)
+    except ValueError:
+        return ()
+
+
+def _validated_followup_materialization_identities(
+    review: LandingReviewEvidence,
+) -> tuple[LandingFollowupMaterializationIdentity, ...]:
+    if not review.followup_findings:
+        return ()
+    if not review.review_id:
+        raise ValueError("follow-up materialization requires review identity")
+    identities: list[LandingFollowupMaterializationIdentity] = []
+    for followup in review.followup_findings:
+        identities.append(
+            LandingFollowupMaterializationIdentity(
+                review_id=review.review_id,
+                source=followup.source or "",
+                finding_id=followup.finding_id,
+                fingerprint=followup.fingerprint,
+            )
+        )
+    durable_keys = [identity.durable_key for identity in identities]
+    if len(durable_keys) != len(set(durable_keys)):
+        raise ValueError("follow-up materialization identities must have unique durable keys")
+    return tuple(sorted(identities, key=lambda identity: identity.fingerprint_key))
+
+
+def _has_valid_followup_finding_set(review: LandingReviewEvidence) -> bool:
+    if not review.followup_findings:
+        return False
+    try:
+        _validated_followup_materialization_identities(review)
+    except ValueError:
+        return False
+    return True
 
 
 def _spec_coherence_fingerprint_from_facts(
@@ -976,7 +1110,10 @@ def _evaluate_review_policy(
                     _review_evidence(review, facts),
                 ),
             )
-        return LandingPolicyDecision(True)
+        return LandingPolicyDecision(
+            True,
+            followup_materialization_identities=_followup_materialization_identities(review),
+        )
     if review.verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}:
         if facts.open_blockers:
             blocker = facts.open_blockers[0]
@@ -989,8 +1126,15 @@ def _evaluate_review_policy(
                 ),
             )
         if park_overrides:
-            return _judge_for_overrides(facts=facts, judge=judge, allowed_overrides=park_overrides)
-        return LandingPolicyDecision(True)
+            return _judge_for_overrides(
+                facts=facts,
+                judge=judge,
+                allowed_overrides=park_overrides,
+            )
+        return LandingPolicyDecision(
+            True,
+            followup_materialization_identities=_followup_materialization_identities(review),
+        )
     if review.verdict != "CHANGES_REQUESTED" or review.mode not in {"plain_full", "resolution"}:
         return LandingPolicyDecision(
             False,
@@ -1042,28 +1186,50 @@ def _review_availability_block(facts: LandingPolicyFacts) -> LandBlocked | None:
             "required review evidence is unavailable",
             _review_evidence(review, facts),
         )
-    if not review.required:
-        return None
     if (
-        review.status != "completed"
-        or not review.current
-        or not review.parseable
-        or not review.identity_matched
-        or not review.review_id
-        or review.reviewed_head != facts.source_head
-        or review.verdict is None
-        or review.verdict == "NEEDS_DISCUSSION"
-        or review.mode == "unknown"
+        review.required
+        and (
+            review.status != "completed"
+            or not review.current
+            or not review.parseable
+            or not review.identity_matched
+            or not review.review_id
+            or review.reviewed_head != facts.source_head
+            or review.verdict is None
+            or review.verdict == "NEEDS_DISCUSSION"
+            or review.mode == "unknown"
+        )
     ):
         return LandBlocked(
             "required-review-unavailable",
             "required review evidence is unavailable",
             _review_evidence(review, facts),
         )
-    if review.mode == "spec_coherence":
+    if review.required and review.mode == "spec_coherence":
         return LandBlocked(
             "required-review-unavailable",
             "spec-coherence review cannot satisfy code-review landing",
+            _review_evidence(review, facts),
+        )
+    if review.followup_findings:
+        try:
+            _validated_followup_materialization_identities(review)
+        except ValueError:
+            return LandBlocked(
+                "required-review-unavailable",
+                "review has no valid follow-up finding evidence",
+                _review_evidence(review, facts),
+            )
+    if review.verdict == "APPROVED_WITH_FOLLOWUPS" and not _has_valid_followup_finding_set(review):
+        return LandBlocked(
+            "required-review-unavailable",
+            "approved-with-followups review has no valid follow-up finding evidence",
+            _review_evidence(review, facts),
+        )
+    if review.verdict == "APPROVED" and review.followup_findings:
+        return LandBlocked(
+            "required-review-unavailable",
+            "approved review contradicts parsed follow-up finding evidence",
             _review_evidence(review, facts),
         )
     return None
@@ -1111,6 +1277,9 @@ def _judge_for_overrides(
         judgment_verdict=judgment.verdict,
         judgment_artifact_id=judgment.artifact_id,
         judgment_key=judgment.key,
+        followup_materialization_identities=_followup_materialization_identities(facts.review)
+        if facts.review is not None
+        else (),
     )
 
 
