@@ -21,6 +21,7 @@ from gza.cli.git_ops import (
     _classify_squash_reconcile_push_failure,
     _create_or_reuse_deferred_blocker_tasks,
     _execute_merge_action,
+    _finalize_staged_isolated_merge_action,
     _merge_single_task,
     _MergeSingleTaskResult,
     _prepare_create_review_action,
@@ -30,14 +31,21 @@ from gza.cli.git_ops import (
     _remove_watch_merge_checkout,
     _resolve_merge_subject,
     _run_task_backed_rebase,
+    _StagedIsolatedMergeAction,
     _tracking_ref_refresh_command,
     cmd_advance,
     cmd_rebase,
     ensure_watch_main_checkout,
+    merge_source_for_action,
 )
 from gza.concurrency import launch_permit
 from gza.config import Config
-from gza.db import DuplicateActiveChildError
+from gza.db import (
+    MERGE_SOURCE_ADVANCE,
+    MERGE_SOURCE_MAX_CYCLES_DEFERRED,
+    MERGE_SOURCE_WATCH,
+    DuplicateActiveChildError,
+)
 from gza.git import Git, GitError, ResolvedGitRef, ResolvedMergeSourceRef
 from gza.lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows
 from gza.main_integration_verify import (
@@ -2927,6 +2935,156 @@ def test_execute_merge_action_mark_merged_rejects_failed_owner_without_marking_u
     refreshed = store.resolve_merge_unit_for_task(failed.id)
     assert refreshed is not None
     assert refreshed.state == "unmerged"
+
+
+def test_merge_source_for_action_only_overrides_explicit_max_cycle_merge_action() -> None:
+    assert merge_source_for_action({"type": "merge"}, MERGE_SOURCE_ADVANCE) == MERGE_SOURCE_ADVANCE
+    assert (
+        merge_source_for_action({"type": "merge", "max_cycles_merge_and_defer": False}, MERGE_SOURCE_WATCH)
+        == MERGE_SOURCE_WATCH
+    )
+    assert (
+        merge_source_for_action(
+            {"type": "merge_with_followups", "max_cycles_merge_and_defer": True},
+            MERGE_SOURCE_ADVANCE,
+        )
+        == MERGE_SOURCE_ADVANCE
+    )
+    assert (
+        merge_source_for_action({"type": "merge", "max_cycles_merge_and_defer": True}, MERGE_SOURCE_WATCH)
+        == MERGE_SOURCE_MAX_CYCLES_DEFERRED
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "default_source", "expected_source"),
+    [
+        ({"type": "merge", "description": "Merge"}, MERGE_SOURCE_ADVANCE, MERGE_SOURCE_ADVANCE),
+        ({"type": "merge", "description": "Merge"}, MERGE_SOURCE_WATCH, MERGE_SOURCE_WATCH),
+        (
+            {"type": "merge", "description": "Merge and defer", "max_cycles_merge_and_defer": True},
+            MERGE_SOURCE_WATCH,
+            MERGE_SOURCE_MAX_CYCLES_DEFERRED,
+        ),
+    ],
+)
+def test_execute_merge_action_mark_merged_uses_action_provenance_selector(
+    tmp_path: Path,
+    action: dict[str, object],
+    default_source: str,
+    expected_source: str,
+) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed implementation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = f"feature/{task.id}-already-merged"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+
+    git = SimpleNamespace(repo_dir=tmp_path)
+    merge_git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=True),
+        resolve_fresh_merge_source=MagicMock(return_value=ResolvedMergeSourceRef(task.branch)),
+    )
+
+    result = _execute_merge_action(
+        config,
+        store,
+        git,
+        task,
+        action,
+        target_branch="main",
+        current_branch="main",
+        merge_git=merge_git,
+        merge_current_branch="main",
+        already_merged_behavior="mark_merged",
+        merge_source=default_source,
+    )
+
+    assert result.rc == 0
+    assert result.status == "already_merged"
+    assert result.created_deferred_blockers == []
+    assert result.reused_deferred_blockers == []
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "merged"
+    assert refreshed_unit.merge_source == expected_source
+
+
+@pytest.mark.parametrize(
+    ("metadata", "default_source", "expected_source"),
+    [
+        ({}, MERGE_SOURCE_WATCH, MERGE_SOURCE_WATCH),
+        ({"type": "merge", "description": "Merge"}, MERGE_SOURCE_ADVANCE, MERGE_SOURCE_ADVANCE),
+        (
+            {"type": "merge", "max_cycles_merge_and_defer": True},
+            MERGE_SOURCE_ADVANCE,
+            MERGE_SOURCE_MAX_CYCLES_DEFERRED,
+        ),
+    ],
+)
+def test_finalize_staged_isolated_merge_action_uses_action_provenance_selector(
+    tmp_path: Path,
+    metadata: dict[str, object],
+    default_source: str,
+    expected_source: str,
+) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    task = store.add("Completed implementation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = f"feature/{task.id}-isolated-finalize"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+
+    created_blocker = store.add("Deferred blocker", task_type="implement", based_on=task.id)
+    reused_blocker = store.add("Reused blocker", task_type="implement", based_on=task.id)
+    staged = _StagedIsolatedMergeAction(
+        merge_subject=task,
+        merge_unit_id=unit.id,
+        merge_branch=task.branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+        created_deferred_blockers=(created_blocker,),
+        reused_deferred_blockers=(reused_blocker,),
+        merge_action_metadata=metadata,
+    )
+
+    result = _finalize_staged_isolated_merge_action(
+        config,
+        store,
+        SimpleNamespace(),
+        staged=staged,
+        merge_source=default_source,
+        quiet_mechanics=True,
+    )
+
+    assert result.rc == 0
+    assert result.created_deferred_blockers == [created_blocker]
+    assert result.reused_deferred_blockers == [reused_blocker]
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.merge_source == expected_source
 
 
 def test_execute_merge_action_propagates_blocked_dirty_checkout_status(tmp_path: Path) -> None:

@@ -9,7 +9,7 @@ import subprocess
 import sys
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -49,6 +49,7 @@ from ..db import (
     MERGE_SOURCE_ADVANCE,
     MERGE_SOURCE_MANUAL,
     MERGE_SOURCE_MANUAL_FORCE,
+    MERGE_SOURCE_MAX_CYCLES_DEFERRED,
     DuplicateActiveChildError,
     MergeTargetResolutionError,
     SqliteTaskStore,
@@ -3315,6 +3316,8 @@ class _MergeActionResult:
     reused_followups: list[DbTask]
     created_investigation_task_ids: list[str]
     reused_investigation_task_ids: list[str]
+    created_deferred_blockers: list[DbTask] = field(default_factory=list)
+    reused_deferred_blockers: list[DbTask] = field(default_factory=list)
     status: str = "merged"
     block_reason: str | None = None
     promotion_warnings: tuple[str, ...] = ()
@@ -3331,6 +3334,9 @@ class _StagedIsolatedMergeAction:
     followup_findings: tuple[ReviewFinding, ...]
     created_investigation_task_ids: tuple[str, ...]
     reused_investigation_task_ids: tuple[str, ...]
+    created_deferred_blockers: tuple[DbTask, ...] = ()
+    reused_deferred_blockers: tuple[DbTask, ...] = ()
+    merge_action_metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -3458,6 +3464,13 @@ def _materialize_merge_followup_side_effects(
     )
 
 
+def merge_source_for_action(action: Mapping[str, Any], default_merge_source: str) -> str:
+    """Return persisted merge provenance for an action execution."""
+    if action.get("type") == "merge" and action.get("max_cycles_merge_and_defer") is True:
+        return MERGE_SOURCE_MAX_CYCLES_DEFERRED
+    return default_merge_source
+
+
 def _finalize_staged_isolated_merge_action(
     config: Config,
     store: SqliteTaskStore,
@@ -3488,12 +3501,13 @@ def _finalize_staged_isolated_merge_action(
             ),
             suppress_success=quiet_mechanics,
         )
+    effective_merge_source = merge_source_for_action(staged.merge_action_metadata, merge_source)
     if staged.merge_unit_id is not None:
         store.set_merge_unit_state(
             staged.merge_unit_id,
             "merged",
             merged_by_task_id=staged.merge_subject.id,
-            merge_source=merge_source,
+            merge_source=effective_merge_source,
         )
     else:
         store.set_merge_status(staged.merge_subject.id, "merged")
@@ -3503,6 +3517,8 @@ def _finalize_staged_isolated_merge_action(
         reused_followups=reused_followups,
         created_investigation_task_ids=list(staged.created_investigation_task_ids),
         reused_investigation_task_ids=list(staged.reused_investigation_task_ids),
+        created_deferred_blockers=list(staged.created_deferred_blockers),
+        reused_deferred_blockers=list(staged.reused_deferred_blockers),
     )
 
 
@@ -3577,12 +3593,13 @@ def _stage_isolated_merge_action(
         and resolved_subject.merge_source_ref
         and merge_git.is_merged(resolved_subject.merge_source_ref, merge_current_branch)
     ):
+        effective_merge_source = merge_source_for_action(action, merge_source)
         if resolved_subject.merge_unit_id is not None:
             store.set_merge_unit_state(
                 resolved_subject.merge_unit_id,
                 "merged",
                 merged_by_task_id=merge_subject.id,
-                merge_source=merge_source,
+                merge_source=effective_merge_source,
             )
         else:
             store.set_merge_status(merge_subject.id, "merged")
@@ -3611,6 +3628,7 @@ def _stage_isolated_merge_action(
             branch=resolved_subject.merge_branch,
         )
     assert task.id is not None
+    effective_merge_source = merge_source_for_action(action, merge_source)
     merge_result = _coerce_merge_single_task_result(
         _merge_single_task(
             task.id,
@@ -3620,7 +3638,7 @@ def _stage_isolated_merge_action(
             merge_args,
             merge_current_branch,
             merge_preflight_ref=merge_preflight_ref,
-            merge_source=merge_source,
+            merge_source=effective_merge_source,
             quiet_mechanics=quiet_mechanics,
             materialize_side_effects=False,
         )
@@ -3650,6 +3668,7 @@ def _stage_isolated_merge_action(
         followup_findings=followup_findings,
         created_investigation_task_ids=created_investigation_task_ids,
         reused_investigation_task_ids=reused_investigation_task_ids,
+        merge_action_metadata=dict(action),
     )
 
 
@@ -3671,6 +3690,8 @@ def _execute_merge_action(
     """Execute a merge-style advance action and materialize follow-up tasks if needed."""
     created_followups: list[DbTask] = []
     reused_followups: list[DbTask] = []
+    created_deferred_blockers: list[DbTask] = []
+    reused_deferred_blockers: list[DbTask] = []
     created_investigation_task_ids = [
         task_id
         for task_id in action.get("created_investigation_task_ids", ())
@@ -3730,6 +3751,7 @@ def _execute_merge_action(
     )
 
     assert task.id is not None
+    effective_merge_source = merge_source_for_action(action, merge_source)
     if (
         already_merged_behavior == "mark_merged"
         and resolved_subject is not None
@@ -3741,7 +3763,7 @@ def _execute_merge_action(
                 resolved_subject.merge_unit_id,
                 "merged",
                 merged_by_task_id=merge_subject.id,
-                merge_source=merge_source,
+                merge_source=effective_merge_source,
             )
         else:
             store.set_merge_status(merge_subject.id, "merged")
@@ -3805,7 +3827,7 @@ def _execute_merge_action(
                 execution_git,
                 merge_args,
                 execution_branch,
-                merge_source=merge_source,
+                merge_source=effective_merge_source,
                 quiet_mechanics=quiet_mechanics,
             )
         )
@@ -3870,6 +3892,8 @@ def _execute_merge_action(
             )
             created_followups = finalized.created_followups
             reused_followups = finalized.reused_followups
+            created_deferred_blockers = finalized.created_deferred_blockers
+            reused_deferred_blockers = finalized.reused_deferred_blockers
         except GitError as exc:
             print(f"Error finalizing isolated merge success: {exc}")
             rc = 1
@@ -3887,6 +3911,8 @@ def _execute_merge_action(
         reused_followups=reused_followups,
         created_investigation_task_ids=created_investigation_task_ids,
         reused_investigation_task_ids=reused_investigation_task_ids,
+        created_deferred_blockers=created_deferred_blockers,
+        reused_deferred_blockers=reused_deferred_blockers,
         status=merge_result.status,
         block_reason=merge_result.block_reason,
         promotion_warnings=promotion_warnings,
