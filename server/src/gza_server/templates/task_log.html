@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}{{ task.id }} log · gza{% endblock %}
+{% block content %}
+  <p><a href="{{ detail.detail_url }}">← {{ task.id }}</a></p>
+  <h1>{{ task.id }} <span class="muted">{{ view.stream }} log</span></h1>
+
+  <p class="log-toolbar">
+    <a href="{{ view.log_url }}?stream={{ view.other_stream }}">view {{ view.other_stream }} log</a>
+    {% if view.path %}<span class="muted log-path">{{ view.path }}</span>{% endif %}
+  </p>
+
+  {% if view.missing_message %}
+    <p class="muted empty-state">{{ view.missing_message }}</p>
+  {% else %}
+    <p class="log-controls">
+      {% if view.truncated_head or view.start_offset > 0 %}
+        <a href="{{ view.url_at(0) }}">load from start</a>
+      {% endif %}
+      {% if not view.eof %}
+        <a href="{{ view.url_at(view.next_offset) }}">load newer →</a>
+      {% endif %}
+      <span class="muted">bytes {{ view.start_offset }}–{{ view.next_offset }} of {{ view.size }}</span>
+    </p>
+
+    {% if view.truncated_head %}
+      <p class="muted">Showing the tail of this log. Earlier entries are above the current window.</p>
+    {% endif %}
+
+    {% if view.is_running %}
+      <p class="log-follow-status muted">Following this running task&rsquo;s log&hellip;</p>
+    {% endif %}
+
+    <ol class="log-events"
+        data-task-id="{{ task.id }}"
+        data-project-id="{{ detail.project_id }}"
+        data-stream="{{ view.stream }}"
+        data-next-offset="{{ view.next_offset }}"
+        data-running="{{ 'true' if view.is_running else 'false' }}">
+      {% for event in view.events %}
+        <li class="log-event log-{{ event.kind }}{{ ' log-error' if event.is_error else '' }}">
+          <span class="log-kind">{{ event.tool_name or event.role or event.kind }}</span>
+          {% if event.title %}<span class="log-title">{{ event.title }}</span>{% endif %}
+          {% if event.has_body %}<pre class="log-body">{{ event.body }}</pre>{% endif %}
+        </li>
+      {% else %}
+        <li class="muted">No entries in this window.</li>
+      {% endfor %}
+    </ol>
+
+    {% if not view.eof %}
+      <p><a href="{{ view.url_at(view.next_offset) }}">load newer →</a></p>
+    {% endif %}
+  {% endif %}
+{% endblock %}

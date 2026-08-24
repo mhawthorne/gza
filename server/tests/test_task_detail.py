@@ -2,6 +2,7 @@ import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from gza_server.app import create_app
 
@@ -43,7 +44,7 @@ def test_implement_task_detail_renders_metadata_prompt_and_full_json(tmp_path: P
     assert "120.5 seconds" in response.text
     assert "<h2>Ship safely</h2>" in response.text
     assert "Use <strong>targeted checks</strong> before release." in response.text
-    assert "<h2>Plan</h2>" not in response.text
+    assert "<h2>Output</h2>" not in response.text
 
     assert api_response.status_code == 200
     record = api_response.json()
@@ -72,7 +73,7 @@ def test_plan_task_detail_renders_cli_plan_content_below_prompt(tmp_path: Path) 
 
     assert response.status_code == 200
     assert "<h1>Planning prompt</h1>" in response.text
-    assert "<h2>Plan</h2>" in response.text
+    assert "<h2>Output</h2>" in response.text
     assert "<h2>Rollout plan</h2>" in response.text
     assert "<li>Ship canary</li>" in response.text
     assert response.text.index("Planning prompt") < response.text.index("Rollout plan")
@@ -263,3 +264,93 @@ def test_cross_project_plan_content_uses_owner_root_for_file_only_and_newer_file
         assert foreign not in html.text
         assert json_response.json()["plan_content"] == f"## {expected}\n"
         assert foreign not in json_response.json()["plan_content"]
+
+
+@pytest.mark.parametrize(
+    "task_type",
+    ["implement", "explore", "review", "improve", "fix", "internal"],
+)
+def test_non_plan_task_detail_renders_output_without_edit_affordance(
+    tmp_path: Path, task_type: str
+) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    task = store.add("Do the thing.", task_type=task_type)
+    store.mark_completed(task, output_content="## Findings\n\nOne blocker remains.")
+    client = _client(store, project_dir=tmp_path)
+
+    response = client.get(f"/tasks/{task.id}")
+    record = client.get(f"/api/tasks/{task.id}").json()
+
+    assert response.status_code == 200
+    assert "<h2>Output</h2>" in response.text
+    assert "<h2>Findings</h2>" in response.text
+    assert "edit=plan" not in response.text
+    assert record["task_output"] == "## Findings\n\nOne blocker remains."
+    assert record["plan_content"] is None
+
+
+REVIEW_REPORT = (
+    "## Summary\n\n- Mostly good.\n\n"
+    "## Blockers\n\n"
+    "### B1 Unhandled API error\n"
+    "Evidence: missing branch\n"
+    "Open-state citation: `src/api.py:12-18`\n"
+    "Impact: crashes\n"
+    "Required fix: handle error path\n"
+    "Required tests: add regression\n\n"
+    "## Follow-Ups\n\n"
+    "### F1 Tighten input checks\n"
+    "Evidence: optional field assumptions\n"
+    "Impact: low risk\n"
+    "Recommended follow-up: validate optional values\n"
+    "Recommended tests: malformed-input case\n\n"
+    "## Questions / Assumptions\n\nNone.\n\n"
+    "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
+)
+
+
+def test_implement_task_shows_findings_from_its_child_review(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    implement = store.add("Build it.", task_type="implement")
+    review = store.add("Review it.", task_type="review", based_on=implement.id)
+    store.mark_completed(review, output_content=REVIEW_REPORT)
+    client = _client(store, project_dir=tmp_path)
+
+    response = client.get(f"/tasks/{implement.id}")
+    record = client.get(f"/api/tasks/{implement.id}").json()
+
+    assert response.status_code == 200
+    assert "<h2>Review findings</h2>" in response.text
+    assert "Unhandled API error" in response.text
+    assert "CHANGES_REQUESTED" in response.text
+
+    (summary,) = record["reviews"]
+    assert summary["task_id"] == review.id
+    assert summary["verdict"] == "CHANGES_REQUESTED"
+    assert [finding["severity"] for finding in summary["findings"]] == ["BLOCKER", "FOLLOWUP"]
+
+
+def test_review_task_does_not_recurse_into_its_own_findings_section(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    review = store.add("Review it.", task_type="review")
+    store.mark_completed(review, output_content=REVIEW_REPORT)
+    client = _client(store, project_dir=tmp_path)
+
+    response = client.get(f"/tasks/{review.id}")
+    record = client.get(f"/api/tasks/{review.id}").json()
+
+    # The review's own report is its Output; it is not also a "review of itself".
+    assert "<h2>Output</h2>" in response.text
+    assert "<h2>Review findings</h2>" not in response.text
+    assert record["reviews"] == []
+
+
+def test_task_without_reviews_has_no_findings_section(tmp_path: Path) -> None:
+    store = SqliteTaskStore(tmp_path / "tasks.db", prefix="srv", project_id="server-test")
+    implement = store.add("Build it.", task_type="implement")
+    client = _client(store, project_dir=tmp_path)
+
+    response = client.get(f"/tasks/{implement.id}")
+
+    assert "<h2>Review findings</h2>" not in response.text
+    assert client.get(f"/api/tasks/{implement.id}").json()["reviews"] == []

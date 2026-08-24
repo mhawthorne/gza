@@ -14,7 +14,7 @@ from typing import Annotated, Any, Literal, Protocol, cast
 from urllib.parse import parse_qs, urlencode
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, ValidationError
@@ -35,7 +35,10 @@ from .tag_dashboard import (
     query_tag_dashboard,
     resolve_window,
 )
+from .log_stream import stream_log
+from .log_view import TERMINAL_STATUSES, build_log_view
 from .task_detail import AmbiguousTaskIdError, TaskDetail, query_task_detail
+from .task_log import clamp_max_bytes
 from .task_edit import (
     TaskEditConflict,
     edit_task_plan,
@@ -723,7 +726,7 @@ def create_app(
             )
         rejected_edit_mode: str | None = None
         prompt_eligible = detail.task.status == "pending"
-        plan_eligible = detail.task.task_type == "plan" and detail.plan_content is not None
+        plan_eligible = detail.plan_editable
         if edit_mode == "prompt" and not prompt_eligible:
             if edit_error is not None and edited_content is not None:
                 rejected_edit_mode = edit_mode
@@ -891,6 +894,148 @@ def create_app(
     @app.get("/api/projects/{project_id}/tasks/{task_id}")
     def qualified_task_detail_api(project_id: str, task_id: str) -> dict[str, object]:
         return task_detail_record(task_id, project_id)
+
+    def render_log_view(
+        request: Request,
+        task_id: str,
+        project_id: str | None = None,
+        *,
+        stream: str = "conversation",
+        offset: int | None = None,
+        limit: int | None = None,
+    ):
+        try:
+            detail = load_task_detail(task_id, project_id)
+        except AmbiguousTaskIdError as exc:
+            return _TEMPLATES.TemplateResponse(
+                request=request,
+                name="409.html",
+                context={"task_id": exc.task_id, "project_ids": exc.project_ids},
+                status_code=409,
+            )
+        if detail is None:
+            return _TEMPLATES.TemplateResponse(
+                request=request,
+                name="404.html",
+                context={"task_id": task_id},
+                status_code=404,
+            )
+        view = build_log_view(
+            detail,
+            stream=stream,
+            offset=offset,
+            max_bytes=clamp_max_bytes(limit),
+            fallback_root=project_dir,
+        )
+        return _TEMPLATES.TemplateResponse(
+            request=request,
+            name="task_log.html",
+            context={"view": view, "detail": detail, "task": detail.task},
+        )
+
+    def log_view_record(
+        task_id: str,
+        project_id: str | None = None,
+        *,
+        stream: str = "conversation",
+        offset: int | None = None,
+        limit: int | None = None,
+    ) -> dict[str, object]:
+        try:
+            detail = load_task_detail(task_id, project_id)
+        except AmbiguousTaskIdError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if detail is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        return build_log_view(
+            detail,
+            stream=stream,
+            offset=offset,
+            max_bytes=clamp_max_bytes(limit),
+            fallback_root=project_dir,
+        ).json_record()
+
+    @app.get("/tasks/{task_id}/log")
+    def task_log_page(
+        request: Request,
+        task_id: str,
+        stream: str = "conversation",
+        offset: int | None = None,
+        limit: int | None = None,
+    ):
+        return render_log_view(request, task_id, stream=stream, offset=offset, limit=limit)
+
+    @app.get("/projects/{project_id}/tasks/{task_id}/log")
+    def qualified_task_log_page(
+        request: Request,
+        project_id: str,
+        task_id: str,
+        stream: str = "conversation",
+        offset: int | None = None,
+        limit: int | None = None,
+    ):
+        return render_log_view(
+            request, task_id, project_id, stream=stream, offset=offset, limit=limit
+        )
+
+    @app.get("/api/tasks/{task_id}/log")
+    def task_log_api(
+        task_id: str,
+        stream: str = "conversation",
+        offset: int | None = None,
+        limit: int | None = None,
+    ) -> dict[str, object]:
+        return log_view_record(task_id, stream=stream, offset=offset, limit=limit)
+
+    @app.get("/api/projects/{project_id}/tasks/{task_id}/log")
+    def qualified_task_log_api(
+        project_id: str,
+        task_id: str,
+        stream: str = "conversation",
+        offset: int | None = None,
+        limit: int | None = None,
+    ) -> dict[str, object]:
+        return log_view_record(task_id, project_id, stream=stream, offset=offset, limit=limit)
+
+    def log_stream_response(
+        task_id: str,
+        project_id: str | None = None,
+        *,
+        stream: str = "conversation",
+        offset: int = 0,
+    ):
+        try:
+            detail = load_task_detail(task_id, project_id)
+        except AmbiguousTaskIdError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if detail is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id} not found")
+        if detail.task.status in TERMINAL_STATUSES:
+            # Nothing more will be written; the paged reader is the right tool.
+            raise HTTPException(
+                status_code=409,
+                detail=f"Task {task_id} is {detail.task.status}; read its log with ?offset=",
+            )
+        return StreamingResponse(
+            stream_log(
+                lambda: load_task_detail(task_id, project_id),
+                stream=stream,
+                offset=offset,
+                fallback_root=project_dir,
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.get("/api/tasks/{task_id}/log/stream")
+    def task_log_stream(task_id: str, stream: str = "conversation", offset: int = 0):
+        return log_stream_response(task_id, stream=stream, offset=offset)
+
+    @app.get("/api/projects/{project_id}/tasks/{task_id}/log/stream")
+    def qualified_task_log_stream(
+        project_id: str, task_id: str, stream: str = "conversation", offset: int = 0
+    ):
+        return log_stream_response(task_id, project_id, stream=stream, offset=offset)
 
     @app.post("/api/tasks/{task_id}/tags")
     async def task_tags_api(request: Request, task_id: str):

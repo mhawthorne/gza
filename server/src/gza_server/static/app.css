@@ -469,3 +469,100 @@ tr.merge-unit-owner { font-weight: 600; }
 .usage-detail { margin: 0; font-size: 0.9rem; }
 .usage-warning { margin: 0.35rem 0 0; font-weight: 600; }
 .usage-age { margin: 0.35rem 0 0; font-size: 0.8rem; }
+
+/* Task log ---------------------------------------------------------------- */
+
+.log-toolbar,
+.log-controls {
+  display: flex;
+  gap: 0.75rem;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.log-path {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+.log-events {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.log-event {
+  border: 1px solid var(--hairline);
+  border-left-width: 3px;
+  border-radius: 4px;
+  background: var(--surface);
+  padding: 0.5rem 0.7rem;
+}
+
+.log-event.log-tool_use { border-left-color: var(--status-unmerged); }
+.log-event.log-tool_result { border-left-color: var(--hairline-strong); }
+.log-event.log-thinking { border-left-color: var(--ink-faint); }
+.log-event.log-result { border-left-color: var(--status-completed); }
+.log-event.log-error,
+.log-event.log-error.log-tool_result { border-left-color: var(--status-failed); }
+
+.log-kind {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-dim);
+  margin-right: 0.5rem;
+}
+
+.log-title {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+
+/* Long tool output and commands scroll inside the entry, not the page. */
+.log-body {
+  margin: 0.4rem 0 0;
+  max-height: 22rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: var(--text-sm);
+}
+
+.log-event.log-thinking .log-body { color: var(--ink-dim); }
+
+/* Review findings --------------------------------------------------------- */
+
+.findings {
+  list-style: none;
+  margin: 0 0 1rem;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.finding {
+  border-left: 3px solid var(--hairline-strong);
+  padding: 0.35rem 0.7rem;
+}
+
+.finding-blocker { border-left-color: var(--status-failed); }
+.finding-followup { border-left-color: var(--status-in-progress); }
+.finding-nit { border-left-color: var(--ink-faint); }
+
+.finding .severity,
+.verdict {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: 0.04em;
+  color: var(--ink-dim);
+  margin-right: 0.5rem;
+}
+
+.finding p { margin: 0.2rem 0 0; }
