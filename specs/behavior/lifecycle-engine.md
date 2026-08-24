@@ -1002,12 +1002,20 @@ selected task, resolve it through canonical merge-unit membership to the unit ow
 representative, local source ref, and canonical local target branch, and re-read that
 state after every mutating step. Initial resolution and every later reconciliation MUST
 first handle the complete terminal-state branch before testing ordinary unmerged
-eligibility. If authoritative merge-unit reconciliation proves the active unit is
-`merged`, `empty`, or `redundant`, `land` MUST finish idempotently with an explicit
-terminal result and MUST NOT rebase, run source verify, run spec-coherence review, run
-code or resolution review, run a landing judgment, create or reuse follow-up/deferred
-tasks, materialize artifacts, mark merged, perform a git merge, or mutate merge state in
-that invocation. The three terminal results are distinct: `merged` reports
+eligibility. The reconciliation boundary is explicit: if the active unit is already
+`merged`, `empty`, or `redundant`, writable and dry-run `land` MUST return that known
+terminal result without mutating merge state or running downstream landing activity. If
+canonical writable reconciliation of an active `unmerged` unit proves terminal no-work,
+it MAY persist exactly one merge-state transition from `unmerged` to `empty` or
+`redundant`; after that write, the known terminal result MUST be returned and all later
+landing activity in the invocation is prohibited. Dry-run MUST remain query-only and
+MUST NOT perform the reconciliation mutation, even when the query result proves
+`empty` or `redundant`. Once a terminal result is known, `land` MUST NOT rebase, run a
+provider, run source verify, refresh post-merge target verify, run spec-coherence
+review, run code or resolution review, run a landing judgment, create or reuse
+follow-up/deferred tasks, materialize artifacts, mark merged, perform a git merge, or
+perform any merge-state mutation beyond the single allowed writable no-work
+reconciliation. The three terminal results are distinct: `merged` reports
 already-landed success, while `empty` and `redundant` report terminal no-work success and
 MUST NOT be described as landed, merged, or marked merged. Only after this terminal
 branch is excluded may continuing `land` require the unit's merge state to be exactly
@@ -1327,14 +1335,16 @@ required by the selected phase. Mismatched active work MUST fail closed without 
 duplicate tasks or launching a provider, and after any ownership change or active-work
 terminalization, `land` MUST re-resolve canonical merge-unit, source, target, review, and
 verify state before continuing. Exact matching rebase, review, judgment, and
-deferred-blocker artifacts MUST be reused; successful rerun after a terminal result MUST
-reconcile and report that terminal state without another merge. Reconciliation to
-`merged` MUST still refresh or reuse the configured post-merge target checkpoint for the
-exact merged target tree and current gate identity before returning success, without
-rerunning earlier rebase, source-verify, review, judgment, or merge phases.
-Reconciliation to `empty` or `redundant` has no post-merge checkpoint because no merge
-occurred; it MUST return terminal no-work success without running the post-merge
-checkpoint and without reporting the unit as landed.
+deferred-blocker artifacts MUST be reused before a terminal result is known; successful
+rerun after a terminal result MUST reconcile and report that terminal state without
+another merge. Post-merge target verification belongs to the original successful merge
+path before `merged` is recorded. A later `land` invocation that enters with
+authoritative state `merged` MUST return the known already-landed terminal result
+without refreshing verification, reusing or materializing checkpoint evidence, rerunning
+earlier rebase/source-verify/review/judgment phases, creating tasks/artifacts, marking
+merged, or merging. Reconciliation to `empty` or `redundant` has no post-merge checkpoint
+because no merge occurred; it MUST return terminal no-work success without running the
+post-merge checkpoint and without reporting the unit as landed.
 
 Every pre-merge terminal refusal MUST be represented as one stable `LandBlocked` result
 with at least:

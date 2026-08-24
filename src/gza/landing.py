@@ -22,7 +22,7 @@ from gza.cli.advance_executor import (
     AdvanceActionExecutionResult,
     execute_advance_action,
 )
-from gza.db import SqliteTaskStore, Task as DbTask, _task_is_actionable_merge_unit_member
+from gza.db import MERGE_UNIT_LANDED_OR_NO_WORK_STATES, MergeUnit, SqliteTaskStore, Task as DbTask, _task_is_actionable_merge_unit_member
 from gza.dependency_preconditions import dependency_readiness
 from gza.merge_services import ResolvedMergeSubject, check_manual_merge_preflight, resolve_merge_subject_query_only
 from gza.query import get_implementation_review_evidence, get_same_branch_rebase_descendants_for_root
@@ -141,6 +141,8 @@ LandingRebaseOutcomeKind = Literal[
     "recovered",
     "resumed",
 ]
+LandTerminalState = Literal["merged", "empty", "redundant"]
+TerminalNoWorkState = Literal["empty", "redundant"]
 
 LANDING_PHASES: tuple[LandingPhaseName, ...] = (
     "resolve",
@@ -191,6 +193,67 @@ def _normalize_optional_identity(value: str | None) -> str | None:
         return None
     normalized = value.strip()
     return normalized or None
+
+
+class LandingStore(Protocol):
+    """Store methods required by the terminal landing boundary."""
+
+    def resolve_merge_unit_subject(self, subject_id: str) -> MergeUnit | None: ...
+
+    def get_merge_unit(self, unit_id: str) -> MergeUnit | None: ...
+
+    def set_merge_unit_state(self, unit_id: str, state: str) -> None: ...
+
+
+TerminalReconciler = Callable[[LandingStore, MergeUnit], TerminalNoWorkState | None]
+
+
+def _no_terminal_reconciliation(
+    _store: LandingStore,
+    _unit: MergeUnit,
+) -> TerminalNoWorkState | None:
+    return None
+
+
+@dataclass(frozen=True)
+class LandingCollaborators:
+    """Observable landing side-effect boundary.
+
+    Terminal resolution may query canonical merge truth and, for writable no-work
+    reconciliation, persist exactly one merge-unit state transition. Every other
+    collaborator represents downstream landing activity that must remain untouched once
+    a terminal result is known.
+    """
+
+    reconcile_terminal_state: TerminalReconciler = _no_terminal_reconciliation
+    run_rebase: Callable[[], object] = lambda: None
+    run_provider: Callable[[], object] = lambda: None
+    run_source_verify: Callable[[], object] = lambda: None
+    run_post_merge_verify: Callable[[], object] = lambda: None
+    run_spec_review: Callable[[], object] = lambda: None
+    run_code_review: Callable[[], object] = lambda: None
+    run_judgment: Callable[[], object] = lambda: None
+    create_followup_or_deferred_task: Callable[[], object] = lambda: None
+    materialize_artifact: Callable[[], object] = lambda: None
+    mark_merged: Callable[[], object] = lambda: None
+    git_merge: Callable[[], object] = lambda: None
+
+
+@dataclass(frozen=True)
+class LandTerminalResult:
+    """Known terminal landing result."""
+
+    outcome: LandTerminalState
+    merge_unit_id: str
+    owner_task_id: str | None
+    source_branch: str
+    target_branch: str
+    dry_run: bool
+    reconciled: bool = False
+
+    @property
+    def no_work(self) -> bool:
+        return self.outcome in {"empty", "redundant"}
 
 
 @dataclass(frozen=True)
@@ -265,11 +328,14 @@ class LandResult:
     owner_task_id: str | None
     target_branch: str | None
     source_ref: str | None
+    merge_unit_id: str | None = None
     steps: tuple[LandStep, ...] = ()
     blocked: LandBlocked | None = None
     post_merge_verify_failure: LandPostMergeVerifyFailure | None = None
     merged: bool = False
     already_merged: bool = False
+    terminal_outcome: LandTerminalState | None = None
+    terminal_reconciled: bool = False
     merge_provenance: Literal["manual_land", "manual_land_escalated"] | None = None
     judgment_artifact_id: str | None = None
     judgment_key: str | None = None
@@ -349,7 +415,7 @@ class LandingCoordinator:
     """
 
     store: SqliteTaskStore
-    git: Any
+    git: Any | None = None
     config: Any | None = None
     transition_limit: LandingTransitionLimitPolicy = LandingTransitionLimitPolicy()
     resolve_subject: Callable[..., ResolvedMergeSubject | None] = resolve_merge_subject_query_only
@@ -367,9 +433,63 @@ class LandingCoordinator:
     create_resolution_review: Callable[..., DbTask] = create_resolution_review_task
     landing_judge: LandingJudge | None = None
     post_rebase_review_budget_used: bool = False
+    collaborators: LandingCollaborators | None = None
 
     def plan(self, request: LandRequest) -> LandResult:
         return self.run(request)
+
+    def land(self, request: LandRequest) -> LandTerminalResult | LandBlocked:
+        unit = self.store.resolve_merge_unit_subject(request.task_id)
+        if unit is None:
+            return LandBlocked(
+                reason_code="identity-proof-unavailable",
+                fact=f"selected task {request.task_id} has no active merge unit",
+                evidence_refs=(request.task_id,),
+            )
+
+        terminal = _terminal_result_for_unit(unit, dry_run=request.dry_run)
+        if terminal is not None:
+            return terminal
+
+        if unit.state != "unmerged":
+            return LandBlocked(
+                reason_code="identity-proof-unavailable",
+                fact=f"merge unit {unit.id} is {unit.state}, not an unmerged landing candidate",
+                evidence_refs=(unit.id,),
+            )
+
+        collaborators = self.collaborators or LandingCollaborators()
+        reconciled_state = collaborators.reconcile_terminal_state(self.store, unit)
+        if reconciled_state is not None:
+            if request.dry_run:
+                terminal = _terminal_result_for_unit(
+                    _unit_with_state(unit, reconciled_state),
+                    dry_run=True,
+                    reconciled=True,
+                )
+                assert terminal is not None
+                return terminal
+
+            self.store.set_merge_unit_state(unit.id, reconciled_state)
+            refreshed = self.store.get_merge_unit(unit.id)
+            if refreshed is None or refreshed.state != reconciled_state:
+                return LandBlocked(
+                    reason_code="materialization-or-persistence-failed",
+                    fact=f"merge unit {unit.id} terminal reconciliation did not persist",
+                    evidence_refs=(unit.id,),
+                )
+            terminal = _terminal_result_for_unit(refreshed, dry_run=False, reconciled=True)
+            assert terminal is not None
+            return terminal
+
+        return LandBlocked(
+            reason_code="required-review-unavailable",
+            fact=(
+                f"gza land terminal reconciliation found merge unit {unit.id} still unmerged; "
+                "full landing orchestration is not implemented in this slice"
+            ),
+            evidence_refs=(unit.id,),
+        )
 
     def run(self, request: LandRequest) -> LandResult:
         steps: list[LandStep] = []
@@ -447,8 +567,34 @@ class LandingCoordinator:
                     owner_task_id=identity.owner_task_id,
                     target_branch=identity.target_branch,
                     source_ref=identity.source_ref,
+                    merge_unit_id=identity.merge_unit_id,
                     steps=tuple(steps),
                     already_merged=True,
+                    terminal_outcome="merged",
+                )
+
+            if identity.merge_unit_state in {"empty", "redundant"}:
+                steps.append(
+                    LandStep(
+                        "merge",
+                        "completed",
+                        f"source is terminal no-work state {identity.merge_unit_state}",
+                        evidence_refs=_evidence_refs(
+                            identity.owner_task_id,
+                            identity.merge_unit_id,
+                            identity.source_sha,
+                            identity.target_sha,
+                        ),
+                    )
+                )
+                return LandResult(
+                    request=request,
+                    owner_task_id=identity.owner_task_id,
+                    target_branch=identity.target_branch,
+                    source_ref=identity.source_ref,
+                    merge_unit_id=identity.merge_unit_id,
+                    steps=tuple(steps),
+                    terminal_outcome=cast(LandTerminalState, identity.merge_unit_state),
                 )
 
             pre_execution_block = _known_pre_execution_block(facts)
@@ -860,6 +1006,7 @@ class LandingCoordinator:
             owner_task_id=identity.owner_task_id,
             target_branch=identity.target_branch,
             source_ref=identity.source_ref,
+            merge_unit_id=identity.merge_unit_id,
             steps=tuple(steps),
             blocked=blocked,
         )
@@ -951,13 +1098,13 @@ class LandingCoordinator:
                 "canonical merge-unit row is unavailable",
                 _evidence_refs(request.task_id, subject.merge_unit_id),
             )
-        if unit.state not in {"unmerged", "merged"}:
+        if unit.state not in (MERGE_UNIT_LANDED_OR_NO_WORK_STATES | {"unmerged"}):
             return LandBlocked(
                 "identity-proof-unavailable",
-                f"canonical merge unit is {unit.state}, not active unmerged",
+                f"canonical merge unit is {unit.state}, not active unmerged or terminal",
                 _evidence_refs(request.task_id, unit.id, unit.state),
             )
-        if unit.state == "merged":
+        if unit.state in MERGE_UNIT_LANDED_OR_NO_WORK_STATES:
             target_sha = _rev_parse_if_exists(self.git, unit.target_branch)
             member_task_ids = tuple(task.id for task in subject.merge_member_tasks if task.id is not None)
             return LandingResolvedIdentity(
@@ -965,7 +1112,7 @@ class LandingCoordinator:
                 owner_task=owner,
                 representative_task=representative,
                 merge_unit_id=unit.id,
-                merge_unit_state="merged",
+                merge_unit_state=unit.state,
                 source_branch=unit.source_branch,
                 source_ref=_normalize_optional_identity(subject.merge_source_ref) or unit.source_branch,
                 source_sha=_rev_parse_if_exists(self.git, subject.merge_source_ref or unit.source_branch),
@@ -974,7 +1121,7 @@ class LandingCoordinator:
                 current_branch=None,
                 member_task_ids=member_task_ids,
                 checkout_clean=True,
-                already_merged=True,
+                already_merged=unit.state == "merged",
                 merge_truth=None,
             )
         if not _task_is_actionable_merge_unit_member(representative, unit):
@@ -4750,3 +4897,58 @@ def _blocker_evidence(blocker: LandingOpenBlocker) -> tuple[str, ...]:
     if blocker.fingerprint:
         refs.append(blocker.fingerprint)
     return tuple(refs)
+
+
+def _terminal_result_for_unit(
+    unit: MergeUnit,
+    *,
+    dry_run: bool,
+    reconciled: bool = False,
+) -> LandTerminalResult | None:
+    if unit.state not in MERGE_UNIT_LANDED_OR_NO_WORK_STATES:
+        return None
+    return LandTerminalResult(
+        outcome=cast(LandTerminalState, unit.state),
+        merge_unit_id=unit.id,
+        owner_task_id=unit.owner_task_id,
+        source_branch=unit.source_branch,
+        target_branch=unit.target_branch,
+        dry_run=dry_run,
+        reconciled=reconciled,
+    )
+
+
+def _unit_with_state(unit: MergeUnit, state: TerminalNoWorkState) -> MergeUnit:
+    return MergeUnit(
+        id=unit.id,
+        source_branch=unit.source_branch,
+        target_branch=unit.target_branch,
+        state=state,
+        owner_task_id=unit.owner_task_id,
+        head_sha=unit.head_sha,
+        base_sha=unit.base_sha,
+        created_at=unit.created_at,
+        updated_at=unit.updated_at,
+        merged_at=None,
+        merged_by_task_id=None,
+        merge_source=None,
+        superseded_by_unit_id=unit.superseded_by_unit_id,
+        pr_number=unit.pr_number,
+        pr_state=unit.pr_state,
+        pr_last_synced_at=unit.pr_last_synced_at,
+        sync_last_synced_at=unit.sync_last_synced_at,
+        diff_files_changed=unit.diff_files_changed,
+        diff_lines_added=unit.diff_lines_added,
+        diff_lines_removed=unit.diff_lines_removed,
+    )
+
+
+def land_terminal_state(
+    store: SqliteTaskStore,
+    request: LandRequest,
+    *,
+    collaborators: LandingCollaborators | None = None,
+) -> LandTerminalResult | LandBlocked:
+    """Resolve the terminal landing boundary for a selected task."""
+
+    return LandingCoordinator(store, collaborators=collaborators).land(request)
