@@ -1,6 +1,8 @@
 """Tests for review_tasks helpers."""
 
 import hashlib
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -3068,6 +3070,7 @@ class TestFollowupTasks:
         )
         store.get_based_on_children.return_value = [existing]
         store.supports_merge_units.return_value = False
+        store.create_or_reuse_capped_review_blocker_task.return_value = (existing, False)
 
         reused, created_now = create_or_reuse_capped_review_blocker_task(
             store,
@@ -3081,8 +3084,7 @@ class TestFollowupTasks:
 
         assert reused is existing
         assert created_now is False
-        store.add.assert_not_called()
-        store.update.assert_not_called()
+        store.create_or_reuse_capped_review_blocker_task.assert_called_once()
 
     def test_create_or_reuse_capped_review_blocker_task_reconciles_reused_tags(
         self,
@@ -3172,10 +3174,10 @@ class TestFollowupTasks:
             tags=("legacy-extra",),
         )
 
-        def fail_update(_task: Task) -> None:
+        def fail_replace_tags(*_args: object, **_kwargs: object) -> None:
             raise RuntimeError("tag write failed")
 
-        monkeypatch.setattr(store, "update", fail_update)
+        monkeypatch.setattr(store, "_replace_task_tags_conn", fail_replace_tags)
 
         with pytest.raises(RuntimeError, match="tag write failed"):
             create_or_reuse_capped_review_blocker_task(
@@ -3453,7 +3455,7 @@ class TestFollowupTasks:
         )
         created_task = _task(id="gza-702", task_type="implement")
         store.get_based_on_children.return_value = []
-        store.add.return_value = created_task
+        store.create_or_reuse_capped_review_blocker_task.return_value = (created_task, True)
 
         created, created_now = create_or_reuse_capped_review_blocker_task(
             store,
@@ -3467,16 +3469,20 @@ class TestFollowupTasks:
 
         assert created is created_task
         assert created_now is True
-        kwargs = store.add.call_args.kwargs
-        assert kwargs["task_type"] == "implement"
-        assert kwargs["based_on"] == "gza-101"
-        assert kwargs["depends_on"] == "gza-101"
-        assert kwargs["review_scope"] == format_blocker_finding_context(finding)
-        assert kwargs["create_pr"] is True
-        assert kwargs["urgent"] is True
-        assert kwargs["trigger_source"] == "watch"
-        assert kwargs["tags"] == ("release", "backend", "urgent-scope", DEFERRED_REVIEW_BLOCKER_TAG)
-        prompt = kwargs["prompt"]
+        kwargs = store.create_or_reuse_capped_review_blocker_task.call_args.kwargs
+        assert kwargs["prompt_prefix"] == build_capped_review_blocker_prompt_prefix(
+            "gza-200", "gza-101", "B2"
+        )
+        assert kwargs["required_tags"] == ("release", "backend", "urgent-scope", DEFERRED_REVIEW_BLOCKER_TAG)
+        params = kwargs["params"]
+        assert params.task_type == "implement"
+        assert params.based_on == "gza-101"
+        assert params.depends_on == "gza-101"
+        assert params.review_scope == format_blocker_finding_context(finding)
+        assert params.create_pr is True
+        assert params.urgent is True
+        assert params.trigger_source == "watch"
+        prompt = params.prompt
         assert prompt.startswith(
             build_capped_review_blocker_prompt_prefix("gza-200", "gza-101", "B2")
         )
@@ -3594,6 +3600,129 @@ class TestFollowupTasks:
         assert len([child for child in impl_children if child.task_type == "implement"]) == 2
         assert review_children == []
 
+    def test_create_or_reuse_capped_review_blocker_task_serializes_same_identity_two_writers(
+        self,
+        tmp_path: Path,
+    ):
+        config, store = _make_store(tmp_path)
+        impl_task = store.add("Implement capped merge", task_type="implement", tags=("release",))
+        assert impl_task.id is not None
+        review_task = store.add("Review capped merge", task_type="review", based_on=impl_task.id)
+        assert review_task.id is not None
+        finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Concurrent blocker",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="create once",
+            tests=None,
+            open_state_citation=None,
+        )
+        start = threading.Barrier(2)
+
+        def create_from_writer() -> tuple[str | None, bool]:
+            writer_store = SqliteTaskStore(store.db_path, prefix=config.project_prefix)
+            start.wait(timeout=5)
+            task, created_now = create_or_reuse_capped_review_blocker_task(
+                writer_store,
+                review_task=review_task,
+                impl_task=impl_task,
+                finding=finding,
+                persisted_review_output="raw review text\n",
+                active_scope_tags=("scoped",),
+                trigger_source="advance",
+            )
+            return task.id, created_now
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(executor.map(lambda _: create_from_writer(), range(2)))
+
+        task_ids = [task_id for task_id, _created_now in results]
+        assert len(set(task_ids)) == 1
+        assert sorted(created_now for _task_id, created_now in results) == [False, True]
+        impl_children = [
+            child
+            for child in store.get_based_on_children(impl_task.id)
+            if child.task_type == "implement"
+            and child.prompt.startswith(
+                build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, "B1")
+            )
+        ]
+        assert [child.id for child in impl_children] == [task_ids[0]]
+        assert store.get_based_on_children(review_task.id) == []
+
+    def test_create_or_reuse_capped_review_blocker_task_serializes_distinct_findings_without_sibling_guard(
+        self,
+        tmp_path: Path,
+    ):
+        config, store = _make_store(tmp_path)
+        impl_task = store.add("Implement capped merge", task_type="implement", tags=("release",))
+        assert impl_task.id is not None
+        review_task = store.add("Review capped merge", task_type="review", based_on=impl_task.id)
+        assert review_task.id is not None
+        findings = (
+            ReviewFinding(
+                id="B1",
+                severity="BLOCKER",
+                title="First concurrent blocker",
+                body="Body",
+                evidence=None,
+                impact=None,
+                fix_or_followup="fix first",
+                tests=None,
+                open_state_citation=None,
+            ),
+            ReviewFinding(
+                id="B2",
+                severity="BLOCKER",
+                title="Second concurrent blocker",
+                body="Body",
+                evidence=None,
+                impact=None,
+                fix_or_followup="fix second",
+                tests=None,
+                open_state_citation=None,
+            ),
+        )
+        start = threading.Barrier(2)
+
+        def create_from_writer(finding: ReviewFinding) -> tuple[str | None, bool]:
+            writer_store = SqliteTaskStore(store.db_path, prefix=config.project_prefix)
+            start.wait(timeout=5)
+            task, created_now = create_or_reuse_capped_review_blocker_task(
+                writer_store,
+                review_task=review_task,
+                impl_task=impl_task,
+                finding=finding,
+                persisted_review_output="raw review text\n",
+                active_scope_tags=("scoped",),
+                trigger_source="advance",
+            )
+            return task.id, created_now
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = tuple(executor.map(create_from_writer, findings))
+
+        assert all(created_now for _task_id, created_now in results)
+        task_ids = [task_id for task_id, _created_now in results]
+        assert len(set(task_ids)) == 2
+        impl_children = [
+            child
+            for child in store.get_based_on_children(impl_task.id)
+            if child.task_type == "implement"
+            and extract_capped_review_blocker_prompt_parts(child.prompt) is not None
+        ]
+        assert sorted(child.id for child in impl_children) == sorted(task_ids)
+        finding_ids = []
+        for child in impl_children:
+            prompt_parts = extract_capped_review_blocker_prompt_parts(child.prompt)
+            assert prompt_parts is not None
+            finding_ids.append(prompt_parts[0])
+        assert set(finding_ids) == {"B1", "B2"}
+        assert store.get_based_on_children(review_task.id) == []
+
     @pytest.mark.parametrize(
         ("findings", "match"),
         [
@@ -3708,7 +3837,7 @@ class TestFollowupTasks:
             open_state_citation=None,
         )
         store.get_based_on_children.return_value = []
-        store.add.side_effect = RuntimeError("database is locked")
+        store.create_or_reuse_capped_review_blocker_task.side_effect = RuntimeError("database is locked")
 
         with pytest.raises(RuntimeError, match="database is locked"):
             create_or_reuse_capped_review_blocker_task(
@@ -3737,7 +3866,7 @@ class TestFollowupTasks:
         )
         created_task = _task(id="gza-704", task_type="implement")
         store.get_based_on_children.return_value = []
-        store.add.return_value = created_task
+        store.create_or_reuse_capped_review_blocker_task.return_value = (created_task, True)
 
         created, reused = common_create_capped_review_blocker_tasks(
             store,
@@ -3751,7 +3880,10 @@ class TestFollowupTasks:
 
         assert created == [created_task]
         assert reused == []
-        assert store.add.call_args.kwargs["tags"] == ("release", DEFERRED_REVIEW_BLOCKER_TAG)
+        assert store.create_or_reuse_capped_review_blocker_task.call_args.kwargs["required_tags"] == (
+            "release",
+            DEFERRED_REVIEW_BLOCKER_TAG,
+        )
 
     def test_manual_deferred_blocker_helper_remains_review_based_without_reserved_tag(self):
         store = MagicMock()

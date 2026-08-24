@@ -1416,6 +1416,8 @@ MERGE_UNIT_ACTIONABLE_STATES: frozenset[str] = frozenset({"unmerged", "blocked",
 MERGE_UNIT_LANDED_OR_NO_WORK_STATES: frozenset[str] = frozenset({"merged", "empty", "redundant"})
 MERGE_UNIT_INACTIVE_TOMBSTONE_STATES: frozenset[str] = frozenset({"dropped", "superseded"})
 MERGE_UNIT_ACTIVE_STATES: frozenset[str] = MERGE_UNIT_ACTIONABLE_STATES | MERGE_UNIT_LANDED_OR_NO_WORK_STATES
+CAPPED_REVIEW_BLOCKER_NON_REUSABLE_STATUSES: frozenset[str] = frozenset({"dropped", "superseded"})
+CAPPED_REVIEW_BLOCKER_TERMINAL_MERGE_STATUSES: frozenset[str] = frozenset({"merged", "empty", "redundant"})
 BEHAVIOR_FINDING_TERMINAL_LINKED_TASK_STATUSES: frozenset[str] = frozenset({"dropped"})
 BEHAVIOR_FINDING_TERMINAL_LINKED_TASK_MERGE_STATUSES: frozenset[str] = frozenset({"merged"})
 
@@ -7622,6 +7624,122 @@ class SqliteTaskStore:
                 conn.close()
             except Exception:
                 pass
+
+    def create_or_reuse_capped_review_blocker_task(
+        self,
+        *,
+        prompt_prefix: str,
+        params: NewTaskParams,
+        required_tags: Iterable[str],
+    ) -> tuple[Task, bool]:
+        """Atomically create or reuse one exact capped-review blocker task.
+
+        The identity is the implementation child ``based_on`` edge plus implement
+        task type plus deterministic prompt prefix, which encodes
+        (implementation, review, finding, review-max-cycles). The lookup, lifecycle
+        eligibility check, tag reconciliation, and insert are serialized by one
+        immediate write transaction so competing writers return the same row.
+        """
+        if params.based_on is None:
+            raise ValueError("Cannot create capped review blocker task without implementation based_on.")
+        if params.task_type != "implement":
+            raise ValueError("Capped review blocker tasks must be implement tasks.")
+        normalized_required_tags = _normalize_tags(tuple(required_tags))
+        with self._write_transaction() as conn:
+            existing = self._find_capped_review_blocker_task_conn(
+                conn,
+                impl_task_id=params.based_on,
+                prompt_prefix=prompt_prefix,
+            )
+            if existing is not None:
+                if not self._capped_review_blocker_can_be_reused_conn(conn, existing):
+                    raise ValueError(
+                        f"Existing capped review blocker task {existing.id or '<unknown>'} "
+                        f"cannot be reused from status {existing.status!r} "
+                        f"and merge status {existing.merge_status!r}."
+                    )
+                reconciled_tags = _normalize_tags((*existing.tags, *normalized_required_tags))
+                if reconciled_tags != existing.tags:
+                    assert existing.id is not None
+                    self._replace_task_tags_conn(conn, existing.id, reconciled_tags)
+                    row = conn.execute(
+                        "SELECT * FROM tasks WHERE project_id = ? AND id = ?",
+                        (self._project_id, existing.id),
+                    ).fetchone()
+                    assert row is not None
+                    existing = self._rows_to_tasks(conn, [row])[0]
+                return existing, False
+
+            return self._add_task_conn(conn, replace(params, tags=normalized_required_tags)), True
+
+    def _find_capped_review_blocker_task_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        impl_task_id: str,
+        prompt_prefix: str,
+    ) -> Task | None:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM tasks
+            WHERE project_id = ?
+              AND based_on = ?
+              AND task_type = 'implement'
+            ORDER BY created_at ASC
+            """,
+            (self._project_id, impl_task_id),
+        ).fetchall()
+        for child in self._rows_to_tasks(conn, rows):
+            if child.prompt.strip().startswith(prompt_prefix):
+                return child
+        return None
+
+    def _capped_review_blocker_can_be_reused_conn(
+        self,
+        conn: sqlite3.Connection,
+        existing: Task,
+    ) -> bool:
+        if existing.id is not None and self.supports_merge_units():
+            active_rows = conn.execute(
+                f"""
+                SELECT mu.*
+                FROM merge_unit_tasks mut
+                JOIN merge_units mu
+                  ON mu.project_id = mut.project_id
+                 AND mu.id = mut.merge_unit_id
+                WHERE mut.project_id = ?
+                  AND mut.task_id = ?
+                  AND {active_merge_unit_where_sql("mu")}
+                ORDER BY mu.updated_at DESC, mu.id DESC
+                """,
+                (self._project_id, existing.id),
+            ).fetchall()
+            active_units = [
+                unit for row in active_rows if (unit := self._row_to_merge_unit(row)) is not None
+            ]
+            if active_units:
+                active_unit = active_units[0]
+                return (
+                    active_unit.state in MERGE_UNIT_ACTIONABLE_STATES
+                    and active_unit.superseded_by_unit_id is None
+                )
+            historical_row = conn.execute(
+                """
+                SELECT 1
+                FROM merge_unit_tasks
+                WHERE project_id = ?
+                  AND task_id = ?
+                LIMIT 1
+                """,
+                (self._project_id, existing.id),
+            ).fetchone()
+            if historical_row is not None:
+                return False
+        return (
+            existing.status not in CAPPED_REVIEW_BLOCKER_NON_REUSABLE_STATUSES
+            and existing.merge_status not in CAPPED_REVIEW_BLOCKER_TERMINAL_MERGE_STATUSES
+        )
 
     def _add_task_conn(self, conn: sqlite3.Connection, params: NewTaskParams) -> Task:
         """Insert one task using an already-open connection."""

@@ -13,13 +13,7 @@ from typing import Any, Literal, cast
 from .artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from .artifacts import prepare_command_output_artifact, store_command_output_artifact
 from .config import Config
-from .db import (
-    MERGE_UNIT_ACTIONABLE_STATES,
-    NewTaskParams,
-    SqliteTaskStore,
-    Task,
-    TaskArtifact,
-)
+from .db import NewTaskParams, SqliteTaskStore, Task, TaskArtifact
 from .derived_tags import resolve_derived_task_tags
 from .git import Git
 from .lineage import resolve_impl_task, walk_based_on_descendants
@@ -73,8 +67,6 @@ _REVIEW_BLOCKER_ADJUDICATION_HEAD_SHA_RE = re.compile(
     r"^Dispute source head SHA:\s*(\S+)\s*$",
     re.MULTILINE,
 )
-_CAPPED_REVIEW_BLOCKER_NON_REUSABLE_STATUSES = frozenset({"dropped", "superseded"})
-_CAPPED_REVIEW_BLOCKER_TERMINAL_MERGE_STATUSES = frozenset({"merged", "empty", "redundant"})
 _REVIEW_BLOCKER_ADJUDICATION_SOURCE_BRANCH_RE = re.compile(
     r"^Dispute source branch:\s*(\S+)\s*$",
     re.MULTILINE,
@@ -2452,35 +2444,6 @@ def _validate_capped_review_blocker_findings(findings: tuple[ReviewFinding, ...]
         seen.add(finding_id)
 
 
-def _capped_review_blocker_can_be_reused(store: SqliteTaskStore, existing: Task) -> bool:
-    if existing.id is not None and store.supports_merge_units():
-        active_unit = store.resolve_merge_unit_for_task(existing.id)
-        if active_unit is not None:
-            return active_unit.state in MERGE_UNIT_ACTIONABLE_STATES and active_unit.superseded_by_unit_id is None
-        if store.list_merge_units_for_task(existing.id, active_only=False):
-            return False
-    return (
-        existing.status not in _CAPPED_REVIEW_BLOCKER_NON_REUSABLE_STATUSES
-        and existing.merge_status not in _CAPPED_REVIEW_BLOCKER_TERMINAL_MERGE_STATUSES
-    )
-
-
-def _reconcile_capped_review_blocker_tags(
-    store: SqliteTaskStore,
-    existing: Task,
-    *,
-    impl_task: Task,
-    active_scope_tags: Iterable[str] | None,
-) -> Task:
-    required_tags = _capped_review_blocker_tags(impl_task, active_scope_tags=active_scope_tags)
-    reconciled_tags = tuple(dict.fromkeys((*existing.tags, *required_tags)))
-    if reconciled_tags == existing.tags:
-        return existing
-    updated = replace(existing, tags=reconciled_tags)
-    store.update(updated)
-    return updated
-
-
 def create_or_reuse_capped_review_blocker_task(
     store: SqliteTaskStore,
     *,
@@ -2500,27 +2463,6 @@ def create_or_reuse_capped_review_blocker_task(
     if impl_task.id is None:
         raise ValueError("Cannot create capped review blocker for implementation without an ID.")
 
-    existing = find_existing_capped_review_blocker_task(
-        store,
-        review_task_id=review_task.id,
-        impl_task_id=impl_task.id,
-        finding_id=finding_id,
-    )
-    if existing is not None:
-        if not _capped_review_blocker_can_be_reused(store, existing):
-            raise ValueError(
-                f"Existing capped review blocker task {existing.id or '<unknown>'} "
-                f"cannot be reused from status {existing.status!r} "
-                f"and merge status {existing.merge_status!r}."
-            )
-        reconciled = _reconcile_capped_review_blocker_tags(
-            store,
-            existing,
-            impl_task=impl_task,
-            active_scope_tags=active_scope_tags,
-        )
-        return reconciled, False
-
     prompt = build_capped_review_blocker_prompt(
         review_task.id,
         impl_task.id,
@@ -2528,18 +2470,21 @@ def create_or_reuse_capped_review_blocker_task(
         persisted_review_output,
     )
     _require_model_for_created_task(config, "implement")
-    created = store.add(
+    params = NewTaskParams(
         prompt=prompt,
         task_type="implement",
         based_on=impl_task.id,
         depends_on=impl_task.id,
         review_scope=format_blocker_finding_context(finding),
-        tags=_capped_review_blocker_tags(impl_task, active_scope_tags=active_scope_tags),
         trigger_source=trigger_source,
         create_pr=True,
         urgent=True,
     )
-    return created, True
+    return store.create_or_reuse_capped_review_blocker_task(
+        prompt_prefix=build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, finding_id),
+        params=params,
+        required_tags=_capped_review_blocker_tags(impl_task, active_scope_tags=active_scope_tags),
+    )
 
 
 def create_or_reuse_capped_review_blocker_tasks(
