@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -56,6 +57,7 @@ from ..db import (
     task_id_numeric_key,
 )
 from ..dispatch_preview import (
+    DispatchPreview,
     DispatchPreviewEntry,
     DispatchSelectionMode,
     build_dispatch_preview,
@@ -6543,11 +6545,32 @@ class WatchProjectSelection:
 
 
 @dataclass(frozen=True)
+class WatchRuntimeIdentity:
+    """Exact runtime provenance for artifacts created by a project runtime."""
+
+    selector_key: str
+    db_path: Path
+    project_id: str
+    generation: str
+
+    @classmethod
+    def create(cls, *, selector_key: str, config: Config, store: SqliteTaskStore) -> "WatchRuntimeIdentity":
+        return cls(
+            selector_key=selector_key,
+            db_path=store.db_path.resolve(),
+            project_id=config.project_id,
+            generation=uuid.uuid4().hex,
+        )
+
+
+@dataclass(frozen=True)
 class ProjectCycleAnalysis:
     """Single-project analysis wrapper for future supervisor phase extraction."""
 
     runtime_key: str
     plan: _WatchCyclePlan
+    runtime_identity: WatchRuntimeIdentity | None = None
+    excluded_owner_ids: frozenset[str] = frozenset()
 
     @property
     def analysis(self) -> _WatchCycleAnalysis:
@@ -6589,8 +6612,48 @@ class ProjectDispatchCandidate:
     runtime_key: str
     task: DbTask
     lane: Literal["recovery", "pending", "lifecycle"]
+    runtime_identity: WatchRuntimeIdentity | None = None
+    preview_entry: DispatchPreviewEntry | None = None
     owner_task: DbTask | None = None
     detail: str | None = None
+
+
+@dataclass(frozen=True)
+class ProjectDispatchResult:
+    """Runtime-local launch settlement for a worker-consuming dispatch candidate."""
+
+    runtime_key: str
+    candidate: ProjectDispatchCandidate
+    status: Literal[
+        "dry_run",
+        "live",
+        "terminal_before_running",
+        "no_live_proof",
+        "launch_blocked",
+        "local_capacity_blocked",
+        "not_dispatchable",
+    ]
+    slot_consuming: bool
+    work_done: bool
+    dispatch_budget_consuming: bool = False
+    detail: str | None = None
+    task: DbTask | None = None
+
+
+@dataclass(frozen=True)
+class _WatchDispatchSuppressionContext:
+    started_task_ids: frozenset[str] = frozenset()
+    pending_recovery_task_ids: frozenset[str] = frozenset()
+    step1_handled_child_task_ids: frozenset[str] = frozenset()
+    excluded_owner_ids: frozenset[str] = frozenset()
+
+    def for_preview_filter(self) -> tuple[set[str], set[str], set[str], frozenset[str]]:
+        return (
+            set(self.started_task_ids),
+            set(self.pending_recovery_task_ids),
+            set(self.step1_handled_child_task_ids),
+            self.excluded_owner_ids,
+        )
 
 
 @dataclass
@@ -6602,12 +6665,15 @@ class WatchProjectRuntime:
     store: SqliteTaskStore
     git: Git
     log: "_WatchLog"
+    runtime_identity: WatchRuntimeIdentity
     failure_backoffs: dict[str, _OwnerFailureBackoffState] = field(default_factory=dict)
     previous_snapshot: dict[str, dict[str, str | None]] = field(default_factory=dict)
     expected_starts: dict[str, _ExpectedStart] = field(default_factory=dict)
     seen_active_recovery_subject_ids: frozenset[str] = frozenset()
     system_hold_active: bool = False
     git_health_hold_active: bool = False
+    _confirmed_started_task_ids: set[str] = field(default_factory=set)
+    _attempted_dispatch_task_ids: set[str] = field(default_factory=set)
 
     @classmethod
     def create(
@@ -6621,6 +6687,7 @@ class WatchProjectRuntime:
         any_tag: bool,
         git: Git | None = None,
     ) -> "WatchProjectRuntime":
+        identity = WatchRuntimeIdentity.create(selector_key=key, config=config, store=store)
         return cls(
             selection=WatchProjectSelection(
                 key=key,
@@ -6632,6 +6699,7 @@ class WatchProjectRuntime:
             store=store,
             git=git if git is not None else Git(config.project_dir),
             log=log,
+            runtime_identity=identity,
         )
 
     def initialize_baseline(self) -> None:
@@ -6690,7 +6758,12 @@ class WatchProjectRuntime:
             excluded_owner_ids=excluded_owner_ids,
             git=self.git,
         )
-        return ProjectCycleAnalysis(runtime_key=self.key, plan=plan)
+        return ProjectCycleAnalysis(
+            runtime_key=self.key,
+            plan=plan,
+            runtime_identity=self.runtime_identity,
+            excluded_owner_ids=excluded_owner_ids,
+        )
 
     def build_cycle_plan(self, **kwargs: Any) -> ProjectCycleAnalysis:
         return self.analyze_cycle(**kwargs)
@@ -6706,6 +6779,77 @@ class WatchProjectRuntime:
             **kwargs,
         )
 
+    def _validate_analysis(self, analysis: ProjectCycleAnalysis) -> None:
+        if analysis.runtime_key != self.key or analysis.runtime_identity != self.runtime_identity:
+            raise ValueError(
+                f"analysis for runtime {analysis.runtime_key!r} cannot be used by runtime {self.key!r}"
+            )
+
+    def _candidate_belongs_to_runtime(self, candidate: ProjectDispatchCandidate) -> bool:
+        return candidate.runtime_key == self.key and candidate.runtime_identity == self.runtime_identity
+
+    def begin_dispatch_pass(self) -> None:
+        """Start a new supervisor arbitration pass for transient dispatch skips."""
+        self._attempted_dispatch_task_ids.clear()
+
+    def _current_confirmed_start_exclusion_ids(self) -> frozenset[str]:
+        still_excluded: set[str] = set()
+        for task_id in tuple(self._confirmed_started_task_ids):
+            task = self.store.get(task_id)
+            if task is None or task.status not in {"pending", "in_progress"}:
+                self._confirmed_started_task_ids.discard(task_id)
+                continue
+            start_state = _watch_dispatch_start_state(config=self.config, store=self.store, task_id=task_id)
+            if start_state.status is not _DispatchSettleProbeStatus.LIVE:
+                self._confirmed_started_task_ids.discard(task_id)
+                continue
+            still_excluded.add(task_id)
+        return frozenset(still_excluded)
+
+    def _dispatch_exclusion_ids(self) -> frozenset[str]:
+        return self._current_confirmed_start_exclusion_ids() | frozenset(self._attempted_dispatch_task_ids)
+
+    def _dispatch_suppression_context(
+        self,
+        analysis: ProjectCycleAnalysis | None = None,
+        *,
+        excluded_owner_ids: frozenset[str] = frozenset(),
+        step1_handled_child_task_ids: frozenset[str] = frozenset(),
+    ) -> _WatchDispatchSuppressionContext:
+        if analysis is not None:
+            self._validate_analysis(analysis)
+        plan_analysis = analysis.analysis if analysis is not None else None
+        return _WatchDispatchSuppressionContext(
+            started_task_ids=self._dispatch_exclusion_ids(),
+            pending_recovery_task_ids=(
+                plan_analysis.pending_recovery_task_ids if plan_analysis is not None else frozenset()
+            ),
+            step1_handled_child_task_ids=step1_handled_child_task_ids,
+            excluded_owner_ids=(analysis.excluded_owner_ids if analysis is not None else frozenset()) | excluded_owner_ids,
+        )
+
+    def _current_pending_dispatch_head_for_validation(
+        self,
+        *,
+        suppression_context: _WatchDispatchSuppressionContext,
+    ) -> ProjectDispatchCandidate | None:
+        return next(
+            iter(
+                self.dispatch_candidates(
+                    lane="pending",
+                    recovery_mode="pending_only",
+                    max_recovery_attempts=self.config.max_resume_attempts,
+                    pending_limit=None,
+                    suppression_context=suppression_context,
+                )
+            ),
+            None,
+        )
+
+    def _exclude_pending_dispatch_candidate_for_pass(self, task_id: str | None) -> None:
+        if task_id is not None:
+            self._attempted_dispatch_task_ids.add(str(task_id))
+
     def run_direct_phase(
         self,
         *,
@@ -6716,6 +6860,7 @@ class WatchProjectRuntime:
         precomputed_plan = kwargs.pop("precomputed_plan", None)
         plan_supplied_by_analysis = analysis is not None
         if analysis is not None:
+            self._validate_analysis(analysis)
             precomputed_plan = analysis.plan
         result = self.run_cycle(
             direct_phase_only=True,
@@ -6730,6 +6875,476 @@ class WatchProjectRuntime:
             project_analysis_invalidated=result.project_analysis_invalidated,
             needs_replan=result.needs_replan,
             cycle_result=result,
+        )
+
+    def build_dispatch_preview(
+        self,
+        *,
+        recovery_mode: DispatchSelectionMode = "default",
+        max_recovery_attempts: int,
+        analysis: ProjectCycleAnalysis | None = None,
+        pending_limit: int | None = None,
+        include_recovery: bool = True,
+        include_pending: bool = True,
+    ) -> DispatchPreview:
+        """Build this runtime's project-local dispatch preview using its own config/store/Git."""
+        if analysis is not None:
+            self._validate_analysis(analysis)
+        plan_analysis = analysis.analysis if analysis is not None else None
+        return build_dispatch_preview(
+            self.store,
+            config=self.config,
+            git=self.git,
+            target_branch=plan_analysis.target_branch if plan_analysis is not None else self.git.default_branch(),
+            owner_rows=plan_analysis.owner_rows if plan_analysis is not None else None,
+            read_context=plan_analysis.watch_read_context if plan_analysis is not None else None,
+            tags=self.tags,
+            any_tag=self.any_tag,
+            max_recovery_attempts=max_recovery_attempts,
+            selection_mode=recovery_mode,
+            pending_limit=pending_limit,
+            include_recovery=include_recovery,
+            include_pending=include_pending,
+        )
+
+    def dispatch_candidates(
+        self,
+        *,
+        lane: Literal["recovery", "pending"] | None = None,
+        recovery_mode: DispatchSelectionMode = "default",
+        max_recovery_attempts: int,
+        analysis: ProjectCycleAnalysis | None = None,
+        pending_limit: int | None = None,
+        excluded_owner_ids: frozenset[str] = frozenset(),
+        step1_handled_child_task_ids: frozenset[str] = frozenset(),
+        suppression_context: _WatchDispatchSuppressionContext | None = None,
+    ) -> tuple[ProjectDispatchCandidate, ...]:
+        """Expose locally ordered runnable recovery/pending candidates for fleet arbitration."""
+        preview = self.build_dispatch_preview(
+            recovery_mode=recovery_mode,
+            max_recovery_attempts=max_recovery_attempts,
+            analysis=analysis,
+            pending_limit=pending_limit,
+            include_recovery=lane in {None, "recovery"},
+            include_pending=lane in {None, "pending"},
+        )
+        if suppression_context is None:
+            suppression_context = self._dispatch_suppression_context(
+                analysis,
+                excluded_owner_ids=excluded_owner_ids,
+                step1_handled_child_task_ids=step1_handled_child_task_ids,
+            )
+        started_task_ids, pending_recovery_task_ids, handled_child_ids, context_excluded_owner_ids = (
+            suppression_context.for_preview_filter()
+        )
+        runnable_entries = _filter_watch_dispatch_preview_entries(
+            preview.runnable_entries,
+            store=self.store,
+            started_task_ids=started_task_ids,
+            pending_recovery_task_ids=pending_recovery_task_ids,
+            step1_handled_child_task_ids=handled_child_ids,
+            excluded_owner_ids=context_excluded_owner_ids,
+        )
+        candidates: list[ProjectDispatchCandidate] = []
+        for entry in runnable_entries:
+            if lane is not None and entry.lane != lane:
+                continue
+            if entry.task.id is None:
+                continue
+            if entry.lane == "recovery" and not entry.worker_consuming:
+                break
+            if not entry.worker_consuming:
+                continue
+            candidates.append(
+                ProjectDispatchCandidate(
+                    runtime_key=self.key,
+                    task=entry.task,
+                    lane=entry.lane,
+                    runtime_identity=self.runtime_identity,
+                    preview_entry=entry,
+                    owner_task=entry.owner_task,
+                    detail=entry.reason_code,
+                )
+            )
+        return tuple(candidates)
+
+    def recovery_dispatch_head(
+        self,
+        *,
+        max_recovery_attempts: int,
+        recovery_mode: DispatchSelectionMode = "default",
+        analysis: ProjectCycleAnalysis | None = None,
+        excluded_owner_ids: frozenset[str] = frozenset(),
+    ) -> ProjectDispatchCandidate | None:
+        """Return this runtime's current recovery head without changing project-local order."""
+        return next(
+            iter(
+                self.dispatch_candidates(
+                    lane="recovery",
+                    recovery_mode=recovery_mode,
+                    max_recovery_attempts=max_recovery_attempts,
+                    analysis=analysis,
+                    pending_limit=1,
+                    excluded_owner_ids=excluded_owner_ids,
+                )
+            ),
+            None,
+        )
+
+    def pending_dispatch_head(
+        self,
+        *,
+        max_recovery_attempts: int,
+        analysis: ProjectCycleAnalysis | None = None,
+        excluded_owner_ids: frozenset[str] = frozenset(),
+        step1_handled_child_task_ids: frozenset[str] = frozenset(),
+    ) -> ProjectDispatchCandidate | None:
+        """Return this runtime's current pending pickup head in canonical local order."""
+        return next(
+            iter(
+                self.dispatch_candidates(
+                    lane="pending",
+                    recovery_mode="pending_only",
+                    max_recovery_attempts=max_recovery_attempts,
+                    analysis=analysis,
+                    pending_limit=None,
+                    excluded_owner_ids=excluded_owner_ids,
+                    step1_handled_child_task_ids=step1_handled_child_task_ids,
+                )
+            ),
+            None,
+        )
+
+    def settle_dispatch_starts(
+        self,
+        pending_starts: Sequence[_PendingWatchDispatchSettle],
+    ) -> list[_WatchDispatchSettleResult]:
+        """Settle launches through this runtime's config and store."""
+        return _settle_watch_dispatch_starts(
+            config=self.config,
+            store=self.store,
+            pending_starts=pending_starts,
+        )
+
+    def dispatch_pending_candidate(
+        self,
+        candidate: ProjectDispatchCandidate,
+        *,
+        max_iterations: int,
+        dry_run: bool = False,
+        quiet: bool = False,
+        analysis: ProjectCycleAnalysis | None = None,
+        excluded_owner_ids: frozenset[str] = frozenset(),
+        step1_handled_child_task_ids: frozenset[str] = frozenset(),
+    ) -> ProjectDispatchResult:
+        """Dispatch one pending candidate through this runtime's local launch machinery."""
+        if not self._candidate_belongs_to_runtime(candidate) or candidate.lane != "pending" or candidate.task.id is None:
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="not_dispatchable",
+                slot_consuming=False,
+                work_done=False,
+                detail="candidate does not belong to this runtime pending lane",
+            )
+        task = self.store.get(str(candidate.task.id))
+        if task is None:
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="not_dispatchable",
+                slot_consuming=False,
+                work_done=False,
+                detail=f"task {candidate.task.id} is not present in runtime store",
+            )
+        if task.id != candidate.task.id:
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="not_dispatchable",
+                slot_consuming=False,
+                work_done=False,
+                detail=f"candidate task {candidate.task.id} resolved to unexpected runtime row {task.id}",
+                task=task,
+            )
+        if task.status != "pending":
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="not_dispatchable",
+                slot_consuming=False,
+                work_done=False,
+                detail=f"task is {task.status}, not pending",
+                task=task,
+            )
+        suppression_context = self._dispatch_suppression_context(
+            analysis,
+            excluded_owner_ids=excluded_owner_ids,
+            step1_handled_child_task_ids=step1_handled_child_task_ids,
+        )
+        if str(task.id) in suppression_context.started_task_ids:
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="not_dispatchable",
+                slot_consuming=False,
+                work_done=False,
+                detail=f"task {task.id} is already attempted in this runtime dispatch pass",
+                task=task,
+            )
+        current_head = self._current_pending_dispatch_head_for_validation(suppression_context=suppression_context)
+        if current_head is None or current_head.task.id != task.id:
+            detail = (
+                f"task {task.id} is not the current eligible pending dispatch head"
+                if current_head is not None
+                else f"task {task.id} is no longer eligible for pending dispatch"
+            )
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="not_dispatchable",
+                slot_consuming=False,
+                work_done=False,
+                detail=detail,
+                task=task,
+            )
+        task_type = task.task_type or "implement"
+        if dry_run:
+            prompt = _format_prompt_for_width(
+                task.prompt,
+                prefix=16 + len(f'{task.id} {task_type} "'),
+                suffix=len('" [dry-run]'),
+            )
+            self.log.emit("START", f'{task.id} {task_type} "{prompt}" [dry-run]')
+            self._exclude_pending_dispatch_candidate_for_pass(str(task.id))
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="dry_run",
+                slot_consuming=False,
+                work_done=True,
+                dispatch_budget_consuming=True,
+                task=task,
+            )
+
+        pending_action = _pending_queue_dispatch_action(task)
+        if _maybe_emit_active_watch_recovery_backoff(
+            store=self.store,
+            log=self.log,
+            subject_task=task,
+            action=pending_action,
+        ):
+            self._exclude_pending_dispatch_candidate_for_pass(str(task.id))
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="launch_blocked",
+                slot_consuming=False,
+                work_done=False,
+                detail="active recovery backoff",
+                task=task,
+            )
+        no_progress_attention = _maybe_park_watch_no_progress(
+            config=self.config,
+            store=self.store,
+            subject_task=task,
+            action=pending_action,
+            action_task=task,
+            failed_task=None,
+            no_progress_cycles=self.config.watch.no_progress_cycles,
+        )
+        if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
+            _maybe_emit_active_watch_recovery_backoff(
+                store=self.store,
+                log=self.log,
+                subject_task=task,
+                action=pending_action,
+            )
+            self._exclude_pending_dispatch_candidate_for_pass(str(task.id))
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="launch_blocked",
+                slot_consuming=False,
+                work_done=False,
+                detail="transient recovery backoff",
+                task=task,
+            )
+        if no_progress_attention is not None:
+            self.log.emit_attention(
+                attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
+                message=_watch_needs_attention_message(task, no_progress_attention),
+            )
+            self._exclude_pending_dispatch_candidate_for_pass(str(task.id))
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="launch_blocked",
+                slot_consuming=False,
+                work_done=False,
+                detail=str(no_progress_attention.get("needs_attention_reason", "watch-no-progress")),
+                task=task,
+            )
+
+        try:
+            permit = launch_permit(self.config, self.store)
+        except MaxConcurrentTasksError as exc:
+            self.log.emit(
+                "SKIP",
+                f"{task.id}: {exc}",
+                dedupe_key=f"watch-max-concurrent:{task_type}:{task.id}",
+            )
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="local_capacity_blocked",
+                slot_consuming=False,
+                work_done=False,
+                detail=str(exc),
+                task=task,
+            )
+
+        settle_task_before: _WatchDispatchTaskSnapshot | None
+        dedupe_suffix: str
+        if task_type == "implement":
+            prepared_task = _prepare_task_for_immediate_execution(
+                self.config,
+                task,
+                rollback_on_failure=False,
+            )
+            if prepared_task is None:
+                permit.release()
+                self.log.emit(
+                    "START_FAILED",
+                    f"{task.id} {task_type}: iterate startup preparation failed",
+                    dedupe_key=f"prepare-iterate-failed:{task.id}",
+                )
+                self._exclude_pending_dispatch_candidate_for_pass(str(task.id))
+                return ProjectDispatchResult(
+                    runtime_key=self.key,
+                    candidate=candidate,
+                    status="launch_blocked",
+                    slot_consuming=False,
+                    work_done=True,
+                    detail="iterate startup preparation failed",
+                    task=task,
+                )
+            reserve_task_launch_permit(str(prepared_task.id), permit)
+            settle_task_before = _snapshot_watch_dispatch_task(prepared_task)
+            pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
+            iterate_args = argparse.Namespace(
+                max_iterations=max_iterations,
+                no_docker=False,
+                resume=False,
+                retry=False,
+                auto_iterate=True,
+            )
+            rc = _spawn_worker_with_failure_log(
+                quiet=quiet,
+                log=self.log,
+                failure_message=f"{task.id} {task_type}: iterate worker spawn failed",
+                dedupe_key=f"spawn-iterate-failed:{task.id}",
+                spawn_fn=lambda: _spawn_background_iterate(
+                    iterate_args,
+                    self.config,
+                    task,
+                    prepared_task_id=str(prepared_task.id),
+                    prepared_resume=pending_recovery_mode == "resume",
+                    prepared_phase="preloop",
+                    startup_quiet=True,
+                ),
+            )
+            release_task_launch_permit(str(prepared_task.id))
+            dedupe_suffix = "iterate"
+        else:
+            settle_task_before = _snapshot_watch_dispatch_task(task)
+            worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+            rc = _spawn_worker_with_failure_log(
+                quiet=quiet,
+                log=self.log,
+                failure_message=f"{task.id} {task_type}: worker spawn failed",
+                dedupe_key=f"spawn-worker-failed:{task.id}",
+                spawn_fn=lambda: _spawn_background_worker(
+                    worker_args,
+                    self.config,
+                    task_id=task.id,
+                    quiet=quiet,
+                    startup_quiet=True,
+                ),
+            )
+            permit.release()
+            dedupe_suffix = "worker"
+        if rc != 0:
+            self._exclude_pending_dispatch_candidate_for_pass(str(task.id))
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="launch_blocked",
+                slot_consuming=False,
+                work_done=False,
+                detail=f"{task_type} worker spawn failed",
+                task=task,
+            )
+
+        deferred = _DeferredWatchDispatchStart(
+            settle=_PendingWatchDispatchSettle(
+                task_id=str(task.id),
+                task_before=settle_task_before,
+                start_label=f"{task.id} {task_type}",
+                dedupe_key=f"pending-undispatched:{task.id}:{dedupe_suffix}",
+            ),
+            subject_task=task,
+            action=pending_action,
+            action_task_before=task,
+            failed_task=None,
+            owner_task_id=task.id,
+            action_type=str(task_type),
+            start_message=_format_start_line(task),
+        )
+        [settle_result] = self.settle_dispatch_starts([deferred.settle])
+        started, no_progress_attention = _emit_deferred_watch_dispatch_outcome(
+            config=self.config,
+            store=self.store,
+            log=self.log,
+            deferred=deferred,
+            settle_result=settle_result,
+        )
+        if no_progress_attention is not None:
+            self.log.emit_attention(
+                attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
+                message=_watch_needs_attention_message(task, no_progress_attention),
+            )
+        if started:
+            self._confirmed_started_task_ids.add(str(task.id))
+            self._exclude_pending_dispatch_candidate_for_pass(str(task.id))
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="live",
+                slot_consuming=True,
+                work_done=True,
+                dispatch_budget_consuming=True,
+                task=settle_result.task,
+            )
+        self._exclude_pending_dispatch_candidate_for_pass(str(task.id))
+        if settle_result.status is _DispatchSettleStatus.TERMINAL_BEFORE_RUNNING:
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="terminal_before_running",
+                slot_consuming=False,
+                work_done=False,
+                detail=settle_result.reason,
+                task=settle_result.task,
+            )
+        return ProjectDispatchResult(
+            runtime_key=self.key,
+            candidate=candidate,
+            status="no_live_proof",
+            slot_consuming=False,
+            work_done=False,
+            detail=settle_result.reason,
+            task=settle_result.task,
         )
 
 
