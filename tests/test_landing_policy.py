@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -22,13 +23,28 @@ def _counting_judge(verdict: LandingJudgeVerdict) -> tuple[Callable[[], LandingJ
     return judge, calls
 
 
+def _review(**overrides: Any) -> LandingReviewEvidence:
+    values: dict[str, Any] = {
+        "status": "completed",
+        "mode": "plain_full",
+        "verdict": "APPROVED",
+        "current": True,
+        "parseable": True,
+        "identity_matched": True,
+        "review_id": "gza-200",
+        "reviewed_head": "source",
+    }
+    values.update(overrides)
+    return LandingReviewEvidence(**values)
+
+
 def test_guarded_current_changes_requested_reaches_exactly_one_judge() -> None:
     judge, calls = _counting_judge("LAND")
 
     decision = classify_landing_review_policy(
         policy="guarded",
-        review=LandingReviewEvidence(mode="plain_full", verdict="CHANGES_REQUESTED"),
-        open_blockers=(LandingOpenBlocker("B1", deferrable=True),),
+        review=_review(mode="plain_full", verdict="CHANGES_REQUESTED"),
+        open_blockers=(LandingOpenBlocker("B1", deferrable=True, blocker_class="adjacent"),),
         judge=judge,
     )
 
@@ -43,8 +59,8 @@ def test_strict_current_changes_requested_is_nondeferrable_without_judge() -> No
 
     decision = classify_landing_review_policy(
         policy="strict",
-        review=LandingReviewEvidence(mode="resolution", verdict="CHANGES_REQUESTED"),
-        open_blockers=(LandingOpenBlocker("B1", deferrable=True),),
+        review=_review(mode="resolution", verdict="CHANGES_REQUESTED"),
+        open_blockers=(LandingOpenBlocker("B1", deferrable=True, blocker_class="adjacent"),),
         judge=judge,
     )
 
@@ -58,8 +74,32 @@ def test_guarded_nondeferrable_blocker_stops_before_judge() -> None:
 
     decision = classify_landing_review_policy(
         policy="guarded",
-        review=LandingReviewEvidence(mode="plain_full", verdict="CHANGES_REQUESTED"),
+        review=_review(mode="plain_full", verdict="CHANGES_REQUESTED"),
         open_blockers=(LandingOpenBlocker("B1", deferrable=False),),
+        judge=judge,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason_code == "nondeferrable-blocker"
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    (
+        LandingOpenBlocker("B1", deferrable=True),
+        LandingOpenBlocker("B1", deferrable=True, blocker_class="unknown"),
+    ),
+)
+def test_guarded_omitted_or_unknown_blocker_class_stops_before_judge(
+    blocker: LandingOpenBlocker,
+) -> None:
+    judge, calls = _counting_judge("LAND")
+
+    decision = classify_landing_review_policy(
+        policy="guarded",
+        review=_review(mode="plain_full", verdict="CHANGES_REQUESTED"),
+        open_blockers=(blocker,),
         judge=judge,
     )
 
@@ -85,8 +125,8 @@ def test_guarded_judge_verdicts_map_to_declared_outcomes(
 
     decision = classify_landing_review_policy(
         policy="guarded",
-        review=LandingReviewEvidence(mode="resolution", verdict="CHANGES_REQUESTED"),
-        open_blockers=(LandingOpenBlocker("B1", deferrable=True),),
+        review=_review(mode="resolution", verdict="CHANGES_REQUESTED"),
+        open_blockers=(LandingOpenBlocker("B1", deferrable=True, blocker_class="adjacent"),),
         judge=judge,
     )
 
@@ -100,14 +140,17 @@ def test_guarded_judge_verdicts_map_to_declared_outcomes(
     "review",
     [
         None,
-        LandingReviewEvidence(current=False, verdict="CHANGES_REQUESTED"),
-        LandingReviewEvidence(parseable=False, verdict="CHANGES_REQUESTED"),
-        LandingReviewEvidence(mode="unknown", verdict="CHANGES_REQUESTED"),
-        LandingReviewEvidence(verdict="NEEDS_DISCUSSION"),
-        LandingReviewEvidence(status="failed", verdict="CHANGES_REQUESTED"),
-        LandingReviewEvidence(status="unavailable", verdict="CHANGES_REQUESTED"),
-        LandingReviewEvidence(identity_matched=False, verdict="CHANGES_REQUESTED"),
-        LandingReviewEvidence(verdict=None),
+        _review(current=False, verdict="CHANGES_REQUESTED"),
+        _review(parseable=False, verdict="CHANGES_REQUESTED"),
+        _review(mode="unknown", verdict="CHANGES_REQUESTED"),
+        _review(verdict="NEEDS_DISCUSSION"),
+        _review(status="failed", verdict="CHANGES_REQUESTED"),
+        _review(status="unavailable", verdict="CHANGES_REQUESTED"),
+        _review(identity_matched=False, verdict="CHANGES_REQUESTED"),
+        _review(review_id=None, verdict="CHANGES_REQUESTED"),
+        _review(reviewed_head=None, verdict="CHANGES_REQUESTED"),
+        _review(reviewed_head="other", verdict="CHANGES_REQUESTED"),
+        _review(verdict=None),
     ],
 )
 def test_unusable_reviews_remain_required_review_unavailable_without_judge(
@@ -118,7 +161,7 @@ def test_unusable_reviews_remain_required_review_unavailable_without_judge(
     decision = classify_landing_review_policy(
         policy="guarded",
         review=review,
-        open_blockers=(LandingOpenBlocker("B1", deferrable=True),),
+        open_blockers=(LandingOpenBlocker("B1", deferrable=True, blocker_class="adjacent"),),
         judge=judge,
     )
 
