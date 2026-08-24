@@ -12,13 +12,10 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
 import gza.colors as _colors
-from gza.query import (
-    get_base_task_slug as _get_base_task_slug,
-    get_reviews_for_root as _get_reviews_for_root,
-)
+from gza.query import get_base_task_slug as _get_base_task_slug
 
 from ..advance_engine import (
     IMPROVE_ACTION_REASON_REVIEW_CHANGES_REQUESTED,
@@ -48,7 +45,6 @@ from ..db import (
     DB_UNSET,
     MERGE_SOURCE_ADVANCE,
     MERGE_SOURCE_MANUAL,
-    MERGE_SOURCE_MANUAL_FORCE,
     MERGE_SOURCE_MAX_CYCLES_DEFERRED,
     DuplicateActiveChildError,
     MergeTargetResolutionError,
@@ -90,7 +86,25 @@ from ..main_integration_verify import (
     promote_candidate_integration_verify_evidence,
     verify_gate_enabled,
 )
-from ..merge_state import resolve_task_merge_source, resolve_task_merge_state_for_target
+from ..merge_services import (
+    ManualMergeExecutionHooks,
+    ManualMergeExecutionRequest,
+    ManualMergeExecutionResult,
+    MergeDeferredBlockerDecision as _MergeDeferredBlockerDecision,
+    ResolvedMergeSubject as _ResolvedMergeSubject,
+    classify_manual_merge_blockers,
+    execute_manual_merge,
+    latest_completed_review_for_merge_subject,
+    manual_force_merge_source,
+    mark_merge_subject_merged,
+    materialize_merge_deferred_blockers,
+    materialize_merge_followups,
+    resolve_fresh_merge_source,
+    resolve_merge_subject,
+    resolve_merge_subject_query_only,
+    resolve_merge_target_task,
+)
+from ..merge_state import resolve_task_merge_state_for_target
 from ..pickup import (
     count_worker_consuming_actions,
     get_runnable_pending_tasks,
@@ -291,27 +305,6 @@ def _print_mixed_recovery_preview_entries(
 
 
 @dataclass(frozen=True)
-class _ResolvedMergeSubject:
-    trigger_task: DbTask
-    execution_task: DbTask
-    merge_subject: DbTask
-    merge_unit_id: str | None
-    merge_branch: str | None
-    merge_source_ref: str | None
-    merge_source_warning: str | None
-    merge_member_tasks: tuple[DbTask, ...] = ()
-    merge_resolution_warning: str | None = None
-
-
-@dataclass(frozen=True)
-class _MergeDeferredBlockerDecision:
-    review_task: DbTask | None
-    blockers: tuple[ReviewFinding, ...]
-    should_materialize: bool
-    refusal_message: str | None = None
-
-
-@dataclass(frozen=True)
 class _CandidateVerifyPromotionProof:
     blocked_status: Literal["blocked_candidate_verify", "blocked_candidate_verify_unavailable"]
     block_reason: str
@@ -329,20 +322,11 @@ def _materialize_merge_followups(
     merge_subject: DbTask,
 ) -> tuple[list[DbTask], list[DbTask]]:
     """Create or reuse FOLLOWUP tasks for the latest completed review on a merged task."""
-    review_task = _latest_completed_review_for_merge_subject(store, merge_subject)
-    if review_task is None:
-        return ([], [])
-    report = get_review_report(config.project_dir, review_task)
-    findings = tuple(finding for finding in report.findings if finding.severity == "FOLLOWUP")
-    if not findings:
-        return ([], [])
-    return _create_or_reuse_followup_tasks(
+    return materialize_merge_followups(
         store,
-        config=config,
-        review_task=review_task,
-        impl_task=merge_subject,
-        findings=findings,
-        trigger_source="manual",
+        config,
+        merge_subject,
+        create_followups=_create_or_reuse_followup_tasks,
     )
 
 
@@ -350,16 +334,7 @@ def _latest_completed_review_for_merge_subject(
     store: SqliteTaskStore,
     merge_subject: DbTask,
 ) -> DbTask | None:
-    if merge_subject.id is None:
-        return None
-    return next(
-        (
-            review
-            for review in _get_reviews_for_root(store, merge_subject)
-            if review.status == "completed" and review.completed_at is not None
-        ),
-        None,
-    )
+    return latest_completed_review_for_merge_subject(store, merge_subject)
 
 
 def _classify_manual_merge_blockers(
@@ -369,80 +344,14 @@ def _classify_manual_merge_blockers(
     merge_subject: DbTask,
     defer_blockers: bool,
 ) -> _MergeDeferredBlockerDecision:
-    review_task = _latest_completed_review_for_merge_subject(store, merge_subject)
-    if review_task is None:
-        return _MergeDeferredBlockerDecision(
-            review_task=None,
-            blockers=(),
-            should_materialize=False,
-        )
-
-    report = get_review_report(config.project_dir, review_task)
-    review_content = get_review_content(config.project_dir, review_task)
-    if report.verdict != "CHANGES_REQUESTED":
-        return _MergeDeferredBlockerDecision(
-            review_task=review_task,
-            blockers=(),
-            should_materialize=False,
-        )
-
-    if declares_spec_coherence_review_mode(review_task.review_scope):
-        assert merge_subject.id is not None
-        assert review_task.id is not None
-        return _MergeDeferredBlockerDecision(
-            review_task=review_task,
-            blockers=(),
-            should_materialize=False,
-            refusal_message=(
-                f"Error: Task {merge_subject.id} has behavior-spec coherence "
-                f"CHANGES_REQUESTED review {review_task.id}; review blockers from "
-                "behavior-spec coherence reviews are not deferable."
-            ),
-        )
-
-    blockers = tuple(finding for finding in report.findings if finding.severity == "BLOCKER")
-    if not blockers:
-        assert merge_subject.id is not None
-        assert review_task.id is not None
-        return _MergeDeferredBlockerDecision(
-            review_task=review_task,
-            blockers=(),
-            should_materialize=False,
-            refusal_message=(
-                f"Error: Task {merge_subject.id} has CHANGES_REQUESTED review {review_task.id}, "
-                "but no parsed BLOCKER findings were available to defer. Refusing to guess."
-            ),
-        )
-
-    assert merge_subject.id is not None
-    assert review_task.id is not None
-    summary = summarize_review_blockers(review_content)
-    if summary.blocker_count != len(blockers):
-        return _MergeDeferredBlockerDecision(
-            review_task=review_task,
-            blockers=(),
-            should_materialize=False,
-            refusal_message=(
-                f"Error: Task {merge_subject.id} has CHANGES_REQUESTED review {review_task.id}, "
-                "but blocker classification did not match the parsed blocker set. Refusing to guess."
-            ),
-        )
-
-    if defer_blockers:
-        return _MergeDeferredBlockerDecision(
-            review_task=review_task,
-            blockers=blockers,
-            should_materialize=True,
-        )
-
-    return _MergeDeferredBlockerDecision(
-        review_task=review_task,
-        blockers=blockers,
-        should_materialize=False,
-        refusal_message=(
-            f"Error: Task {merge_subject.id} has open BLOCKER findings in review {review_task.id}.\n"
-            "Use --defer-blockers to merge anyway and create urgent PR-required follow-up tasks."
-        ),
+    return classify_manual_merge_blockers(
+        store=store,
+        config=config,
+        merge_subject=merge_subject,
+        defer_blockers=defer_blockers,
+        load_review_report=get_review_report,
+        load_review_content=get_review_content,
+        summarize_blockers=summarize_review_blockers,
     )
 
 
@@ -453,25 +362,20 @@ def _materialize_merge_deferred_blockers(
     *,
     defer_blockers: bool,
 ) -> tuple[list[DbTask], list[DbTask]] | None:
-    decision = _classify_manual_merge_blockers(
-        store=store,
-        config=config,
-        merge_subject=merge_subject,
-        defer_blockers=defer_blockers,
-    )
-    if decision.refusal_message is not None:
-        print(decision.refusal_message)
-        return None
-    if not decision.should_materialize or decision.review_task is None or not decision.blockers:
-        return ([], [])
-    return _create_or_reuse_deferred_blocker_tasks(
+    materialization = materialize_merge_deferred_blockers(
         store,
-        config=config,
-        review_task=decision.review_task,
-        impl_task=merge_subject,
-        findings=decision.blockers,
-        trigger_source="manual",
+        config,
+        merge_subject,
+        defer_blockers=defer_blockers,
+        create_deferred_blockers=_create_or_reuse_deferred_blocker_tasks,
+        load_review_report=get_review_report,
+        load_review_content=get_review_content,
+        summarize_blockers=summarize_review_blockers,
     )
+    if materialization.decision.refusal_message is not None:
+        print(materialization.decision.refusal_message)
+        return None
+    return materialization.tasks
 
 
 def _print_deferred_blocker_tasks(
@@ -886,11 +790,21 @@ def _coerce_merge_single_task_result(result: int | _MergeSingleTaskResult) -> _M
     return _MergeSingleTaskResult(rc=result)
 
 
+def _coerce_manual_merge_execution_result(result: ManualMergeExecutionResult) -> _MergeSingleTaskResult:
+    return _MergeSingleTaskResult(
+        rc=result.rc,
+        status=result.status,
+        block_reason=result.block_reason,
+        pending_squash_reconcile=cast(
+            _PendingSquashBranchReconcile | None,
+            result.pending_squash_reconcile,
+        ),
+    )
+
+
 def _resolve_fresh_merge_source(git: Git, branch: str | None) -> ResolvedMergeSourceRef:
     """Return the local-only merge source ref used by lifecycle merge execution."""
-    if not branch:
-        return ResolvedMergeSourceRef(None)
-    return resolve_task_merge_source(git, branch)
+    return resolve_fresh_merge_source(git, branch)
 
 
 def _task_is_already_merged(store: SqliteTaskStore, task: DbTask) -> bool:
@@ -1500,25 +1414,7 @@ def _resolve_merge_target_task(
     task_id: str,
     target_branch: str,
 ) -> DbTask | None:
-    task = store.get(task_id)
-    if task is None:
-        return None
-    if task.id is None:
-        return task
-    unit = store.resolve_merge_unit_for_task(task.id)
-    if unit is None:
-        unit = store.get_or_create_merge_unit_for_task(task)
-    if unit is None:
-        return task
-    representative = store.resolve_merge_unit_representative_task(
-        unit,
-        preferred_task_id=task.id,
-        require_actionable=True,
-    )
-    if representative is not None:
-        return representative
-    owner = store.resolve_merge_unit_owner_task(unit)
-    return owner or task
+    return resolve_merge_target_task(store, task_id, target_branch)
 
 
 def _resolve_merge_subject(
@@ -1528,53 +1424,7 @@ def _resolve_merge_subject(
     *,
     target_branch: str,
 ) -> _ResolvedMergeSubject | None:
-    trigger_task = store.get(task_id)
-    if trigger_task is None:
-        return None
-    trigger_source = _resolve_fresh_merge_source(git, trigger_task.branch)
-    if trigger_task.id is None:
-        return _ResolvedMergeSubject(
-            trigger_task=trigger_task,
-            execution_task=trigger_task,
-            merge_subject=trigger_task,
-            merge_unit_id=None,
-            merge_branch=trigger_task.branch,
-            merge_source_ref=trigger_source.ref,
-            merge_source_warning=trigger_source.warning,
-        )
-
-    unit = store.resolve_merge_unit_for_task(trigger_task.id)
-    if unit is None and trigger_task.branch:
-        unit = store.get_or_create_merge_unit_for_task(trigger_task)
-    if unit is None:
-        return _ResolvedMergeSubject(
-            trigger_task=trigger_task,
-            execution_task=trigger_task,
-            merge_subject=trigger_task,
-            merge_unit_id=None,
-            merge_branch=trigger_task.branch,
-            merge_source_ref=trigger_source.ref,
-            merge_source_warning=trigger_source.warning,
-        )
-
-    merge_subject = store.resolve_merge_unit_owner_task(unit) or trigger_task
-    execution_task = store.resolve_merge_unit_representative_task(
-        unit,
-        preferred_task_id=trigger_task.id,
-        require_actionable=True,
-    )
-    if execution_task is None:
-        execution_task = trigger_task if trigger_task.branch == unit.source_branch else merge_subject
-    merge_source = _resolve_fresh_merge_source(git, unit.source_branch)
-    return _ResolvedMergeSubject(
-        trigger_task=trigger_task,
-        execution_task=execution_task,
-        merge_subject=merge_subject,
-        merge_unit_id=unit.id,
-        merge_branch=unit.source_branch,
-        merge_source_ref=merge_source.ref,
-        merge_source_warning=merge_source.warning,
-    )
+    return resolve_merge_subject(store, git, task_id, target_branch=target_branch)
 
 
 def _resolve_merge_subject_query_only(
@@ -1585,79 +1435,7 @@ def _resolve_merge_subject_query_only(
     target_branch: str,
 ) -> _ResolvedMergeSubject | None:
     """Resolve a merge subject without creating or backfilling merge-unit state."""
-    trigger_task = store.get(task_id)
-    if trigger_task is None:
-        return None
-    trigger_source = _resolve_fresh_merge_source(git, trigger_task.branch)
-    if trigger_task.id is None:
-        return _ResolvedMergeSubject(
-            trigger_task=trigger_task,
-            execution_task=trigger_task,
-            merge_subject=trigger_task,
-            merge_unit_id=None,
-            merge_branch=trigger_task.branch,
-            merge_source_ref=trigger_source.ref,
-            merge_source_warning=trigger_source.warning,
-        )
-
-    unit = store.resolve_merge_unit_for_task(trigger_task.id)
-    plan_result = store.resolve_merge_unit_plan_result_for_task(trigger_task, target_branch=target_branch)
-    if plan_result.diagnostic is not None:
-        return _ResolvedMergeSubject(
-            trigger_task=trigger_task,
-            execution_task=trigger_task,
-            merge_subject=trigger_task,
-            merge_unit_id=None,
-            merge_branch=trigger_task.branch,
-            merge_source_ref=trigger_source.ref,
-            merge_source_warning=trigger_source.warning,
-            merge_resolution_warning=plan_result.diagnostic.message,
-        )
-    plan = plan_result.plan
-    if unit is None and plan is None:
-        return _ResolvedMergeSubject(
-            trigger_task=trigger_task,
-            execution_task=trigger_task,
-            merge_subject=trigger_task,
-            merge_unit_id=None,
-            merge_branch=trigger_task.branch,
-            merge_source_ref=trigger_source.ref,
-            merge_source_warning=trigger_source.warning,
-        )
-
-    if plan is not None:
-        merge_subject = plan.owner_task
-        execution_task = plan.representative_task
-        merge_unit_id = plan.unit.id if plan.unit is not None else None
-        merge_branch = plan.source_branch
-        merge_member_tasks = plan.effective_member_tasks
-    else:
-        assert unit is not None
-        merge_subject = store.resolve_merge_unit_owner_task(unit) or trigger_task
-        execution_task_candidate = store.resolve_merge_unit_representative_task(
-            unit,
-            preferred_task_id=trigger_task.id,
-            require_actionable=True,
-        )
-        execution_task = (
-            execution_task_candidate
-            if execution_task_candidate is not None
-            else trigger_task if trigger_task.branch == unit.source_branch else merge_subject
-        )
-        merge_unit_id = unit.id
-        merge_branch = unit.source_branch
-        merge_member_tasks = ()
-    merge_source = _resolve_fresh_merge_source(git, merge_branch)
-    return _ResolvedMergeSubject(
-        trigger_task=trigger_task,
-        execution_task=execution_task,
-        merge_subject=merge_subject,
-        merge_unit_id=merge_unit_id,
-        merge_branch=merge_branch,
-        merge_source_ref=merge_source.ref,
-        merge_source_warning=merge_source.warning,
-        merge_member_tasks=tuple(merge_member_tasks),
-    )
+    return resolve_merge_subject_query_only(store, git, task_id, target_branch=target_branch)
 
 
 def _merge_option_relationship_error(args: argparse.Namespace) -> str | None:
@@ -1741,21 +1519,15 @@ def _merge_single_task(
             if deferred_blockers is None:
                 return _MergeSingleTaskResult(rc=1)
             _print_deferred_blocker_tasks(merge_subject, deferred_blockers)
-            if (
-                merge_source == MERGE_SOURCE_MANUAL
-                and (deferred_blockers[0] or deferred_blockers[1])
-            ):
-                merge_source = MERGE_SOURCE_MANUAL_FORCE
+            if deferred_blockers[0] or deferred_blockers[1]:
+                merge_source = manual_force_merge_source(merge_source)
 
-        if merge_unit_id is not None:
-            store.set_merge_unit_state(
-                merge_unit_id,
-                "merged",
-                merged_by_task_id=merge_subject.id,
-                merge_source=merge_source,
-            )
-        else:
-            store.set_merge_status(merge_subject.id, "merged")
+        mark_merge_subject_merged(
+            store,
+            merge_subject=merge_subject,
+            merge_unit_id=merge_unit_id,
+            merge_source=merge_source,
+        )
         if not getattr(args, "no_followups", False):
             created_followups, reused_followups = _materialize_merge_followups(store, config, merge_subject)
             for followup_task in created_followups:
@@ -1829,11 +1601,7 @@ def _merge_single_task(
                     f"{description}. Red verify gates require --force --ignore-verify-gate."
                 )
                 return _MergeSingleTaskResult(rc=1)
-            effective_merge_source = (
-                MERGE_SOURCE_MANUAL_FORCE
-                if merge_source == MERGE_SOURCE_MANUAL
-                else merge_source
-            )
+            effective_merge_source = manual_force_merge_source(merge_source)
             proof = planned_action["red_verify_gate_proof"]
             failing_head = str(proof["reviewed_head_sha"])
             verify_command = str(proof["verify_command"])
@@ -1867,11 +1635,7 @@ def _merge_single_task(
                 return _MergeSingleTaskResult(rc=1)
             _print_deferred_blocker_tasks(merge_subject, pregate_deferred_blockers)
             pregate_deferred_blockers_printed = True
-            effective_merge_source = (
-                MERGE_SOURCE_MANUAL_FORCE
-                if merge_source == MERGE_SOURCE_MANUAL
-                else merge_source
-            )
+            effective_merge_source = manual_force_merge_source(merge_source)
             description = str(planned_action.get("description") or "merge is blocked")
             print(f"Warning: Forcing merge despite lifecycle gate: {description}")
         elif is_red_verify_gate_family_action(planned_action):
@@ -1906,11 +1670,7 @@ def _merge_single_task(
             )
             return _MergeSingleTaskResult(rc=1)
         elif getattr(args, "force", False) and classify_advance_action(planned_action) == "needs_attention":
-            effective_merge_source = (
-                MERGE_SOURCE_MANUAL_FORCE
-                if merge_source == MERGE_SOURCE_MANUAL
-                else merge_source
-            )
+            effective_merge_source = manual_force_merge_source(merge_source)
             description = str(planned_action.get("description") or "merge is blocked")
             print(f"Warning: Forcing merge despite lifecycle gate: {description}")
         else:
@@ -1918,148 +1678,77 @@ def _merge_single_task(
             print(f"Error: {description}")
             return _MergeSingleTaskResult(rc=1)
 
-    # Check if branch already merged
-    if git.is_merged(merge_source_ref, current_branch):
-        default_branch = git.default_branch()
-        if current_branch != default_branch and not git.is_merged(merge_source_ref, default_branch):
-            print(
-                f"Error: Branch '{merge_source_ref}' is already merged into current branch "
-                f"'{current_branch}', but still unmerged from default branch '{default_branch}'"
-            )
-        else:
-            print(f"Error: Branch '{merge_source_ref}' is already merged into {current_branch}")
-        return _MergeSingleTaskResult(rc=1)
-
-    # Check for uncommitted changes (untracked files are OK, they won't conflict with merge)
-    if git.has_changes(include_untracked=False):
-        print("Error: You have uncommitted changes. Please commit or stash them first.")
-        return _MergeSingleTaskResult(
-            rc=1,
-            status="blocked_dirty_checkout",
-            block_reason="main checkout has uncommitted changes",
+    def _build_commit_message(subject: DbTask) -> str:
+        assert subject.id is not None, "Task ID must be set before squash merge commit"
+        return build_task_commit_message(
+            subject.prompt,
+            task_id=subject.id,
+            task_slug=subject.slug,
+            subject_prefix="Squash merge: ",
         )
 
-    merge_preflight_target = merge_preflight_ref or current_branch
-    if not git.can_merge(merge_source_ref, merge_preflight_target):
-        print(
-            f"Error: Branch '{merge_source_ref}' has conflicts against '{merge_preflight_target}' "
-            "and cannot be merged cleanly."
-        )
-        print(f"Run: uv run gza rebase {merge_subject.id} --resolve")
-        print(f"Or preview the lifecycle action with: uv run gza advance {merge_subject.id} --dry-run")
-        return _MergeSingleTaskResult(
-            rc=1,
-            status="merge_conflict",
-            block_reason=f"branch '{merge_source_ref}' conflicts against '{merge_preflight_target}'",
+    def _reconcile_squash(git_to_reconcile: Git, branch: str, squash_oid: str, state: Any) -> SquashBranchReconcileResult:
+        pending = state if isinstance(state, _PendingSquashBranchReconcile) else None
+        return _reconcile_squash_merged_branch_with_origin(
+            git_to_reconcile,
+            branch=branch,
+            squash_oid=squash_oid,
+            pre_squash_local_oid=pending.pre_squash_local_oid if pending is not None else None,
+            pre_squash_remote_oid=pending.pre_squash_remote_oid if pending is not None else None,
+            remote=pending.remote if pending is not None else "origin",
         )
 
-    if materialize_side_effects:
-        deferred_blockers = pregate_deferred_blockers
-        if deferred_blockers is None:
-            deferred_blockers = _materialize_merge_deferred_blockers(
+    def _print_followups(subject: DbTask, followups: tuple[list[DbTask], list[DbTask]]) -> None:
+        created_followups, reused_followups = followups
+        for followup_task in created_followups:
+            print(f"FOLLOW {followup_task.id} created from {subject.id}")
+        for followup_task in reused_followups:
+            print(f"FOLLOW {followup_task.id} reused from {subject.id}")
+
+    result = execute_manual_merge(
+        ManualMergeExecutionRequest(
+            store=store,
+            config=config,
+            git=git,
+            merge_subject=merge_subject,
+            merge_unit_id=merge_unit_id,
+            merge_branch=merge_branch,
+            merge_source_ref=merge_source_ref,
+            current_branch=current_branch,
+            merge_source=effective_merge_source,
+            merge_preflight_target=merge_preflight_ref or current_branch,
+            squash=getattr(args, "squash", False),
+            delete_branch=getattr(args, "delete", False),
+            no_followups=getattr(args, "no_followups", False),
+            quiet_mechanics=quiet_mechanics,
+            materialize_side_effects=materialize_side_effects,
+            pre_materialized_deferred_blockers=pregate_deferred_blockers,
+            pre_materialized_deferred_blockers_printed=pregate_deferred_blockers_printed,
+        ),
+        ManualMergeExecutionHooks(
+            build_commit_message=_build_commit_message,
+            capture_pre_squash_reconcile_state=lambda git_to_capture, branch: _capture_pre_squash_reconcile_state(
+                git_to_capture,
+                branch=branch,
+            ),
+            reconcile_squash_merge=_reconcile_squash,
+            print_squash_reconcile_result=lambda reconcile_result, suppress_success: _print_squash_reconcile_result(
+                reconcile_result,
+                suppress_success=suppress_success,
+            ),
+            rev_parse_head=lambda git_to_parse: _rev_parse_if_supported(git_to_parse, "HEAD"),
+            materialize_deferred_blockers=lambda subject: _materialize_merge_deferred_blockers(
                 store,
                 config,
-                merge_subject,
+                subject,
                 defer_blockers=getattr(args, "defer_blockers", False),
-            )
-        if deferred_blockers is None:
-            return _MergeSingleTaskResult(rc=1)
-        if not pregate_deferred_blockers_printed:
-            _print_deferred_blocker_tasks(merge_subject, deferred_blockers)
-
-    # Perform the merge or rebase
-    try:
-        pending_squash_reconcile: _PendingSquashBranchReconcile | None = None
-        # Regular merge or squash merge
-        if not quiet_mechanics:
-            print(f"Merging '{merge_source_ref}' into '{current_branch}'...")
-
-        # For squash merge, create a commit message from the task
-        commit_message = None
-        if args.squash:
-            assert merge_subject.id is not None, "Task ID must be set before squash merge commit"
-            commit_message = build_task_commit_message(
-                merge_subject.prompt,
-                task_id=merge_subject.id,
-                task_slug=merge_subject.slug,
-                subject_prefix="Squash merge: ",
-            )
-
-        pre_squash_local_oid = None
-        pre_squash_remote_oid = None
-        if args.squash:
-            pre_squash_local_oid = _rev_parse_if_exists_if_supported(git, f"refs/heads/{merge_branch}")
-            pre_squash_remote_oid = _rev_parse_if_exists_if_supported(git, f"refs/remotes/origin/{merge_branch}")
-
-        git.merge(merge_source_ref, squash=args.squash, commit_message=commit_message)
-
-        if args.squash:
-            squash_oid = _rev_parse_if_supported(git, "HEAD")
-            if squash_oid is not None and git.repo_dir == config.project_dir:
-                _print_squash_reconcile_result(
-                    _reconcile_squash_merged_branch_with_origin(
-                        git,
-                        branch=merge_branch,
-                        squash_oid=squash_oid,
-                        pre_squash_local_oid=pre_squash_local_oid,
-                        pre_squash_remote_oid=pre_squash_remote_oid,
-                    ),
-                    suppress_success=quiet_mechanics,
-                )
-            elif squash_oid is not None:
-                pending_squash_reconcile = _PendingSquashBranchReconcile(
-                    branch=merge_branch,
-                    pre_squash_local_oid=pre_squash_local_oid,
-                    pre_squash_remote_oid=pre_squash_remote_oid,
-                )
-            if not quiet_mechanics:
-                print(f"✓ Successfully squash merged {merge_source_ref} and created commit")
-        else:
-            if not quiet_mechanics:
-                print(f"✓ Successfully merged {merge_source_ref}")
-
-        # Delete branch if requested
-        if args.delete:
-            try:
-                git.delete_branch(merge_branch)
-                print(f"✓ Deleted branch {merge_branch}")
-            except GitError as e:
-                print(f"Warning: Could not delete branch: {e}")
-
-        if git.repo_dir == config.project_dir and materialize_side_effects:
-            if merge_unit_id is not None:
-                store.set_merge_unit_state(
-                    merge_unit_id,
-                    "merged",
-                    merged_by_task_id=merge_subject.id,
-                    merge_source=effective_merge_source,
-                )
-            else:
-                store.set_merge_status(merge_subject.id, "merged")
-            if not getattr(args, "no_followups", False):
-                created_followups, reused_followups = _materialize_merge_followups(store, config, merge_subject)
-                for followup_task in created_followups:
-                    print(f"FOLLOW {followup_task.id} created from {merge_subject.id}")
-                for followup_task in reused_followups:
-                    print(f"FOLLOW {followup_task.id} reused from {merge_subject.id}")
-        return _MergeSingleTaskResult(rc=0, pending_squash_reconcile=pending_squash_reconcile)
-
-    except GitError as e:
-        operation = "merge"
-
-        print(f"Error during {operation} for {merge_subject.id} (branch {merge_branch}): {e}")
-        print(f"\nAborting {operation} for {merge_subject.id} (branch {merge_branch}) and restoring clean state...")
-        try:
-            try:
-                git.merge_abort()
-                print("✓ Merge aborted, working directory restored")
-            except GitError:
-                # Failed squash merges can leave tracked files dirty without MERGE_HEAD.
-                git.reset_hard_head()
-                print("✓ Merge cleanup reset tracked files to HEAD")
-        except GitError as abort_error:
-            print(f"Warning: Could not abort {operation} for {merge_subject.id} (branch {merge_branch}): {abort_error}")
-        return _MergeSingleTaskResult(rc=1)
+            ),
+            print_deferred_blockers=_print_deferred_blocker_tasks,
+            materialize_followups=lambda subject: _materialize_merge_followups(store, config, subject),
+            print_followups=_print_followups,
+        ),
+    )
+    return _coerce_manual_merge_execution_result(result)
 
 
 def cmd_merge(args: argparse.Namespace) -> int:
@@ -3502,15 +3191,12 @@ def _finalize_staged_isolated_merge_action(
             suppress_success=quiet_mechanics,
         )
     effective_merge_source = merge_source_for_action(staged.merge_action_metadata, merge_source)
-    if staged.merge_unit_id is not None:
-        store.set_merge_unit_state(
-            staged.merge_unit_id,
-            "merged",
-            merged_by_task_id=staged.merge_subject.id,
-            merge_source=effective_merge_source,
-        )
-    else:
-        store.set_merge_status(staged.merge_subject.id, "merged")
+    mark_merge_subject_merged(
+        store,
+        merge_subject=staged.merge_subject,
+        merge_unit_id=staged.merge_unit_id,
+        merge_source=effective_merge_source,
+    )
     return _MergeActionResult(
         rc=0,
         created_followups=created_followups,
@@ -3594,15 +3280,12 @@ def _stage_isolated_merge_action(
         and merge_git.is_merged(resolved_subject.merge_source_ref, merge_current_branch)
     ):
         effective_merge_source = merge_source_for_action(action, merge_source)
-        if resolved_subject.merge_unit_id is not None:
-            store.set_merge_unit_state(
-                resolved_subject.merge_unit_id,
-                "merged",
-                merged_by_task_id=merge_subject.id,
-                merge_source=effective_merge_source,
-            )
-        else:
-            store.set_merge_status(merge_subject.id, "merged")
+        mark_merge_subject_merged(
+            store,
+            merge_subject=merge_subject,
+            merge_unit_id=resolved_subject.merge_unit_id,
+            merge_source=effective_merge_source,
+        )
         return _MergeActionResult(
             rc=0,
             created_followups=[],
@@ -3758,15 +3441,12 @@ def _execute_merge_action(
         and resolved_subject.merge_source_ref
         and execution_git.is_merged(resolved_subject.merge_source_ref, execution_branch)
     ):
-        if resolved_subject.merge_unit_id is not None:
-            store.set_merge_unit_state(
-                resolved_subject.merge_unit_id,
-                "merged",
-                merged_by_task_id=merge_subject.id,
-                merge_source=effective_merge_source,
-            )
-        else:
-            store.set_merge_status(merge_subject.id, "merged")
+        mark_merge_subject_merged(
+            store,
+            merge_subject=merge_subject,
+            merge_unit_id=resolved_subject.merge_unit_id,
+            merge_source=effective_merge_source,
+        )
         return _MergeActionResult(
             rc=0,
             created_followups=created_followups,

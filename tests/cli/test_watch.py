@@ -15089,6 +15089,83 @@ def test_watch_cycle_isolated_batch_already_merged_reconciliation_counts_as_work
     assert log_text.count(f"MERGE     {task.id} -> main") == 1
 
 
+def test_watch_cycle_isolated_batch_late_already_merged_preflight_failure_stops_without_reconciliation(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    later_unstaged = _make_completed_watch_merge_task(
+        store,
+        "Batch must not continue after unreconciled race",
+        branch="feature/watch-batch-unreconciled-race-first",
+    )
+    failing_first = _make_completed_watch_merge_task(
+        store,
+        "Batch unreconciled already-merged race",
+        branch="feature/watch-batch-unreconciled-race-second",
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    git = _make_watch_git()
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "tip-before-unreconciled-race"
+    staged_ids: list[str] = []
+
+    def fake_stage(*_args, **_kwargs):
+        task = _args[3]
+        staged_ids.append(task.id)
+        assert task.id == failing_first.id
+        return _MergeActionResult(
+            rc=1,
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+            status="merged",
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=git),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch("gza.cli.watch.check_candidate_integration_verify") as candidate_verify,
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch") as promote,
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action") as finalize,
+    ):
+        result = _run_cycle_and_emit_transition_events(
+            config=config,
+            store=store,
+            batch=2,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+        )
+
+    assert result.work_done is False
+    assert staged_ids == [failing_first.id]
+    assert (store.get(failing_first.id) or SimpleNamespace()).merge_status == "unmerged"
+    assert (store.get(later_unstaged.id) or SimpleNamespace()).merge_status == "unmerged"
+    candidate_verify.assert_not_called()
+    promote.assert_not_called()
+    finalize.assert_not_called()
+    log_text = log_path.read_text()
+    assert f"ERROR     {failing_first.id}: isolated merge staging failed" in log_text
+    assert "already merged" not in log_text
+    assert "MERGE     " not in log_text
+
+
 def test_watch_cycle_isolated_batch_conflict_reassessment_already_merged_reconciles_and_continues(
     tmp_path: Path,
 ) -> None:

@@ -4,6 +4,7 @@ import argparse
 import sqlite3
 import sys
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from gza.cli.git_ops import (
     _create_or_reuse_deferred_blocker_tasks,
     _execute_merge_action,
     _finalize_staged_isolated_merge_action,
+    _MergeActionResult,
     _merge_single_task,
     _MergeSingleTaskResult,
     _prepare_create_review_action,
@@ -31,6 +33,7 @@ from gza.cli.git_ops import (
     _remove_watch_merge_checkout,
     _resolve_merge_subject,
     _run_task_backed_rebase,
+    _stage_isolated_merge_action,
     _StagedIsolatedMergeAction,
     _tracking_ref_refresh_command,
     cmd_advance,
@@ -42,6 +45,8 @@ from gza.concurrency import launch_permit
 from gza.config import Config
 from gza.db import (
     MERGE_SOURCE_ADVANCE,
+    MERGE_SOURCE_MANUAL,
+    MERGE_SOURCE_MANUAL_FORCE,
     MERGE_SOURCE_MAX_CYCLES_DEFERRED,
     MERGE_SOURCE_WATCH,
     DuplicateActiveChildError,
@@ -58,6 +63,7 @@ from gza.rebase_checkout import StaleRebaseImportError
 from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult, parse_rebase_diff_provenance
 from gza.review_verdict import ReviewFinding
 from gza.review_verify_state import persist_verify_gate_artifact
+from gza.merge_services import ManualMergeExecutionHooks, ManualMergeExecutionRequest, execute_manual_merge
 from gza.worktree_roots import managed_worktree_root_paths
 
 from .conftest import invoke_gza, make_store, setup_config
@@ -177,6 +183,81 @@ def _add_completed_impl_with_approved_review(store, branch: str, *, when: dateti
     review.report_file = "reviews/fake.md"
     store.update(review)
     return task, review
+
+
+def _manual_merge_args(
+    *,
+    force: bool = False,
+    defer_blockers: bool = False,
+    no_followups: bool = False,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        rebase=False,
+        squash=False,
+        delete=False,
+        mark_only=False,
+        force=force,
+        remote=False,
+        resolve=False,
+        defer_blockers=defer_blockers,
+        no_followups=no_followups,
+    )
+
+
+def _manual_merge_service_hooks(events: list[str] | None = None) -> ManualMergeExecutionHooks:
+    sink = events if events is not None else []
+
+    return ManualMergeExecutionHooks(
+        build_commit_message=lambda task: f"Squash merge: {task.id}",
+        capture_pre_squash_reconcile_state=lambda _git, branch: _PendingSquashBranchReconcile(
+            branch=branch,
+            pre_squash_local_oid="local-before",
+            pre_squash_remote_oid="remote-before",
+        ),
+        reconcile_squash_merge=lambda *_args: SquashBranchReconcileResult(status="skipped_no_remote_tracking_ref"),
+        print_squash_reconcile_result=lambda _result, _suppress_success: sink.append("squash-reconcile"),
+        rev_parse_head=lambda _git: "squash-oid",
+        materialize_deferred_blockers=lambda _task: ([], []),
+        print_deferred_blockers=lambda _task, blockers: sink.append(
+            f"deferred:{len(blockers[0])}:{len(blockers[1])}"
+        ),
+        materialize_followups=lambda _task: ([], []),
+        print_followups=lambda _task, followups: sink.append(f"followups:{len(followups[0])}:{len(followups[1])}"),
+        emit=sink.append,
+    )
+
+
+def _manual_merge_service_request(
+    tmp_path: Path,
+    store,
+    git,
+    task,
+    *,
+    merge_source: str = MERGE_SOURCE_MANUAL,
+    materialize_side_effects: bool = True,
+    pre_materialized_deferred_blockers: tuple[list[Any], list[Any]] | None = None,
+    pre_materialized_deferred_blockers_printed: bool = False,
+) -> ManualMergeExecutionRequest:
+    config = Config.load(tmp_path)
+    assert task.id is not None
+    assert task.branch is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    return ManualMergeExecutionRequest(
+        store=store,
+        config=config,
+        git=git,
+        merge_subject=task,
+        merge_unit_id=unit.id,
+        merge_branch=task.branch,
+        merge_source_ref=task.branch,
+        current_branch="main",
+        merge_source=merge_source,
+        merge_preflight_target="main",
+        materialize_side_effects=materialize_side_effects,
+        pre_materialized_deferred_blockers=pre_materialized_deferred_blockers,
+        pre_materialized_deferred_blockers_printed=pre_materialized_deferred_blockers_printed,
+    )
 
 
 def _make_preload_recording_git(tmp_path: Path) -> tuple[MagicMock, list[tuple[tuple[str, ...], str]], list[tuple[str, ...]]]:
@@ -651,6 +732,628 @@ def test_merge_single_task_runs_shared_verify_gate_before_merge(tmp_path: Path) 
     assert determine.call_args.kwargs["selected_for_merge"] is True
     execute_action.assert_called_once()
     git.merge.assert_called_once_with("feature/gated-merge", squash=False, commit_message=None)
+
+
+def test_merge_single_task_normal_merge_uses_shared_preflight_service(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement shared preflight merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/shared-preflight"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        get_diff_name_status=MagicMock(return_value=""),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    config = Config.load(tmp_path)
+
+    with (
+        _force_merge_planner_action(),
+        patch(
+            "gza.cli.git_ops.execute_manual_merge",
+            wraps=execute_manual_merge,
+        ) as execute_merge,
+    ):
+        result = _merge_single_task(task.id, config, store, git, _manual_merge_args(), "main")
+
+    assert result.rc == 0
+    execute_merge.assert_called_once()
+    assert execute_merge.call_args.args[0].merge_source_ref == "feature/shared-preflight"
+    git.merge.assert_called_once_with("feature/shared-preflight", squash=False, commit_message=None)
+
+
+def test_manual_merge_execution_api_normal_merge_marks_merge_unit(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement service merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/service-merge"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    unit = store.get_or_create_merge_unit_for_task(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    events: list[str] = []
+
+    result = execute_manual_merge(
+        _manual_merge_service_request(tmp_path, store, git, task),
+        _manual_merge_service_hooks(events),
+    )
+
+    assert result.rc == 0
+    git.merge.assert_called_once_with("feature/service-merge", squash=False, commit_message=None)
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "merged"
+    assert refreshed_unit.merge_source == MERGE_SOURCE_MANUAL
+    assert events[:2] == ["deferred:0:0", "Merging 'feature/service-merge' into 'main'..."]
+
+
+def test_manual_merge_execution_api_forced_merge_records_force_provenance(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement forced service merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/service-force"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    unit = store.get_or_create_merge_unit_for_task(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+
+    result = execute_manual_merge(
+        _manual_merge_service_request(
+            tmp_path,
+            store,
+            git,
+            task,
+            merge_source=MERGE_SOURCE_MANUAL_FORCE,
+        ),
+        _manual_merge_service_hooks(),
+    )
+
+    assert result.rc == 0
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.merge_source == MERGE_SOURCE_MANUAL_FORCE
+
+
+def test_manual_merge_execution_api_materializes_deferred_blockers_before_merge(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement deferred service merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/service-defer"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    blocker = store.add("Deferred blocker follow-up", task_type="implement")
+    store.get_or_create_merge_unit_for_task(task)
+    events: list[str] = []
+
+    def merge(*_args, **_kwargs):
+        events.append("merge")
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(side_effect=merge),
+    )
+    hooks = _manual_merge_service_hooks(events)
+
+    result = execute_manual_merge(
+        _manual_merge_service_request(
+            tmp_path,
+            store,
+            git,
+            task,
+            pre_materialized_deferred_blockers=([blocker], []),
+        ),
+        hooks,
+    )
+
+    assert result.rc == 0
+    assert result.created_deferred_blockers == [blocker]
+    assert events.index("deferred:1:0") < events.index("merge")
+
+
+def test_manual_merge_execution_api_refuses_spec_coherence_materialization_failure_before_merge(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement spec refusal", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/service-spec-refusal"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    store.get_or_create_merge_unit_for_task(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    hooks = _manual_merge_service_hooks()
+    hooks = replace(hooks, materialize_deferred_blockers=lambda _task: None)
+
+    result = execute_manual_merge(
+        _manual_merge_service_request(tmp_path, store, git, task),
+        hooks,
+    )
+
+    assert result.rc == 1
+    git.merge.assert_not_called()
+    refreshed_unit = store.resolve_merge_unit_for_task(task.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+
+
+def test_manual_merge_execution_api_late_already_merged_refusal_is_not_success_status(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement already merged race", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/service-already-race"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    unit = store.get_or_create_merge_unit_for_task(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=True),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    events: list[str] = []
+
+    result = execute_manual_merge(
+        _manual_merge_service_request(tmp_path, store, git, task),
+        _manual_merge_service_hooks(events),
+    )
+
+    assert result.rc == 1
+    assert result.status == "merged"
+    git.merge.assert_not_called()
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+    assert "already merged into main" in "\n".join(events)
+
+
+def test_merge_single_task_manual_already_merged_message_and_exit_code_are_preserved(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement manual already merged", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/manual-already"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    unit = store.get_or_create_merge_unit_for_task(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=True),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        get_diff_name_status=MagicMock(return_value=""),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+
+    with _force_merge_planner_action():
+        result = _merge_single_task(task.id, Config.load(tmp_path), store, git, _manual_merge_args(), "main")
+
+    assert result.rc == 1
+    assert result.status == "merged"
+    assert "Error: Branch 'feature/manual-already' is already merged into main" in capsys.readouterr().out
+    git.merge.assert_not_called()
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+
+
+def test_manual_merge_execution_api_merge_failure_cleans_up(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement cleanup service merge", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/service-cleanup"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    store.get_or_create_merge_unit_for_task(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(side_effect=GitError("merge failed")),
+        merge_abort=MagicMock(),
+        reset_hard_head=MagicMock(),
+    )
+
+    result = execute_manual_merge(
+        _manual_merge_service_request(tmp_path, store, git, task),
+        _manual_merge_service_hooks(),
+    )
+
+    assert result.rc == 1
+    git.merge_abort.assert_called_once_with()
+    git.reset_hard_head.assert_not_called()
+    refreshed_unit = store.resolve_merge_unit_for_task(task.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+
+
+def test_staged_isolated_merge_late_already_merged_race_stops_without_reconciliation(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement isolated already merged race", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/isolated-race"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    unit = store.get_or_create_merge_unit_for_task(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        default_branch=MagicMock(return_value="main"),
+        branch_exists=MagicMock(return_value=True),
+        ref_exists=MagicMock(return_value=False),
+        is_merged=MagicMock(side_effect=[False, True]),
+        has_changes=MagicMock(return_value=False),
+        get_diff_name_status=MagicMock(return_value=""),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    action = {"type": "merge", "description": "Merge"}
+
+    with _force_merge_planner_action():
+        result = _stage_isolated_merge_action(
+            Config.load(tmp_path),
+            store,
+            git,
+            task,
+            action,
+            target_branch="main",
+            current_branch="main",
+            merge_git=git,
+            merge_current_branch="main",
+            already_merged_behavior="mark_merged",
+        )
+
+    assert isinstance(result, _MergeActionResult)
+    assert result.rc == 1
+    assert result.status == "merged"
+    git.merge.assert_not_called()
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+
+
+def test_staged_isolated_merge_explicit_already_merged_reconciliation_marks_unit(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement isolated already merged reconciliation", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/isolated-reconcile"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    unit = store.get_or_create_merge_unit_for_task(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        default_branch=MagicMock(return_value="main"),
+        branch_exists=MagicMock(return_value=True),
+        ref_exists=MagicMock(return_value=False),
+        is_merged=MagicMock(return_value=True),
+        has_changes=MagicMock(return_value=False),
+        get_diff_name_status=MagicMock(return_value=""),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+
+    result = _stage_isolated_merge_action(
+        Config.load(tmp_path),
+        store,
+        git,
+        task,
+        {"type": "merge", "description": "Merge"},
+        target_branch="main",
+        current_branch="main",
+        merge_git=git,
+        merge_current_branch="main",
+        already_merged_behavior="mark_merged",
+    )
+
+    assert isinstance(result, _MergeActionResult)
+    assert result.rc == 0
+    assert result.status == "already_merged"
+    git.merge.assert_not_called()
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "merged"
+
+
+def test_merge_single_task_force_uses_shared_override_source_helper(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement shared force override", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/shared-force"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        get_diff_name_status=MagicMock(return_value=""),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    config = Config.load(tmp_path)
+
+    from gza.cli import git_ops as git_ops_module
+
+    with (
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={
+                "type": "parked",
+                "description": "Manual review required before merge",
+                "needs_attention_reason": "operator-review-required",
+                "subject_task_id": task.id,
+            },
+        ),
+        patch(
+            "gza.cli.git_ops.manual_force_merge_source",
+            wraps=git_ops_module.manual_force_merge_source,
+        ) as force_source,
+    ):
+        result = _merge_single_task(task.id, config, store, git, _manual_merge_args(force=True), "main")
+
+    assert result.rc == 0
+    force_source.assert_called_once_with("manual")
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    assert unit.merge_source == "manual_force"
+
+
+def test_merge_single_task_defer_blockers_uses_shared_materialization_service(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement shared defer blockers", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/shared-defer"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+    blocker = ReviewFinding(
+        id="B-shared-defer",
+        severity="BLOCKER",
+        title="Needs follow-up",
+        body="Body",
+        evidence=None,
+        impact=None,
+        fix_or_followup="track as urgent follow-up",
+        tests=None,
+        open_state_citation="citation",
+    )
+    deferred = store.add("Deferred blocker task", task_type="implement", based_on=review.id)
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        get_diff_name_status=MagicMock(return_value=""),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    config = Config.load(tmp_path)
+
+    from gza.cli import git_ops as git_ops_module
+
+    with (
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={
+                "type": "improve",
+                "description": "Create improve task (review CHANGES_REQUESTED)",
+                "improve_reason": "review_changes_requested",
+                "review_task": review,
+            },
+        ),
+        patch(
+            "gza.cli.git_ops.get_review_report",
+            return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(blocker,), format_version="v2"),
+        ),
+        patch("gza.cli.git_ops.get_review_content", return_value="review content"),
+        patch("gza.cli.git_ops.summarize_review_blockers", return_value=SimpleNamespace(blocker_count=1)),
+        patch("gza.cli.git_ops._create_or_reuse_deferred_blocker_tasks", return_value=([deferred], [])),
+        patch(
+            "gza.cli.git_ops.materialize_merge_deferred_blockers",
+            wraps=git_ops_module.materialize_merge_deferred_blockers,
+        ) as materialize,
+    ):
+        result = _merge_single_task(
+            task.id,
+            config,
+            store,
+            git,
+            _manual_merge_args(defer_blockers=True),
+            "main",
+        )
+
+    assert result.rc == 0
+    assert materialize.call_count == 1
+    assert materialize.call_args.kwargs["defer_blockers"] is True
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    assert unit.merge_source == "manual_force"
+
+
+def test_merge_single_task_spec_coherence_refusal_uses_shared_blocker_classifier(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implement shared spec coherence refusal", task_type="implement")
+    assert task.id is not None
+    task.status = "completed"
+    task.completed_at = datetime.now(UTC)
+    task.branch = "feature/shared-spec-refusal"
+    task.has_commits = True
+    task.merge_status = "unmerged"
+    store.update(task)
+    review = store.add(f"Spec coherence review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.review_scope = "\n".join(
+        (
+            "Review mode: spec-coherence",
+            f"Implementation task: {task.id}",
+            "Reviewed head SHA: reviewed-head",
+            'Changed behavior-spec paths JSON: ["specs/behavior/lifecycle-engine.md"]',
+        )
+    )
+    review.output_content = "**Verdict: CHANGES_REQUESTED**"
+    store.update(review)
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        branch_exists=MagicMock(return_value=True),
+        is_merged=MagicMock(return_value=False),
+        default_branch=MagicMock(return_value="main"),
+        has_changes=MagicMock(return_value=False),
+        get_diff_name_status=MagicMock(return_value=""),
+        can_merge=MagicMock(return_value=True),
+        merge=MagicMock(),
+    )
+    config = Config.load(tmp_path)
+
+    from gza.cli import git_ops as git_ops_module
+
+    with (
+        patch(
+            "gza.cli.git_ops.determine_next_action",
+            return_value={
+                "type": "parked",
+                "description": "Manual review required before merge",
+                "needs_attention_reason": "operator-review-required",
+                "subject_task_id": task.id,
+            },
+        ),
+        patch(
+            "gza.cli.git_ops.get_review_report",
+            return_value=SimpleNamespace(verdict="CHANGES_REQUESTED", findings=(), format_version="v2"),
+        ),
+        patch(
+            "gza.cli.git_ops.materialize_merge_deferred_blockers",
+            wraps=git_ops_module.materialize_merge_deferred_blockers,
+        ) as materialize,
+    ):
+        result = _merge_single_task(
+            task.id,
+            config,
+            store,
+            git,
+            _manual_merge_args(force=True, defer_blockers=True),
+            "main",
+        )
+
+    assert result.rc == 1
+    materialize.assert_called_once()
+    git.merge.assert_not_called()
+    output = capsys.readouterr().out
+    assert "behavior-spec coherence CHANGES_REQUESTED review" in output
+    assert "not deferable" in output
 
 
 @pytest.mark.parametrize(
