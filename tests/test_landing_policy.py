@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from gza.landing_policy import (
+    LandingJudgment,
     LandingJudgeVerdict,
     LandingOpenBlocker,
     LandingReviewEvidence,
@@ -13,14 +14,34 @@ from gza.landing_policy import (
 )
 
 
-def _counting_judge(verdict: LandingJudgeVerdict) -> tuple[Callable[[], LandingJudgeVerdict], list[str]]:
+def _counting_judge(
+    verdict: LandingJudgeVerdict,
+) -> tuple[Callable[[], LandingJudgment | LandingJudgeVerdict], list[str]]:
     calls: list[str] = []
 
-    def judge() -> LandingJudgeVerdict:
+    def judge() -> LandingJudgment | LandingJudgeVerdict:
         calls.append(verdict)
+        if verdict == "LAND":
+            return LandingJudgment("LAND", artifact_id="judge-artifact", key="judge-key")
         return verdict
 
     return judge, calls
+
+
+def _blocker(
+    finding_id: str,
+    *,
+    deferrable: bool,
+    blocker_class: str = "adjacent",
+    fingerprint: str | None = None,
+) -> LandingOpenBlocker:
+    return LandingOpenBlocker(
+        finding_id,
+        deferrable=deferrable,
+        blocker_class=blocker_class,  # type: ignore[arg-type]
+        source="review:gza-200",
+        fingerprint=fingerprint or f"blocker:{finding_id}:normalized",
+    )
 
 
 def _review(**overrides: Any) -> LandingReviewEvidence:
@@ -44,7 +65,7 @@ def test_guarded_current_changes_requested_reaches_exactly_one_judge() -> None:
     decision = classify_landing_review_policy(
         policy="guarded",
         review=_review(mode="plain_full", verdict="CHANGES_REQUESTED"),
-        open_blockers=(LandingOpenBlocker("B1", deferrable=True, blocker_class="adjacent"),),
+        open_blockers=(_blocker("B1", deferrable=True, blocker_class="adjacent"),),
         judge=judge,
     )
 
@@ -60,7 +81,7 @@ def test_strict_current_changes_requested_is_nondeferrable_without_judge() -> No
     decision = classify_landing_review_policy(
         policy="strict",
         review=_review(mode="resolution", verdict="CHANGES_REQUESTED"),
-        open_blockers=(LandingOpenBlocker("B1", deferrable=True, blocker_class="adjacent"),),
+        open_blockers=(_blocker("B1", deferrable=True, blocker_class="adjacent"),),
         judge=judge,
     )
 
@@ -75,7 +96,7 @@ def test_guarded_nondeferrable_blocker_stops_before_judge() -> None:
     decision = classify_landing_review_policy(
         policy="guarded",
         review=_review(mode="plain_full", verdict="CHANGES_REQUESTED"),
-        open_blockers=(LandingOpenBlocker("B1", deferrable=False),),
+        open_blockers=(_blocker("B1", deferrable=False, blocker_class="correctness"),),
         judge=judge,
     )
 
@@ -87,8 +108,8 @@ def test_guarded_nondeferrable_blocker_stops_before_judge() -> None:
 @pytest.mark.parametrize(
     "blocker",
     (
-        LandingOpenBlocker("B1", deferrable=True),
-        LandingOpenBlocker("B1", deferrable=True, blocker_class="unknown"),
+        _blocker("B1", deferrable=True, blocker_class="unknown"),
+        _blocker("B2", deferrable=True, blocker_class="unknown"),
     ),
 )
 def test_guarded_omitted_or_unknown_blocker_class_stops_before_judge(
@@ -126,7 +147,7 @@ def test_guarded_judge_verdicts_map_to_declared_outcomes(
     decision = classify_landing_review_policy(
         policy="guarded",
         review=_review(mode="resolution", verdict="CHANGES_REQUESTED"),
-        open_blockers=(LandingOpenBlocker("B1", deferrable=True, blocker_class="adjacent"),),
+        open_blockers=(_blocker("B1", deferrable=True, blocker_class="adjacent"),),
         judge=judge,
     )
 
@@ -161,7 +182,7 @@ def test_unusable_reviews_remain_required_review_unavailable_without_judge(
     decision = classify_landing_review_policy(
         policy="guarded",
         review=review,
-        open_blockers=(LandingOpenBlocker("B1", deferrable=True, blocker_class="adjacent"),),
+        open_blockers=(_blocker("B1", deferrable=True, blocker_class="adjacent"),),
         judge=judge,
     )
 

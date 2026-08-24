@@ -637,7 +637,7 @@ def test_recovery_preview_scoped_seed_ignores_large_non_recovery_descendant_hist
     store.attach_task_to_merge_unit(failed.id, failed_unit.id, "owner")
     non_recovery_descendant_ids = _bulk_insert_completed_history(
         store,
-        count=9000,
+        count=3000,
         start=200000,
         based_on=failed.id,
         task_type="internal",

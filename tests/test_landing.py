@@ -8,6 +8,7 @@ import pytest
 from gza.landing import (
     LANDING_PHASES,
     LandingOpenBlocker,
+    LandingJudgment,
     LandingJudgeVerdict,
     LandingPolicyDecision,
     LandingPolicyFacts,
@@ -84,12 +85,35 @@ def _green_facts(**overrides: Any) -> LandingPolicyFacts:
 def _recording_judge(
     calls: list[str],
     verdict: LandingJudgeVerdict,
-) -> Callable[[], LandingJudgeVerdict]:
-    def judge() -> LandingJudgeVerdict:
+) -> Callable[[], LandingJudgment | LandingJudgeVerdict]:
+    def judge() -> LandingJudgment | LandingJudgeVerdict:
         calls.append("called")
+        if verdict == "LAND":
+            return LandingJudgment("LAND", artifact_id="judge-artifact", key="judge-key")
         return verdict
 
     return judge
+
+
+def _landing_judgment() -> LandingJudgment:
+    return LandingJudgment("LAND", artifact_id="judge-artifact", key="judge-key")
+
+
+def _blocker(
+    finding_id: str,
+    *,
+    deferrable: bool,
+    blocker_class: str = "out_of_scope",
+    source: str = "review:gza-200",
+    fingerprint: str | None = None,
+) -> LandingOpenBlocker:
+    return LandingOpenBlocker(
+        finding_id,
+        deferrable=deferrable,
+        blocker_class=blocker_class,  # type: ignore[arg-type]
+        source=source,
+        fingerprint=fingerprint or f"blocker:{finding_id}:normalized",
+    )
 
 
 @pytest.mark.parametrize(
@@ -106,8 +130,14 @@ def _recording_judge(
         (_green_facts(rebase_status="in_progress", rebase_resolution_kind="none"), "rebase-or-conflict"),
         (_green_facts(rebase_status="completed", rebase_resolution_kind="none"), "rebase-or-conflict"),
         (_green_facts(rebase_status="none", rebase_resolution_kind="mechanical"), "rebase-or-conflict"),
-        (_green_facts(rebase_status="none", rebase_resolution_kind="none", rebase_target_contained=False), "rebase-or-conflict"),
-        (_green_facts(rebase_status="none", rebase_resolution_kind="none", rebase_target_contained=None), "rebase-or-conflict"),
+        (
+            _green_facts(rebase_status="none", rebase_resolution_kind="none", rebase_target_contained=False),
+            "rebase-or-conflict",
+        ),
+        (
+            _green_facts(rebase_status="none", rebase_resolution_kind="none", rebase_target_contained=None),
+            "rebase-or-conflict",
+        ),
         (
             _green_facts(
                 spec_coherence=LandingSpecCoherenceEvidence(
@@ -153,7 +183,7 @@ def _recording_judge(
         (_green_facts(actionable_lifecycle_work=("verify-fix:gza-300",)), "verify-unavailable-or-red"),
         (
             _green_facts(
-                open_blockers=(LandingOpenBlocker("B1", deferrable=True, blocker_class="out_of_scope"),),
+                open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope"),),
             ),
             "nondeferrable-blocker",
         ),
@@ -212,7 +242,6 @@ def test_landing_policy_maps_exact_matching_lifecycle_work_to_phase_refusal(
         "active-work-identity-mismatch:gza-205",
         "ambiguous-active-work:gza-206",
         "stale-active-work:gza-207",
-        "",
     ),
 )
 def test_landing_policy_reserves_identity_refusal_for_active_work_identity_mismatch(
@@ -257,7 +286,7 @@ def test_landing_policy_preserves_non_escalated_review_disabled_path() -> None:
             review=_review(required=False),
             parked_reason="improve-no-op",
         ),
-        judge=lambda: "LAND",
+        judge=_landing_judgment,
     )
 
     assert allowed.allowed is True
@@ -272,9 +301,9 @@ def test_guarded_allows_exact_review_churn_park_and_deferred_blocker_override() 
         facts=_green_facts(
             parked_reason="review-max-cycles-reached",
             review=_review(verdict="CHANGES_REQUESTED"),
-            open_blockers=(LandingOpenBlocker("B1", deferrable=True, blocker_class="out_of_scope"),),
+            open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope"),),
         ),
-        judge=lambda: "LAND",
+        judge=_landing_judgment,
     )
 
     assert decision.allowed is True
@@ -289,8 +318,8 @@ def test_guarded_allows_exact_review_churn_park_and_deferred_blocker_override() 
 @pytest.mark.parametrize(
     "blocker",
     (
-        LandingOpenBlocker("B1", deferrable=True),
-        LandingOpenBlocker("B1", deferrable=True, blocker_class="unknown"),
+        _blocker("B1", deferrable=True, blocker_class="unknown"),
+        _blocker("B2", deferrable=True, blocker_class="unknown"),
     ),
 )
 def test_changes_requested_with_omitted_or_unknown_blocker_class_never_calls_judge(
@@ -384,6 +413,8 @@ def test_approved_review_plus_eligible_park_allows_only_after_land_judgment() ->
     assert calls == ["called"]
     assert decision.allowed is True
     assert decision.allowed_overrides == ("parked:improve-no-op",)
+    assert decision.judgment_artifact_id == "judge-artifact"
+    assert decision.judgment_key == "judge-key"
 
 
 def test_unsupported_incomplete_and_review_disabled_parks_do_not_call_judge() -> None:
@@ -416,13 +447,19 @@ def test_unsupported_incomplete_and_review_disabled_parks_do_not_call_judge() ->
             ),
             "rebase-or-conflict",
         ),
-        (_green_facts(actionable_lifecycle_work=("verify:gza-203",), verify=_verify(status="failed")), "verify-unavailable-or-red"),
-        (_green_facts(actionable_lifecycle_work=("review:gza-204",), verify=_verify(status="failed")), "verify-unavailable-or-red"),
+        (
+            _green_facts(actionable_lifecycle_work=("verify:gza-203",), verify=_verify(status="failed")),
+            "verify-unavailable-or-red",
+        ),
+        (
+            _green_facts(actionable_lifecycle_work=("review:gza-204",), verify=_verify(status="failed")),
+            "verify-unavailable-or-red",
+        ),
         (
             _green_facts(
                 actionable_lifecycle_work=("spec-coherence:gza-205",),
                 review=_review(verdict="CHANGES_REQUESTED"),
-                open_blockers=(LandingOpenBlocker("B1", deferrable=False, blocker_class="correctness"),),
+                open_blockers=(_blocker("B1", deferrable=False, blocker_class="correctness"),),
             ),
             "required-review-unavailable",
         ),
@@ -444,7 +481,7 @@ def test_unsupported_incomplete_and_review_disabled_parks_do_not_call_judge() ->
         (
             _green_facts(
                 review=_review(verdict="CHANGES_REQUESTED"),
-                open_blockers=(LandingOpenBlocker("B1", deferrable=False, blocker_class="correctness"),),
+                open_blockers=(_blocker("B1", deferrable=False, blocker_class="correctness"),),
                 parked_reason="review-blocker-adjudication-needed",
             ),
             "nondeferrable-blocker",
@@ -492,7 +529,7 @@ def test_strict_refuses_changes_requested_without_judge() -> None:
         policy="strict",
         facts=_green_facts(
             review=_review(mode="resolution", verdict="CHANGES_REQUESTED"),
-            open_blockers=(LandingOpenBlocker("B1", deferrable=True, blocker_class="out_of_scope"),),
+            open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope"),),
         ),
         judge=_recording_judge(calls, "LAND"),
     )
@@ -508,7 +545,7 @@ def test_spec_coherence_review_cannot_be_used_as_code_review_evidence() -> None:
     decision = evaluate_landing_policy(
         policy="guarded",
         facts=_green_facts(review=_review(mode="spec_coherence", verdict="CHANGES_REQUESTED")),
-        judge=lambda: "LAND",
+        judge=_landing_judgment,
     )
 
     assert decision.allowed is False
@@ -518,8 +555,8 @@ def test_spec_coherence_review_cannot_be_used_as_code_review_evidence() -> None:
 
 def test_conflict_resolution_and_correctness_blockers_are_nondeferrable() -> None:
     for blocker in (
-        LandingOpenBlocker("B1", deferrable=True, blocker_class="conflict_resolution"),
-        LandingOpenBlocker("B2", deferrable=True, blocker_class="correctness"),
+        _blocker("B1", deferrable=True, blocker_class="conflict_resolution"),
+        _blocker("B2", deferrable=True, blocker_class="correctness"),
     ):
         decision = evaluate_landing_policy(
             policy="guarded",
@@ -527,12 +564,12 @@ def test_conflict_resolution_and_correctness_blockers_are_nondeferrable() -> Non
                 review=_review(mode="resolution", verdict="CHANGES_REQUESTED"),
                 open_blockers=(blocker,),
             ),
-            judge=lambda: "LAND",
+            judge=_landing_judgment,
         )
         assert decision.allowed is False
         assert decision.blocked is not None
         assert decision.blocked.reason_code == "nondeferrable-blocker"
-        assert decision.blocked.evidence_refs == (blocker.finding_id,)
+        assert decision.blocked.evidence_refs == (blocker.finding_id, blocker.source, blocker.fingerprint)
 
 
 def test_landing_phase_order_matches_verify_spec_coherence_review_contract() -> None:
@@ -884,8 +921,8 @@ def test_landing_state_fingerprint_includes_rebase_outcome_and_canonicalizes_set
         rebase_attempted_target_head="target-a",
         rebase_target_contained=True,
         open_blockers=(
-            LandingOpenBlocker("B2", deferrable=True, fingerprint="blocker-b"),
-            LandingOpenBlocker("B1", deferrable=True, fingerprint="blocker-a"),
+            _blocker("B2", deferrable=True, fingerprint="blocker-b"),
+            _blocker("B1", deferrable=True, fingerprint="blocker-a"),
         ),
     )
     facts_b = _green_facts(
@@ -898,8 +935,8 @@ def test_landing_state_fingerprint_includes_rebase_outcome_and_canonicalizes_set
         rebase_target_contained=True,
         rebase_provider_resolution_proof=True,
         open_blockers=(
-            LandingOpenBlocker("B1", deferrable=True, fingerprint="blocker-a"),
-            LandingOpenBlocker("B2", deferrable=True, fingerprint="blocker-b"),
+            _blocker("B1", deferrable=True, fingerprint="blocker-a"),
+            _blocker("B2", deferrable=True, fingerprint="blocker-b"),
         ),
     )
 
@@ -948,6 +985,38 @@ def test_landing_state_fingerprint_differs_when_only_rebase_outcome_id_changes()
     )
 
     assert LandingStateFingerprint.from_facts(facts_a) != LandingStateFingerprint.from_facts(facts_b)
+
+
+def test_landing_state_fingerprint_changes_when_same_finding_id_has_new_blocker_content() -> None:
+    facts_a = _green_facts(
+        open_blockers=(
+            _blocker(
+                "B1",
+                deferrable=True,
+                blocker_class="out_of_scope",
+                source="artifact:review-a",
+                fingerprint="normalized:old-evidence",
+            ),
+        ),
+    )
+    facts_b = _green_facts(
+        open_blockers=(
+            _blocker(
+                "B1",
+                deferrable=True,
+                blocker_class="out_of_scope",
+                source="artifact:review-a",
+                fingerprint="normalized:new-evidence",
+            ),
+        ),
+    )
+
+    fingerprint_a = LandingStateFingerprint.from_facts(facts_a)
+    fingerprint_b = LandingStateFingerprint.from_facts(facts_b)
+
+    assert fingerprint_a != fingerprint_b
+    assert fingerprint_a.blocker_fingerprints == ("normalized:old-evidence",)
+    assert fingerprint_b.blocker_fingerprints == ("normalized:new-evidence",)
 
 
 @pytest.mark.parametrize(
@@ -1194,11 +1263,11 @@ def test_supplied_fingerprints_remain_supported_when_facts_have_no_identity() ->
         _green_facts(review=_review(status="failed")),
         _green_facts(
             review=_review(verdict="CHANGES_REQUESTED"),
-            open_blockers=(LandingOpenBlocker("B1", deferrable=False, source="review:gza-200"),),
+            open_blockers=(_blocker("B1", deferrable=False, blocker_class="correctness"),),
         ),
         _green_facts(
             review=_review(verdict="CHANGES_REQUESTED"),
-            open_blockers=(LandingOpenBlocker("B1", deferrable=True, blocker_class="out_of_scope"),),
+            open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope"),),
             guarded_judgment_enabled=False,
         ),
         _green_facts(parked_reason="improve-no-op", review=_review(required=False)),
@@ -1270,6 +1339,27 @@ def test_already_merged_post_merge_verify_failure_needs_no_new_provenance(
 def test_landblocked_rejects_empty_evidence_refs() -> None:
     with pytest.raises(ValueError):
         LandBlocked("identity-proof-unavailable", "source proof is unavailable")
+    with pytest.raises(ValueError):
+        LandBlocked("identity-proof-unavailable", "source proof is unavailable", (" ",))
+    with pytest.raises(ValueError):
+        LandPostMergeVerifyFailure(status="missing", fact="missing", evidence_refs=("checkpoint-1", "\t"))
+    with pytest.raises(ValueError):
+        LandStep("resolve", "blocked", "blocked", evidence_refs=("gza-100", ""))
+
+
+def test_open_blockers_require_durable_provenance_and_normalized_fingerprint() -> None:
+    with pytest.raises(ValueError):
+        LandingOpenBlocker("", deferrable=True, source="review:gza-200", fingerprint="blocker")
+    with pytest.raises(ValueError):
+        LandingOpenBlocker("B1", deferrable=True, source=" ", fingerprint="blocker")
+    with pytest.raises(ValueError):
+        LandingOpenBlocker("B1", deferrable=True, source="review:gza-200", fingerprint="\n")
+
+    blocker = LandingOpenBlocker(" B1 ", deferrable=True, source=" review:gza-200 ", fingerprint=" blocker:a ")
+
+    assert blocker.finding_id == "B1"
+    assert blocker.source == "review:gza-200"
+    assert blocker.fingerprint == "blocker:a"
 
 
 def test_landing_policy_decision_rejects_contradictory_direct_construction() -> None:
@@ -1285,6 +1375,42 @@ def test_landing_policy_decision_rejects_contradictory_direct_construction() -> 
             blocked=blocked,
             allowed_overrides=("defer-review-blockers",),
         )
+    with pytest.raises(ValueError):
+        LandingPolicyDecision(True, allowed_overrides=("defer-review-blockers",))
+    with pytest.raises(ValueError):
+        LandingPolicyDecision(
+            True,
+            allowed_overrides=("defer-review-blockers",),
+            judgment_verdict="BLOCK",
+            judgment_artifact_id="judge-artifact",
+            judgment_key="judge-key",
+        )
+    with pytest.raises(ValueError):
+        LandingPolicyDecision(
+            True,
+            allowed_overrides=("defer-review-blockers",),
+            judgment_verdict="NEEDS_HUMAN",
+            judgment_artifact_id="judge-artifact",
+            judgment_key="judge-key",
+        )
+    with pytest.raises(ValueError):
+        LandingPolicyDecision(
+            True,
+            allowed_overrides=("defer-review-blockers",),
+            judgment_verdict="LAND",
+            judgment_artifact_id="judge-artifact",
+        )
+
+    accepted = LandingPolicyDecision(
+        True,
+        allowed_overrides=("defer-review-blockers",),
+        judgment_verdict="LAND",
+        judgment_artifact_id=" judge-artifact ",
+        judgment_key=" judge-key ",
+    )
+
+    assert accepted.judgment_artifact_id == "judge-artifact"
+    assert accepted.judgment_key == "judge-key"
 
 
 def test_land_result_requires_new_merge_provenance_but_allows_already_merged() -> None:
@@ -1327,19 +1453,33 @@ def test_land_result_requires_escalated_provenance_for_deferred_blocker_ids() ->
         source_ref="feature/example",
         merged=True,
         merge_provenance="manual_land_escalated",
+        judgment_artifact_id="judge-artifact",
+        judgment_key="judge-key",
         deferred_task_ids=("gza-300",),
     )
-    park_only = LandResult(
-        request=LandRequest(task_id="gza-101"),
-        owner_task_id="gza-101",
-        target_branch="main",
-        source_ref="feature/park-only",
-        merged=True,
-        merge_provenance="manual_land_escalated",
-    )
+    with pytest.raises(ValueError):
+        LandResult(
+            request=LandRequest(task_id="gza-101"),
+            owner_task_id="gza-101",
+            target_branch="main",
+            source_ref="feature/park-only",
+            merged=True,
+            merge_provenance="manual_land_escalated",
+        )
+    with pytest.raises(ValueError):
+        LandResult(
+            request=LandRequest(task_id="gza-101"),
+            owner_task_id="gza-101",
+            target_branch="main",
+            source_ref="feature/park-only",
+            merged=True,
+            merge_provenance="manual_land_escalated",
+            judgment_artifact_id="judge-artifact",
+        )
 
     assert escalated.deferred_task_ids == ("gza-300",)
-    assert park_only.deferred_task_ids == ()
+    assert escalated.judgment_artifact_id == "judge-artifact"
+    assert escalated.judgment_key == "judge-key"
 
 
 def test_land_result_rejects_contradictory_terminal_state_combinations() -> None:

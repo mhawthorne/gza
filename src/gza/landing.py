@@ -137,6 +137,7 @@ class LandBlocked:
     evidence_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_refs", _normalize_evidence_refs(self.evidence_refs))
         if not self.evidence_refs:
             raise ValueError("blocked landing result requires durable evidence")
 
@@ -157,12 +158,9 @@ class LandPostMergeVerifyFailure:
 
     def __post_init__(self) -> None:
         if not self.evidence_refs:
-            refs = tuple(
-                ref
-                for ref in (self.checkpoint_id, self.target_head, self.gate_identity)
-                if ref
-            )
+            refs = tuple(ref for ref in (self.checkpoint_id, self.target_head, self.gate_identity) if ref)
             object.__setattr__(self, "evidence_refs", refs)
+        object.__setattr__(self, "evidence_refs", _normalize_evidence_refs(self.evidence_refs))
         if not self.evidence_refs:
             raise ValueError("post-merge verification failure requires checkpoint evidence")
 
@@ -180,6 +178,9 @@ class LandStep:
     blocked: LandBlocked | None = None
     evidence_refs: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "evidence_refs", _normalize_evidence_refs(self.evidence_refs))
+
 
 @dataclass(frozen=True)
 class LandResult:
@@ -195,6 +196,8 @@ class LandResult:
     merged: bool = False
     already_merged: bool = False
     merge_provenance: Literal["manual_land", "manual_land_escalated"] | None = None
+    judgment_artifact_id: str | None = None
+    judgment_key: str | None = None
     deferred_task_ids: tuple[str, ...] = ()
     followup_task_ids: tuple[str, ...] = ()
 
@@ -215,6 +218,13 @@ class LandResult:
             raise ValueError("newly merged result requires land provenance")
         if self.deferred_task_ids and self.merge_provenance != "manual_land_escalated":
             raise ValueError("deferred blocker task IDs require manual_land_escalated provenance")
+        judgment_refs = _normalize_evidence_refs((self.judgment_artifact_id, self.judgment_key))
+        if self.merge_provenance == "manual_land_escalated" and len(judgment_refs) != 2:
+            raise ValueError("manual_land_escalated result requires judgment artifact and key")
+        if self.merge_provenance != "manual_land_escalated" and judgment_refs:
+            raise ValueError("landing judgment identity requires manual_land_escalated provenance")
+        object.__setattr__(self, "judgment_artifact_id", judgment_refs[0] if judgment_refs else None)
+        object.__setattr__(self, "judgment_key", judgment_refs[1] if judgment_refs else None)
 
 
 @dataclass(frozen=True)
@@ -253,6 +263,14 @@ class LandingOpenBlocker:
     blocker_class: LandingBlockerClass = "unknown"
     fingerprint: str | None = None
     source: str | None = None
+
+    def __post_init__(self) -> None:
+        finding_id = _normalize_required_ref(self.finding_id, "blocker finding ID")
+        source = _normalize_required_ref(self.source, "blocker durable source")
+        fingerprint = _normalize_required_ref(self.fingerprint, "blocker normalized fingerprint")
+        object.__setattr__(self, "finding_id", finding_id)
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "fingerprint", fingerprint)
 
 
 @dataclass(frozen=True)
@@ -313,6 +331,8 @@ class LandingPolicyDecision:
     blocked: LandBlocked | None = None
     allowed_overrides: tuple[LandingPolicyOverride, ...] = ()
     judgment_verdict: LandingJudgeVerdict | None = None
+    judgment_artifact_id: str | None = None
+    judgment_key: str | None = None
 
     @property
     def reason_code(self) -> LandingPolicyReasonCode | None:
@@ -331,6 +351,14 @@ class LandingPolicyDecision:
             raise ValueError("landing policy allowed state must exactly match absence of a blocker")
         if not self.allowed and self.allowed_overrides:
             raise ValueError("denied landing policy decisions cannot carry allowed overrides")
+        judgment_refs = _normalize_evidence_refs((self.judgment_artifact_id, self.judgment_key))
+        if self.allowed_overrides:
+            if self.judgment_verdict != "LAND" or len(judgment_refs) != 2:
+                raise ValueError("override-bearing landing policy decisions require validated LAND judgment identity")
+        elif judgment_refs:
+            raise ValueError("landing judgment identity requires an allowed override")
+        object.__setattr__(self, "judgment_artifact_id", judgment_refs[0] if judgment_refs else None)
+        object.__setattr__(self, "judgment_key", judgment_refs[1] if judgment_refs else None)
 
 
 @dataclass(frozen=True)
@@ -425,19 +453,44 @@ class LandingStateFingerprint:
                 tree_fingerprint=verify.tree_fingerprint if verify is not None else None,
             ),
             rebase=resolved_rebase,
-            blocker_fingerprints=tuple(
-                sorted(
-                    blocker.fingerprint or f"{blocker.finding_id}:{blocker.blocker_class}:{blocker.deferrable}"
-                    for blocker in facts.open_blockers
-                )
-            ),
+            blocker_fingerprints=tuple(sorted(_blocker_fingerprint(blocker) for blocker in facts.open_blockers)),
             policy_judgment_identity=policy_judgment_identity,
             adjudication_fingerprints=tuple(sorted(adjudication_fingerprints)),
             spec_coherence=resolved_spec,
         )
 
 
-LandingJudge = Callable[[], LandingJudgeVerdict]
+@dataclass(frozen=True)
+class LandingJudgment:
+    """Validated durable landing judgment returned by the semantic judge."""
+
+    verdict: LandingJudgeVerdict
+    artifact_id: str | None = None
+    key: str | None = None
+
+    def __post_init__(self) -> None:
+        judgment_refs = _normalize_evidence_refs((self.artifact_id, self.key))
+        if self.verdict == "LAND" and len(judgment_refs) != 2:
+            raise ValueError("LAND judgment requires durable artifact and key")
+        if self.verdict != "LAND" and judgment_refs:
+            raise ValueError("non-LAND judgment cannot authorize artifact/key identity")
+        object.__setattr__(self, "artifact_id", judgment_refs[0] if judgment_refs else None)
+        object.__setattr__(self, "key", judgment_refs[1] if judgment_refs else None)
+
+
+LandingJudge = Callable[[], LandingJudgment | LandingJudgeVerdict]
+
+
+@dataclass(frozen=True)
+class _LandingParkClassification:
+    """Internal park classification before the semantic judge authorizes overrides."""
+
+    blocked: LandBlocked | None = None
+    allowed_overrides: tuple[LandingPolicyOverride, ...] = ()
+
+    @property
+    def allowed(self) -> bool:
+        return self.blocked is None
 
 
 def dry_run_steps_until_boundary(
@@ -503,8 +556,8 @@ def evaluate_landing_policy(
         )
 
     park_decision = _classify_park(policy, facts)
-    if not park_decision.allowed:
-        return park_decision
+    if park_decision.blocked is not None:
+        return LandingPolicyDecision(False, blocked=park_decision.blocked)
 
     review_decision = _evaluate_review_policy(
         policy=policy,
@@ -520,6 +573,8 @@ def evaluate_landing_policy(
         True,
         allowed_overrides=tuple(dict.fromkeys(overrides)),
         judgment_verdict=review_decision.judgment_verdict,
+        judgment_artifact_id=review_decision.judgment_artifact_id,
+        judgment_key=review_decision.judgment_key,
     )
 
 
@@ -565,7 +620,30 @@ def classify_landing_review_policy(
 
 
 def _evidence_refs(*refs: str | None) -> tuple[str, ...]:
-    return tuple(ref for ref in refs if ref)
+    return _normalize_evidence_refs(refs)
+
+
+def _normalize_evidence_refs(refs: tuple[str | None, ...]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    for ref in refs:
+        if ref is None:
+            continue
+        stripped = ref.strip()
+        if not stripped:
+            raise ValueError("evidence references must be nonblank")
+        normalized.append(stripped)
+    return tuple(normalized)
+
+
+def _normalize_required_ref(ref: str | None, label: str) -> str:
+    refs = _normalize_evidence_refs((ref,))
+    if not refs:
+        raise ValueError(f"{label} is required")
+    return refs[0]
+
+
+def _blocker_fingerprint(blocker: LandingOpenBlocker) -> str:
+    return _normalize_required_ref(blocker.fingerprint, "blocker normalized fingerprint")
 
 
 def _identity_evidence(facts: LandingPolicyFacts) -> tuple[str, ...]:
@@ -715,11 +793,7 @@ def _mechanical_blocked_fact(facts: LandingPolicyFacts) -> LandBlocked | None:
     )
     if lifecycle_rebase_block is not None:
         return lifecycle_rebase_block
-    if (
-        not facts.ancestry_proof_available
-        or not facts.clean_merge
-        or not _rebase_state_consistent(facts)
-    ):
+    if not facts.ancestry_proof_available or not facts.clean_merge or not _rebase_state_consistent(facts):
         return LandBlocked(
             "rebase-or-conflict",
             "rebase, ancestry, or clean-merge proof is unavailable",
@@ -901,7 +975,7 @@ def _evaluate_review_policy(
                     "review-disabled landing cannot use guarded escalation",
                     _review_evidence(review, facts),
                 ),
-        )
+            )
         return LandingPolicyDecision(True)
     if review.verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}:
         if facts.open_blockers:
@@ -1010,8 +1084,18 @@ def _judge_for_overrides(
                 _identity_evidence(facts),
             ),
         )
-    judgment = judge()
-    if judgment != "LAND":
+    try:
+        judgment = _normalize_landing_judgment(judge())
+    except ValueError:
+        return LandingPolicyDecision(
+            False,
+            blocked=LandBlocked(
+                "policy-or-judge-refused",
+                "guarded landing judgment identity is invalid",
+                _identity_evidence(facts),
+            ),
+        )
+    if judgment.verdict != "LAND":
         return LandingPolicyDecision(
             False,
             blocked=LandBlocked(
@@ -1019,24 +1103,31 @@ def _judge_for_overrides(
                 "guarded landing judgment refused landing",
                 _identity_evidence(facts),
             ),
-            judgment_verdict=judgment,
+            judgment_verdict=judgment.verdict,
         )
     return LandingPolicyDecision(
         True,
         allowed_overrides=allowed_overrides,
-        judgment_verdict=judgment,
+        judgment_verdict=judgment.verdict,
+        judgment_artifact_id=judgment.artifact_id,
+        judgment_key=judgment.key,
     )
+
+
+def _normalize_landing_judgment(result: LandingJudgment | LandingJudgeVerdict) -> LandingJudgment:
+    if isinstance(result, LandingJudgment):
+        return result
+    return LandingJudgment(result)
 
 
 def _classify_park(
     policy: LandingPolicyName,
     facts: LandingPolicyFacts,
-) -> LandingPolicyDecision:
+) -> _LandingParkClassification:
     if not facts.parked_reason:
-        return LandingPolicyDecision(True)
+        return _LandingParkClassification()
     if policy == "strict":
-        return LandingPolicyDecision(
-            False,
+        return _LandingParkClassification(
             blocked=LandBlocked(
                 "nondeferrable-blocker",
                 "strict policy refuses parked-state overrides",
@@ -1045,9 +1136,8 @@ def _classify_park(
         )
     if facts.parked_reason == "review-blocker-adjudication-needed":
         if facts.review_blocker_adjudication_evidence_complete:
-            return LandingPolicyDecision(True, allowed_overrides=("parked:review-blocker-adjudication-needed",))
-        return LandingPolicyDecision(
-            False,
+            return _LandingParkClassification(allowed_overrides=("parked:review-blocker-adjudication-needed",))
+        return _LandingParkClassification(
             blocked=LandBlocked(
                 "policy-or-judge-refused",
                 "review-blocker adjudication evidence is incomplete",
@@ -1056,9 +1146,8 @@ def _classify_park(
         )
     override = GUARDED_PARK_OVERRIDES.get(facts.parked_reason)
     if override is not None:
-        return LandingPolicyDecision(True, allowed_overrides=(override,))
-    return LandingPolicyDecision(
-        False,
+        return _LandingParkClassification(allowed_overrides=(override,))
+    return _LandingParkClassification(
         blocked=LandBlocked(
             "nondeferrable-blocker",
             f"parked reason {facts.parked_reason} is not deferrable",
