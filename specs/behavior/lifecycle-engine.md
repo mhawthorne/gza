@@ -1163,14 +1163,20 @@ side effects after selecting it:
    malformed, unavailable, stopped, or could not be acquired/reused through the shared
    direct verify path.
 5. `required-review-unavailable`: required spec-coherence, code, or resolution review
-   evidence is missing, stale, mismatched, non-merge-permitting, failed, malformed,
-   unknown, unavailable, disabled, in progress without wait completion, or could not be
-   created/run/reused.
-6. `nondeferrable-blocker`: strict mode or guarded policy sees an open blocker that is
-   not deferrable under this contract.
+   evidence is missing, stale, mismatched, failed, malformed, unknown, unavailable,
+   disabled, `NEEDS_DISCUSSION`, identity-mismatched, in progress without wait
+   completion, or could not be created/run/reused. A current, parseable plain-full or
+   resolution `CHANGES_REQUESTED` review is usable guarded-escalation evidence, not
+   unavailable, when the guarded judgment path is otherwise eligible.
+6. `nondeferrable-blocker`: strict mode sees any current plain-full or resolution
+   `CHANGES_REQUESTED` review blocker, or guarded policy sees an open blocker that is not
+   deferrable under this contract. Guarded nondeferrable blockers stop here before any
+   landing judgment.
 7. `policy-or-judge-refused`: guarded escalation is unavailable, disabled by review-gate
    shape, malformed, stale, exact-key invalid, returns `BLOCK`/`NEEDS_HUMAN`, omits
-   required blocker decisions, or fails reuse validation.
+   required blocker decisions, or fails reuse validation. A valid guarded `LAND` judgment
+   permits continuing to materialization and final preflight; guarded `BLOCK` and
+   `NEEDS_HUMAN` stop here.
 8. `materialization-or-persistence-failed`: required ordinary follow-up or deferred task
    creation failed; exact-key reuse validation failed; guarded follow-up urgent/PR
    property reconciliation failed; durable judgment, provenance, merge-unit, task, or
