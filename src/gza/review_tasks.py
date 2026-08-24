@@ -13,7 +13,13 @@ from typing import Any, Literal, cast
 from .artifact_paths import InvalidArtifactPathError, resolve_artifact_path
 from .artifacts import prepare_command_output_artifact, store_command_output_artifact
 from .config import Config
-from .db import NewTaskParams, SqliteTaskStore, Task, TaskArtifact
+from .db import (
+    MERGE_UNIT_ACTIONABLE_STATES,
+    NewTaskParams,
+    SqliteTaskStore,
+    Task,
+    TaskArtifact,
+)
 from .derived_tags import resolve_derived_task_tags
 from .git import Git
 from .lineage import resolve_impl_task, walk_based_on_descendants
@@ -53,6 +59,9 @@ _FOLLOWUP_PROMPT_PREFIX_RE = re.compile(
 _DEFERRED_BLOCKER_PROMPT_PREFIX_RE = re.compile(
     r"^Deferred blocker\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):"
 )
+_CAPPED_REVIEW_BLOCKER_PROMPT_PREFIX_RE = re.compile(
+    r"^Capped review blocker\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+)\s+reason\s+review-max-cycles:"
+)
 _REVIEW_BLOCKER_ADJUDICATION_PROMPT_PREFIX_RE = re.compile(
     r"^Adjudicate blocker\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):"
 )
@@ -64,6 +73,8 @@ _REVIEW_BLOCKER_ADJUDICATION_HEAD_SHA_RE = re.compile(
     r"^Dispute source head SHA:\s*(\S+)\s*$",
     re.MULTILINE,
 )
+_CAPPED_REVIEW_BLOCKER_NON_REUSABLE_STATUSES = frozenset({"dropped", "superseded"})
+_CAPPED_REVIEW_BLOCKER_TERMINAL_MERGE_STATUSES = frozenset({"merged", "empty", "redundant"})
 _REVIEW_BLOCKER_ADJUDICATION_SOURCE_BRANCH_RE = re.compile(
     r"^Dispute source branch:\s*(\S+)\s*$",
     re.MULTILINE,
@@ -104,6 +115,7 @@ VERIFY_FIX_EPOCH_ARTIFACT_SCHEMA_VERSION = 1
 OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND = "off_topic_verify_investigation"
 OFF_TOPIC_VERIFY_INVESTIGATION_REUSABLE_STATUSES = frozenset({"pending", "in_progress"})
 SPEC_COHERENCE_REVIEW_SCOPE = "spec-coherence"
+DEFERRED_REVIEW_BLOCKER_TAG = "deferred-review-blocker"
 
 
 class DuplicateReviewError(ValueError):
@@ -1351,6 +1363,11 @@ def build_deferred_blocker_prompt_prefix(review_task_id: str, impl_task_id: str,
     return f"Deferred blocker {finding_id} from review {review_task_id} for task {impl_task_id}:"
 
 
+def build_capped_review_blocker_prompt_prefix(review_task_id: str, impl_task_id: str, finding_id: str) -> str:
+    """Build deterministic prompt prefix for max-review-cycle deferred blocker tasks."""
+    return f"Capped review blocker {finding_id} from review {review_task_id} for task {impl_task_id} reason review-max-cycles:"
+
+
 def build_review_blocker_adjudication_prompt_prefix(
     review_task_id: str,
     impl_task_id: str,
@@ -1845,6 +1862,37 @@ def build_deferred_blocker_prompt(
     )
 
 
+def build_capped_review_blocker_prompt(
+    review_task_id: str,
+    impl_task_id: str,
+    finding: ReviewFinding,
+    persisted_review_output: str,
+) -> str:
+    """Build full prompt for a max-review-cycle deferred blocker implementation task."""
+    prefix = build_capped_review_blocker_prompt_prefix(review_task_id, impl_task_id, finding.id)
+    tail = (finding.fix_or_followup or finding.title or "").strip()
+    heading = f"{prefix} {tail}" if tail else prefix
+    open_state_citation = finding.open_state_citation or "not provided by review"
+    prompt_before_review = (
+        f"{heading}\n\n"
+        "## Deferred blocker to resolve\n\n"
+        "This task was created because lifecycle reached the configured max review cycle limit "
+        "with an open BLOCKER and is deferring that blocker under the review-max-cycles policy.\n\n"
+        f"Original implementation: {impl_task_id}\n"
+        f"Review: {review_task_id}\n"
+        f"Finding: {finding.id}\n"
+        "Reason: review-max-cycles\n"
+        f"Open-state citation: {open_state_citation}\n\n"
+        "Resolve this blocker, preserve the implementation intent, and rerun the relevant verification.\n\n"
+        "## Blocker identity\n\n"
+        f"{format_blocker_finding_context(finding)}\n\n"
+        "## Complete persisted review output\n\n"
+        "----- BEGIN PERSISTED REVIEW OUTPUT -----\n"
+    )
+    prompt_after_review = "\n----- END PERSISTED REVIEW OUTPUT -----"
+    return prompt_before_review + persisted_review_output + prompt_after_review
+
+
 def build_review_blocker_adjudication_prompt(
     review_task_id: str,
     impl_task_id: str,
@@ -1974,6 +2022,14 @@ def extract_followup_prompt_parts(prompt: str) -> tuple[str, str, str] | None:
 def extract_deferred_blocker_prompt_parts(prompt: str) -> tuple[str, str, str] | None:
     """Return (finding_id, review_task_id, impl_task_id) for deferred blocker prompts."""
     match = _DEFERRED_BLOCKER_PROMPT_PREFIX_RE.match(prompt.strip())
+    if match is None:
+        return None
+    return match.group(1), match.group(2), match.group(3)
+
+
+def extract_capped_review_blocker_prompt_parts(prompt: str) -> tuple[str, str, str] | None:
+    """Return (finding_id, review_task_id, impl_task_id) for capped-review blocker prompts."""
+    match = _CAPPED_REVIEW_BLOCKER_PROMPT_PREFIX_RE.match(prompt.strip())
     if match is None:
         return None
     return match.group(1), match.group(2), match.group(3)
@@ -2187,6 +2243,23 @@ def find_existing_deferred_blocker_task(
     return None
 
 
+def find_existing_capped_review_blocker_task(
+    store: SqliteTaskStore,
+    *,
+    review_task_id: str,
+    impl_task_id: str,
+    finding_id: str,
+) -> Task | None:
+    """Return an existing max-review-cycle blocker task for (implementation, review, finding)."""
+    prefix = build_capped_review_blocker_prompt_prefix(review_task_id, impl_task_id, finding_id)
+    for child in store.get_based_on_children(impl_task_id):
+        if child.task_type != "implement":
+            continue
+        if child.prompt.strip().startswith(prefix):
+            return child
+    return None
+
+
 def find_existing_review_blocker_adjudication_task(
     store: SqliteTaskStore,
     *,
@@ -2330,6 +2403,177 @@ def create_or_reuse_deferred_blocker_task(
         urgent=True,
     )
     return created, True
+
+
+def _capped_review_blocker_tags(
+    impl_task: Task,
+    *,
+    active_scope_tags: Iterable[str] | None = None,
+) -> tuple[str, ...]:
+    tags: list[str] = []
+    seen: set[str] = set()
+    for tag in (*resolve_derived_task_tags(impl_task), *(active_scope_tags or ())):
+        tag_text = str(tag)
+        if tag_text in seen:
+            continue
+        tags.append(tag_text)
+        seen.add(tag_text)
+    if DEFERRED_REVIEW_BLOCKER_TAG not in seen:
+        tags.append(DEFERRED_REVIEW_BLOCKER_TAG)
+    return tuple(tags)
+
+
+def _validate_capped_review_persisted_output(persisted_review_output: str) -> None:
+    if not isinstance(persisted_review_output, str) or not persisted_review_output.strip():
+        raise ValueError("Cannot create capped review blocker task without persisted review output.")
+
+
+def _validate_capped_review_blocker_finding(finding: ReviewFinding) -> str:
+    finding_id = str(finding.id).strip()
+    if finding.severity != "BLOCKER":
+        raise ValueError(
+            "Cannot create capped review blocker task for "
+            f"{finding_id or '<blank>'}: expected BLOCKER severity, got {finding.severity!r}."
+        )
+    if not finding_id:
+        raise ValueError("Cannot create capped review blocker task without a nonblank finding ID.")
+    return finding_id
+
+
+def _validate_capped_review_blocker_findings(findings: tuple[ReviewFinding, ...]) -> None:
+    if not findings:
+        raise ValueError("Cannot create capped review blocker tasks without at least one finding.")
+
+    seen: set[str] = set()
+    for finding in findings:
+        finding_id = _validate_capped_review_blocker_finding(finding)
+        if finding_id in seen:
+            raise ValueError(f"Cannot create capped review blocker tasks with duplicate finding ID {finding_id!r}.")
+        seen.add(finding_id)
+
+
+def _capped_review_blocker_can_be_reused(store: SqliteTaskStore, existing: Task) -> bool:
+    if existing.id is not None and store.supports_merge_units():
+        active_unit = store.resolve_merge_unit_for_task(existing.id)
+        if active_unit is not None:
+            return active_unit.state in MERGE_UNIT_ACTIONABLE_STATES and active_unit.superseded_by_unit_id is None
+        if store.list_merge_units_for_task(existing.id, active_only=False):
+            return False
+    return (
+        existing.status not in _CAPPED_REVIEW_BLOCKER_NON_REUSABLE_STATUSES
+        and existing.merge_status not in _CAPPED_REVIEW_BLOCKER_TERMINAL_MERGE_STATUSES
+    )
+
+
+def _reconcile_capped_review_blocker_tags(
+    store: SqliteTaskStore,
+    existing: Task,
+    *,
+    impl_task: Task,
+    active_scope_tags: Iterable[str] | None,
+) -> Task:
+    required_tags = _capped_review_blocker_tags(impl_task, active_scope_tags=active_scope_tags)
+    reconciled_tags = tuple(dict.fromkeys((*existing.tags, *required_tags)))
+    if reconciled_tags == existing.tags:
+        return existing
+    updated = replace(existing, tags=reconciled_tags)
+    store.update(updated)
+    return updated
+
+
+def create_or_reuse_capped_review_blocker_task(
+    store: SqliteTaskStore,
+    *,
+    config: Config | None = None,
+    review_task: Task,
+    impl_task: Task,
+    finding: ReviewFinding,
+    persisted_review_output: str,
+    active_scope_tags: Iterable[str] | None = None,
+    trigger_source: str,
+) -> tuple[Task, bool]:
+    """Create or reuse one implement child for an open max-review-cycle BLOCKER finding."""
+    _validate_capped_review_persisted_output(persisted_review_output)
+    finding_id = _validate_capped_review_blocker_finding(finding)
+    if review_task.id is None:
+        raise ValueError("Cannot create capped review blocker for review without an ID.")
+    if impl_task.id is None:
+        raise ValueError("Cannot create capped review blocker for implementation without an ID.")
+
+    existing = find_existing_capped_review_blocker_task(
+        store,
+        review_task_id=review_task.id,
+        impl_task_id=impl_task.id,
+        finding_id=finding_id,
+    )
+    if existing is not None:
+        if not _capped_review_blocker_can_be_reused(store, existing):
+            raise ValueError(
+                f"Existing capped review blocker task {existing.id or '<unknown>'} "
+                f"cannot be reused from status {existing.status!r} "
+                f"and merge status {existing.merge_status!r}."
+            )
+        reconciled = _reconcile_capped_review_blocker_tags(
+            store,
+            existing,
+            impl_task=impl_task,
+            active_scope_tags=active_scope_tags,
+        )
+        return reconciled, False
+
+    prompt = build_capped_review_blocker_prompt(
+        review_task.id,
+        impl_task.id,
+        finding,
+        persisted_review_output,
+    )
+    _require_model_for_created_task(config, "implement")
+    created = store.add(
+        prompt=prompt,
+        task_type="implement",
+        based_on=impl_task.id,
+        depends_on=impl_task.id,
+        review_scope=format_blocker_finding_context(finding),
+        tags=_capped_review_blocker_tags(impl_task, active_scope_tags=active_scope_tags),
+        trigger_source=trigger_source,
+        create_pr=True,
+        urgent=True,
+    )
+    return created, True
+
+
+def create_or_reuse_capped_review_blocker_tasks(
+    store: SqliteTaskStore,
+    *,
+    config: Config | None = None,
+    review_task: Task,
+    impl_task: Task,
+    findings: tuple[ReviewFinding, ...],
+    persisted_review_output: str,
+    active_scope_tags: Iterable[str] | None = None,
+    trigger_source: str,
+) -> tuple[list[Task], list[Task]]:
+    """Create/reuse max-review-cycle blocker tasks, failing hard on persistence errors."""
+    _validate_capped_review_persisted_output(persisted_review_output)
+    _validate_capped_review_blocker_findings(findings)
+    created: list[Task] = []
+    reused: list[Task] = []
+    for finding in findings:
+        task, created_now = create_or_reuse_capped_review_blocker_task(
+            store,
+            config=config,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+            persisted_review_output=persisted_review_output,
+            active_scope_tags=active_scope_tags,
+            trigger_source=trigger_source,
+        )
+        if created_now:
+            created.append(task)
+        else:
+            reused.append(task)
+    return created, reused
 
 
 def create_or_reuse_review_blocker_adjudication_task(

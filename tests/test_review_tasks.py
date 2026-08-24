@@ -8,12 +8,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gza.artifacts import store_command_output_artifact
+from gza.cli._common import _create_or_reuse_capped_review_blocker_tasks as common_create_capped_review_blocker_tasks
 from gza.config import Config, ConfigError
 from gza.db import SqliteTaskStore, Task
 from gza.git import Git
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance, parse_rebase_diff_provenance
 from gza.review_scope import parse_resolution_review_scope, parse_spec_coherence_review_scope
 from gza.review_tasks import (
+    DEFERRED_REVIEW_BLOCKER_TAG,
     OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
     DuplicateReviewError,
     OffTopicVerifyPersistenceError,
@@ -21,6 +23,7 @@ from gza.review_tasks import (
     backfill_changed_diff_rebase_review_scope_provenance,
     backfill_resolution_review_scope_provenance,
     build_auto_review_prompt,
+    build_capped_review_blocker_prompt_prefix,
     build_deferred_blocker_prompt_prefix,
     build_followup_prompt,
     build_followup_prompt_prefix,
@@ -28,6 +31,8 @@ from gza.review_tasks import (
     build_review_blocker_adjudication_prompt_prefix,
     build_spec_coherence_review_prompt,
     build_verify_fix_prompt,
+    create_or_reuse_capped_review_blocker_task,
+    create_or_reuse_capped_review_blocker_tasks,
     create_or_reuse_deferred_blocker_task,
     create_or_reuse_followup_task,
     create_or_reuse_off_topic_verify_investigations,
@@ -36,10 +41,12 @@ from gza.review_tasks import (
     create_resolution_review_task,
     create_review_task,
     create_spec_coherence_review_task,
+    extract_capped_review_blocker_prompt_parts,
     extract_deferred_blocker_prompt_parts,
     extract_followup_prompt_parts,
     extract_review_blocker_adjudication_dispute_identity,
     extract_review_blocker_adjudication_dispute_reference,
+    find_existing_capped_review_blocker_task,
     find_existing_deferred_blocker_task,
     find_existing_followup_task,
     find_existing_review_blocker_adjudication_task,
@@ -3003,6 +3010,782 @@ class TestFollowupTasks:
         assert created_now is True
         assert store.add.call_args.kwargs["prompt"].startswith(
             build_deferred_blocker_prompt_prefix("gza-200", "gza-101", "F1")
+        )
+
+    def test_extract_capped_review_blocker_prompt_parts(self):
+        assert extract_capped_review_blocker_prompt_parts(
+            "Capped review blocker B1 from review gza-200 for task gza-101 reason review-max-cycles: fix gate"
+        ) == ("B1", "gza-200", "gza-101")
+        assert extract_capped_review_blocker_prompt_parts(
+            "Deferred blocker B1 from review gza-200 for task gza-101: fix gate"
+        ) is None
+
+    def test_find_existing_capped_review_blocker_task_matches_implementation_child_prefix(self):
+        store = MagicMock()
+        existing = _task(
+            id="gza-701",
+            task_type="implement",
+            prompt=(
+                "Capped review blocker B1 from review gza-200 for task gza-101 "
+                "reason review-max-cycles: fix flaky gate"
+            ),
+        )
+        store.get_based_on_children.return_value = [existing]
+
+        found = find_existing_capped_review_blocker_task(
+            store,
+            review_task_id="gza-200",
+            impl_task_id="gza-101",
+            finding_id="B1",
+        )
+
+        assert found is existing
+        store.get_based_on_children.assert_called_once_with("gza-101")
+
+    def test_create_or_reuse_capped_review_blocker_task_is_idempotent(self):
+        store = MagicMock()
+        review_task = _task(id="gza-200", task_type="review")
+        impl_task = _task(id="gza-101", task_type="implement", tags=("release",))
+        finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Fix flaky verify gate",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="stabilize verify",
+            tests=None,
+            open_state_citation=None,
+        )
+        existing = _task(
+            id="gza-701",
+            task_type="implement",
+            prompt=(
+                "Capped review blocker B1 from review gza-200 for task gza-101 "
+                "reason review-max-cycles: stabilize verify"
+            ),
+            tags=(DEFERRED_REVIEW_BLOCKER_TAG, "release", "scoped"),
+        )
+        store.get_based_on_children.return_value = [existing]
+        store.supports_merge_units.return_value = False
+
+        reused, created_now = create_or_reuse_capped_review_blocker_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+            persisted_review_output="raw review",
+            active_scope_tags=("scoped",),
+            trigger_source="advance",
+        )
+
+        assert reused is existing
+        assert created_now is False
+        store.add.assert_not_called()
+        store.update.assert_not_called()
+
+    def test_create_or_reuse_capped_review_blocker_task_reconciles_reused_tags(
+        self,
+        tmp_path: Path,
+    ):
+        _config, store = _make_store(tmp_path)
+        impl_task = store.add(
+            "Implement capped merge",
+            task_type="implement",
+            tags=("release",),
+        )
+        assert impl_task.id is not None
+        review_task = store.add("Review capped merge", task_type="review", based_on=impl_task.id)
+        assert review_task.id is not None
+        finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Missing scope tags",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="reconcile tags",
+            tests=None,
+            open_state_citation=None,
+        )
+        existing = store.add(
+            build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, finding.id)
+            + " reconcile tags",
+            task_type="implement",
+            based_on=impl_task.id,
+            depends_on=impl_task.id,
+            tags=("legacy-extra",),
+        )
+        assert existing.id is not None
+
+        impl_task.tags = ("release", "backend")
+        reused, created_now = create_or_reuse_capped_review_blocker_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+            persisted_review_output="raw review",
+            active_scope_tags=("scoped",),
+            trigger_source="advance",
+        )
+
+        assert reused.id == existing.id
+        assert created_now is False
+        assert store.get(reused.id).tags == (
+            "backend",
+            DEFERRED_REVIEW_BLOCKER_TAG,
+            "legacy-extra",
+            "release",
+            "scoped",
+        )
+        assert len(
+            [child for child in store.get_based_on_children(impl_task.id) if child.task_type == "implement"]
+        ) == 1
+
+    def test_create_or_reuse_capped_review_blocker_task_propagates_tag_reconciliation_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        _config, store = _make_store(tmp_path)
+        impl_task = store.add("Implement capped merge", task_type="implement", tags=("release",))
+        assert impl_task.id is not None
+        review_task = store.add("Review capped merge", task_type="review", based_on=impl_task.id)
+        assert review_task.id is not None
+        finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Missing reserved tag",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="add reserved tag",
+            tests=None,
+            open_state_citation=None,
+        )
+        store.add(
+            build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, finding.id)
+            + " add reserved tag",
+            task_type="implement",
+            based_on=impl_task.id,
+            depends_on=impl_task.id,
+            tags=("legacy-extra",),
+        )
+
+        def fail_update(_task: Task) -> None:
+            raise RuntimeError("tag write failed")
+
+        monkeypatch.setattr(store, "update", fail_update)
+
+        with pytest.raises(RuntimeError, match="tag write failed"):
+            create_or_reuse_capped_review_blocker_task(
+                store,
+                review_task=review_task,
+                impl_task=impl_task,
+                finding=finding,
+                persisted_review_output="raw review",
+                active_scope_tags=("scoped",),
+                trigger_source="advance",
+            )
+
+    @pytest.mark.parametrize(
+        ("unit_state", "superseded_by_unit_id"),
+        [
+            ("merged", None),
+            ("empty", None),
+            ("redundant", None),
+            ("dropped", None),
+            ("superseded", "winner-unit"),
+            ("unmerged", "winner-unit"),
+        ],
+    )
+    def test_create_or_reuse_capped_review_blocker_task_rejects_terminal_merge_unit_prompt_match(
+        self,
+        tmp_path: Path,
+        unit_state: str,
+        superseded_by_unit_id: str | None,
+    ):
+        _config, store = _make_store(tmp_path)
+        impl_task = store.add("Implement capped merge", task_type="implement", tags=("release",))
+        assert impl_task.id is not None
+        review_task = store.add("Review capped merge", task_type="review", based_on=impl_task.id)
+        assert review_task.id is not None
+        finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Terminal row",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="do not reuse",
+            tests=None,
+            open_state_citation=None,
+        )
+        existing = store.add(
+            build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, finding.id)
+            + " do not reuse",
+            task_type="implement",
+            based_on=impl_task.id,
+            depends_on=impl_task.id,
+            tags=(DEFERRED_REVIEW_BLOCKER_TAG,),
+        )
+        assert existing.id is not None
+        unit = store.create_merge_unit(
+            source_branch=f"task/{unit_state}-{superseded_by_unit_id or 'none'}",
+            target_branch="main",
+            owner_task_id=existing.id,
+            state=unit_state,
+        )
+        store.attach_task_to_merge_unit(existing.id, unit.id, "owner")
+        if superseded_by_unit_id is not None:
+            with store._connect() as conn:  # noqa: SLF001 - fixture-only historical supersession setup
+                conn.execute(
+                    """
+                    UPDATE merge_units
+                    SET superseded_by_unit_id = ?
+                    WHERE project_id = ?
+                      AND id = ?
+                    """,
+                    (superseded_by_unit_id, store._project_id, unit.id),
+                )
+
+        with pytest.raises(ValueError, match="cannot be reused"):
+            create_or_reuse_capped_review_blocker_task(
+                store,
+                review_task=review_task,
+                impl_task=impl_task,
+                finding=finding,
+                persisted_review_output="raw review",
+                active_scope_tags=("scoped",),
+                trigger_source="advance",
+            )
+
+        assert store.get(existing.id).tags == (DEFERRED_REVIEW_BLOCKER_TAG,)
+        assert [
+            child.id
+            for child in store.get_based_on_children(impl_task.id)
+            if child.task_type == "implement"
+        ] == [existing.id]
+
+    @pytest.mark.parametrize("historical_state", ["dropped", "superseded"])
+    @pytest.mark.parametrize("active_state", ["unmerged", "blocked", "stale"])
+    def test_create_or_reuse_capped_review_blocker_task_reuses_active_unit_despite_historical_tombstone(
+        self,
+        tmp_path: Path,
+        historical_state: str,
+        active_state: str,
+    ):
+        _config, store = _make_store(tmp_path)
+        impl_task = store.add("Implement capped merge", task_type="implement", tags=("release",))
+        assert impl_task.id is not None
+        review_task = store.add("Review capped merge", task_type="review", based_on=impl_task.id)
+        assert review_task.id is not None
+        finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Mixed lifecycle row",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="reuse current active work",
+            tests=None,
+            open_state_citation=None,
+        )
+        existing = store.add(
+            build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, finding.id)
+            + " reuse current active work",
+            task_type="implement",
+            based_on=impl_task.id,
+            depends_on=impl_task.id,
+            tags=("legacy-extra",),
+        )
+        assert existing.id is not None
+        historical_unit = store.create_merge_unit(
+            source_branch=f"task/historical-{historical_state}",
+            target_branch="main",
+            owner_task_id=existing.id,
+            state=historical_state,
+        )
+        store.attach_task_to_merge_unit(existing.id, historical_unit.id, "owner")
+        if historical_state == "superseded":
+            with store._connect() as conn:  # noqa: SLF001 - fixture-only historical supersession setup
+                conn.execute(
+                    """
+                    UPDATE merge_units
+                    SET superseded_by_unit_id = ?
+                    WHERE project_id = ?
+                      AND id = ?
+                    """,
+                    ("replacement-unit", store._project_id, historical_unit.id),
+                )
+        active_unit = store.create_merge_unit(
+            source_branch=f"task/current-{active_state}",
+            target_branch="main",
+            owner_task_id=existing.id,
+            state=active_state,
+        )
+        store.attach_task_to_merge_unit(existing.id, active_unit.id, "owner")
+
+        reused, created_now = create_or_reuse_capped_review_blocker_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+            persisted_review_output="raw review",
+            active_scope_tags=("scoped",),
+            trigger_source="advance",
+        )
+
+        assert reused.id == existing.id
+        assert created_now is False
+        assert store.get(existing.id).tags == (
+            DEFERRED_REVIEW_BLOCKER_TAG,
+            "legacy-extra",
+            "release",
+            "scoped",
+        )
+        assert store.resolve_merge_unit_for_task(existing.id).id == active_unit.id
+        assert [
+            child.id
+            for child in store.get_based_on_children(impl_task.id)
+            if child.task_type == "implement"
+        ] == [existing.id]
+
+    @pytest.mark.parametrize(
+        ("existing_status", "unit_state"),
+        [
+            ("failed", "unmerged"),
+            ("completed", "unmerged"),
+        ],
+    )
+    def test_create_or_reuse_capped_review_blocker_task_reuses_active_merge_unit_prompt_match(
+        self,
+        tmp_path: Path,
+        existing_status: str,
+        unit_state: str,
+    ):
+        _config, store = _make_store(tmp_path)
+        impl_task = store.add("Implement capped merge", task_type="implement", tags=("release",))
+        assert impl_task.id is not None
+        review_task = store.add("Review capped merge", task_type="review", based_on=impl_task.id)
+        assert review_task.id is not None
+        finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Active row",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="reuse safely",
+            tests=None,
+            open_state_citation=None,
+        )
+        existing = store.add(
+            build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, finding.id)
+            + " reuse safely",
+            task_type="implement",
+            based_on=impl_task.id,
+            depends_on=impl_task.id,
+            tags=("legacy-extra",),
+        )
+        assert existing.id is not None
+        existing.status = existing_status
+        store.update(existing)
+        unit = store.create_merge_unit(
+            source_branch=f"task/reusable-{existing_status}",
+            target_branch="main",
+            owner_task_id=existing.id,
+            state=unit_state,
+        )
+        store.attach_task_to_merge_unit(existing.id, unit.id, "owner")
+
+        reused, created_now = create_or_reuse_capped_review_blocker_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+            persisted_review_output="raw review",
+            active_scope_tags=("scoped",),
+            trigger_source="advance",
+        )
+
+        assert reused.id == existing.id
+        assert created_now is False
+        assert store.get(existing.id).tags == (
+            DEFERRED_REVIEW_BLOCKER_TAG,
+            "legacy-extra",
+            "release",
+            "scoped",
+        )
+        assert [
+            child.id
+            for child in store.get_based_on_children(impl_task.id)
+            if child.task_type == "implement"
+        ] == [existing.id]
+
+    def test_create_or_reuse_capped_review_blocker_task_creates_expected_shape_and_prompt(self):
+        store = MagicMock()
+        review_task = _task(id="gza-200", task_type="review")
+        impl_task = _task(
+            id="gza-101",
+            task_type="implement",
+            tags=("release", "backend"),
+        )
+        finding = ReviewFinding(
+            id="B2",
+            severity="BLOCKER",
+            title="Missing persistence guard",
+            body="Canonical blocker context.",
+            evidence="Null state can escape the gate",
+            impact="Auto merge could lose a required data fix",
+            fix_or_followup="Persist the deferred blocker record first",
+            tests="Add merge-and-defer coverage",
+            open_state_citation="finding B2 remains open",
+        )
+        persisted_review_output = (
+            "# Review\n\n"
+            "- [BLOCKER] B2\n"
+            "  Preserve  odd   spacing.\n"
+            "\n"
+            "```text\n"
+            "line with trailing spaces   \n"
+            "```\n"
+        )
+        created_task = _task(id="gza-702", task_type="implement")
+        store.get_based_on_children.return_value = []
+        store.add.return_value = created_task
+
+        created, created_now = create_or_reuse_capped_review_blocker_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+            persisted_review_output=persisted_review_output,
+            active_scope_tags=("backend", "urgent-scope"),
+            trigger_source="watch",
+        )
+
+        assert created is created_task
+        assert created_now is True
+        kwargs = store.add.call_args.kwargs
+        assert kwargs["task_type"] == "implement"
+        assert kwargs["based_on"] == "gza-101"
+        assert kwargs["depends_on"] == "gza-101"
+        assert kwargs["review_scope"] == format_blocker_finding_context(finding)
+        assert kwargs["create_pr"] is True
+        assert kwargs["urgent"] is True
+        assert kwargs["trigger_source"] == "watch"
+        assert kwargs["tags"] == ("release", "backend", "urgent-scope", DEFERRED_REVIEW_BLOCKER_TAG)
+        prompt = kwargs["prompt"]
+        assert prompt.startswith(
+            build_capped_review_blocker_prompt_prefix("gza-200", "gza-101", "B2")
+        )
+        assert "Reason: review-max-cycles" in prompt
+        assert "----- BEGIN PERSISTED REVIEW OUTPUT -----\n" + persisted_review_output in prompt
+        assert persisted_review_output + "\n----- END PERSISTED REVIEW OUTPUT -----" in prompt
+
+    @pytest.mark.parametrize("persisted_review_output", ["", "   \n\t  "])
+    def test_create_or_reuse_capped_review_blocker_task_rejects_blank_review_output_before_writes(
+        self,
+        tmp_path: Path,
+        persisted_review_output: str,
+    ):
+        _config, store = _make_store(tmp_path)
+        impl_task = store.add("Implement capped merge", task_type="implement", tags=("release",))
+        assert impl_task.id is not None
+        review_task = store.add("Review capped merge", task_type="review", based_on=impl_task.id)
+        assert review_task.id is not None
+        finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Missing review output",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="fail closed",
+            tests=None,
+            open_state_citation=None,
+        )
+
+        with pytest.raises(ValueError, match="persisted review output"):
+            create_or_reuse_capped_review_blocker_task(
+                store,
+                review_task=review_task,
+                impl_task=impl_task,
+                finding=finding,
+                persisted_review_output=persisted_review_output,
+                active_scope_tags=("scoped",),
+                trigger_source="advance",
+            )
+
+        assert [
+            child for child in store.get_based_on_children(impl_task.id) if child.task_type == "implement"
+        ] == []
+
+    def test_create_or_reuse_capped_review_blocker_tasks_fans_out_and_replays_partial_creation(
+        self,
+        tmp_path: Path,
+    ):
+        _config, store = _make_store(tmp_path)
+        impl_task = store.add("Implement capped merge", task_type="implement", tags=("release",))
+        assert impl_task.id is not None
+        review_task = store.add("Review capped merge", task_type="review", based_on=impl_task.id)
+        assert review_task.id is not None
+        first = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="First blocker",
+            body="First body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="fix first",
+            tests=None,
+            open_state_citation=None,
+        )
+        second = ReviewFinding(
+            id="B2",
+            severity="BLOCKER",
+            title="Second blocker",
+            body="Second body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="fix second",
+            tests=None,
+            open_state_citation=None,
+        )
+        created, reused = create_or_reuse_capped_review_blocker_tasks(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            findings=(first,),
+            persisted_review_output="raw review text\n",
+            active_scope_tags=("scoped",),
+            trigger_source="advance",
+        )
+        assert len(created) == 1
+        assert reused == []
+
+        replay_created, replay_reused = create_or_reuse_capped_review_blocker_tasks(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            findings=(first, second),
+            persisted_review_output="raw review text\n",
+            active_scope_tags=("scoped",),
+            trigger_source="advance",
+        )
+
+        assert [task.id for task in replay_reused] == [created[0].id]
+        assert len(replay_created) == 1
+        second_replay_created, second_replay_reused = create_or_reuse_capped_review_blocker_tasks(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            findings=(first, second),
+            persisted_review_output="raw review text\n",
+            active_scope_tags=("scoped",),
+            trigger_source="advance",
+        )
+
+        assert second_replay_created == []
+        assert [task.id for task in second_replay_reused] == [created[0].id, replay_created[0].id]
+        impl_children = store.get_based_on_children(impl_task.id)
+        review_children = store.get_based_on_children(review_task.id)
+        assert len([child for child in impl_children if child.task_type == "implement"]) == 2
+        assert review_children == []
+
+    @pytest.mark.parametrize(
+        ("findings", "match"),
+        [
+            ((), "at least one finding"),
+            ((_finding("B1", "FOLLOWUP"),), "expected BLOCKER severity"),
+            ((_finding("   ", "BLOCKER"),), "nonblank finding ID"),
+            ((_finding("B1", "BLOCKER"), _finding("B1", "BLOCKER")), "duplicate finding ID"),
+        ],
+    )
+    def test_create_or_reuse_capped_review_blocker_tasks_preflights_invalid_collections_before_reuse_mutation(
+        self,
+        tmp_path: Path,
+        findings: tuple[ReviewFinding, ...],
+        match: str,
+    ):
+        _config, store = _make_store(tmp_path)
+        impl_task = store.add("Implement capped merge", task_type="implement", tags=("release",))
+        assert impl_task.id is not None
+        review_task = store.add("Review capped merge", task_type="review", based_on=impl_task.id)
+        assert review_task.id is not None
+        existing = store.add(
+            build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, "B1")
+            + " stale tags",
+            task_type="implement",
+            based_on=impl_task.id,
+            depends_on=impl_task.id,
+            tags=("legacy-extra",),
+        )
+        assert existing.id is not None
+
+        with pytest.raises(ValueError, match=match):
+            create_or_reuse_capped_review_blocker_tasks(
+                store,
+                review_task=review_task,
+                impl_task=impl_task,
+                findings=findings,
+                persisted_review_output="raw review text\n",
+                active_scope_tags=("scoped",),
+                trigger_source="advance",
+            )
+
+        assert store.get(existing.id).tags == ("legacy-extra",)
+        assert [
+            child.id
+            for child in store.get_based_on_children(impl_task.id)
+            if child.task_type == "implement"
+        ] == [existing.id]
+        assert store.get_based_on_children(review_task.id) == []
+
+    @pytest.mark.parametrize("persisted_review_output", ["", "  \n\t "])
+    def test_create_or_reuse_capped_review_blocker_tasks_rejects_blank_review_output_before_fanout(
+        self,
+        tmp_path: Path,
+        persisted_review_output: str,
+    ):
+        _config, store = _make_store(tmp_path)
+        impl_task = store.add("Implement capped merge", task_type="implement", tags=("release",))
+        assert impl_task.id is not None
+        review_task = store.add("Review capped merge", task_type="review", based_on=impl_task.id)
+        assert review_task.id is not None
+        first = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="First blocker",
+            body="First body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="fix first",
+            tests=None,
+            open_state_citation=None,
+        )
+        second = ReviewFinding(
+            id="B2",
+            severity="BLOCKER",
+            title="Second blocker",
+            body="Second body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="fix second",
+            tests=None,
+            open_state_citation=None,
+        )
+
+        with pytest.raises(ValueError, match="persisted review output"):
+            create_or_reuse_capped_review_blocker_tasks(
+                store,
+                review_task=review_task,
+                impl_task=impl_task,
+                findings=(first, second),
+                persisted_review_output=persisted_review_output,
+                active_scope_tags=("scoped",),
+                trigger_source="advance",
+            )
+
+        assert [
+            child for child in store.get_based_on_children(impl_task.id) if child.task_type == "implement"
+        ] == []
+
+    def test_create_or_reuse_capped_review_blocker_task_persistence_failure_fails_hard(self):
+        store = MagicMock()
+        review_task = _task(id="gza-200", task_type="review")
+        impl_task = _task(id="gza-101", task_type="implement")
+        finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Missing guard",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="add guard",
+            tests=None,
+            open_state_citation=None,
+        )
+        store.get_based_on_children.return_value = []
+        store.add.side_effect = RuntimeError("database is locked")
+
+        with pytest.raises(RuntimeError, match="database is locked"):
+            create_or_reuse_capped_review_blocker_task(
+                store,
+                review_task=review_task,
+                impl_task=impl_task,
+                finding=finding,
+                persisted_review_output="raw review",
+                trigger_source="advance",
+            )
+
+    def test_common_capped_review_blocker_wrapper_forwards_to_creator(self):
+        store = MagicMock()
+        review_task = _task(id="gza-200", task_type="review")
+        impl_task = _task(id="gza-101", task_type="implement")
+        finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Missing guard",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="add guard",
+            tests=None,
+            open_state_citation=None,
+        )
+        created_task = _task(id="gza-704", task_type="implement")
+        store.get_based_on_children.return_value = []
+        store.add.return_value = created_task
+
+        created, reused = common_create_capped_review_blocker_tasks(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            findings=(finding,),
+            persisted_review_output="raw review",
+            active_scope_tags=("release",),
+            trigger_source="advance",
+        )
+
+        assert created == [created_task]
+        assert reused == []
+        assert store.add.call_args.kwargs["tags"] == ("release", DEFERRED_REVIEW_BLOCKER_TAG)
+
+    def test_manual_deferred_blocker_helper_remains_review_based_without_reserved_tag(self):
+        store = MagicMock()
+        review_task = _task(id="gza-200", task_type="review")
+        impl_task = _task(id="gza-101", task_type="implement", tags=("release",))
+        finding = ReviewFinding(
+            id="B1",
+            severity="BLOCKER",
+            title="Manual blocker",
+            body="Body",
+            evidence=None,
+            impact=None,
+            fix_or_followup="fix blocker",
+            tests=None,
+            open_state_citation=None,
+        )
+        created_task = _task(id="gza-703", task_type="implement")
+        store.get_based_on_children.return_value = []
+        store.add.return_value = created_task
+
+        create_or_reuse_deferred_blocker_task(
+            store,
+            review_task=review_task,
+            impl_task=impl_task,
+            finding=finding,
+            trigger_source="manual",
+        )
+
+        kwargs = store.add.call_args.kwargs
+        assert kwargs["based_on"] == "gza-200"
+        assert kwargs["depends_on"] == "gza-101"
+        assert kwargs["tags"] == ("release",)
+        assert kwargs["prompt"].startswith(
+            build_deferred_blocker_prompt_prefix("gza-200", "gza-101", "B1")
         )
 
 

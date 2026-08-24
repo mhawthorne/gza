@@ -81,6 +81,7 @@ from ..recovery_engine import FailedRecoveryDecision, classify_recovery_row, dec
 from ..review_scope import extract_review_scope_from_prompt
 from ..review_tasks import (
     DuplicateReviewError,  # noqa: F401
+    create_or_reuse_capped_review_blocker_tasks,
     create_or_reuse_deferred_blocker_task,
     create_or_reuse_followup_task,
     create_or_reuse_review_blocker_adjudication_task,
@@ -3083,6 +3084,30 @@ def _create_or_reuse_deferred_blocker_tasks(
         else:
             reused.append(task)
     return created, reused
+
+
+def _create_or_reuse_capped_review_blocker_tasks(
+    store: SqliteTaskStore,
+    *,
+    config: Config | None = None,
+    review_task: DbTask,
+    impl_task: DbTask,
+    findings: tuple[ReviewFinding, ...],
+    persisted_review_output: str,
+    active_scope_tags: tuple[str, ...] | None = None,
+    trigger_source: str,
+) -> tuple[list[DbTask], list[DbTask]]:
+    """Create/reuse max-review-cycle deferred-blocker implement tasks."""
+    return create_or_reuse_capped_review_blocker_tasks(
+        store,
+        config=config,
+        review_task=review_task,
+        impl_task=impl_task,
+        findings=findings,
+        persisted_review_output=persisted_review_output,
+        active_scope_tags=active_scope_tags,
+        trigger_source=trigger_source,
+    )
 
 
 def resolve_improve_action(
