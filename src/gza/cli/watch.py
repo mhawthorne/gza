@@ -6806,8 +6806,30 @@ class WatchProjectRuntime:
             still_excluded.add(task_id)
         return frozenset(still_excluded)
 
+    def _current_live_worker_exclusion_ids(self) -> frozenset[str]:
+        live_task_ids: set[str] = set()
+        registry = WorkerRegistry(self.config.workers_path)
+        for worker in registry.list_all(include_completed=False):
+            if worker.status != "running" or worker.task_id is None:
+                continue
+            if not registry.is_running(worker.worker_id):
+                continue
+            task_id = str(worker.task_id)
+            task = self.store.get(task_id)
+            if task is None or task.status not in {"pending", "in_progress"}:
+                continue
+            live_task_ids.add(task_id)
+        return frozenset(live_task_ids)
+
+    def _task_has_current_live_worker_proof(self, task_id: str) -> bool:
+        return str(task_id) in self._current_live_worker_exclusion_ids()
+
     def _dispatch_exclusion_ids(self) -> frozenset[str]:
-        return self._current_confirmed_start_exclusion_ids() | frozenset(self._attempted_dispatch_task_ids)
+        return (
+            self._current_confirmed_start_exclusion_ids()
+            | self._current_live_worker_exclusion_ids()
+            | frozenset(self._attempted_dispatch_task_ids)
+        )
 
     def _dispatch_suppression_context(
         self,
@@ -7109,6 +7131,22 @@ class WatchProjectRuntime:
                 task=task,
             )
         task_type = task.task_type or "implement"
+        def reject_if_live_worker_proof() -> ProjectDispatchResult | None:
+            if not self._task_has_current_live_worker_proof(str(task.id)):
+                return None
+            return ProjectDispatchResult(
+                runtime_key=self.key,
+                candidate=candidate,
+                status="not_dispatchable",
+                slot_consuming=False,
+                work_done=False,
+                detail=f"task {task.id} already has live worker proof",
+                task=task,
+            )
+
+        live_worker_rejection = reject_if_live_worker_proof()
+        if live_worker_rejection is not None:
+            return live_worker_rejection
         if dry_run:
             prompt = _format_prompt_for_width(
                 task.prompt,
@@ -7144,6 +7182,9 @@ class WatchProjectRuntime:
                 detail="active recovery backoff",
                 task=task,
             )
+        live_worker_rejection = reject_if_live_worker_proof()
+        if live_worker_rejection is not None:
+            return live_worker_rejection
         no_progress_attention = _maybe_park_watch_no_progress(
             config=self.config,
             store=self.store,
@@ -7185,6 +7226,9 @@ class WatchProjectRuntime:
                 detail=str(no_progress_attention.get("needs_attention_reason", "watch-no-progress")),
                 task=task,
             )
+        live_worker_rejection = reject_if_live_worker_proof()
+        if live_worker_rejection is not None:
+            return live_worker_rejection
 
         try:
             permit = launch_permit(self.config, self.store)
@@ -7203,6 +7247,10 @@ class WatchProjectRuntime:
                 detail=str(exc),
                 task=task,
             )
+        live_worker_rejection = reject_if_live_worker_proof()
+        if live_worker_rejection is not None:
+            permit.release()
+            return live_worker_rejection
 
         settle_task_before: _WatchDispatchTaskSnapshot | None
         dedupe_suffix: str
@@ -7232,6 +7280,10 @@ class WatchProjectRuntime:
             reserve_task_launch_permit(str(prepared_task.id), permit)
             settle_task_before = _snapshot_watch_dispatch_task(prepared_task)
             pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
+            live_worker_rejection = reject_if_live_worker_proof()
+            if live_worker_rejection is not None:
+                release_task_launch_permit(str(prepared_task.id))
+                return live_worker_rejection
             iterate_args = argparse.Namespace(
                 max_iterations=max_iterations,
                 no_docker=False,
@@ -7259,6 +7311,10 @@ class WatchProjectRuntime:
         else:
             settle_task_before = _snapshot_watch_dispatch_task(task)
             worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+            live_worker_rejection = reject_if_live_worker_proof()
+            if live_worker_rejection is not None:
+                permit.release()
+                return live_worker_rejection
             rc = _spawn_worker_with_failure_log(
                 quiet=quiet,
                 log=self.log,
@@ -12540,6 +12596,8 @@ def _run_cycle(
                         action=pending_action,
                     ):
                         continue
+                    if _watch_task_has_live_registered_worker(config, str(task.id)):
+                        continue
                     no_progress_attention = _maybe_park_watch_no_progress(
                         config=config,
                         store=store,
@@ -12563,6 +12621,8 @@ def _run_cycle(
                             message=_watch_needs_attention_message(task, no_progress_attention),
                         )
                         continue
+                    if _watch_task_has_live_registered_worker(config, str(task.id)):
+                        continue
                     iterate_args = argparse.Namespace(
                         max_iterations=max_iterations,
                         no_docker=False,
@@ -12573,6 +12633,9 @@ def _run_cycle(
                     pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
                     reserved_launch = _reserve_watch_launch("iterate", str(task.id))
                     if reserved_launch is None:
+                        continue
+                    if _watch_task_has_live_registered_worker(config, str(task.id)):
+                        reserved_launch.release()
                         continue
                     prepared_pending_task = _prepare_watch_reserved_task(
                         task,
@@ -12588,6 +12651,9 @@ def _run_cycle(
                         work_done = True
                         continue
                     pending_task_before = _snapshot_watch_dispatch_task(prepared_pending_task)
+                    if _watch_task_has_live_registered_worker(config, str(task.id)):
+                        _release_watch_reserved_task(str(prepared_pending_task.id))
+                        continue
                     rc = _spawn_worker_with_failure_log(
                         quiet=quiet,
                         log=log,
@@ -12645,6 +12711,8 @@ def _run_cycle(
                     action=pending_action,
                 ):
                     continue
+                if _watch_task_has_live_registered_worker(config, str(task.id)):
+                    continue
                 no_progress_attention = _maybe_park_watch_no_progress(
                     config=config,
                     store=store,
@@ -12668,8 +12736,12 @@ def _run_cycle(
                         message=_watch_needs_attention_message(task, no_progress_attention),
                     )
                     continue
+                if _watch_task_has_live_registered_worker(config, str(task.id)):
+                    continue
                 worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
                 pending_task_before = _snapshot_watch_dispatch_task(task)
+                if _watch_task_has_live_registered_worker(config, str(task.id)):
+                    continue
                 rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
                     log=log,

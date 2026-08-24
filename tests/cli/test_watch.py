@@ -32394,6 +32394,19 @@ def _live_worker_registry_for_task(task_id: str) -> MagicMock:
     return registry
 
 
+def _register_live_worker_for_task(config: Config, task_id: str, *, worker_id: str = "w-live") -> WorkerRegistry:
+    registry = WorkerRegistry(config.workers_path)
+    registry.register(
+        WorkerMetadata(
+            worker_id=worker_id,
+            task_id=task_id,
+            pid=os.getpid(),
+            status="running",
+        )
+    )
+    return registry
+
+
 def _make_runtime_for_dispatch_api(
     tmp_path: Path,
     store: SqliteTaskStore | None = None,
@@ -32835,6 +32848,7 @@ def test_watch_project_runtime_live_pending_dispatch_excludes_confirmed_start_fr
     def settle_live_preloop(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
         [entry] = pending_starts
         assert store.get(first.id).status == "pending"
+        _register_live_worker_for_task(runtime.config, first.id)
         return [
             watch_module._WatchDispatchSettleResult(
                 entry=entry,
@@ -32848,8 +32862,6 @@ def test_watch_project_runtime_live_pending_dispatch_excludes_confirmed_start_fr
         patch("gza.cli.watch.launch_permit", return_value=permit) as acquire_permit,
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
         patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_live_preloop),
-        patch("gza.concurrency.WorkerRegistry", return_value=_live_worker_registry_for_task(first.id)),
-        patch("gza.cli.watch.WorkerRegistry", return_value=_live_worker_registry_for_task(first.id)),
     ):
         result = runtime.dispatch_pending_candidate(first_candidate, max_iterations=1)
         refreshed_head = runtime.pending_dispatch_head(max_recovery_attempts=1)
@@ -32877,23 +32889,19 @@ def test_watch_project_runtime_live_pending_dispatch_excludes_only_pending_head(
     with (
         patch("gza.cli.watch.launch_permit", return_value=permit),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
-        patch("gza.concurrency.WorkerRegistry", return_value=_live_worker_registry_for_task(only.id)),
-        patch("gza.cli.watch.WorkerRegistry", return_value=_live_worker_registry_for_task(only.id)),
         patch(
             "gza.cli.watch._settle_watch_dispatch_starts",
-            return_value=[
-                watch_module._WatchDispatchSettleResult(
-                    entry=watch_module._PendingWatchDispatchSettle(
-                        task_id=only.id,
-                        task_before=None,
-                        start_label=f"{only.id} plan",
-                        dedupe_key=f"pending-undispatched:{only.id}:worker",
-                    ),
-                    status=watch_module._DispatchSettleStatus.LIVE,
-                    reason=f"task {only.id} is pending with a live registered worker in preloop",
-                    task=store.get(only.id),
-                )
-            ],
+            side_effect=lambda pending_starts, **_kwargs: (
+                _register_live_worker_for_task(runtime.config, only.id),
+                [
+                    watch_module._WatchDispatchSettleResult(
+                        entry=pending_starts[0],
+                        status=watch_module._DispatchSettleStatus.LIVE,
+                        reason=f"task {only.id} is pending with a live registered worker in preloop",
+                        task=store.get(only.id),
+                    )
+                ],
+            )[1],
         ),
     ):
         result = runtime.dispatch_pending_candidate(candidate, max_iterations=1)
@@ -33120,6 +33128,306 @@ def test_watch_project_runtime_pending_local_cap_is_runtime_wide_hold_not_candid
     assert runtime.pending_dispatch_head(max_recovery_attempts=1).task.id == first.id
 
 
+def test_watch_project_runtime_pending_dispatch_refreshes_live_proof_before_side_effects(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    first = store.add("First pending gains live proof before dispatch side effects", task_type="plan")
+    second = store.add("Second pending after live proof", task_type="plan")
+    assert first.id is not None
+    assert second.id is not None
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    candidate = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert candidate is not None
+    assert candidate.task.id == first.id
+    original_head_for_validation = runtime._current_pending_dispatch_head_for_validation
+
+    def validate_then_register_live_worker(
+        *,
+        suppression_context: watch_module._WatchDispatchSuppressionContext,
+    ) -> ProjectDispatchCandidate | None:
+        head = original_head_for_validation(suppression_context=suppression_context)
+        _register_live_worker_for_task(runtime.config, first.id)
+        return head
+
+    with (
+        patch.object(
+            runtime,
+            "_current_pending_dispatch_head_for_validation",
+            side_effect=validate_then_register_live_worker,
+        ),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", side_effect=AssertionError("no-progress mutated")),
+        patch("gza.cli.watch.launch_permit", side_effect=AssertionError("permit acquired")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=AssertionError("settled")),
+    ):
+        result = runtime.dispatch_pending_candidate(candidate, max_iterations=1)
+
+    assert result.status == "not_dispatchable"
+    assert result.work_done is False
+    assert result.slot_consuming is False
+    assert result.dispatch_budget_consuming is False
+    assert store.get(first.id).status == "pending"
+    assert first.id not in runtime._attempted_dispatch_task_ids
+    live_head = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert live_head is not None
+    assert live_head.task.id == second.id
+
+    WorkerRegistry(runtime.config.workers_path).mark_completed("w-live", exit_code=0)
+    runtime.begin_dispatch_pass()
+    head_after_worker_exit = runtime.pending_dispatch_head(max_recovery_attempts=1)
+
+    assert head_after_worker_exit is not None
+    assert head_after_worker_exit.task.id == first.id
+
+
+def test_watch_project_runtime_pending_dispatch_refreshes_live_proof_after_backoff_before_no_progress(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    first = store.add("First pending gains live proof after backoff", task_type="plan")
+    second = store.add("Second pending after backoff live proof", task_type="plan")
+    assert first.id is not None
+    assert second.id is not None
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    candidate = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert candidate is not None
+    assert candidate.task.id == first.id
+
+    def backoff_then_register_live_worker(*_args: object, **_kwargs: object) -> bool:
+        _register_live_worker_for_task(runtime.config, first.id)
+        return False
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", side_effect=backoff_then_register_live_worker),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", side_effect=AssertionError("no-progress mutated")),
+        patch("gza.cli.watch.launch_permit", side_effect=AssertionError("permit acquired")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=AssertionError("settled")),
+    ):
+        result = runtime.dispatch_pending_candidate(candidate, max_iterations=1)
+
+    assert result.status == "not_dispatchable"
+    assert result.work_done is False
+    assert result.slot_consuming is False
+    assert result.dispatch_budget_consuming is False
+    assert store.get(first.id).status == "pending"
+    assert first.id not in runtime._attempted_dispatch_task_ids
+    live_head = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert live_head is not None
+    assert live_head.task.id == second.id
+
+    WorkerRegistry(runtime.config.workers_path).mark_completed("w-live", exit_code=0)
+    runtime.begin_dispatch_pass()
+    head_after_worker_exit = runtime.pending_dispatch_head(max_recovery_attempts=1)
+
+    assert head_after_worker_exit is not None
+    assert head_after_worker_exit.task.id == first.id
+
+
+def test_watch_project_runtime_pending_dispatch_refreshes_live_proof_after_no_progress_before_permit(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    first = store.add("First pending gains live proof after no-progress", task_type="plan")
+    second = store.add("Second pending after no-progress live proof", task_type="plan")
+    assert first.id is not None
+    assert second.id is not None
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    candidate = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert candidate is not None
+    assert candidate.task.id == first.id
+
+    def no_progress_then_register_live_worker(*_args: object, **_kwargs: object) -> None:
+        _register_live_worker_for_task(runtime.config, first.id)
+        return None
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", side_effect=no_progress_then_register_live_worker),
+        patch("gza.cli.watch.launch_permit", side_effect=AssertionError("permit acquired")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=AssertionError("settled")),
+    ):
+        result = runtime.dispatch_pending_candidate(candidate, max_iterations=1)
+
+    assert result.status == "not_dispatchable"
+    assert result.work_done is False
+    assert result.slot_consuming is False
+    assert result.dispatch_budget_consuming is False
+    assert store.get(first.id).status == "pending"
+    assert first.id not in runtime._attempted_dispatch_task_ids
+    live_head = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert live_head is not None
+    assert live_head.task.id == second.id
+
+    WorkerRegistry(runtime.config.workers_path).mark_completed("w-live", exit_code=0)
+    runtime.begin_dispatch_pass()
+    head_after_worker_exit = runtime.pending_dispatch_head(max_recovery_attempts=1)
+
+    assert head_after_worker_exit is not None
+    assert head_after_worker_exit.task.id == first.id
+
+
+def test_watch_project_runtime_pending_dispatch_releases_permit_when_live_proof_appears_after_acquire(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    first = store.add("First implement gains live proof after permit", task_type="implement")
+    second = store.add("Second pending after permit live proof", task_type="plan")
+    assert first.id is not None
+    assert second.id is not None
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    candidate = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert candidate is not None
+    assert candidate.task.id == first.id
+    permit = _RuntimeDispatchPermit()
+
+    def acquire_then_register_live_worker(config: Config, store: SqliteTaskStore) -> _RuntimeDispatchPermit:
+        assert config is runtime.config
+        assert store is runtime.store
+        _register_live_worker_for_task(runtime.config, first.id)
+        return permit
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None) as no_progress,
+        patch("gza.cli.watch.launch_permit", side_effect=acquire_then_register_live_worker) as acquire_permit,
+        patch(
+            "gza.cli.watch._prepare_task_for_immediate_execution",
+            side_effect=AssertionError("task prepared"),
+        ),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate spawned")),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=AssertionError("settled")),
+    ):
+        result = runtime.dispatch_pending_candidate(candidate, max_iterations=1)
+
+    assert result.status == "not_dispatchable"
+    assert result.work_done is False
+    assert result.slot_consuming is False
+    assert result.dispatch_budget_consuming is False
+    assert acquire_permit.call_count == 1
+    assert no_progress.call_count == 1
+    assert permit.released is True
+    assert store.get(first.id).status == "pending"
+    assert first.id not in runtime._attempted_dispatch_task_ids
+    live_head = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert live_head is not None
+    assert live_head.task.id == second.id
+
+    WorkerRegistry(runtime.config.workers_path).mark_completed("w-live", exit_code=0)
+    runtime.begin_dispatch_pass()
+    head_after_worker_exit = runtime.pending_dispatch_head(max_recovery_attempts=1)
+
+    assert head_after_worker_exit is not None
+    assert head_after_worker_exit.task.id == first.id
+
+
+def test_watch_project_runtime_pending_dispatch_releases_prepared_reservation_when_live_proof_appears_before_iterate_spawn(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    first = store.add("First implement gains live proof after preparation", task_type="implement")
+    second = store.add("Second pending after prepared live proof", task_type="plan")
+    assert first.id is not None
+    assert second.id is not None
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    candidate = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert candidate is not None
+    assert candidate.task.id == first.id
+    permit = _RuntimeDispatchPermit()
+    release_reserved_task = watch_module.release_task_launch_permit
+
+    def prepare_then_register_live_worker(_config: Config, task: object, **_kwargs: object) -> object:
+        _register_live_worker_for_task(runtime.config, first.id)
+        return task
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.launch_permit", return_value=permit),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", side_effect=prepare_then_register_live_worker),
+        patch("gza.cli.watch.release_task_launch_permit", wraps=release_reserved_task) as release_reserved,
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate spawned")),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=AssertionError("settled")),
+    ):
+        result = runtime.dispatch_pending_candidate(candidate, max_iterations=1)
+
+    assert result.status == "not_dispatchable"
+    assert result.work_done is False
+    assert result.slot_consuming is False
+    assert result.dispatch_budget_consuming is False
+    release_reserved.assert_called_once_with(first.id)
+    assert permit.released is True
+    assert store.get(first.id).status == "pending"
+    assert first.id not in runtime._attempted_dispatch_task_ids
+    live_head = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert live_head is not None
+    assert live_head.task.id == second.id
+
+    WorkerRegistry(runtime.config.workers_path).mark_completed("w-live", exit_code=0)
+    runtime.begin_dispatch_pass()
+    head_after_worker_exit = runtime.pending_dispatch_head(max_recovery_attempts=1)
+
+    assert head_after_worker_exit is not None
+    assert head_after_worker_exit.task.id == first.id
+
+
+def test_watch_project_runtime_pending_dispatch_releases_plain_permit_when_live_proof_appears_before_worker_spawn(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    first = store.add("First plan gains live proof before worker spawn", task_type="plan")
+    second = store.add("Second pending after plain live proof", task_type="plan")
+    assert first.id is not None
+    assert second.id is not None
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    candidate = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert candidate is not None
+    assert candidate.task.id == first.id
+    permit = _RuntimeDispatchPermit()
+    original_snapshot = watch_module._snapshot_watch_dispatch_task
+
+    def snapshot_then_register_live_worker(task: object | None) -> object | None:
+        snapshot = original_snapshot(task)
+        _register_live_worker_for_task(runtime.config, first.id)
+        return snapshot
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.launch_permit", return_value=permit),
+        patch("gza.cli.watch._snapshot_watch_dispatch_task", side_effect=snapshot_then_register_live_worker),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=AssertionError("settled")),
+    ):
+        result = runtime.dispatch_pending_candidate(candidate, max_iterations=1)
+
+    assert result.status == "not_dispatchable"
+    assert result.work_done is False
+    assert result.slot_consuming is False
+    assert result.dispatch_budget_consuming is False
+    assert permit.released is True
+    assert store.get(first.id).status == "pending"
+    assert first.id not in runtime._attempted_dispatch_task_ids
+    live_head = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert live_head is not None
+    assert live_head.task.id == second.id
+
+    WorkerRegistry(runtime.config.workers_path).mark_completed("w-live", exit_code=0)
+    runtime.begin_dispatch_pass()
+    head_after_worker_exit = runtime.pending_dispatch_head(max_recovery_attempts=1)
+
+    assert head_after_worker_exit is not None
+    assert head_after_worker_exit.task.id == first.id
+
+
 def test_watch_project_runtime_live_dispatch_attempt_blocks_same_pass_after_worker_proof_expires(
     tmp_path: Path,
 ) -> None:
@@ -33133,12 +33441,12 @@ def test_watch_project_runtime_live_dispatch_attempt_blocks_same_pass_after_work
     candidate = runtime.pending_dispatch_head(max_recovery_attempts=1)
     assert candidate is not None
     permit = _RuntimeDispatchPermit()
-    live_registry = _live_worker_registry_for_task(first.id)
     dead_registry = _live_worker_registry_for_task(first.id)
     dead_registry.is_running.return_value = False
 
     def settle_live_preloop(*, pending_starts: list[object], **_kwargs: object) -> list[object]:
         [entry] = pending_starts
+        _register_live_worker_for_task(runtime.config, first.id)
         return [
             watch_module._WatchDispatchSettleResult(
                 entry=entry,
@@ -33152,8 +33460,6 @@ def test_watch_project_runtime_live_dispatch_attempt_blocks_same_pass_after_work
         patch("gza.cli.watch.launch_permit", return_value=permit),
         patch("gza.cli.watch._spawn_background_worker", return_value=0),
         patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_live_preloop),
-        patch("gza.concurrency.WorkerRegistry", return_value=live_registry),
-        patch("gza.cli.watch.WorkerRegistry", return_value=live_registry),
     ):
         result = runtime.dispatch_pending_candidate(candidate, max_iterations=1)
         live_head = runtime.pending_dispatch_head(max_recovery_attempts=1)
@@ -33242,6 +33548,77 @@ def test_watch_project_runtime_confirmed_start_exclusion_keeps_live_in_progress_
 
     assert runtime._current_confirmed_start_exclusion_ids() == frozenset()
     assert task.id not in runtime._confirmed_started_task_ids
+
+
+def test_watch_project_runtime_fresh_pending_head_skips_registry_backed_live_preloop_worker(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    first = store.add("First pending with adopted preloop worker", task_type="plan")
+    second = store.add("Second pending after adopted preloop worker", task_type="plan")
+    assert first.id is not None
+    assert second.id is not None
+
+    fresh_runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    stale_candidate = fresh_runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert stale_candidate is not None
+    assert stale_candidate.task.id == first.id
+    registry = _register_live_worker_for_task(fresh_runtime.config, first.id)
+
+    head = fresh_runtime.pending_dispatch_head(max_recovery_attempts=1)
+
+    assert head is not None
+    assert head.task.id == second.id
+    assert fresh_runtime._confirmed_started_task_ids == set()
+    _assert_pending_candidate_rejected_without_dispatch_side_effects(
+        fresh_runtime,
+        stale_candidate,
+        next_head_id=second.id,
+    )
+
+    registry.mark_completed("w-live", exit_code=0)
+    fresh_runtime.begin_dispatch_pass()
+    head_after_worker_exit = fresh_runtime.pending_dispatch_head(max_recovery_attempts=1)
+
+    assert head_after_worker_exit is not None
+    assert head_after_worker_exit.task.id == first.id
+
+
+def test_watch_project_runtime_replacement_pending_head_skips_confirmed_registry_backed_preloop_worker(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    first = store.add("First pending confirmed by replaced runtime", task_type="plan")
+    second = store.add("Second pending after replaced runtime", task_type="plan")
+    assert first.id is not None
+    assert second.id is not None
+    original_runtime = _make_runtime_for_dispatch_api(tmp_path, store, key="shared")
+    original_runtime._confirmed_started_task_ids.add(first.id)
+    assert first.id in original_runtime._confirmed_started_task_ids
+    replacement_runtime = _make_runtime_for_dispatch_api(tmp_path, store, key="shared")
+    first_candidate = replacement_runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert first_candidate is not None
+    assert first_candidate.task.id == first.id
+    _register_live_worker_for_task(replacement_runtime.config, first.id)
+    replacement_head = replacement_runtime.pending_dispatch_head(max_recovery_attempts=1)
+
+    assert replacement_head is not None
+    assert replacement_head.task.id == second.id
+    assert replacement_runtime._confirmed_started_task_ids == set()
+    _assert_pending_candidate_rejected_without_dispatch_side_effects(
+        replacement_runtime,
+        first_candidate,
+        next_head_id=second.id,
+    )
+
+    WorkerRegistry(replacement_runtime.config.workers_path).mark_completed("w-live", exit_code=0)
+    replacement_runtime.begin_dispatch_pass()
+    head_after_worker_exit = replacement_runtime.pending_dispatch_head(max_recovery_attempts=1)
+
+    assert head_after_worker_exit is not None
+    assert head_after_worker_exit.task.id == first.id
 
 
 def test_watch_project_runtime_rejects_foreign_analysis_before_preview(tmp_path: Path) -> None:
