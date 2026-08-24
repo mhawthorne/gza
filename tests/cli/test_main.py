@@ -1491,6 +1491,17 @@ class TestHelpOutput:
         assert "Allow manual merge over a latest plain-full or resolution CHANGES_REQUESTED review" in help_text
         assert "behavior-spec coherence review blockers are not deferable" in help_text
 
+    @pytest.mark.parametrize("removed_flag", ["--rebase", "--remote", "--resolve"])
+    def test_merge_removed_rebase_flags_are_rejected_by_parser(self, tmp_path, removed_flag: str) -> None:
+        """Removed merge rebase flags should have no compatibility parsing surface."""
+        setup_config(tmp_path)
+
+        result = invoke_gza("merge", "gza-1", removed_flag, "--project", str(tmp_path))
+
+        assert result.returncode == 2
+        assert "unrecognized arguments" in result.stderr
+        assert removed_flag in result.stderr
+
     def test_show_help_and_docs_describe_prompt_as_plain_text(self, tmp_path):
         """`show --prompt` should be documented as plain prompt-text output, not JSON."""
         setup_config(tmp_path)
@@ -1790,6 +1801,60 @@ class TestCommandAliases:
         args = cmd_watch.call_args.args[0]
         assert args.command == "watch"
         assert args.batch == 2
+
+    @pytest.mark.parametrize(
+        ("argv_tail", "expected_policy", "expected_dry_run"),
+        [
+            (["testproject-1"], "guarded", False),
+            (["testproject-1", "--policy", "guarded"], "guarded", False),
+            (["testproject-1", "--policy", "strict", "--dry-run"], "strict", True),
+        ],
+    )
+    def test_land_dispatches_exactly_one_task_policy_and_dry_run(
+        self,
+        tmp_path: Path,
+        argv_tail: list[str],
+        expected_policy: str,
+        expected_dry_run: bool,
+    ) -> None:
+        """`land` should parse its behavior surface and dispatch without relying on help text."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with (
+            patch.object(sys, "argv", ["gza", "land", *argv_tail, "--project", str(tmp_path)]),
+            patch("gza.cli.main.cmd_land", return_value=0) as cmd_land,
+        ):
+            rc = main()
+
+        assert rc == 0
+        cmd_land.assert_called_once()
+        args = cmd_land.call_args.args[0]
+        assert args.command == "land"
+        assert args.task_id == "testproject-1"
+        assert args.policy == expected_policy
+        assert args.dry_run is expected_dry_run
+
+    @pytest.mark.parametrize(
+        "argv_tail",
+        [
+            [],
+            ["testproject-1", "testproject-2"],
+            ["testproject-1", "--policy", "loose"],
+        ],
+    )
+    def test_land_rejects_invalid_cardinality_and_policy(self, tmp_path: Path, argv_tail: list[str]) -> None:
+        """`land` should accept one task and only the declared policy choices."""
+        from gza.cli.main import main
+
+        setup_config(tmp_path)
+
+        with patch.object(sys, "argv", ["gza", "land", *argv_tail, "--project", str(tmp_path)]):
+            with pytest.raises(SystemExit) as excinfo:
+                main()
+
+        assert excinfo.value.code == 2
 
     def test_watch_hidden_resumed_reexec_flag_still_parses(self, tmp_path):
         """Hidden internal watch flags should stay callable without appearing in help."""

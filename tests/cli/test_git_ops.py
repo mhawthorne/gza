@@ -858,7 +858,7 @@ def test_merge_single_task_merge_failure_output_names_subject_task(
     assert f"Warning: Could not abort merge {subject}: {abort_error}" in output
 
 
-def test_merge_single_task_rebase_failure_output_names_subject_task(
+def test_merge_single_task_removed_rebase_option_fails_before_git_work(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -873,16 +873,15 @@ def test_merge_single_task_rebase_failure_output_names_subject_task(
     task.merge_status = "unmerged"
     store.update(task)
 
-    git_error = "git rebase main failed: conflict"
-    abort_error = "git rebase --abort failed: no rebase in progress"
     git = SimpleNamespace(
         repo_dir=tmp_path,
         branch_exists=MagicMock(return_value=True),
         is_merged=MagicMock(return_value=False),
         default_branch=MagicMock(return_value="main"),
         has_changes=MagicMock(return_value=False),
-        rebase=MagicMock(side_effect=GitError(git_error)),
-        rebase_abort=MagicMock(side_effect=GitError(abort_error)),
+        can_merge=MagicMock(return_value=True),
+        rebase=MagicMock(),
+        rebase_abort=MagicMock(),
         checkout=MagicMock(),
         merge=MagicMock(),
     )
@@ -901,10 +900,11 @@ def test_merge_single_task_rebase_failure_output_names_subject_task(
 
     assert result.rc == 1
     output = capsys.readouterr().out
-    subject = f"for {task.id} (branch feature/rebase-failure-output)"
-    assert f"Error during rebase {subject}: {git_error}" in output
-    assert f"Aborting rebase {subject} and restoring clean state..." in output
-    assert f"Warning: Could not abort rebase {subject}: {abort_error}" in output
+    assert "removed merge option(s) --rebase" in output
+    assert "gza rebase <task-id> --run" in output
+    git.checkout.assert_not_called()
+    git.rebase.assert_not_called()
+    git.merge.assert_not_called()
 
 
 def test_merge_single_task_quiet_mechanics_suppresses_default_success_output(
@@ -2151,9 +2151,8 @@ def test_merge_single_task_defer_blockers_prints_reused_task_before_invalid_flag
     assert result.rc == 1
     git.merge.assert_not_called()
     output = capsys.readouterr().out
-    assert output.count(f"DEFERRED-BLOCKER {deferred_task[0].id} reused from {owner.id}") == 1
-    assert f"DEFERRED-BLOCKER {deferred_task[0].id} created from {owner.id}" not in output
-    assert "Error: Cannot use --rebase and --squash together" in output
+    assert f"DEFERRED-BLOCKER {deferred_task[0].id}" not in output
+    assert "removed merge option(s) --rebase" in output
 
 
 def test_merge_single_task_defer_blockers_refuses_ambiguous_changes_requested_gate(

@@ -178,9 +178,11 @@ reason=`verify-fix-failed`. Successful bypasses print the failing epoch head and
 command and persist `manual_force` merge provenance. The red-gate bypass does not cover
 pending/in-progress verify-fix task recovery (`run_verify_fix` / `wait_verify_fix`),
 unavailable verify evidence, invalid verify-fix proof, failed/stopped verify-fix task
-recovery, git conflicts, or open review `BLOCKER` findings. Manual forced lifecycle
-merges also reject `--rebase --resolve` before starting rebase work; automatic conflict
-resolution remains available only for ordinary non-forced rebase merges.
+recovery, git conflicts, or open review `BLOCKER` findings. Manual `gza merge` is not a
+rebase orchestration surface: the removed merge flags `--rebase`, `--remote`, and
+`--resolve` are rejected by the parser with no compatibility aliases. Use
+`gza rebase <task-id> --run` for standalone task-backed rebase execution, or `gza land
+<task-id>` for full operator landing orchestration.
 
 When a completed changed-diff rebase row has lost or partially lost its persisted provenance block, a writable maintenance/lifecycle path first re-derives that provenance from local reflogs plus the surviving branch/target refs and writes the repaired `review_scope` back to the rebase row. Complete recovered provenance is usable for the narrow resolution-review optimization when all pre-rebase SHAs plus resolved post-rebase head/target SHAs are available. When a required post-rebase refresh review already exists but its persisted resolution metadata is blank or otherwise inconsistent with that authoritative rebase context, writable lifecycle re-derives the canonical resolved head/target SHAs, rewrites the review row with structured resolution metadata, and continues through the normal narrow review/merge path. Plain reviews remain plain; they are not rewritten into resolution reviews merely because they were completed after a changed-diff rebase.
 

@@ -1372,7 +1372,7 @@ def test_merge_ignore_verify_gate_without_force_refuses_before_resolution_or_git
     assert store.resolve_merge_unit_for_task(impl.id) is None
 
 
-def test_merge_force_rebase_resolve_refuses_before_terminal_planning_can_persist_merge_truth(
+def test_merge_removed_rebase_flags_refuse_before_terminal_planning_can_persist_merge_truth(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -1404,8 +1404,10 @@ def test_merge_force_rebase_resolve_refuses_before_terminal_planning_can_persist
             cwd=tmp_path,
         )
 
-    assert result.returncode == 1
-    assert "--force cannot be combined with --rebase --resolve" in result.stdout
+    assert result.returncode == 2
+    assert "unrecognized arguments" in result.stderr
+    assert "--rebase" in result.stderr
+    assert "--resolve" in result.stderr
     assert _snapshot_merge_refusal_state(store, impl.id) == before
     assert store.resolve_merge_unit_for_task(impl.id) is None
 
@@ -1577,7 +1579,7 @@ class _ConflictingRebaseMergeGit(_MergeGit):
         ),
     ],
 )
-def test_merge_force_rebase_resolve_refuses_before_conflict_resolution(
+def test_merge_removed_rebase_resolve_flags_refuse_before_conflict_resolution(
     tmp_path: Path,
     planned_action: dict,
     extra_flags: tuple[str, ...],
@@ -1612,8 +1614,10 @@ def test_merge_force_rebase_resolve_refuses_before_conflict_resolution(
             cwd=tmp_path,
         )
 
-    assert result.returncode == 1
-    assert "--force cannot be combined with --rebase --resolve" in result.stdout
+    assert result.returncode == 2
+    assert "unrecognized arguments" in result.stderr
+    assert "--rebase" in result.stderr
+    assert "--resolve" in result.stderr
     assert "Warning: Forcing merge despite" not in result.stdout
     invoke_provider_resolve.assert_not_called()
     assert fake_git.checked_out == []
@@ -1623,7 +1627,7 @@ def test_merge_force_rebase_resolve_refuses_before_conflict_resolution(
     assert store.resolve_merge_unit_for_task(impl.id) is None
 
 
-def test_merge_rebase_resolve_without_force_still_resolves_conflicts(tmp_path: Path) -> None:
+def test_merge_rebase_resolve_without_force_is_rejected_without_provider_resolution(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
 
@@ -1649,16 +1653,18 @@ def test_merge_rebase_resolve_without_force_still_resolves_conflicts(tmp_path: P
             cwd=tmp_path,
         )
 
-    assert result.returncode == 0
-    assert "Conflicts detected. Invoking provider to resolve" in result.stdout
-    invoke_provider_resolve.assert_called_once()
-    assert fake_git.checked_out == ["feature/ordinary-rebase-resolve", "main"]
-    assert fake_git.rebased == ["main"]
-    assert fake_git.merged == [("feature/ordinary-rebase-resolve", False)]
+    assert result.returncode == 2
+    assert "unrecognized arguments" in result.stderr
+    assert "--rebase" in result.stderr
+    assert "--resolve" in result.stderr
+    invoke_provider_resolve.assert_not_called()
+    assert fake_git.checked_out == []
+    assert fake_git.rebased == []
+    assert fake_git.merged == []
     unit = store.resolve_merge_unit_for_task(impl.id)
     assert unit is not None
-    assert unit.state == "merged"
-    assert unit.merge_source != MERGE_SOURCE_MANUAL_FORCE
+    assert unit.state == "unmerged"
+    assert unit.merge_source is None
 
 
 @pytest.mark.parametrize(

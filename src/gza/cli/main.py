@@ -93,6 +93,7 @@ from .git_ops import (
     cmd_rebase,
     cmd_sync,
 )
+from .land import cmd_land
 from .log import cmd_log
 from .query import (
     cmd_artifact,
@@ -1515,16 +1516,6 @@ def main() -> int:
         help="Perform a squash merge instead of a regular merge",
     )
     merge_parser.add_argument(
-        "--rebase",
-        action="store_true",
-        help="Rebase the task's branch onto current branch instead of merging",
-    )
-    merge_parser.add_argument(
-        "--remote",
-        action="store_true",
-        help="Fetch from origin and rebase against origin/<target-branch> (requires --rebase)",
-    )
-    merge_parser.add_argument(
         "--mark-only",
         action="store_true",
         help="Mark the task as merged in the database without performing an actual git merge (branch is preserved)",
@@ -1537,8 +1528,8 @@ def main() -> int:
             "Still refuses git conflicts and actionable gates such as rebase, verify, or improve work "
             "except for latest plain-full or resolution CHANGES_REQUESTED review blockers explicitly deferred "
             "with --defer-blockers; behavior-spec coherence review blockers are not deferable; "
-            "red verify gates also require --ignore-verify-gate; forced merges cannot be combined with "
-            "--rebase --resolve; successful overrides record manual_force provenance."
+            "red verify gates also require --ignore-verify-gate; successful overrides record "
+            "manual_force provenance."
         ),
     )
     merge_parser.add_argument(
@@ -1567,12 +1558,27 @@ def main() -> int:
             "successful overrides record manual_force provenance."
         ),
     )
-    merge_parser.add_argument(
-        "--resolve",
-        action="store_true",
-        help="Auto-resolve conflicts using AI when rebasing (requires --rebase)",
-    )
     add_common_args(merge_parser)
+
+    # land command
+    land_parser = subparsers.add_parser("land", help="Synchronously land one task merge unit")
+    land_parser.add_argument(
+        "task_id",
+        type=str,
+        help="Full prefixed task ID whose canonical merge unit should be landed",
+    )
+    land_parser.add_argument(
+        "--policy",
+        choices=("guarded", "strict"),
+        default="guarded",
+        help="Landing policy to apply for this invocation (default: guarded)",
+    )
+    land_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the resolved landing plan without creating tasks, running providers, verifying, rebasing, or merging",
+    )
+    add_common_args(land_parser)
 
     # verify command
     verify_parser = subparsers.add_parser("verify", help="Rerun or inspect a task's lifecycle verify gate")
@@ -3469,6 +3475,8 @@ def main() -> int:
             return cmd_sync(args)
         elif args.command == "merge":
             return cmd_merge(args)
+        elif args.command == "land":
+            return cmd_land(args)
         elif args.command == "verify":
             return cmd_verify(args)
         elif args.command == "rebase":

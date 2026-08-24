@@ -589,8 +589,9 @@ Each watch cycle MUST execute these phases in order:
 4. **Blind parked auto-rearm phase.** After the direct non-worker lifecycle phase has
    reconciled the freshest target state for this cycle, watch MAY run one conservative
    parked-owner auto-rearm pass before any worker dispatch. This phase MUST stay
-   supervisor-owned and MUST reuse the shared parked clear service; it MUST NOT create a
-   judge task, inspect per-merge relevance, or fork a second lifecycle policy. For each
+   supervisor-owned and MUST reuse the shared parked clear service; it MUST NOT invoke
+   operator-triggered guarded landing, create a landing judge task, inspect per-merge
+   relevance, defer blockers, or fork a second lifecycle policy. For each
    currently parked subject/reason candidate, watch MUST first exclude
    `verify-fix-failed`, which remains a manual-only fresh-verify escape hatch, and then
    apply these gates in order: feature enabled, budget remaining, cooldown elapsed, and
@@ -1052,6 +1053,9 @@ These are exclusions in the contract, not omissions in the current implementatio
   detached worker processes plus supervisor polling.
 - Watch MUST NOT kill, reset, or discard code work solely to make the loop progress.
 - Watch MUST NOT widen scope past explicit tag filters.
+- Watch MUST NOT invoke `gza land` semantics, create or reuse landing judgments, defer
+  review blockers, or bypass parked lifecycle gates. Guarded landing is an explicit
+  operator command for one selected merge unit; ordinary watch remains strict.
 
 ## Policy knobs this layer owns
 

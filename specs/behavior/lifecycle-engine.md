@@ -697,8 +697,10 @@ failure *and* actionable merge/review work remains eligible for the latter.
   `require_review_before_merge` off → if the current pre-merge verify gate is green,
   `merge`; otherwise lifecycle MUST route through the shared `verify_gate` / same-epoch
   `verify_fix` handling before merge. This review-disabled branch is the only exception
-  to the ordinary implementation two-gate merge rule from
-  [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules).
+  available to ordinary automated lifecycle under the implementation two-gate merge rule
+  from [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules). The
+  separate exact-state guarded-landing exception named there is operator-triggered only
+  and belongs to §8a; `advance` and `watch` MUST NOT use it.
 - A selected `create_review` action has epoch identity, and automation MUST NOT treat an
   older review row or mismatched active duplicate as the selected action. Ordinary
   branch-head and closing-review refreshes match the implementation and selected reviewed
@@ -715,17 +717,25 @@ failure *and* actionable merge/review work remains eligible for the latter.
   [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 4), respects
   `merge_squash_threshold`, and MUST NOT push the target branch as a side effect. Direct
   mark-merged paths and post-promotion bookkeeping are part of the same precondition: they
-  MUST reject merge representatives whose execution status is not `completed` or
-  `unmerged`.
+  MUST prove the owning merge unit is independently unmerged and MUST reject merge
+  representatives whose task execution status is neither canonical `completed` nor the
+  compatibility task execution status `unmerged` defined in
+  [00-overview.md](00-overview.md#vocabulary-the-data-model-abstractly). Pending,
+  in-progress, and failed representatives MUST be rejected even when their owning merge
+  unit is unmerged.
 - Manual `gza merge` retains a narrower human-override path than automation. Automated
   lifecycle actions (`advance`/`watch`) MUST still merge only review-cleared work under
   the rules above; they MUST NOT auto-merge `CHANGES_REQUESTED` reviews by deferring
   blockers, and they MUST NOT bypass parked lifecycle `needs_attention` /
   `needs_discussion` merge gates. Manual `gza merge --force` MAY override those parked
   lifecycle gates for the local merge path only, but it MUST still refuse any real git
-  conflict, MUST reject `--force --rebase --resolve` before any rebase conflict
-  resolution path, and MUST leave the unit's persisted provenance distinguishable from an
-  ordinary manual merge. Manual `gza merge` MUST refuse a latest completed
+  conflict and MUST leave the unit's persisted provenance distinguishable from an
+  ordinary manual merge. Manual `gza merge` is a non-rebase merge command: standalone
+  task-backed rebase orchestration belongs to `gza rebase <task-id> --run`, and full
+  rebase/review/judgment/merge orchestration belongs to `gza land <task-id>`. The removed
+  merge flags `--rebase`, `--remote`, and `--resolve` have no compatibility surface and
+  MUST be rejected by the CLI parser rather than parsed as aliases. Manual `gza merge`
+  MUST refuse a latest completed
   plain-full or resolution `CHANGES_REQUESTED` review that still has any open non-verify
   `BLOCKER` finding unless the operator passes `--defer-blockers`. Behavior-spec
   coherence `CHANGES_REQUESTED` reviews are not eligible for `--defer-blockers` and MUST
@@ -803,6 +813,390 @@ Note: the "implementation unit with no review" rule above applies only when the
 implementation still has reviewable commits or diff against the target. Terminal
 empty/redundant implementations are covered by the moot rule and do not require review
 creation.
+
+### §8a — Operator-triggered land
+
+`uv run gza land <task-id>` is a manual command over one canonical merge unit, not an
+ordinary lifecycle action selected by `advance` or `watch`. The command MUST accept one
+selected task, resolve it through canonical merge-unit membership to the unit owner,
+representative, local source ref, and canonical local target branch, and re-read that
+state after every mutating step. If authoritative merge-unit reconciliation proves the
+unit is already `merged`, `land` MUST finish idempotently without rebasing, reviewing,
+judging, deferring blockers, or merging again.
+
+Landing phase order is part of the safety contract. Writable `land` MUST execute or stop
+in this order, re-reading durable state between phases and after every source-head
+change: resolve identity and active merge unit; prove dependency readiness; prove project
+scope from reliable changed-path inspection; prove source/target heads and checkout
+cleanliness; run or exact-reuse the one required rebase when the source lacks the target
+tip; re-read and re-prove dependency readiness and project scope for the new source head;
+acquire or exact-reuse current lifecycle source verify; acquire or exact-reuse required
+spec-coherence evidence; acquire or exact-reuse the required code/resolution review;
+evaluate strict or guarded policy; perform final preflight; materialize ordinary
+follow-ups and, for guarded escalation, deferred blockers; merge or mark merged; then
+refresh/reuse the post-merge target verification checkpoint. Out-of-scope and
+scope-unverifiable branches MUST stop before rebase, verify, review, judgment, or any
+provider-backed work launches. If a rebase or any other source-head change introduces an
+out-of-scope path, unverifiable changed-path set, newly unresolved dependency, or
+dependency proof that can no longer be trusted, `land` MUST stop before verify, review,
+judgment, follow-up/deferred-task materialization, or merge.
+
+`land` has one per-run policy: `guarded` by default, or `strict`. `strict` MUST obey the
+ordinary §8 merge gates exactly: it MUST perform or exact-reuse deterministic
+prerequisites such as the required same-source rebase, current verify acquisition, and
+required current reviews whenever acquisition is enabled and identity proof is available,
+but it MUST stop on any parked lifecycle gate or open blocker that ordinary automation
+would not merge. When `require_review_before_merge=false`, `strict` MUST preserve §8's
+explicit no-review merge path: current green source verify plus all other non-review
+merge prerequisites are sufficient and no code-review acquisition is required. `guarded`
+does not support review-disabled escalation in this version; if
+`require_review_before_merge=false` and strict prerequisites are otherwise satisfied, it
+MUST use the same non-escalated no-review path and record `manual_land`, and if escalation
+would be needed it MUST stop with a review-gate-disabled blocking fact rather than ask a
+landing judge to waive an absent review. `guarded` MAY choose the equivalent of manual
+force/deferred-blocker merge only after every deterministic gate below passes and the
+durable landing judgment authorizes escalation for the exact current state. Neither
+policy is a config knob, and neither changes unattended `advance`/`watch` behavior.
+
+#### Deterministic prerequisites
+
+Before any semantic landing judgment, `land` MUST fail closed unless all facts below are
+proven from current state:
+
+- The selected ID resolves to exactly one active merge unit whose canonical execution
+  representative has task execution status `completed` or compatibility task execution
+  status `unmerged`, whose owning merge unit is independently in merge state `unmerged`,
+  has a resolvable local source ref, and targets the currently checked-out canonical
+  local target branch. A pending, in-progress, failed, missing, or ambiguous
+  representative is rejected even when the merge unit is unmerged.
+- All merge-required dependencies are proven satisfied by authoritative merged or
+  terminal no-work merge-unit state before any code action. Missing, stale, ambiguous, or
+  still-unresolved dependency proof is nonforceable and MUST be recomputed after every
+  rebase or other source-head-changing step.
+- Project scope is proven before any rebase, verify, review, judgment, merge, or other
+  provider-backed work. The proof MUST come from reliable changed-path inspection for the
+  exact live source head and target head being considered, applying §3's cross-project
+  and project-root attribution rules. Out-of-scope paths and
+  `project-scope-unverified` stop before launching any rebase/provider work. The
+  changed-path set and scope decision MUST be recomputed after every rebase or other
+  source-head-changing step before verify, spec-coherence, code review, judgment,
+  follow-up/deferred-task materialization, merge, or mark-merged can continue.
+- The tracked checkout is clean, the live source head and target head are known, and a
+  final pre-merge proof shows the source cleanly merges into that local target after any
+  completed rebase. Missing ancestry, missing merge proof, remote-only source proof, or
+  unresolved/failed conflict resolution is nonforceable.
+- If the source does not contain the target tip, `land` MUST run or exact-reuse exactly
+  one task-backed rebase onto the canonical local target when rebase acquisition is
+  enabled, the shared launch route has capacity/permission, and exact identity proof is
+  available. It MUST refuse only for an enumerated inability: acquisition disabled,
+  source/target or active-work identity conflict, launch/capacity failure, terminal
+  worker failure, unavailable ancestry/rebase proof, incompatible exact reuse, an exact
+  in-progress rebase that must be waited on, or exhausted invocation budget. If
+  ancestry/behind proof is unavailable, or the rebase fails, is unresolved, is superseded
+  without exact target-tip containment proof, or still leaves the source unmergeable, the
+  command MUST stop.
+- Current lifecycle verify evidence is green for the exact final live source head/tree
+  and current verify-gate identity. If evidence is absent or stale, writable `land` MUST
+  run or exact-reuse the shared direct verify acquisition path when acquisition is
+  enabled and identity proof is available. It MUST refuse only for an enumerated
+  inability: verify acquisition disabled, source/epoch or active-work identity conflict,
+  launch/capacity failure, terminal worker failure, unavailable proof, exact
+  in-progress verify work that must be waited on, incompatible exact reuse, or exhausted
+  invocation budget. Provider-side rebase verification is not a substitute for canonical
+  lifecycle verify evidence. Red, unavailable, malformed, stale, stopped, or still
+  missing verify evidence after the acquisition/reuse attempt is nondeferrable.
+- If the ordinary §8 gate requires a review, the latest relevant code review is current,
+  parseable, and either plain-full or resolution mode. All code/resolution-review
+  acquisition, reuse, waiting, budget, and verdict rules in this section apply only to
+  these review-enabled lineages. If the review gate is disabled, `strict` and
+  non-escalated `guarded` landing use the §8 no-review path; guarded escalation is
+  rejected as described above.
+- Spec-coherence has an explicit phase between current source-verify acquisition and the
+  invocation-local code/resolution-review phase. If spec-coherence is disabled or the
+  current changed-path set does not touch configured spec-coherence paths, `land` skips
+  this phase. If touched paths require evidence and no exact spec-coherence task or
+  artifact exists, writable `land` MUST create/run the exact task through the shared
+  launch route when acquisition is enabled and identity proof is available; it MUST NOT
+  proceed as though the gate were optional. If an exact pending spec-coherence task
+  exists, `land` MUST run or exact-reuse that task unless an enumerated inability applies.
+  If an exact in-progress spec-coherence task exists, `land` MUST wait or
+  stop rather than create a duplicate. If exact current evidence is terminal `APPROVED`,
+  `land` may proceed to the code/resolution-review phase. Every other terminal verdict
+  (`CHANGES_REQUESTED`, `NEEDS_DISCUSSION`, failed, malformed, unknown, or unavailable)
+  and every stale, head-mismatched, path-mismatched, or identity-mismatched task/artifact
+  MUST stop before code-review judgment or deferred blocker materialization. Mandatory
+  spec-coherence work is independent of the invocation-local one code/resolution-review
+  budget; creating, running, reusing, or waiting on spec-coherence work MUST NOT consume
+  that budget, and spending the code-review budget MUST NOT skip or satisfy a required
+  spec-coherence review.
+- There is no unresolved dependency, out-of-project path gate, missing source/target
+  proof, freshness uncertainty, failed implementation/rebase/verify-fix recovery,
+  pending or in-progress verify-fix work, unavailable verify epoch, or other actionable
+  lifecycle work that must run before merge.
+
+Missing or stale required code/resolution review evidence in a review-enabled lineage is
+not a generic prerequisite-missing stop. Writable `land` MUST create/run or exact-reuse
+the required plain-full or resolution review through the shared route when acquisition is
+enabled, exact identity proof is available, and the invocation-local review budget has
+not been spent. It MUST refuse only for an enumerated inability: review acquisition
+disabled, source/head/mode/rebase-provenance or active-work identity conflict,
+launch/capacity failure, terminal worker failure, unavailable proof, exact in-progress
+review work that must be waited on, incompatible exact reuse, or exhausted invocation
+budget.
+
+The only parked reason classes `guarded` may consider overriding are review-churn
+exhaustion states: `review-max-cycles-reached`, `duplicate-blocker-no-progress`, and
+`improve-no-op`. `review-blocker-adjudication-needed` is eligible only when the landing
+judgment receives the complete current dispute and adjudication evidence. `guarded` MUST
+NOT override a review verdict of `NEEDS_DISCUSSION`, project-scope parks, recovery parks,
+verify parks, rebase parks, malformed/unknown review parks, missing manual-review parks,
+or unrelated needs-attention classes merely because `gza merge --force` has a narrower
+human escape hatch.
+
+#### Post-rebase review bound
+
+For review-enabled lineages, `land` MUST capture the pre-rebase context and enforce an
+invocation-local budget of at most one post-rebase code/resolution review. A mechanical
+rebase that proves `changed_diff == false` and did not require provider/AI conflict
+resolution MAY preserve an eligible current review. The rebase outcome MUST be durable,
+structured, bound to the attempted source head and target head, and must classify the
+execution as `mechanical`, `no-op`, or `provider-resolved`. Missing, malformed,
+head-mismatched, unsupported, or prose-only rebase outcome proof MUST fail closed and
+MUST be included in the coordinator's reuse and non-progress fingerprint identity. `land`
+MUST NOT infer mechanical safety or provider resolution from task output prose or logs.
+Every durable `no-op` subtype MUST carry explicit proof and be classified before any
+review evidence is carried forward:
+
+- `no-op:already-contained` MAY preserve an eligible current review only when the outcome
+  proves exact attempted source-head identity, exact attempted target-head identity, exact
+  target-tip containment in the live source head, `changed_diff == false`, and
+  `provider_conflict_resolution == false`.
+- `no-op:superseded-contained` MAY proceed without another rebase only when the outcome
+  proves the live source head now exactly contains the attempted target tip, the live
+  source head is the head re-read by the coordinator, and no provider conflict resolution
+  occurred. It MAY preserve existing review evidence only when the same exact source-head
+  identity and `changed_diff == false` proof also holds; otherwise it MUST obtain the
+  single current-head review required by this section.
+- `no-op:unchanged-target`, `no-op:moot`, or any other unchanged no-op subtype MAY carry
+  review evidence forward only with exact source/target identity, target-tip containment,
+  `changed_diff == false`, and proof that no provider conflict resolution occurred.
+- A no-op outcome with missing, mismatched, prose-only, unsupported, or ambiguous proof
+  MUST fail closed with a named `LandBlocked` reason if the coordinator cannot safely
+  acquire a current review. If current review acquisition is enabled and budget remains,
+  it MUST refresh through the single current-head review path instead of preserving old
+  review evidence.
+Any `provider-resolved` outcome requires one current resolution review even when
+`changed_diff == false`, because conflict resolution is itself an unreviewed code
+decision. A changed diff, unknown diff, recovered/resumed rebase, or unrepaired
+resolution-review provenance also requires exactly one current-head review: prefer a
+resolution review when exact provenance can be bound, otherwise fall back to one plain
+full review bound to the proven live head.
+
+For review-disabled lineages, the same provider-resolved, changed/unknown-diff,
+unrepaired-provenance, and recovered/resumed rebase outcomes MUST NOT create, run, reuse,
+or wait on a code review or resolution review, and MUST NOT create or run a landing
+judgment. After any rebase or source-head-changing step, both `strict` and
+non-escalated `guarded` landing MUST obtain current canonical green lifecycle verify
+evidence for the exact final live source head/tree and current gate identity, satisfy all
+other non-review prerequisites and final preflight rules, and then continue through
+ordinary no-review landing with `manual_land` provenance.
+
+After every rebase or any other source-head-changing step in a review-enabled lineage,
+`land` MUST first obtain or reuse current canonical green lifecycle verify evidence for
+the new live source head and current gate identity before it creates, runs, reuses, or
+waits on the invocation's post-rebase code/resolution review. Red, unavailable,
+malformed, stale, or missing verify evidence after that acquisition attempt MUST stop
+without consuming the one post-rebase review budget and without creating or running a
+landing judgment.
+
+An exact matching pending review MAY be reused only when its mode and reviewed-head
+identity match the required review. A genuinely in-progress matching review is a wait/stop
+condition, not permission to create a duplicate. `APPROVED` and valid
+`APPROVED_WITH_FOLLOWUPS` remain merge-permitting. `CHANGES_REQUESTED` under `strict`
+blocks immediately; under `guarded` it may proceed only to the single landing judgment.
+`land` MUST NOT create, run, wait on, or resume an `improve` task, and MUST NOT start a
+second review in the same invocation after a post-rebase `CHANGES_REQUESTED` verdict.
+Failed, malformed, unknown, or `NEEDS_DISCUSSION` review output stops the command.
+
+#### Guarded landing judgment
+
+`guarded` escalation requires a bounded independent landing judgment with strict
+structured output. The judgment prompt MUST include the authoritative review scope and
+linked request/plan context, source and target heads, current diff context, the current
+review and parsed blocker records, current green verify evidence, the exact current
+blocker-resolution, dispute, and adjudication artifact identities and their normalized
+decision content, and the guarded policy definition.
+
+The judgment schema MUST be versioned and produce exactly one overall result:
+`LAND`, `BLOCK`, or `NEEDS_HUMAN`. `LAND` is valid only when it states that the original
+graded ask is satisfied and every current blocker is `DEFERABLE`. A blocker is
+deferrable only when it is adjacent to or beyond the authoritative scope and safe as an
+urgent follow-up. Correctness regressions, repository-rule violations, integration
+contract defects, unsafe conflict-resolution defects, behavior-spec coherence findings,
+verify failures, source/target proof failures, and dependency/scope gates are
+nondeferrable regardless of judge text. Missing findings, malformed output, ambiguous or
+uncited evidence, `NEEDS_HUMAN`, or any `REQUIRED` blocker MUST block landing.
+
+The judgment MUST be persisted as an auditable artifact keyed at minimum by policy/schema
+version, implementation ID, merge-unit ID, review ID and reviewed head, live source head,
+target head, verify artifact or epoch identity, authoritative review scope, and normalized
+current blocker fingerprints plus the current blocker-resolution, dispute, and
+adjudication artifact identities and normalized decision content. It MAY be reused only on
+an exact key match. Any source, target, review, verify, blocker, resolution/dispute/
+adjudication artifact, scope, or policy change invalidates the prior judgment. The
+judgment reuse key and the coordinator visited fingerprint are one exact-identity class:
+any input that can affect a landing decision MUST appear in at least one of those
+identities, and any durable evidence phase that can make progress MUST appear in the
+visited fingerprint.
+
+#### Deferred blockers, provenance, and final preflight
+
+Immediately before any durable follow-up/deferred-task materialization, mark-merged
+mutation, or merge mutation, every `strict`, `guarded`, escalated, and non-escalated
+landing path MUST run the same final preflight: recheck the exact source head, exact
+target head, tracked checkout cleanliness, and clean-merge proof that the preceding
+verify/review/judgment evidence was bound to. If either head moved, the checkout dirtied,
+or clean-merge proof changed, it MUST stop with that single blocking fact, perform no
+merge mutation, create no follow-up or deferred-blocker tasks, and MUST NOT spend another
+rebase, review, or judgment budget in the same invocation. Only after this final preflight
+may the command create or reuse all ordinary `FOLLOWUP` tasks from the current review and,
+for guarded escalation, urgent PR-required deferred-blocker `implement` tasks for every
+deferred `BLOCKER`. Every landing path, including strict, non-escalated guarded,
+escalated guarded, merge, and mark-merged success, MUST create or reuse the deterministic
+ordinary follow-up task set before recording success whenever the current review contains
+`FOLLOWUP` findings. Ordinary `FOLLOWUP` findings materialized from a guarded
+`CHANGES_REQUESTED` escalation are part of the same safety handoff as deferred blockers:
+each such follow-up MUST be urgent and PR-required before merge or mark-merged success.
+Exact-key reuse of a pre-existing ordinary follow-up from that guarded escalation MUST
+validate both properties and reconcile them before merge when reconciliation is available;
+if either property is missing and cannot be reconciled, landing MUST refuse before any
+merge-state mutation. Ordinary follow-up semantics for non-escalated
+`APPROVED_WITH_FOLLOWUPS` paths remain unchanged unless another owning contract requires
+urgent or PR-required handling. Guarded deferred-blocker tasks MUST preserve both urgent
+handling and PR-required semantics. Any follow-up or deferred-blocker creation failure,
+reuse-validation failure, property-reconciliation failure, or persistence failure MUST
+block landing and MUST occur before any merge-state mutation.
+
+A successful non-escalated land MUST record `manual_land` merge provenance. A successful
+guarded escalation that deferred blockers or overrode an eligible churn park MUST record
+`manual_land_escalated` merge provenance and link the judgment artifact plus follow-up and
+deferred task IDs so the override is directly auditable. Successful output SHOULD name the
+canonical owner, target branch, whether rebase/review/judgment were used, any follow-up
+task IDs, any deferred task IDs, and the final merge provenance. After merge, the command
+MUST refresh or reuse the same
+canonical post-merge target verification checkpoint required by §8 before reporting the
+authoritative merged result. Configured-gate completion means fresh or reused `passed`
+evidence for the exact final target tree and current gate identity. Projects with no
+configured `verify_command` keep §8's explicit no-gate exception. If the merge mutation
+already occurred but the post-merge checkpoint is red, unavailable, malformed, stale, or
+missing after the refresh/reuse attempt, `land` MUST return non-success with wording that
+truthfully states the merge occurred but integration verification failed; it MUST NOT use
+the pre-merge `Cannot land ...` refusal template for that post-merge state.
+
+#### Dry run, idempotency, and refusal output
+
+`land --dry-run` is query-only. It MUST NOT create tasks or artifacts, run providers,
+run verification, rewrite refs, update worker registry state, create follow-ups or
+deferred blockers, repair durable metadata, merge, or mark anything merged. It MUST show
+the resolved owner, local source, canonical target, current evidence known from queryable
+state, and the ordered conditional phases available before execution. Where a future fact
+requires executing a rebase, review, verify, judgment, task materialization, or merge, dry
+run MUST explicitly label that phase as conditional or unknown and MUST stop prediction at
+the first execution-required boundary instead of synthesizing later outcomes.
+
+Writable `land` MUST be bounded and idempotent. It MUST enforce a named, swappable
+per-invocation maximum-transition policy, `LandingTransitionLimitPolicy`, in addition to
+the visited-state detector. The visited-state detector is the earlier non-progress guard:
+if an exact fingerprint repeats before the transition cap is exhausted, `land` MUST stop
+on that repeat. If the transition count is exhausted first, `land` MUST stop with exactly
+one precedence-compatible `LandBlocked` fact for the bounded-attempt refusal, regardless
+of whether every observed fingerprint was distinct. After either boundedness refusal, the
+coordinator MUST NOT launch later provider work, create or reuse follow-up or deferred
+tasks, run a landing judgment, merge, or mark anything merged in that invocation.
+
+The fingerprint MUST include merge-unit state, source and target SHAs, latest relevant
+review ID/verdict/reviewed head, verify epoch/verdict, durable rebase outcome
+ID/status/`changed_diff`/resolution kind/source head/target head, blocker fingerprints,
+landing-judgment identity, the blocker-resolution/dispute/adjudication artifact
+identities and normalized decision content that feed the judgment, and the relevant
+spec-coherence task/evidence identity, status, verdict, reviewed head, and normalized
+changed-path set. Every
+live worker/provider phase launched by `land` (rebase, verify, code review,
+spec-coherence review, and landing judgment) MUST use the shared launch-permit and
+execution route. Foreground `land` owns one foreground slot and MUST transfer/reuse that
+slot for child worker phases rather than acquiring extra capacity for each child. Exact
+matching active rebase, review, spec-coherence review, or judgment work MAY be reused or
+waited on only when its identity exactly matches the current source head, target head,
+review mode, changed paths, gate identity, policy schema, and blocker fingerprint
+required by the selected phase. Mismatched active work MUST fail closed without creating
+duplicate tasks or launching a provider, and after any ownership change or active-work
+terminalization, `land` MUST re-resolve canonical merge-unit, source, target, review, and
+verify state before continuing. Exact matching rebase, review, judgment, and
+deferred-blocker artifacts MUST be reused; successful rerun after merge MUST reconcile
+and report the already-merged state without another merge. Already-merged reconciliation
+MUST still refresh or reuse the configured post-merge target checkpoint for the exact
+merged target tree and current gate identity before returning success, without rerunning
+earlier rebase, source-verify, review, judgment, or merge phases.
+
+Every pre-merge terminal refusal MUST be represented as one stable `LandBlocked` result
+with at least:
+
+- `reason_code`: one of the stable codes in the total precedence list below;
+- `fact`: one concise human-readable fact that explains the selected blocking condition;
+- `evidence_refs`: one or more durable references such as task IDs, artifact IDs, review
+  IDs, verify epochs, source/target SHAs, changed-path proof IDs, or persistence error
+  records that justify the reason.
+
+When multiple refusal facts are simultaneously true, `land` MUST select exactly one
+`LandBlocked` result by this total precedence order and MUST perform no lower-precedence
+side effects after selecting it:
+
+1. `identity-proof-unavailable`: selected task, active merge unit, representative,
+   dependency readiness, project-scope proof, source ref, target ref, source head, target
+   head, or exact active-work identity proof is missing, ambiguous, out of scope, stale,
+   or mismatched.
+2. `dirty-checkout`: tracked checkout cleanliness proof failed.
+3. `rebase-or-conflict`: ancestry proof, required rebase acquisition/reuse, rebase
+   terminal result, durable rebase outcome proof, target-tip containment, or final
+   clean-merge proof failed.
+4. `verify-unavailable-or-red`: required source verify evidence is missing, stale, red,
+   malformed, unavailable, stopped, or could not be acquired/reused through the shared
+   direct verify path.
+5. `required-review-unavailable`: required spec-coherence, code, or resolution review
+   evidence is missing, stale, mismatched, non-merge-permitting, failed, malformed,
+   unknown, unavailable, disabled, in progress without wait completion, or could not be
+   created/run/reused.
+6. `nondeferrable-blocker`: strict mode or guarded policy sees an open blocker that is
+   not deferrable under this contract.
+7. `policy-or-judge-refused`: guarded escalation is unavailable, disabled by review-gate
+   shape, malformed, stale, exact-key invalid, returns `BLOCK`/`NEEDS_HUMAN`, omits
+   required blocker decisions, or fails reuse validation.
+8. `materialization-or-persistence-failed`: required ordinary follow-up or deferred task
+   creation failed; exact-key reuse validation failed; guarded follow-up urgent/PR
+   property reconciliation failed; durable judgment, provenance, merge-unit, task, or
+   artifact persistence failed; or follow-up/deferred materialization could not be
+   recorded before merge.
+9. `bounded-attempt-exhausted`: the visited fingerprint repeated, the
+   `LandingTransitionLimitPolicy` transition cap was exhausted, or the invocation budget
+   for rebase, review, verify, spec-coherence, judgment, or materialization was spent
+   before the command could reach a merge decision.
+10. `merge-failed`: final merge, mark-merged, or pre-merge merge-state mutation failed
+    before success was recorded.
+
+Repeated-state, transition-cap, follow-up/deferred materialization, reuse-validation, and
+persistence failures are therefore first-class refusals, not generic "prerequisite
+missing" stops. The final user-facing pre-merge refusal line MUST be exactly one
+sentence:
+`Cannot land <task-id>: <fact>.` Normal phase progress may precede it and detailed
+diagnostics may live in task/ops logs, but the terminal refusal MUST NOT print competing
+error paragraphs or a list of suggested commands.
+
+A post-merge checkpoint failure is a separate non-success result, not `LandBlocked`, and
+it MUST NOT participate in the pre-merge refusal precedence. Its terminal user-facing
+line MUST be exactly one truthful sentence stating that the merge occurred and that
+integration verification failed, including the single checkpoint fact; it MUST NOT use
+the `Cannot land <task-id>: <fact>.` template because that would falsely imply no merge
+mutation occurred.
 
 ### §9 — PR publication for completed code tasks
 

@@ -1660,10 +1660,19 @@ def _resolve_merge_subject_query_only(
 
 
 def _merge_option_relationship_error(args: argparse.Namespace) -> str | None:
+    removed_flags = [
+        flag
+        for flag in ("rebase", "remote", "resolve")
+        if bool(getattr(args, flag, False))
+    ]
+    if removed_flags:
+        rendered = ", ".join(f"--{flag}" for flag in removed_flags)
+        return (
+            f"Error: removed merge option(s) {rendered}; use `gza rebase <task-id> --run` "
+            "for standalone rebases or `gza land <task-id>` for full landing orchestration"
+        )
     if getattr(args, "ignore_verify_gate", False) and not getattr(args, "force", False):
         return "Error: --ignore-verify-gate requires --force"
-    if getattr(args, "force", False) and getattr(args, "rebase", False) and getattr(args, "resolve", False):
-        return "Error: --force cannot be combined with --rebase --resolve; forced lifecycle merges must refuse conflicts"
     return None
 
 
@@ -1717,8 +1726,8 @@ def _merge_single_task(
     # Handle --mark-only flag
     if args.mark_only:
         # Check for conflicting flags
-        if args.rebase or args.squash or args.delete or getattr(args, "force", False):
-            print("Error: --mark-only cannot be used with --rebase, --squash, --delete, or --force")
+        if getattr(args, "squash", False) or getattr(args, "delete", False) or getattr(args, "force", False):
+            print("Error: --mark-only cannot be used with --squash, --delete, or --force")
             return _MergeSingleTaskResult(rc=1)
 
         if materialize_side_effects:
@@ -1929,23 +1938,8 @@ def _merge_single_task(
             block_reason="main checkout has uncommitted changes",
         )
 
-    # Check for conflicting flags
-    if args.rebase and args.squash:
-        print("Error: Cannot use --rebase and --squash together")
-        return _MergeSingleTaskResult(rc=1)
-
-    # Validate --remote flag
-    if hasattr(args, 'remote') and args.remote and not args.rebase:
-        print("Error: --remote requires --rebase")
-        return _MergeSingleTaskResult(rc=1)
-
-    # Validate --resolve flag
-    if getattr(args, 'resolve', False) and not args.rebase:
-        print("Error: --resolve requires --rebase")
-        return _MergeSingleTaskResult(rc=1)
-
     merge_preflight_target = merge_preflight_ref or current_branch
-    if not args.rebase and not git.can_merge(merge_source_ref, merge_preflight_target):
+    if not git.can_merge(merge_source_ref, merge_preflight_target):
         print(
             f"Error: Branch '{merge_source_ref}' has conflicts against '{merge_preflight_target}' "
             "and cannot be merged cleanly."
@@ -1975,74 +1969,53 @@ def _merge_single_task(
     # Perform the merge or rebase
     try:
         pending_squash_reconcile: _PendingSquashBranchReconcile | None = None
-        if args.rebase:
-            # Determine the target branch to rebase onto
-            rebase_target = current_branch
-            if hasattr(args, 'remote') and args.remote:
-                # Fetch from origin first
-                print("Fetching from origin...")
-                git.fetch("origin")
-                print("✓ Fetched from origin")
-                rebase_target = f"origin/{current_branch}"
+        # Regular merge or squash merge
+        if not quiet_mechanics:
+            print(f"Merging '{merge_source_ref}' into '{current_branch}'...")
 
-            # For rebase: checkout the task branch, rebase onto target, then fast-forward merge
-            print(f"Rebasing '{merge_branch}' onto '{rebase_target}'...")
-            git.checkout(merge_branch)
-            git.rebase(rebase_target)
-            print(f"✓ Successfully rebased {merge_branch}")
+        # For squash merge, create a commit message from the task
+        commit_message = None
+        if args.squash:
+            assert merge_subject.id is not None, "Task ID must be set before squash merge commit"
+            commit_message = build_task_commit_message(
+                merge_subject.prompt,
+                task_id=merge_subject.id,
+                task_slug=merge_subject.slug,
+                subject_prefix="Squash merge: ",
+            )
 
-            # Switch back and fast-forward merge
-            git.checkout(current_branch)
-            git.merge(merge_branch, squash=False)
-            print(f"✓ Fast-forwarded {current_branch} to {merge_branch}")
-        else:
-            # Regular merge or squash merge
-            if not quiet_mechanics:
-                print(f"Merging '{merge_source_ref}' into '{current_branch}'...")
+        pre_squash_local_oid = None
+        pre_squash_remote_oid = None
+        if args.squash:
+            pre_squash_local_oid = _rev_parse_if_exists_if_supported(git, f"refs/heads/{merge_branch}")
+            pre_squash_remote_oid = _rev_parse_if_exists_if_supported(git, f"refs/remotes/origin/{merge_branch}")
 
-            # For squash merge, create a commit message from the task
-            commit_message = None
-            if args.squash:
-                assert merge_subject.id is not None, "Task ID must be set before squash merge commit"
-                commit_message = build_task_commit_message(
-                    merge_subject.prompt,
-                    task_id=merge_subject.id,
-                    task_slug=merge_subject.slug,
-                    subject_prefix="Squash merge: ",
-                )
+        git.merge(merge_source_ref, squash=args.squash, commit_message=commit_message)
 
-            pre_squash_local_oid = None
-            pre_squash_remote_oid = None
-            if args.squash:
-                pre_squash_local_oid = _rev_parse_if_exists_if_supported(git, f"refs/heads/{merge_branch}")
-                pre_squash_remote_oid = _rev_parse_if_exists_if_supported(git, f"refs/remotes/origin/{merge_branch}")
-
-            git.merge(merge_source_ref, squash=args.squash, commit_message=commit_message)
-
-            if args.squash:
-                squash_oid = _rev_parse_if_supported(git, "HEAD")
-                if squash_oid is not None and git.repo_dir == config.project_dir:
-                    _print_squash_reconcile_result(
-                        _reconcile_squash_merged_branch_with_origin(
-                            git,
-                            branch=merge_branch,
-                            squash_oid=squash_oid,
-                            pre_squash_local_oid=pre_squash_local_oid,
-                            pre_squash_remote_oid=pre_squash_remote_oid,
-                        ),
-                        suppress_success=quiet_mechanics,
-                    )
-                elif squash_oid is not None:
-                    pending_squash_reconcile = _PendingSquashBranchReconcile(
+        if args.squash:
+            squash_oid = _rev_parse_if_supported(git, "HEAD")
+            if squash_oid is not None and git.repo_dir == config.project_dir:
+                _print_squash_reconcile_result(
+                    _reconcile_squash_merged_branch_with_origin(
+                        git,
                         branch=merge_branch,
+                        squash_oid=squash_oid,
                         pre_squash_local_oid=pre_squash_local_oid,
                         pre_squash_remote_oid=pre_squash_remote_oid,
-                    )
-                if not quiet_mechanics:
-                    print(f"✓ Successfully squash merged {merge_source_ref} and created commit")
-            else:
-                if not quiet_mechanics:
-                    print(f"✓ Successfully merged {merge_source_ref}")
+                    ),
+                    suppress_success=quiet_mechanics,
+                )
+            elif squash_oid is not None:
+                pending_squash_reconcile = _PendingSquashBranchReconcile(
+                    branch=merge_branch,
+                    pre_squash_local_oid=pre_squash_local_oid,
+                    pre_squash_remote_oid=pre_squash_remote_oid,
+                )
+            if not quiet_mechanics:
+                print(f"✓ Successfully squash merged {merge_source_ref} and created commit")
+        else:
+            if not quiet_mechanics:
+                print(f"✓ Successfully merged {merge_source_ref}")
 
         # Delete branch if requested
         if args.delete:
@@ -2071,83 +2044,18 @@ def _merge_single_task(
         return _MergeSingleTaskResult(rc=0, pending_squash_reconcile=pending_squash_reconcile)
 
     except GitError as e:
-        operation = "rebase" if args.rebase else "merge"
-
-        if args.rebase and getattr(args, 'resolve', False):
-            # --resolve: invoke Claude to fix conflicts
-            print("Conflicts detected. Invoking provider to resolve...")
-            resolve_log = ensure_task_log_path(config, store, execution_task)
-            conflicts_resolved = invoke_provider_resolve(
-                execution_task,
-                merge_branch,
-                rebase_target,
-                config,
-                log_file=resolve_log,
-                logger=TaskExecutionLogger(resolve_ops_log_path(config, resolve_log), echo=True),
-            )
-
-            if not conflicts_resolved:
-                print("Could not resolve conflicts automatically.")
-                try:
-                    git.rebase_abort()
-                    try:
-                        git.checkout(current_branch)
-                    except GitError:
-                        pass
-                except GitError as abort_error:
-                    print(f"Warning: Could not abort rebase: {abort_error}")
-                return _MergeSingleTaskResult(rc=1)
-
-            # Switch back and fast-forward merge
-            git.checkout(current_branch)
-            git.merge(merge_branch, squash=False)
-            print(f"✓ Fast-forwarded {current_branch} to {merge_branch}")
-
-            # Delete branch if requested
-            if args.delete:
-                try:
-                    git.delete_branch(merge_branch)
-                    print(f"✓ Deleted branch {merge_branch}")
-                except GitError as del_error:
-                    print(f"Warning: Could not delete branch: {del_error}")
-
-            if git.repo_dir == config.project_dir and materialize_side_effects:
-                if merge_unit_id is not None:
-                    store.set_merge_unit_state(
-                        merge_unit_id,
-                        "merged",
-                        merged_by_task_id=merge_subject.id,
-                        merge_source=effective_merge_source,
-                    )
-                else:
-                    store.set_merge_status(merge_subject.id, "merged")
-                if not getattr(args, "no_followups", False):
-                    created_followups, reused_followups = _materialize_merge_followups(store, config, merge_subject)
-                    for followup_task in created_followups:
-                        print(f"FOLLOW {followup_task.id} created from {merge_subject.id}")
-                    for followup_task in reused_followups:
-                        print(f"FOLLOW {followup_task.id} reused from {merge_subject.id}")
-            return _MergeSingleTaskResult(rc=0)
+        operation = "merge"
 
         print(f"Error during {operation} for {merge_subject.id} (branch {merge_branch}): {e}")
         print(f"\nAborting {operation} for {merge_subject.id} (branch {merge_branch}) and restoring clean state...")
         try:
-            if args.rebase:
-                git.rebase_abort()
-                # Try to switch back to original branch
-                try:
-                    git.checkout(current_branch)
-                except GitError:
-                    pass  # Best effort to return to original branch
-                print("✓ Rebase aborted, working directory restored")
-            else:
-                try:
-                    git.merge_abort()
-                    print("✓ Merge aborted, working directory restored")
-                except GitError:
-                    # Failed squash merges can leave tracked files dirty without MERGE_HEAD.
-                    git.reset_hard_head()
-                    print("✓ Merge cleanup reset tracked files to HEAD")
+            try:
+                git.merge_abort()
+                print("✓ Merge aborted, working directory restored")
+            except GitError:
+                # Failed squash merges can leave tracked files dirty without MERGE_HEAD.
+                git.reset_hard_head()
+                print("✓ Merge cleanup reset tracked files to HEAD")
         except GitError as abort_error:
             print(f"Warning: Could not abort {operation} for {merge_subject.id} (branch {merge_branch}): {abort_error}")
         return _MergeSingleTaskResult(rc=1)

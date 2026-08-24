@@ -17,6 +17,7 @@ This document specifies that lifecycle as a state machine. It is the answer to:
 - When does work move from implement → review → improve?
 - When do rebases happen?
 - When does a merge happen?
+- When may an operator explicitly ask gza to land a parked-but-reviewed unit?
 - **When must a human get involved, and how do they clear it?**
 
 It does **not** specify the long-running runtime loop that drives those decisions. Cycle
@@ -34,6 +35,11 @@ The contract is defined over these concepts, independent of how they are stored.
   the *atoms*; the engine spawns them and reads their results.
   - **Types:** `plan`, `plan_review`, `plan_improve`, `explore`, `implement`, `review`, `improve`, `verify_fix`, `rebase`.
   - **Execution status:** `pending` → `in_progress` → `completed` | `failed`.
+  - **Compatibility execution status:** legacy task rows MAY still carry
+    `status="unmerged"` to mean "completed task whose owning work unit has not landed."
+    New lifecycle decisions MUST treat that value as a compatibility task execution
+    status only. It is not the canonical merge state, and every eligibility check that
+    accepts it MUST also prove the owning work unit's merge state independently.
 - **Work unit** (a.k.a. *merge unit* / *implementation lineage*) — the *molecule*: the
   set of related tasks that together produce one mergeable change on one branch. This is
   the thing that has a lifecycle and a merge state. A work unit MUST have exactly one
@@ -141,19 +147,28 @@ These hold across the whole machine; the detailed rules in
    derived fan-out such as follow-up `implement` tasks, and it does not block
    comments-only `improve` refreshes when newer unresolved feedback needs a fresh pass.
 2. **Bounded loops, always.** Every cycle (review→improve, rebase, recovery, no-op
-   improve) MUST have a hard bound. When the bound is hit, the unit goes to a human
-   state — it MUST NOT loop forever and MUST NOT silently give up. The *existence and
-   enforcement* of each bound is invariant; the specific bound *values* are tunable
-   policy knobs, not contract (see [lifecycle-engine.md](lifecycle-engine.md)).
+   improve, writable landing transitions) MUST have a hard bound. When the bound is hit,
+   the unit goes to a human state or a single explicit blocking fact — it MUST NOT loop
+   forever and MUST NOT silently give up. The *existence and enforcement* of each bound is
+   invariant; the specific bound *values* are tunable policy knobs, not contract. Landing
+   uses a named, swappable per-invocation transition-limit policy in
+   [lifecycle-engine.md](lifecycle-engine.md#8a--operator-triggered-land).
 3. **Merge is a two-gate decision.** For an implementation work unit whose review gate is
-   enabled, lifecycle MUST have current green evidence for both:
+   enabled, ordinary lifecycle MUST have current green evidence for both:
    - the **code-review gate**: a current, valid review whose verdict permits merge
      (`APPROVED` or `APPROVED_WITH_FOLLOWUPS`);
    - the **verify gate**: current runner-owned verify evidence for the current
      implementation head and verify-gate identity.
    When `require_review_before_merge=false` disables the review gate for that
    implementation-owned lineage, the verify gate remains mandatory and that no-review
-   merge path is the only exception to the ordinary two-gate rule.
+   merge path is an explicit exception to the ordinary two-gate rule. The other explicit
+   exception is exact-state, operator-triggered guarded landing: `gza land --policy
+   guarded` MAY merge a current `CHANGES_REQUESTED` code-review gate only after the
+   guarded landing contract in [lifecycle-engine.md](lifecycle-engine.md#8a--operator-triggered-land)
+   obtains a current green verify gate, any mandatory spec-coherence gate, and a durable
+   `LAND` judgment for that exact source/target/review/verify/blocker identity. This
+   exception is operator-scoped only; `advance` and `watch` remain strict and MUST NOT use
+   guarded landing authority.
    `APPROVED_WITH_FOLLOWUPS` permits merge only when the follow-up tasks are durably
    recorded *before* the merge completes, so nothing is lost. Historical compatibility
    handling for older review-coupled verify blockers MUST NOT be read as widening this
@@ -170,6 +185,41 @@ These hold across the whole machine; the detailed rules in
 The pass-ordering invariant "land fresh code first" is owned by
 [watch-supervisor.md](watch-supervisor.md), because it constrains the supervisor's cycle
 execution order rather than the engine's per-work-unit decision function.
+
+## Operator-triggered landing
+
+`uv run gza land <task-id>` is a manual, synchronous operator command for one selected
+merge unit. It is not part of ordinary unattended lifecycle cadence. The command resolves
+the selected task to its canonical active merge unit, uses the unit's canonical local
+target branch, and either finishes idempotently when authoritative merge state is already
+`merged` or runs the guarded landing contract specified in
+[lifecycle-engine.md](lifecycle-engine.md#8a--operator-triggered-land).
+
+`gza land` has two per-run policies:
+
+- `guarded` (default) MAY escalate beyond strict lifecycle only after deterministic
+  mechanical gates pass and a durable landing judgment says the original graded ask is
+  satisfied and every remaining blocker is safe to defer.
+- `strict` uses the same orchestration but MUST NOT override parked lifecycle gates and
+  MUST NOT defer open blockers.
+
+Running `gza land` is the operator's explicit authorization for that selected unit only.
+It does not change the normal two-gate merge invariant for `advance` or `watch`: unattended
+automation remains strict, never creates landing judgments, never defers new blockers, and
+never bypasses parked lifecycle gates merely because guarded landing exists.
+
+Successful guarded escalation is auditable as distinct merge provenance. A strict or
+non-escalated landing records `manual_land`; a guarded landing that defers blockers or
+overrides an eligible churn park records `manual_land_escalated` and links the landing
+judgment and deferred task IDs.
+
+`land` command refusals are operator-facing command results, not parked lifecycle states.
+They MUST still use a stable machine-readable `LandBlocked` result with one reason code,
+one human fact, and evidence references; see the command-refusal table below and
+[lifecycle-engine.md](lifecycle-engine.md#8a--operator-triggered-land) for the total
+precedence order. A `LandBlocked` result does not by itself clear or create a parked
+row. The human clears it by changing the cited state, evidence, or configuration and
+rerunning the command.
 
 ## Human-escalation table
 
@@ -203,6 +253,25 @@ time, so each row names what would let us remove it.
 | `needs_discussion` — no-op improves | Improve completed without changing code, repeatedly (`max_noop_improve_cycles`). Disputed non-verify CODE blockers route to adjudication first; remaining no-op cases still park. Legacy compatibility handling for verify-only blocked reviews does not make repeated no-op improves a normal merge path. | Decide whether the feedback is actionable; fix or drop. | Detect un-actionable feedback up front. |
 | `needs_discussion` — unknown verdict | The review verdict could not be classified. | Re-review or correct the output. | More reliable verdict extraction. |
 | `HumanParked` — recovery exhausted | Automatic resume/retry hit its limit or the recovery situation is ambiguous. | Diagnose the failure; resume, redirect, or drop. | Better failure classification & recovery. |
+
+## Operator command-refusal table
+
+These are stable direct-command refusals. They are not lifecycle parked states unless a
+separate lifecycle rule also records one. Every row MUST render as a typed result with
+`reason_code`, one human-readable `fact`, and `evidence_refs`.
+
+| Result / reason code | Trigger | How a human clears it | Path to removing the stop |
+|----------------------|---------|------------------------|---------------------------|
+| `LandBlocked` — `identity-proof-unavailable` | The selected task, active merge unit, representative, source, target, dependency, or project-scope proof is missing, ambiguous, or out of scope. | Fix task/merge-unit/source metadata or branch refs; tag `cross-project` only when the scope policy allows it and the wide scope is intended. | More complete canonical merge-unit and scope-proof repair. |
+| `LandBlocked` — `dirty-checkout` | The tracked checkout is not clean at a required landing preflight. | Save or discard unrelated local changes, then rerun `land`. | Better isolated preflight checkouts. |
+| `LandBlocked` — `rebase-or-conflict` | Required ancestry, rebase, rebase outcome, or clean-merge proof failed or became unverifiable. | Resolve the rebase/conflict or repair the durable outcome proof, then rerun. | Better autonomous conflict resolution and outcome persistence. |
+| `LandBlocked` — `verify-unavailable-or-red` | Current source verify evidence is missing, stale, red, malformed, unavailable, or could not be acquired/reused. | Fix the branch or environment and rerun verify/land. | More reliable verify acquisition and diagnostics. |
+| `LandBlocked` — `required-review-unavailable` | Required spec-coherence, code, or resolution review evidence is missing, stale, mismatched, failed, malformed, non-merge-permitting, or could not be acquired/reused. | Let the exact active review finish, enable acquisition, or repair/re-run the required review. | More reliable exact-identity review reuse and creation. |
+| `LandBlocked` — `nondeferrable-blocker` | Strict mode or guarded policy sees an open blocker that cannot be deferred. | Fix or explicitly resolve the blocker, then rerun. | Better scoped blocker adjudication and review quality. |
+| `LandBlocked` — `policy-or-judge-refused` | Guarded judgment is disabled, unavailable, malformed, not exact, returns `BLOCK`/`NEEDS_HUMAN`, or required judgment reuse is invalid. | Inspect the judgment evidence or run strict/manual remediation. | Better judgment prompting and identity validation. |
+| `LandBlocked` — `materialization-or-persistence-failed` | Required ordinary follow-up/deferred task creation, exact-key reuse validation, reconciliation, or persistence failed before merge mutation. | Repair task storage/reuse state and rerun. | Transactional materialization helpers. |
+| `LandBlocked` — `bounded-attempt-exhausted` | The visited fingerprint repeats or the `LandingTransitionLimitPolicy` transition cap is exhausted. | Inspect the repeated state/evidence refs, change the blocking state manually, then rerun. | More complete progress detection and phase-specific refusal reasons. |
+| `LandBlocked` — `merge-failed` | Final merge or mark-merged precondition failed before durable merge-state mutation. | Fix the cited merge failure and rerun. | Better shared merge executor diagnostics. |
 
 **Reason codes are contract; messages are not.** Several rows share one state
 (`HumanParked`) and differ only by *reason*. Each parked action MUST carry a
