@@ -5772,11 +5772,13 @@ def _reconcile_watch_runtime_state(
         pid for pid in getattr(live_state, "anonymous_worker_pids", frozenset()) if pid > 0 and pid in live_pids
     )
     starting_worker_ids = tuple(str(worker_id) for worker_id in getattr(live_state, "live_starting_worker_ids", ()))
+    starting_task_ids = tuple(str(task_id) for task_id in getattr(live_state, "starting_task_ids", ()))
     return ProjectRuntimeReconcileResult(
         runtime_key=runtime_key,
         live_pids=frozenset(live_pids),
         running_pids=running_pids,
         starting_pids=starting_pids,
+        starting_task_ids=starting_task_ids,
         anonymous_worker_pids=anonymous_worker_pids,
         running_task_ids=tuple(running_task_ids),
         running_task_pid_by_task_id=running_task_pid_by_task_id,
@@ -7098,6 +7100,7 @@ class ProjectRuntimeReconcileResult:
     starting_worker_count: int
     running_pids: frozenset[int] = frozenset()
     starting_pids: frozenset[int] = frozenset()
+    starting_task_ids: tuple[str, ...] = ()
     anonymous_worker_pids: frozenset[int] = frozenset()
     running_task_pid_by_task_id: Mapping[str, int] = field(default_factory=dict)
     starting_worker_ids: tuple[str, ...] = ()
@@ -7123,6 +7126,7 @@ class ProjectLocalOccupancy:
     starting_pids: frozenset[int]
     running_task_ids: tuple[str, ...]
     anonymous_worker_count: int
+    starting_task_ids: tuple[str, ...] = ()
     launch_blocked_reasons: tuple[str, ...] = ()
 
     @property
@@ -7142,6 +7146,8 @@ class AggregateWatchOccupancy:
     starting_pids: frozenset[int]
     live_pids: frozenset[int]
     local: tuple[ProjectLocalOccupancy, ...]
+    provisional_reservations: int = 0
+    reservation_ids: tuple[str, ...] = ()
 
     @property
     def local_by_runtime_key(self) -> Mapping[str, ProjectLocalOccupancy]:
@@ -7290,6 +7296,7 @@ class ProjectDispatchResult:
         "no_live_proof",
         "launch_blocked",
         "local_capacity_blocked",
+        "global_capacity_blocked",
         "not_dispatchable",
     ]
     slot_consuming: bool
@@ -7297,6 +7304,217 @@ class ProjectDispatchResult:
     dispatch_budget_consuming: bool = False
     detail: str | None = None
     task: DbTask | None = None
+
+
+@dataclass(frozen=True)
+class SupervisorLaunchReservation:
+    """One provisional global launch reservation held until dispatch settlement."""
+
+    reservation_id: str
+    runtime_key: str
+    task_id: str
+    lane: Literal["recovery", "pending", "lifecycle"]
+
+
+@dataclass
+class SupervisorLaunchBudget:
+    """Same-process global worker launch budget for future multi-project watch dispatch."""
+
+    runtimes: Sequence["WatchProjectRuntime"]
+    supervisor_batch: int
+    dry_run: bool = False
+    _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
+    _reservations: dict[str, SupervisorLaunchReservation] = field(default_factory=dict, init=False, repr=False)
+    _settled_reservation_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _occupancy: AggregateWatchOccupancy | None = field(default=None, init=False, repr=False)
+    refresh_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.supervisor_batch < 0:
+            raise ValueError("supervisor_batch must be non-negative")
+        self.refresh_occupancy()
+
+    @property
+    def runtime_by_key(self) -> Mapping[str, "WatchProjectRuntime"]:
+        return {runtime.key: runtime for runtime in self.runtimes}
+
+    @property
+    def reservations(self) -> tuple[SupervisorLaunchReservation, ...]:
+        with self._lock:
+            return tuple(self._reservations.values())
+
+    @property
+    def occupancy(self) -> AggregateWatchOccupancy:
+        with self._lock:
+            assert self._occupancy is not None
+            return self._occupancy_with_reservations(self._occupancy)
+
+    def refresh_occupancy(self) -> AggregateWatchOccupancy:
+        with self._lock:
+            self._occupancy = aggregate_watch_project_occupancy(
+                self.runtimes,
+                supervisor_batch=self.supervisor_batch,
+                dry_run=self.dry_run,
+            )
+            self._release_reconciled_reservations_locked(self._occupancy)
+            self.refresh_count += 1
+            return self._occupancy_with_reservations(self._occupancy)
+
+    def reserve(self, candidate: ProjectDispatchCandidate) -> SupervisorLaunchReservation | None:
+        with self._lock:
+            assert self._occupancy is not None
+            if self._available_slots_locked() <= 0:
+                return None
+            if candidate.runtime_key not in self.runtime_by_key or candidate.task.id is None:
+                return None
+            reservation = SupervisorLaunchReservation(
+                reservation_id=uuid.uuid4().hex,
+                runtime_key=candidate.runtime_key,
+                task_id=str(candidate.task.id),
+                lane=candidate.lane,
+            )
+            self._reservations[reservation.reservation_id] = reservation
+            return reservation
+
+    def release(self, reservation: SupervisorLaunchReservation) -> None:
+        with self._lock:
+            self._pop_reservation_locked(reservation.reservation_id)
+
+    def dispatch_pending_candidate(
+        self,
+        runtime: "WatchProjectRuntime",
+        candidate: ProjectDispatchCandidate,
+        *,
+        max_iterations: int,
+        dry_run: bool = False,
+        quiet: bool = False,
+        analysis: ProjectCycleAnalysis | None = None,
+        excluded_owner_ids: frozenset[str] = frozenset(),
+        step1_handled_child_task_ids: frozenset[str] = frozenset(),
+    ) -> ProjectDispatchResult:
+        """Reserve one global slot, run the runtime-local dispatch, then settle the claim."""
+        with self._lock:
+            reservation = self.reserve(candidate)
+            if reservation is None:
+                return ProjectDispatchResult(
+                    runtime_key=runtime.key,
+                    candidate=candidate,
+                    status="global_capacity_blocked",
+                    slot_consuming=False,
+                    work_done=False,
+                    detail="supervisor launch budget has no available slots",
+                    task=candidate.task,
+                )
+            try:
+                result = runtime.dispatch_pending_candidate(
+                    candidate,
+                    max_iterations=max_iterations,
+                    dry_run=dry_run,
+                    quiet=quiet,
+                    analysis=analysis,
+                    excluded_owner_ids=excluded_owner_ids,
+                    step1_handled_child_task_ids=step1_handled_child_task_ids,
+                )
+            except Exception as dispatch_exc:
+                self._settled_reservation_ids.add(reservation.reservation_id)
+                try:
+                    self.refresh_occupancy()
+                except Exception as refresh_exc:
+                    dispatch_exc.add_note(
+                        f"supervisor occupancy refresh failed while reconciling reservation "
+                        f"{reservation.reservation_id}: {refresh_exc}"
+                    )
+                raise
+            self._settled_reservation_ids.add(reservation.reservation_id)
+            self.refresh_occupancy()
+            if not result.slot_consuming:
+                self.release(reservation)
+            return result
+
+    def _available_slots_locked(self) -> int:
+        assert self._occupancy is not None
+        return max(0, self._occupancy.slots - len(self._reservations))
+
+    def _occupancy_with_reservations(self, occupancy: AggregateWatchOccupancy) -> AggregateWatchOccupancy:
+        reservations = tuple(self._reservations.values())
+        return replace(
+            occupancy,
+            slots=max(0, occupancy.slots - len(reservations)),
+            provisional_reservations=len(reservations),
+            reservation_ids=tuple(reservation.reservation_id for reservation in reservations),
+        )
+
+    def _release_reconciled_reservations_locked(self, occupancy: AggregateWatchOccupancy) -> None:
+        if not self._reservations:
+            return
+        local_by_runtime_key = occupancy.local_by_runtime_key
+        runtime_by_key = self.runtime_by_key
+        reconciled_reservation_ids: list[str] = []
+        for reservation_id, reservation in self._reservations.items():
+            local = local_by_runtime_key.get(reservation.runtime_key)
+            if local is None:
+                continue
+            running_task_ids = set(local.running_task_ids)
+            starting_task_ids = set(local.starting_task_ids)
+            if reservation.task_id in running_task_ids or reservation.task_id in starting_task_ids:
+                reconciled_reservation_ids.append(reservation_id)
+                continue
+            runtime = runtime_by_key.get(reservation.runtime_key)
+            task = runtime.store.get(reservation.task_id) if runtime is not None else None
+            if task is not None and task.status not in {"pending", "in_progress"}:
+                reconciled_reservation_ids.append(reservation_id)
+                continue
+            if reservation_id in self._settled_reservation_ids and task is not None and task.status == "pending":
+                reconciled_reservation_ids.append(reservation_id)
+                continue
+            if reservation_id in self._settled_reservation_ids and task is None:
+                reconciled_reservation_ids.append(reservation_id)
+        for reservation_id in reconciled_reservation_ids:
+            self._pop_reservation_locked(reservation_id)
+
+    def _pop_reservation_locked(self, reservation_id: str) -> None:
+        self._reservations.pop(reservation_id, None)
+        self._settled_reservation_ids.discard(reservation_id)
+
+
+def dispatch_watch_supervisor_pending_candidates(
+    runtimes: Sequence["WatchProjectRuntime"],
+    candidates: Sequence[ProjectDispatchCandidate],
+    *,
+    launch_budget: SupervisorLaunchBudget,
+    max_iterations: int,
+    dry_run: bool = False,
+    quiet: bool = False,
+) -> tuple[ProjectDispatchResult, ...]:
+    """Dispatch strategy-selected pending heads through a shared supervisor launch budget."""
+    runtime_by_key = {runtime.key: runtime for runtime in runtimes}
+    results: list[ProjectDispatchResult] = []
+    for candidate in candidates:
+        runtime = runtime_by_key.get(candidate.runtime_key)
+        if runtime is None:
+            results.append(
+                ProjectDispatchResult(
+                    runtime_key=candidate.runtime_key,
+                    candidate=candidate,
+                    status="not_dispatchable",
+                    slot_consuming=False,
+                    work_done=False,
+                    detail=f"runtime {candidate.runtime_key!r} is not selected",
+                    task=candidate.task,
+                )
+            )
+            continue
+        result = launch_budget.dispatch_pending_candidate(
+            runtime,
+            candidate,
+            max_iterations=max_iterations,
+            dry_run=dry_run,
+            quiet=quiet,
+        )
+        results.append(result)
+        if result.status == "global_capacity_blocked":
+            break
+    return tuple(results)
 
 
 def aggregate_watch_project_occupancy(
@@ -7362,6 +7580,7 @@ def aggregate_reconciled_watch_occupancy(
                 starting_pids=starting_pids,
                 running_task_ids=state.running_task_ids,
                 anonymous_worker_count=state.anonymous_worker_count,
+                starting_task_ids=state.starting_task_ids,
                 launch_blocked_reasons=launch_blocked_reasons,
             )
         )
@@ -8201,93 +8420,110 @@ class WatchProjectRuntime:
                 detail=str(exc),
                 task=task,
             )
-        live_worker_rejection = reject_if_live_worker_proof()
-        if live_worker_rejection is not None:
-            permit.release()
-            return live_worker_rejection
-
-        settle_task_before: _WatchDispatchTaskSnapshot | None
-        dedupe_suffix: str
-        if task_type == "implement":
-            prepared_task = _prepare_task_for_immediate_execution(
-                self.config,
-                task,
-                rollback_on_failure=False,
-                store=self.store,
-                runtime_context=self.runtime_context,
-            )
-            if prepared_task is None:
-                permit.release()
-                self.log.emit(
-                    "START_FAILED",
-                    f"{task.id} {task_type}: iterate startup preparation failed",
-                    dedupe_key=f"prepare-iterate-failed:{task.id}",
-                )
-                self._exclude_pending_dispatch_candidate_for_pass(str(task.id))
-                return ProjectDispatchResult(
-                    runtime_key=self.key,
-                    candidate=candidate,
-                    status="launch_blocked",
-                    slot_consuming=False,
-                    work_done=True,
-                    detail="iterate startup preparation failed",
-                    task=task,
-                )
-            reserve_task_launch_permit(str(prepared_task.id), permit)
-            settle_task_before = _snapshot_watch_dispatch_task(prepared_task)
-            pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
+        owned_launch_permit: LaunchPermit | None = permit
+        reserved_launch_permit_task_id: str | None = None
+        try:
             live_worker_rejection = reject_if_live_worker_proof()
             if live_worker_rejection is not None:
-                release_task_launch_permit(str(prepared_task.id))
+                permit.release()
+                owned_launch_permit = None
                 return live_worker_rejection
-            iterate_args = argparse.Namespace(
-                max_iterations=max_iterations,
-                no_docker=False,
-                resume=False,
-                retry=False,
-                auto_iterate=True,
-            )
-            rc = _spawn_worker_with_failure_log(
-                quiet=quiet,
-                log=self.log,
-                failure_message=f"{task.id} {task_type}: iterate worker spawn failed",
-                dedupe_key=f"spawn-iterate-failed:{task.id}",
-                spawn_fn=lambda: _spawn_background_iterate(
-                    iterate_args,
+
+            settle_task_before: _WatchDispatchTaskSnapshot | None
+            dedupe_suffix: str
+            if task_type == "implement":
+                prepared_task = _prepare_task_for_immediate_execution(
                     self.config,
                     task,
-                    prepared_task_id=str(prepared_task.id),
-                    prepared_resume=pending_recovery_mode == "resume",
-                    prepared_phase="preloop",
-                    startup_quiet=True,
+                    rollback_on_failure=False,
+                    store=self.store,
                     runtime_context=self.runtime_context,
-                ),
-            )
-            release_task_launch_permit(str(prepared_task.id))
-            dedupe_suffix = "iterate"
-        else:
-            settle_task_before = _snapshot_watch_dispatch_task(task)
-            worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-            live_worker_rejection = reject_if_live_worker_proof()
-            if live_worker_rejection is not None:
-                permit.release()
-                return live_worker_rejection
-            rc = _spawn_worker_with_failure_log(
-                quiet=quiet,
-                log=self.log,
-                failure_message=f"{task.id} {task_type}: worker spawn failed",
-                dedupe_key=f"spawn-worker-failed:{task.id}",
-                spawn_fn=lambda: _spawn_background_worker(
-                    worker_args,
-                    self.config,
-                    task_id=task.id,
+                )
+                if prepared_task is None:
+                    permit.release()
+                    owned_launch_permit = None
+                    self.log.emit(
+                        "START_FAILED",
+                        f"{task.id} {task_type}: iterate startup preparation failed",
+                        dedupe_key=f"prepare-iterate-failed:{task.id}",
+                    )
+                    self._exclude_pending_dispatch_candidate_for_pass(str(task.id))
+                    return ProjectDispatchResult(
+                        runtime_key=self.key,
+                        candidate=candidate,
+                        status="launch_blocked",
+                        slot_consuming=False,
+                        work_done=True,
+                        detail="iterate startup preparation failed",
+                        task=task,
+                    )
+                prepared_task_id = str(prepared_task.id)
+                reserved_launch_permit_task_id = prepared_task_id
+                reserve_task_launch_permit(prepared_task_id, permit)
+                owned_launch_permit = None
+                settle_task_before = _snapshot_watch_dispatch_task(prepared_task)
+                pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
+                live_worker_rejection = reject_if_live_worker_proof()
+                if live_worker_rejection is not None:
+                    release_task_launch_permit(reserved_launch_permit_task_id)
+                    reserved_launch_permit_task_id = None
+                    return live_worker_rejection
+                iterate_args = argparse.Namespace(
+                    max_iterations=max_iterations,
+                    no_docker=False,
+                    resume=False,
+                    retry=False,
+                    auto_iterate=True,
+                )
+                rc = _spawn_worker_with_failure_log(
                     quiet=quiet,
-                    startup_quiet=True,
-                    runtime_context=self.runtime_context,
-                ),
-            )
-            permit.release()
-            dedupe_suffix = "worker"
+                    log=self.log,
+                    failure_message=f"{task.id} {task_type}: iterate worker spawn failed",
+                    dedupe_key=f"spawn-iterate-failed:{task.id}",
+                    spawn_fn=lambda: _spawn_background_iterate(
+                        iterate_args,
+                        self.config,
+                        task,
+                        prepared_task_id=prepared_task_id,
+                        prepared_resume=pending_recovery_mode == "resume",
+                        prepared_phase="preloop",
+                        startup_quiet=True,
+                        runtime_context=self.runtime_context,
+                    ),
+                )
+                release_task_launch_permit(reserved_launch_permit_task_id)
+                reserved_launch_permit_task_id = None
+                dedupe_suffix = "iterate"
+            else:
+                settle_task_before = _snapshot_watch_dispatch_task(task)
+                worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+                live_worker_rejection = reject_if_live_worker_proof()
+                if live_worker_rejection is not None:
+                    permit.release()
+                    owned_launch_permit = None
+                    return live_worker_rejection
+                rc = _spawn_worker_with_failure_log(
+                    quiet=quiet,
+                    log=self.log,
+                    failure_message=f"{task.id} {task_type}: worker spawn failed",
+                    dedupe_key=f"spawn-worker-failed:{task.id}",
+                    spawn_fn=lambda: _spawn_background_worker(
+                        worker_args,
+                        self.config,
+                        task_id=task.id,
+                        quiet=quiet,
+                        startup_quiet=True,
+                        runtime_context=self.runtime_context,
+                    ),
+                )
+                permit.release()
+                owned_launch_permit = None
+                dedupe_suffix = "worker"
+        finally:
+            if reserved_launch_permit_task_id is not None:
+                release_task_launch_permit(reserved_launch_permit_task_id)
+            if owned_launch_permit is not None:
+                owned_launch_permit.release()
         if rc != 0:
             self._exclude_pending_dispatch_candidate_for_pass(str(task.id))
             return ProjectDispatchResult(

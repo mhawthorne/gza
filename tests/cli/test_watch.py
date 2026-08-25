@@ -12,6 +12,8 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -69,8 +71,10 @@ from gza.cli.watch import (
     ProjectCycleAnalysis,
     ProjectDirectResult,
     ProjectDispatchCandidate,
+    ProjectDispatchResult,
     ProjectLocalOccupancy,
     ProjectRuntimeReconcileResult,
+    SupervisorLaunchBudget,
     WatchProjectRuntime,
     WatchRuntimeIdentity,
     WatchProjectSelection,
@@ -135,9 +139,10 @@ from gza.cli.watch import (
     allocate_watch_slots,
     cmd_main_verify,
     cmd_watch,
+    dispatch_watch_supervisor_pending_candidates,
     format_red_duration,
 )
-from gza.concurrency import MaxConcurrentTasksError, _LiveRunningState, launch_permit
+from gza.concurrency import MaxConcurrentTasksError, _LiveRunningState, launch_permit, take_task_launch_permit
 from gza.config import Config, ConfigError
 from gza.db import (
     DuplicateActiveChildError,
@@ -1038,6 +1043,7 @@ def test_watch_project_runtime_reconcile_runtime_state_preserves_legacy_order(tm
     assert result.starting_worker_count == 1
     assert result.running_pids == frozenset({321})
     assert result.starting_pids == frozenset({654})
+    assert result.starting_task_ids == ()
     reconcile_in_progress.assert_called_once_with(config, store=store, runtime_context=runtime.runtime_context)
     prune_dead.assert_called_once_with(config)
     reconcile_recovery.assert_called_once_with(config, store=store, runtime_context=runtime.runtime_context)
@@ -1090,6 +1096,7 @@ def test_watch_project_runtime_reconcile_dry_run_only_observes_runtime_state(tmp
     assert result.live_pids == frozenset({654, 655, 656})
     assert result.running_task_ids == ("gza-2",)
     assert result.starting_worker_count == 3
+    assert result.starting_task_ids == ()
 
 
 def test_watch_project_runtime_reconcile_uses_one_liveness_snapshot(tmp_path: Path) -> None:
@@ -1381,6 +1388,7 @@ def test_aggregate_watch_occupancy_counts_starting_workers_against_global_slots(
     assert occupancy.running == 0
     assert occupancy.starting == 1
     assert occupancy.starting_pids == frozenset({os.getpid()})
+    assert occupancy.local_by_runtime_key["core"].starting_task_ids == (task.id,)
     assert occupancy.slots == 1
 
 
@@ -34441,6 +34449,28 @@ def _make_runtime_for_dispatch_api(
     )
 
 
+def _candidate_for_runtime_head(runtime: WatchProjectRuntime) -> ProjectDispatchCandidate:
+    candidate = runtime.pending_dispatch_head(max_recovery_attempts=1)
+    assert candidate is not None
+    return candidate
+
+
+def _assert_runtime_dispatch_exception_cleanup(
+    *,
+    runtime: WatchProjectRuntime,
+    task_id: str,
+    budget: SupervisorLaunchBudget,
+    reserved_task_id: str | None = None,
+) -> None:
+    assert budget.reservations == ()
+    assert budget.occupancy.provisional_reservations == 0
+    assert budget.occupancy.slots == 1
+    leftover_permit = take_task_launch_permit(reserved_task_id or task_id)
+    assert leftover_permit is None
+    competing_permit = launch_permit(runtime.config, runtime.store)
+    competing_permit.release()
+
+
 def _runtime_analysis_with_pending_suppression(
     runtime: WatchProjectRuntime,
     *,
@@ -35534,6 +35564,512 @@ def test_watch_project_runtime_pending_local_cap_is_runtime_wide_hold_not_candid
     assert runtime.pending_dispatch_head(max_recovery_attempts=1).task.id == first.id
 
 
+@pytest.mark.parametrize(
+    ("settle_status", "expected_status"),
+    [
+        (watch_module._DispatchSettleStatus.TERMINAL_BEFORE_RUNNING, "terminal_before_running"),
+        (watch_module._DispatchSettleStatus.NO_LIVE_PROOF, "no_live_proof"),
+    ],
+)
+def test_supervisor_launch_budget_releases_non_live_reservations_and_reuses_capacity(
+    tmp_path: Path,
+    settle_status: object,
+    expected_status: str,
+) -> None:
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    setup_config(project_a)
+    setup_config(project_b)
+    store_a = make_store(project_a)
+    store_b = make_store(project_b)
+    task_a = store_a.add("Pending A settles without live proof", task_type="plan")
+    task_b = store_b.add("Pending B reuses released global slot", task_type="plan")
+    assert task_a.id is not None
+    assert task_b.id is not None
+    runtime_a = _make_runtime_for_dispatch_api(project_a, store_a, key="a")
+    runtime_b = _make_runtime_for_dispatch_api(project_b, store_b, key="b")
+    candidate_a = runtime_a.pending_dispatch_head(max_recovery_attempts=1)
+    candidate_b = runtime_b.pending_dispatch_head(max_recovery_attempts=1)
+    assert candidate_a is not None
+    assert candidate_b is not None
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+    permit_a = _RuntimeDispatchPermit()
+    permit_b = _RuntimeDispatchPermit()
+    permit_reservation_counts: list[int] = []
+
+    def launch_spy(config: Config, _store: SqliteTaskStore) -> _RuntimeDispatchPermit:
+        permit_reservation_counts.append(len(budget.reservations))
+        return permit_a if config is runtime_a.config else permit_b
+
+    def settle_spy(*, pending_starts: list[object], store: SqliteTaskStore, **_kwargs: object) -> list[object]:
+        [entry] = pending_starts
+        if store is store_a:
+            return [
+                watch_module._WatchDispatchSettleResult(
+                    entry=entry,
+                    status=settle_status,
+                    reason=f"task {task_a.id} did not occupy a live slot",
+                    task=store.get(task_a.id),
+                )
+            ]
+        _register_live_worker_for_task(runtime_b.config, task_b.id)
+        return _live_settle_results(pending_starts, store=store)
+
+    with (
+        patch("gza.cli.watch.launch_permit", side_effect=launch_spy),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_spy),
+    ):
+        results = dispatch_watch_supervisor_pending_candidates(
+            [runtime_a, runtime_b],
+            [candidate_a, candidate_b],
+            launch_budget=budget,
+            max_iterations=1,
+        )
+
+    assert [result.status for result in results] == [expected_status, "live"]
+    assert [result.slot_consuming for result in results] == [False, True]
+    assert budget.reservations == ()
+    assert budget.occupancy.provisional_reservations == 0
+    assert budget.occupancy.slots == 0
+    assert budget.refresh_count == 3
+    assert permit_a.released is True
+    assert permit_b.released is True
+    assert permit_reservation_counts == [1, 1]
+
+
+def test_supervisor_launch_budget_releases_local_cap_rejection_so_another_project_can_fill_slot(
+    tmp_path: Path,
+) -> None:
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    setup_config(project_a)
+    setup_config(project_b)
+    store_a = make_store(project_a)
+    store_b = make_store(project_b)
+    task_a = store_a.add("Pending A hits local cap race", task_type="plan")
+    task_b = store_b.add("Pending B fills released global slot", task_type="plan")
+    assert task_a.id is not None
+    assert task_b.id is not None
+    runtime_a = _make_runtime_for_dispatch_api(project_a, store_a, key="a")
+    runtime_b = _make_runtime_for_dispatch_api(project_b, store_b, key="b")
+    candidate_a = runtime_a.pending_dispatch_head(max_recovery_attempts=1)
+    candidate_b = runtime_b.pending_dispatch_head(max_recovery_attempts=1)
+    assert candidate_a is not None
+    assert candidate_b is not None
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+    permit_b = _RuntimeDispatchPermit()
+    launch_attempts: list[str] = []
+
+    def launch_spy(config: Config, _store: SqliteTaskStore) -> _RuntimeDispatchPermit:
+        launch_attempts.append("a" if config is runtime_a.config else "b")
+        assert len(budget.reservations) == 1
+        if config is runtime_a.config:
+            raise MaxConcurrentTasksError("local cap reached")
+        return permit_b
+
+    def settle_spy(*, pending_starts: list[object], store: SqliteTaskStore, **_kwargs: object) -> list[object]:
+        _register_live_worker_for_task(runtime_b.config, task_b.id)
+        return _live_settle_results(pending_starts, store=store)
+
+    with (
+        patch("gza.cli.watch.launch_permit", side_effect=launch_spy),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_spy),
+    ):
+        results = dispatch_watch_supervisor_pending_candidates(
+            [runtime_a, runtime_b],
+            [candidate_a, candidate_b],
+            launch_budget=budget,
+            max_iterations=1,
+        )
+
+    assert [result.status for result in results] == ["local_capacity_blocked", "live"]
+    assert launch_attempts == ["a", "b"]
+    assert budget.reservations == ()
+    assert budget.occupancy.slots == 0
+    assert permit_b.released is True
+
+
+def test_supervisor_launch_budget_capacity_blocks_while_provisional_reservation_is_unsettled(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "core", project_name="core")
+    task = runtime.store.add("Pending under unsettled reservation", task_type="plan")
+    assert task.id is not None
+    candidate = ProjectDispatchCandidate(
+        runtime_key=runtime.key,
+        task=task,
+        lane="pending",
+        runtime_identity=runtime.runtime_identity,
+    )
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1)
+    reservation = budget.reserve(candidate)
+
+    assert reservation is not None
+    assert budget.occupancy.provisional_reservations == 1
+    assert budget.occupancy.slots == 0
+    assert budget.reserve(candidate) is None
+
+    budget.release(reservation)
+
+    assert budget.occupancy.provisional_reservations == 0
+    assert budget.occupancy.slots == 1
+
+
+def test_supervisor_launch_budget_reconciles_pre_spawn_exception_and_reuses_slot(tmp_path: Path) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    task_a = runtime_a.store.add("Pending A raises before spawn proof", task_type="plan")
+    task_b = runtime_b.store.add("Pending B reuses slot after no-live proof", task_type="plan")
+    assert task_a.id is not None
+    assert task_b.id is not None
+    candidate_a = ProjectDispatchCandidate(
+        runtime_key=runtime_a.key,
+        task=task_a,
+        lane="pending",
+        runtime_identity=runtime_a.runtime_identity,
+    )
+    candidate_b = ProjectDispatchCandidate(
+        runtime_key=runtime_b.key,
+        task=task_b,
+        lane="pending",
+        runtime_identity=runtime_b.runtime_identity,
+    )
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+    attempts: list[str] = []
+
+    def fake_runtime_dispatch(
+        candidate: ProjectDispatchCandidate,
+        **_kwargs: object,
+    ) -> ProjectDispatchResult:
+        attempts.append(candidate.runtime_key)
+        if candidate.runtime_key == runtime_a.key:
+            raise RuntimeError("dispatch failed before spawn")
+        running_task = runtime_b.store.get(task_b.id)
+        assert running_task is not None
+        running_task.status = "in_progress"
+        running_task.running_pid = os.getpid()
+        runtime_b.store.update(running_task)
+        _register_live_worker_for_task(runtime_b.config, task_b.id)
+        return ProjectDispatchResult(
+            runtime_key=candidate.runtime_key,
+            candidate=candidate,
+            status="live",
+            slot_consuming=True,
+            work_done=True,
+            task=candidate.task,
+        )
+
+    with patch.object(WatchProjectRuntime, "dispatch_pending_candidate", side_effect=fake_runtime_dispatch):
+        with pytest.raises(RuntimeError, match="dispatch failed before spawn"):
+            budget.dispatch_pending_candidate(runtime_a, candidate_a, max_iterations=1)
+
+        result_b = budget.dispatch_pending_candidate(runtime_b, candidate_b, max_iterations=1)
+
+    assert attempts == [runtime_a.key, runtime_b.key]
+    assert result_b.status == "live"
+    assert budget.reservations == ()
+    assert budget.occupancy.provisional_reservations == 0
+    assert budget.occupancy.slots == 0
+
+
+def test_supervisor_launch_budget_replaces_pending_preloop_exception_with_single_starting_claim(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    task_a = runtime_a.store.add("Pending A registered but not activated", task_type="plan")
+    task_b = runtime_b.store.add("Pending B can use remaining batch capacity", task_type="plan")
+    assert task_a.id is not None
+    assert task_b.id is not None
+    candidate_a = ProjectDispatchCandidate(
+        runtime_key=runtime_a.key,
+        task=task_a,
+        lane="pending",
+        runtime_identity=runtime_a.runtime_identity,
+    )
+    candidate_b = ProjectDispatchCandidate(
+        runtime_key=runtime_b.key,
+        task=task_b,
+        lane="pending",
+        runtime_identity=runtime_b.runtime_identity,
+    )
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=2)
+
+    def fake_runtime_dispatch(
+        candidate: ProjectDispatchCandidate,
+        **_kwargs: object,
+    ) -> ProjectDispatchResult:
+        assert candidate.runtime_key == runtime_a.key
+        _register_live_worker_for_task(runtime_a.config, task_a.id)
+        raise RuntimeError("settlement failed while worker remained pending")
+
+    with patch.object(WatchProjectRuntime, "dispatch_pending_candidate", side_effect=fake_runtime_dispatch):
+        with pytest.raises(RuntimeError, match="worker remained pending"):
+            budget.dispatch_pending_candidate(runtime_a, candidate_a, max_iterations=1)
+
+        after_starting = budget.occupancy
+
+    assert after_starting.starting == 1
+    assert after_starting.running == 0
+    assert after_starting.provisional_reservations == 0
+    assert after_starting.slots == 1
+    assert budget.reserve(candidate_b) is not None
+    assert budget.occupancy.provisional_reservations == 1
+    assert budget.occupancy.starting == 1
+    assert budget.occupancy.slots == 0
+
+
+def test_supervisor_launch_budget_eventually_replaces_pending_reservation_with_starting_claim(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    task = runtime.store.add("Pending reservation becomes starting", task_type="plan")
+    assert task.id is not None
+    candidate = ProjectDispatchCandidate(
+        runtime_key=runtime.key,
+        task=task,
+        lane="pending",
+        runtime_identity=runtime.runtime_identity,
+    )
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1)
+    reservation = budget.reserve(candidate)
+    assert reservation is not None
+    assert budget.occupancy.provisional_reservations == 1
+    assert budget.occupancy.slots == 0
+
+    _register_live_worker_for_task(runtime.config, task.id)
+    budget.refresh_occupancy()
+
+    assert budget.reservations == ()
+    assert budget.occupancy.provisional_reservations == 0
+    assert budget.occupancy.starting == 1
+    assert budget.occupancy.slots == 0
+
+
+def test_supervisor_launch_budget_serializes_cross_project_launch_attempts(tmp_path: Path) -> None:
+    project_a = tmp_path / "project-a"
+    project_b = tmp_path / "project-b"
+    project_a.mkdir()
+    project_b.mkdir()
+    setup_config(project_a)
+    setup_config(project_b)
+    store_a = make_store(project_a)
+    store_b = make_store(project_b)
+    task_a = store_a.add("Pending A serialized launch", task_type="plan")
+    task_b = store_b.add("Pending B waits for launch settlement", task_type="plan")
+    assert task_a.id is not None
+    assert task_b.id is not None
+    runtime_a = _make_runtime_for_dispatch_api(project_a, store_a, key="a")
+    runtime_b = _make_runtime_for_dispatch_api(project_b, store_b, key="b")
+    candidate_a = runtime_a.pending_dispatch_head(max_recovery_attempts=1)
+    candidate_b = runtime_b.pending_dispatch_head(max_recovery_attempts=1)
+    assert candidate_a is not None
+    assert candidate_b is not None
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+    active_dispatches = 0
+    max_active_dispatches = 0
+    start_barrier = threading.Barrier(2)
+    first_dispatch_entered = threading.Event()
+    results: list[ProjectDispatchResult] = []
+    results_guard = threading.Lock()
+
+    def fake_runtime_dispatch(
+        candidate: ProjectDispatchCandidate,
+        **_kwargs: object,
+    ) -> ProjectDispatchResult:
+        nonlocal active_dispatches, max_active_dispatches
+        with results_guard:
+            active_dispatches += 1
+            max_active_dispatches = max(max_active_dispatches, active_dispatches)
+        first_dispatch_entered.set()
+        time.sleep(0.05)
+        if candidate.runtime_key == runtime_a.key:
+            _register_live_worker_for_task(runtime_a.config, task_a.id)
+        else:
+            _register_live_worker_for_task(runtime_b.config, task_b.id)
+        with results_guard:
+            active_dispatches -= 1
+        return ProjectDispatchResult(
+            runtime_key=candidate.runtime_key,
+            candidate=candidate,
+            status="live",
+            slot_consuming=True,
+            work_done=True,
+            task=candidate.task,
+        )
+
+    def run_dispatch(runtime: WatchProjectRuntime, candidate: ProjectDispatchCandidate) -> None:
+        start_barrier.wait()
+        result = budget.dispatch_pending_candidate(runtime, candidate, max_iterations=1)
+        with results_guard:
+            results.append(result)
+
+    with patch.object(WatchProjectRuntime, "dispatch_pending_candidate", side_effect=fake_runtime_dispatch):
+        thread_a = threading.Thread(target=run_dispatch, args=(runtime_a, candidate_a))
+        thread_b = threading.Thread(target=run_dispatch, args=(runtime_b, candidate_b))
+        thread_a.start()
+        thread_b.start()
+        assert first_dispatch_entered.wait(timeout=1)
+        thread_a.join(timeout=1)
+        thread_b.join(timeout=1)
+
+    assert not thread_a.is_alive()
+    assert not thread_b.is_alive()
+    assert max_active_dispatches == 1
+    assert sorted(result.status for result in results) == ["global_capacity_blocked", "live"]
+    assert budget.reservations == ()
+    assert budget.occupancy.slots == 0
+
+
+def test_supervisor_launch_budget_replaces_reservation_when_settlement_raises_after_running_visibility(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    task_a = runtime_a.store.add("Pending A becomes visible then settlement raises", task_type="plan")
+    task_b = runtime_b.store.add("Pending B must stay globally blocked", task_type="plan")
+    assert task_a.id is not None
+    assert task_b.id is not None
+    candidate_a = ProjectDispatchCandidate(
+        runtime_key=runtime_a.key,
+        task=task_a,
+        lane="pending",
+        runtime_identity=runtime_a.runtime_identity,
+    )
+    candidate_b = ProjectDispatchCandidate(
+        runtime_key=runtime_b.key,
+        task=task_b,
+        lane="pending",
+        runtime_identity=runtime_b.runtime_identity,
+    )
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+    live_visible = threading.Event()
+    competitor_poised = threading.Event()
+    result_b: list[ProjectDispatchResult] = []
+    error_a: list[RuntimeError] = []
+
+    def fake_runtime_dispatch(
+        candidate: ProjectDispatchCandidate,
+        **_kwargs: object,
+    ) -> ProjectDispatchResult:
+        if candidate.runtime_key != runtime_a.key:
+            raise AssertionError("competing dispatch should be blocked by retained reservation")
+        running_task = runtime_a.store.get(task_a.id)
+        assert running_task is not None
+        running_task.status = "in_progress"
+        running_task.running_pid = os.getpid()
+        runtime_a.store.update(running_task)
+        _register_live_worker_for_task(runtime_a.config, task_a.id)
+        live_visible.set()
+        assert competitor_poised.wait(timeout=1)
+        raise RuntimeError("settlement failed after live visibility")
+
+    def run_first_dispatch() -> None:
+        try:
+            budget.dispatch_pending_candidate(runtime_a, candidate_a, max_iterations=1)
+        except RuntimeError as exc:
+            error_a.append(exc)
+
+    def run_competing_dispatch() -> None:
+        assert live_visible.wait(timeout=1)
+        competitor_poised.set()
+        result_b.append(budget.dispatch_pending_candidate(runtime_b, candidate_b, max_iterations=1))
+
+    with patch.object(WatchProjectRuntime, "dispatch_pending_candidate", side_effect=fake_runtime_dispatch):
+        thread_a = threading.Thread(target=run_first_dispatch)
+        thread_b = threading.Thread(target=run_competing_dispatch)
+        thread_a.start()
+        thread_b.start()
+        thread_a.join(timeout=1)
+        thread_b.join(timeout=1)
+
+    assert not thread_a.is_alive()
+    assert not thread_b.is_alive()
+    assert str(error_a[0]) == "settlement failed after live visibility"
+    assert [result.status for result in result_b] == ["global_capacity_blocked"]
+    assert budget.reservations == ()
+    assert budget.occupancy.provisional_reservations == 0
+    assert budget.occupancy.slots == 0
+
+    budget.refresh_occupancy()
+
+    assert budget.reservations == ()
+    assert budget.occupancy.slots == 0
+
+
+@pytest.mark.parametrize("later_proof", ["no_live", "terminal", "starting", "running"])
+def test_supervisor_launch_budget_retains_after_failed_refresh_then_resolves_on_later_proof(
+    tmp_path: Path,
+    later_proof: str,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    task_a = runtime_a.store.add("Pending A unresolved before failed refresh", task_type="plan")
+    task_b = runtime_b.store.add("Pending B waits for reconciliation", task_type="plan")
+    assert task_a.id is not None
+    assert task_b.id is not None
+    candidate_a = ProjectDispatchCandidate(
+        runtime_key=runtime_a.key,
+        task=task_a,
+        lane="pending",
+        runtime_identity=runtime_a.runtime_identity,
+    )
+    candidate_b = ProjectDispatchCandidate(
+        runtime_key=runtime_b.key,
+        task=task_b,
+        lane="pending",
+        runtime_identity=runtime_b.runtime_identity,
+    )
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+
+    def fake_runtime_dispatch(
+        candidate: ProjectDispatchCandidate,
+        **_kwargs: object,
+    ) -> ProjectDispatchResult:
+        raise RuntimeError("dispatch failed before refresh")
+
+    with (
+        patch.object(WatchProjectRuntime, "dispatch_pending_candidate", side_effect=fake_runtime_dispatch),
+        patch("gza.cli.watch.aggregate_watch_project_occupancy", side_effect=RuntimeError("refresh failed")),
+    ):
+        with pytest.raises(RuntimeError, match="dispatch failed before refresh"):
+            budget.dispatch_pending_candidate(runtime_a, candidate_a, max_iterations=1)
+
+    assert len(budget.reservations) == 1
+    assert budget.occupancy.provisional_reservations == 1
+    assert budget.reserve(candidate_b) is None
+
+    if later_proof == "terminal":
+        terminal_task = runtime_a.store.get(task_a.id)
+        assert terminal_task is not None
+        terminal_task.status = "failed"
+        runtime_a.store.update(terminal_task)
+    elif later_proof == "starting":
+        _register_live_worker_for_task(runtime_a.config, task_a.id)
+    elif later_proof == "running":
+        running_task = runtime_a.store.get(task_a.id)
+        assert running_task is not None
+        running_task.status = "in_progress"
+        running_task.running_pid = os.getpid()
+        runtime_a.store.update(running_task)
+        _register_live_worker_for_task(runtime_a.config, task_a.id)
+
+    budget.refresh_occupancy()
+
+    assert budget.reservations == ()
+    if later_proof in {"starting", "running"}:
+        assert budget.reserve(candidate_b) is None
+        assert budget.occupancy.slots == 0
+    else:
+        assert budget.reserve(candidate_b) is not None
+
+
 def test_watch_project_runtime_pending_dispatch_refreshes_live_proof_before_side_effects(
     tmp_path: Path,
 ) -> None:
@@ -35832,6 +36368,140 @@ def test_watch_project_runtime_pending_dispatch_releases_plain_permit_when_live_
 
     assert head_after_worker_exit is not None
     assert head_after_worker_exit.task.id == first.id
+
+
+def test_watch_project_runtime_releases_local_permit_when_exception_follows_acquire(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Pending plan raises immediately after permit", task_type="plan")
+    assert task.id is not None
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    candidate = _candidate_for_runtime_head(runtime)
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1)
+    acquired = False
+
+    def acquire_real_permit(config: Config, task_store: SqliteTaskStore) -> object:
+        nonlocal acquired
+        acquired = True
+        return launch_permit(config, task_store)
+
+    def fail_after_acquire(_task_id: str) -> bool:
+        if acquired:
+            raise RuntimeError("live proof failed after local permit")
+        return False
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.launch_permit", side_effect=acquire_real_permit),
+        patch.object(runtime, "_task_has_current_live_worker_proof", side_effect=fail_after_acquire),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+    ):
+        with pytest.raises(RuntimeError, match="live proof failed after local permit"):
+            budget.dispatch_pending_candidate(runtime, candidate, max_iterations=1)
+
+    _assert_runtime_dispatch_exception_cleanup(
+        runtime=runtime,
+        task_id=task.id,
+        budget=budget,
+    )
+
+
+def test_watch_project_runtime_releases_local_permit_when_implement_prepare_raises(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Pending implement raises during preparation", task_type="implement")
+    assert task.id is not None
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    candidate = _candidate_for_runtime_head(runtime)
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1)
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.launch_permit", side_effect=launch_permit),
+        patch(
+            "gza.cli.watch._prepare_task_for_immediate_execution",
+            side_effect=RuntimeError("prepare failed after local permit"),
+        ),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate spawned")),
+    ):
+        with pytest.raises(RuntimeError, match="prepare failed after local permit"):
+            budget.dispatch_pending_candidate(runtime, candidate, max_iterations=1)
+
+    _assert_runtime_dispatch_exception_cleanup(
+        runtime=runtime,
+        task_id=task.id,
+        budget=budget,
+    )
+
+
+def test_watch_project_runtime_releases_reserved_permit_when_iterate_spawn_wrapper_raises(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Pending implement raises after reserved permit", task_type="implement")
+    assert task.id is not None
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    candidate = _candidate_for_runtime_head(runtime)
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1)
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.launch_permit", side_effect=launch_permit),
+        patch("gza.cli.watch._prepare_task_for_immediate_execution", return_value=task),
+        patch(
+            "gza.cli.watch._spawn_worker_with_failure_log",
+            side_effect=RuntimeError("iterate spawn wrapper failed before consuming permit"),
+        ),
+        patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("iterate spawned")),
+    ):
+        with pytest.raises(RuntimeError, match="iterate spawn wrapper failed before consuming permit"):
+            budget.dispatch_pending_candidate(runtime, candidate, max_iterations=1)
+
+    _assert_runtime_dispatch_exception_cleanup(
+        runtime=runtime,
+        task_id=task.id,
+        budget=budget,
+        reserved_task_id=task.id,
+    )
+
+
+def test_watch_project_runtime_releases_local_permit_when_non_implement_spawn_wrapper_raises(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Pending plan raises in spawn wrapper", task_type="plan")
+    assert task.id is not None
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    candidate = _candidate_for_runtime_head(runtime)
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1)
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.launch_permit", side_effect=launch_permit),
+        patch(
+            "gza.cli.watch._spawn_worker_with_failure_log",
+            side_effect=RuntimeError("worker spawn wrapper failed after local permit"),
+        ),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+    ):
+        with pytest.raises(RuntimeError, match="worker spawn wrapper failed after local permit"):
+            budget.dispatch_pending_candidate(runtime, candidate, max_iterations=1)
+
+    _assert_runtime_dispatch_exception_cleanup(
+        runtime=runtime,
+        task_id=task.id,
+        budget=budget,
+    )
 
 
 def test_watch_project_runtime_live_dispatch_attempt_blocks_same_pass_after_worker_proof_expires(

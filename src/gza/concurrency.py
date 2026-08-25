@@ -53,6 +53,7 @@ class _LiveRunningState:
     anonymous_worker_count: int
     starting_worker_count: int = 0
     running_task_pid_by_task_id: dict[str, int] | None = None
+    starting_task_ids: tuple[str, ...] = ()
 
 
 class MaxConcurrentTasksError(RuntimeError):
@@ -124,6 +125,7 @@ def _collect_live_running_state_details(config: Config, store: SqliteTaskStore) 
     live_active_task_pids: set[int] = set()
     live_starting_task_pids: set[int] = set()
     live_starting_worker_ids: set[str] = set()
+    live_starting_task_ids: set[str] = set()
     live_task_pid_by_task_id: dict[str, int] = {}
     active_task_statuses = {
         str(task.id): task.status
@@ -155,6 +157,7 @@ def _collect_live_running_state_details(config: Config, store: SqliteTaskStore) 
                 if worker.pid > 0:
                     live_starting_task_pids.add(worker.pid)
                     live_starting_worker_ids.add(worker.worker_id)
+                    live_starting_task_ids.add(task_id)
                 continue
             if task_status is not None:
                 continue
@@ -187,6 +190,7 @@ def _collect_live_running_state_details(config: Config, store: SqliteTaskStore) 
         anonymous_worker_count=anonymous_worker_count,
         starting_worker_count=starting_worker_count,
         running_task_pid_by_task_id=live_task_pid_by_task_id,
+        starting_task_ids=tuple(sorted(live_starting_task_ids, key=lambda task_id: task_id_numeric_key(task_id))),
     )
 
 
