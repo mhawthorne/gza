@@ -18,6 +18,7 @@ import gza.concurrency as concurrency_module
 import gza.workers as workers_module
 from checks.unit_suite_boundary import DEFAULT_PATHS, find_unit_suite_boundary_violations
 from gza.pytest_timeout_diagnostics import positive_int_env, register_sigterm_faulthandler
+from tests.helpers.env import COLOR_FORCING_ENV_VARS
 
 # The unit suite uses two separate guards:
 # - a generous wall-clock SIGALRM hang-guard that can still interrupt a stuck
@@ -325,7 +326,7 @@ def _isolate_rich_console(monkeypatch):
     mid-test and plaintext assertions on stderr fail. We therefore also pin the
     captured systems to ``None`` so any restore keeps output plain.
     """
-    for name in ("FORCE_COLOR", "TTY_COMPATIBLE", "CLICOLOR_FORCE", "NO_COLOR"):
+    for name in COLOR_FORCING_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("COLUMNS", "200")
 

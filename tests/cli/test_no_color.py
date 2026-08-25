@@ -1,15 +1,19 @@
 """CLI color-disable integration tests."""
 
 import io
+import os
 import re
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from rich.console import Console
 
 from gza.cli import query as query_cli, watch as watch_cli
 from gza.console import build_console, set_config_no_color
 from gza.db import Task
+from tests.helpers import cli as cli_helpers
 
 from .conftest import invoke_gza, make_store, mark_orphaned, setup_config
 from .test_query import _FastUnmergedGit, _UnavailableGitHub
@@ -139,6 +143,40 @@ def test_no_color_env_disables_ansi_even_when_config_allows_color(
 
     assert returncode == 0
     assert ANSI_RE.search(output) is None, output
+
+
+def test_invoke_gza_neutralizes_ambient_force_color(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("FORCE_COLOR", "3")
+
+    def emit_styled_output() -> int:
+        Console(file=sys.stdout).print("[bold]plain under ambient FORCE_COLOR[/bold]")
+        return 0
+
+    with patch.object(cli_helpers, "cli_main", emit_styled_output):
+        result = invoke_gza("noop")
+
+    assert result.returncode == 0
+    assert ANSI_RE.search(result.stdout) is None, result.stdout
+
+
+def test_invoke_gza_preserves_explicit_force_color_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    seen_force_color: list[str | None] = []
+
+    def emit_styled_output() -> int:
+        seen_force_color.append(os.environ.get("FORCE_COLOR"))
+        Console(file=sys.stdout).print("[bold]colored under explicit FORCE_COLOR[/bold]")
+        return 0
+
+    with patch.object(cli_helpers, "cli_main", emit_styled_output):
+        result = invoke_gza("noop", env={"FORCE_COLOR": "3"})
+
+    assert result.returncode == 0
+    assert seen_force_color == ["3"]
 
 
 @pytest.fixture(autouse=True)

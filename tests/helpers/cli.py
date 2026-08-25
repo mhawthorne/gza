@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from gza.cli import main as cli_main
+from tests.helpers.env import COLOR_FORCING_ENV_VARS
 
 
 class _PatchedStdin(io.StringIO):
@@ -36,6 +37,8 @@ def invoke_gza(
     stderr = io.StringIO()
     old_cwd = Path.cwd()
     run_env = os.environ.copy()
+    for name in COLOR_FORCING_ENV_VARS:
+        run_env.pop(name, None)
     if env:
         run_env.update(env)
 
