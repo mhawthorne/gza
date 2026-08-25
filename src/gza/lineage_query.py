@@ -658,8 +658,7 @@ def _build_lineage_indexes(
         merge_units_by_task_id=merge_units_by_task_id,
         historical_merge_units_by_task_id=historical_merge_units_by_task_id,
         landed_lineage_tasks_by_root_id={
-            root_id: tuple(tasks)
-            for root_id, tasks in (landed_lineage_tasks_by_root_id or {}).items()
+            root_id: tuple(tasks) for root_id, tasks in (landed_lineage_tasks_by_root_id or {}).items()
         },
         impl_based_on_ids=store.get_impl_based_on_ids(),
         non_dropped_impl_source_ids=collect_non_dropped_implement_source_ids(tasks),
@@ -789,7 +788,9 @@ def _load_recovery_unit_indexes(store: SqliteTaskStore, query: LineageOwnerQuery
     terminal_units_by_task_id = store.list_merge_units_for_tasks(tuple(terminal_candidate_ids), active_only=True)
     for task_id in terminal_candidate_ids:
         task = tasks_by_id.get(task_id)
-        active_no_work_unit = next((unit for unit in terminal_units_by_task_id.get(task_id, ()) if unit.state in {"empty", "redundant"}), None)
+        active_no_work_unit = next(
+            (unit for unit in terminal_units_by_task_id.get(task_id, ()) if unit.state in {"empty", "redundant"}), None
+        )
         if task is not None and active_no_work_unit is not None and _task_has_executed_resumable_session(task):
             seed_ids.add(task_id)
         else:
@@ -817,12 +818,12 @@ def _load_recovery_unit_indexes(store: SqliteTaskStore, query: LineageOwnerQuery
 
     resolution_frontier = set(seed_ids)
     failed_seed_ids = {
-        task_id
-        for task_id in seed_ids
-        if (task := tasks_by_id.get(task_id)) is not None and task.status == "failed"
+        task_id for task_id in seed_ids if (task := tasks_by_id.get(task_id)) is not None and task.status == "failed"
     }
     if failed_seed_ids:
-        resolution_frontier.update(add_tasks(store.get_recovery_or_same_slice_sibling_candidates_for_failed_tasks(failed_seed_ids)))
+        resolution_frontier.update(
+            add_tasks(store.get_recovery_or_same_slice_sibling_candidates_for_failed_tasks(failed_seed_ids))
+        )
 
     frontier = {task_id for task_id in resolution_frontier if task_id in tasks_by_id}
     seen_child_frontier: set[str] = set()
@@ -1400,7 +1401,14 @@ def collect_stale_unmerged_sweep_candidates(
     live_owner_ids = _collect_live_owner_ids_for_stale_dependency_links(store, indexes=indexes)
     candidates: list[StaleUnmergedSweepCandidate] = []
 
-    for owner_id, owner, owner_members, _root, _owner_matches_owner_filter in _candidate_owner_rows(
+    for (
+        owner_id,
+        owner,
+        owner_members,
+        _root,
+        _owner_matches_owner_filter,
+        _selected_via_skipped_member,
+    ) in _candidate_owner_rows(
         indexes,
         LineageOwnerQuery(limit=None, exclude_dropped_from_planning=True),
         owner_ids_filter=None,
@@ -1479,8 +1487,8 @@ def _candidate_owner_rows(
     *,
     owner_ids_filter: set[str] | None,
     task_ids_filter: set[str] | None,
-) -> tuple[tuple[str, DbTask, tuple[DbTask, ...], DbTask, bool], ...]:
-    candidates: list[tuple[str, DbTask, tuple[DbTask, ...], DbTask, bool]] = []
+) -> tuple[tuple[str, DbTask, tuple[DbTask, ...], DbTask, bool, bool], ...]:
+    candidates: list[tuple[str, DbTask, tuple[DbTask, ...], DbTask, bool, bool]] = []
     for owner_id, owner_members in indexes.members_by_owner_id.items():
         owner = indexes.task_by_id.get(owner_id)
         if owner is None:
@@ -1506,8 +1514,9 @@ def _candidate_owner_rows(
                 for task in owner_members
                 if task.id is not None
             )
+            skipped_member_matches_task_filter = False
             if not member_matches_task_filter:
-                member_matches_task_filter = any(
+                skipped_member_matches_task_filter = any(
                     task.id in task_ids_filter
                     and not (
                         query.exclude_dropped_from_planning
@@ -1520,7 +1529,11 @@ def _candidate_owner_rows(
                     for task in indexes.skipped_same_branch_members_by_root_id.get(owner_id, ())
                     if task.id is not None
                 )
+                member_matches_task_filter = skipped_member_matches_task_filter
+        else:
+            skipped_member_matches_task_filter = False
         owner_matches_owner_filter = owner_ids_filter is not None and owner_id in owner_ids_filter
+        owner_scope_matches_all_members = owner_matches_owner_filter
         use_union_filter = query.selector_filter_mode == "union"
         if owner_ids_filter is not None and task_ids_filter is None and not owner_matches_owner_filter:
             continue
@@ -1538,31 +1551,25 @@ def _candidate_owner_rows(
         root = indexes.root_by_task_id.get(owner.id or "", owner)
         if _is_broken_same_branch_owner(owner=owner, root=root):
             continue
-        candidates.append((owner_id, owner, tuple(owner_members), root, owner_matches_owner_filter))
+        candidates.append(
+            (
+                owner_id,
+                owner,
+                tuple(owner_members),
+                root,
+                owner_scope_matches_all_members,
+                skipped_member_matches_task_filter,
+            )
+        )
     return tuple(candidates)
 
 
-def _build_tag_recovery_scope(
+def _expand_recovery_scope_from_seed_ids(
     indexes: _LineageIndexes,
-    query: LineageOwnerQuery,
-    *,
-    tag_matcher,
+    seed_task_ids: set[str],
 ) -> frozenset[str] | None:
-    if query.tags is None and query.exclude_tags is None:
-        return None
-
-    def _matches_tag_scope(task: DbTask) -> bool:
-        if query.tags is not None and not tag_matcher(
-            task_tags=task.tags, tag_filters=query.tags, any_tag=query.any_tag
-        ):
-            return False
-        if query.exclude_tags is not None and tag_matcher(
-            task_tags=task.tags,
-            tag_filters=query.exclude_tags,
-            any_tag=query.any_tag,
-        ):
-            return False
-        return True
+    if not seed_task_ids:
+        return frozenset()
 
     scoped_task_ids: set[str] = set()
     queue: deque[str] = deque()
@@ -1573,9 +1580,8 @@ def _build_tag_recovery_scope(
         scoped_task_ids.add(task.id)
         queue.append(task.id)
 
-    for task in indexes.tasks:
-        if _matches_tag_scope(task):
-            _add_task(task)
+    for task_id in seed_task_ids:
+        _add_task(indexes.task_by_id.get(task_id))
 
     while queue:
         task_id = queue.popleft()
@@ -1600,6 +1606,123 @@ def _build_tag_recovery_scope(
             _add_task(child)
 
     return frozenset(scoped_task_ids)
+
+
+def _build_task_id_recovery_scope(
+    indexes: _LineageIndexes,
+    seed_task_ids: set[str],
+) -> frozenset[str]:
+    """Return recovery candidates belonging to explicitly selected owner lineages.
+
+    Task-id selectors must not broaden through ordinary dependency-ordering edges.
+    Same-branch implement slice attachment is represented in the owner/member indexes,
+    so owner membership is the only depends_on-derived relationship admitted here.
+    """
+    if not seed_task_ids:
+        return frozenset()
+
+    scoped_task_ids: set[str] = set()
+    selected_owner_ids: set[str] = set()
+    queue: deque[str] = deque()
+
+    def _add_task(task: DbTask | None) -> None:
+        if task is None or task.id is None or task.id in scoped_task_ids:
+            return
+        scoped_task_ids.add(task.id)
+        queue.append(task.id)
+
+    def _add_owner_lineage(owner: DbTask | None) -> None:
+        if owner is None or owner.id is None or owner.id in selected_owner_ids:
+            return
+        selected_owner_ids.add(owner.id)
+        _add_task(owner)
+        for member in indexes.members_by_owner_id.get(owner.id, ()):
+            _add_task(member)
+        for member in indexes.skipped_same_branch_members_by_root_id.get(owner.id, ()):
+            _add_task(member)
+
+    skipped_member_root_owner_by_task_id: dict[str, DbTask] = {}
+    for root_id, skipped_members in indexes.skipped_same_branch_members_by_root_id.items():
+        root_owner = indexes.task_by_id.get(root_id)
+        if root_owner is None:
+            continue
+        for skipped_member in skipped_members:
+            if skipped_member.id is not None:
+                skipped_member_root_owner_by_task_id[skipped_member.id] = root_owner
+
+    for task_id in seed_task_ids:
+        seed = indexes.task_by_id.get(task_id)
+        if seed is None:
+            continue
+        _add_task(seed)
+        _add_owner_lineage(indexes.owner_by_task_id.get(task_id))
+        _add_owner_lineage(skipped_member_root_owner_by_task_id.get(task_id))
+
+    while queue:
+        task_id = queue.popleft()
+        current_task = indexes.task_by_id.get(task_id)
+        if current_task is None:
+            continue
+
+        if current_task.based_on is not None:
+            parent = indexes.task_by_id.get(current_task.based_on)
+            parent_owner = indexes.owner_by_task_id.get(current_task.based_on)
+            if parent_owner is not None and parent_owner.id in selected_owner_ids:
+                _add_task(parent)
+
+        for child in indexes.based_on_children.get(task_id, ()):
+            if child.id is None:
+                continue
+            child_owner = indexes.owner_by_task_id.get(child.id)
+            if child_owner is not None and child_owner.id in selected_owner_ids:
+                _add_task(child)
+
+    return frozenset(scoped_task_ids)
+
+
+def _build_tag_recovery_scope(
+    indexes: _LineageIndexes,
+    query: LineageOwnerQuery,
+    *,
+    tag_matcher,
+) -> frozenset[str] | None:
+    if query.tags is None and query.exclude_tags is None:
+        return None
+
+    def _matches_tag_scope(task: DbTask) -> bool:
+        if query.tags is not None and not tag_matcher(
+            task_tags=task.tags, tag_filters=query.tags, any_tag=query.any_tag
+        ):
+            return False
+        if query.exclude_tags is not None and tag_matcher(
+            task_tags=task.tags,
+            tag_filters=query.exclude_tags,
+            any_tag=query.any_tag,
+        ):
+            return False
+        return True
+
+    seed_task_ids: set[str] = set()
+    for task in indexes.tasks:
+        if task.id is not None and _matches_tag_scope(task):
+            seed_task_ids.add(task.id)
+
+    return _expand_recovery_scope_from_seed_ids(indexes, seed_task_ids)
+
+
+def _build_recovery_scope(
+    indexes: _LineageIndexes,
+    query: LineageOwnerQuery,
+    *,
+    tag_matcher,
+) -> frozenset[str] | None:
+    tag_scope = _build_tag_recovery_scope(indexes, query, tag_matcher=tag_matcher)
+    task_scope = _build_task_id_recovery_scope(indexes, set(query.task_ids)) if query.task_ids is not None else None
+    if tag_scope is None:
+        return task_scope
+    if task_scope is None:
+        return tag_scope
+    return tag_scope & task_scope
 
 
 def query_lineage_owner_rows(
@@ -1717,7 +1840,7 @@ def _query_lineage_owner_rows_with_context(
         historical_merge_units_by_task_id=indexes.historical_merge_units_by_task_id,
         landed_lineage_tasks_by_root_id=indexes.landed_lineage_tasks_by_root_id,
         allow_reconcile_mutation=store._read_session_depth == 0,
-        recovery_scope_task_ids=_build_tag_recovery_scope(
+        recovery_scope_task_ids=_build_recovery_scope(
             indexes,
             query,
             tag_matcher=task_matches_tag_filters,
@@ -1758,7 +1881,14 @@ def _query_lineage_owner_rows_with_context(
             git,
             branch_names=(
                 task.branch
-                for _owner_id, _owner, owner_members, _root, _owner_matches_owner_filter in candidate_owner_rows
+                for (
+                    _owner_id,
+                    _owner,
+                    owner_members,
+                    _root,
+                    _owner_matches_owner_filter,
+                    _selected_via_skipped_member,
+                ) in candidate_owner_rows
                 for task in owner_members
                 if task.branch
             ),
@@ -1872,7 +2002,14 @@ def _query_lineage_owner_rows_with_context(
                 )
             )
 
-        for owner_id, owner, owner_members, root, owner_matches_owner_filter in candidate_owner_rows:
+        for (
+            owner_id,
+            owner,
+            owner_members,
+            root,
+            owner_matches_owner_filter,
+            selected_via_skipped_member,
+        ) in candidate_owner_rows:
             merge_units_by_member = {
                 task.id: indexes.merge_units_by_task_id[task.id]
                 for task in owner_members
@@ -1926,9 +2063,14 @@ def _query_lineage_owner_rows_with_context(
                 ):
                     continue
                 merge_unit = merge_units_by_member.get(task.id)
+                task_filter_query = (
+                    replace(query, task_ids=None)
+                    if selected_via_skipped_member and query.task_ids is not None and task.status == "failed"
+                    else query
+                )
                 matches = owner_scope_matches_all_members or _matches_task_filters(
                     task,
-                    query,
+                    task_filter_query,
                     tag_matcher=task_matches_tag_filters,
                     include_tag_filters=False,
                     merge_unit=merge_unit,

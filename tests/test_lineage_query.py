@@ -407,8 +407,7 @@ def test_failed_leaf_recorded_head_bad_source_ref_still_warns_and_uses_fallback(
     assert git.ancestor_probes == [("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "refs/heads/feature/failed-leaf")]
     assert git.patch_present_probes == [("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "main")]
     assert any(
-        record.levelname == "WARNING" and "Could not verify whether" in record.getMessage()
-        for record in caplog.records
+        record.levelname == "WARNING" and "Could not verify whether" in record.getMessage() for record in caplog.records
     )
 
 
@@ -5958,6 +5957,363 @@ def test_query_lineage_owner_rows_short_circuits_attached_member_when_owner_unit
     assert attached_failed.id not in store_calls
 
 
+def test_query_lineage_owner_rows_task_id_scope_classifies_only_target_lineage_failed_tasks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    shared_plan = store.add("Shared plan", task_type="plan")
+    assert shared_plan.id is not None
+    shared_plan.status = "completed"
+    shared_plan.completed_at = datetime(2026, 8, 25, 8, 0, tzinfo=UTC)
+    store.update(shared_plan)
+
+    owner = store.add("Selected owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime(2026, 8, 25, 9, 0, tzinfo=UTC)
+    owner.branch = "feature/selected-owner"
+    owner.has_commits = True
+    owner.merge_status = "unmerged"
+    owner.depends_on = shared_plan.id
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    selected_failed_ids: list[str] = []
+    for prompt in ("Selected failed review", "Selected failed improve"):
+        failed = store.add(prompt, task_type="review", based_on=owner.id, depends_on=owner.id)
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.completed_at = datetime(2026, 8, 25, 9, len(selected_failed_ids) + 1, tzinfo=UTC)
+        store.update(failed)
+        store.attach_task_to_merge_unit(failed.id, owner_unit.id, "review")
+        selected_failed_ids.append(failed.id)
+
+    shared_plan_sibling = store.add("Shared-plan failed sibling", task_type="implement")
+    assert shared_plan_sibling.id is not None
+    shared_plan_sibling.status = "failed"
+    shared_plan_sibling.failure_reason = "INFRASTRUCTURE_ERROR"
+    shared_plan_sibling.completed_at = datetime(2026, 8, 25, 10, 0, tzinfo=UTC)
+    shared_plan_sibling.branch = "feature/shared-plan-sibling"
+    shared_plan_sibling.depends_on = shared_plan.id
+    store.update(shared_plan_sibling)
+    shared_plan_sibling_unit = store.create_merge_unit(
+        source_branch=shared_plan_sibling.branch,
+        target_branch="main",
+        owner_task_id=shared_plan_sibling.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(shared_plan_sibling.id, shared_plan_sibling_unit.id, "owner")
+
+    downstream_dependent = store.add("Failed downstream dependent", task_type="implement")
+    assert downstream_dependent.id is not None
+    downstream_dependent.status = "failed"
+    downstream_dependent.failure_reason = "INFRASTRUCTURE_ERROR"
+    downstream_dependent.completed_at = datetime(2026, 8, 25, 10, 1, tzinfo=UTC)
+    downstream_dependent.branch = "feature/downstream-dependent"
+    downstream_dependent.depends_on = owner.id
+    store.update(downstream_dependent)
+    downstream_dependent_unit = store.create_merge_unit(
+        source_branch=downstream_dependent.branch,
+        target_branch="main",
+        owner_task_id=downstream_dependent.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(downstream_dependent.id, downstream_dependent_unit.id, "owner")
+
+    chain_resolved_calls: list[str] = []
+    inactive_merge_unit_calls: list[str] = []
+    merged_target_calls: list[str] = []
+
+    def _record_chain_resolved(store_arg, task, *, read_context=None):
+        assert task.id is not None
+        chain_resolved_calls.append(task.id)
+        return False
+
+    def _record_inactive_merge_unit(store_arg, task, *, read_context=None):
+        assert task.id is not None
+        inactive_merge_unit_calls.append(task.id)
+        return False
+
+    def _record_merged_target(store_arg, task, *, merge_context, read_context=None):
+        assert task.id is not None
+        merged_target_calls.append(task.id)
+        return False
+
+    monkeypatch.setattr(recovery_engine, "is_chain_resolved_by_recovery", _record_chain_resolved)
+    monkeypatch.setattr(
+        recovery_engine,
+        "is_recovery_suppressed_by_inactive_merge_unit",
+        _record_inactive_merge_unit,
+    )
+    monkeypatch.setattr(recovery_engine, "is_resolved_by_merged_target", _record_merged_target)
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            exclude_dropped_from_planning=True,
+            max_recovery_attempts=1,
+            task_ids=(owner.id,),
+        ),
+        config=Config.load(tmp_path),
+        target_branch="main",
+    )
+
+    assert rows
+    assert set(chain_resolved_calls) == set(selected_failed_ids)
+    assert set(inactive_merge_unit_calls) == set(selected_failed_ids)
+    assert set(merged_target_calls) == set(selected_failed_ids)
+    assert len(chain_resolved_calls) == len(selected_failed_ids)
+    assert len(inactive_merge_unit_calls) == len(selected_failed_ids)
+    assert len(merged_target_calls) == len(selected_failed_ids)
+    external_failed_ids = {shared_plan_sibling.id, downstream_dependent.id}
+    assert not (external_failed_ids & set(chain_resolved_calls))
+    assert not (external_failed_ids & set(inactive_merge_unit_calls))
+    assert not (external_failed_ids & set(merged_target_calls))
+
+
+@pytest.mark.parametrize("use_matching_tag", (False, True))
+def test_query_lineage_owner_rows_orphan_task_id_scope_classifies_canonical_root_failed_members(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    use_matching_tag: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    tag = "selected-lineage"
+
+    owner = store.add(
+        "Implementation root",
+        task_type="implement",
+        tags=(tag,) if use_matching_tag else (),
+    )
+    assert owner.id is not None
+    owner.status = "in_progress"
+    owner.branch = "feature/canonical-orphan-owner"
+    owner.has_commits = True
+    store.update(owner)
+
+    selected_failed_ids: list[str] = []
+    for prompt, task_type in (
+        ("Failed root review", "review"),
+        ("Failed root improve", "improve"),
+    ):
+        failed = store.add(prompt, task_type=task_type, based_on=owner.id, depends_on=owner.id)
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "INFRASTRUCTURE_ERROR"
+        failed.completed_at = datetime(2026, 8, 25, 9, len(selected_failed_ids), tzinfo=UTC)
+        store.update(failed)
+        selected_failed_ids.append(failed.id)
+
+    orphan = store.add(
+        "Completed orphan rebase",
+        task_type="rebase",
+        based_on=owner.id,
+        same_branch=True,
+    )
+    assert orphan.id is not None
+    _set_completed(
+        orphan,
+        when=datetime(2026, 8, 25, 10, 0, tzinfo=UTC),
+        branch="feature/orphan-rebase",
+        has_commits=True,
+    )
+    orphan.merge_status = "unmerged"
+    if use_matching_tag:
+        orphan.tags = (tag,)
+    store.update(orphan)
+    orphan_unit = store.create_merge_unit(
+        source_branch=orphan.branch,
+        target_branch="main",
+        owner_task_id=orphan.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(orphan.id, orphan_unit.id, "owner")
+
+    unrelated_failed = store.add("Unrelated failed implementation", task_type="implement")
+    assert unrelated_failed.id is not None
+    unrelated_failed.status = "failed"
+    unrelated_failed.failure_reason = "INFRASTRUCTURE_ERROR"
+    unrelated_failed.completed_at = datetime(2026, 8, 25, 11, 0, tzinfo=UTC)
+    store.update(unrelated_failed)
+
+    downstream_dependent = store.add("Failed downstream dependent", task_type="implement")
+    assert downstream_dependent.id is not None
+    downstream_dependent.status = "failed"
+    downstream_dependent.failure_reason = "INFRASTRUCTURE_ERROR"
+    downstream_dependent.completed_at = datetime(2026, 8, 25, 11, 1, tzinfo=UTC)
+    downstream_dependent.depends_on = owner.id
+    store.update(downstream_dependent)
+
+    query_kwargs = {"tags": (tag,)} if use_matching_tag else {}
+    git = MagicMock()
+    git.branch_exists.return_value = True
+    git.can_merge.return_value = True
+
+    global_rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            max_recovery_attempts=1,
+            **query_kwargs,
+        ),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+    baseline_row = next(row for row in global_rows if row.owner_task.id == owner.id)
+    assert baseline_row.recovery_action_task is not None
+    assert baseline_row.recovery_action_task.id in selected_failed_ids
+
+    chain_resolved_calls: list[str] = []
+    inactive_merge_unit_calls: list[str] = []
+    merged_target_calls: list[str] = []
+
+    def _record_chain_resolved(store_arg, task, *, read_context=None):
+        assert task.id is not None
+        chain_resolved_calls.append(task.id)
+        return False
+
+    def _record_inactive_merge_unit(store_arg, task, *, read_context=None):
+        assert task.id is not None
+        inactive_merge_unit_calls.append(task.id)
+        return False
+
+    def _record_merged_target(store_arg, task, *, merge_context, read_context=None):
+        assert task.id is not None
+        merged_target_calls.append(task.id)
+        return False
+
+    monkeypatch.setattr(recovery_engine, "is_chain_resolved_by_recovery", _record_chain_resolved)
+    monkeypatch.setattr(
+        recovery_engine,
+        "is_recovery_suppressed_by_inactive_merge_unit",
+        _record_inactive_merge_unit,
+    )
+    monkeypatch.setattr(recovery_engine, "is_resolved_by_merged_target", _record_merged_target)
+
+    explicit_rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            max_recovery_attempts=1,
+            task_ids=(orphan.id,),
+            **query_kwargs,
+        ),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(explicit_rows) == 1
+    explicit_row = explicit_rows[0]
+    assert explicit_row.owner_task.id == owner.id
+    assert explicit_row.next_action == baseline_row.next_action
+    assert explicit_row.recovery_action_task is not None
+    assert explicit_row.recovery_action_task.id == baseline_row.recovery_action_task.id
+    assert set(chain_resolved_calls) == set(selected_failed_ids)
+    assert set(inactive_merge_unit_calls) == set(selected_failed_ids)
+    assert set(merged_target_calls) == set(selected_failed_ids)
+    external_failed_ids = {unrelated_failed.id, downstream_dependent.id}
+    assert not (external_failed_ids & set(chain_resolved_calls))
+    assert not (external_failed_ids & set(inactive_merge_unit_calls))
+    assert not (external_failed_ids & set(merged_target_calls))
+
+
+def test_query_lineage_owner_rows_skipped_task_id_scope_honors_task_type_for_failed_members(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    owner = store.add("Implementation root", task_type="implement")
+    assert owner.id is not None
+    owner.status = "in_progress"
+    owner.branch = "feature/skipped-member-type-filter"
+    owner.has_commits = True
+    store.update(owner)
+
+    failed_review = store.add("Failed root review", task_type="review", based_on=owner.id, depends_on=owner.id)
+    assert failed_review.id is not None
+    failed_review.status = "failed"
+    failed_review.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_review.completed_at = datetime(2026, 8, 25, 9, 0, tzinfo=UTC)
+    store.update(failed_review)
+
+    failed_impl = store.add("Failed implementation retry", task_type="implement", based_on=owner.id, same_branch=True)
+    assert failed_impl.id is not None
+    failed_impl.status = "failed"
+    failed_impl.failure_reason = "INFRASTRUCTURE_ERROR"
+    failed_impl.completed_at = datetime(2026, 8, 25, 9, 1, tzinfo=UTC)
+    store.update(failed_impl)
+
+    orphan = store.add(
+        "Completed orphan rebase",
+        task_type="rebase",
+        based_on=owner.id,
+        same_branch=True,
+    )
+    assert orphan.id is not None
+    _set_completed(
+        orphan,
+        when=datetime(2026, 8, 25, 10, 0, tzinfo=UTC),
+        branch="feature/skipped-orphan",
+        has_commits=True,
+    )
+    orphan.merge_status = "unmerged"
+    store.update(orphan)
+    orphan_unit = store.create_merge_unit(
+        source_branch=orphan.branch,
+        target_branch="main",
+        owner_task_id=orphan.id,
+        state="unmerged",
+    )
+    store.attach_task_to_merge_unit(orphan.id, orphan_unit.id, "owner")
+
+    git = MagicMock()
+    git.branch_exists.return_value = True
+    git.can_merge.return_value = True
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(
+            limit=None,
+            include_skipped=True,
+            max_recovery_attempts=1,
+            task_ids=(orphan.id,),
+            task_types=("implement",),
+        ),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.owner_task.id == owner.id
+    assert row.recovery_action_task is not None
+    assert row.recovery_action_task.id == failed_impl.id
+    assert row.lifecycle_action_task is None
+    assert {task.id for task in row.unresolved_tasks if task.id is not None} == {failed_impl.id}
+    assert failed_review.id not in {summary.task_id for summary in row.unresolved_leaf_summary}
+
+
 def test_query_lineage_owner_rows_seeded_git_drives_same_suppression_as_non_seeded(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -6343,9 +6699,10 @@ def test_query_lineage_owner_rows_sanitizes_current_malformed_main_verify_legacy
     assert row.owner_task.id == main_verify_task.id
     assert row.next_action is not None
     assert row.next_action["needs_attention_reason"] == "main-integration-verify-red"
-    assert "main verify evidence unknown for current HEAD; invalid verify status evidence" in row.next_action[
-        "description"
-    ]
+    assert (
+        "main verify evidence unknown for current HEAD; invalid verify status evidence"
+        in row.next_action["description"]
+    )
     assert "abc123" not in row.next_action["description"]
     assert "RED" not in row.next_action["description"]
     assert "merges halted" not in row.next_action["description"]
@@ -7207,9 +7564,10 @@ def test_query_lineage_owner_rows_renders_current_unknown_main_verify_status_as_
     row = rows[0]
     assert row.owner_task.id == main_verify_task.id
     assert row.next_action is not None
-    assert "main verify evidence unknown for current HEAD; unrecognized verify status `mystery`" in row.next_action[
-        "description"
-    ]
+    assert (
+        "main verify evidence unknown for current HEAD; unrecognized verify status `mystery`"
+        in row.next_action["description"]
+    )
     assert "abc123" not in row.next_action["description"]
     assert "main verify RED" not in row.next_action["description"]
     assert "merges halted" not in row.next_action["description"]
@@ -7288,10 +7646,7 @@ def test_query_lineage_owner_rows_suppresses_incompatible_legacy_main_verify_att
     [
         (
             MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
-            (
-                "main verify freshness unproven at `abc123` - merges halted; "
-                "exact tree fingerprint unavailable"
-            ),
+            ("main verify freshness unproven at `abc123` - merges halted; exact tree fingerprint unavailable"),
         ),
         (
             MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
@@ -7391,8 +7746,7 @@ def test_query_lineage_owner_rows_surfaces_canonical_launch_failure_concisely(
     main_verify_task.review_verify_status = "unavailable"
     main_verify_task.review_verify_exit_status = MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS
     main_verify_task.review_verify_failure = (
-        "verify_command environment error: could not launch `ruff` "
-        "for phase `ruff` (not on PATH)"
+        "verify_command environment error: could not launch `ruff` for phase `ruff` (not on PATH)"
     )
     main_verify_task.review_verify_head_sha = "abc123"
     main_verify_task.output_content = json.dumps(
@@ -7447,8 +7801,7 @@ def test_query_lineage_owner_rows_surfaces_canonical_launch_failure_concisely(
     assert loaded_state is not None
     assert main_verify_state_halts_merges(loaded_state) is False
     assert not any(
-        task.trigger_source == MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE
-        for task in store.get_all()
+        task.trigger_source == MAIN_INTEGRATION_VERIFY_REMEDIATION_TRIGGER_SOURCE for task in store.get_all()
     )
 
 
@@ -7570,9 +7923,10 @@ def test_query_lineage_owner_rows_rejects_legacy_exhaustion_for_invalid_non_stri
     row = rows[0]
     assert row.owner_task.id == "gza-main"
     assert row.next_action is not None
-    assert "main verify evidence unknown for current HEAD; invalid verify status evidence" in row.next_action[
-        "description"
-    ]
+    assert (
+        "main verify evidence unknown for current HEAD; invalid verify status evidence"
+        in row.next_action["description"]
+    )
     assert "abc123" not in row.next_action["description"]
     assert "RED" not in row.next_action["description"]
     assert "merges halted" not in row.next_action["description"]
