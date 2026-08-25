@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import inspect
 from dataclasses import dataclass
+import operator
 
 import pytest
 
@@ -16,11 +16,33 @@ class SyntheticCandidate:
 
 
 class PoisonCandidate:
-    @property
-    def queue_position(self) -> int:
-        raise AssertionError("cross-project strategy must not inspect queue_position")
+    __slots__ = ()
+
+    def __getattribute__(self, name: str) -> object:
+        raise AssertionError(f"cross-project strategy must not inspect candidate attribute {name!r}")
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AssertionError(f"cross-project strategy must not mutate candidate attribute {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        raise AssertionError(f"cross-project strategy must not delete candidate attribute {name!r}")
 
     def __lt__(self, other: object) -> bool:
+        raise AssertionError("cross-project strategy must not compare candidates")
+
+    def __le__(self, other: object) -> bool:
+        raise AssertionError("cross-project strategy must not compare candidates")
+
+    def __eq__(self, other: object) -> bool:
+        raise AssertionError("cross-project strategy must not compare candidates")
+
+    def __ne__(self, other: object) -> bool:
+        raise AssertionError("cross-project strategy must not compare candidates")
+
+    def __gt__(self, other: object) -> bool:
+        raise AssertionError("cross-project strategy must not compare candidates")
+
+    def __ge__(self, other: object) -> bool:
         raise AssertionError("cross-project strategy must not compare candidates")
 
 
@@ -333,15 +355,31 @@ def test_project_priority_strictly_starves_later_projects_while_first_project_re
 
 
 def test_strategies_do_not_inspect_or_compare_cross_project_candidate_positions() -> None:
-    source = inspect.getsource(watch_strategies)
-    assert "queue_position" not in source
-
     for strategy_name in ("round-robin", "weighted-round-robin", "project-priority"):
         strategy = create_watch_dispatch_strategy(
             strategy_name,
             project_order=("later", "earlier"),
             weights={"later": 1, "earlier": 1} if strategy_name == "weighted-round-robin" else None,
         )
-        choice = strategy.select_next({"earlier": PoisonCandidate(), "later": PoisonCandidate()})
+        candidates = {"earlier": PoisonCandidate(), "later": PoisonCandidate()}
+        choice = strategy.select_next(candidates)
         assert choice is not None
         assert choice.project_key == "later"
+        assert choice.candidate is candidates["later"]
+
+
+def test_poison_candidate_rejects_inspection_mutation_and_comparison_escape_paths() -> None:
+    candidate = PoisonCandidate()
+
+    with pytest.raises(AssertionError, match="inspect candidate attribute '__class__'"):
+        candidate.__class__
+    with pytest.raises(AssertionError, match="inspect candidate attribute '__dict__'"):
+        candidate.__dict__
+    with pytest.raises(AssertionError, match="mutate candidate attribute 'queue_position'"):
+        candidate.queue_position = 1
+    with pytest.raises(AssertionError, match="delete candidate attribute 'queue_position'"):
+        del candidate.queue_position
+
+    for compare in (operator.lt, operator.le, operator.eq, operator.ne, operator.gt, operator.ge):
+        with pytest.raises(AssertionError, match="compare candidates"):
+            compare(candidate, PoisonCandidate())
