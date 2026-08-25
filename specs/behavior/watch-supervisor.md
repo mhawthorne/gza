@@ -687,6 +687,24 @@ state to win over already-mergeable fresh code.
   evaluated cycle.
 - `watch.max_idle` / `--max-idle` bound consecutive idle supervisor time. When reached,
   watch MUST exit cleanly rather than spin forever doing no work.
+- During watch-supervised phases that can exceed `watch.long_phase_threshold_seconds`,
+  watch MUST emit operator-visible long-phase progress. The phase MUST emit a `START`
+  line before silence begins and then `BUSY` heartbeats every
+  `watch.heartbeat_interval_seconds` while still in flight. Each heartbeat MUST identify
+  the phase and task or merge-unit subject, report elapsed wall time, and include real
+  child-process liveness evidence such as CPU delta or captured output advancement. If
+  supported liveness evidence was sampled and has not advanced since the previous
+  heartbeat, the heartbeat MUST say `NO PROGRESS` explicitly. Unsupported evidence MUST
+  be rendered distinctly, such as `cpu unavailable`, and MUST NOT be treated as observed
+  flat progress. This heartbeat stream is separate from the restart-safe watch-progress
+  backstop state.
+- Background workers are long phases even when watch is sleeping between cycles. Watch
+  MUST track each live registered worker independently across sleep intervals, including
+  workers that were already running when watch started. Worker heartbeat subjects MUST
+  preserve the task-to-phase mapping, using `rebase <task-id>` for rebase workers and
+  `agent:execution <task-id>` for other task workers, with elapsed time derived from the
+  durable task or worker start timestamp. Short `watch.poll` values MUST NOT suppress a
+  due worker heartbeat.
 - `watch.max_iterations` / `--max-iterations` are **not** a supervisor loop bound. They
   bound iterate workers launched for detached iterate chains. Watch MUST pass that budget
   to those workers, whether the chain is driving implementation review/improve work or

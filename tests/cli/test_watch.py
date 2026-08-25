@@ -10,6 +10,7 @@ import platform
 import re
 import signal
 import sqlite3
+import subprocess
 import sys
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -97,6 +98,7 @@ from gza.cli.watch import (
     _main_verify_remediation_attempts_from_prompt,
     _main_verify_remediation_prompt,
     _MainVerifyRemediationIdentity,
+    _make_watch_lifecycle_heartbeat_factory,
     _maybe_file_main_verify_remediation,
     _maybe_finalize_watch_no_progress_for_background_action,
     _maybe_park_watch_no_progress,
@@ -123,6 +125,8 @@ from gza.cli.watch import (
     _WatchCycleAnalysis,
     _WatchCyclePlan,
     _WatchLog,
+    _WatchLongPhaseReporter,
+    _WatchWorkerHeartbeatMonitor,
     allocate_watch_slots,
     cmd_main_verify,
     cmd_watch,
@@ -190,7 +194,7 @@ from gza.review_scope import (
 )
 from gza.review_verdict import ParsedReviewReport
 from gza.review_verify_state import VERIFY_GATE_ARTIFACT_KIND, persist_verify_gate_artifact
-from gza.runner import _make_review_verify_result
+from gza.runner import LongPhaseProgress, _make_review_verify_result, _read_darwin_process_tree_cpu_seconds
 from gza.runtime_context import RuntimeExecutionContext
 from gza.unstick import VERIFY_FIX_FAILED_REASON, select_and_clear_parked_tasks
 from gza.watch_leases import (
@@ -2555,6 +2559,834 @@ def test_watch_cycle_surfaces_manual_review_creation_as_attention(tmp_path: Path
     assert "reason=review-needs-manual-creation" in attention_lines[0]
     assert "run gza review manually" in attention_lines[0]
     assert not any("SKIP: no review exists and advance_create_reviews=false" in line for line in lines)
+
+
+def test_watch_long_phase_reporter_emits_start_busy_and_no_progress(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    reporter = _WatchLongPhaseReporter(log=log, threshold_seconds=60, interval_seconds=60)
+
+    heartbeat = reporter.start("verify:unit", "gza-9026")
+    heartbeat(
+        LongPhaseProgress(
+            elapsed_seconds=60,
+            cpu_delta_seconds=58,
+            output_bytes_delta=4096,
+            output_lines_delta=412,
+            no_progress=False,
+        )
+    )
+    heartbeat(
+        LongPhaseProgress(
+            elapsed_seconds=120,
+            cpu_delta_seconds=0,
+            output_bytes_delta=0,
+            output_lines_delta=0,
+            no_progress=True,
+        )
+    )
+
+    log_text = log_path.read_text()
+    assert "START" in log_text
+    assert "verify:unit gza-9026" in log_text
+    assert "BUSY" in log_text
+    assert "elapsed 1m00s cpu +58s out +412 lines" in log_text
+    assert "elapsed 2m00s cpu +0s out +0 bytes (NO PROGRESS)" in log_text
+
+
+def test_watch_long_phase_reporter_renders_subsecond_cpu_progress(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    reporter = _WatchLongPhaseReporter(log=log, threshold_seconds=1, interval_seconds=1)
+    heartbeat = reporter.start("verify:unit", "gza-9026")
+
+    heartbeat(
+        LongPhaseProgress(
+            elapsed_seconds=1,
+            cpu_delta_seconds=0.5,
+            output_bytes_delta=0,
+            output_lines_delta=0,
+            no_progress=False,
+        )
+    )
+    heartbeat(
+        LongPhaseProgress(
+            elapsed_seconds=2,
+            cpu_delta_seconds=0.0,
+            output_bytes_delta=0,
+            output_lines_delta=0,
+            no_progress=True,
+        )
+    )
+
+    log_text = log_path.read_text()
+    assert "elapsed 1s cpu +0.5s out +0 bytes" in log_text
+    assert "elapsed 1s cpu +0.5s out +0 bytes (NO PROGRESS)" not in log_text
+    assert "elapsed 2s cpu +0s out +0 bytes (NO PROGRESS)" in log_text
+
+
+def test_watch_long_phase_reporter_renders_cpu_unavailable_without_no_progress(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    reporter = _WatchLongPhaseReporter(log=log, threshold_seconds=1, interval_seconds=1)
+    heartbeat = reporter.start("verify:unit", "gza-9026")
+
+    heartbeat(
+        LongPhaseProgress(
+            elapsed_seconds=1,
+            cpu_delta_seconds=None,
+            output_bytes_delta=0,
+            output_lines_delta=0,
+            no_progress=False,
+        )
+    )
+
+    log_text = log_path.read_text()
+    assert "elapsed 1s cpu unavailable out +0 bytes" in log_text
+    assert "(NO PROGRESS)" not in log_text
+
+
+def test_watch_long_phase_reporter_records_completed_prior_duration_only_on_finish(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    times = iter([100.0, 145.0, 200.0])
+
+    with patch("gza.cli.watch.time.monotonic", side_effect=lambda: next(times)):
+        reporter = _WatchLongPhaseReporter(log=log, threshold_seconds=60, interval_seconds=60)
+        heartbeat = reporter.start("verify:main", "main")
+        heartbeat(
+            LongPhaseProgress(
+                elapsed_seconds=30,
+                cpu_delta_seconds=1,
+                output_bytes_delta=0,
+                output_lines_delta=0,
+                no_progress=False,
+            )
+        )
+        heartbeat.finish()
+        reporter.start("verify:main", "main")
+
+    log_text = log_path.read_text()
+    assert "last run of this phase took 45s" in log_text
+    assert "last run of this phase took 30s" not in log_text
+
+
+def test_watch_long_phase_reporter_retains_history_across_watch_cycles(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    times = iter([10.0, 80.0, 100.0])
+
+    with patch("gza.cli.watch.time.monotonic", side_effect=lambda: next(times)):
+        first_cycle = _WatchLongPhaseReporter(log=log, threshold_seconds=60, interval_seconds=60)
+        first_cycle.start("verify:candidate-prefix", "gza-1").finish()
+        second_cycle = _WatchLongPhaseReporter(log=log, threshold_seconds=60, interval_seconds=60)
+        second_cycle.start("verify:candidate-prefix", "gza-1")
+
+    assert "last run of this phase took 1m10s" in log_path.read_text()
+
+
+def test_watch_long_phase_reporter_finalizes_exceptional_completion_in_finally(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    times = iter([300.0, 320.0, 400.0])
+
+    with patch("gza.cli.watch.time.monotonic", side_effect=lambda: next(times)):
+        reporter = _WatchLongPhaseReporter(log=log, threshold_seconds=60, interval_seconds=60)
+        heartbeat = reporter.start("verify:unit", "gza-2")
+        try:
+            raise RuntimeError("boom")
+        except RuntimeError:
+            pass
+        finally:
+            heartbeat.finish()
+        reporter.start("verify:unit", "gza-2")
+
+    assert "last run of this phase took 20s" in log_path.read_text()
+
+
+def test_watch_lifecycle_heartbeat_factory_preserves_finish_protocol(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    task = DbTask(id="gza-9117", prompt="task", task_type="implement")
+    times = iter([100.0, 145.0, 200.0])
+
+    with patch("gza.cli.watch.time.monotonic", side_effect=lambda: next(times)):
+        reporter = _WatchLongPhaseReporter(log=log, threshold_seconds=60, interval_seconds=60)
+        heartbeat_for_phase = _make_watch_lifecycle_heartbeat_factory(reporter)
+        heartbeat = heartbeat_for_phase("verify:unit", task)
+        assert heartbeat is not None
+        heartbeat.finish()
+        heartbeat_for_phase("verify:unit", task)
+
+    assert "last run of this phase took 45s" in log_path.read_text()
+
+
+def test_watch_lifecycle_verify_heartbeat_uses_meaningful_nonduplicated_phase(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    task = DbTask(id="gza-9117", prompt="task", task_type="implement")
+    reporter = _WatchLongPhaseReporter(log=log, threshold_seconds=60, interval_seconds=60)
+    heartbeat_for_phase = _make_watch_lifecycle_heartbeat_factory(reporter)
+    heartbeat = heartbeat_for_phase(watch_module._watch_lifecycle_verify_phase_label("verify"), task)
+    assert heartbeat is not None
+
+    heartbeat(
+        LongPhaseProgress(
+            elapsed_seconds=60,
+            cpu_delta_seconds=1,
+            output_bytes_delta=0,
+            output_lines_delta=0,
+            no_progress=False,
+        )
+    )
+
+    log_text = log_path.read_text()
+    assert "START     verify:lifecycle gza-9117" in log_text
+    assert "BUSY      verify:lifecycle gza-9117 elapsed 1m00s cpu +1s out +0 bytes" in log_text
+    assert "verify:verify" not in log_text
+
+
+def test_watch_candidate_batch_heartbeat_identifies_merge_units(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    staged_batch = [
+        SimpleNamespace(display_task=DbTask(id="gza-1001", prompt="first")),
+        SimpleNamespace(display_task=DbTask(id="gza-1002", prompt="second")),
+    ]
+    subject = watch_module._format_candidate_batch_heartbeat_subject(staged_batch)
+    reporter = _WatchLongPhaseReporter(log=log, threshold_seconds=60, interval_seconds=60)
+    heartbeat = reporter.start("verify:candidate-batch", subject)
+
+    heartbeat(
+        LongPhaseProgress(
+            elapsed_seconds=120,
+            cpu_delta_seconds=0,
+            output_bytes_delta=0,
+            output_lines_delta=0,
+            no_progress=True,
+        )
+    )
+
+    log_text = log_path.read_text()
+    assert subject == "batch:gza-1001,gza-1002"
+    assert "START     verify:candidate-batch batch:gza-1001,gza-1002" in log_text
+    assert (
+        "BUSY      verify:candidate-batch batch:gza-1001,gza-1002 elapsed 2m00s "
+        "cpu +0s out +0 bytes (NO PROGRESS)"
+    ) in log_text
+
+
+def test_watch_composite_heartbeat_services_worker_monitor_independently(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    reporter = _WatchLongPhaseReporter(log=log, threshold_seconds=60, interval_seconds=60)
+    worker_calls: list[str] = []
+
+    class FakeWorkerHeartbeat:
+        def __call__(self) -> None:
+            worker_calls.append("service")
+
+        def seconds_until_next(self) -> float:
+            return 0.25
+
+    heartbeat = watch_module._make_composite_long_phase_heartbeat(
+        reporter.start("verify:main", "main"),
+        FakeWorkerHeartbeat(),
+    )
+
+    assert heartbeat.seconds_until_next() == 0.25  # type: ignore[attr-defined]
+    heartbeat.service_due()  # type: ignore[attr-defined]
+    heartbeat(
+        LongPhaseProgress(
+            elapsed_seconds=60,
+            cpu_delta_seconds=2,
+            output_bytes_delta=10,
+            output_lines_delta=1,
+            no_progress=False,
+        )
+    )
+
+    assert worker_calls == ["service", "service"]
+    log_text = log_path.read_text()
+    assert "START     verify:main main" in log_text
+    assert "BUSY      verify:main main elapsed 1m00s cpu +2s out +1 lines" in log_text
+
+
+def test_watch_lifecycle_heartbeat_factory_records_exceptional_verify_completion(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    task = DbTask(id="gza-9117", prompt="task", task_type="implement")
+    times = iter([300.0, 320.0, 400.0])
+
+    with patch("gza.cli.watch.time.monotonic", side_effect=lambda: next(times)):
+        reporter = _WatchLongPhaseReporter(log=log, threshold_seconds=60, interval_seconds=60)
+        heartbeat_for_phase = _make_watch_lifecycle_heartbeat_factory(reporter)
+        heartbeat = heartbeat_for_phase("verify:unit", task)
+        assert heartbeat is not None
+        try:
+            raise RuntimeError("verify failed")
+        except RuntimeError:
+            pass
+        finally:
+            heartbeat.finish()
+        heartbeat_for_phase("verify:unit", task)
+
+    assert "last run of this phase took 20s" in log_path.read_text()
+
+
+def test_watch_long_phase_reporter_does_not_report_partial_heartbeat_as_last_run(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    times = iter([100.0, 200.0])
+
+    with patch("gza.cli.watch.time.monotonic", side_effect=lambda: next(times)):
+        reporter = _WatchLongPhaseReporter(log=log, threshold_seconds=60, interval_seconds=60)
+        heartbeat = reporter.start("verify:unit", "gza-3")
+        heartbeat(
+            LongPhaseProgress(
+                elapsed_seconds=60,
+                cpu_delta_seconds=0,
+                output_bytes_delta=0,
+                output_lines_delta=0,
+                no_progress=True,
+            )
+        )
+        reporter.start("verify:unit", "gza-3")
+
+    assert "last run of this phase took" not in log_path.read_text()
+
+
+def _register_watch_worker(
+    config: Config,
+    *,
+    worker_id: str,
+    task_id: str | None,
+    started_at: datetime,
+    log_file: str | None = None,
+) -> None:
+    WorkerRegistry(config.workers_path).register(
+        WorkerMetadata(
+            worker_id=worker_id,
+            task_id=task_id,
+            pid=os.getpid(),
+            started_at=started_at.isoformat(),
+            log_file=log_file,
+        )
+    )
+
+
+def test_watch_worker_heartbeat_emits_rebase_start_and_elapsed_busy(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Rebase task", task_type="rebase")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC) - timedelta(seconds=70)
+    task.running_pid = os.getpid()
+    task.log_file = ".gza/logs/rebase.log"
+    store.update(task)
+    log_file = tmp_path / task.log_file
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("start\n")
+    _register_watch_worker(
+        config,
+        worker_id="w-rebase",
+        task_id=str(task.id),
+        started_at=task.started_at,
+        log_file=task.log_file,
+    )
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    cpu_samples = iter([1.0, 3.0])
+    now = 1000.0
+    monitor = _WatchWorkerHeartbeatMonitor(
+        config=config,
+        store=store,
+        log=log,
+        threshold_seconds=60,
+        interval_seconds=60,
+        clock=lambda: now,
+        cpu_sampler=lambda _pid: next(cpu_samples),
+    )
+
+    monitor()
+    now = 1060.0
+    monitor()
+
+    log_text = log.path.read_text()
+    assert "START" in log_text and f"rebase {task.id} elapsed 1m" in log_text
+    assert "BUSY" in log_text and f"rebase {task.id} elapsed 1m" in log_text
+    assert "cpu +2s" in log_text
+
+
+def test_watch_worker_heartbeat_emits_agent_specific_elapsed_output(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implementation task", task_type="implement")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC) - timedelta(seconds=30)
+    task.running_pid = os.getpid()
+    task.log_file = ".gza/logs/agent.log"
+    store.update(task)
+    log_file = tmp_path / task.log_file
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("start\n")
+    _register_watch_worker(
+        config,
+        worker_id="w-agent",
+        task_id=str(task.id),
+        started_at=task.started_at,
+        log_file=task.log_file,
+    )
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    cpu_samples = iter([None, None])
+    now = 500.0
+    monitor = _WatchWorkerHeartbeatMonitor(
+        config=config,
+        store=store,
+        log=log,
+        threshold_seconds=60,
+        interval_seconds=60,
+        clock=lambda: now,
+        cpu_sampler=lambda _pid: next(cpu_samples),
+    )
+
+    monitor()
+    log_file.write_text("start\nmore output\n")
+    now = 531.0
+    monitor()
+
+    log_text = log.path.read_text()
+    assert f"agent:execution {task.id} elapsed 1m" in log_text
+    assert "cpu unavailable log +" in log_text
+    assert "(NO PROGRESS)" not in log_text
+
+
+def test_watch_worker_heartbeat_due_when_poll_shorter_than_interval(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implementation task", task_type="implement")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC) - timedelta(seconds=58)
+    task.running_pid = os.getpid()
+    store.update(task)
+    _register_watch_worker(config, worker_id="w-short-poll", task_id=str(task.id), started_at=task.started_at)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    now = 1000.0
+    cpu_samples = iter([5.0, 5.0])
+    monitor = _WatchWorkerHeartbeatMonitor(
+        config=config,
+        store=store,
+        log=log,
+        threshold_seconds=60,
+        interval_seconds=60,
+        clock=lambda: now,
+        cpu_sampler=lambda _pid: next(cpu_samples),
+    )
+
+    monitor()
+    now += 5.0
+    monitor()
+
+    lines = log.path.read_text().splitlines()
+    assert any("START" in line for line in lines)
+    assert any("BUSY" in line and f"agent:execution {task.id}" in line for line in lines)
+
+
+def test_watch_worker_heartbeat_first_busy_respects_threshold(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Implementation task", task_type="implement")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC) - timedelta(seconds=30)
+    task.running_pid = os.getpid()
+    store.update(task)
+    _register_watch_worker(config, worker_id="w-threshold", task_id=str(task.id), started_at=task.started_at)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    monitor = _WatchWorkerHeartbeatMonitor(
+        config=config,
+        store=store,
+        log=log,
+        threshold_seconds=60,
+        interval_seconds=60,
+        clock=lambda: 1000.0,
+        cpu_sampler=lambda _pid: 1.0,
+    )
+
+    monitor()
+
+    log_text = log.path.read_text()
+    assert "START" in log_text
+    assert "BUSY" not in log_text
+
+
+def test_watch_worker_heartbeat_frames_already_running_worker_after_watch_start(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Existing worker task", task_type="implement")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC) - timedelta(seconds=120)
+    task.running_pid = os.getpid()
+    store.update(task)
+    _register_watch_worker(config, worker_id="w-existing", task_id=str(task.id), started_at=task.started_at)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    now = 1000.0
+    monitor = _WatchWorkerHeartbeatMonitor(
+        config=config,
+        store=store,
+        log=log,
+        threshold_seconds=60,
+        interval_seconds=60,
+        clock=lambda: now,
+        cpu_sampler=lambda _pid: None,
+    )
+
+    monitor()
+    immediate_log_text = log.path.read_text()
+    assert "START" in immediate_log_text and f"agent:execution {task.id} elapsed 2m" in immediate_log_text
+    assert "BUSY" not in immediate_log_text
+
+    now = 1060.0
+    monitor()
+
+    log_text = log.path.read_text()
+    assert "START" in log_text and f"agent:execution {task.id} elapsed 2m" in log_text
+    assert "BUSY" in log_text and f"agent:execution {task.id}" in log_text
+    assert "cpu unavailable" in log_text
+    assert "(NO PROGRESS)" not in log_text
+
+
+def test_watch_worker_heartbeat_renders_subsecond_cpu_progress(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Subsecond worker task", task_type="implement")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC) - timedelta(seconds=30)
+    task.running_pid = os.getpid()
+    store.update(task)
+    _register_watch_worker(config, worker_id="w-subsecond", task_id=str(task.id), started_at=task.started_at)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    now = 1000.0
+    cpu_samples = iter([1.0, 1.5, 1.5])
+    monitor = _WatchWorkerHeartbeatMonitor(
+        config=config,
+        store=store,
+        log=log,
+        threshold_seconds=60,
+        interval_seconds=60,
+        clock=lambda: now,
+        cpu_sampler=lambda _pid: next(cpu_samples),
+    )
+
+    monitor()
+    now = 1030.0
+    monitor()
+    now = 1090.0
+    monitor()
+
+    log_text = log.path.read_text()
+    assert "cpu +0.5s log +0 bytes" in log_text
+    assert "cpu +0.5s log +0 bytes (NO PROGRESS)" not in log_text
+    assert "cpu +0s log +0 bytes (NO PROGRESS)" in log_text
+
+
+def test_watch_worker_heartbeat_uses_fake_darwin_descendant_cpu_progress(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Darwin worker task", task_type="implement")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC) - timedelta(seconds=120)
+    task.running_pid = 100
+    task.log_file = ".gza/logs/darwin-worker.log"
+    store.update(task)
+    log_file = tmp_path / task.log_file
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    log_file.write_text("start\n")
+    _register_watch_worker(config, worker_id="w-darwin", task_id=str(task.id), started_at=task.started_at, log_file=task.log_file)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    ps_outputs = iter(
+        [
+            " 100 1 00:00:03\n 101 100 00:00:05\n",
+            " 100 1 00:00:03\n 101 100 00:00:09\n",
+        ]
+    )
+
+    def ps_runner() -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(["ps"], 0, stdout=next(ps_outputs), stderr="")
+
+    now = 1000.0
+    monitor = _WatchWorkerHeartbeatMonitor(
+        config=config,
+        store=store,
+        log=log,
+        threshold_seconds=60,
+        interval_seconds=60,
+        clock=lambda: now,
+        cpu_sampler=lambda _pid: _read_darwin_process_tree_cpu_seconds(100, ps_runner=ps_runner),
+    )
+
+    monitor()
+    now = 1060.0
+    monitor()
+
+    log_text = log.path.read_text()
+    assert f"agent:execution {task.id}" in log_text
+    assert "cpu +4s log +0 bytes" in log_text
+    assert "(NO PROGRESS)" not in log_text
+
+
+def test_watch_worker_heartbeat_reports_concurrent_workers_independently(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    started_at = datetime.now(UTC) - timedelta(seconds=30)
+    progressing = store.add("Progressing task", task_type="implement")
+    flat = store.add("Flat task", task_type="implement")
+    assert progressing.id is not None
+    assert flat.id is not None
+    for task, name in ((progressing, "progressing"), (flat, "flat")):
+        task.status = "in_progress"
+        task.started_at = started_at
+        task.running_pid = os.getpid()
+        task.log_file = f".gza/logs/{name}.log"
+        store.update(task)
+        path = tmp_path / task.log_file
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("start\n")
+        _register_watch_worker(config, worker_id=f"w-{name}", task_id=str(task.id), started_at=started_at, log_file=task.log_file)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    now = 1000.0
+    monitor = _WatchWorkerHeartbeatMonitor(
+        config=config,
+        store=store,
+        log=log,
+        threshold_seconds=60,
+        interval_seconds=60,
+        clock=lambda: now,
+        cpu_sampler=lambda _pid: None,
+    )
+
+    monitor()
+    now = 1031.0
+    assert progressing.log_file is not None
+    (tmp_path / progressing.log_file).write_text("start\nmore\n")
+    monitor()
+
+    lines = log.path.read_text().splitlines()
+    progressing_busy = [line for line in lines if "BUSY" in line and f"agent:execution {progressing.id}" in line]
+    flat_busy = [line for line in lines if "BUSY" in line and f"agent:execution {flat.id}" in line]
+    assert progressing_busy and "(NO PROGRESS)" not in progressing_busy[0]
+    assert flat_busy and "cpu unavailable" in flat_busy[0]
+    assert flat_busy and "(NO PROGRESS)" not in flat_busy[0]
+
+
+class _FakeDueWorkerHeartbeat:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self) -> None:
+        self.calls += 1
+
+    def seconds_until_next(self) -> float:
+        return 0.0
+
+
+def _emit_fake_merge_child_heartbeats(kwargs: dict[str, object]) -> None:
+    heartbeat = kwargs["on_heartbeat"]
+    assert callable(heartbeat)
+    heartbeat(
+        LongPhaseProgress(
+            elapsed_seconds=61,
+            cpu_delta_seconds=2.0,
+            output_bytes_delta=0,
+            output_lines_delta=0,
+            no_progress=False,
+        )
+    )
+    heartbeat(
+        LongPhaseProgress(
+            elapsed_seconds=121,
+            cpu_delta_seconds=0.0,
+            output_bytes_delta=0,
+            output_lines_delta=0,
+            no_progress=True,
+        )
+    )
+
+
+def test_watch_isolated_batch_staging_emits_merge_heartbeats_and_services_workers(tmp_path: Path) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    task = _make_completed_watch_merge_task(store, "Completed task", branch="feature/stage-heartbeat")
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    repo_git = _make_watch_git()
+    merge_git = _make_watch_git()
+    merge_git.rev_parse = MagicMock(return_value="isolated-tip")  # type: ignore[method-assign]
+    worker_heartbeat = _FakeDueWorkerHeartbeat()
+
+    def fake_stage(*_args: object, **kwargs: object) -> _MergeActionResult:
+        _emit_fake_merge_child_heartbeats(kwargs)
+        return _MergeActionResult(
+            rc=1,
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+            status="blocked_dirty_checkout",
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+            worker_heartbeat=worker_heartbeat,
+        )
+
+    log_text = log.path.read_text()
+    assert f"START     merge:stage {task.id}" in log_text
+    assert f"BUSY      merge:stage {task.id} elapsed 1m01s cpu +2s out +0 bytes" in log_text
+    assert f"BUSY      merge:stage {task.id} elapsed 2m01s cpu +0s out +0 bytes (NO PROGRESS)" in log_text
+    assert worker_heartbeat.calls >= 2
+
+
+def test_watch_isolated_prefix_replay_emits_merge_heartbeats_and_services_workers(tmp_path: Path) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\nmain_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    task = _make_completed_watch_merge_task(store, "Completed task", branch="feature/prefix-heartbeat")
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    repo_git = _make_watch_git()
+    merge_git = _make_watch_git()
+    merge_git.rev_parse = MagicMock(return_value="isolated-tip")  # type: ignore[method-assign]
+    worker_heartbeat = _FakeDueWorkerHeartbeat()
+
+    staged = _StagedIsolatedMergeAction(
+        merge_subject=task,
+        merge_unit_id=None,
+        merge_branch=task.branch,
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+    )
+
+    def fake_stage(*_args: object, **kwargs: object) -> _StagedIsolatedMergeAction:
+        if kwargs.get("merge_preflight_ref") == "HEAD":
+            _emit_fake_merge_child_heartbeats(kwargs)
+        return staged
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_resume_worker", return_value=0),
+        patch("gza.cli.watch._spawn_background_iterate", return_value=0),
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=fake_stage),
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            side_effect=[
+                _candidate_verify_check(tmp_path, status="failed", classification="deterministic_red"),
+                _candidate_verify_check(tmp_path, status="passed", classification="pass"),
+            ],
+        ),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+            worker_heartbeat=worker_heartbeat,
+        )
+
+    log_text = log.path.read_text()
+    assert f"START     merge:prefix-replay {task.id}" in log_text
+    assert f"BUSY      merge:prefix-replay {task.id} elapsed 1m01s cpu +2s out +0 bytes" in log_text
+    assert f"BUSY      merge:prefix-replay {task.id} elapsed 2m01s cpu +0s out +0 bytes (NO PROGRESS)" in log_text
+    assert worker_heartbeat.calls >= 2
+
+
+def test_watch_ordinary_merge_execution_emits_merge_heartbeats_and_services_workers(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _make_completed_watch_merge_task(store, "Completed task", branch="feature/execute-heartbeat")
+    config = Config.load(tmp_path)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    repo_git = _make_watch_git()
+    worker_heartbeat = _FakeDueWorkerHeartbeat()
+
+    def fake_execute(*_args: object, **kwargs: object) -> _MergeActionResult:
+        _emit_fake_merge_child_heartbeats(kwargs)
+        return _MergeActionResult(
+            rc=1,
+            created_followups=[],
+            reused_followups=[],
+            created_investigation_task_ids=[],
+            reused_investigation_task_ids=[],
+            status="blocked_dirty_checkout",
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=repo_git),
+        patch("gza.cli.watch.determine_next_action", return_value={"type": "merge"}),
+        patch("gza.cli.watch._execute_merge_action", side_effect=fake_execute),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            quiet=True,
+            worker_heartbeat=worker_heartbeat,
+        )
+
+    log_text = log.path.read_text()
+    assert f"START     merge:execute {task.id}" in log_text
+    assert f"BUSY      merge:execute {task.id} elapsed 1m01s cpu +2s out +0 bytes" in log_text
+    assert f"BUSY      merge:execute {task.id} elapsed 2m01s cpu +0s out +0 bytes (NO PROGRESS)" in log_text
+    assert worker_heartbeat.calls >= 2
 
 
 def _setup_watch_owner_with_failed_rebase(tmp_path: Path, *, failure_reason: str):
@@ -52666,6 +53498,71 @@ def test_cmd_watch_holds_until_docker_returns_then_resumes(tmp_path: Path) -> No
     assert "failure halt threshold reached" not in log_text
 
 
+def test_cmd_watch_docker_hold_emits_due_worker_heartbeats(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Worker active during Docker hold", task_type="implement")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC) - timedelta(seconds=120)
+    task.running_pid = os.getpid()
+    store.update(task)
+    _register_watch_worker(config, worker_id="w-docker-hold", task_id=str(task.id), started_at=task.started_at)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=60,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        group=None,
+    )
+    signal_handlers: dict[signal.Signals, object] = {}
+    now = 1000.0
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def make_heartbeat(config_arg: Config, store_arg: SqliteTaskStore, log_arg: _WatchLog):
+        return _WatchWorkerHeartbeatMonitor(
+            config=config_arg,
+            store=store_arg,
+            log=log_arg,
+            threshold_seconds=60,
+            interval_seconds=60,
+            clock=lambda: now,
+            cpu_sampler=lambda _pid: None,
+        )
+
+    def fake_sleep(_seconds: int, stop_requested) -> None:
+        nonlocal now
+        now += 60.0
+        stop_requested()
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    with (
+        patch("gza.cli.watch._system_can_run_tasks", return_value=False),
+        patch("gza.cli.watch._make_worker_sleep_heartbeat", side_effect=make_heartbeat),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "HOLD" in log_text
+    assert f"agent:execution {task.id}" in log_text
+    assert "START" in log_text
+    assert "BUSY" in log_text
+
+
 def test_cmd_watch_no_docker_bypasses_system_probe(tmp_path: Path) -> None:
     """No-Docker watch should proceed without probing Docker readiness."""
     worktree_dir = tmp_path / ".gza-test-worktrees"
@@ -52782,6 +53679,146 @@ def test_cmd_watch_git_health_halts_before_transitions_and_cycle(tmp_path: Path)
     assert "HOLD" in log_text
     assert "ATTENTION" in log_text
     assert "git worktree health RED - dispatch halted" in log_text
+
+
+def test_cmd_watch_git_health_hold_emits_due_worker_heartbeats(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Worker active during git health hold", task_type="implement")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC) - timedelta(seconds=120)
+    task.running_pid = os.getpid()
+    store.update(task)
+    _register_watch_worker(config, worker_id="w-git-hold", task_id=str(task.id), started_at=task.started_at)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=60,
+        max_idle=10,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        group=None,
+    )
+    signal_handlers: dict[signal.Signals, object] = {}
+    now = 1000.0
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def make_heartbeat(config_arg: Config, store_arg: SqliteTaskStore, log_arg: _WatchLog):
+        return _WatchWorkerHeartbeatMonitor(
+            config=config_arg,
+            store=store_arg,
+            log=log_arg,
+            threshold_seconds=60,
+            interval_seconds=60,
+            clock=lambda: now,
+            cpu_sampler=lambda _pid: None,
+        )
+
+    def fake_sleep(_seconds: int, stop_requested) -> None:
+        nonlocal now
+        now += 60.0
+        stop_requested()
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    red_check = SimpleNamespace(
+        dispatch_halted=True,
+        state=SimpleNamespace(alert_message="git worktree health RED - dispatch halted"),
+    )
+
+    with (
+        patch("gza.cli.watch.check_git_health", return_value=red_check),
+        patch("gza.cli.watch._make_worker_sleep_heartbeat", side_effect=make_heartbeat),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    assert "HOLD" in log_text
+    assert f"agent:execution {task.id}" in log_text
+    assert "START" in log_text
+    assert "BUSY" in log_text
+
+
+def test_cmd_watch_worker_heartbeat_starts_before_first_cycle_and_runs_during_cycle(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Worker active before first cycle", task_type="implement")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC) - timedelta(seconds=120)
+    task.running_pid = os.getpid()
+    store.update(task)
+    _register_watch_worker(config, worker_id="w-first-cycle", task_id=str(task.id), started_at=task.started_at)
+
+    args = argparse.Namespace(
+        project_dir=tmp_path,
+        batch=1,
+        poll=60,
+        max_idle=120,
+        max_iterations=10,
+        dry_run=False,
+        quiet=True,
+        yes=True,
+        group=None,
+    )
+    signal_handlers: dict[signal.Signals, object] = {}
+    now = 1000.0
+
+    def register_signal(sig: signal.Signals, handler: object) -> object:
+        signal_handlers[sig] = handler
+        return object()
+
+    def make_heartbeat(config_arg: Config, store_arg: SqliteTaskStore, log_arg: _WatchLog):
+        return _WatchWorkerHeartbeatMonitor(
+            config=config_arg,
+            store=store_arg,
+            log=log_arg,
+            threshold_seconds=60,
+            interval_seconds=60,
+            clock=lambda: now,
+            cpu_sampler=lambda _pid: None,
+        )
+
+    def fake_run_cycle(*_args: object, worker_heartbeat=None, **_kwargs: object) -> _CycleResult:
+        nonlocal now
+        assert worker_heartbeat is not None
+        assert "START" in (tmp_path / ".gza" / "watch.log").read_text()
+        now += 60.0
+        worker_heartbeat()
+        return _CycleResult(False, 1, 0)
+
+    def fake_sleep(_seconds: int, _stop_requested) -> None:
+        handler = signal_handlers[signal.SIGTERM]
+        assert callable(handler)
+        handler(signal.SIGTERM, None)
+
+    with (
+        patch("gza.cli.watch._system_can_run_tasks", return_value=True),
+        patch("gza.cli.watch._make_worker_sleep_heartbeat", side_effect=make_heartbeat),
+        patch("gza.cli.watch._run_cycle", side_effect=fake_run_cycle),
+        patch("gza.cli.watch.signal.signal", side_effect=register_signal),
+        patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 128 + signal.SIGTERM
+    lines = (tmp_path / ".gza" / "watch.log").read_text().splitlines()
+    start_index = next(i for i, line in enumerate(lines) if "START" in line and f"agent:execution {task.id}" in line)
+    busy_index = next(i for i, line in enumerate(lines) if "BUSY" in line and f"agent:execution {task.id}" in line)
+    assert start_index < busy_index
 
 
 def test_cmd_watch_git_health_dedupes_attention_and_resumes(tmp_path: Path) -> None:

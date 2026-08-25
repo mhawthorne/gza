@@ -56,6 +56,7 @@ from ..review_verify_state import (
 )
 from ..runner import (
     LifecycleVerifyExecution,
+    LongPhaseHeartbeat,
     ProjectReviewVerifyResult,
     _capture_noop_verify_fix_timeout_rerun,
     _capture_review_verify_result,
@@ -151,6 +152,7 @@ class AdvanceActionExecutionContext:
     ] | None = None
     create_targeted_rebase_task: Callable[[DbTask, str], DbTask] | None = None
     reconcile_diverged_branch: Callable[[DbTask], BranchDivergenceReconcileResult] | None = None
+    heartbeat_for_lifecycle_phase: Callable[[str, DbTask], LongPhaseHeartbeat | None] | None = None
     config: Any | None = None
     git: Any | None = None
     runtime_context: Any | None = None
@@ -1340,6 +1342,7 @@ def _execute_verify_gate(
         timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(context.config)
         provider_cwd = _worktree_execution_dir(worktree_git.repo_dir, _project_boundary(context.config))
         reviewed_base_sha = _resolve_review_verify_base_sha(worktree_git, worktree_git.default_branch())
+        heartbeat_for_phase = context.heartbeat_for_lifecycle_phase
         execution = _run_lifecycle_verify(
             config=context.config,
             task=subject_task,
@@ -1352,6 +1355,13 @@ def _execute_verify_gate(
             reviewed_branch=current_epoch.reviewed_branch,
             reviewed_head_sha=current_epoch.reviewed_head_sha,
             reviewed_base_sha=reviewed_base_sha,
+            heartbeat_threshold_seconds=context.config.watch.long_phase_threshold_seconds,
+            heartbeat_interval_seconds=context.config.watch.heartbeat_interval_seconds,
+            heartbeat_for_phase=(
+                (lambda phase: heartbeat_for_phase(phase, subject_task))
+                if heartbeat_for_phase is not None
+                else None
+            ),
         )
         if execution is None:
             unavailable_result = _make_review_verify_result(

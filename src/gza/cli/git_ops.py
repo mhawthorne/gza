@@ -143,10 +143,12 @@ from ..review_verdict import (
 from ..review_verify_state import refresh_preserved_rebase_review_verify_heads
 from ..runner import (
     WIP_INTERRUPTED_COMMIT_SUBJECT,
+    LongPhaseHeartbeat,
     TaskExecutionLogger,
     _call_provider_run,
     _complete_failed_code_task_after_pr_publication,
     _compute_tree_fingerprint,
+    _LongPhaseHeartbeatState,
     _resolve_impl_ancestor,
     _resolve_root_implementation_for_fix,
     ensure_task_log_path,
@@ -834,6 +836,46 @@ def _coerce_manual_merge_execution_result(result: ManualMergeExecutionResult) ->
     )
 
 
+def _call_git_rebase_with_optional_monitor(
+    git: Git,
+    branch: str,
+    process_monitor_factory: Callable[[subprocess.Popen[str], float], _LongPhaseHeartbeatState] | None,
+) -> None:
+    if process_monitor_factory is None:
+        git.rebase(branch)
+        return
+    try:
+        git.rebase(branch, process_monitor_factory=process_monitor_factory)
+    except TypeError as exc:
+        if "process_monitor_factory" not in str(exc):
+            raise
+        git.rebase(branch)
+
+
+def _call_git_merge_with_optional_monitor(
+    git: Git,
+    branch: str,
+    *,
+    squash: bool,
+    commit_message: str | None = None,
+    process_monitor_factory: Callable[[subprocess.Popen[str], float], _LongPhaseHeartbeatState] | None,
+) -> None:
+    if process_monitor_factory is None:
+        git.merge(branch, squash=squash, commit_message=commit_message)
+        return
+    try:
+        git.merge(
+            branch,
+            squash=squash,
+            commit_message=commit_message,
+            process_monitor_factory=process_monitor_factory,
+        )
+    except TypeError as exc:
+        if "process_monitor_factory" not in str(exc):
+            raise
+        git.merge(branch, squash=squash, commit_message=commit_message)
+
+
 def _resolve_fresh_merge_source(git: Git, branch: str | None) -> ResolvedMergeSourceRef:
     """Return the local-only merge source ref used by lifecycle merge execution."""
     return resolve_fresh_merge_source(git, branch)
@@ -1496,6 +1538,9 @@ def _merge_single_task(
     merge_source: str = MERGE_SOURCE_MANUAL,
     quiet_mechanics: bool = False,
     materialize_side_effects: bool = True,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    on_heartbeat: LongPhaseHeartbeat | None = None,
 ) -> _MergeSingleTaskResult:
     """Merge a single task's branch."""
     option_error = _merge_option_relationship_error(args)
@@ -1503,6 +1548,16 @@ def _merge_single_task(
         print(option_error)
         return _MergeSingleTaskResult(rc=1)
 
+    def _process_monitor_factory(process: subprocess.Popen[str], started_at: float) -> _LongPhaseHeartbeatState:
+        return _LongPhaseHeartbeatState(
+            process=process,
+            started_at=started_at,
+            threshold_seconds=max(0, int(heartbeat_threshold_seconds or 0)),
+            interval_seconds=max(1, int(heartbeat_interval_seconds or 1)),
+            on_heartbeat=on_heartbeat,
+        )
+
+    process_monitor_factory = _process_monitor_factory if on_heartbeat is not None else None
     target_branch = git.default_branch()
     resolved = _resolve_merge_subject(store, git, task_id, target_branch=target_branch)
     if resolved is None:
@@ -1753,6 +1808,7 @@ def _merge_single_task(
             materialize_side_effects=materialize_side_effects,
             pre_materialized_deferred_blockers=pregate_deferred_blockers,
             pre_materialized_deferred_blockers_printed=pregate_deferred_blockers_printed,
+            process_monitor_factory=process_monitor_factory,
         ),
         ManualMergeExecutionHooks(
             build_commit_message=_build_commit_message,
@@ -3291,6 +3347,9 @@ def _stage_isolated_merge_action(
     already_merged_behavior: str = "error",
     merge_source: str = MERGE_SOURCE_MANUAL,
     quiet_mechanics: bool = False,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    on_heartbeat: LongPhaseHeartbeat | None = None,
 ) -> _StagedIsolatedMergeAction | _MergeActionResult:
     created_investigation_task_ids = tuple(
         task_id
@@ -3392,6 +3451,9 @@ def _stage_isolated_merge_action(
             merge_source=effective_merge_source,
             quiet_mechanics=quiet_mechanics,
             materialize_side_effects=False,
+            heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            on_heartbeat=on_heartbeat,
         )
     )
     if merge_result.rc != 0:
@@ -3437,6 +3499,9 @@ def _execute_merge_action(
     already_merged_behavior: str = "error",
     merge_source: str = MERGE_SOURCE_MANUAL,
     quiet_mechanics: bool = False,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    on_heartbeat: LongPhaseHeartbeat | None = None,
 ) -> _MergeActionResult:
     """Execute a merge-style advance action and materialize follow-up tasks if needed."""
     created_followups: list[DbTask] = []
@@ -3561,6 +3626,9 @@ def _execute_merge_action(
             already_merged_behavior=already_merged_behavior,
             merge_source=merge_source,
             quiet_mechanics=quiet_mechanics,
+            heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            on_heartbeat=on_heartbeat,
         )
         if isinstance(staged_result, _MergeActionResult):
             return staged_result
@@ -3577,6 +3645,9 @@ def _execute_merge_action(
                 execution_branch,
                 merge_source=effective_merge_source,
                 quiet_mechanics=quiet_mechanics,
+                heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+                on_heartbeat=on_heartbeat,
             )
         )
     rc = merge_result.rc

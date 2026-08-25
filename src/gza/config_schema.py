@@ -266,6 +266,8 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ),
     ConfigKeySpec("watch.no_progress_cycles", "int", 3, "Repeated unchanged watch-action cycles before the subject is parked for manual attention."),
     ConfigKeySpec("watch.slot_settle_seconds", "int", 5, "Bounded seconds `gza watch` gives a selected worker launch to settle for current-pass slot accounting: only live-running proof consumes a slot; terminal-before-running and no-live-proof launches release provisional budget and stay non-slot-consuming."),
+    ConfigKeySpec("watch.long_phase_threshold_seconds", "int", 60, "Seconds before a watch-supervised long phase starts emitting operator-visible heartbeat progress."),
+    ConfigKeySpec("watch.heartbeat_interval_seconds", "int", 60, "Cadence for watch `BUSY` heartbeat lines during long-running verify, merge, rebase, and agent execution phases."),
     ConfigKeySpec(
         "watch.main_verify_remediation_max_attempts",
         "int",

@@ -109,6 +109,8 @@ DEFAULT_WATCH_TRANSIENT_RECOVERY_BACKOFF_MAX = 1800
 DEFAULT_WATCH_FAILURE_HALT_AFTER: int | None = 10
 DEFAULT_WATCH_NO_PROGRESS_CYCLES = 3
 DEFAULT_WATCH_SLOT_SETTLE_SECONDS = 5
+DEFAULT_WATCH_LONG_PHASE_THRESHOLD_SECONDS = 60
+DEFAULT_WATCH_HEARTBEAT_INTERVAL_SECONDS = 60
 DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS = 2
 DEFAULT_WATCH_PARKED_AUTO_REARM_ENABLED = False
 DEFAULT_WATCH_PARKED_AUTO_REARM_BUDGET = 2
@@ -268,6 +270,8 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
         "failure_halt_after": None,
         "no_progress_cycles": None,
         "slot_settle_seconds": None,
+        "long_phase_threshold_seconds": None,
+        "heartbeat_interval_seconds": None,
         "main_verify_remediation_max_attempts": None,
         "parked_auto_rearm": {
             "enabled": None,
@@ -395,6 +399,8 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
         "transient_recovery_backoff_max": None,
         "failure_halt_after": None,
         "slot_settle_seconds": None,
+        "long_phase_threshold_seconds": None,
+        "heartbeat_interval_seconds": None,
         "main_verify_remediation_max_attempts": None,
     },
     "iterate_max_iterations": None,
@@ -1483,6 +1489,8 @@ class WatchConfig:
     failure_halt_after: int | None = DEFAULT_WATCH_FAILURE_HALT_AFTER
     no_progress_cycles: int = DEFAULT_WATCH_NO_PROGRESS_CYCLES
     slot_settle_seconds: int = DEFAULT_WATCH_SLOT_SETTLE_SECONDS
+    long_phase_threshold_seconds: int = DEFAULT_WATCH_LONG_PHASE_THRESHOLD_SECONDS
+    heartbeat_interval_seconds: int = DEFAULT_WATCH_HEARTBEAT_INTERVAL_SECONDS
     main_verify_remediation_max_attempts: int = DEFAULT_WATCH_MAIN_VERIFY_REMEDIATION_MAX_ATTEMPTS
     parked_auto_rearm: ParkedAutoRearmConfig = field(default_factory=ParkedAutoRearmConfig)
 
@@ -2836,6 +2844,24 @@ class Config:
         )
         if watch_slot_settle_seconds is None:
             raise ConfigError("watch.slot_settle_seconds must be greater than 1 and less than 15 seconds")
+        watch_long_phase_threshold_seconds = _validate_positive_int_field(
+            watch_data.get(
+                "long_phase_threshold_seconds",
+                DEFAULT_WATCH_LONG_PHASE_THRESHOLD_SECONDS,
+            ),
+            "watch.long_phase_threshold_seconds",
+        )
+        if watch_long_phase_threshold_seconds is None:
+            raise ConfigError("watch.long_phase_threshold_seconds must be a positive integer")
+        watch_heartbeat_interval_seconds = _validate_positive_int_field(
+            watch_data.get(
+                "heartbeat_interval_seconds",
+                DEFAULT_WATCH_HEARTBEAT_INTERVAL_SECONDS,
+            ),
+            "watch.heartbeat_interval_seconds",
+        )
+        if watch_heartbeat_interval_seconds is None:
+            raise ConfigError("watch.heartbeat_interval_seconds must be a positive integer")
         watch_main_verify_remediation_max_attempts = _validate_positive_int_field(
             watch_data.get(
                 "main_verify_remediation_max_attempts",
@@ -2890,6 +2916,8 @@ class Config:
             failure_halt_after=watch_failure_halt_after,
             no_progress_cycles=watch_no_progress_cycles,
             slot_settle_seconds=watch_slot_settle_seconds,
+            long_phase_threshold_seconds=watch_long_phase_threshold_seconds,
+            heartbeat_interval_seconds=watch_heartbeat_interval_seconds,
             main_verify_remediation_max_attempts=watch_main_verify_remediation_max_attempts,
             parked_auto_rearm=ParkedAutoRearmConfig(
                 enabled=parked_auto_rearm_enabled,
@@ -3607,6 +3635,18 @@ class Config:
                         "watch.slot_settle_seconds",
                         greater_than=1,
                         less_than=15,
+                        errors=errors,
+                    )
+                if "long_phase_threshold_seconds" in watch_data:
+                    _validate_positive_int_field(
+                        watch_data["long_phase_threshold_seconds"],
+                        "watch.long_phase_threshold_seconds",
+                        errors=errors,
+                    )
+                if "heartbeat_interval_seconds" in watch_data:
+                    _validate_positive_int_field(
+                        watch_data["heartbeat_interval_seconds"],
+                        "watch.heartbeat_interval_seconds",
                         errors=errors,
                     )
                 if "main_verify_remediation_max_attempts" in watch_data:

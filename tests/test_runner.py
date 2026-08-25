@@ -4,6 +4,8 @@ import json
 import logging
 import math
 import os
+import selectors
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -12,6 +14,7 @@ from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
@@ -42,7 +45,6 @@ from gza.review_verify_state import (
     latest_verify_result_for_epoch,
     persist_verify_gate_artifact,
 )
-from gza.runtime_context import RuntimeExecutionContext
 from gza.runner import (
     BACKUP_DIR,
     BRANCH_UNPUSHABLE_FAILURE_REASON,
@@ -56,6 +58,7 @@ from gza.runner import (
     CompletedCodeTaskPrPublicationOutcome,
     CrossProjectReviewVerifyResult,
     ExtractionSeedResult,
+    LongPhaseProgress,
     ProjectBoundary,
     ProjectReviewVerifyResult,
     ResolvedTimeoutBudget,
@@ -82,9 +85,12 @@ from gza.runner import (
     _format_review_verify_failure,
     _format_review_verify_result,
     _get_task_output,
+    _LongPhaseHeartbeatState,
+    _monitored_review_verify_process_pipe_drain,
     _persist_review_blocker_adjudication_for_completed_task,
     _post_complete_code_task,
     _prepare_docker_worktree_git_metadata,
+    _read_darwin_process_tree_cpu_seconds,
     _resolve_code_task_branch_name,
     _resolve_review_verify_timeout_grace_seconds,
     _resolve_task_timeout_budget,
@@ -94,6 +100,7 @@ from gza.runner import (
     _run_non_code_task,
     _run_result_to_stats,
     _run_review_verify_command,
+    _run_review_verify_command_with_timeout_diagnostics,
     _run_review_verify_commands_for_projects,
     _run_verify_command,
     _select_worktree_base_ref,
@@ -101,6 +108,7 @@ from gza.runner import (
     _slug_exists,
     _snapshot_task_db_to_worktree,
     _stage_worktree_agent_resources,
+    _wait_for_review_verify_process_group_exit,
     backup_database,
     build_prompt,
     generate_slug,
@@ -114,6 +122,7 @@ from gza.runner import (
     write_ops_entry,
     write_worker_start_event,
 )
+from gza.runtime_context import RuntimeExecutionContext
 from gza.verify_fix_outcome import effective_verify_fix_completion_outcome
 from gza.worktree_roots import managed_worktree_root_paths
 
@@ -1993,6 +2002,494 @@ class TestReviewContextFromChain:
         assert "- Exit status: 0" in rendered
         mock_warning.assert_not_called()
         mock_print.assert_not_called()
+
+    def test_long_phase_heartbeat_reports_cpu_and_output_progress(self) -> None:
+        """Heartbeat state should report real child liveness deltas without sleeping."""
+        samples: list[LongPhaseProgress] = []
+        now = 100.0
+        cpu_samples = iter([2.0, 7.5])
+        child = SimpleNamespace(pid=1234)
+        heartbeat = _LongPhaseHeartbeatState(
+            process=child,
+            started_at=now,
+            threshold_seconds=60,
+            interval_seconds=60,
+            on_heartbeat=samples.append,
+            clock=lambda: now + 60.0,
+            cpu_sampler=lambda _pid: next(cpu_samples),
+        )
+
+        heartbeat.note_output(b"one\ntwo\n")
+        heartbeat.emit_due()
+
+        assert len(samples) == 1
+        assert samples[0].elapsed_seconds == 60.0
+        assert samples[0].cpu_delta_seconds == 5.5
+        assert samples[0].output_lines_delta == 2
+        assert samples[0].output_bytes_delta == len(b"one\ntwo\n")
+        assert samples[0].no_progress is False
+
+    def test_long_phase_heartbeat_marks_no_progress_when_liveness_does_not_advance(self) -> None:
+        """No-progress heartbeats should be explicit when CPU and output stay flat."""
+        samples: list[LongPhaseProgress] = []
+        now = 500.0
+        child = SimpleNamespace(pid=4321)
+        heartbeat = _LongPhaseHeartbeatState(
+            process=child,
+            started_at=now,
+            threshold_seconds=60,
+            interval_seconds=60,
+            on_heartbeat=samples.append,
+            clock=lambda: now + 60.0,
+            cpu_sampler=lambda _pid: 9.0,
+        )
+
+        heartbeat.emit_due()
+
+        assert len(samples) == 1
+        assert samples[0].cpu_delta_seconds == 0.0
+        assert samples[0].output_lines_delta == 0
+        assert samples[0].output_bytes_delta == 0
+        assert samples[0].no_progress is True
+
+    def test_long_phase_heartbeat_treats_descendant_cpu_progress_as_liveness(self) -> None:
+        samples: list[LongPhaseProgress] = []
+        child = SimpleNamespace(pid=4321)
+        cpu_samples = iter([10.0, 16.0])
+        heartbeat = _LongPhaseHeartbeatState(
+            process=child,
+            started_at=100.0,
+            threshold_seconds=60,
+            interval_seconds=60,
+            on_heartbeat=samples.append,
+            clock=lambda: 160.0,
+            cpu_sampler=lambda _pid: next(cpu_samples),
+        )
+
+        heartbeat.emit_due()
+
+        assert len(samples) == 1
+        assert samples[0].cpu_delta_seconds == 6.0
+        assert samples[0].no_progress is False
+
+    def test_long_phase_heartbeat_marks_cpu_unavailable_without_claiming_no_progress(self) -> None:
+        samples: list[LongPhaseProgress] = []
+        child = SimpleNamespace(pid=4321)
+        heartbeat = _LongPhaseHeartbeatState(
+            process=child,
+            started_at=100.0,
+            threshold_seconds=60,
+            interval_seconds=60,
+            on_heartbeat=samples.append,
+            clock=lambda: 160.0,
+            cpu_sampler=lambda _pid: None,
+        )
+
+        heartbeat.emit_due()
+
+        assert len(samples) == 1
+        assert samples[0].cpu_delta_seconds is None
+        assert samples[0].no_progress is False
+
+    def test_darwin_process_tree_cpu_sampler_counts_descendant_cpu(self) -> None:
+        def first_ps() -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(
+                ["ps"],
+                0,
+                stdout=(
+                    " 100 1 00:00:03\n"
+                    " 101 100 00:00:05\n"
+                    " 102 101 00:00:07\n"
+                    " 200 1 00:01:00\n"
+                ),
+                stderr="",
+            )
+
+        assert _read_darwin_process_tree_cpu_seconds(100, ps_runner=first_ps) == 15.0
+
+    def test_darwin_process_tree_cpu_sampler_ignores_patched_verify_popen(self) -> None:
+        class FakeVerifyProcess:
+            pid = 12345
+
+        class FakePsProcess:
+            args = ["ps", "-axo", "pid=,ppid=,time="]
+            returncode = 0
+
+            def communicate(self) -> tuple[str, str]:
+                return " 100 1 00:00:03\n 101 100 00:00:05\n", ""
+
+        with (
+            patch("gza.runner.subprocess.Popen", return_value=FakeVerifyProcess()),
+            patch("gza.runner._ORIGINAL_SUBPROCESS_POPEN", return_value=FakePsProcess()) as ps_popen,
+        ):
+            assert _read_darwin_process_tree_cpu_seconds(100) == 8.0
+
+        ps_popen.assert_called_once_with(
+            ["ps", "-axo", "pid=,ppid=,time="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def test_long_phase_heartbeat_uses_fake_darwin_descendant_cpu_progress(self) -> None:
+        samples: list[LongPhaseProgress] = []
+        ps_outputs = iter(
+            [
+                " 100 1 00:00:03\n 101 100 00:00:05\n",
+                " 100 1 00:00:03\n 101 100 00:00:09\n",
+            ]
+        )
+
+        def ps_runner() -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(["ps"], 0, stdout=next(ps_outputs), stderr="")
+
+        heartbeat = _LongPhaseHeartbeatState(
+            process=SimpleNamespace(pid=100),
+            started_at=10.0,
+            threshold_seconds=5,
+            interval_seconds=5,
+            on_heartbeat=samples.append,
+            clock=lambda: 15.0,
+            cpu_sampler=lambda pid: _read_darwin_process_tree_cpu_seconds(pid, ps_runner=ps_runner),
+        )
+
+        heartbeat.emit_due()
+
+        assert len(samples) == 1
+        assert samples[0].cpu_delta_seconds == 4.0
+        assert samples[0].output_bytes_delta == 0
+        assert samples[0].no_progress is False
+
+    def test_long_phase_heartbeat_treats_output_as_progress_when_cpu_unavailable(self) -> None:
+        samples: list[LongPhaseProgress] = []
+        child = SimpleNamespace(pid=4321)
+        heartbeat = _LongPhaseHeartbeatState(
+            process=child,
+            started_at=100.0,
+            threshold_seconds=60,
+            interval_seconds=60,
+            on_heartbeat=samples.append,
+            clock=lambda: 160.0,
+            cpu_sampler=lambda _pid: None,
+        )
+
+        heartbeat.note_output(b"still working\n")
+        heartbeat.emit_due()
+
+        assert len(samples) == 1
+        assert samples[0].cpu_delta_seconds is None
+        assert samples[0].output_bytes_delta == len(b"still working\n")
+        assert samples[0].no_progress is False
+
+    def test_long_phase_heartbeat_keeps_concurrent_worker_progress_independent(self) -> None:
+        first_samples: list[LongPhaseProgress] = []
+        second_samples: list[LongPhaseProgress] = []
+        now = 260.0
+        first = _LongPhaseHeartbeatState(
+            process=SimpleNamespace(pid=111),
+            started_at=200.0,
+            threshold_seconds=60,
+            interval_seconds=60,
+            on_heartbeat=first_samples.append,
+            clock=lambda: now,
+            cpu_sampler=lambda _pid: 8.0,
+        )
+        second = _LongPhaseHeartbeatState(
+            process=SimpleNamespace(pid=222),
+            started_at=200.0,
+            threshold_seconds=60,
+            interval_seconds=60,
+            on_heartbeat=second_samples.append,
+            clock=lambda: now,
+            cpu_sampler=lambda _pid: None,
+        )
+
+        first.note_output(b"first\n")
+        first.emit_due()
+        second.emit_due()
+
+        assert first_samples[0].no_progress is False
+        assert second_samples[0].no_progress is False
+
+    def test_long_phase_heartbeat_emits_one_truthful_sample_after_missed_intervals(self) -> None:
+        samples: list[LongPhaseProgress] = []
+        child = SimpleNamespace(pid=4321)
+        cpu_samples = iter([1.0, 13.0])
+        heartbeat = _LongPhaseHeartbeatState(
+            process=child,
+            started_at=100.0,
+            threshold_seconds=60,
+            interval_seconds=60,
+            on_heartbeat=samples.append,
+            clock=lambda: 285.0,
+            cpu_sampler=lambda _pid: next(cpu_samples),
+        )
+        heartbeat.note_output(b"accumulated\n")
+
+        heartbeat.emit_due()
+
+        assert len(samples) == 1
+        assert samples[0].elapsed_seconds == 185.0
+        assert samples[0].cpu_delta_seconds == 12.0
+        assert samples[0].no_progress is False
+        assert heartbeat.next_at == 340.0
+
+    def test_long_phase_heartbeat_emits_one_no_progress_sample_after_missed_intervals(self) -> None:
+        samples: list[LongPhaseProgress] = []
+        child = SimpleNamespace(pid=4321)
+        heartbeat = _LongPhaseHeartbeatState(
+            process=child,
+            started_at=100.0,
+            threshold_seconds=60,
+            interval_seconds=60,
+            on_heartbeat=samples.append,
+            clock=lambda: 285.0,
+            cpu_sampler=lambda _pid: 1.0,
+        )
+
+        heartbeat.emit_due()
+
+        assert len(samples) == 1
+        assert samples[0].elapsed_seconds == 185.0
+        assert samples[0].no_progress is True
+        assert heartbeat.next_at == 340.0
+
+    def test_review_verify_normal_exit_drain_bounds_open_non_ready_descendant_pipe(self) -> None:
+        read_fd, write_fd = os.pipe()
+        selector = selectors.DefaultSelector()
+        stdout = bytearray()
+        stderr = bytearray()
+        process = SimpleNamespace(pid=12345, poll=lambda: 0)
+        try:
+            os.set_blocking(read_fd, False)
+            selector.register(read_fd, selectors.EVENT_READ, data="stdout")
+            with patch("gza.runner._review_verify_process_group_alive", return_value=True), patch(
+                "gza.runner.time.monotonic", side_effect=[10.0, 10.2]
+            ):
+                completed = _monitored_review_verify_process_pipe_drain(
+                    process,
+                    selector,
+                    stdout=stdout,
+                    stderr=stderr,
+                    heartbeat=None,
+                    deadline=10.1,
+                    wait_for_process_group=True,
+                )
+        finally:
+            selector.close()
+            os.close(read_fd)
+            os.close(write_fd)
+
+        assert completed is False
+        assert stdout == b""
+        assert stderr == b""
+
+    def test_review_verify_parent_green_with_live_descendant_times_out_and_terminates(self, tmp_path: Path) -> None:
+        now = 0.0
+        terminated = False
+        signals_sent: list[int] = []
+
+        class FakeProcess:
+            pid = 12345
+            args = ["bash", "-lc", "fake"]
+            stdout = None
+            stderr = None
+            returncode = 0
+
+            def poll(self) -> int:
+                return 0
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                return 0
+
+        def fake_sleep(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        def fake_group_alive(_process: object) -> bool:
+            return not terminated
+
+        def fake_signal(_process: object, sig: int) -> bool:
+            nonlocal terminated
+            signals_sent.append(sig)
+            if sig == signal.SIGTERM:
+                terminated = True
+            return True
+
+        with (
+            patch("gza.runner.subprocess.Popen", return_value=FakeProcess()),
+            patch("gza.runner.time.monotonic", side_effect=lambda: now),
+            patch("gza.runner.time.sleep", side_effect=fake_sleep),
+            patch("gza.runner._review_verify_process_group_alive", side_effect=fake_group_alive),
+            patch("gza.runner._signal_review_verify_process_group", side_effect=fake_signal),
+        ):
+            result = _run_review_verify_command_with_timeout_diagnostics(
+                "fake",
+                cwd=tmp_path,
+                timeout_seconds=2,
+                termination_grace_seconds=1,
+            )
+
+        assert result.timed_out is True
+        assert result.forced_kill is False
+        assert signals_sent == [signal.SIGTERM]
+        assert now >= 2.0
+
+    def test_review_verify_heartbeat_exception_terminates_group_and_surfaces_error(self, tmp_path: Path) -> None:
+        now = 0.0
+        terminated = False
+        signals_sent: list[int] = []
+
+        class FakeProcess:
+            pid = 12345
+            args = ["bash", "-lc", "fake"]
+            stdout = None
+            stderr = None
+            returncode = None
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, timeout: float | None = None) -> int:
+                del timeout
+                return 0
+
+        class FakeSelector:
+            def get_map(self) -> dict[int, object]:
+                return {}
+
+            def register(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            def select(self, timeout: float | None = None) -> list[tuple[object, int]]:
+                nonlocal now
+                now += float(timeout or 0.0)
+                return []
+
+            def close(self) -> None:
+                return None
+
+        def fake_group_alive(_process: object) -> bool:
+            return not terminated
+
+        def fake_signal(_process: object, sig: int) -> bool:
+            nonlocal terminated
+            signals_sent.append(sig)
+            if sig == signal.SIGTERM:
+                terminated = True
+            return True
+
+        def raising_heartbeat(_progress: LongPhaseProgress) -> None:
+            raise RuntimeError("heartbeat failed")
+
+        with (
+            patch("gza.runner.subprocess.Popen", return_value=FakeProcess()),
+            patch("gza.runner.selectors.DefaultSelector", side_effect=FakeSelector),
+            patch("gza.runner.time.monotonic", side_effect=lambda: now),
+            patch("gza.runner._review_verify_process_group_alive", side_effect=fake_group_alive),
+            patch("gza.runner._signal_review_verify_process_group", side_effect=fake_signal),
+        ):
+            with pytest.raises(RuntimeError, match="heartbeat failed"):
+                _run_review_verify_command_with_timeout_diagnostics(
+                    "fake",
+                    cwd=tmp_path,
+                    timeout_seconds=5,
+                    termination_grace_seconds=1,
+                    heartbeat_threshold_seconds=1,
+                    heartbeat_interval_seconds=1,
+                    on_heartbeat=raising_heartbeat,
+                )
+
+        assert signals_sent == [signal.SIGTERM]
+
+    def test_review_verify_normal_exit_drain_retains_multiple_queued_chunks(self) -> None:
+        key = SimpleNamespace(fd=99, data="stdout")
+
+        class FakeSelector:
+            def __init__(self) -> None:
+                self.active = True
+
+            def get_map(self) -> dict[int, object]:
+                return {99: key} if self.active else {}
+
+            def select(self, timeout: float | None = None) -> list[tuple[object, int]]:
+                del timeout
+                return [(key, selectors.EVENT_READ)] if self.active else []
+
+            def unregister(self, fd: int) -> None:
+                assert fd == 99
+                self.active = False
+
+        selector = FakeSelector()
+        stdout = bytearray()
+        stderr = bytearray()
+        process = SimpleNamespace(pid=12345, poll=lambda: 0)
+        payload = (b"a" * 65536) + b"tail"
+        with (
+            patch("gza.runner.os.read", side_effect=[payload[:65536], payload[65536:], b""]),
+            patch("gza.runner._review_verify_process_group_alive", return_value=False),
+            patch("gza.runner.time.monotonic", return_value=10.0),
+        ):
+            completed = _monitored_review_verify_process_pipe_drain(
+                process,
+                selector,  # type: ignore[arg-type]
+                stdout=stdout,
+                stderr=stderr,
+                heartbeat=None,
+                deadline=11.0,
+                wait_for_process_group=True,
+            )
+
+        assert completed is True
+        assert bytes(stdout) == payload
+        assert stderr == b""
+
+    def test_review_verify_timeout_grace_emits_due_heartbeats_until_group_exits(self) -> None:
+        samples: list[LongPhaseProgress] = []
+        now = 0.0
+
+        def fake_sleep(seconds: float) -> None:
+            nonlocal now
+            now += seconds
+
+        def fake_monotonic() -> float:
+            return now
+
+        def fake_group_alive(process: object) -> bool:
+            del process
+            return now < 3.05
+
+        read_fd, write_fd = os.pipe()
+        process = SimpleNamespace(pid=12345, stdout=os.fdopen(read_fd, "rb", buffering=0), stderr=None, poll=lambda: 0)
+        heartbeat = _LongPhaseHeartbeatState(
+            process=process,
+            started_at=0.0,
+            threshold_seconds=1,
+            interval_seconds=1,
+            on_heartbeat=samples.append,
+            clock=fake_monotonic,
+            cpu_sampler=lambda _pid: 1.0,
+        )
+        try:
+            os.close(write_fd)
+            with (
+                patch("gza.runner.time.monotonic", side_effect=fake_monotonic),
+                patch("gza.runner.time.sleep", side_effect=fake_sleep),
+                patch("gza.runner._review_verify_process_group_alive", side_effect=fake_group_alive),
+            ):
+                _stdout, _stderr, exited = _wait_for_review_verify_process_group_exit(
+                    process,
+                    grace_seconds=5,
+                    initial_stdout=None,
+                    initial_stderr=None,
+                    heartbeat=heartbeat,
+                )
+        finally:
+            process.stdout.close()
+
+        assert exited is True
+        assert [int(sample.elapsed_seconds) for sample in samples] == [1, 2, 3]
 
     def test_run_review_verify_commands_for_cross_project_runs_each_affected_project(self, tmp_path: Path):
         project_dir = tmp_path / "services" / "foo"
@@ -21089,8 +21586,8 @@ class TestLoadDotenv:
     ) -> None:
         """Provider execution sees project dotenv values without mutating supervisor env."""
         from gza.providers import RunResult
-        from gza.runtime_context import RuntimeExecutionContext
         from gza.runner import _call_provider_run
+        from gza.runtime_context import RuntimeExecutionContext
 
         project_a = tmp_path / "a"
         project_b = tmp_path / "b"
@@ -21150,8 +21647,8 @@ class TestLoadDotenv:
     ) -> None:
         """Explicit provider envs isolate interleaved runtime calls from supervisor state."""
         from gza.providers import RunResult
-        from gza.runtime_context import RuntimeExecutionContext
         from gza.runner import _call_provider_run
+        from gza.runtime_context import RuntimeExecutionContext
 
         project_a = tmp_path / "a"
         project_b = tmp_path / "b"
@@ -21219,8 +21716,8 @@ class TestLoadDotenv:
         assert os.environ["GIT_DIR"] == str(ambient_pwd / ".git")
 
     def test_provider_run_typeerror_after_side_effect_is_not_retried(self, tmp_path: Path) -> None:
-        from gza.runtime_context import RuntimeExecutionContext
         from gza.runner import _call_provider_run
+        from gza.runtime_context import RuntimeExecutionContext
 
         project = tmp_path / "project"
         project.mkdir()

@@ -131,7 +131,14 @@ from ..recovery_transients import (
     classify_transient_recovery_terminal,
     compute_transient_recovery_backoff_seconds,
 )
-from ..runner import require_execution_route_for_task
+from ..runner import (
+    LongPhaseHeartbeat,
+    LongPhaseProgress,
+    _long_phase_no_progress,
+    _read_process_tree_cpu_seconds,
+    finish_long_phase_heartbeat,
+    require_execution_route_for_task,
+)
 from ..runtime_context import RuntimeExecutionContext
 from ..source_followup import collect_non_dropped_implement_source_ids
 from ..status_ops import apply_manual_task_status
@@ -4361,6 +4368,15 @@ class _CandidateReworkBatchContext:
     batch_size: int
 
 
+def _format_candidate_batch_heartbeat_subject(staged_batch: Sequence[_WatchBatchStagedMerge]) -> str:
+    task_ids = [str(entry.display_task.id) for entry in staged_batch if entry.display_task.id is not None]
+    if not task_ids:
+        return "batch:unknown"
+    if len(task_ids) <= 5:
+        return "batch:" + ",".join(task_ids)
+    return "batch:" + ",".join(task_ids[:5]) + f",+{len(task_ids) - 5}"
+
+
 @dataclass(frozen=True)
 class _MergeConflictRebaseRoutingResult:
     handled: bool
@@ -4800,12 +4816,18 @@ def _run_isolated_merge_batch(
     ],
     note_handled_child_task_id: Callable[[str], None],
     defer_lifecycle_start: Callable[["_DeferredWatchDispatchStart"], None],
+    worker_heartbeat: Callable[[], None] | None = None,
 ) -> tuple[bool, bool, MainIntegrationVerifyRemediation | None]:
     del dry_run
     staged_batch: list[_WatchBatchStagedMerge] = []
     batch_conflict_rebases: list[_BatchConflictRebaseDispatch] = []
     batch_conflict_rebase_task_ids: set[str] = set()
     reconciled_work_done = False
+    long_phase_reporter = _WatchLongPhaseReporter(
+        log=log,
+        threshold_seconds=config.watch.long_phase_threshold_seconds,
+        interval_seconds=config.watch.heartbeat_interval_seconds,
+    )
 
     def _restore_isolated_checkout_to_tip(tip: str) -> None:
         try:
@@ -4830,21 +4852,33 @@ def _run_isolated_merge_batch(
                 merge_status_before = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get("merge_status")
 
         def _stage_current_merge() -> _StagedIsolatedMergeAction | _MergeActionResult:
-            return _stage_isolated_merge_action(
-                config,
-                store,
-                git,
-                task,
-                action,
-                target_branch=target_branch,
-                current_branch=current_branch,
-                merge_git=merge_git,
-                merge_current_branch=target_branch,
-                merge_preflight_ref=isolated_tip_before_stage,
-                already_merged_behavior="mark_merged",
-                merge_source=MERGE_SOURCE_WATCH,
-                quiet_mechanics=True,
+            heartbeat = _make_watch_merge_heartbeat(
+                long_phase_reporter,
+                phase="merge:stage",
+                subject_id=str(display_task.id),
+                worker_heartbeat=worker_heartbeat,
             )
+            try:
+                return _stage_isolated_merge_action(
+                    config,
+                    store,
+                    git,
+                    task,
+                    action,
+                    target_branch=target_branch,
+                    current_branch=current_branch,
+                    merge_git=merge_git,
+                    merge_current_branch=target_branch,
+                    merge_preflight_ref=isolated_tip_before_stage,
+                    already_merged_behavior="mark_merged",
+                    merge_source=MERGE_SOURCE_WATCH,
+                    quiet_mechanics=True,
+                    heartbeat_threshold_seconds=config.watch.long_phase_threshold_seconds,
+                    heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
+                    on_heartbeat=heartbeat,
+                )
+            finally:
+                _finish_watch_merge_heartbeat(heartbeat)
 
         isolated_tip_before_stage = _run_with_optional_stdout_suppressed(quiet, lambda: merge_git.rev_parse("HEAD"))
         staged_result = _run_with_optional_stdout_suppressed(quiet, _stage_current_merge)
@@ -5011,6 +5045,7 @@ def _run_isolated_merge_batch(
     if not staged_batch:
         return reconciled_work_done, False, None
 
+    batch_heartbeat_subject = _format_candidate_batch_heartbeat_subject(staged_batch)
     combined_candidate = _run_with_optional_stdout_suppressed(
         quiet,
         lambda: check_candidate_integration_verify(
@@ -5019,6 +5054,15 @@ def _run_isolated_merge_batch(
             reason="watch-pre-merge-batch",
             red_reruns=2,
             env=env,
+            heartbeat_threshold_seconds=config.watch.long_phase_threshold_seconds,
+            heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
+            heartbeat_for_attempt=lambda _attempt: _make_composite_long_phase_heartbeat(
+                long_phase_reporter.start(
+                    "verify:candidate-batch",
+                    batch_heartbeat_subject,
+                ),
+                worker_heartbeat,
+            ),
         ),
     )
     if combined_candidate.evidence.verify_status == "passed":
@@ -5128,21 +5172,33 @@ def _run_isolated_merge_batch(
     for staged_entry in staged_batch:
 
         def _replay_staged_merge() -> _StagedIsolatedMergeAction | _MergeActionResult:
-            return _stage_isolated_merge_action(
-                config,
-                store,
-                git,
-                staged_entry.task,
-                staged_entry.action,
-                target_branch=target_branch,
-                current_branch=current_branch,
-                merge_git=merge_git,
-                merge_current_branch=target_branch,
-                merge_preflight_ref="HEAD",
-                already_merged_behavior="mark_merged",
-                merge_source=MERGE_SOURCE_WATCH,
-                quiet_mechanics=True,
+            heartbeat = _make_watch_merge_heartbeat(
+                long_phase_reporter,
+                phase="merge:prefix-replay",
+                subject_id=str(staged_entry.display_task.id),
+                worker_heartbeat=worker_heartbeat,
             )
+            try:
+                return _stage_isolated_merge_action(
+                    config,
+                    store,
+                    git,
+                    staged_entry.task,
+                    staged_entry.action,
+                    target_branch=target_branch,
+                    current_branch=current_branch,
+                    merge_git=merge_git,
+                    merge_current_branch=target_branch,
+                    merge_preflight_ref="HEAD",
+                    already_merged_behavior="mark_merged",
+                    merge_source=MERGE_SOURCE_WATCH,
+                    quiet_mechanics=True,
+                    heartbeat_threshold_seconds=config.watch.long_phase_threshold_seconds,
+                    heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
+                    on_heartbeat=heartbeat,
+                )
+            finally:
+                _finish_watch_merge_heartbeat(heartbeat)
 
         replay = _run_with_optional_stdout_suppressed(quiet, _replay_staged_merge)
         if not isinstance(replay, _StagedIsolatedMergeAction):
@@ -5157,6 +5213,15 @@ def _run_isolated_merge_batch(
                 reason=f"watch-pre-merge-prefix-{staged_entry.display_task.id}",
                 red_reruns=2,
                 env=env,
+                heartbeat_threshold_seconds=config.watch.long_phase_threshold_seconds,
+                heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
+                heartbeat_for_attempt=lambda _attempt: _make_composite_long_phase_heartbeat(
+                    long_phase_reporter.start(
+                        "verify:candidate-prefix",
+                        str(staged_entry.display_task.id),
+                    ),
+                    worker_heartbeat,
+                ),
             ),
         )
         if prefix_check.evidence.verify_status != "passed":
@@ -5203,15 +5268,31 @@ def _run_isolated_merge_batch(
     return reconciled_work_done, False, None
 
 
-def _sleep_interruptibly(seconds: int, stop_requested: Callable[[], bool], *, quantum: float = 1.0) -> None:
+def _sleep_interruptibly(
+    seconds: int,
+    stop_requested: Callable[[], bool],
+    *,
+    quantum: float = 1.0,
+    on_interval: Callable[[], None] | None = None,
+    interval_seconds: int | None = None,
+) -> None:
     """Sleep for up to `seconds`, exiting early if stop was requested."""
     remaining = float(seconds)
+    next_interval = float(interval_seconds) if interval_seconds is not None else None
+    elapsed = 0.0
     while remaining > 0:
         if stop_requested():
             return
         step = min(quantum, remaining)
+        if next_interval is not None:
+            step = min(step, max(0.0, next_interval - elapsed))
         time.sleep(step)
         remaining -= step
+        elapsed += step
+        if on_interval is not None and next_interval is not None and elapsed >= next_interval:
+            on_interval()
+            assert interval_seconds is not None
+            next_interval += float(interval_seconds)
 
 
 def _task_snapshot(store: SqliteTaskStore) -> dict[str, dict[str, str | None]]:
@@ -5795,6 +5876,150 @@ def _format_watch_duration(seconds: float) -> str:
     return f"{secs}s"
 
 
+def _format_watch_cpu_delta(seconds: float) -> str:
+    if 0.0 < seconds < 1.0:
+        return f"{seconds:.1f}s"
+    return _format_watch_duration(seconds)
+
+
+class _WatchLongPhaseReporter:
+    _duration_history_by_log: dict[Path, dict[tuple[str, str], float]] = {}
+
+    def __init__(self, *, log: _WatchLog, threshold_seconds: int, interval_seconds: int) -> None:
+        self.log = log
+        self.threshold_seconds = threshold_seconds
+        self.interval_seconds = interval_seconds
+        self._last_durations = self._duration_history_by_log.setdefault(log.path, {})
+        self._starts: dict[tuple[str, str], float] = {}
+
+    def start(self, phase: str, subject_id: str) -> LongPhaseHeartbeat:
+        key = (phase, subject_id)
+        self._starts[key] = time.monotonic()
+        prior = self._last_durations.get(key)
+        prior_suffix = f" (last run of this phase took {_format_watch_duration(prior)})" if prior is not None else ""
+        self.log.emit("START", f"{phase} {subject_id}{prior_suffix}")
+
+        return _WatchLongPhaseHeartbeat(self, phase, subject_id)
+
+    def finish(self, phase: str, subject_id: str) -> None:
+        key = (phase, subject_id)
+        started = self._starts.pop(key, None)
+        if started is not None:
+            self._last_durations[key] = time.monotonic() - started
+
+    def _format_busy_line(self, phase: str, subject_id: str, progress: LongPhaseProgress) -> str:
+        elapsed = _format_watch_duration(progress.elapsed_seconds)
+        cpu = (
+            "cpu unavailable"
+            if progress.cpu_delta_seconds is None
+            else f"cpu +{_format_watch_cpu_delta(progress.cpu_delta_seconds)}"
+        )
+        if progress.output_lines_delta > 0:
+            output = f"out +{progress.output_lines_delta} lines"
+        else:
+            output = f"out +{progress.output_bytes_delta} bytes"
+        no_progress = " (NO PROGRESS)" if progress.no_progress else ""
+        return f"{phase} {subject_id} elapsed {elapsed} {cpu} {output}{no_progress}"
+
+class _WatchLongPhaseHeartbeat:
+    def __init__(self, reporter: _WatchLongPhaseReporter, phase: str, subject_id: str) -> None:
+        self._reporter = reporter
+        self._phase = phase
+        self._subject_id = subject_id
+        self._finished = False
+
+    def __call__(self, progress: LongPhaseProgress) -> None:
+        self._reporter.log.emit("BUSY", self._reporter._format_busy_line(self._phase, self._subject_id, progress))
+
+    def finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        self._reporter.finish(self._phase, self._subject_id)
+
+
+class _CompositeLongPhaseHeartbeat:
+    def __init__(
+        self,
+        foreground: LongPhaseHeartbeat,
+        worker_heartbeat: Callable[[], None] | None,
+    ) -> None:
+        self._foreground = foreground
+        self._worker_heartbeat = worker_heartbeat
+        self._finished = False
+
+    def __call__(self, progress: LongPhaseProgress) -> None:
+        self._foreground(progress)
+        self.service_due()
+
+    def service_due(self) -> None:
+        if self._worker_heartbeat is not None:
+            self._worker_heartbeat()
+
+    def seconds_until_next(self) -> float | None:
+        if self._worker_heartbeat is None:
+            return None
+        seconds_until_next = getattr(self._worker_heartbeat, "seconds_until_next", None)
+        if not callable(seconds_until_next):
+            return 0.0
+        return seconds_until_next()
+
+    def finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        finish = getattr(self._foreground, "finish", None)
+        if callable(finish):
+            finish()
+
+
+def _make_composite_long_phase_heartbeat(
+    foreground: LongPhaseHeartbeat,
+    worker_heartbeat: Callable[[], None] | None,
+) -> LongPhaseHeartbeat:
+    if worker_heartbeat is None:
+        return foreground
+    return _CompositeLongPhaseHeartbeat(foreground, worker_heartbeat)
+
+
+def _make_watch_lifecycle_heartbeat_factory(
+    reporter: _WatchLongPhaseReporter,
+    *,
+    worker_heartbeat: Callable[[], None] | None = None,
+) -> Callable[[str, DbTask], LongPhaseHeartbeat | None]:
+    def _heartbeat_for_subject(phase: str, task: DbTask) -> LongPhaseHeartbeat | None:
+        if task.id is None:
+            return None
+        return _make_composite_long_phase_heartbeat(reporter.start(phase, str(task.id)), worker_heartbeat)
+
+    return _heartbeat_for_subject
+
+
+def _make_watch_merge_heartbeat(
+    reporter: _WatchLongPhaseReporter,
+    *,
+    phase: str,
+    subject_id: str,
+    worker_heartbeat: Callable[[], None] | None,
+) -> LongPhaseHeartbeat:
+    return _make_composite_long_phase_heartbeat(
+        reporter.start(phase, subject_id),
+        worker_heartbeat,
+    )
+
+
+def _finish_watch_merge_heartbeat(heartbeat: LongPhaseHeartbeat | None) -> None:
+    finish_long_phase_heartbeat(heartbeat)
+
+
+def _watch_lifecycle_verify_phase_label(phase: str) -> str:
+    if phase == "verify":
+        return "verify:lifecycle"
+    if phase.startswith("verify:"):
+        return phase
+    return f"verify:{phase}"
+
+
 def _resolve_main_verify_target_head(git: Git, target_branch: str, log: "_WatchLog") -> str | None:
     head_sha: str | None = None
     try:
@@ -5857,6 +6082,7 @@ def _run_watch_main_integration_verify(
     red_reruns: int,
     suppress_verify_stdout: bool = False,
     env: Mapping[str, str] | None = None,
+    worker_heartbeat: Callable[[], None] | None = None,
 ) -> MainIntegrationVerifyCheck:
     head_sha = _resolve_main_verify_target_head(git, target_branch, log)
     target = _format_main_verify_target(target_branch, head_sha)
@@ -5870,6 +6096,11 @@ def _run_watch_main_integration_verify(
     )
     started = time.perf_counter()
     visible_stdout = sys.stdout
+    long_phase_reporter = _WatchLongPhaseReporter(
+        log=log,
+        threshold_seconds=config.watch.long_phase_threshold_seconds,
+        interval_seconds=config.watch.heartbeat_interval_seconds,
+    )
 
     def log_initial_run(attempt: int, total: int) -> None:
         message = (
@@ -5902,6 +6133,15 @@ def _run_watch_main_integration_verify(
             env=env or getattr(git, "env", None) or RuntimeExecutionContext.from_config(config).env,
             on_initial_run_start=log_initial_run,
             on_red_rerun_start=log_red_rerun,
+            heartbeat_threshold_seconds=config.watch.long_phase_threshold_seconds,
+            heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
+            heartbeat_for_attempt=lambda _attempt: _make_composite_long_phase_heartbeat(
+                long_phase_reporter.start(
+                    "verify:main",
+                    target_branch,
+                ),
+                worker_heartbeat,
+            ),
         ),
     )
     elapsed = _format_watch_duration(time.perf_counter() - started)
@@ -6392,6 +6632,182 @@ def _format_sleep_message(
     if confirmed_start_count > 0:
         message += f"; +{confirmed_start_count} started this pass"
     return message + ")"
+
+
+@dataclass
+class _WatchWorkerHeartbeatState:
+    phase: str
+    subject_id: str
+    worker_id: str
+    pid: int
+    started_at_monotonic: float
+    next_at: float
+    last_cpu: float | None
+    log_file: Path | None
+    last_log_size: int | None
+
+
+class _WatchWorkerHeartbeatMonitor:
+    def __init__(
+        self,
+        *,
+        config: Config,
+        store: SqliteTaskStore,
+        log: _WatchLog,
+        threshold_seconds: int,
+        interval_seconds: int,
+        clock: Callable[[], float] = time.monotonic,
+        cpu_sampler: Callable[[int], float | None] = _read_process_tree_cpu_seconds,
+    ) -> None:
+        self.config = config
+        self.store = store
+        self.log = log
+        self.threshold_seconds = threshold_seconds
+        self.interval_seconds = max(1, interval_seconds)
+        self.clock = clock
+        self.cpu_sampler = cpu_sampler
+        self._states: dict[str, _WatchWorkerHeartbeatState] = {}
+        self._next_scan_at: float | None = None
+
+    def __call__(self) -> None:
+        now = self.clock()
+        live = self._live_workers(now)
+        self._next_scan_at = now + self.interval_seconds
+        live_keys = {key for key, _worker, _task in live}
+        for stale_key in tuple(self._states):
+            if stale_key not in live_keys:
+                self._states.pop(stale_key, None)
+        for key, worker, task in live:
+            state = self._states.get(key)
+            if state is None:
+                state = self._start_worker_state(worker, task, now)
+                self._states[key] = state
+                continue
+            else:
+                state.pid = worker.pid
+            if now < state.next_at:
+                continue
+            self._emit_busy(state, now)
+            while state.next_at <= now:
+                state.next_at += self.interval_seconds
+
+    def seconds_until_next(self) -> float:
+        now = self.clock()
+        due_times = [state.next_at for state in self._states.values()]
+        if self._next_scan_at is None:
+            due_times.append(now)
+        else:
+            due_times.append(self._next_scan_at)
+        return max(0.0, min(due_times) - now)
+
+    def _live_workers(self, now: float) -> list[tuple[str, Any, DbTask | None]]:
+        del now
+        registry = WorkerRegistry(self.config.workers_path)
+        live: list[tuple[str, Any, DbTask | None]] = []
+        for worker in registry.list_all(include_completed=False):
+            if worker.status != "running" or not registry.is_running(worker.worker_id):
+                continue
+            task = self.store.get(worker.task_id) if worker.task_id is not None else None
+            key_subject = worker.task_id or f"worker:{worker.worker_id}"
+            live.append((f"{worker.worker_id}:{key_subject}", worker, task))
+        return live
+
+    def _start_worker_state(self, worker: Any, task: DbTask | None, now: float) -> _WatchWorkerHeartbeatState:
+        started_at = _worker_started_at_monotonic(worker, task, now)
+        phase, subject_id = _worker_heartbeat_phase_subject(worker, task)
+        log_file = _worker_progress_log_file(self.config, worker, task)
+        state = _WatchWorkerHeartbeatState(
+            phase=phase,
+            subject_id=subject_id,
+            worker_id=str(worker.worker_id),
+            pid=int(worker.pid),
+            started_at_monotonic=started_at,
+            next_at=started_at + self.threshold_seconds,
+            last_cpu=self.cpu_sampler(int(worker.pid)),
+            log_file=log_file,
+            last_log_size=_read_file_size(log_file),
+        )
+        self.log.emit("START", f"{phase} {subject_id} elapsed {_format_watch_duration(now - started_at)}")
+        return state
+
+    def _emit_busy(self, state: _WatchWorkerHeartbeatState, now: float) -> None:
+        current_cpu = self.cpu_sampler(state.pid)
+        cpu_delta: float | None = None
+        if current_cpu is not None and state.last_cpu is not None:
+            cpu_delta = max(0.0, current_cpu - state.last_cpu)
+        current_log_size = _read_file_size(state.log_file)
+        log_delta = 0
+        if current_log_size is not None and state.last_log_size is not None:
+            log_delta = max(0, current_log_size - state.last_log_size)
+        cpu = "cpu unavailable" if cpu_delta is None else f"cpu +{_format_watch_cpu_delta(cpu_delta)}"
+        no_progress = _long_phase_no_progress(
+            output_bytes_delta=log_delta,
+            output_lines_delta=0,
+            cpu_delta_seconds=cpu_delta,
+        )
+        no_progress_suffix = " (NO PROGRESS)" if no_progress else ""
+        self.log.emit(
+            "BUSY",
+            (
+                f"{state.phase} {state.subject_id} elapsed {_format_watch_duration(now - state.started_at_monotonic)} "
+                f"{cpu} log +{log_delta} bytes{no_progress_suffix}"
+            ),
+        )
+        state.last_cpu = current_cpu
+        state.last_log_size = current_log_size
+
+
+def _worker_started_at_monotonic(worker: Any, task: DbTask | None, now: float) -> float:
+    started_at = task.started_at if task is not None and task.started_at is not None else None
+    if started_at is None and getattr(worker, "started_at", None):
+        try:
+            started_at = datetime.fromisoformat(str(worker.started_at))
+        except ValueError:
+            started_at = None
+    if started_at is None:
+        return now
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=UTC)
+    elapsed = max(0.0, (datetime.now(UTC) - started_at).total_seconds())
+    return now - elapsed
+
+
+def _worker_heartbeat_phase_subject(worker: Any, task: DbTask | None) -> tuple[str, str]:
+    task_id = str(task.id) if task is not None and task.id is not None else getattr(worker, "task_id", None)
+    if task is not None and task.task_type == "rebase":
+        return "rebase", str(task_id)
+    if task_id:
+        return "agent:execution", str(task_id)
+    return "agent:execution", f"worker:{worker.worker_id}"
+
+
+def _worker_progress_log_file(config: Config, worker: Any, task: DbTask | None) -> Path | None:
+    raw_log = (task.log_file if task is not None else None) or getattr(worker, "log_file", None) or getattr(
+        worker, "startup_log_file", None
+    )
+    if not raw_log:
+        return None
+    path = Path(str(raw_log))
+    return path if path.is_absolute() else config.project_dir / path
+
+
+def _read_file_size(path: Path | None) -> int | None:
+    if path is None:
+        return None
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def _make_worker_sleep_heartbeat(config: Config, store: SqliteTaskStore, log: _WatchLog) -> Callable[[], None]:
+    return _WatchWorkerHeartbeatMonitor(
+        config=config,
+        store=store,
+        log=log,
+        threshold_seconds=config.watch.long_phase_threshold_seconds,
+        interval_seconds=config.watch.heartbeat_interval_seconds,
+    )
 
 
 @dataclass
@@ -9714,6 +10130,7 @@ def _dispatch_scoped_watch_once(
     direct_phase_only: bool = False,
     skip_runtime_reconcile: bool = False,
     skip_stale_no_progress_reconcile: bool = False,
+    worker_heartbeat: Callable[[], None] | None = None,
 ) -> _CycleResult:
     """Run one scoped watch dispatch pass through the shared watch execution path."""
     return _run_cycle(
@@ -9750,6 +10167,7 @@ def _dispatch_scoped_watch_once(
         direct_phase_only=direct_phase_only,
         skip_runtime_reconcile=skip_runtime_reconcile,
         skip_stale_no_progress_reconcile=skip_stale_no_progress_reconcile,
+        worker_heartbeat=worker_heartbeat,
     )
 
 
@@ -9790,6 +10208,7 @@ def _run_cycle(
     direct_phase_only: bool = False,
     skip_runtime_reconcile: bool = False,
     skip_stale_no_progress_reconcile: bool = False,
+    worker_heartbeat: Callable[[], None] | None = None,
 ) -> _CycleResult:
     runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
     tags = normalize_tag_filters(tags)
@@ -9876,6 +10295,19 @@ def _run_cycle(
     reserved_recovery_slots = 0
     remaining_new_worker_starts = max(0, new_worker_start_cap) if new_worker_start_cap is not None else None
     project_analysis_invalidated = False
+    long_phase_reporter = _WatchLongPhaseReporter(
+        log=log,
+        threshold_seconds=config.watch.long_phase_threshold_seconds,
+        interval_seconds=config.watch.heartbeat_interval_seconds,
+    )
+    lifecycle_heartbeat_factory = _make_watch_lifecycle_heartbeat_factory(
+        long_phase_reporter,
+        worker_heartbeat=worker_heartbeat,
+    )
+
+    def _emit_worker_heartbeat() -> None:
+        if worker_heartbeat is not None:
+            worker_heartbeat()
 
     def _check_canonical_checkout_boundary(action: str) -> None:
         if dry_run:
@@ -9905,6 +10337,7 @@ def _run_cycle(
         )
 
     if emit_cycle_header:
+        _emit_worker_heartbeat()
         log.emit(
             "WAKE",
             _format_wake_message(
@@ -9923,6 +10356,8 @@ def _run_cycle(
         usage_message = _format_watch_usage_message(config, store, runtime_context=runtime_context)
         if usage_message is not None:
             log.emit("INFO", usage_message)
+    else:
+        _emit_worker_heartbeat()
 
     def _reserve_watch_launch(worker_label: str, subject_task_id: str) -> LaunchPermit | None:
         try:
@@ -10313,6 +10748,10 @@ def _run_cycle(
             t,
             target_branch=target_branch,
         ),
+        heartbeat_for_lifecycle_phase=lambda phase, task: lifecycle_heartbeat_factory(
+            _watch_lifecycle_verify_phase_label(phase),
+            task,
+        ),
         runtime_context=runtime_context,
     )
     current_branch = git.current_branch()
@@ -10394,6 +10833,7 @@ def _run_cycle(
             reason="watch-main-verify",
             red_reruns=2,
             env=runtime_context.env,
+            worker_heartbeat=worker_heartbeat,
         )
         main_verify_dispatch_state_changed = _retire_cleared_main_verify_remediations(
             store=store,
@@ -10639,6 +11079,7 @@ def _run_cycle(
                         observe_dispatch=_observe_dispatch,
                         note_handled_child_task_id=step1_handled_child_task_ids.add,
                         defer_lifecycle_start=deferred_lifecycle_starts.append,
+                        worker_heartbeat=worker_heartbeat,
                     )
                     _set_active_main_verify_remediation(active_main_verify_remediation)
                     if batch_work_done:
@@ -10649,6 +11090,7 @@ def _run_cycle(
                     batch_processed = len(leading_merge_decisions)
 
         for lifecycle_execution_decision in execution_decisions[batch_processed:]:
+            _emit_worker_heartbeat()
             row, task, action = lifecycle_execution_decision.item
             action = dict(lifecycle_execution_decision.action)
             display_task = row.owner_task
@@ -10861,23 +11303,35 @@ def _run_cycle(
                         merge_status_before = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
                             "merge_status"
                         )
-                merge_result = _run_with_optional_stdout_suppressed(
-                    quiet,
-                    lambda: _execute_merge_action(
-                        config,
-                        store,
-                        git,
-                        cast(DbTask, task),
-                        action,
-                        target_branch=target_branch,
-                        current_branch=current_branch,
-                        merge_git=merge_execution_git,
-                        merge_current_branch=merge_execution_branch,
-                        already_merged_behavior="mark_merged",
-                        merge_source=MERGE_SOURCE_WATCH,
-                        quiet_mechanics=True,
-                    ),
-                )
+                def _execute_current_merge() -> _MergeActionResult:
+                    heartbeat = _make_watch_merge_heartbeat(
+                        long_phase_reporter,
+                        phase="merge:execute",
+                        subject_id=str(display_task.id),
+                        worker_heartbeat=worker_heartbeat,
+                    )
+                    try:
+                        return _execute_merge_action(
+                            config,
+                            store,
+                            git,
+                            cast(DbTask, task),
+                            action,
+                            target_branch=target_branch,
+                            current_branch=current_branch,
+                            merge_git=merge_execution_git,
+                            merge_current_branch=merge_execution_branch,
+                            already_merged_behavior="mark_merged",
+                            merge_source=MERGE_SOURCE_WATCH,
+                            quiet_mechanics=True,
+                            heartbeat_threshold_seconds=config.watch.long_phase_threshold_seconds,
+                            heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
+                            on_heartbeat=heartbeat,
+                        )
+                    finally:
+                        _finish_watch_merge_heartbeat(heartbeat)
+
+                merge_result = _run_with_optional_stdout_suppressed(quiet, _execute_current_merge)
                 rc = merge_result.rc
                 consumed_exempt_terminal_attempt = False
                 if rc == 0:
@@ -10911,6 +11365,7 @@ def _run_cycle(
                         reason="watch-post-merge",
                         red_reruns=2,
                         env=runtime_context.env,
+                        worker_heartbeat=worker_heartbeat,
                     )
                     main_verify_dispatch_state_changed = _retire_cleared_main_verify_remediations(
                         store=store,
@@ -13604,6 +14059,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
         needs_initial_preview = not skip_confirm
         pending_first_cycle_plan: _WatchCyclePlan | None = None
         preview_cycle_open = False
+        worker_heartbeat = _make_worker_sleep_heartbeat(runtime.config, runtime.store, runtime.log)
+        worker_heartbeat()
+
+        def _watch_sleep_stop_requested() -> bool:
+            worker_heartbeat()
+            return stop_requested
 
         def _active_failure_owner_ids() -> frozenset[str]:
             return runtime.active_failure_owner_ids()
@@ -13751,6 +14212,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
             if watch_session_recorded:
                 _heartbeat_watch_session(store=runtime.store, log=runtime.log, owner_pid=watch_pid)
+                worker_heartbeat()
 
             if not _system_can_run_tasks(runtime.config, runtime_context=runtime.runtime_context):
                 if preview_cycle_open:
@@ -13812,7 +14274,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 runtime.system_hold_active = True
                 if stop_requested:
                     break
-                _sleep_interruptibly(poll, lambda: stop_requested)
+                _sleep_interruptibly(poll, _watch_sleep_stop_requested)
                 continue
 
             if runtime.system_hold_active:
@@ -13839,7 +14301,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                 runtime.git_health_hold_active = True
                 if stop_requested:
                     break
-                _sleep_interruptibly(poll, lambda: stop_requested)
+                _sleep_interruptibly(poll, _watch_sleep_stop_requested)
                 continue
 
             if runtime.git_health_hold_active:
@@ -13919,6 +14381,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     seen_active_recovery_subject_ids=runtime.seen_active_recovery_subject_ids,
                     git=runtime.git,
                     runtime_context=runtime.runtime_context,
+                    worker_heartbeat=worker_heartbeat,
                 )
             else:
                 cycle_result = runtime.run_cycle(
@@ -13943,6 +14406,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     known_effective_scoped_owner_ids=effective_scoped_owner_ids,
                     excluded_owner_ids=excluded_owner_ids,
                     seen_active_recovery_subject_ids=runtime.seen_active_recovery_subject_ids,
+                    worker_heartbeat=worker_heartbeat,
                 )
             pending_first_cycle_plan = None
             preview_cycle_open = False
@@ -14023,7 +14487,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
             if stop_requested:
                 break
-            _sleep_interruptibly(poll, lambda: stop_requested)
+            _sleep_interruptibly(poll, _watch_sleep_stop_requested)
 
         if result_code is not None:
             pass

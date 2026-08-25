@@ -193,6 +193,8 @@ from .worktree_roots import managed_worktree_root_paths
 
 logger = logging.getLogger(__name__)
 
+_ORIGINAL_SUBPROCESS_POPEN = subprocess.Popen
+
 REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND = "review_blocker_resolution"
 REVIEW_BLOCKER_RESOLUTION_ARTIFACT_SCHEMA_VERSION = 1
 NOOP_IMPROVE_KIND_VERIFY_ONLY = "verify_only"
@@ -4221,6 +4223,259 @@ class _ReviewVerifyCommandRun:
     forced_kill: bool = False
 
 
+@dataclass(frozen=True)
+class LongPhaseProgress:
+    """Operator-facing progress sample for a long child process."""
+
+    elapsed_seconds: float
+    cpu_delta_seconds: float | None
+    output_bytes_delta: int
+    output_lines_delta: int
+    no_progress: bool
+
+
+LongPhaseHeartbeat = Callable[[LongPhaseProgress], None]
+
+
+def finish_long_phase_heartbeat(heartbeat: LongPhaseHeartbeat | None) -> None:
+    """Finalize heartbeat state for callbacks that retain completed duration history."""
+    if heartbeat is None:
+        return
+    finish = getattr(heartbeat, "finish", None)
+    if callable(finish):
+        finish()
+
+
+def _format_seconds_for_busy(seconds: float) -> str:
+    elapsed = max(0, int(seconds))
+    minutes = elapsed // 60
+    secs = elapsed % 60
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _read_linux_process_cpu_seconds(pid: int) -> float | None:
+    if os.name != "posix":
+        return None
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text()
+        fields = stat_text.rsplit(") ", 1)[1].split()
+        ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        return (int(fields[11]) + int(fields[12]) + int(fields[13]) + int(fields[14])) / float(ticks)
+    except (OSError, IndexError, KeyError, TypeError, ValueError):
+        return None
+
+
+def _read_darwin_cpu_time_seconds(value: str) -> float | None:
+    """Parse Darwin `ps` cumulative CPU time (`[[dd-]hh:]mm:ss`)."""
+    value = value.strip()
+    if not value:
+        return None
+    days = 0
+    if "-" in value:
+        day_text, value = value.split("-", 1)
+        try:
+            days = int(day_text)
+        except ValueError:
+            return None
+    parts = value.split(":")
+    try:
+        if len(parts) == 2:
+            hours = 0
+            minutes, seconds = (int(part) for part in parts)
+        elif len(parts) == 3:
+            hours, minutes, seconds = (int(part) for part in parts)
+        else:
+            return None
+    except ValueError:
+        return None
+    return float((((days * 24) + hours) * 60 + minutes) * 60 + seconds)
+
+
+def _read_darwin_process_tree_cpu_seconds(
+    pid: int,
+    *,
+    ps_runner: Callable[[], subprocess.CompletedProcess[str]] | None = None,
+) -> float | None:
+    """Return CPU seconds for a Darwin process and its live descendants."""
+    if ps_runner is None:
+        def _run_ps() -> subprocess.CompletedProcess[str]:
+            process = _ORIGINAL_SUBPROCESS_POPEN(
+                ["ps", "-axo", "pid=,ppid=,time="],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            stdout, stderr = process.communicate()
+            return subprocess.CompletedProcess(process.args, process.returncode, stdout=stdout, stderr=stderr)
+
+        ps_runner = _run_ps
+    try:
+        result = ps_runner()
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+
+    children_by_parent: dict[int, list[int]] = {}
+    cpu_by_pid: dict[int, float] = {}
+    for raw_line in result.stdout.splitlines():
+        fields = raw_line.split(None, 2)
+        if len(fields) != 3:
+            continue
+        try:
+            child_pid = int(fields[0])
+            parent_pid = int(fields[1])
+        except ValueError:
+            continue
+        cpu = _read_darwin_cpu_time_seconds(fields[2])
+        if cpu is None:
+            continue
+        cpu_by_pid[child_pid] = cpu
+        children_by_parent.setdefault(parent_pid, []).append(child_pid)
+
+    total = 0.0
+    sampled_any = False
+    seen: set[int] = set()
+    stack = [pid]
+    while stack:
+        current_pid = stack.pop()
+        if current_pid in seen:
+            continue
+        seen.add(current_pid)
+        cpu = cpu_by_pid.get(current_pid)
+        if cpu is not None:
+            total += cpu
+            sampled_any = True
+        stack.extend(child for child in children_by_parent.get(current_pid, []) if child not in seen)
+    return total if sampled_any else None
+
+
+def _read_linux_process_tree_cpu_seconds(pid: int) -> float | None:
+    """Return CPU seconds for a Linux process and its live descendants."""
+    if os.name != "posix":
+        return None
+    seen: set[int] = set()
+
+    def _children_of(current_pid: int) -> list[int]:
+        children_path = Path(f"/proc/{current_pid}/task/{current_pid}/children")
+        try:
+            return [int(value) for value in children_path.read_text().split()]
+        except (OSError, ValueError):
+            return []
+
+    total = 0.0
+    sampled_any = False
+    stack = [pid]
+    while stack:
+        current_pid = stack.pop()
+        if current_pid in seen:
+            continue
+        seen.add(current_pid)
+        cpu = _read_linux_process_cpu_seconds(current_pid)
+        if cpu is not None:
+            total += cpu
+            sampled_any = True
+        stack.extend(child for child in _children_of(current_pid) if child not in seen)
+    return total if sampled_any else None
+
+
+def _read_process_tree_cpu_seconds(pid: int) -> float | None:
+    """Return CPU seconds for a process and live descendants when supported."""
+    if sys.platform == "darwin":
+        return _read_darwin_process_tree_cpu_seconds(pid)
+    return _read_linux_process_tree_cpu_seconds(pid)
+
+
+def _long_phase_no_progress(
+    *,
+    output_bytes_delta: int,
+    output_lines_delta: int,
+    cpu_delta_seconds: float | None,
+) -> bool:
+    """Return whether supported liveness evidence was sampled and stayed flat."""
+    return (
+        output_bytes_delta == 0
+        and output_lines_delta == 0
+        and cpu_delta_seconds is not None
+        and cpu_delta_seconds <= 0.0
+    )
+
+
+class _LongPhaseHeartbeatState:
+    def __init__(
+        self,
+        *,
+        process: subprocess.Popen[Any],
+        started_at: float,
+        threshold_seconds: int,
+        interval_seconds: int,
+        on_heartbeat: LongPhaseHeartbeat | None,
+        clock: Callable[[], float] = time.monotonic,
+        cpu_sampler: Callable[[int], float | None] = _read_process_tree_cpu_seconds,
+    ) -> None:
+        self.process = process
+        self.started_at = started_at
+        self.threshold_seconds = threshold_seconds
+        self.interval_seconds = interval_seconds
+        self.on_heartbeat = on_heartbeat
+        self.clock = clock
+        self.cpu_sampler = cpu_sampler
+        self.next_at = started_at + threshold_seconds
+        self.last_cpu = cpu_sampler(process.pid)
+        self.output_bytes_since_last = 0
+        self.output_lines_since_last = 0
+
+    def note_output(self, chunk: bytes) -> None:
+        self.output_bytes_since_last += len(chunk)
+        self.output_lines_since_last += chunk.count(b"\n")
+
+    def seconds_until_next(self) -> float | None:
+        if self.on_heartbeat is None:
+            return None
+        timeouts = [max(0.0, self.next_at - self.clock())]
+        service_seconds_until_next = getattr(self.on_heartbeat, "seconds_until_next", None)
+        if callable(service_seconds_until_next):
+            service_timeout = service_seconds_until_next()
+            if service_timeout is not None:
+                timeouts.append(max(0.0, float(service_timeout)))
+        return min(timeouts)
+
+    def emit_due(self) -> None:
+        if self.on_heartbeat is None:
+            return
+        service_due = getattr(self.on_heartbeat, "service_due", None)
+        if callable(service_due):
+            service_due()
+        now = self.clock()
+        if now < self.next_at:
+            return
+        current_cpu = self.cpu_sampler(self.process.pid)
+        cpu_delta: float | None = None
+        if current_cpu is not None and self.last_cpu is not None:
+            cpu_delta = max(0.0, current_cpu - self.last_cpu)
+        no_progress = _long_phase_no_progress(
+            output_bytes_delta=self.output_bytes_since_last,
+            output_lines_delta=self.output_lines_since_last,
+            cpu_delta_seconds=cpu_delta,
+        )
+        self.on_heartbeat(
+            LongPhaseProgress(
+                elapsed_seconds=now - self.started_at,
+                cpu_delta_seconds=cpu_delta,
+                output_bytes_delta=self.output_bytes_since_last,
+                output_lines_delta=self.output_lines_since_last,
+                no_progress=no_progress,
+            )
+        )
+        self.last_cpu = current_cpu
+        self.output_bytes_since_last = 0
+        self.output_lines_since_last = 0
+        while self.next_at <= now:
+            self.next_at += self.interval_seconds
+
+
 def _resolve_review_verify_timeout_seconds(config: Config | object) -> int:
     """Return the configured autonomous review verify budget with fallback."""
     timeout_seconds = getattr(
@@ -4271,6 +4526,19 @@ def _signal_review_verify_process_group(process: subprocess.Popen[Any], sig: int
         return False
 
 
+def _reap_review_verify_process(process: subprocess.Popen[Any]) -> None:
+    """Best-effort reap for the tracked review verify shell process."""
+    wait = getattr(process, "wait", None)
+    if not callable(wait):
+        return
+    try:
+        wait(timeout=0)
+    except subprocess.TimeoutExpired:
+        return
+    except (OSError, ValueError):
+        return
+
+
 def _review_verify_process_group_alive(process: subprocess.Popen[Any]) -> bool:
     """Return whether the tracked verify process group still exists."""
     if process.poll() is None:
@@ -4316,6 +4584,7 @@ def _read_review_verify_process_pipe_events(
     *,
     stdout: bytearray,
     stderr: bytearray,
+    heartbeat: _LongPhaseHeartbeatState | None = None,
 ) -> None:
     """Consume ready review verify pipe chunks into the provided collectors."""
     collectors = {
@@ -4332,8 +4601,75 @@ def _read_review_verify_process_pipe_events(
             continue
         if chunk:
             collectors[cast(str, key.data)].extend(chunk)
+            if heartbeat is not None:
+                heartbeat.note_output(chunk)
             continue
-        selector.unregister(key.fd)
+        try:
+            selector.unregister(key.fd)
+        except (KeyError, ValueError):
+            pass
+
+
+def _monitored_review_verify_process_pipe_drain(
+    process: subprocess.Popen[bytes],
+    selector: selectors.BaseSelector,
+    *,
+    stdout: bytearray,
+    stderr: bytearray,
+    heartbeat: _LongPhaseHeartbeatState | None,
+    deadline: float,
+    wait_for_process_group: bool,
+) -> bool:
+    """Drain ready verify output without blocking, emitting due heartbeats while bounded."""
+    exited = False
+    while True:
+        if wait_for_process_group:
+            exited = not _review_verify_process_group_alive(process)
+        else:
+            exited = process.poll() is not None
+
+        if exited and not selector.get_map():
+            return True
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+
+        select_timeout = min(remaining, 0.05)
+        if heartbeat is not None:
+            heartbeat_timeout = heartbeat.seconds_until_next()
+            if heartbeat_timeout is not None:
+                select_timeout = min(select_timeout, heartbeat_timeout)
+
+        if not selector.get_map():
+            time.sleep(min(select_timeout, 0.01))
+            if heartbeat is not None:
+                heartbeat.emit_due()
+            continue
+
+        events = selector.select(timeout=max(0.0, select_timeout))
+        if events:
+            _read_review_verify_process_pipe_events(
+                selector,
+                events,
+                stdout=stdout,
+                stderr=stderr,
+                heartbeat=heartbeat,
+            )
+        if heartbeat is not None:
+            heartbeat.emit_due()
+
+    if selector.get_map():
+        events = selector.select(timeout=0)
+        if events:
+            _read_review_verify_process_pipe_events(
+                selector,
+                events,
+                stdout=stdout,
+                stderr=stderr,
+                heartbeat=heartbeat,
+            )
+    return exited or not _review_verify_process_group_alive(process)
 
 
 def _drain_review_verify_process_pipes_until_deadline(
@@ -4342,6 +4678,7 @@ def _drain_review_verify_process_pipes_until_deadline(
     deadline: float,
     initial_stdout: str | bytes | None,
     initial_stderr: str | bytes | None,
+    heartbeat: _LongPhaseHeartbeatState | None = None,
 ) -> tuple[bytes, bytes]:
     """Read whatever pipe output is currently available without waiting for EOF."""
     stdout = bytearray(_coerce_review_verify_pipe_bytes(initial_stdout))
@@ -4353,14 +4690,14 @@ def _drain_review_verify_process_pipes_until_deadline(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            events = selector.select(timeout=min(remaining, 0.05))
-            if not events:
-                continue
-            _read_review_verify_process_pipe_events(
+            _monitored_review_verify_process_pipe_drain(
+                process,
                 selector,
-                events,
                 stdout=stdout,
                 stderr=stderr,
+                heartbeat=heartbeat,
+                deadline=deadline,
+                wait_for_process_group=False,
             )
         return bytes(stdout), bytes(stderr)
     finally:
@@ -4373,6 +4710,7 @@ def _wait_for_review_verify_process_group_exit(
     grace_seconds: float,
     initial_stdout: str | bytes | None,
     initial_stderr: str | bytes | None,
+    heartbeat: _LongPhaseHeartbeatState | None = None,
 ) -> tuple[bytes, bytes, bool]:
     """Collect timeout output until the verify process group exits or grace expires."""
     deadline = time.monotonic() + grace_seconds
@@ -4382,40 +4720,16 @@ def _wait_for_review_verify_process_group_exit(
     selector = selectors.DefaultSelector()
     try:
         _register_review_verify_process_pipes(selector, process)
-        while True:
-            process_group_alive = _review_verify_process_group_alive(process)
-            if not process_group_alive:
-                exited_during_grace = True
-                if not selector.get_map():
-                    return bytes(stdout), bytes(stderr), True
-
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-
-            if not selector.get_map():
-                time.sleep(min(remaining, 0.01))
-                continue
-
-            events = selector.select(timeout=min(remaining, 0.05))
-            if not events:
-                continue
-            _read_review_verify_process_pipe_events(
-                selector,
-                events,
-                stdout=stdout,
-                stderr=stderr,
-            )
-        if selector.get_map():
-            events = selector.select(timeout=0)
-            if events:
-                _read_review_verify_process_pipe_events(
-                    selector,
-                    events,
-                    stdout=stdout,
-                    stderr=stderr,
-                )
-        return bytes(stdout), bytes(stderr), exited_during_grace or not _review_verify_process_group_alive(process)
+        exited_during_grace = _monitored_review_verify_process_pipe_drain(
+            process,
+            selector,
+            stdout=stdout,
+            stderr=stderr,
+            heartbeat=heartbeat,
+            deadline=deadline,
+            wait_for_process_group=True,
+        )
+        return bytes(stdout), bytes(stderr), exited_during_grace
     finally:
         selector.close()
 
@@ -4427,11 +4741,15 @@ def _run_review_verify_command_with_timeout_diagnostics(
     env: Mapping[str, str] | None = None,
     timeout_seconds: int,
     termination_grace_seconds: float,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    on_heartbeat: LongPhaseHeartbeat | None = None,
 ) -> _ReviewVerifyCommandRun:
     """Run review verification and preserve output across graceful timeout escalation."""
     def _resolved_returncode(process: subprocess.Popen[Any]) -> int:
         return process.returncode if process.returncode is not None else 1
 
+    started_at = time.monotonic()
     process = subprocess.Popen(
         ["bash", "-lc", verify_command],
         cwd=cwd,
@@ -4442,22 +4760,29 @@ def _run_review_verify_command_with_timeout_diagnostics(
         start_new_session=(os.name == "posix"),
         env=normalize_subprocess_env(env, cwd),
     )
-    try:
-        completed_stdout, completed_stderr = process.communicate(timeout=timeout_seconds)
-        return _ReviewVerifyCommandRun(
-            returncode=_resolved_returncode(process),
-            stdout=completed_stdout,
-            stderr=completed_stderr,
-        )
-    except subprocess.TimeoutExpired as exc:
+    stdout = bytearray()
+    stderr = bytearray()
+    heartbeat = _LongPhaseHeartbeatState(
+        process=process,
+        started_at=started_at,
+        threshold_seconds=int(heartbeat_threshold_seconds or timeout_seconds + 1),
+        interval_seconds=max(1, int(heartbeat_interval_seconds or timeout_seconds + 1)),
+        on_heartbeat=on_heartbeat,
+    )
+    selector = selectors.DefaultSelector()
+    _register_review_verify_process_pipes(selector, process)
+
+    def _terminate_and_collect_timeout(exc: subprocess.TimeoutExpired) -> _ReviewVerifyCommandRun:
         _signal_review_verify_process_group(process, signal.SIGTERM)
         timeout_stdout, timeout_stderr, exited_during_grace = _wait_for_review_verify_process_group_exit(
             process,
             grace_seconds=termination_grace_seconds,
-            initial_stdout=exc.stdout,
-            initial_stderr=exc.stderr,
+            initial_stdout=bytes(stdout) if stdout else exc.stdout,
+            initial_stderr=bytes(stderr) if stderr else exc.stderr,
+            heartbeat=heartbeat,
         )
         if exited_during_grace:
+            _reap_review_verify_process(process)
             return _ReviewVerifyCommandRun(
                 returncode=_resolved_returncode(process),
                 stdout=timeout_stdout,
@@ -4472,9 +4797,14 @@ def _run_review_verify_command_with_timeout_diagnostics(
             deadline=kill_deadline,
             initial_stdout=timeout_stdout,
             initial_stderr=timeout_stderr,
+            heartbeat=heartbeat,
         )
         while _review_verify_process_group_alive(process) and time.monotonic() < kill_deadline:
-            time.sleep(0.01)
+            heartbeat_timeout = heartbeat.seconds_until_next()
+            sleep_for = 0.01 if heartbeat_timeout is None else min(0.01, max(0.0, heartbeat_timeout))
+            time.sleep(sleep_for)
+            heartbeat.emit_due()
+        _reap_review_verify_process(process)
         return _ReviewVerifyCommandRun(
             returncode=_resolved_returncode(process),
             stdout=timeout_stdout,
@@ -4482,6 +4812,76 @@ def _run_review_verify_command_with_timeout_diagnostics(
             timed_out=True,
             forced_kill=True,
         )
+
+    def _terminate_before_reraising() -> None:
+        _signal_review_verify_process_group(process, signal.SIGTERM)
+        timeout_stdout, timeout_stderr, exited_during_grace = _wait_for_review_verify_process_group_exit(
+            process,
+            grace_seconds=termination_grace_seconds,
+            initial_stdout=bytes(stdout),
+            initial_stderr=bytes(stderr),
+            heartbeat=None,
+        )
+        stdout[:] = timeout_stdout
+        stderr[:] = timeout_stderr
+        if not exited_during_grace:
+            _signal_review_verify_process_group(process, signal.SIGKILL)
+            kill_deadline = time.monotonic() + 1.0
+            timeout_stdout, timeout_stderr = _drain_review_verify_process_pipes_until_deadline(
+                process,
+                deadline=kill_deadline,
+                initial_stdout=bytes(stdout),
+                initial_stderr=bytes(stderr),
+                heartbeat=None,
+            )
+            stdout[:] = timeout_stdout
+            stderr[:] = timeout_stderr
+        _reap_review_verify_process(process)
+
+    try:
+        deadline = started_at + timeout_seconds
+        while True:
+            if process.poll() is not None:
+                completed = _monitored_review_verify_process_pipe_drain(
+                    process,
+                    selector,
+                    stdout=stdout,
+                    stderr=stderr,
+                    heartbeat=heartbeat,
+                    deadline=deadline,
+                    wait_for_process_group=True,
+                )
+                if not completed:
+                    raise subprocess.TimeoutExpired(process.args, timeout_seconds, bytes(stdout), bytes(stderr))
+                break
+            timeout = max(0.0, deadline - time.monotonic())
+            heartbeat_timeout = heartbeat.seconds_until_next()
+            if heartbeat_timeout is not None:
+                timeout = min(timeout, heartbeat_timeout)
+            if timeout <= 0.0 and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(process.args, timeout_seconds, bytes(stdout), bytes(stderr))
+            events = selector.select(timeout)
+            if events:
+                _read_review_verify_process_pipe_events(
+                    selector,
+                    events,
+                    stdout=stdout,
+                    stderr=stderr,
+                    heartbeat=heartbeat,
+                )
+            heartbeat.emit_due()
+        return _ReviewVerifyCommandRun(
+            returncode=_resolved_returncode(process),
+            stdout=bytes(stdout),
+            stderr=bytes(stderr),
+        )
+    except subprocess.TimeoutExpired as exc:
+        return _terminate_and_collect_timeout(exc)
+    except Exception:
+        _terminate_before_reraising()
+        raise
+    finally:
+        selector.close()
 
 
 def _resolve_review_verify_timeout_settings(config: object) -> tuple[int, float]:
@@ -4502,18 +4902,27 @@ def _run_verify_command(
     reviewed_base_sha: str | None = None,
     timeout_seconds: int = AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
     timeout_grace_seconds: float = REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    on_heartbeat: LongPhaseHeartbeat | None = None,
 ) -> ReviewVerifyResult:
     """Run the configured verify command for a lifecycle verify iteration."""
     captured_at = datetime.now(UTC)
     started_at = time.monotonic()
     try:
-        result = _run_review_verify_command_with_timeout_diagnostics(
-            verify_command,
-            cwd=cwd,
-            env=env,
-            timeout_seconds=timeout_seconds,
-            termination_grace_seconds=timeout_grace_seconds,
-        )
+        try:
+            result = _run_review_verify_command_with_timeout_diagnostics(
+                verify_command,
+                cwd=cwd,
+                env=env,
+                timeout_seconds=timeout_seconds,
+                termination_grace_seconds=timeout_grace_seconds,
+                heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+                on_heartbeat=on_heartbeat,
+            )
+        finally:
+            finish_long_phase_heartbeat(on_heartbeat)
     except OSError as exc:
         return _make_verify_result(
             verify_command,
@@ -4579,6 +4988,9 @@ def _run_review_verify_command(
     reviewed_base_sha: str | None = None,
     timeout_seconds: int = AUTONOMOUS_VERIFY_TIMEOUT_SECONDS,
     timeout_grace_seconds: float = REVIEW_VERIFY_TIMEOUT_GRACE_SECONDS,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    on_heartbeat: LongPhaseHeartbeat | None = None,
 ) -> ReviewVerifyResult:
     """Compatibility wrapper for legacy review-specific verify execution."""
     return _run_verify_command(
@@ -4590,6 +5002,9 @@ def _run_review_verify_command(
         reviewed_base_sha=reviewed_base_sha,
         timeout_seconds=timeout_seconds,
         timeout_grace_seconds=timeout_grace_seconds,
+        heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+        on_heartbeat=on_heartbeat,
     )
 
 
@@ -4903,6 +5318,9 @@ def _run_verify_commands_for_projects(
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
     reviewed_base_sha: str | None = None,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    heartbeat_for_project: Callable[[str], LongPhaseHeartbeat | None] | None = None,
 ) -> CrossProjectVerificationResult | None:
     """Run lifecycle verification from each affected project root."""
     if not _task_is_cross_project(task, config):
@@ -4970,6 +5388,9 @@ def _run_verify_commands_for_projects(
             reviewed_base_sha=reviewed_base_sha,
             timeout_seconds=project_timeout_seconds,
             timeout_grace_seconds=project_timeout_grace_seconds,
+            heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            on_heartbeat=heartbeat_for_project(scope) if heartbeat_for_project is not None else None,
         )
         project_results.append(
             ProjectReviewVerifyResult(
@@ -5032,6 +5453,9 @@ def _run_review_verify_commands_for_projects(
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
     reviewed_base_sha: str | None = None,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    heartbeat_for_project: Callable[[str], LongPhaseHeartbeat | None] | None = None,
 ) -> CrossProjectReviewVerifyResult | None:
     """Compatibility wrapper for review-specific cross-project execution."""
     return _run_verify_commands_for_projects(
@@ -5045,6 +5469,9 @@ def _run_review_verify_commands_for_projects(
         reviewed_branch=reviewed_branch,
         reviewed_head_sha=reviewed_head_sha,
         reviewed_base_sha=reviewed_base_sha,
+        heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+        heartbeat_for_project=heartbeat_for_project,
     )
 
 
@@ -5061,6 +5488,9 @@ def _run_lifecycle_verify(
     reviewed_branch: str | None = None,
     reviewed_head_sha: str | None = None,
     reviewed_base_sha: str | None = None,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    heartbeat_for_phase: Callable[[str], LongPhaseHeartbeat | None] | None = None,
 ) -> LifecycleVerifyExecution | None:
     """Run the reusable lifecycle verify path for the current evaluated head."""
     if _task_is_cross_project(task, config):
@@ -5075,6 +5505,9 @@ def _run_lifecycle_verify(
             reviewed_branch=reviewed_branch,
             reviewed_head_sha=reviewed_head_sha,
             reviewed_base_sha=reviewed_base_sha,
+            heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            heartbeat_for_project=heartbeat_for_phase,
         )
         if execution is None:
             return None
@@ -5097,6 +5530,9 @@ def _run_lifecycle_verify(
         reviewed_base_sha=reviewed_base_sha,
         timeout_seconds=timeout_seconds,
         timeout_grace_seconds=timeout_grace_seconds,
+        heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+        on_heartbeat=heartbeat_for_phase("verify") if heartbeat_for_phase is not None else None,
     )
     return LifecycleVerifyExecution(
         markdown=_format_review_verify_result(result),

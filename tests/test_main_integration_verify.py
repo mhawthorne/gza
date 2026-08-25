@@ -1408,6 +1408,7 @@ def test_check_main_integration_verify_treats_missing_environment_identity_as_st
     config.autonomous_verify_timeout_seconds = 120
     config.review_verify_timeout_grace_seconds = 5.0
     config.main_integration_verify_red_ttl_minutes = 30
+    config.project_dir = tmp_path
 
     git = MagicMock()
     git.repo_dir = tmp_path
@@ -1469,6 +1470,7 @@ def test_check_main_integration_verify_treats_environment_identity_mismatch_as_s
     config.autonomous_verify_timeout_seconds = 120
     config.review_verify_timeout_grace_seconds = 5.0
     config.main_integration_verify_red_ttl_minutes = 30
+    config.project_dir = tmp_path
 
     git = MagicMock()
     git.repo_dir = tmp_path
@@ -1602,6 +1604,84 @@ def test_check_main_integration_verify_does_not_emit_initial_start_for_disabled_
     assert check.state.gate_enabled is False
     assert check.state.verify_status == "unavailable"
     assert starts == []
+
+
+def test_check_main_integration_verify_does_not_create_heartbeat_for_disabled_gate(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+    heartbeat_for_attempt = MagicMock()
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-live"),
+        patch("gza.main_integration_verify._run_review_verify_command") as run_verify,
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="watch-main-verify",
+            heartbeat_for_attempt=heartbeat_for_attempt,
+        )
+
+    run_verify.assert_not_called()
+    heartbeat_for_attempt.assert_not_called()
+    assert check.performed_verify is True
+    assert check.state.gate_enabled is False
+
+
+def test_check_main_integration_verify_creates_one_heartbeat_for_enabled_child_run(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+    config.project_dir = tmp_path
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+    heartbeat = MagicMock()
+    heartbeat_for_attempt = MagicMock(return_value=heartbeat)
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 23, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        output="all good",
+    )
+
+    def run_verify_body(*_args, **kwargs):
+        assert kwargs["on_heartbeat"] is heartbeat
+        heartbeat_for_attempt.assert_called_once_with(1)
+        return verify_result
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", side_effect=["fp-live", "fp-live"]),
+        patch("gza.main_integration_verify._run_review_verify_command", side_effect=run_verify_body) as run_verify,
+    ):
+        check = check_main_integration_verify(
+            config,
+            store,
+            git,
+            reason="watch-main-verify",
+            heartbeat_for_attempt=heartbeat_for_attempt,
+        )
+
+    assert check.performed_verify is True
+    run_verify.assert_called_once()
+    heartbeat_for_attempt.assert_called_once_with(1)
 
 
 def test_check_main_integration_verify_does_not_emit_initial_start_for_cached_checkpoint(tmp_path) -> None:
@@ -1888,7 +1968,6 @@ def test_check_candidate_integration_verify_pass_returns_structured_evidence_wit
     tmp_path,
 ) -> None:
     setup_config(tmp_path)
-    store = make_store(tmp_path)
 
     config = MagicMock(spec=Config)
     config.verify_command = "./bin/tests"
@@ -1941,6 +2020,74 @@ def test_check_candidate_integration_verify_pass_returns_structured_evidence_wit
     assert check.evidence.head_sha == "def456"
     assert check.evidence.reviewed_branch == "candidate-main"
     assert check.evidence.working_directory == str(tmp_path)
+
+
+def test_check_candidate_integration_verify_does_not_create_heartbeat_for_disabled_gate(tmp_path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "candidate-main"
+    git.rev_parse_if_exists.return_value = "def456"
+    heartbeat_for_attempt = MagicMock()
+
+    with patch("gza.main_integration_verify._run_review_verify_command") as run_verify:
+        check = check_candidate_integration_verify(
+            config,
+            git,
+            reason="candidate-disabled",
+            heartbeat_for_attempt=heartbeat_for_attempt,
+        )
+
+    run_verify.assert_not_called()
+    heartbeat_for_attempt.assert_not_called()
+    assert check.verify_runs == 0
+    assert check.evidence.gate_enabled is False
+    assert check.evidence.verify_status == "unavailable"
+
+
+def test_check_candidate_integration_verify_creates_one_heartbeat_for_enabled_child_run(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = MagicMock(spec=Config)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "candidate-main"
+    git.rev_parse_if_exists.return_value = "def456"
+    heartbeat = MagicMock()
+    heartbeat_for_attempt = MagicMock(return_value=heartbeat)
+    fingerprint = "b" * 64
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 6, 29, 12, 0, tzinfo=UTC),
+        reviewed_branch="candidate-main",
+        reviewed_head_sha="def456",
+        working_directory=str(tmp_path),
+        output=f"gza-verify phase=passed name=unit duration_seconds=3.25 tree_fingerprint={fingerprint}",
+    )
+
+    def run_verify_body(*_args, **kwargs):
+        assert kwargs["on_heartbeat"] is heartbeat
+        heartbeat_for_attempt.assert_called_once_with(1)
+        return verify_result
+
+    with patch("gza.main_integration_verify._run_review_verify_command", side_effect=run_verify_body) as run_verify:
+        check = check_candidate_integration_verify(
+            config,
+            git,
+            reason="candidate-enabled",
+            heartbeat_for_attempt=heartbeat_for_attempt,
+        )
+
+    assert check.verify_runs == 1
+    assert check.classification == "pass"
+    run_verify.assert_called_once()
+    heartbeat_for_attempt.assert_called_once_with(1)
     assert check.evidence.verify_status == "passed"
     assert check.evidence.failing_phase is None
     assert load_main_integration_verify_state(store) is None

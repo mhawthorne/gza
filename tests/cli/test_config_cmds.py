@@ -4961,6 +4961,8 @@ class TestWatchConfigValidation:
             ("transient_recovery_backoff_max", "bad"),
             ("failure_halt_after", "bad"),
             ("no_progress_cycles", "bad"),
+            ("long_phase_threshold_seconds", "bad"),
+            ("heartbeat_interval_seconds", "bad"),
             ("main_verify_remediation_max_attempts", "bad"),
             ("no_activity_timeout", "bad"),
             ("poll", "bad"),
@@ -4985,6 +4987,8 @@ class TestWatchConfigValidation:
             "transient_recovery_backoff_max",
             "failure_halt_after",
             "no_progress_cycles",
+            "long_phase_threshold_seconds",
+            "heartbeat_interval_seconds",
             "main_verify_remediation_max_attempts",
             "no_activity_timeout",
             "poll",
@@ -5013,6 +5017,8 @@ class TestWatchConfigValidation:
             "  transient_recovery_backoff_max: 1200\n"
             "  failure_halt_after: 6\n"
             "  no_progress_cycles: 4\n"
+            "  long_phase_threshold_seconds: 30\n"
+            "  heartbeat_interval_seconds: 45\n"
             "  main_verify_remediation_max_attempts: 5\n"
             "  no_activity_timeout: 75\n"
             "  poll: 45\n"
@@ -5026,6 +5032,8 @@ class TestWatchConfigValidation:
         assert config.watch.transient_recovery_backoff_max == 1200
         assert config.watch.failure_halt_after == 6
         assert config.watch.no_progress_cycles == 4
+        assert config.watch.long_phase_threshold_seconds == 30
+        assert config.watch.heartbeat_interval_seconds == 45
         assert config.watch.main_verify_remediation_max_attempts == 5
         assert config.watch.no_activity_timeout == 75
         assert config.watch.poll == 45
@@ -5371,6 +5379,8 @@ class TestWatchConfigValidation:
             ("failure_backoff_max", "bad"),
             ("transient_recovery_backoff_max", "bad"),
             ("failure_halt_after", "bad"),
+            ("long_phase_threshold_seconds", "bad"),
+            ("heartbeat_interval_seconds", "bad"),
             ("main_verify_remediation_max_attempts", "bad"),
             ("no_activity_timeout", "bad"),
             ("poll", "bad"),
@@ -5395,6 +5405,8 @@ class TestWatchConfigValidation:
             "failure_backoff_max",
             "transient_recovery_backoff_max",
             "failure_halt_after",
+            "long_phase_threshold_seconds",
+            "heartbeat_interval_seconds",
             "main_verify_remediation_max_attempts",
             "no_activity_timeout",
             "poll",

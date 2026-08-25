@@ -390,6 +390,14 @@ provider: codex
 #   backoff.
 #   Default: 10
 #   failure_halt_after: 10
+#   Cadence for watch `BUSY` heartbeat lines during long-running verify, merge, rebase, and agent
+#   execution phases.
+#   Default: 60
+#   heartbeat_interval_seconds: 60
+#   Seconds before a watch-supervised long phase starts emitting operator-visible heartbeat
+#   progress.
+#   Default: 60
+#   long_phase_threshold_seconds: 60
 #   Maximum automatic remediation attempts watch may spend for one main-verify failure identity,
 #   counting both failed remediation row requeues and merged-but-still-red consumed attempts, before
 #   it stops and requires human intervention.

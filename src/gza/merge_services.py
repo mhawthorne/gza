@@ -76,6 +76,7 @@ class ManualMergeExecutionRequest:
     pre_materialized_deferred_blockers: tuple[list[DbTask], list[DbTask]] | None = None
     pre_materialized_deferred_blockers_printed: bool = False
     pending_squash_reconcile: Any = None
+    process_monitor_factory: Any = None
 
 
 @dataclass(frozen=True)
@@ -545,11 +546,22 @@ def execute_manual_merge(
                 request.merge_branch,
             )
 
-        request.git.merge(
-            request.merge_source_ref,
-            squash=request.squash,
-            commit_message=commit_message,
-        )
+        merge_kwargs: dict[str, Any] = {
+            "squash": request.squash,
+            "commit_message": commit_message,
+        }
+        if request.process_monitor_factory is not None:
+            merge_kwargs["process_monitor_factory"] = request.process_monitor_factory
+        try:
+            request.git.merge(request.merge_source_ref, **merge_kwargs)
+        except TypeError as exc:
+            if request.process_monitor_factory is None or "process_monitor_factory" not in str(exc):
+                raise
+            request.git.merge(
+                request.merge_source_ref,
+                squash=request.squash,
+                commit_message=commit_message,
+            )
 
         if request.squash:
             squash_oid = hooks.rev_parse_head(request.git)

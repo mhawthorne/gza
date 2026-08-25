@@ -6,7 +6,8 @@ import re
 import shutil
 import subprocess
 import threading
-from collections.abc import Iterable, Mapping, Sequence
+import time
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,7 @@ from gza.runtime_context import normalize_subprocess_env
 _GIT_RUN_COUNT_METRIC = "gza_git_run_total"
 _GIT_RUN_LATENCY_METRIC = "gza_git_run_latency_seconds"
 _GIT_RUN_LABELS = {"operation": "run"}
+GitProcessMonitorFactory = Callable[[subprocess.Popen[str], float], Any]
 
 
 class GitError(Exception):
@@ -459,7 +461,13 @@ class Git:
         result = self._run(*args, check=check) if stdin is None else self._run(*args, check=check, stdin=stdin)
         return self._store_cached_value(key, result)
 
-    def _run(self, *args: str, check: bool = True, stdin: bytes | None = None) -> subprocess.CompletedProcess:
+    def _run(
+        self,
+        *args: str,
+        check: bool = True,
+        stdin: bytes | None = None,
+        process_monitor_factory: GitProcessMonitorFactory | None = None,
+    ) -> subprocess.CompletedProcess:
         """Run a git command.
 
         Args:
@@ -472,9 +480,19 @@ class Git:
         """
         git_input = stdin.decode() if stdin else None
         git_env = normalize_subprocess_env(getattr(self, "env", None), self.repo_dir)
-        if metrics.enabled():
-            metrics.incr(_GIT_RUN_COUNT_METRIC, labels=_GIT_RUN_LABELS)
-            with metrics.timer(_GIT_RUN_LATENCY_METRIC, labels=_GIT_RUN_LABELS):
+        if process_monitor_factory is None:
+            if metrics.enabled():
+                metrics.incr(_GIT_RUN_COUNT_METRIC, labels=_GIT_RUN_LABELS)
+                with metrics.timer(_GIT_RUN_LATENCY_METRIC, labels=_GIT_RUN_LABELS):
+                    result = subprocess.run(
+                        [self._git_executable(git_env), *args],
+                        cwd=self.repo_dir,
+                        env=git_env,
+                        capture_output=True,
+                        text=True,
+                        input=git_input,
+                    )
+            else:
                 result = subprocess.run(
                     [self._git_executable(git_env), *args],
                     cwd=self.repo_dir,
@@ -484,18 +502,70 @@ class Git:
                     input=git_input,
                 )
         else:
-            result = subprocess.run(
+            result = self._run_with_process_monitor(
                 [self._git_executable(git_env), *args],
-                cwd=self.repo_dir,
                 env=git_env,
-                capture_output=True,
-                text=True,
                 input=git_input,
+                process_monitor_factory=process_monitor_factory,
             )
         if check and result.returncode != 0:
             error_output = result.stderr or result.stdout
             raise GitError(f"git {' '.join(args)} failed:\n{error_output}")
         return result
+
+    def _run_with_process_monitor(
+        self,
+        command: list[str],
+        *,
+        env: Mapping[str, str],
+        input: str | None,
+        process_monitor_factory: GitProcessMonitorFactory,
+    ) -> subprocess.CompletedProcess:
+        if metrics.enabled():
+            metrics.incr(_GIT_RUN_COUNT_METRIC, labels=_GIT_RUN_LABELS)
+        started_at = time.monotonic()
+        timer = metrics.timer(_GIT_RUN_LATENCY_METRIC, labels=_GIT_RUN_LABELS) if metrics.enabled() else None
+        if timer is not None:
+            timer.__enter__()
+        process = subprocess.Popen(
+            command,
+            cwd=self.repo_dir,
+            stdin=subprocess.PIPE if input is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        monitor = process_monitor_factory(process, started_at)
+        try:
+            while True:
+                seconds_until_next = getattr(monitor, "seconds_until_next", None)
+                timeout = 0.1
+                if callable(seconds_until_next):
+                    next_timeout = seconds_until_next()
+                    if next_timeout is not None:
+                        timeout = max(0.0, float(next_timeout))
+                try:
+                    stdout, stderr = process.communicate(input=input, timeout=timeout)
+                    break
+                except subprocess.TimeoutExpired:
+                    input = None
+                    emit_due = getattr(monitor, "emit_due", None)
+                    if callable(emit_due):
+                        emit_due()
+            return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+        except BaseException:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=2)
+            raise
+        finally:
+            if timer is not None:
+                timer.__exit__(None, None, None)
 
     def current_branch(self) -> str:
         """Get current branch name."""
@@ -1499,7 +1569,14 @@ class Git:
         result = self._run_readonly_cached("merge-tree", "--write-tree", into, branch, check=False)
         return result.returncode == 0
 
-    def merge(self, branch: str, squash: bool = False, commit_message: str | None = None) -> None:
+    def merge(
+        self,
+        branch: str,
+        squash: bool = False,
+        commit_message: str | None = None,
+        *,
+        process_monitor_factory: GitProcessMonitorFactory | None = None,
+    ) -> None:
         """Merge a branch into the current branch.
 
         Args:
@@ -1517,7 +1594,10 @@ class Git:
             args.append("--no-ff")
         args.append(branch)
         with self._mutation_scope():
-            self._run(*args)
+            if process_monitor_factory is None:
+                self._run(*args)
+            else:
+                self._run(*args, process_monitor_factory=process_monitor_factory)
 
         # Auto-commit after squash merge
         if squash:
@@ -1603,7 +1683,12 @@ class Git:
                 return False
             raise GitError(f"git stash pop failed:\n{error_output}")
 
-    def rebase(self, branch: str) -> None:
+    def rebase(
+        self,
+        branch: str,
+        *,
+        process_monitor_factory: GitProcessMonitorFactory | None = None,
+    ) -> None:
         """Rebase the current branch onto another branch.
 
         Args:
@@ -1613,7 +1698,10 @@ class Git:
             GitError: If the rebase fails
         """
         with self._mutation_scope():
-            self._run("rebase", branch)
+            if process_monitor_factory is None:
+                self._run("rebase", branch)
+            else:
+                self._run("rebase", branch, process_monitor_factory=process_monitor_factory)
 
     def rebase_abort(self) -> None:
         """Abort a rebase in progress and restore clean state.

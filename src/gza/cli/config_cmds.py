@@ -2305,6 +2305,8 @@ def _config_to_effective_dict(config: Config) -> dict:
             "failure_halt_after": config.watch.failure_halt_after,
             "no_progress_cycles": config.watch.no_progress_cycles,
             "slot_settle_seconds": config.watch.slot_settle_seconds,
+            "long_phase_threshold_seconds": config.watch.long_phase_threshold_seconds,
+            "heartbeat_interval_seconds": config.watch.heartbeat_interval_seconds,
             "main_verify_remediation_max_attempts": (
                 config.watch.main_verify_remediation_max_attempts
             ),

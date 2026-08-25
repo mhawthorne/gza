@@ -18,6 +18,7 @@ from .db import SqliteTaskStore, Task
 from .git import Git, GitError
 from .off_topic_verify import extract_pytest_failing_nodeids
 from .runner import (
+    LongPhaseHeartbeat,
     _capture_review_verify_result,
     _compute_tree_fingerprint,
     _extract_review_verify_phase_results,
@@ -1209,6 +1210,9 @@ def run_main_integration_verify(
     runner_class: Literal["host", "container"] = "host",
     resolved_head_sha: str | None | object = _HEAD_SHA_UNSET,
     env: Mapping[str, str] | None = None,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    on_heartbeat: LongPhaseHeartbeat | None = None,
 ) -> MainIntegrationVerifyState:
     """Run the configured verify gate against the current local target checkout."""
     task = ensure_main_integration_verify_task(store)
@@ -1235,15 +1239,29 @@ def run_main_integration_verify(
     else:
         assert gate.verify_timeout_seconds is not None
         assert gate.verify_timeout_grace_seconds is not None
-        result = _run_review_verify_command(
-            verify_command,
-            cwd=git.repo_dir,
-            env=env,
-            reviewed_branch=git.current_branch(),
-            reviewed_head_sha=head_sha,
-            timeout_seconds=gate.verify_timeout_seconds,
-            timeout_grace_seconds=gate.verify_timeout_grace_seconds,
-        )
+        if on_heartbeat is not None:
+            result = _run_review_verify_command(
+                verify_command,
+                cwd=git.repo_dir,
+                env=env,
+                reviewed_branch=git.current_branch(),
+                reviewed_head_sha=head_sha,
+                timeout_seconds=gate.verify_timeout_seconds,
+                timeout_grace_seconds=gate.verify_timeout_grace_seconds,
+                heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+                on_heartbeat=on_heartbeat,
+            )
+        else:
+            result = _run_review_verify_command(
+                verify_command,
+                cwd=git.repo_dir,
+                env=env,
+                reviewed_branch=git.current_branch(),
+                reviewed_head_sha=head_sha,
+                timeout_seconds=gate.verify_timeout_seconds,
+                timeout_grace_seconds=gate.verify_timeout_grace_seconds,
+            )
 
     failing_phase = _verify_failure_phase_name(result.output)
     launch_issue = _detect_verify_launch_issue(
@@ -1356,7 +1374,7 @@ def run_main_integration_verify(
 
 
 def _run_integration_verify_with_red_reruns(
-    run_once: Callable[[str], IntegrationVerifyEvidence],
+    run_once: Callable[[str, int], IntegrationVerifyEvidence],
     *,
     reason: str,
     red_reruns: int,
@@ -1373,7 +1391,7 @@ def _run_integration_verify_with_red_reruns(
     total_attempts = red_reruns + 1
     if on_initial_run_start is not None:
         on_initial_run_start(1, total_attempts)
-    state = run_once(reason)
+    state = run_once(reason, 1)
     verify_runs = 1 if getattr(state, "gate_enabled", True) else 0
     if red_reruns <= 0:
         return state, None, None, verify_runs
@@ -1411,7 +1429,7 @@ def _run_integration_verify_with_red_reruns(
     for attempt in range(1, red_reruns + 1):
         if on_red_rerun_start is not None:
             on_red_rerun_start(attempt + 1, total_attempts, state)
-        rerun_state = run_once(f"{reason}-rerun-{attempt}")
+        rerun_state = run_once(f"{reason}-rerun-{attempt}", attempt + 1)
         verify_runs += 1
         if not _verify_result_halts_merges(
             status=rerun_state.verify_status,
@@ -1448,11 +1466,15 @@ def _run_main_integration_verify_with_red_reruns(
     env: Mapping[str, str] | None = None,
     on_initial_run_start: Callable[[int, int], None] | None = None,
     on_red_rerun_start: Callable[[int, int, IntegrationVerifyEvidence], None] | None = None,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    heartbeat_for_attempt: Callable[[int], LongPhaseHeartbeat | None] | None = None,
 ) -> tuple[MainIntegrationVerifyState, MainIntegrationVerifyRemediation | None, int]:
     current_gate = _current_gate_identity(config, runner_class=runner_class)
     gated_initial_run_start = on_initial_run_start if current_gate.gate_enabled else None
+    gated_heartbeat_for_attempt = heartbeat_for_attempt if current_gate.gate_enabled else None
     state, remediation, remediation_source_state, verify_runs = _run_integration_verify_with_red_reruns(
-        lambda run_reason: run_main_integration_verify(
+        lambda run_reason, attempt: run_main_integration_verify(
             config,
             store,
             git,
@@ -1460,6 +1482,9 @@ def _run_main_integration_verify_with_red_reruns(
             runner_class=runner_class,
             resolved_head_sha=resolved_head_sha,
             env=env,
+            heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            on_heartbeat=gated_heartbeat_for_attempt(attempt) if gated_heartbeat_for_attempt is not None else None,
         ),
         reason=reason,
         red_reruns=red_reruns,
@@ -1500,6 +1525,9 @@ def check_main_integration_verify(
     env: Mapping[str, str] | None = None,
     on_initial_run_start: Callable[[int, int], None] | None = None,
     on_red_rerun_start: Callable[[int, int, IntegrationVerifyEvidence], None] | None = None,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    heartbeat_for_attempt: Callable[[int], LongPhaseHeartbeat | None] | None = None,
 ) -> MainIntegrationVerifyCheck:
     """Reuse or refresh local-main verify state for the current tree and gate identity."""
     if resolved_head_sha is _HEAD_SHA_UNSET:
@@ -1585,6 +1613,9 @@ def check_main_integration_verify(
         env=env,
         on_initial_run_start=on_initial_run_start,
         on_red_rerun_start=on_red_rerun_start,
+        heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+        heartbeat_interval_seconds=heartbeat_interval_seconds,
+        heartbeat_for_attempt=heartbeat_for_attempt,
     )
     resolved_signature = None
     if not _verify_result_halts_merges(
@@ -1674,6 +1705,9 @@ def run_candidate_integration_verify(
     reason: str,
     runner_class: Literal["host", "container"] = "host",
     env: Mapping[str, str] | None = None,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    on_heartbeat: LongPhaseHeartbeat | None = None,
 ) -> CandidateIntegrationVerifyEvidence:
     """Run the configured verify gate against an exact candidate checkout."""
     del reason
@@ -1699,15 +1733,29 @@ def run_candidate_integration_verify(
     else:
         assert gate.verify_timeout_seconds is not None
         assert gate.verify_timeout_grace_seconds is not None
-        result = _run_review_verify_command(
-            verify_command,
-            cwd=git.repo_dir,
-            env=env,
-            reviewed_branch=current_branch,
-            reviewed_head_sha=head_sha,
-            timeout_seconds=gate.verify_timeout_seconds,
-            timeout_grace_seconds=gate.verify_timeout_grace_seconds,
-        )
+        if on_heartbeat is not None:
+            result = _run_review_verify_command(
+                verify_command,
+                cwd=git.repo_dir,
+                env=env,
+                reviewed_branch=current_branch,
+                reviewed_head_sha=head_sha,
+                timeout_seconds=gate.verify_timeout_seconds,
+                timeout_grace_seconds=gate.verify_timeout_grace_seconds,
+                heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+                heartbeat_interval_seconds=heartbeat_interval_seconds,
+                on_heartbeat=on_heartbeat,
+            )
+        else:
+            result = _run_review_verify_command(
+                verify_command,
+                cwd=git.repo_dir,
+                env=env,
+                reviewed_branch=current_branch,
+                reviewed_head_sha=head_sha,
+                timeout_seconds=gate.verify_timeout_seconds,
+                timeout_grace_seconds=gate.verify_timeout_grace_seconds,
+            )
 
     failing_phase = _verify_failure_phase_name(result.output)
     launch_issue = _detect_verify_launch_issue(
@@ -1779,15 +1827,23 @@ def check_candidate_integration_verify(
     runner_class: Literal["host", "container"] = "host",
     env: Mapping[str, str] | None = None,
     on_red_rerun_start: Callable[[int, int, IntegrationVerifyEvidence], None] | None = None,
+    heartbeat_threshold_seconds: int | None = None,
+    heartbeat_interval_seconds: int | None = None,
+    heartbeat_for_attempt: Callable[[int], LongPhaseHeartbeat | None] | None = None,
 ) -> CandidateIntegrationVerifyCheck:
     """Run candidate integration verify for an exact checkout without touching main state."""
+    current_gate = _current_gate_identity(config, runner_class=runner_class)
+    gated_heartbeat_for_attempt = heartbeat_for_attempt if current_gate.gate_enabled else None
     evidence, remediation, _remediation_source_state, verify_runs = _run_integration_verify_with_red_reruns(
-        lambda run_reason: run_candidate_integration_verify(
+        lambda run_reason, attempt: run_candidate_integration_verify(
             config,
             git,
             reason=run_reason,
             runner_class=runner_class,
             env=env,
+            heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            on_heartbeat=gated_heartbeat_for_attempt(attempt) if gated_heartbeat_for_attempt is not None else None,
         ),
         reason=reason,
         red_reruns=red_reruns,
