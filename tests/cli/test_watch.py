@@ -34471,6 +34471,35 @@ def _assert_runtime_dispatch_exception_cleanup(
     competing_permit.release()
 
 
+def _assert_fresh_launch_permit_reacquires_bounded(
+    runtime: WatchProjectRuntime,
+    *,
+    timeout: float = 1.0,
+) -> None:
+    acquired = False
+    errors: list[BaseException] = []
+
+    def reacquire_and_release() -> None:
+        nonlocal acquired
+        try:
+            permit = launch_permit(runtime.config, runtime.store)
+            try:
+                acquired = True
+            finally:
+                permit.release()
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=reacquire_and_release, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout)
+
+    assert not thread.is_alive(), f"timed out reacquiring launch permit for runtime {runtime.key}"
+    if errors:
+        raise AssertionError(f"failed to reacquire launch permit for runtime {runtime.key}") from errors[0]
+    assert acquired
+
+
 def _runtime_analysis_with_pending_suppression(
     runtime: WatchProjectRuntime,
     *,
@@ -35925,6 +35954,123 @@ def test_supervisor_launch_budget_serializes_cross_project_launch_attempts(tmp_p
     assert sorted(result.status for result in results) == ["global_capacity_blocked", "live"]
     assert budget.reservations == ()
     assert budget.occupancy.slots == 0
+
+
+@pytest.mark.parametrize("first_outcome", ["live", "post_acquire_exception"])
+def test_supervisor_dispatch_holds_global_reservation_while_waiting_on_real_local_permit(
+    tmp_path: Path,
+    first_outcome: str,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a", max_concurrent=2)
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b", max_concurrent=2)
+    task_a = runtime_a.store.add("Pending A waits on real local permit", task_type="plan")
+    task_b = runtime_b.store.add("Pending B cannot oversubscribe while A waits", task_type="plan")
+    assert task_a.id is not None
+    assert task_b.id is not None
+    candidate_a = _candidate_for_runtime_head(runtime_a)
+    candidate_b = _candidate_for_runtime_head(runtime_b)
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+    held_local_permit = launch_permit(runtime_a.config, runtime_a.store)
+    first_attempting_local_permit = threading.Event()
+    first_acquired_local_permit = threading.Event()
+    competing_started = threading.Event()
+    competing_completed = threading.Event()
+    settle_task_ids: list[str] = []
+    first_results: list[ProjectDispatchResult] = []
+    first_errors: list[RuntimeError] = []
+    competing_results: list[ProjectDispatchResult] = []
+
+    def launch_spy(config: Config, task_store: SqliteTaskStore) -> object:
+        if config is runtime_a.config:
+            first_attempting_local_permit.set()
+        permit = launch_permit(config, task_store)
+        if config is runtime_a.config:
+            first_acquired_local_permit.set()
+        return permit
+
+    def live_proof_spy(task_id: str) -> bool:
+        if task_id == task_a.id and first_outcome == "post_acquire_exception" and first_acquired_local_permit.is_set():
+            raise RuntimeError("post-acquire live proof failed")
+        return False
+
+    def settle_spy(*, pending_starts: list[object], store: SqliteTaskStore, **_kwargs: object) -> list[object]:
+        [entry] = pending_starts
+        task_id = getattr(entry, "task_id", None)
+        assert isinstance(task_id, str)
+        settle_task_ids.append(task_id)
+        runtime = runtime_a if store is runtime_a.store else runtime_b
+        _register_live_worker_for_task(runtime.config, task_id, worker_id=f"w-live-{task_id}")
+        return _live_settle_results(pending_starts, store=store)
+
+    def run_first_dispatch() -> None:
+        try:
+            result = budget.dispatch_pending_candidate(runtime_a, candidate_a, max_iterations=1)
+            first_results.append(result)
+        except RuntimeError as exc:
+            first_errors.append(exc)
+
+    def run_competing_dispatch() -> None:
+        competing_started.set()
+        try:
+            competing_results.append(budget.dispatch_pending_candidate(runtime_b, candidate_b, max_iterations=1))
+        finally:
+            competing_completed.set()
+
+    with (
+        patch("gza.cli.watch._maybe_emit_active_watch_recovery_backoff", return_value=False),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.launch_permit", side_effect=launch_spy),
+        patch.object(runtime_a, "_task_has_current_live_worker_proof", side_effect=live_proof_spy),
+        patch("gza.cli.watch._spawn_background_worker", return_value=0),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=settle_spy),
+    ):
+        first_thread = threading.Thread(target=run_first_dispatch)
+        competing_thread = threading.Thread(target=run_competing_dispatch)
+        try:
+            first_thread.start()
+            assert first_attempting_local_permit.wait(timeout=1)
+            assert not first_acquired_local_permit.is_set()
+            assert [
+                (reservation.runtime_key, reservation.task_id)
+                for reservation in budget._reservations.values()
+            ] == [(runtime_a.key, task_a.id)]
+
+            competing_thread.start()
+            assert competing_started.wait(timeout=1)
+            assert not competing_completed.is_set()
+
+            held_local_permit.release()
+            held_local_permit = None
+
+            first_thread.join(timeout=1)
+            competing_thread.join(timeout=1)
+        finally:
+            if held_local_permit is not None:
+                held_local_permit.release()
+
+    assert not first_thread.is_alive()
+    assert not competing_thread.is_alive()
+    assert first_acquired_local_permit.is_set()
+    assert take_task_launch_permit(task_a.id) is None
+    assert take_task_launch_permit(task_b.id) is None
+    assert budget.reservations == ()
+    assert budget.occupancy.provisional_reservations == 0
+    assert len(settle_task_ids) == 1
+    _assert_fresh_launch_permit_reacquires_bounded(runtime_a)
+
+    if first_outcome == "live":
+        assert [result.status for result in first_results] == ["live"]
+        assert first_errors == []
+        assert [result.status for result in competing_results] == ["global_capacity_blocked"]
+        assert settle_task_ids == [task_a.id]
+        assert budget.occupancy.slots == 0
+    else:
+        assert first_results == []
+        assert str(first_errors[0]) == "post-acquire live proof failed"
+        assert [result.status for result in competing_results] == ["live"]
+        assert settle_task_ids == [task_b.id]
+        assert budget.occupancy.slots == 0
+        _assert_fresh_launch_permit_reacquires_bounded(runtime_b)
 
 
 def test_supervisor_launch_budget_replaces_reservation_when_settlement_raises_after_running_visibility(
