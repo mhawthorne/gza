@@ -7631,6 +7631,7 @@ def dispatch_watch_supervisor_lane_incrementally(
             candidate,
             max_iterations=max_iterations,
             dry_run=budget.dry_run,
+            analysis=analyses.get(runtime.key),
         )
 
     dispatcher = dispatch_candidate or default_dispatch

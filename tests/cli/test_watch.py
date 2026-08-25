@@ -5930,6 +5930,129 @@ def test_watch_supervisor_default_pending_dispatch_uses_budget_dry_run_without_m
     assert budget.occupancy.slots == 0
 
 
+def test_watch_supervisor_default_pending_dispatch_preserves_pending_recovery_analysis(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    recovery_owned = store.add("Pending recovery child", task_type="improve")
+    selected = store.add("Selected pending after recovery-owned child", task_type="plan")
+    assert recovery_owned.id is not None
+    assert selected.id is not None
+    recovery_owned.queue_position = 1
+    selected.queue_position = 2
+    store.update(recovery_owned)
+    store.update(selected)
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store, key="a")
+    analysis = _runtime_analysis_with_pending_suppression(
+        runtime,
+        pending_recovery_task_ids=frozenset({recovery_owned.id}),
+    )
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1, dry_run=True)
+    before = _task_snapshot(store)
+
+    with (
+        patch("gza.cli.watch.launch_permit", side_effect=AssertionError("permit acquired")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+    ):
+        results = dispatch_watch_supervisor_lane_incrementally(
+            [runtime],
+            lane="pending",
+            limit=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
+            launch_budget=budget,
+            analyses={"a": analysis},
+        )
+
+    assert [result.status for result in results] == ["dry_run"]
+    assert [result.candidate.task.id for result in results] == [selected.id]
+    assert _task_snapshot(store) == before
+    assert budget.virtual_dispatch_starts == 1
+    assert budget.virtual_dispatch_starts_for_runtime("a") == 1
+    assert budget.occupancy.slots == 0
+
+
+def test_watch_supervisor_default_pending_dispatch_preserves_analyzed_excluded_owner_ids(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    owner = store.add("Excluded failed owner", task_type="implement")
+    pending_child = store.add("Excluded pending child", task_type="improve", based_on=owner.id)
+    selected = store.add("Selected pending after excluded owner", task_type="plan")
+    assert owner.id is not None
+    assert pending_child.id is not None
+    assert selected.id is not None
+    owner.status = "failed"
+    owner.completed_at = datetime.now(UTC)
+    pending_child.queue_position = 1
+    selected.queue_position = 2
+    store.update(owner)
+    store.update(pending_child)
+    store.update(selected)
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store, key="a")
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner, pending_child),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="test",
+        unresolved_tasks=(pending_child,),
+        unresolved_leaf_summary=(),
+        recovery_leaf_task=None,
+    )
+    analysis = _runtime_analysis_with_pending_suppression(
+        runtime,
+        excluded_owner_ids=frozenset({owner.id}),
+    )
+    pending_entry = DispatchPreviewEntry(
+        lane="pending",
+        task=pending_child,
+        runnable=True,
+        worker_consuming=True,
+        owner_task=owner,
+        lineage_row=row,
+    )
+    selected_entry = DispatchPreviewEntry(
+        lane="pending",
+        task=selected,
+        runnable=True,
+        worker_consuming=True,
+        owner_task=selected,
+    )
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1, dry_run=True)
+    before = _task_snapshot(store)
+
+    with (
+        patch(
+            "gza.cli.watch.build_dispatch_preview",
+            return_value=DispatchPreview(entries=(pending_entry, selected_entry)),
+        ),
+        patch("gza.cli.watch.launch_permit", side_effect=AssertionError("permit acquired")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+    ):
+        results = dispatch_watch_supervisor_lane_incrementally(
+            [runtime],
+            lane="pending",
+            limit=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
+            launch_budget=budget,
+            analyses={"a": analysis},
+        )
+
+    assert [result.status for result in results] == ["dry_run"]
+    assert [result.candidate.task.id for result in results] == [selected.id]
+    assert _task_snapshot(store) == before
+    assert budget.virtual_dispatch_starts == 1
+    assert budget.virtual_dispatch_starts_for_runtime("a") == 1
+    assert budget.occupancy.slots == 0
+
+
 def test_watch_supervisor_weighted_strategy_records_actual_incremental_selections(
     tmp_path: Path,
 ) -> None:
