@@ -37,7 +37,7 @@ from ..concurrency import (
     ConcurrencySnapshot,
     LaunchPermit,
     MaxConcurrentTasksError,
-    _collect_live_running_state as _shared_collect_live_running_state,
+    _collect_live_running_state_details as _shared_collect_live_running_state_details,
     get_concurrency_snapshot as _shared_get_concurrency_snapshot,
     launch_permit,
     release_task_launch_permit,
@@ -5677,9 +5677,19 @@ def _count_live_workers(config: Config, store: SqliteTaskStore) -> int:
 
 
 def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple[set[int], list[str], int, int]:
-    live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = _shared_collect_live_running_state(
-        config, store
-    )
+    live_state = _shared_collect_live_running_state_details(config, store)
+    return _watch_visible_running_state_from_live_state(live_state, store=store)
+
+
+def _watch_visible_running_state_from_live_state(
+    live_state: Any,
+    *,
+    store: SqliteTaskStore,
+) -> tuple[set[int], list[str], int, int]:
+    live_pids = live_state.live_pids
+    running_task_ids = live_state.running_task_ids
+    anonymous_worker_count = live_state.anonymous_worker_count
+    starting_worker_count = live_state.starting_worker_count
     hidden_internal_pids: set[int] = set()
     visible_task_ids: list[str] = []
     for task_id in running_task_ids:
@@ -5690,7 +5700,48 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
             continue
         visible_task_ids.append(task_id)
     filtered_live_pids = {pid for pid in live_pids if pid not in hidden_internal_pids}
+    anonymous_worker_pids = set(getattr(live_state, "anonymous_worker_pids", frozenset()))
+    if anonymous_worker_pids:
+        anonymous_worker_count = len(anonymous_worker_pids - hidden_internal_pids)
     return filtered_live_pids, visible_task_ids, anonymous_worker_count, starting_worker_count
+
+
+def _collect_watch_running_and_starting_pids(config: Config, store: SqliteTaskStore) -> tuple[frozenset[int], frozenset[int]]:
+    live_state = _shared_collect_live_running_state_details(config, store)
+    return _watch_running_and_starting_pids_from_live_state(live_state, store=store)
+
+
+def _watch_running_and_starting_pids_from_live_state(
+    live_state: Any,
+    *,
+    store: SqliteTaskStore,
+) -> tuple[frozenset[int], frozenset[int]]:
+    hidden_internal_pids: set[int] = set()
+    for task_id in live_state.running_task_ids:
+        task = store.get(task_id)
+        if task is not None and task.task_type == "internal" and "behavior-monitor" in task.tags:
+            if task.running_pid is not None:
+                hidden_internal_pids.add(task.running_pid)
+    running_pids = frozenset(pid for pid in live_state.live_active_task_pids if pid not in hidden_internal_pids)
+    starting_pids = frozenset(pid for pid in live_state.live_starting_task_pids if pid > 0 and pid not in running_pids)
+    return running_pids, starting_pids
+
+
+def _watch_running_task_pid_by_task_id_from_live_state(
+    live_state: Any,
+    *,
+    store: SqliteTaskStore,
+) -> dict[str, int]:
+    running_task_pid_by_task_id = getattr(live_state, "running_task_pid_by_task_id", None) or {}
+    visible_task_pid_by_task_id: dict[str, int] = {}
+    for task_id, pid in running_task_pid_by_task_id.items():
+        if pid <= 0:
+            continue
+        task = store.get(task_id)
+        if task is not None and task.task_type == "internal" and "behavior-monitor" in task.tags:
+            continue
+        visible_task_pid_by_task_id[str(task_id)] = pid
+    return visible_task_pid_by_task_id
 
 
 def _reconcile_watch_runtime_state(
@@ -5711,16 +5762,27 @@ def _reconcile_watch_runtime_state(
         reconcile_in_progress_tasks(config, store=store, runtime_context=runtime_context)
         prune_terminal_dead_workers(config)
         reconcile_dead_pending_recovery_tasks(config, store=store, runtime_context=runtime_context)
-    live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = _collect_live_running_state(
-        config,
-        store,
+    live_state = _shared_collect_live_running_state_details(config, store)
+    live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = (
+        _watch_visible_running_state_from_live_state(live_state, store=store)
     )
+    running_pids, starting_pids = _watch_running_and_starting_pids_from_live_state(live_state, store=store)
+    running_task_pid_by_task_id = _watch_running_task_pid_by_task_id_from_live_state(live_state, store=store)
+    anonymous_worker_pids = frozenset(
+        pid for pid in getattr(live_state, "anonymous_worker_pids", frozenset()) if pid > 0 and pid in live_pids
+    )
+    starting_worker_ids = tuple(str(worker_id) for worker_id in getattr(live_state, "live_starting_worker_ids", ()))
     return ProjectRuntimeReconcileResult(
         runtime_key=runtime_key,
         live_pids=frozenset(live_pids),
+        running_pids=running_pids,
+        starting_pids=starting_pids,
+        anonymous_worker_pids=anonymous_worker_pids,
         running_task_ids=tuple(running_task_ids),
+        running_task_pid_by_task_id=running_task_pid_by_task_id,
         anonymous_worker_count=anonymous_worker_count,
         starting_worker_count=starting_worker_count,
+        starting_worker_ids=starting_worker_ids,
     )
 
 
@@ -7034,10 +7096,159 @@ class ProjectRuntimeReconcileResult:
     running_task_ids: tuple[str, ...]
     anonymous_worker_count: int
     starting_worker_count: int
+    running_pids: frozenset[int] = frozenset()
+    starting_pids: frozenset[int] = frozenset()
+    anonymous_worker_pids: frozenset[int] = frozenset()
+    running_task_pid_by_task_id: Mapping[str, int] = field(default_factory=dict)
+    starting_worker_ids: tuple[str, ...] = ()
+    runtime_identity: WatchRuntimeIdentity | None = None
 
     @property
     def running(self) -> int:
-        return len(self.running_task_ids)
+        claims = _watch_running_claims_for_reconciled_state(self)
+        return len(claims)
+
+
+@dataclass(frozen=True)
+class ProjectLocalOccupancy:
+    """Per-runtime worker occupancy used by a fleet supervisor before arbitration."""
+
+    runtime_key: str
+    limit: int
+    running: int
+    starting: int
+    available: int
+    live_pids: frozenset[int]
+    running_pids: frozenset[int]
+    starting_pids: frozenset[int]
+    running_task_ids: tuple[str, ...]
+    anonymous_worker_count: int
+    launch_blocked_reasons: tuple[str, ...] = ()
+
+    @property
+    def locally_capped(self) -> bool:
+        return "local_max_concurrent" in self.launch_blocked_reasons
+
+
+@dataclass(frozen=True)
+class AggregateWatchOccupancy:
+    """Deduplicated selected-project occupancy for a future multi-project supervisor."""
+
+    supervisor_batch: int
+    running: int
+    starting: int
+    slots: int
+    running_pids: frozenset[int]
+    starting_pids: frozenset[int]
+    live_pids: frozenset[int]
+    local: tuple[ProjectLocalOccupancy, ...]
+
+    @property
+    def local_by_runtime_key(self) -> Mapping[str, ProjectLocalOccupancy]:
+        return {state.runtime_key: state for state in self.local}
+
+
+@dataclass(frozen=True)
+class _WatchSlotClaim:
+    """One aggregate worker-slot claim from PID or project-qualified fallback evidence."""
+
+    kind: Literal["running", "starting"]
+    identity: tuple[str, ...]
+    pid: int | None = None
+
+
+def _watch_runtime_identity_key(state: ProjectRuntimeReconcileResult) -> tuple[str, str, str]:
+    identity = state.runtime_identity
+    if identity is None:
+        raise ValueError(f"runtime {state.runtime_key!r} missing resolved identity for PID-less slot claim")
+    return (identity.selector_key, str(identity.db_path.resolve()), identity.project_id)
+
+
+def _watch_pidless_claim_identity(
+    state: ProjectRuntimeReconcileResult,
+    *,
+    kind: Literal["runtime-task", "runtime-starting"],
+    launch_id: str,
+) -> tuple[str, ...]:
+    selector_key, db_path, project_id = _watch_runtime_identity_key(state)
+    return (kind, selector_key, db_path, project_id, launch_id)
+
+
+def _validate_reconciled_runtime_identities(reconciled_states: Sequence[ProjectRuntimeReconcileResult]) -> None:
+    runtime_keys: set[str] = set()
+    resolved_identities: set[tuple[str, str, str]] = set()
+    for state in reconciled_states:
+        if state.runtime_key in runtime_keys:
+            raise ValueError(f"duplicate runtime key {state.runtime_key!r} in reconciled watch occupancy")
+        runtime_keys.add(state.runtime_key)
+        if state.runtime_identity is None:
+            continue
+        identity_key = _watch_runtime_identity_key(state)
+        if identity_key in resolved_identities:
+            raise ValueError(
+                "duplicate runtime identity in reconciled watch occupancy: "
+                f"selector={identity_key[0]!r}, db_path={identity_key[1]!r}, project_id={identity_key[2]!r}"
+            )
+        resolved_identities.add(identity_key)
+
+
+def _watch_running_claims_for_reconciled_state(
+    state: ProjectRuntimeReconcileResult,
+    *,
+    include_anonymous: bool = False,
+) -> tuple[_WatchSlotClaim, ...]:
+    """Normalize one runtime's running evidence into one claim per launch."""
+    claims_by_identity: dict[tuple[str, ...], _WatchSlotClaim] = {}
+    positive_running_pids = tuple(sorted(pid for pid in state.running_pids if pid > 0))
+    positive_anonymous_pids: tuple[int, ...] = ()
+    if include_anonymous:
+        positive_anonymous_pids = tuple(
+            sorted(pid for pid in state.anonymous_worker_pids if pid > 0 and pid not in positive_running_pids)
+        )
+    task_pid_by_task_id = dict(state.running_task_pid_by_task_id)
+    if not task_pid_by_task_id and len(positive_running_pids) == len(state.running_task_ids):
+        task_pid_by_task_id = dict(zip(state.running_task_ids, positive_running_pids))
+    for pid in positive_running_pids + positive_anonymous_pids:
+        identity: tuple[str, ...] = ("pid", str(pid))
+        claims_by_identity[identity] = _WatchSlotClaim(kind="running", identity=identity, pid=pid)
+    for task_id in state.running_task_ids:
+        task_pid = task_pid_by_task_id.get(task_id)
+        if task_pid is not None and task_pid > 0:
+            identity = ("pid", str(task_pid))
+            claims_by_identity[identity] = _WatchSlotClaim(kind="running", identity=identity, pid=task_pid)
+            continue
+        identity = _watch_pidless_claim_identity(state, kind="runtime-task", launch_id=task_id)
+        claims_by_identity[identity] = _WatchSlotClaim(kind="running", identity=identity)
+    return tuple(claims_by_identity.values())
+
+
+def _watch_starting_claims_for_reconciled_state(
+    state: ProjectRuntimeReconcileResult,
+    *,
+    local_running_claims: Sequence[_WatchSlotClaim],
+) -> tuple[_WatchSlotClaim, ...]:
+    running_identities = {claim.identity for claim in local_running_claims}
+    claims_by_identity: dict[tuple[str, ...], _WatchSlotClaim] = {}
+    for pid in state.starting_pids:
+        if pid <= 0:
+            continue
+        identity: tuple[str, ...] = ("pid", str(pid))
+        if identity in running_identities:
+            continue
+        claims_by_identity[identity] = _WatchSlotClaim(kind="starting", identity=identity, pid=pid)
+    pid_backed_starting_count = len(claims_by_identity)
+    pidless_starting_count = state.starting_worker_count - pid_backed_starting_count
+    if pidless_starting_count <= 0:
+        return tuple(claims_by_identity.values())
+    if len(state.starting_worker_ids) < state.starting_worker_count:
+        raise ValueError(
+            f"runtime {state.runtime_key!r} has PID-less starting workers without globally unique launch identity"
+        )
+    for worker_id in state.starting_worker_ids[pid_backed_starting_count : state.starting_worker_count]:
+        identity = _watch_pidless_claim_identity(state, kind="runtime-starting", launch_id=worker_id)
+        if identity not in running_identities:
+            claims_by_identity[identity] = _WatchSlotClaim(kind="starting", identity=identity)
+    return tuple(claims_by_identity.values())
 
 
 @dataclass(frozen=True)
@@ -7086,6 +7297,103 @@ class ProjectDispatchResult:
     dispatch_budget_consuming: bool = False
     detail: str | None = None
     task: DbTask | None = None
+
+
+def aggregate_watch_project_occupancy(
+    runtimes: Sequence["WatchProjectRuntime"],
+    *,
+    supervisor_batch: int,
+    dry_run: bool,
+) -> AggregateWatchOccupancy:
+    """Reconcile and aggregate selected runtime occupancy without launching workers."""
+    if supervisor_batch < 0:
+        raise ValueError("supervisor_batch must be non-negative")
+    snapshots = tuple(runtime.reconcile_runtime_state(dry_run=dry_run) for runtime in runtimes)
+    limit_by_runtime_key = {runtime.key: runtime.config.max_concurrent for runtime in runtimes}
+    return aggregate_reconciled_watch_occupancy(
+        snapshots,
+        supervisor_batch=supervisor_batch,
+        limit_by_runtime_key=limit_by_runtime_key,
+    )
+
+
+def aggregate_reconciled_watch_occupancy(
+    reconciled_states: Sequence[ProjectRuntimeReconcileResult],
+    *,
+    supervisor_batch: int,
+    limit_by_runtime_key: Mapping[str, int],
+) -> AggregateWatchOccupancy:
+    """Aggregate already-reconciled selected-project occupancy with PID deduplication."""
+    if supervisor_batch < 0:
+        raise ValueError("supervisor_batch must be non-negative")
+    _validate_reconciled_runtime_identities(reconciled_states)
+
+    running_claims: dict[tuple[str, ...], _WatchSlotClaim] = {}
+    starting_claims: dict[tuple[str, ...], _WatchSlotClaim] = {}
+    aggregate_live_pids: set[int] = set()
+    local_states: list[ProjectLocalOccupancy] = []
+
+    for state in reconciled_states:
+        if state.runtime_key not in limit_by_runtime_key:
+            raise ValueError(f"missing local max_concurrent limit for runtime {state.runtime_key!r}")
+        limit = limit_by_runtime_key[state.runtime_key]
+        running_pids = frozenset(pid for pid in state.running_pids if pid > 0)
+        starting_pids = frozenset(pid for pid in state.starting_pids if pid > 0 and pid not in running_pids)
+        live_pids = frozenset(pid for pid in state.live_pids if pid > 0)
+        local_running_claims = _watch_running_claims_for_reconciled_state(state)
+        aggregate_running_claims = _watch_running_claims_for_reconciled_state(state, include_anonymous=True)
+        local_starting_claims = _watch_starting_claims_for_reconciled_state(
+            state,
+            local_running_claims=local_running_claims,
+        )
+        local_running = len(local_running_claims)
+        local_starting = len(local_starting_claims)
+        available = max(0, limit - local_running)
+        launch_blocked_reasons = ("local_max_concurrent",) if local_running >= limit else ()
+        local_states.append(
+            ProjectLocalOccupancy(
+                runtime_key=state.runtime_key,
+                limit=limit,
+                running=local_running,
+                starting=local_starting,
+                available=available,
+                live_pids=live_pids,
+                running_pids=running_pids,
+                starting_pids=starting_pids,
+                running_task_ids=state.running_task_ids,
+                anonymous_worker_count=state.anonymous_worker_count,
+                launch_blocked_reasons=launch_blocked_reasons,
+            )
+        )
+        aggregate_live_pids.update(live_pids)
+        for claim in aggregate_running_claims:
+            running_claims[claim.identity] = claim
+            starting_claims.pop(claim.identity, None)
+        for claim in local_starting_claims:
+            identity = claim.identity
+            if identity in running_claims:
+                continue
+            starting_claims[identity] = claim
+
+    running_pids_for_report = frozenset(
+        claim.pid for claim in running_claims.values() if claim.pid is not None and claim.pid > 0
+    )
+    starting_pids_for_report = frozenset(
+        claim.pid
+        for identity, claim in starting_claims.items()
+        if claim.pid is not None and claim.pid > 0 and identity not in running_claims
+    )
+    occupied = len(running_claims) + len(starting_claims)
+    return AggregateWatchOccupancy(
+        supervisor_batch=supervisor_batch,
+        running=len(running_claims),
+        starting=len(starting_claims),
+        slots=max(0, supervisor_batch - occupied),
+        running_pids=running_pids_for_report,
+        starting_pids=starting_pids_for_report,
+        live_pids=frozenset(aggregate_live_pids),
+        local=tuple(local_states),
+    )
 
 
 @dataclass(frozen=True)
@@ -7343,13 +7651,14 @@ class WatchProjectRuntime:
         )
 
     def reconcile_runtime_state(self, *, dry_run: bool) -> ProjectRuntimeReconcileResult:
-        return _reconcile_watch_runtime_state(
+        reconciled = _reconcile_watch_runtime_state(
             config=self.config,
             store=self.store,
             runtime_key=self.key,
             runtime_context=self.runtime_context,
             dry_run=dry_run,
         )
+        return replace(reconciled, runtime_identity=self.runtime_identity)
 
     def analyze_cycle(
         self,

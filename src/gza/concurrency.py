@@ -46,9 +46,13 @@ class ConcurrencySnapshot:
 class _LiveRunningState:
     live_pids: frozenset[int]
     live_active_task_pids: frozenset[int]
+    live_starting_task_pids: frozenset[int]
+    live_starting_worker_ids: tuple[str, ...]
+    anonymous_worker_pids: frozenset[int]
     running_task_ids: tuple[str, ...]
     anonymous_worker_count: int
     starting_worker_count: int = 0
+    running_task_pid_by_task_id: dict[str, int] | None = None
 
 
 class MaxConcurrentTasksError(RuntimeError):
@@ -119,6 +123,8 @@ def _collect_live_running_state_details(config: Config, store: SqliteTaskStore) 
     live_task_ids: set[str] = set()
     live_active_task_pids: set[int] = set()
     live_starting_task_pids: set[int] = set()
+    live_starting_worker_ids: set[str] = set()
+    live_task_pid_by_task_id: dict[str, int] = {}
     active_task_statuses = {
         str(task.id): task.status
         for task in store.get_in_progress()
@@ -128,27 +134,32 @@ def _collect_live_running_state_details(config: Config, store: SqliteTaskStore) 
     for worker in registry.list_all(include_completed=False):
         if worker.status != "running" or not registry.is_running(worker.worker_id):
             continue
-        if worker.pid > 0:
-            live_pids.add(worker.pid)
         if worker.task_id is not None:
             task_id = str(worker.task_id)
+            task = store.get(task_id)
+            if task is not None and task.task_type == "internal" and "behavior-monitor" in task.tags:
+                continue
             task_status = active_task_statuses.get(task_id)
-            if task_status is None:
-                task = store.get(task_id)
-                task_status = task.status if task is not None else None
-                if task_status is not None:
-                    active_task_statuses[task_id] = task_status
+            if task_status is None and task is not None:
+                task_status = task.status
+                active_task_statuses[task_id] = task_status
+            if worker.pid > 0:
+                live_pids.add(worker.pid)
             if task_status == "in_progress":
                 if worker.pid > 0:
                     live_active_task_pids.add(worker.pid)
+                    live_task_pid_by_task_id[task_id] = worker.pid
                 live_task_ids.add(task_id)
                 continue
             if task_status == "pending":
                 if worker.pid > 0:
                     live_starting_task_pids.add(worker.pid)
+                    live_starting_worker_ids.add(worker.worker_id)
                 continue
             if task_status is not None:
                 continue
+        elif worker.pid > 0:
+            live_pids.add(worker.pid)
 
     for task in store.get_in_progress():
         pid = task.running_pid
@@ -158,17 +169,24 @@ def _collect_live_running_state_details(config: Config, store: SqliteTaskStore) 
         live_pids.add(pid)
         live_active_task_pids.add(pid)
         if task.id is not None:
-            live_task_ids.add(str(task.id))
+            task_id = str(task.id)
+            live_task_ids.add(task_id)
+            live_task_pid_by_task_id[task_id] = pid
 
     running_task_ids = tuple(sorted(live_task_ids, key=lambda task_id: task_id_numeric_key(task_id)))
     starting_worker_count = len(live_starting_task_pids - live_active_task_pids)
-    anonymous_worker_count = len(live_pids - live_active_task_pids - live_starting_task_pids)
+    anonymous_worker_pids = live_pids - live_active_task_pids - live_starting_task_pids
+    anonymous_worker_count = len(anonymous_worker_pids)
     return _LiveRunningState(
         live_pids=frozenset(live_pids),
         live_active_task_pids=frozenset(live_active_task_pids),
+        live_starting_task_pids=frozenset(live_starting_task_pids),
+        live_starting_worker_ids=tuple(sorted(live_starting_worker_ids)),
+        anonymous_worker_pids=frozenset(anonymous_worker_pids),
         running_task_ids=running_task_ids,
         anonymous_worker_count=anonymous_worker_count,
         starting_worker_count=starting_worker_count,
+        running_task_pid_by_task_id=live_task_pid_by_task_id,
     )
 
 

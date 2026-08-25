@@ -59,6 +59,7 @@ from gza.cli.git_ops import (
     ensure_watch_main_checkout,
 )
 from gza.cli.watch import (
+    AggregateWatchOccupancy,
     MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT,
     MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON,
     MAIN_VERIFY_REMEDIATION_EXHAUSTED_FAILURE_REASON,
@@ -68,10 +69,14 @@ from gza.cli.watch import (
     ProjectCycleAnalysis,
     ProjectDirectResult,
     ProjectDispatchCandidate,
+    ProjectLocalOccupancy,
     ProjectRuntimeReconcileResult,
     WatchProjectRuntime,
+    WatchRuntimeIdentity,
     WatchProjectSelection,
     WatchSlotAllocation,
+    aggregate_reconciled_watch_occupancy,
+    aggregate_watch_project_occupancy,
     _active_failure_backoff_owner_ids,
     _build_watch_cycle_plan,
     _collect_advance_completed_tasks,
@@ -132,7 +137,7 @@ from gza.cli.watch import (
     cmd_watch,
     format_red_duration,
 )
-from gza.concurrency import MaxConcurrentTasksError, launch_permit
+from gza.concurrency import MaxConcurrentTasksError, _LiveRunningState, launch_permit
 from gza.config import Config, ConfigError
 from gza.db import (
     DuplicateActiveChildError,
@@ -1007,8 +1012,18 @@ def test_watch_project_runtime_reconcile_runtime_state_preserves_legacy_order(tm
             side_effect=lambda cfg, **kwargs: calls.append("pending_recovery"),
         ) as reconcile_recovery,
         patch(
-            "gza.cli.watch._collect_live_running_state",
-            side_effect=lambda cfg, st: calls.append("collect") or ({321}, ["gza-1"], 2, 1),
+            "gza.cli.watch._shared_collect_live_running_state_details",
+            side_effect=lambda cfg, st: calls.append("collect")
+            or _LiveRunningState(
+                live_pids=frozenset({321, 654}),
+                live_active_task_pids=frozenset({321}),
+                live_starting_task_pids=frozenset({654}),
+                live_starting_worker_ids=("w-starting",),
+                anonymous_worker_pids=frozenset(),
+                running_task_ids=("gza-1",),
+                anonymous_worker_count=2,
+                starting_worker_count=1,
+            ),
         ) as collect_live,
     ):
         result = runtime.reconcile_runtime_state(dry_run=False)
@@ -1016,11 +1031,13 @@ def test_watch_project_runtime_reconcile_runtime_state_preserves_legacy_order(tm
     assert isinstance(result, ProjectRuntimeReconcileResult)
     assert calls == ["in_progress", "prune", "pending_recovery", "collect"]
     assert result.runtime_key == "core"
-    assert result.live_pids == frozenset({321})
+    assert result.live_pids == frozenset({321, 654})
     assert result.running_task_ids == ("gza-1",)
     assert result.running == 1
     assert result.anonymous_worker_count == 2
     assert result.starting_worker_count == 1
+    assert result.running_pids == frozenset({321})
+    assert result.starting_pids == frozenset({654})
     reconcile_in_progress.assert_called_once_with(config, store=store, runtime_context=runtime.runtime_context)
     prune_dead.assert_called_once_with(config)
     reconcile_recovery.assert_called_once_with(config, store=store, runtime_context=runtime.runtime_context)
@@ -1054,13 +1071,635 @@ def test_watch_project_runtime_reconcile_dry_run_only_observes_runtime_state(tmp
             "gza.cli._common.reconcile_dead_pending_recovery_tasks",
             side_effect=AssertionError("dry-run reconciled"),
         ),
-        patch("gza.cli.watch._collect_live_running_state", return_value=({654}, ["gza-2"], 0, 3)),
+        patch(
+            "gza.cli.watch._shared_collect_live_running_state_details",
+            return_value=_LiveRunningState(
+                live_pids=frozenset({654, 655, 656}),
+                live_active_task_pids=frozenset({654}),
+                live_starting_task_pids=frozenset({655, 656}),
+                live_starting_worker_ids=("w-starting-1", "w-starting-2", "w-starting-3"),
+                anonymous_worker_pids=frozenset(),
+                running_task_ids=("gza-2",),
+                anonymous_worker_count=0,
+                starting_worker_count=3,
+            ),
+        ),
     ):
         result = runtime.reconcile_runtime_state(dry_run=True)
 
-    assert result.live_pids == frozenset({654})
+    assert result.live_pids == frozenset({654, 655, 656})
     assert result.running_task_ids == ("gza-2",)
     assert result.starting_worker_count == 3
+
+
+def test_watch_project_runtime_reconcile_uses_one_liveness_snapshot(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    runtime = WatchProjectRuntime.create(
+        key="core",
+        config=config,
+        store=store,
+        log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+    snapshots = [
+        _LiveRunningState(
+            live_pids=frozenset({7001}),
+            live_active_task_pids=frozenset(),
+            live_starting_task_pids=frozenset({7001}),
+            live_starting_worker_ids=("w-starting",),
+            anonymous_worker_pids=frozenset(),
+            running_task_ids=(),
+            anonymous_worker_count=0,
+            starting_worker_count=1,
+        ),
+        _LiveRunningState(
+            live_pids=frozenset({7001}),
+            live_active_task_pids=frozenset({7001}),
+            live_starting_task_pids=frozenset(),
+            live_starting_worker_ids=(),
+            anonymous_worker_pids=frozenset(),
+            running_task_ids=("gza-77",),
+            anonymous_worker_count=0,
+            starting_worker_count=0,
+        ),
+    ]
+
+    with patch("gza.cli.watch._shared_collect_live_running_state_details", side_effect=snapshots) as collect_live:
+        result = runtime.reconcile_runtime_state(dry_run=True)
+
+    collect_live.assert_called_once_with(config, store)
+    assert result.running_task_ids == ()
+    assert result.running_pids == frozenset()
+    assert result.starting_pids == frozenset({7001})
+    assert result.starting_worker_count == 1
+
+
+def _make_aggregate_runtime(
+    project_dir: Path,
+    *,
+    project_name: str,
+    max_concurrent: int = 5,
+    db_path: Path | None = None,
+) -> WatchProjectRuntime:
+    project_dir.mkdir(parents=True, exist_ok=True)
+    if db_path is None:
+        setup_config(project_dir, project_name=project_name)
+        config_path = project_dir / "gza.yaml"
+        config_path.write_text(
+            config_path.read_text(encoding="utf-8") + f"max_concurrent: {max_concurrent}\n",
+            encoding="utf-8",
+        )
+    else:
+        (project_dir / "gza.yaml").write_text(
+            f"project_name: {project_name}\n"
+            f"project_id: {project_name}\n"
+            f"project_prefix: {project_name}\n"
+            f"db_path: {db_path}\n"
+            "provider: codex\n"
+            "model: gpt-5.5\n"
+            f"max_concurrent: {max_concurrent}\n",
+            encoding="utf-8",
+        )
+    config = Config.load(project_dir)
+    return WatchProjectRuntime.create(
+        key=project_name,
+        config=config,
+        store=SqliteTaskStore.from_config(config),
+        log=_WatchLog(project_dir / ".gza" / "watch.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+
+
+def _runtime_identity(tmp_path: Path, selector_key: str, project_id: str) -> WatchRuntimeIdentity:
+    return WatchRuntimeIdentity(
+        selector_key=selector_key,
+        db_path=(tmp_path / f"{selector_key}.db").resolve(),
+        project_id=project_id,
+        generation=f"gen-{selector_key}",
+    )
+
+
+def _mark_running(store: SqliteTaskStore, task: DbTask, *, pid: int) -> None:
+    task.status = "in_progress"
+    task.running_pid = pid
+    store.update(task)
+
+
+def test_aggregate_watch_occupancy_counts_shared_db_selected_work_once_per_pid(tmp_path: Path) -> None:
+    shared_db = tmp_path / "shared.db"
+    core = _make_aggregate_runtime(tmp_path / "core", project_name="core", db_path=shared_db)
+    server = _make_aggregate_runtime(tmp_path / "server", project_name="server", db_path=shared_db)
+    core_task = core.store.add("Core work", task_type="plan")
+    server_task = server.store.add("Server work", task_type="plan")
+    assert core_task.id is not None
+    assert server_task.id is not None
+    _mark_running(core.store, core_task, pid=111)
+    _mark_running(server.store, server_task, pid=222)
+
+    with patch("gza.concurrency._pid_alive", side_effect=lambda pid: bool(pid and pid > 0)):
+        occupancy = aggregate_watch_project_occupancy([core, server], supervisor_batch=4, dry_run=True)
+
+    assert isinstance(occupancy, AggregateWatchOccupancy)
+    assert occupancy.running == 2
+    assert occupancy.starting == 0
+    assert occupancy.slots == 2
+    assert occupancy.running_pids == frozenset({111, 222})
+    assert [state.runtime_key for state in occupancy.local] == ["core", "server"]
+
+
+def test_aggregate_watch_occupancy_counts_unrelated_db_selected_work(tmp_path: Path) -> None:
+    alpha = _make_aggregate_runtime(tmp_path / "alpha", project_name="alpha")
+    beta = _make_aggregate_runtime(tmp_path / "beta", project_name="beta")
+    alpha_task = alpha.store.add("Alpha work", task_type="plan")
+    beta_task = beta.store.add("Beta work", task_type="plan")
+    assert alpha_task.id is not None
+    assert beta_task.id is not None
+    _mark_running(alpha.store, alpha_task, pid=333)
+    _mark_running(beta.store, beta_task, pid=444)
+
+    with patch("gza.concurrency._pid_alive", side_effect=lambda pid: bool(pid and pid > 0)):
+        occupancy = aggregate_watch_project_occupancy([alpha, beta], supervisor_batch=3, dry_run=True)
+
+    assert occupancy.running == 2
+    assert occupancy.slots == 1
+    assert occupancy.local_by_runtime_key["alpha"].running == 1
+    assert occupancy.local_by_runtime_key["beta"].running == 1
+
+
+def test_aggregate_watch_occupancy_deduplicates_duplicate_pid_visibility(tmp_path: Path) -> None:
+    alpha = _make_aggregate_runtime(tmp_path / "alpha", project_name="alpha")
+    beta = _make_aggregate_runtime(tmp_path / "beta", project_name="beta")
+    alpha_task = alpha.store.add("Alpha duplicate pid work", task_type="plan")
+    beta_task = beta.store.add("Beta duplicate pid work", task_type="plan")
+    assert alpha_task.id is not None
+    assert beta_task.id is not None
+    _mark_running(alpha.store, alpha_task, pid=555)
+    _mark_running(beta.store, beta_task, pid=555)
+
+    with patch("gza.concurrency._pid_alive", side_effect=lambda pid: bool(pid and pid > 0)):
+        occupancy = aggregate_watch_project_occupancy([alpha, beta], supervisor_batch=2, dry_run=True)
+
+    assert occupancy.running == 1
+    assert occupancy.slots == 1
+    assert occupancy.running_pids == frozenset({555})
+    assert occupancy.local_by_runtime_key["alpha"].running == 1
+    assert occupancy.local_by_runtime_key["beta"].running == 1
+
+
+def test_aggregate_watch_occupancy_adopts_already_running_task_rows(tmp_path: Path) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "core", project_name="core")
+    task = runtime.store.add("Already running row", task_type="plan")
+    assert task.id is not None
+    _mark_running(runtime.store, task, pid=666)
+
+    with patch("gza.concurrency._pid_alive", side_effect=lambda pid: bool(pid and pid > 0)):
+        occupancy = aggregate_watch_project_occupancy([runtime], supervisor_batch=2, dry_run=True)
+
+    assert occupancy.running == 1
+    assert occupancy.running_pids == frozenset({666})
+    assert occupancy.slots == 1
+
+
+def test_aggregate_watch_occupancy_deduplicates_duplicate_registry_and_task_row_launch(tmp_path: Path) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "core", project_name="core")
+    task = runtime.store.add("Already running row with registry evidence", task_type="plan")
+    assert task.id is not None
+    _mark_running(runtime.store, task, pid=777)
+    WorkerRegistry(runtime.config.workers_path).register(
+        WorkerMetadata(worker_id="w-running", task_id=task.id, pid=777, status="running")
+    )
+
+    with patch("gza.concurrency._pid_alive", side_effect=lambda pid: bool(pid and pid > 0)):
+        occupancy = aggregate_watch_project_occupancy([runtime], supervisor_batch=2, dry_run=True)
+
+    assert occupancy.running == 1
+    assert occupancy.running_pids == frozenset({777})
+    assert occupancy.slots == 1
+    local = occupancy.local_by_runtime_key["core"]
+    assert local.running == 1
+    assert local.available == 4
+    assert local.locally_capped is False
+
+
+def test_aggregate_watch_occupancy_counts_live_terminal_task_worker_as_aggregate_claim(tmp_path: Path) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "core", project_name="core")
+    terminal_task = runtime.store.add("Terminal detached iterate", task_type="implement")
+    assert terminal_task.id is not None
+    terminal_task.status = "completed"
+    runtime.store.update(terminal_task)
+    WorkerRegistry(runtime.config.workers_path).register(
+        WorkerMetadata(worker_id="w-terminal", task_id=terminal_task.id, pid=os.getpid(), status="running")
+    )
+
+    occupancy = aggregate_watch_project_occupancy([runtime], supervisor_batch=1, dry_run=True)
+
+    assert occupancy.running == 1
+    assert occupancy.slots == 0
+    assert occupancy.running_pids == frozenset({os.getpid()})
+    local = occupancy.local_by_runtime_key["core"]
+    assert local.running == 0
+    assert local.anonymous_worker_count == 1
+    assert local.available == 5
+    assert local.locally_capped is False
+
+
+def test_aggregate_reconciled_watch_occupancy_deduplicates_anonymous_pid_across_runtimes() -> None:
+    occupancy = aggregate_reconciled_watch_occupancy(
+        [
+            ProjectRuntimeReconcileResult(
+                runtime_key="core",
+                live_pids=frozenset({4242}),
+                running_pids=frozenset(),
+                starting_pids=frozenset(),
+                anonymous_worker_pids=frozenset({4242}),
+                running_task_ids=(),
+                anonymous_worker_count=1,
+                starting_worker_count=0,
+            ),
+            ProjectRuntimeReconcileResult(
+                runtime_key="server",
+                live_pids=frozenset({4242}),
+                running_pids=frozenset(),
+                starting_pids=frozenset(),
+                anonymous_worker_pids=frozenset({4242}),
+                running_task_ids=(),
+                anonymous_worker_count=1,
+                starting_worker_count=0,
+            ),
+        ],
+        supervisor_batch=2,
+        limit_by_runtime_key={"core": 5, "server": 5},
+    )
+
+    assert occupancy.running == 1
+    assert occupancy.slots == 1
+    assert occupancy.running_pids == frozenset({4242})
+    assert occupancy.local_by_runtime_key["core"].running == 0
+    assert occupancy.local_by_runtime_key["server"].running == 0
+
+
+def test_aggregate_watch_occupancy_excludes_behavior_monitor_internal_pid_evidence(tmp_path: Path) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "core", project_name="core")
+    monitor_task = runtime.store.add(
+        "Behavior monitor pass",
+        task_type="internal",
+        tags=("behavior-monitor",),
+    )
+    assert monitor_task.id is not None
+    monitor_task.status = "completed"
+    runtime.store.update(monitor_task)
+    WorkerRegistry(runtime.config.workers_path).register(
+        WorkerMetadata(worker_id="w-behavior-monitor", task_id=monitor_task.id, pid=os.getpid(), status="running")
+    )
+
+    occupancy = aggregate_watch_project_occupancy([runtime], supervisor_batch=1, dry_run=True)
+
+    assert occupancy.running == 0
+    assert occupancy.starting == 0
+    assert occupancy.slots == 1
+    assert occupancy.running_pids == frozenset()
+    assert occupancy.live_pids == frozenset()
+    assert occupancy.local_by_runtime_key["core"].anonymous_worker_count == 0
+
+
+def test_aggregate_watch_occupancy_counts_starting_workers_against_global_slots(tmp_path: Path) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "core", project_name="core")
+    task = runtime.store.add("Pending with worker starting", task_type="plan")
+    assert task.id is not None
+    WorkerRegistry(runtime.config.workers_path).register(
+        WorkerMetadata(worker_id="w-starting", task_id=task.id, pid=os.getpid(), status="running")
+    )
+
+    occupancy = aggregate_watch_project_occupancy([runtime], supervisor_batch=2, dry_run=True)
+
+    assert occupancy.running == 0
+    assert occupancy.starting == 1
+    assert occupancy.starting_pids == frozenset({os.getpid()})
+    assert occupancy.slots == 1
+
+
+def test_aggregate_watch_occupancy_empty_projects_do_not_consume_slots(tmp_path: Path) -> None:
+    empty = _make_aggregate_runtime(tmp_path / "empty", project_name="empty")
+    active = _make_aggregate_runtime(tmp_path / "active", project_name="active")
+    task = active.store.add("Active work", task_type="plan")
+    assert task.id is not None
+    _mark_running(active.store, task, pid=888)
+
+    with patch("gza.concurrency._pid_alive", side_effect=lambda pid: bool(pid and pid > 0)):
+        occupancy = aggregate_watch_project_occupancy([empty, active], supervisor_batch=2, dry_run=True)
+
+    assert occupancy.running == 1
+    assert occupancy.slots == 1
+    assert occupancy.local_by_runtime_key["empty"].running == 0
+    assert occupancy.local_by_runtime_key["empty"].starting == 0
+    assert occupancy.local_by_runtime_key["empty"].locally_capped is False
+
+
+def test_aggregate_watch_occupancy_exposes_locally_capped_runtime_skip_state(tmp_path: Path) -> None:
+    capped = _make_aggregate_runtime(tmp_path / "capped", project_name="capped", max_concurrent=1)
+    eligible = _make_aggregate_runtime(tmp_path / "eligible", project_name="eligible", max_concurrent=3)
+    capped_task = capped.store.add("Capped running work", task_type="plan")
+    eligible_task = eligible.store.add("Eligible running work", task_type="plan")
+    assert capped_task.id is not None
+    assert eligible_task.id is not None
+    _mark_running(capped.store, capped_task, pid=901)
+    _mark_running(eligible.store, eligible_task, pid=902)
+
+    with patch("gza.concurrency._pid_alive", side_effect=lambda pid: bool(pid and pid > 0)):
+        occupancy = aggregate_watch_project_occupancy([capped, eligible], supervisor_batch=4, dry_run=True)
+
+    capped_state = occupancy.local_by_runtime_key["capped"]
+    eligible_state = occupancy.local_by_runtime_key["eligible"]
+    assert isinstance(capped_state, ProjectLocalOccupancy)
+    assert capped_state.locally_capped is True
+    assert capped_state.launch_blocked_reasons == ("local_max_concurrent",)
+    assert capped_state.available == 0
+    assert eligible_state.locally_capped is False
+    assert eligible_state.available == 2
+    assert occupancy.slots == 2
+
+
+def test_aggregate_reconciled_watch_occupancy_deduplicates_starting_pid_seen_as_running() -> None:
+    occupancy = aggregate_reconciled_watch_occupancy(
+        [
+            ProjectRuntimeReconcileResult(
+                runtime_key="running",
+                live_pids=frozenset({1234}),
+                running_pids=frozenset({1234}),
+                starting_pids=frozenset(),
+                running_task_ids=("gza-1",),
+                anonymous_worker_count=0,
+                starting_worker_count=0,
+            ),
+            ProjectRuntimeReconcileResult(
+                runtime_key="starting",
+                live_pids=frozenset({1234}),
+                running_pids=frozenset(),
+                starting_pids=frozenset({1234}),
+                running_task_ids=(),
+                anonymous_worker_count=0,
+                starting_worker_count=1,
+            ),
+        ],
+        supervisor_batch=2,
+        limit_by_runtime_key={"running": 5, "starting": 5},
+    )
+
+    assert occupancy.running == 1
+    assert occupancy.starting == 0
+    assert occupancy.slots == 1
+
+
+def test_aggregate_reconciled_watch_occupancy_counts_pidless_same_task_id_per_runtime() -> None:
+    occupancy = aggregate_reconciled_watch_occupancy(
+        [
+            ProjectRuntimeReconcileResult(
+                runtime_key="core",
+                live_pids=frozenset(),
+                running_pids=frozenset(),
+                starting_pids=frozenset(),
+                running_task_ids=("gza-42",),
+                anonymous_worker_count=0,
+                starting_worker_count=0,
+                runtime_identity=_runtime_identity(Path("/tmp"), "core", "core"),
+            ),
+            ProjectRuntimeReconcileResult(
+                runtime_key="server",
+                live_pids=frozenset(),
+                running_pids=frozenset(),
+                starting_pids=frozenset(),
+                running_task_ids=("gza-42",),
+                anonymous_worker_count=0,
+                starting_worker_count=0,
+                runtime_identity=_runtime_identity(Path("/tmp"), "server", "server"),
+            ),
+        ],
+        supervisor_batch=3,
+        limit_by_runtime_key={"core": 5, "server": 5},
+    )
+
+    assert occupancy.running == 2
+    assert occupancy.starting == 0
+    assert occupancy.slots == 1
+    assert occupancy.running_pids == frozenset()
+
+
+def test_aggregate_reconciled_watch_occupancy_uses_resolved_identity_for_pidless_task_collisions(
+    tmp_path: Path,
+) -> None:
+    occupancy = aggregate_reconciled_watch_occupancy(
+        [
+            ProjectRuntimeReconcileResult(
+                runtime_key="core",
+                live_pids=frozenset(),
+                running_pids=frozenset(),
+                starting_pids=frozenset(),
+                running_task_ids=("gza-42",),
+                anonymous_worker_count=0,
+                starting_worker_count=0,
+                runtime_identity=_runtime_identity(tmp_path, "core", "gza"),
+            ),
+            ProjectRuntimeReconcileResult(
+                runtime_key="shop",
+                live_pids=frozenset(),
+                running_pids=frozenset(),
+                starting_pids=frozenset(),
+                running_task_ids=("gza-42",),
+                anonymous_worker_count=0,
+                starting_worker_count=0,
+                runtime_identity=_runtime_identity(tmp_path, "shop", "gza"),
+            ),
+        ],
+        supervisor_batch=2,
+        limit_by_runtime_key={"core": 5, "shop": 5},
+    )
+
+    assert occupancy.running == 2
+    assert occupancy.slots == 0
+    assert occupancy.running_pids == frozenset()
+
+
+def test_aggregate_reconciled_watch_occupancy_rejects_duplicate_runtime_identity(
+    tmp_path: Path,
+) -> None:
+    duplicate_identity = _runtime_identity(tmp_path, "core", "gza")
+    with pytest.raises(ValueError, match="duplicate runtime identity"):
+        aggregate_reconciled_watch_occupancy(
+            [
+                ProjectRuntimeReconcileResult(
+                    runtime_key="core",
+                    live_pids=frozenset(),
+                    running_pids=frozenset(),
+                    starting_pids=frozenset(),
+                    running_task_ids=("gza-42",),
+                    anonymous_worker_count=0,
+                    starting_worker_count=0,
+                    runtime_identity=duplicate_identity,
+                ),
+                ProjectRuntimeReconcileResult(
+                    runtime_key="core-alias",
+                    live_pids=frozenset(),
+                    running_pids=frozenset(),
+                    starting_pids=frozenset(),
+                    running_task_ids=("gza-43",),
+                    anonymous_worker_count=0,
+                    starting_worker_count=0,
+                    runtime_identity=duplicate_identity,
+                ),
+            ],
+            supervisor_batch=2,
+            limit_by_runtime_key={"core": 5, "core-alias": 5},
+        )
+
+
+def test_aggregate_reconciled_watch_occupancy_rejects_duplicate_runtime_key() -> None:
+    with pytest.raises(ValueError, match="duplicate runtime key"):
+        aggregate_reconciled_watch_occupancy(
+            [
+                ProjectRuntimeReconcileResult(
+                    runtime_key="core",
+                    live_pids=frozenset({1234}),
+                    running_pids=frozenset({1234}),
+                    starting_pids=frozenset(),
+                    running_task_ids=("gza-42",),
+                    anonymous_worker_count=0,
+                    starting_worker_count=0,
+                ),
+                ProjectRuntimeReconcileResult(
+                    runtime_key="core",
+                    live_pids=frozenset({5678}),
+                    running_pids=frozenset({5678}),
+                    starting_pids=frozenset(),
+                    running_task_ids=("gza-43",),
+                    anonymous_worker_count=0,
+                    starting_worker_count=0,
+                ),
+            ],
+            supervisor_batch=2,
+            limit_by_runtime_key={"core": 5},
+        )
+
+
+def test_aggregate_reconciled_watch_occupancy_deduplicates_two_task_ids_sharing_one_pid() -> None:
+    occupancy = aggregate_reconciled_watch_occupancy(
+        [
+            ProjectRuntimeReconcileResult(
+                runtime_key="core",
+                live_pids=frozenset({1234}),
+                running_pids=frozenset({1234}),
+                starting_pids=frozenset(),
+                running_task_ids=("gza-1", "gza-2"),
+                running_task_pid_by_task_id={"gza-1": 1234, "gza-2": 1234},
+                anonymous_worker_count=0,
+                starting_worker_count=0,
+            ),
+        ],
+        supervisor_batch=2,
+        limit_by_runtime_key={"core": 2},
+    )
+
+    assert occupancy.running == 1
+    assert occupancy.starting == 0
+    assert occupancy.slots == 1
+    local = occupancy.local_by_runtime_key["core"]
+    assert local.running == 1
+    assert local.available == 1
+    assert local.locally_capped is False
+    assert occupancy.running_pids == frozenset({1234})
+
+
+def test_aggregate_reconciled_watch_occupancy_counts_pid_backed_and_pidless_running_claims(tmp_path: Path) -> None:
+    occupancy = aggregate_reconciled_watch_occupancy(
+        [
+            ProjectRuntimeReconcileResult(
+                runtime_key="core",
+                live_pids=frozenset({1234}),
+                running_pids=frozenset({1234}),
+                starting_pids=frozenset(),
+                running_task_ids=("gza-1", "gza-2"),
+                running_task_pid_by_task_id={"gza-1": 1234},
+                anonymous_worker_count=0,
+                starting_worker_count=0,
+                runtime_identity=_runtime_identity(tmp_path, "core", "core"),
+            ),
+        ],
+        supervisor_batch=3,
+        limit_by_runtime_key={"core": 3},
+    )
+
+    assert occupancy.running == 2
+    assert occupancy.starting == 0
+    assert occupancy.slots == 1
+    local = occupancy.local_by_runtime_key["core"]
+    assert local.running == 2
+    assert local.available == 1
+    assert local.locally_capped is False
+    assert occupancy.running_pids == frozenset({1234})
+
+
+def test_aggregate_reconciled_watch_occupancy_counts_pidless_starting_capacity() -> None:
+    occupancy = aggregate_reconciled_watch_occupancy(
+        [
+            ProjectRuntimeReconcileResult(
+                runtime_key="core",
+                live_pids=frozenset(),
+                running_pids=frozenset(),
+                starting_pids=frozenset(),
+                running_task_ids=(),
+                anonymous_worker_count=0,
+                starting_worker_count=1,
+                starting_worker_ids=("w-core",),
+                runtime_identity=_runtime_identity(Path("/tmp"), "core", "core"),
+            ),
+            ProjectRuntimeReconcileResult(
+                runtime_key="server",
+                live_pids=frozenset(),
+                running_pids=frozenset(),
+                starting_pids=frozenset(),
+                running_task_ids=(),
+                anonymous_worker_count=0,
+                starting_worker_count=2,
+                starting_worker_ids=("w-server-1", "w-server-2"),
+                runtime_identity=_runtime_identity(Path("/tmp"), "server", "server"),
+            ),
+        ],
+        supervisor_batch=4,
+        limit_by_runtime_key={"core": 5, "server": 5},
+    )
+
+    assert occupancy.running == 0
+    assert occupancy.starting == 3
+    assert occupancy.slots == 1
+    assert occupancy.starting_pids == frozenset()
+
+
+def test_aggregate_reconciled_watch_occupancy_replaces_fallback_with_pid_claim() -> None:
+    occupancy = aggregate_reconciled_watch_occupancy(
+        [
+            ProjectRuntimeReconcileResult(
+                runtime_key="core",
+                live_pids=frozenset({1234}),
+                running_pids=frozenset({1234}),
+                starting_pids=frozenset(),
+                running_task_ids=("gza-42",),
+                anonymous_worker_count=0,
+                starting_worker_count=0,
+            ),
+        ],
+        supervisor_batch=2,
+        limit_by_runtime_key={"core": 5},
+    )
+
+    assert occupancy.running == 1
+    assert occupancy.starting == 0
+    assert occupancy.slots == 1
+    assert occupancy.running_pids == frozenset({1234})
 
 
 def test_watch_project_runtime_analyze_cycle_matches_project_local_plan_without_dispatch(tmp_path: Path) -> None:
@@ -1968,9 +2607,18 @@ def test_run_cycle_uses_reconciled_occupancy_for_legacy_capacity_snapshot(tmp_pa
     built_plans: list[_WatchCyclePlan] = []
     real_build_plan = watch_module._build_watch_cycle_plan
 
-    def collect_live_once(*_args: object, **_kwargs: object) -> tuple[set[int], list[str], int, int]:
+    def collect_live_once(*_args: object, **_kwargs: object) -> _LiveRunningState:
         calls.append("occupancy")
-        return {4321}, ["gza-4321"], 2, 1
+        return _LiveRunningState(
+            live_pids=frozenset({4321, 8765}),
+            live_active_task_pids=frozenset({4321}),
+            live_starting_task_pids=frozenset({8765}),
+            live_starting_worker_ids=("w-starting",),
+            anonymous_worker_pids=frozenset(),
+            running_task_ids=("gza-4321",),
+            anonymous_worker_count=2,
+            starting_worker_count=1,
+        )
 
     def build_plan_with_order(**kwargs: object) -> _WatchCyclePlan:
         calls.append("analyze")
@@ -1982,7 +2630,7 @@ def test_run_cycle_uses_reconciled_occupancy_for_legacy_capacity_snapshot(tmp_pa
         patch("gza.cli._common.reconcile_in_progress_tasks", side_effect=lambda cfg, **kwargs: calls.append("reconcile")),
         patch("gza.cli._common.prune_terminal_dead_workers", return_value=None),
         patch("gza.cli._common.reconcile_dead_pending_recovery_tasks", return_value=None),
-        patch("gza.cli.watch._collect_live_running_state", side_effect=collect_live_once),
+        patch("gza.cli.watch._shared_collect_live_running_state_details", side_effect=collect_live_once),
         patch(
             "gza.cli.watch.get_concurrency_snapshot",
             side_effect=AssertionError("plan should reuse reconciled occupancy"),
@@ -55314,7 +55962,19 @@ def test_cmd_watch_sleep_reports_pending_registered_worker_as_starting_not_runni
         patch("gza.cli.watch._maybe_file_main_verify_remediation"),
         patch("gza.cli.watch._emit_git_health_hold", return_value=False),
         patch("gza.cli.watch.get_concurrency_snapshot", return_value=snapshot),
-        patch("gza.cli.watch._collect_live_running_state", return_value=({111, 222}, [running.id], 0, 1)),
+        patch(
+            "gza.cli.watch._shared_collect_live_running_state_details",
+            return_value=_LiveRunningState(
+                live_pids=frozenset({111, 222}),
+                live_active_task_pids=frozenset({111}),
+                live_starting_task_pids=frozenset({222}),
+                live_starting_worker_ids=("w-starting",),
+                anonymous_worker_pids=frozenset(),
+                running_task_ids=(running.id,),
+                anonymous_worker_count=0,
+                starting_worker_count=1,
+            ),
+        ),
         patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
         patch(
             "gza.cli.watch._wait_for_watch_dispatch_start",
