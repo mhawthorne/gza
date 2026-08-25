@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -181,6 +181,7 @@ from ..watch_progress import (
     reconcile_stale_watch_no_progress_parks,
     record_background_watch_execution_start,
 )
+from ..watch_strategies import WatchDispatchStrategy
 from ..workers import WorkerRegistry
 from . import _lifecycle_actions as _shared_lifecycle_actions
 from ._common import (
@@ -7278,6 +7279,8 @@ class ProjectDispatchCandidate:
     task: DbTask
     lane: Literal["recovery", "pending", "lifecycle"]
     runtime_identity: WatchRuntimeIdentity | None = None
+    selection_mode: DispatchSelectionMode = "pending_only"
+    max_recovery_attempts: int | None = None
     preview_entry: DispatchPreviewEntry | None = None
     owner_task: DbTask | None = None
     detail: str | None = None
@@ -7307,6 +7310,31 @@ class ProjectDispatchResult:
 
 
 @dataclass(frozen=True)
+class WatchSupervisorDispatchLanePlan:
+    """Fleet-level worker-consuming dispatch lanes selected from project-local order."""
+
+    recovery_candidates: tuple[ProjectDispatchCandidate, ...]
+    pending_candidates: tuple[ProjectDispatchCandidate, ...]
+    recovery_slot_limit: int
+
+    @property
+    def candidates(self) -> tuple[ProjectDispatchCandidate, ...]:
+        return self.recovery_candidates + self.pending_candidates
+
+
+@dataclass(frozen=True)
+class WatchSupervisorDispatchResult:
+    """Fleet-level worker-consuming dispatch results grouped by lane."""
+
+    recovery_results: tuple[ProjectDispatchResult, ...]
+    pending_results: tuple[ProjectDispatchResult, ...]
+
+    @property
+    def results(self) -> tuple[ProjectDispatchResult, ...]:
+        return self.recovery_results + self.pending_results
+
+
+@dataclass(frozen=True)
 class SupervisorLaunchReservation:
     """One provisional global launch reservation held until dispatch settlement."""
 
@@ -7326,6 +7354,8 @@ class SupervisorLaunchBudget:
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
     _reservations: dict[str, SupervisorLaunchReservation] = field(default_factory=dict, init=False, repr=False)
     _settled_reservation_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _virtual_dispatch_starts: int = field(default=0, init=False, repr=False)
+    _virtual_dispatch_starts_by_runtime_key: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _occupancy: AggregateWatchOccupancy | None = field(default=None, init=False, repr=False)
     refresh_count: int = 0
 
@@ -7431,15 +7461,32 @@ class SupervisorLaunchBudget:
                 self.release(reservation)
             return result
 
+    def consume_virtual_dispatch_capacity(self, runtime_key: str) -> None:
+        """Account for a dry-run or previewed start that consumes this pass's launch budget."""
+        with self._lock:
+            self._virtual_dispatch_starts += 1
+            self._virtual_dispatch_starts_by_runtime_key[runtime_key] = (
+                self._virtual_dispatch_starts_by_runtime_key.get(runtime_key, 0) + 1
+            )
+
+    @property
+    def virtual_dispatch_starts(self) -> int:
+        with self._lock:
+            return self._virtual_dispatch_starts
+
+    def virtual_dispatch_starts_for_runtime(self, runtime_key: str) -> int:
+        with self._lock:
+            return self._virtual_dispatch_starts_by_runtime_key.get(runtime_key, 0)
+
     def _available_slots_locked(self) -> int:
         assert self._occupancy is not None
-        return max(0, self._occupancy.slots - len(self._reservations))
+        return max(0, self._occupancy.slots - len(self._reservations) - self._virtual_dispatch_starts)
 
     def _occupancy_with_reservations(self, occupancy: AggregateWatchOccupancy) -> AggregateWatchOccupancy:
         reservations = tuple(self._reservations.values())
         return replace(
             occupancy,
-            slots=max(0, occupancy.slots - len(reservations)),
+            slots=max(0, occupancy.slots - len(reservations) - self._virtual_dispatch_starts),
             provisional_reservations=len(reservations),
             reservation_ids=tuple(reservation.reservation_id for reservation in reservations),
         )
@@ -7515,6 +7562,361 @@ def dispatch_watch_supervisor_pending_candidates(
         if result.status == "global_capacity_blocked":
             break
     return tuple(results)
+
+
+def _watch_supervisor_lane_head(
+    runtime: "WatchProjectRuntime",
+    *,
+    lane: Literal["recovery", "pending"],
+    recovery_mode: DispatchSelectionMode,
+    max_recovery_attempts: int,
+    analysis: ProjectCycleAnalysis | None,
+) -> ProjectDispatchCandidate | None:
+    if lane == "recovery":
+        return runtime.recovery_dispatch_head(
+            max_recovery_attempts=max_recovery_attempts,
+            recovery_mode=recovery_mode,
+            analysis=analysis,
+        )
+    return runtime.pending_dispatch_head(
+        max_recovery_attempts=max_recovery_attempts,
+        selection_mode=_watch_supervisor_pending_selection_mode(recovery_mode),
+        analysis=analysis,
+    )
+
+
+def dispatch_watch_supervisor_lane_incrementally(
+    runtimes: Sequence["WatchProjectRuntime"],
+    *,
+    lane: Literal["recovery", "pending"],
+    limit: int,
+    recovery_mode: DispatchSelectionMode | None,
+    max_recovery_attempts: int | None,
+    strategy: WatchDispatchStrategy[ProjectDispatchCandidate],
+    launch_budget: SupervisorLaunchBudget,
+    max_iterations: int = 1,
+    dispatch_candidate: Callable[
+        ["WatchProjectRuntime", ProjectDispatchCandidate, SupervisorLaunchBudget],
+        ProjectDispatchResult,
+    ]
+    | None = None,
+    analyses: Mapping[str, ProjectCycleAnalysis] | None = None,
+) -> tuple[ProjectDispatchResult, ...]:
+    """Select, dispatch, settle, and refresh one fleet lane one current head at a time."""
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
+    if limit == 0:
+        return ()
+    mode = normalize_dispatch_selection_mode(recovery_mode)
+    analyses = analyses or {}
+    runtime_by_key = {runtime.key: runtime for runtime in runtimes}
+    attempts_by_runtime_key = {
+        runtime.key: resolve_watch_supervisor_runtime_recovery_attempts(runtime, max_recovery_attempts)
+        for runtime in runtimes
+    }
+    results: list[ProjectDispatchResult] = []
+    worker_consuming_starts = 0
+    suppressed_task_ids_by_runtime_key: dict[str, set[str]] = {}
+    arbitration_strategy = strategy.clone() if launch_budget.dry_run else strategy
+
+    def default_dispatch(
+        runtime: "WatchProjectRuntime",
+        candidate: ProjectDispatchCandidate,
+        budget: SupervisorLaunchBudget,
+    ) -> ProjectDispatchResult:
+        if lane != "pending":
+            raise ValueError("recovery lane dispatch requires an explicit dispatch_candidate callback")
+        return budget.dispatch_pending_candidate(
+            runtime,
+            candidate,
+            max_iterations=max_iterations,
+            dry_run=budget.dry_run,
+        )
+
+    dispatcher = dispatch_candidate or default_dispatch
+    with contextlib.ExitStack() as dry_run_attempt_stack:
+        if launch_budget.dry_run:
+            for runtime in runtimes:
+                dry_run_attempt_stack.enter_context(runtime.isolated_dispatch_attempts())
+        while worker_consuming_starts < limit and launch_budget.occupancy.slots > 0:
+            occupancy = launch_budget.occupancy
+            heads: dict[str, ProjectDispatchCandidate | None] = {}
+            for runtime in runtimes:
+                local = occupancy.local_by_runtime_key.get(runtime.key)
+                if local is not None:
+                    virtual_starts = launch_budget.virtual_dispatch_starts_for_runtime(runtime.key)
+                    if local.available - virtual_starts <= 0:
+                        heads[runtime.key] = None
+                        continue
+                heads[runtime.key] = _watch_supervisor_lane_head(
+                    runtime,
+                    lane=lane,
+                    recovery_mode=mode,
+                    max_recovery_attempts=attempts_by_runtime_key[runtime.key],
+                    analysis=analyses.get(runtime.key),
+                )
+                head = heads[runtime.key]
+                if (
+                    head is not None
+                    and head.task.id is not None
+                    and str(head.task.id) in suppressed_task_ids_by_runtime_key.get(runtime.key, set())
+                ):
+                    heads[runtime.key] = None
+            choice = arbitration_strategy.select_next(heads)
+            if choice is None:
+                break
+            selected_runtime = runtime_by_key.get(choice.project_key)
+            if selected_runtime is None:
+                results.append(
+                    ProjectDispatchResult(
+                        runtime_key=choice.project_key,
+                        candidate=choice.candidate,
+                        status="not_dispatchable",
+                        slot_consuming=False,
+                        work_done=False,
+                        detail=f"runtime {choice.project_key!r} is not selected",
+                        task=choice.candidate.task,
+                    )
+                )
+                continue
+            result = dispatcher(selected_runtime, choice.candidate, launch_budget)
+            results.append(result)
+            if result.status == "global_capacity_blocked":
+                break
+            if result.dispatch_budget_consuming and not result.slot_consuming:
+                launch_budget.consume_virtual_dispatch_capacity(choice.project_key)
+            if result.slot_consuming or result.dispatch_budget_consuming:
+                worker_consuming_starts += 1
+            elif choice.candidate.task.id is not None:
+                suppressed_task_ids_by_runtime_key.setdefault(choice.project_key, set()).add(str(choice.candidate.task.id))
+    return tuple(results)
+
+
+def dispatch_watch_supervisor_lanes_incrementally(
+    runtimes: Sequence["WatchProjectRuntime"],
+    *,
+    recovery_slots_config: int,
+    recovery_mode: DispatchSelectionMode | None,
+    max_recovery_attempts: int | None,
+    recovery_strategy: WatchDispatchStrategy[ProjectDispatchCandidate],
+    pending_strategy: WatchDispatchStrategy[ProjectDispatchCandidate],
+    launch_budget: SupervisorLaunchBudget,
+    max_iterations: int = 1,
+    dispatch_recovery_candidate: Callable[
+        ["WatchProjectRuntime", ProjectDispatchCandidate, SupervisorLaunchBudget],
+        ProjectDispatchResult,
+    ]
+    | None = None,
+    dispatch_pending_candidate: Callable[
+        ["WatchProjectRuntime", ProjectDispatchCandidate, SupervisorLaunchBudget],
+        ProjectDispatchResult,
+    ]
+    | None = None,
+    analyses: Mapping[str, ProjectCycleAnalysis] | None = None,
+) -> WatchSupervisorDispatchResult:
+    """Run recovery then pending with incremental fleet arbitration and settlement refresh."""
+    mode = normalize_dispatch_selection_mode(recovery_mode)
+    recovery_slot_limit = resolve_watch_supervisor_recovery_slot_limit(
+        dispatch_slots=launch_budget.occupancy.slots,
+        recovery_slots_config=recovery_slots_config,
+        recovery_mode=mode,
+    )
+    recovery_results: tuple[ProjectDispatchResult, ...] = ()
+    if mode != "pending_only" and recovery_slot_limit > 0:
+        recovery_results = dispatch_watch_supervisor_lane_incrementally(
+            runtimes,
+            lane="recovery",
+            limit=recovery_slot_limit,
+            recovery_mode=mode,
+            max_recovery_attempts=max_recovery_attempts,
+            strategy=recovery_strategy,
+            launch_budget=launch_budget,
+            max_iterations=max_iterations,
+            dispatch_candidate=dispatch_recovery_candidate,
+            analyses=analyses,
+        )
+
+    pending_results: tuple[ProjectDispatchResult, ...] = ()
+    pending_limit = launch_budget.occupancy.slots
+    if mode != "recovery_only" and pending_limit > 0:
+        pending_results = dispatch_watch_supervisor_lane_incrementally(
+            runtimes,
+            lane="pending",
+            limit=pending_limit,
+            recovery_mode=mode,
+            max_recovery_attempts=max_recovery_attempts,
+            strategy=pending_strategy,
+            launch_budget=launch_budget,
+            max_iterations=max_iterations,
+            dispatch_candidate=dispatch_pending_candidate,
+            analyses=analyses,
+        )
+    return WatchSupervisorDispatchResult(
+        recovery_results=recovery_results,
+        pending_results=pending_results,
+    )
+
+
+def resolve_watch_supervisor_recovery_slot_limit(
+    *,
+    dispatch_slots: int,
+    recovery_slots_config: int,
+    recovery_mode: DispatchSelectionMode | None,
+) -> int:
+    """Resolve the supervisor-global recovery reservation for the current fleet pass."""
+    if dispatch_slots < 0:
+        raise ValueError("dispatch_slots must be non-negative")
+    if recovery_slots_config < 0:
+        raise ValueError("recovery_slots_config must be non-negative")
+    mode = normalize_dispatch_selection_mode(recovery_mode)
+    if mode == "pending_only":
+        return 0
+    if mode == "recovery_only":
+        return dispatch_slots
+    return min(dispatch_slots, recovery_slots_config)
+
+
+def resolve_watch_supervisor_runtime_recovery_attempts(
+    runtime: "WatchProjectRuntime",
+    explicit_override: int | None,
+) -> int:
+    """Resolve recovery attempts using a supervisor override only when supplied."""
+    attempts = runtime.config.max_resume_attempts if explicit_override is None else explicit_override
+    if attempts < 0:
+        raise ValueError("max_recovery_attempts must be non-negative")
+    return attempts
+
+
+def _watch_supervisor_pending_selection_mode(mode: DispatchSelectionMode) -> DispatchSelectionMode:
+    """Return the pending lane's eligibility policy with recovery excluded elsewhere."""
+    if mode == "recovery_first_explicit":
+        return "recovery_first_explicit"
+    return "pending_only"
+
+
+def _select_watch_supervisor_lane_candidates(
+    *,
+    strategy: WatchDispatchStrategy[ProjectDispatchCandidate],
+    candidates_by_runtime_key: Mapping[str, Sequence[ProjectDispatchCandidate]],
+    limit: int,
+    available_by_runtime_key: Mapping[str, int],
+    used_by_runtime_key: dict[str, int],
+) -> tuple[ProjectDispatchCandidate, ...]:
+    """Select only currently exposed project heads for a non-mutating lane preview."""
+    if limit <= 0:
+        return ()
+    preview_strategy = strategy.clone()
+    heads_by_runtime_key = {
+        runtime_key: (candidates[0] if candidates else None)
+        for runtime_key, candidates in candidates_by_runtime_key.items()
+    }
+    selected: list[ProjectDispatchCandidate] = []
+    while len(selected) < limit:
+        heads: dict[str, ProjectDispatchCandidate | None] = {}
+        for runtime_key in heads_by_runtime_key:
+            remaining_runtime_slots = available_by_runtime_key[runtime_key] - used_by_runtime_key.get(runtime_key, 0)
+            heads[runtime_key] = heads_by_runtime_key[runtime_key] if remaining_runtime_slots > 0 else None
+        choice = preview_strategy.select_next(heads)
+        if choice is None:
+            break
+        selected.append(choice.candidate)
+        used_by_runtime_key[choice.project_key] = used_by_runtime_key.get(choice.project_key, 0) + 1
+        heads_by_runtime_key[choice.project_key] = None
+    return tuple(selected)
+
+
+def plan_watch_supervisor_dispatch_lanes(
+    runtimes: Sequence["WatchProjectRuntime"],
+    *,
+    dispatch_slots: int,
+    recovery_slots_config: int,
+    recovery_mode: DispatchSelectionMode | None,
+    max_recovery_attempts: int | None,
+    recovery_strategy: WatchDispatchStrategy[ProjectDispatchCandidate],
+    pending_strategy: WatchDispatchStrategy[ProjectDispatchCandidate],
+    analyses: Mapping[str, ProjectCycleAnalysis] | None = None,
+    local_occupancy: Mapping[str, ProjectLocalOccupancy] | None = None,
+) -> WatchSupervisorDispatchLanePlan:
+    """Build fleet recovery and pending lanes from local runtime candidates.
+
+    Recovery receives one supervisor-global reservation pool before pending gets the
+    remaining capacity. This non-mutating preview arbitrates only the current
+    project heads; additional same-runtime starts require the incremental dispatcher
+    to settle the selected head and refresh the runtime before asking the strategy again.
+    """
+    if dispatch_slots < 0:
+        raise ValueError("dispatch_slots must be non-negative")
+    recovery_slot_limit = resolve_watch_supervisor_recovery_slot_limit(
+        dispatch_slots=dispatch_slots,
+        recovery_slots_config=recovery_slots_config,
+        recovery_mode=recovery_mode,
+    )
+    mode = normalize_dispatch_selection_mode(recovery_mode)
+    analyses = analyses or {}
+    attempts_by_runtime_key = {
+        runtime.key: resolve_watch_supervisor_runtime_recovery_attempts(runtime, max_recovery_attempts)
+        for runtime in runtimes
+    }
+    eligible_runtimes: list[WatchProjectRuntime] = []
+    for runtime in runtimes:
+        occupancy = local_occupancy.get(runtime.key) if local_occupancy is not None else None
+        if occupancy is None or occupancy.available > 0:
+            eligible_runtimes.append(runtime)
+    available_by_runtime_key = {
+        runtime.key: (
+            local_occupancy[runtime.key].available
+            if local_occupancy is not None and runtime.key in local_occupancy
+            else dispatch_slots
+        )
+        for runtime in eligible_runtimes
+    }
+    used_by_runtime_key: dict[str, int] = {}
+
+    recovery_candidates: tuple[ProjectDispatchCandidate, ...] = ()
+    if mode != "pending_only" and recovery_slot_limit > 0:
+        recovery_candidates_by_runtime = {
+            runtime.key: runtime.dispatch_candidates(
+                lane="recovery",
+                recovery_mode=mode,
+                max_recovery_attempts=attempts_by_runtime_key[runtime.key],
+                analysis=analyses.get(runtime.key),
+            )
+            for runtime in eligible_runtimes
+        }
+        recovery_candidates = _select_watch_supervisor_lane_candidates(
+            strategy=recovery_strategy,
+            candidates_by_runtime_key=recovery_candidates_by_runtime,
+            limit=recovery_slot_limit,
+            available_by_runtime_key=available_by_runtime_key,
+            used_by_runtime_key=used_by_runtime_key,
+        )
+
+    pending_slots = dispatch_slots - len(recovery_candidates)
+    pending_candidates: tuple[ProjectDispatchCandidate, ...] = ()
+    if mode != "recovery_only" and pending_slots > 0:
+        pending_selection_mode = _watch_supervisor_pending_selection_mode(mode)
+        pending_candidates_by_runtime = {
+            runtime.key: runtime.dispatch_candidates(
+                lane="pending",
+                recovery_mode=pending_selection_mode,
+                max_recovery_attempts=attempts_by_runtime_key[runtime.key],
+                analysis=analyses.get(runtime.key),
+            )
+            for runtime in eligible_runtimes
+        }
+        pending_candidates = _select_watch_supervisor_lane_candidates(
+            strategy=pending_strategy,
+            candidates_by_runtime_key=pending_candidates_by_runtime,
+            limit=pending_slots,
+            available_by_runtime_key=available_by_runtime_key,
+            used_by_runtime_key=used_by_runtime_key,
+        )
+
+    return WatchSupervisorDispatchLanePlan(
+        recovery_candidates=recovery_candidates,
+        pending_candidates=pending_candidates,
+        recovery_slot_limit=recovery_slot_limit,
+    )
 
 
 def aggregate_watch_project_occupancy(
@@ -7648,6 +8050,7 @@ def _preflight_pending_dispatch_candidate(
     tags: tuple[str, ...] | None,
     any_tag: bool,
     max_recovery_attempts: int,
+    selection_mode: DispatchSelectionMode,
     target_branch: str | None = None,
     owner_rows: tuple[LineageOwnerRow, ...] | None = None,
     read_context: RecoveryReadContext | None = None,
@@ -7683,7 +8086,7 @@ def _preflight_pending_dispatch_candidate(
         tags=tags,
         any_tag=any_tag,
         max_recovery_attempts=max_recovery_attempts,
-        selection_mode="pending_only",
+        selection_mode=selection_mode,
         pending_limit=None,
         include_recovery=False,
         include_pending=True,
@@ -7942,6 +8345,15 @@ class WatchProjectRuntime:
         """Start a new supervisor arbitration pass for transient dispatch skips."""
         self._attempted_dispatch_task_ids.clear()
 
+    @contextlib.contextmanager
+    def isolated_dispatch_attempts(self) -> Iterator[None]:
+        """Temporarily isolate same-pass dispatch exclusions for a non-mutating preview."""
+        attempted_before = set(self._attempted_dispatch_task_ids)
+        try:
+            yield
+        finally:
+            self._attempted_dispatch_task_ids = attempted_before
+
     def _current_confirmed_start_exclusion_ids(self) -> frozenset[str]:
         still_excluded: set[str] = set()
         for task_id in tuple(self._confirmed_started_task_ids):
@@ -8004,13 +8416,15 @@ class WatchProjectRuntime:
         self,
         *,
         suppression_context: _WatchDispatchSuppressionContext,
+        selection_mode: DispatchSelectionMode,
+        max_recovery_attempts: int,
     ) -> ProjectDispatchCandidate | None:
         return next(
             iter(
                 self.dispatch_candidates(
                     lane="pending",
-                    recovery_mode="pending_only",
-                    max_recovery_attempts=self.config.max_resume_attempts,
+                    recovery_mode=selection_mode,
+                    max_recovery_attempts=max_recovery_attempts,
                     pending_limit=None,
                     suppression_context=suppression_context,
                 )
@@ -8127,12 +8541,19 @@ class WatchProjectRuntime:
                 break
             if not entry.worker_consuming:
                 continue
+            candidate_selection_mode = (
+                recovery_mode
+                if entry.lane == "recovery"
+                else _watch_supervisor_pending_selection_mode(recovery_mode)
+            )
             candidates.append(
                 ProjectDispatchCandidate(
                     runtime_key=self.key,
                     task=entry.task,
                     lane=entry.lane,
                     runtime_identity=self.runtime_identity,
+                    selection_mode=candidate_selection_mode,
+                    max_recovery_attempts=max_recovery_attempts,
                     preview_entry=entry,
                     owner_task=entry.owner_task,
                     detail=entry.reason_code,
@@ -8167,6 +8588,7 @@ class WatchProjectRuntime:
         self,
         *,
         max_recovery_attempts: int,
+        selection_mode: DispatchSelectionMode = "pending_only",
         analysis: ProjectCycleAnalysis | None = None,
         excluded_owner_ids: frozenset[str] = frozenset(),
         step1_handled_child_task_ids: frozenset[str] = frozenset(),
@@ -8176,7 +8598,7 @@ class WatchProjectRuntime:
             iter(
                 self.dispatch_candidates(
                     lane="pending",
-                    recovery_mode="pending_only",
+                    recovery_mode=selection_mode,
                     max_recovery_attempts=max_recovery_attempts,
                     analysis=analysis,
                     pending_limit=None,
@@ -8254,6 +8676,11 @@ class WatchProjectRuntime:
             excluded_owner_ids=excluded_owner_ids,
             step1_handled_child_task_ids=step1_handled_child_task_ids,
         )
+        effective_max_recovery_attempts = (
+            candidate.max_recovery_attempts
+            if candidate.max_recovery_attempts is not None
+            else self.config.max_resume_attempts
+        )
         preflight = _preflight_pending_dispatch_candidate(
             config=self.config,
             store=self.store,
@@ -8262,7 +8689,8 @@ class WatchProjectRuntime:
             task=task,
             tags=self.tags,
             any_tag=self.any_tag,
-            max_recovery_attempts=self.config.max_resume_attempts,
+            max_recovery_attempts=effective_max_recovery_attempts,
+            selection_mode=candidate.selection_mode,
             target_branch=(
                 analysis.analysis.target_branch
                 if analysis is not None and analysis.analysis.target_branch is not None
@@ -8300,7 +8728,11 @@ class WatchProjectRuntime:
                 task=task,
             )
 
-        current_head = self._current_pending_dispatch_head_for_validation(suppression_context=suppression_context)
+        current_head = self._current_pending_dispatch_head_for_validation(
+            suppression_context=suppression_context,
+            selection_mode=candidate.selection_mode,
+            max_recovery_attempts=effective_max_recovery_attempts,
+        )
         if current_head is None or current_head.task.id != task.id:
             detail = (
                 f"task {task.id} is not the current eligible pending dispatch head"
@@ -13702,6 +14134,7 @@ def _run_cycle(
     def _recompute_pending_dispatch() -> tuple[list[DbTask], int, bool, tuple[DispatchPreviewEntry, ...]]:
         if scoped_owner_ids is not None:
             return [], 0, False, ()
+        pending_selection_mode = _watch_supervisor_pending_selection_mode(recovery_mode)
         pending_preview = build_dispatch_preview(
             store,
             config=config,
@@ -13710,7 +14143,7 @@ def _run_cycle(
             tags=tags,
             any_tag=any_tag,
             max_recovery_attempts=max_recovery_attempts,
-            selection_mode="pending_only",
+            selection_mode=pending_selection_mode,
             include_recovery=False,
         )
         pending_entries = _filter_watch_dispatch_preview_entries(
@@ -13728,7 +14161,7 @@ def _run_cycle(
             pending_entries,
             slots=effective_pending_slots,
             recovery_slot_cap=0,
-            selection_mode="pending_only",
+            selection_mode=pending_selection_mode,
             include_pending=True,
         )
         planned_pending_entries = tuple(getattr(pending_plan, "entries", pending_entries))
@@ -13865,6 +14298,7 @@ def _run_cycle(
                     tags=tags,
                     any_tag=any_tag,
                     max_recovery_attempts=max_recovery_attempts,
+                    selection_mode=_watch_supervisor_pending_selection_mode(recovery_mode),
                     target_branch=target_branch,
                     owner_rows=analysis.owner_rows,
                     read_context=analysis.watch_read_context,

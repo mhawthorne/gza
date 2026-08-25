@@ -18,7 +18,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal, Sequence
 from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
@@ -139,8 +139,12 @@ from gza.cli.watch import (
     allocate_watch_slots,
     cmd_main_verify,
     cmd_watch,
+    dispatch_watch_supervisor_lane_incrementally,
+    dispatch_watch_supervisor_lanes_incrementally,
     dispatch_watch_supervisor_pending_candidates,
     format_red_duration,
+    plan_watch_supervisor_dispatch_lanes,
+    resolve_watch_supervisor_recovery_slot_limit,
 )
 from gza.concurrency import MaxConcurrentTasksError, _LiveRunningState, launch_permit, take_task_launch_permit
 from gza.config import Config, ConfigError
@@ -168,6 +172,7 @@ from gza.git_health import (
     load_git_health_state,
 )
 from gza.lineage_query import LineageOwnerRow
+from gza.watch_strategies import create_watch_dispatch_strategy
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
@@ -1150,17 +1155,24 @@ def _make_aggregate_runtime(
     *,
     project_name: str,
     max_concurrent: int = 5,
+    max_resume_attempts: int | None = None,
     db_path: Path | None = None,
 ) -> WatchProjectRuntime:
     project_dir.mkdir(parents=True, exist_ok=True)
     if db_path is None:
         setup_config(project_dir, project_name=project_name)
         config_path = project_dir / "gza.yaml"
+        extra_config = f"max_concurrent: {max_concurrent}\n"
+        if max_resume_attempts is not None:
+            extra_config += f"max_resume_attempts: {max_resume_attempts}\n"
         config_path.write_text(
-            config_path.read_text(encoding="utf-8") + f"max_concurrent: {max_concurrent}\n",
+            config_path.read_text(encoding="utf-8") + extra_config,
             encoding="utf-8",
         )
     else:
+        max_resume_attempts_config = (
+            f"max_resume_attempts: {max_resume_attempts}\n" if max_resume_attempts is not None else ""
+        )
         (project_dir / "gza.yaml").write_text(
             f"project_name: {project_name}\n"
             f"project_id: {project_name}\n"
@@ -1168,7 +1180,8 @@ def _make_aggregate_runtime(
             f"db_path: {db_path}\n"
             "provider: codex\n"
             "model: gpt-5.5\n"
-            f"max_concurrent: {max_concurrent}\n",
+            f"max_concurrent: {max_concurrent}\n"
+            + max_resume_attempts_config,
             encoding="utf-8",
         )
     config = Config.load(project_dir)
@@ -4953,6 +4966,1040 @@ def test_allocate_watch_slots(
         )
         == expected
     )
+
+
+def test_resolve_watch_supervisor_recovery_slot_limit_models_global_run_modes() -> None:
+    assert (
+        resolve_watch_supervisor_recovery_slot_limit(
+            dispatch_slots=3,
+            recovery_slots_config=1,
+            recovery_mode=None,
+        )
+        == 1
+    )
+    assert (
+        resolve_watch_supervisor_recovery_slot_limit(
+            dispatch_slots=3,
+            recovery_slots_config=1,
+            recovery_mode="recovery_only",
+        )
+        == 3
+    )
+    assert (
+        resolve_watch_supervisor_recovery_slot_limit(
+            dispatch_slots=3,
+            recovery_slots_config=1,
+            recovery_mode="pending_only",
+        )
+        == 0
+    )
+
+
+def _patch_runtime_lane_candidates(
+    runtime: WatchProjectRuntime,
+    *,
+    recovery: Sequence[ProjectDispatchCandidate] = (),
+    pending: Sequence[ProjectDispatchCandidate] = (),
+) -> Any:
+    def dispatch_candidates(**kwargs: object) -> tuple[ProjectDispatchCandidate, ...]:
+        lane = kwargs["lane"]
+        if lane == "recovery":
+            return tuple(recovery)
+        if lane == "pending":
+            return tuple(pending)
+        raise AssertionError(f"unexpected lane {lane!r}")
+
+    return patch.object(runtime, "dispatch_candidates", side_effect=dispatch_candidates)
+
+
+def _runtime_candidate(
+    runtime: WatchProjectRuntime,
+    task: DbTask,
+    *,
+    lane: Literal["recovery", "pending"],
+) -> ProjectDispatchCandidate:
+    assert task.id is not None
+    return ProjectDispatchCandidate(
+        runtime_key=runtime.key,
+        task=task,
+        lane=lane,
+        runtime_identity=runtime.runtime_identity,
+    )
+
+
+def _add_failed_resume_row(runtime: WatchProjectRuntime, prompt: str) -> DbTask:
+    task = runtime.store.add(prompt, task_type="implement")
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "MAX_TURNS"
+    task.session_id = f"session-{runtime.key}"
+    task.completed_at = datetime.now(UTC)
+    runtime.store.update(task)
+    return task
+
+
+def test_watch_supervisor_dispatch_lanes_reserve_recovery_from_one_global_budget(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    a_recovery = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
+    b_recovery = _runtime_candidate(runtime_b, runtime_b.store.add("B recovery", task_type="implement"), lane="recovery")
+    a_pending = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
+    b_pending = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(_patch_runtime_lane_candidates(runtime_a, recovery=(a_recovery,), pending=(a_pending,)))
+        stack.enter_context(_patch_runtime_lane_candidates(runtime_b, recovery=(b_recovery,), pending=(b_pending,)))
+        plan = plan_watch_supervisor_dispatch_lanes(
+            [runtime_a, runtime_b],
+            dispatch_slots=3,
+            recovery_slots_config=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+        )
+
+    assert plan.recovery_slot_limit == 1
+    assert [candidate.task.id for candidate in plan.recovery_candidates] == [a_recovery.task.id]
+    assert [candidate.task.id for candidate in plan.pending_candidates] == [a_pending.task.id, b_pending.task.id]
+    assert [candidate.lane for candidate in plan.candidates] == ["recovery", "pending", "pending"]
+
+
+def test_watch_supervisor_dispatch_lanes_recovery_only_uses_all_free_capacity_and_blocks_pending(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    a_recovery = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
+    b_recovery = _runtime_candidate(runtime_b, runtime_b.store.add("B recovery", task_type="implement"), lane="recovery")
+    a_pending = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(_patch_runtime_lane_candidates(runtime_a, recovery=(a_recovery,), pending=(a_pending,)))
+        stack.enter_context(_patch_runtime_lane_candidates(runtime_b, recovery=(b_recovery,), pending=()))
+        plan = plan_watch_supervisor_dispatch_lanes(
+            [runtime_a, runtime_b],
+            dispatch_slots=2,
+            recovery_slots_config=1,
+            recovery_mode="recovery_only",
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+        )
+
+    assert plan.recovery_slot_limit == 2
+    assert [candidate.task.id for candidate in plan.recovery_candidates] == [a_recovery.task.id, b_recovery.task.id]
+    assert plan.pending_candidates == ()
+
+
+def test_watch_supervisor_dispatch_lanes_pending_only_disables_global_recovery_lane(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    a_recovery = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
+    a_pending = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
+    b_pending = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(_patch_runtime_lane_candidates(runtime_a, recovery=(a_recovery,), pending=(a_pending,)))
+        stack.enter_context(_patch_runtime_lane_candidates(runtime_b, recovery=(), pending=(b_pending,)))
+        plan = plan_watch_supervisor_dispatch_lanes(
+            [runtime_a, runtime_b],
+            dispatch_slots=2,
+            recovery_slots_config=2,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+        )
+
+    assert plan.recovery_slot_limit == 0
+    assert plan.recovery_candidates == ()
+    assert [candidate.task.id for candidate in plan.pending_candidates] == [a_pending.task.id, b_pending.task.id]
+
+
+def test_watch_supervisor_dispatch_lanes_recovery_first_explicit_keeps_only_positioned_pending(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    a_unpositioned = runtime_a.store.add("A unpositioned pending", task_type="plan")
+    a_positioned = runtime_a.store.add("A positioned pending", task_type="plan")
+    b_unpositioned = runtime_b.store.add("B unpositioned pending", task_type="plan")
+    b_positioned = runtime_b.store.add("B positioned pending", task_type="plan")
+    for task in (a_unpositioned, a_positioned, b_unpositioned, b_positioned):
+        assert task.id is not None
+    assert runtime_a.store.set_queue_position(a_positioned.id, 1)
+    assert runtime_b.store.set_queue_position(b_positioned.id, 1)
+
+    plan = plan_watch_supervisor_dispatch_lanes(
+        [runtime_a, runtime_b],
+        dispatch_slots=4,
+        recovery_slots_config=0,
+        recovery_mode="recovery_first_explicit",
+        max_recovery_attempts=None,
+        recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+        pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+    )
+
+    assert plan.recovery_candidates == ()
+    assert [candidate.task.id for candidate in plan.pending_candidates] == [a_positioned.id, b_positioned.id]
+    assert {candidate.selection_mode for candidate in plan.pending_candidates} == {"recovery_first_explicit"}
+
+
+@pytest.mark.parametrize("recovery_mode", [None, "pending_only"])
+def test_watch_supervisor_dispatch_lanes_default_and_pending_only_keep_normal_pending_order(
+    tmp_path: Path,
+    recovery_mode: Any,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    a_unpositioned = runtime_a.store.add("A unpositioned pending", task_type="plan")
+    a_positioned = runtime_a.store.add("A positioned pending", task_type="plan")
+    b_unpositioned = runtime_b.store.add("B unpositioned pending", task_type="plan")
+    b_positioned = runtime_b.store.add("B positioned pending", task_type="plan")
+    for task in (a_unpositioned, a_positioned, b_unpositioned, b_positioned):
+        assert task.id is not None
+    assert runtime_a.store.set_queue_position(a_positioned.id, 1)
+    assert runtime_b.store.set_queue_position(b_positioned.id, 1)
+
+    plan = plan_watch_supervisor_dispatch_lanes(
+        [runtime_a, runtime_b],
+        dispatch_slots=4,
+        recovery_slots_config=0,
+        recovery_mode=recovery_mode,
+        max_recovery_attempts=None,
+        recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+        pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+    )
+
+    assert [candidate.task.id for candidate in plan.pending_candidates] == [
+        a_positioned.id,
+        b_positioned.id,
+    ]
+    assert {candidate.selection_mode for candidate in plan.pending_candidates} == {"pending_only"}
+
+
+def test_watch_supervisor_dispatch_lanes_resolve_recovery_attempts_per_runtime_unless_overridden(
+    tmp_path: Path,
+) -> None:
+    runtime_disabled = _make_aggregate_runtime(
+        tmp_path / "project-disabled",
+        project_name="disabled",
+        max_resume_attempts=0,
+    )
+    runtime_enabled = _make_aggregate_runtime(
+        tmp_path / "project-enabled",
+        project_name="enabled",
+        max_resume_attempts=1,
+    )
+    disabled_failed = _add_failed_resume_row(runtime_disabled, "Disabled runtime failed")
+    enabled_failed = _add_failed_resume_row(runtime_enabled, "Enabled runtime failed")
+
+    def plan_with(max_recovery_attempts: int | None):
+        return plan_watch_supervisor_dispatch_lanes(
+            [runtime_disabled, runtime_enabled],
+            dispatch_slots=2,
+            recovery_slots_config=2,
+            recovery_mode=None,
+            max_recovery_attempts=max_recovery_attempts,
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("disabled", "enabled")),
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("disabled", "enabled")),
+        )
+
+    assert [candidate.task.id for candidate in plan_with(None).recovery_candidates] == [enabled_failed.id]
+    assert [candidate.task.id for candidate in plan_with(1).recovery_candidates] == [
+        disabled_failed.id,
+        enabled_failed.id,
+    ]
+    assert plan_with(0).recovery_candidates == ()
+
+
+def test_watch_supervisor_dispatch_lanes_donate_unused_recovery_capacity_to_pending(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    a_recovery = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
+    a_pending_1 = _runtime_candidate(runtime_a, runtime_a.store.add("A pending 1", task_type="plan"), lane="pending")
+    a_pending_2 = _runtime_candidate(runtime_a, runtime_a.store.add("A pending 2", task_type="plan"), lane="pending")
+    b_pending = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            _patch_runtime_lane_candidates(
+                runtime_a,
+                recovery=(a_recovery,),
+                pending=(a_pending_1, a_pending_2),
+            )
+        )
+        stack.enter_context(_patch_runtime_lane_candidates(runtime_b, recovery=(), pending=(b_pending,)))
+        plan = plan_watch_supervisor_dispatch_lanes(
+            [runtime_a, runtime_b],
+            dispatch_slots=3,
+            recovery_slots_config=2,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+        )
+
+    assert plan.recovery_slot_limit == 2
+    assert [candidate.task.id for candidate in plan.recovery_candidates] == [a_recovery.task.id]
+    assert [candidate.task.id for candidate in plan.pending_candidates] == [a_pending_1.task.id, b_pending.task.id]
+    assert a_pending_2.task.id not in [candidate.task.id for candidate in plan.candidates]
+
+
+def test_watch_supervisor_dispatch_lanes_reuse_capacity_without_exceeding_runtime_local_slots(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    a_recovery = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
+    a_pending = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
+    b_pending = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
+    local_occupancy = {
+        "a": ProjectLocalOccupancy(
+            runtime_key="a",
+            limit=1,
+            running=0,
+            starting=0,
+            available=1,
+            live_pids=frozenset(),
+            running_pids=frozenset(),
+            starting_pids=frozenset(),
+            running_task_ids=(),
+            anonymous_worker_count=0,
+        ),
+        "b": ProjectLocalOccupancy(
+            runtime_key="b",
+            limit=1,
+            running=0,
+            starting=0,
+            available=1,
+            live_pids=frozenset(),
+            running_pids=frozenset(),
+            starting_pids=frozenset(),
+            running_task_ids=(),
+            anonymous_worker_count=0,
+        ),
+    }
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(_patch_runtime_lane_candidates(runtime_a, recovery=(a_recovery,), pending=(a_pending,)))
+        stack.enter_context(_patch_runtime_lane_candidates(runtime_b, recovery=(), pending=(b_pending,)))
+        plan = plan_watch_supervisor_dispatch_lanes(
+            [runtime_a, runtime_b],
+            dispatch_slots=2,
+            recovery_slots_config=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            local_occupancy=local_occupancy,
+        )
+
+    assert [candidate.task.id for candidate in plan.recovery_candidates] == [a_recovery.task.id]
+    assert [candidate.task.id for candidate in plan.pending_candidates] == [b_pending.task.id]
+    assert a_pending.task.id not in [candidate.task.id for candidate in plan.candidates]
+
+
+@pytest.mark.parametrize("lane", ["recovery", "pending"])
+@pytest.mark.parametrize("strategy_name", ["round-robin", "weighted-round-robin"])
+def test_watch_supervisor_lane_planning_does_not_mutate_strategy_state(
+    tmp_path: Path,
+    strategy_name: str,
+    lane: Literal["recovery", "pending"],
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / f"{lane}-{strategy_name}-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / f"{lane}-{strategy_name}-b", project_name="b")
+    recovery_a = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
+    recovery_b = _runtime_candidate(runtime_b, runtime_b.store.add("B recovery", task_type="implement"), lane="recovery")
+    pending_a = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
+    pending_b = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
+    weights = {"a": 2, "b": 1} if strategy_name == "weighted-round-robin" else None
+    strategy: Any = create_watch_dispatch_strategy(strategy_name, project_order=("a", "b"), weights=weights)
+    if strategy_name == "weighted-round-robin":
+        first = strategy.select_next({"a": pending_a, "b": pending_b})
+        assert first is not None
+        assert strategy.serialize_state()["remaining_turns"] == 1
+    before_state = strategy.serialize_state()
+
+    recovery_strategy: Any = (
+        strategy if lane == "recovery" else create_watch_dispatch_strategy("project-priority", project_order=("a", "b"))
+    )
+    pending_strategy: Any = (
+        strategy if lane == "pending" else create_watch_dispatch_strategy("project-priority", project_order=("a", "b"))
+    )
+    recovery_slots_config = 2 if lane == "recovery" else 0
+    recovery_mode: Literal["recovery_only", "pending_only"] = (
+        "recovery_only" if lane == "recovery" else "pending_only"
+    )
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(
+            _patch_runtime_lane_candidates(runtime_a, recovery=(recovery_a,), pending=(pending_a,))
+        )
+        stack.enter_context(
+            _patch_runtime_lane_candidates(runtime_b, recovery=(recovery_b,), pending=(pending_b,))
+        )
+        plan_watch_supervisor_dispatch_lanes(
+            [runtime_a, runtime_b],
+            dispatch_slots=2,
+            recovery_slots_config=recovery_slots_config,
+            recovery_mode=recovery_mode,
+            max_recovery_attempts=1,
+            recovery_strategy=recovery_strategy,
+            pending_strategy=pending_strategy,
+        )
+
+    assert strategy.serialize_state() == before_state
+
+
+def test_watch_supervisor_preview_does_not_change_following_incremental_recovery_or_pending_order(
+    tmp_path: Path,
+) -> None:
+    def run(preview_first: bool) -> list[tuple[str, str]]:
+        runtime_a = _make_aggregate_runtime(tmp_path / ("preview" if preview_first else "direct") / "a", project_name="a")
+        runtime_b = _make_aggregate_runtime(tmp_path / ("preview" if preview_first else "direct") / "b", project_name="b")
+        recovery_a = _runtime_candidate(
+            runtime_a,
+            runtime_a.store.add("A recovery", task_type="implement"),
+            lane="recovery",
+        )
+        recovery_b = _runtime_candidate(
+            runtime_b,
+            runtime_b.store.add("B recovery", task_type="implement"),
+            lane="recovery",
+        )
+        pending_a = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
+        pending_b = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
+        recovery_strategy: Any = create_watch_dispatch_strategy("round-robin", project_order=("a", "b"))
+        pending_strategy: Any = create_watch_dispatch_strategy("round-robin", project_order=("a", "b"))
+
+        def dispatch(
+            selected_runtime: WatchProjectRuntime,
+            candidate: ProjectDispatchCandidate,
+            launch_budget: SupervisorLaunchBudget,
+        ) -> ProjectDispatchResult:
+            reservation = launch_budget.reserve(candidate)
+            assert reservation is not None
+            launch_budget.release(reservation)
+            return ProjectDispatchResult(
+                runtime_key=selected_runtime.key,
+                candidate=candidate,
+                status="dry_run",
+                slot_consuming=False,
+                work_done=True,
+                dispatch_budget_consuming=True,
+                task=candidate.task,
+            )
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                _patch_runtime_lane_candidates(runtime_a, recovery=(recovery_a,), pending=(pending_a,))
+            )
+            stack.enter_context(
+                _patch_runtime_lane_candidates(runtime_b, recovery=(recovery_b,), pending=(pending_b,))
+            )
+            if preview_first:
+                plan_watch_supervisor_dispatch_lanes(
+                    [runtime_a, runtime_b],
+                    dispatch_slots=2,
+                    recovery_slots_config=1,
+                    recovery_mode=None,
+                    max_recovery_attempts=1,
+                    recovery_strategy=recovery_strategy,
+                    pending_strategy=pending_strategy,
+                )
+            stack.enter_context(patch.object(runtime_a, "recovery_dispatch_head", return_value=recovery_a))
+            stack.enter_context(patch.object(runtime_b, "recovery_dispatch_head", return_value=recovery_b))
+            stack.enter_context(patch.object(runtime_a, "pending_dispatch_head", return_value=pending_a))
+            stack.enter_context(patch.object(runtime_b, "pending_dispatch_head", return_value=pending_b))
+            budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=2)
+            results = dispatch_watch_supervisor_lanes_incrementally(
+                [runtime_a, runtime_b],
+                recovery_slots_config=1,
+                recovery_mode=None,
+                max_recovery_attempts=1,
+                recovery_strategy=recovery_strategy,
+                pending_strategy=pending_strategy,
+                launch_budget=budget,
+                dispatch_recovery_candidate=dispatch,
+                dispatch_pending_candidate=dispatch,
+            ).results
+
+        return [(result.candidate.lane, result.runtime_key) for result in results]
+
+    assert run(preview_first=True) == run(preview_first=False) == [("recovery", "a"), ("pending", "a")]
+
+
+def _mark_runtime_task_live(runtime: WatchProjectRuntime, task_id: str) -> None:
+    task = runtime.store.get(task_id)
+    assert task is not None
+    task.status = "in_progress"
+    task.running_pid = os.getpid()
+    runtime.store.update(task)
+    _register_live_worker_for_task(runtime.config, task_id, worker_id=f"w-{runtime.key}-{task_id}")
+
+
+def test_watch_supervisor_recovery_lane_reuses_slot_after_not_dispatchable_head(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    candidate_a = _runtime_candidate(runtime_a, runtime_a.store.add("A stale recovery", task_type="implement"), lane="recovery")
+    candidate_b = _runtime_candidate(runtime_b, runtime_b.store.add("B fills recovery slot", task_type="implement"), lane="recovery")
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+    selections: list[str] = []
+
+    def dispatch_recovery(
+        runtime: WatchProjectRuntime,
+        candidate: ProjectDispatchCandidate,
+        launch_budget: SupervisorLaunchBudget,
+    ) -> ProjectDispatchResult:
+        reservation = launch_budget.reserve(candidate)
+        assert reservation is not None
+        selections.append(candidate.runtime_key)
+        if candidate.runtime_key == "a":
+            launch_budget.release(reservation)
+            return ProjectDispatchResult(
+                runtime_key=runtime.key,
+                candidate=candidate,
+                status="not_dispatchable",
+                slot_consuming=False,
+                work_done=False,
+                task=candidate.task,
+            )
+        assert candidate.task.id is not None
+        _mark_runtime_task_live(runtime, candidate.task.id)
+        launch_budget.refresh_occupancy()
+        return ProjectDispatchResult(
+            runtime_key=runtime.key,
+            candidate=candidate,
+            status="live",
+            slot_consuming=True,
+            work_done=True,
+            task=runtime.store.get(candidate.task.id),
+        )
+
+    with (
+        patch.object(runtime_a, "recovery_dispatch_head", return_value=candidate_a),
+        patch.object(runtime_b, "recovery_dispatch_head", return_value=candidate_b),
+    ):
+        results = dispatch_watch_supervisor_lane_incrementally(
+            [runtime_a, runtime_b],
+            lane="recovery",
+            limit=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            launch_budget=budget,
+            dispatch_candidate=dispatch_recovery,
+        )
+
+    assert [result.status for result in results] == ["not_dispatchable", "live"]
+    assert selections == ["a", "b"]
+    assert budget.occupancy.slots == 0
+
+
+def test_watch_supervisor_recovery_lane_refreshes_selected_runtime_head_after_success(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    first = _runtime_candidate(runtime, runtime.store.add("First recovery", task_type="implement"), lane="recovery")
+    second = _runtime_candidate(runtime, runtime.store.add("Refreshed recovery", task_type="implement"), lane="recovery")
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=2)
+    dispatched: list[str] = []
+    head_calls: list[str] = []
+
+    def recovery_head(**_kwargs: object) -> ProjectDispatchCandidate | None:
+        if not dispatched:
+            head_calls.append("first-before-dispatch")
+            return first
+        head_calls.append("second-after-dispatch")
+        return second
+
+    def dispatch_recovery(
+        selected_runtime: WatchProjectRuntime,
+        candidate: ProjectDispatchCandidate,
+        launch_budget: SupervisorLaunchBudget,
+    ) -> ProjectDispatchResult:
+        reservation = launch_budget.reserve(candidate)
+        assert reservation is not None
+        assert candidate.task.id is not None
+        dispatched.append(candidate.task.id)
+        _mark_runtime_task_live(selected_runtime, candidate.task.id)
+        launch_budget.refresh_occupancy()
+        return ProjectDispatchResult(
+            runtime_key=selected_runtime.key,
+            candidate=candidate,
+            status="live",
+            slot_consuming=True,
+            work_done=True,
+            task=selected_runtime.store.get(candidate.task.id),
+        )
+
+    with patch.object(runtime, "recovery_dispatch_head", side_effect=recovery_head):
+        results = dispatch_watch_supervisor_lane_incrementally(
+            [runtime],
+            lane="recovery",
+            limit=2,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
+            launch_budget=budget,
+            dispatch_candidate=dispatch_recovery,
+        )
+
+    assert [result.candidate.task.id for result in results] == [first.task.id, second.task.id]
+    assert head_calls == ["first-before-dispatch", "second-after-dispatch"]
+    assert dispatched == [first.task.id, second.task.id]
+
+
+def test_watch_supervisor_donates_recovery_capacity_to_pending_after_recovery_heads_drain(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    recovery = _runtime_candidate(runtime, runtime.store.add("Only recovery", task_type="implement"), lane="recovery")
+    pending = _runtime_candidate(runtime, runtime.store.add("Pending after recovery drain", task_type="plan"), lane="pending")
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=2)
+    recovery_drained = False
+
+    def recovery_head(**_kwargs: object) -> ProjectDispatchCandidate | None:
+        return None if recovery_drained else recovery
+
+    def pending_head(**_kwargs: object) -> ProjectDispatchCandidate | None:
+        assert recovery_drained is True
+        return pending
+
+    def dispatch_recovery(
+        selected_runtime: WatchProjectRuntime,
+        candidate: ProjectDispatchCandidate,
+        launch_budget: SupervisorLaunchBudget,
+    ) -> ProjectDispatchResult:
+        nonlocal recovery_drained
+        reservation = launch_budget.reserve(candidate)
+        assert reservation is not None
+        assert candidate.task.id is not None
+        _mark_runtime_task_live(selected_runtime, candidate.task.id)
+        launch_budget.refresh_occupancy()
+        recovery_drained = True
+        return ProjectDispatchResult(
+            runtime_key=selected_runtime.key,
+            candidate=candidate,
+            status="live",
+            slot_consuming=True,
+            work_done=True,
+            task=selected_runtime.store.get(candidate.task.id),
+        )
+
+    with (
+        patch.object(runtime, "recovery_dispatch_head", side_effect=recovery_head),
+        patch.object(runtime, "pending_dispatch_head", side_effect=pending_head),
+    ):
+        lane_results = dispatch_watch_supervisor_lanes_incrementally(
+            [runtime],
+            recovery_slots_config=2,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
+            pending_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
+            launch_budget=budget,
+            dispatch_recovery_candidate=dispatch_recovery,
+            dispatch_pending_candidate=lambda selected_runtime, candidate, _budget: ProjectDispatchResult(
+                runtime_key=selected_runtime.key,
+                candidate=candidate,
+                status="dry_run",
+                slot_consuming=False,
+                work_done=True,
+                dispatch_budget_consuming=True,
+                task=candidate.task,
+            ),
+        )
+
+    assert [result.candidate.task.id for result in lane_results.recovery_results] == [recovery.task.id]
+    assert [result.candidate.task.id for result in lane_results.pending_results] == [pending.task.id]
+
+
+def test_watch_supervisor_virtual_recovery_start_reduces_pending_capacity(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    recovery = _runtime_candidate(runtime_a, runtime_a.store.add("Recovery dry-run", task_type="implement"), lane="recovery")
+    pending_a = _runtime_candidate(runtime_a, runtime_a.store.add("Pending A dry-run", task_type="plan"), lane="pending")
+    pending_b = _runtime_candidate(runtime_b, runtime_b.store.add("Pending B dry-run", task_type="plan"), lane="pending")
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=2)
+
+    def recovery_head(**_kwargs: object) -> ProjectDispatchCandidate | None:
+        return recovery
+
+    def pending_head_for_a(**_kwargs: object) -> ProjectDispatchCandidate | None:
+        return pending_a
+
+    def pending_head_for_b(**_kwargs: object) -> ProjectDispatchCandidate | None:
+        return pending_b
+
+    def dry_run_dispatch(
+        selected_runtime: WatchProjectRuntime,
+        candidate: ProjectDispatchCandidate,
+        _launch_budget: SupervisorLaunchBudget,
+    ) -> ProjectDispatchResult:
+        return ProjectDispatchResult(
+            runtime_key=selected_runtime.key,
+            candidate=candidate,
+            status="dry_run",
+            slot_consuming=False,
+            work_done=True,
+            dispatch_budget_consuming=True,
+            task=candidate.task,
+        )
+
+    with (
+        patch.object(runtime_a, "recovery_dispatch_head", side_effect=recovery_head),
+        patch.object(runtime_a, "pending_dispatch_head", side_effect=pending_head_for_a),
+        patch.object(runtime_b, "pending_dispatch_head", side_effect=pending_head_for_b),
+    ):
+        lane_results = dispatch_watch_supervisor_lanes_incrementally(
+            [runtime_a, runtime_b],
+            recovery_slots_config=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            launch_budget=budget,
+            dispatch_recovery_candidate=dry_run_dispatch,
+            dispatch_pending_candidate=dry_run_dispatch,
+        )
+
+    results = lane_results.results
+    assert [result.status for result in results] == ["dry_run", "dry_run"]
+    assert [result.dispatch_budget_consuming for result in results] == [True, True]
+    assert [result.candidate.task.id for result in lane_results.recovery_results] == [recovery.task.id]
+    assert len(lane_results.pending_results) == 1
+    assert budget.virtual_dispatch_starts == 2
+    assert budget.occupancy.slots == 0
+
+
+@pytest.mark.parametrize("strategy_name", ["round-robin", "weighted-round-robin"])
+def test_watch_supervisor_incremental_dry_run_preserves_strategy_and_pending_heads(
+    tmp_path: Path,
+    strategy_name: str,
+) -> None:
+    def build_case(case_name: str) -> tuple[
+        WatchProjectRuntime,
+        WatchProjectRuntime,
+        ProjectDispatchCandidate,
+        ProjectDispatchCandidate,
+        ProjectDispatchCandidate,
+        ProjectDispatchCandidate,
+    ]:
+        runtime_a = _make_aggregate_runtime(tmp_path / case_name / "project-a", project_name="a")
+        runtime_b = _make_aggregate_runtime(tmp_path / case_name / "project-b", project_name="b")
+        recovery_a = _runtime_candidate(
+            runtime_a,
+            _add_failed_resume_row(runtime_a, "A recovery"),
+            lane="recovery",
+        )
+        recovery_b = _runtime_candidate(
+            runtime_b,
+            _add_failed_resume_row(runtime_b, "B recovery"),
+            lane="recovery",
+        )
+        pending_a = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
+        pending_b = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
+        return runtime_a, runtime_b, recovery_a, recovery_b, pending_a, pending_b
+
+    def make_strategy() -> Any:
+        weights = {"a": 2, "b": 1} if strategy_name == "weighted-round-robin" else None
+        return create_watch_dispatch_strategy(strategy_name, project_order=("a", "b"), weights=weights)
+
+    runtime_a, runtime_b, recovery_a, recovery_b, pending_a, pending_b = build_case(f"preview-{strategy_name}")
+    recovery_strategy = make_strategy()
+    pending_strategy = make_strategy()
+    recovery_state_before = recovery_strategy.serialize_state()
+    pending_state_before = pending_strategy.serialize_state()
+    pending_heads_before = (
+        runtime_a.pending_dispatch_head(max_recovery_attempts=1).task.id,
+        runtime_b.pending_dispatch_head(max_recovery_attempts=1).task.id,
+    )
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=2, dry_run=True)
+
+    with (
+        patch.object(runtime_a, "recovery_dispatch_head", return_value=recovery_a),
+        patch.object(runtime_b, "recovery_dispatch_head", return_value=recovery_b),
+        patch.object(runtime_a, "pending_dispatch_head", return_value=pending_a),
+        patch.object(runtime_b, "pending_dispatch_head", return_value=pending_b),
+    ):
+        preview_results = dispatch_watch_supervisor_lanes_incrementally(
+            [runtime_a, runtime_b],
+            recovery_slots_config=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=recovery_strategy,
+            pending_strategy=pending_strategy,
+            launch_budget=budget,
+            dispatch_recovery_candidate=lambda selected_runtime, candidate, _budget: ProjectDispatchResult(
+                runtime_key=selected_runtime.key,
+                candidate=candidate,
+                status="dry_run",
+                slot_consuming=False,
+                work_done=True,
+                dispatch_budget_consuming=True,
+                task=candidate.task,
+            ),
+        ).results
+
+    assert [result.status for result in preview_results] == ["dry_run", "dry_run"]
+    assert recovery_strategy.serialize_state() == recovery_state_before
+    assert pending_strategy.serialize_state() == pending_state_before
+    assert (
+        runtime_a.pending_dispatch_head(max_recovery_attempts=1).task.id,
+        runtime_b.pending_dispatch_head(max_recovery_attempts=1).task.id,
+    ) == pending_heads_before
+
+    control_a, control_b, control_recovery_a, _control_recovery_b, control_pending_a, _control_pending_b = build_case(
+        f"control-{strategy_name}"
+    )
+    control_recovery_strategy = make_strategy()
+    control_pending_strategy = make_strategy()
+    live_selections: list[tuple[str, str]] = []
+
+    def live_dispatch(
+        selected_runtime: WatchProjectRuntime,
+        candidate: ProjectDispatchCandidate,
+        launch_budget: SupervisorLaunchBudget,
+    ) -> ProjectDispatchResult:
+        reservation = launch_budget.reserve(candidate)
+        assert reservation is not None
+        assert candidate.task.id is not None
+        _mark_runtime_task_live(selected_runtime, candidate.task.id)
+        launch_budget.refresh_occupancy()
+        live_selections.append((candidate.lane, selected_runtime.key))
+        return ProjectDispatchResult(
+            runtime_key=selected_runtime.key,
+            candidate=candidate,
+            status="live",
+            slot_consuming=True,
+            work_done=True,
+            dispatch_budget_consuming=True,
+            task=selected_runtime.store.get(candidate.task.id),
+        )
+
+    with (
+        patch.object(runtime_a, "recovery_dispatch_head", return_value=recovery_a),
+        patch.object(runtime_b, "recovery_dispatch_head", return_value=recovery_b),
+        patch.object(runtime_a, "pending_dispatch_head", return_value=pending_a),
+        patch.object(runtime_b, "pending_dispatch_head", return_value=pending_b),
+        patch.object(control_a, "recovery_dispatch_head", return_value=control_recovery_a),
+        patch.object(control_b, "recovery_dispatch_head", return_value=None),
+        patch.object(control_a, "pending_dispatch_head", return_value=control_pending_a),
+        patch.object(control_b, "pending_dispatch_head", return_value=None),
+    ):
+        previewed_live = dispatch_watch_supervisor_lanes_incrementally(
+            [runtime_a, runtime_b],
+            recovery_slots_config=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=recovery_strategy,
+            pending_strategy=pending_strategy,
+            launch_budget=SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=2),
+            dispatch_recovery_candidate=live_dispatch,
+            dispatch_pending_candidate=live_dispatch,
+        ).results
+        control_live = dispatch_watch_supervisor_lanes_incrementally(
+            [control_a, control_b],
+            recovery_slots_config=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=control_recovery_strategy,
+            pending_strategy=control_pending_strategy,
+            launch_budget=SupervisorLaunchBudget([control_a, control_b], supervisor_batch=2),
+            dispatch_recovery_candidate=live_dispatch,
+            dispatch_pending_candidate=live_dispatch,
+        ).results
+
+    assert [(result.candidate.lane, result.runtime_key, result.candidate.task.prompt) for result in previewed_live] == [
+        (result.candidate.lane, result.runtime_key, result.candidate.task.prompt) for result in control_live
+    ]
+    assert live_selections == [("recovery", "a"), ("pending", "a"), ("recovery", "a"), ("pending", "a")]
+
+
+def test_watch_supervisor_dry_run_recovery_start_consumes_runtime_capacity_before_pending_donation(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a", max_concurrent=1)
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b", max_concurrent=1)
+    recovery_a = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
+    pending_a = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
+    pending_b = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=2, dry_run=True)
+
+    with (
+        patch.object(runtime_a, "recovery_dispatch_head", return_value=recovery_a),
+        patch.object(runtime_b, "recovery_dispatch_head", return_value=None),
+        patch.object(runtime_a, "pending_dispatch_head", return_value=pending_a),
+        patch.object(runtime_b, "pending_dispatch_head", return_value=pending_b),
+    ):
+        lane_results = dispatch_watch_supervisor_lanes_incrementally(
+            [runtime_a, runtime_b],
+            recovery_slots_config=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            launch_budget=budget,
+            dispatch_recovery_candidate=lambda selected_runtime, candidate, _budget: ProjectDispatchResult(
+                runtime_key=selected_runtime.key,
+                candidate=candidate,
+                status="dry_run",
+                slot_consuming=False,
+                work_done=True,
+                dispatch_budget_consuming=True,
+                task=candidate.task,
+            ),
+        )
+
+    assert [result.candidate.task.id for result in lane_results.recovery_results] == [recovery_a.task.id]
+    assert [result.candidate.task.id for result in lane_results.pending_results] == [pending_b.task.id]
+    assert pending_a.task.id not in [result.candidate.task.id for result in lane_results.results]
+    assert budget.virtual_dispatch_starts_for_runtime("a") == 1
+    assert budget.virtual_dispatch_starts_for_runtime("b") == 1
+
+
+def test_watch_supervisor_pending_dry_run_respects_runtime_capacity_while_filling_global_slots(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a", max_concurrent=1)
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b", max_concurrent=2)
+    first_a = _runtime_candidate(runtime_a, runtime_a.store.add("A first", task_type="plan"), lane="pending")
+    second_a = _runtime_candidate(runtime_a, runtime_a.store.add("A second", task_type="plan"), lane="pending")
+    first_b = _runtime_candidate(runtime_b, runtime_b.store.add("B first", task_type="plan"), lane="pending")
+    second_b = _runtime_candidate(runtime_b, runtime_b.store.add("B second", task_type="plan"), lane="pending")
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=3, dry_run=True)
+    results = dispatch_watch_supervisor_lane_incrementally(
+        [runtime_a, runtime_b],
+        lane="pending",
+        limit=3,
+        recovery_mode="pending_only",
+        max_recovery_attempts=1,
+        strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+        launch_budget=budget,
+    )
+
+    assert [result.candidate.task.id for result in results] == [first_a.task.id, first_b.task.id, second_b.task.id]
+    assert second_a.task.id not in [result.candidate.task.id for result in results]
+    assert budget.virtual_dispatch_starts_for_runtime("a") == 1
+    assert budget.virtual_dispatch_starts_for_runtime("b") == 2
+
+
+def test_watch_supervisor_default_pending_dispatch_uses_budget_dry_run_without_mutation(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    pending = store.add("Pending default dry-run", task_type="plan")
+    assert pending.id is not None
+    pending_id = pending.id
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store, key="a")
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1, dry_run=True)
+
+    with (
+        patch("gza.cli.watch.launch_permit", side_effect=AssertionError("permit acquired")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+    ):
+        results = dispatch_watch_supervisor_lane_incrementally(
+            [runtime],
+            lane="pending",
+            limit=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
+            launch_budget=budget,
+        )
+
+    assert [result.status for result in results] == ["dry_run"]
+    stored_pending = store.get(pending_id)
+    assert stored_pending is not None
+    assert stored_pending.status == "pending"
+    assert budget.virtual_dispatch_starts == 1
+    assert budget.occupancy.slots == 0
+
+
+def test_watch_supervisor_weighted_strategy_records_actual_incremental_selections(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    stale_a = _runtime_candidate(runtime_a, runtime_a.store.add("A stale recovery", task_type="implement"), lane="recovery")
+    replacement_a = _runtime_candidate(
+        runtime_a,
+        runtime_a.store.add("A stale preplanned replacement", task_type="implement"),
+        lane="recovery",
+    )
+    candidate_b = _runtime_candidate(runtime_b, runtime_b.store.add("B actual recovery", task_type="implement"), lane="recovery")
+    strategy = create_watch_dispatch_strategy(
+        "weighted-round-robin",
+        project_order=("a", "b"),
+        weights={"a": 2, "b": 1},
+    )
+    budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
+    selections: list[str] = []
+
+    def dispatch_recovery(
+        runtime: WatchProjectRuntime,
+        candidate: ProjectDispatchCandidate,
+        launch_budget: SupervisorLaunchBudget,
+    ) -> ProjectDispatchResult:
+        reservation = launch_budget.reserve(candidate)
+        assert reservation is not None
+        selections.append(candidate.runtime_key)
+        if candidate.runtime_key == "a":
+            launch_budget.release(reservation)
+            return ProjectDispatchResult(
+                runtime_key=runtime.key,
+                candidate=candidate,
+                status="not_dispatchable",
+                slot_consuming=False,
+                work_done=False,
+                task=candidate.task,
+            )
+        assert candidate.task.id is not None
+        _mark_runtime_task_live(runtime, candidate.task.id)
+        launch_budget.refresh_occupancy()
+        return ProjectDispatchResult(
+            runtime_key=runtime.key,
+            candidate=candidate,
+            status="live",
+            slot_consuming=True,
+            work_done=True,
+            task=runtime.store.get(candidate.task.id),
+        )
+
+    with (
+        patch.object(runtime_a, "recovery_dispatch_head", return_value=stale_a),
+        patch.object(runtime_b, "recovery_dispatch_head", return_value=candidate_b),
+    ):
+        results = dispatch_watch_supervisor_lane_incrementally(
+            [runtime_a, runtime_b],
+            lane="recovery",
+            limit=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            strategy=strategy,
+            launch_budget=budget,
+            dispatch_candidate=dispatch_recovery,
+        )
+
+    assert [result.candidate.task.id for result in results] == [stale_a.task.id, candidate_b.task.id]
+    assert replacement_a.task.id not in [result.candidate.task.id for result in results]
+    assert selections == ["a", "b"]
+    assert strategy.serialize_state()["cursor"] == 0
+    assert strategy.serialize_state()["remaining_turns"] == 2
 
 
 @pytest.mark.parametrize("task_type", ["implement", "review", "improve", "rebase"])
@@ -35565,6 +36612,117 @@ def test_watch_project_runtime_pending_dry_run_consumes_virtual_dispatch_budget_
     assert third.id not in text
 
 
+def test_watch_project_runtime_pending_preflight_refuses_recovery_first_explicit_task_losing_position(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    positioned = store.add("Positioned pending loses explicit queue position", task_type="plan")
+    fallback = store.add("Unpositioned fallback pending", task_type="plan")
+    assert positioned.id is not None
+    assert fallback.id is not None
+    assert store.set_queue_position(positioned.id, 1)
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    candidate = runtime.pending_dispatch_head(max_recovery_attempts=1, selection_mode="recovery_first_explicit")
+    assert candidate is not None
+    assert candidate.task.id == positioned.id
+    assert candidate.selection_mode == "recovery_first_explicit"
+    assert store.clear_queue_position(positioned.id)
+
+    with (
+        patch("gza.cli.watch._maybe_park_watch_no_progress", side_effect=AssertionError("no-progress mutated")),
+        patch("gza.cli.watch.launch_permit", side_effect=AssertionError("permit acquired")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=AssertionError("settled")),
+    ):
+        result = runtime.dispatch_pending_candidate(candidate, max_iterations=1, dry_run=True)
+
+    assert result.status == "not_dispatchable"
+    assert result.work_done is False
+    assert result.slot_consuming is False
+    assert result.detail is not None
+    assert "no longer eligible for pending dispatch" in result.detail
+    assert runtime.pending_dispatch_head(max_recovery_attempts=1, selection_mode="recovery_first_explicit") is None
+
+
+def test_watch_project_runtime_pending_final_validation_refuses_explicit_task_losing_position(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    positioned = store.add("Positioned pending loses queue position after preflight", task_type="plan")
+    fallback = store.add("Unpositioned fallback pending", task_type="plan")
+    assert positioned.id is not None
+    assert fallback.id is not None
+    assert store.set_queue_position(positioned.id, 1)
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    candidate = runtime.pending_dispatch_head(max_recovery_attempts=1, selection_mode="recovery_first_explicit")
+    assert candidate is not None
+    assert candidate.task.id == positioned.id
+    original_preflight = watch_module._preflight_pending_dispatch_candidate
+
+    def preflight_then_clear_position(**kwargs: Any) -> object:
+        result = original_preflight(**kwargs)
+        assert result.dispatchable is True
+        assert store.clear_queue_position(positioned.id)
+        return result
+
+    with (
+        patch("gza.cli.watch._preflight_pending_dispatch_candidate", side_effect=preflight_then_clear_position),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", side_effect=AssertionError("no-progress mutated")),
+        patch("gza.cli.watch.launch_permit", side_effect=AssertionError("permit acquired")),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),
+        patch("gza.cli.watch._settle_watch_dispatch_starts", side_effect=AssertionError("settled")),
+    ):
+        result = runtime.dispatch_pending_candidate(candidate, max_iterations=1, dry_run=True)
+
+    assert result.status == "not_dispatchable"
+    assert result.work_done is False
+    assert result.slot_consuming is False
+    assert result.dispatch_budget_consuming is False
+    assert result.detail is not None
+    assert "no longer eligible for pending dispatch" in result.detail
+    assert runtime.pending_dispatch_head(max_recovery_attempts=1, selection_mode="recovery_first_explicit") is None
+    assert runtime.pending_dispatch_head(max_recovery_attempts=1).task.id == positioned.id
+
+
+def test_watch_project_runtime_pending_validation_uses_candidate_max_recovery_attempts_override(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    positioned = store.add("Positioned pending with explicit attempt override", task_type="plan")
+    assert positioned.id is not None
+    assert store.set_queue_position(positioned.id, 1)
+    runtime = _make_runtime_for_dispatch_api(tmp_path, store)
+    candidate = runtime.pending_dispatch_head(max_recovery_attempts=7, selection_mode="recovery_first_explicit")
+    assert candidate is not None
+    assert candidate.max_recovery_attempts == 7
+    original_preflight = watch_module._preflight_pending_dispatch_candidate
+    original_head_validation = runtime._current_pending_dispatch_head_for_validation
+    preflight_attempts: list[int] = []
+    final_validation_attempts: list[int] = []
+
+    def preflight_spy(**kwargs: Any) -> object:
+        preflight_attempts.append(kwargs["max_recovery_attempts"])
+        return original_preflight(**kwargs)
+
+    def final_validation_spy(**kwargs: Any) -> ProjectDispatchCandidate | None:
+        final_validation_attempts.append(kwargs["max_recovery_attempts"])
+        assert kwargs["selection_mode"] == "recovery_first_explicit"
+        return original_head_validation(**kwargs)
+
+    with (
+        patch("gza.cli.watch._preflight_pending_dispatch_candidate", side_effect=preflight_spy),
+        patch.object(runtime, "_current_pending_dispatch_head_for_validation", side_effect=final_validation_spy),
+    ):
+        result = runtime.dispatch_pending_candidate(candidate, max_iterations=1, dry_run=True)
+
+    assert result.status == "dry_run"
+    assert preflight_attempts == [7]
+    assert final_validation_attempts == [7]
+
+
 def test_watch_project_runtime_pending_local_cap_is_runtime_wide_hold_not_candidate_skip(
     tmp_path: Path,
 ) -> None:
@@ -36234,8 +37392,14 @@ def test_watch_project_runtime_pending_dispatch_refreshes_live_proof_before_side
     def validate_then_register_live_worker(
         *,
         suppression_context: watch_module._WatchDispatchSuppressionContext,
+        selection_mode: Any,
+        max_recovery_attempts: int,
     ) -> ProjectDispatchCandidate | None:
-        head = original_head_for_validation(suppression_context=suppression_context)
+        head = original_head_for_validation(
+            suppression_context=suppression_context,
+            selection_mode=selection_mode,
+            max_recovery_attempts=max_recovery_attempts,
+        )
         _register_live_worker_for_task(runtime.config, first.id)
         return head
 

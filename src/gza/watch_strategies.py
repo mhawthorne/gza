@@ -41,6 +41,9 @@ class WatchDispatchStrategy(Protocol[T]):
     def serialize_state(self) -> dict[str, object]:
         ...
 
+    def clone(self) -> WatchDispatchStrategy[T]:
+        ...
+
 
 def _validate_project_order(project_order: Sequence[str]) -> tuple[str, ...]:
     ordered = tuple(project_order)
@@ -137,6 +140,9 @@ class RoundRobinWatchStrategy(Generic[T]):
             "cursor": self._cursor,
         }
 
+    def clone(self) -> RoundRobinWatchStrategy[T]:
+        return RoundRobinWatchStrategy(self._project_order, state=self.serialize_state())
+
 
 class WeightedRoundRobinWatchStrategy(Generic[T]):
     """Persistent weighted round-robin over positive project weights."""
@@ -224,6 +230,13 @@ class WeightedRoundRobinWatchStrategy(Generic[T]):
             "remaining_turns": self._remaining_turns,
         }
 
+    def clone(self) -> WeightedRoundRobinWatchStrategy[T]:
+        return WeightedRoundRobinWatchStrategy(
+            self._project_order,
+            weights=self._weights,
+            state=self.serialize_state(),
+        )
+
 
 class ProjectPriorityWatchStrategy(Generic[T]):
     """Strict project-priority strategy over declared project order."""
@@ -253,6 +266,9 @@ class ProjectPriorityWatchStrategy(Generic[T]):
             "name": self.metadata.name,
             "project_order": list(self._project_order),
         }
+
+    def clone(self) -> ProjectPriorityWatchStrategy[T]:
+        return ProjectPriorityWatchStrategy(self._project_order, state=self.serialize_state())
 
 
 WATCH_STRATEGY_METADATA: Mapping[str, WatchStrategyMetadata] = {
