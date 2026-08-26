@@ -5145,14 +5145,17 @@ def _run_isolated_merge_batch(
                     and rebase_route.assessment.reason == "branch already merged"
                     and task.id is not None
                 ):
-                    if _watch_pending_merge_finalization_action(
-                        config=config,
-                        store=store,
-                        task=task,
-                        target_branch=target_branch,
-                        resolved_merge_state="merged",
-                        live_target_sha=_watch_ref_sha_if_available(git, target_branch),
-                    ) is not None:
+                    if (
+                        _watch_pending_merge_finalization_action(
+                            config=config,
+                            store=store,
+                            task=task,
+                            target_branch=target_branch,
+                            resolved_merge_state="merged",
+                            live_target_sha=_watch_ref_sha_if_available(git, target_branch),
+                        )
+                        is not None
+                    ):
                         log.emit(
                             "SKIP",
                             f"{display_task.id}: branch already merged; pending merge finalization will replay",
@@ -5289,14 +5292,11 @@ def _run_isolated_merge_batch(
                 )
                 partial_staged = materialized_staged
                 action_metadata = materialized_staged.merge_action_metadata
-                if (
-                    action_metadata.get("pending_merge_finalization") is not True
-                    and (
-                        action_metadata.get("type") == "merge_with_followups"
-                        or (
-                            action_metadata.get("type") == "merge"
-                            and action_metadata.get("max_cycles_merge_and_defer") is True
-                        )
+                if action_metadata.get("pending_merge_finalization") is not True and (
+                    action_metadata.get("type") == "merge_with_followups"
+                    or (
+                        action_metadata.get("type") == "merge"
+                        and action_metadata.get("max_cycles_merge_and_defer") is True
                     )
                 ):
                     source_ref = materialized_staged.source_ref or materialized_staged.merge_branch
@@ -5304,7 +5304,9 @@ def _run_isolated_merge_batch(
                         git,
                         source_ref,
                     )
-                    previous_target_sha = _watch_ref_sha_if_available(git, target_branch) or _watch_ref_sha_if_available(
+                    previous_target_sha = _watch_ref_sha_if_available(
+                        git, target_branch
+                    ) or _watch_ref_sha_if_available(
                         merge_git,
                         target_branch,
                     )
@@ -5377,10 +5379,7 @@ def _run_isolated_merge_batch(
                     reconciled_work_done = True
                 log.emit(
                     "ERROR",
-                    (
-                        f"{staged_entry.display_task.id}: {debt_label} failed: "
-                        f"{exc}; stopping isolated merge batch"
-                    ),
+                    (f"{staged_entry.display_task.id}: {debt_label} failed: {exc}; stopping isolated merge batch"),
                 )
                 return reconciled_work_done, False, None
             materialized_batch.append(replace(staged_entry, staged=materialized_staged))
@@ -5516,9 +5515,7 @@ def _run_isolated_merge_batch(
                 reused_deferred_blockers=tuple(getattr(finalized, "reused_deferred_blockers", ())),
             )
             emitted_entry = replace(staged_entry, staged=finalized_staged)
-            if _emit_staged_deferred_blocker_follow_lines(
-                log, emitted_entry, emitted_task_ids=emitted_follow_task_ids
-            ):
+            if _emit_staged_deferred_blocker_follow_lines(log, emitted_entry, emitted_task_ids=emitted_follow_task_ids):
                 reconciled_work_done = True
             if staged_entry.merge_event is not None:
                 merge_status_after = (_task_snapshot(store).get(staged_entry.merge_event.display_task_id) or {}).get(
@@ -6086,7 +6083,9 @@ def _watch_visible_running_state_from_live_state(
     return filtered_live_pids, visible_task_ids, anonymous_worker_count, starting_worker_count
 
 
-def _collect_watch_running_and_starting_pids(config: Config, store: SqliteTaskStore) -> tuple[frozenset[int], frozenset[int]]:
+def _collect_watch_running_and_starting_pids(
+    config: Config, store: SqliteTaskStore
+) -> tuple[frozenset[int], frozenset[int]]:
     live_state = _shared_collect_live_running_state_details(config, store)
     return _watch_running_and_starting_pids_from_live_state(live_state, store=store)
 
@@ -6336,7 +6335,7 @@ class _WatchLongPhaseReporter:
         self._last_durations = self._duration_history_by_log.setdefault(log.path, {})
         self._starts: dict[tuple[str, str], float] = {}
 
-    def start(self, phase: str, subject_id: str) -> LongPhaseHeartbeat:
+    def start(self, phase: str, subject_id: str) -> "_WatchLongPhaseHeartbeat":
         key = (phase, subject_id)
         self._starts[key] = time.monotonic()
         prior = self._last_durations.get(key)
@@ -6349,7 +6348,9 @@ class _WatchLongPhaseReporter:
         key = (phase, subject_id)
         started = self._starts.pop(key, None)
         if started is not None:
-            self._last_durations[key] = time.monotonic() - started
+            elapsed = time.monotonic() - started
+            self._last_durations[key] = elapsed
+            self.log.emit("DONE", f"{phase} {subject_id} elapsed {_format_watch_duration(elapsed)}")
 
     def _format_busy_line(self, phase: str, subject_id: str, progress: LongPhaseProgress) -> str:
         elapsed = _format_watch_duration(progress.elapsed_seconds)
@@ -6364,6 +6365,7 @@ class _WatchLongPhaseReporter:
             output = f"out +{progress.output_bytes_delta} bytes"
         no_progress = " (NO PROGRESS)" if progress.no_progress else ""
         return f"{phase} {subject_id} elapsed {elapsed} {cpu} {output}{no_progress}"
+
 
 class _WatchLongPhaseHeartbeat:
     def __init__(self, reporter: _WatchLongPhaseReporter, phase: str, subject_id: str) -> None:
@@ -6380,6 +6382,22 @@ class _WatchLongPhaseHeartbeat:
             return
         self._finished = True
         self._reporter.finish(self._phase, self._subject_id)
+
+
+_WATCH_CYCLE_PHASE_SUBJECT_ID = "cycle"
+
+
+def _start_watch_cycle_phase(reporter: _WatchLongPhaseReporter, phase: str) -> _WatchLongPhaseHeartbeat:
+    return reporter.start(phase, _WATCH_CYCLE_PHASE_SUBJECT_ID)
+
+
+@contextlib.contextmanager
+def _watch_cycle_phase(reporter: _WatchLongPhaseReporter, phase: str) -> Iterator[None]:
+    heartbeat = _start_watch_cycle_phase(reporter, phase)
+    try:
+        yield
+    finally:
+        heartbeat.finish()
 
 
 class _CompositeLongPhaseHeartbeat:
@@ -7264,8 +7282,10 @@ def _worker_heartbeat_phase_subject(worker: Any, task: DbTask | None) -> tuple[s
 
 
 def _worker_progress_log_file(config: Config, worker: Any, task: DbTask | None) -> Path | None:
-    raw_log = (task.log_file if task is not None else None) or getattr(worker, "log_file", None) or getattr(
-        worker, "startup_log_file", None
+    raw_log = (
+        (task.log_file if task is not None else None)
+        or getattr(worker, "log_file", None)
+        or getattr(worker, "startup_log_file", None)
     )
     if not raw_log:
         return None
@@ -7614,9 +7634,7 @@ def _validate_watch_selector_name(raw: object, *, field: str = "name") -> str:
     if not name:
         raise ValueError(f"watch project {field} must not be empty")
     if not _WATCH_SELECTOR_NAME_RE.fullmatch(name):
-        raise ValueError(
-            f"watch project {field} {name!r} may only contain letters, numbers, '.', '_', and '-'"
-        )
+        raise ValueError(f"watch project {field} {name!r} may only contain letters, numbers, '.', '_', and '-'")
     return name
 
 
@@ -8640,7 +8658,9 @@ def dispatch_watch_supervisor_lane_incrementally(
             if result.slot_consuming or result.dispatch_budget_consuming:
                 worker_consuming_starts += 1
             elif choice.candidate.task.id is not None:
-                suppressed_task_ids_by_runtime_key.setdefault(choice.project_key, set()).add(str(choice.candidate.task.id))
+                suppressed_task_ids_by_runtime_key.setdefault(choice.project_key, set()).add(
+                    str(choice.candidate.task.id)
+                )
     return tuple(results)
 
 
@@ -9246,7 +9266,10 @@ class WatchProjectRuntime:
         known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
         excluded_owner_ids: frozenset[str] = frozenset(),
     ) -> ProjectCycleAnalysis:
-        plan = _build_watch_cycle_plan(
+        plan = _build_reported_watch_cycle_plan(
+            log=self.log,
+            threshold_seconds=self.config.watch.long_phase_threshold_seconds,
+            heartbeat_interval_seconds=self.config.watch.heartbeat_interval_seconds,
             config=self.config,
             store=self.store,
             batch=batch,
@@ -9493,9 +9516,7 @@ class WatchProjectRuntime:
             if not entry.worker_consuming:
                 continue
             candidate_selection_mode = (
-                recovery_mode
-                if entry.lane == "recovery"
-                else _watch_supervisor_pending_selection_mode(recovery_mode)
+                recovery_mode if entry.lane == "recovery" else _watch_supervisor_pending_selection_mode(recovery_mode)
             )
             candidates.append(
                 ProjectDispatchCandidate(
@@ -11801,6 +11822,7 @@ def _scoped_watch_active_count(
     known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
     git: Git | None = None,
     runtime_context: RuntimeExecutionContext | None = None,
+    log: _WatchLog | None = None,
 ) -> int:
     return _scoped_watch_activity(
         config=config,
@@ -11816,6 +11838,7 @@ def _scoped_watch_active_count(
         known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
         git=git,
         runtime_context=runtime_context,
+        log=log,
     ).active_count
 
 
@@ -11834,23 +11857,44 @@ def _scoped_watch_activity(
     known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
     git: Git | None = None,
     runtime_context: RuntimeExecutionContext | None = None,
+    log: _WatchLog | None = None,
 ) -> _ScopedWatchActivity:
     runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
-    plan = _build_watch_cycle_plan(
-        config=config,
-        store=store,
-        batch=batch,
-        tags=tags,
-        any_tag=any_tag,
-        recovery_slots=recovery_slots,
-        recovery_mode=recovery_mode,
-        max_recovery_attempts=max_recovery_attempts,
-        scoped_owner_ids=scoped_owner_ids,
-        scoped_task_ids=scoped_task_ids,
-        known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
-        git=git,
-        runtime_context=runtime_context,
-    )
+    if log is not None:
+        plan = _build_reported_watch_cycle_plan(
+            log=log,
+            threshold_seconds=config.watch.long_phase_threshold_seconds,
+            heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
+            config=config,
+            store=store,
+            batch=batch,
+            tags=tags,
+            any_tag=any_tag,
+            recovery_slots=recovery_slots,
+            recovery_mode=recovery_mode,
+            max_recovery_attempts=max_recovery_attempts,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
+            git=git,
+            runtime_context=runtime_context,
+        )
+    else:
+        plan = _build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=batch,
+            tags=tags,
+            any_tag=any_tag,
+            recovery_slots=recovery_slots,
+            recovery_mode=recovery_mode,
+            max_recovery_attempts=max_recovery_attempts,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
+            git=git,
+            runtime_context=runtime_context,
+        )
     planned_active_owner_ids = _collect_planned_active_owner_ids(plan.analysis)
     effective_scoped_owner_ids = getattr(plan.analysis, "effective_scoped_owner_ids", None) or scoped_owner_ids
     scoped_git = git if git is not None else Git(config.project_dir, env=runtime_context.env)
@@ -11877,6 +11921,46 @@ def _scoped_watch_activity(
         active_count=active_count,
         effective_scoped_owner_ids=effective_scoped_owner_ids,
     )
+
+
+def _reported_scoped_watch_activity(
+    *,
+    log: _WatchLog,
+    config: Config,
+    store: SqliteTaskStore,
+    batch: int,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    recovery_slots: int,
+    recovery_mode: DispatchSelectionMode | None,
+    max_recovery_attempts: int,
+    scoped_owner_ids: tuple[str, ...],
+    scoped_task_ids: tuple[str, ...] | None = None,
+    known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
+    git: Git | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
+) -> _ScopedWatchActivity:
+    reporter = _WatchLongPhaseReporter(
+        log=log,
+        threshold_seconds=config.watch.long_phase_threshold_seconds,
+        interval_seconds=config.watch.heartbeat_interval_seconds,
+    )
+    with _watch_cycle_phase(reporter, "scoped-completion-analysis"):
+        return _scoped_watch_activity(
+            config=config,
+            store=store,
+            batch=batch,
+            tags=tags,
+            any_tag=any_tag,
+            recovery_slots=recovery_slots,
+            recovery_mode=recovery_mode,
+            max_recovery_attempts=max_recovery_attempts,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
+            git=git,
+            runtime_context=runtime_context,
+        )
 
 
 def _collect_planned_active_owner_ids(analysis: _WatchCycleAnalysis) -> frozenset[str]:
@@ -12027,6 +12111,53 @@ def _build_watch_cycle_plan(
     )
 
 
+def _build_reported_watch_cycle_plan(
+    *,
+    log: "_WatchLog",
+    threshold_seconds: int,
+    heartbeat_interval_seconds: int,
+    config: Config,
+    store: SqliteTaskStore,
+    batch: int,
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    recovery_slots: int,
+    recovery_mode: DispatchSelectionMode | None,
+    max_recovery_attempts: int,
+    scoped_owner_ids: tuple[str, ...] | None = None,
+    scoped_task_ids: tuple[str, ...] | None = None,
+    known_effective_scoped_owner_ids: tuple[str, ...] | None = None,
+    excluded_owner_ids: frozenset[str] = frozenset(),
+    git: Git | None = None,
+    runtime_context: RuntimeExecutionContext | None = None,
+    reconciled_runtime_state: ProjectRuntimeReconcileResult | None = None,
+) -> _WatchCyclePlan:
+    reporter = _WatchLongPhaseReporter(
+        log=log,
+        threshold_seconds=threshold_seconds,
+        interval_seconds=heartbeat_interval_seconds,
+    )
+    with _watch_cycle_phase(reporter, "cycle-plan"):
+        plan = _build_watch_cycle_plan(
+            config=config,
+            store=store,
+            batch=batch,
+            tags=tags,
+            any_tag=any_tag,
+            recovery_slots=recovery_slots,
+            recovery_mode=recovery_mode,
+            max_recovery_attempts=max_recovery_attempts,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
+            excluded_owner_ids=excluded_owner_ids,
+            git=git,
+            runtime_context=runtime_context,
+            reconciled_runtime_state=reconciled_runtime_state,
+        )
+    return plan
+
+
 def _dispatch_scoped_watch_once(
     *,
     config: Config,
@@ -12155,47 +12286,65 @@ def _run_cycle(
         recovery_slots=recovery_slots,
         scoped_mode=scoped_mode,
     )
+    long_phase_reporter = _WatchLongPhaseReporter(
+        log=log,
+        threshold_seconds=config.watch.long_phase_threshold_seconds,
+        interval_seconds=config.watch.heartbeat_interval_seconds,
+    )
 
     if begin_cycle:
         log.begin_cycle()
-    _warn_if_installed_gza_changed(
-        log,
-        installed_package_drift,
-        auto_restart_on_drift=auto_restart_on_drift,
-    )
+    cycle_phase = _start_watch_cycle_phase(long_phase_reporter, "drift-check")
+    try:
+        _warn_if_installed_gza_changed(
+            log,
+            installed_package_drift,
+            auto_restart_on_drift=auto_restart_on_drift,
+        )
+    finally:
+        cycle_phase.finish()
     reconciled_runtime_state: ProjectRuntimeReconcileResult | None = None
     if not skip_runtime_reconcile:
-        reconciled_runtime_state = _reconcile_watch_runtime_state(
+        cycle_phase = _start_watch_cycle_phase(long_phase_reporter, "runtime-reconcile")
+        try:
+            reconciled_runtime_state = _reconcile_watch_runtime_state(
+                config=config,
+                store=store,
+                runtime_key=config.project_name,
+                runtime_context=runtime_context,
+                dry_run=dry_run,
+            )
+        finally:
+            cycle_phase.finish()
+
+    if precomputed_plan is not None:
+        if excluded_owner_ids:
+            precomputed_plan = _filter_precomputed_watch_cycle_plan(
+                precomputed_plan,
+                excluded_owner_ids=excluded_owner_ids,
+            )
+        plan = precomputed_plan
+    else:
+        plan = _build_reported_watch_cycle_plan(
+            log=log,
+            threshold_seconds=config.watch.long_phase_threshold_seconds,
+            heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
             config=config,
             store=store,
-            runtime_key=config.project_name,
-            runtime_context=runtime_context,
-            dry_run=dry_run,
-        )
-
-    if precomputed_plan is not None and excluded_owner_ids:
-        precomputed_plan = _filter_precomputed_watch_cycle_plan(
-            precomputed_plan,
+            batch=batch,
+            tags=tags,
+            any_tag=any_tag,
+            recovery_slots=recovery_slots,
+            recovery_mode=recovery_mode,
+            max_recovery_attempts=max_recovery_attempts,
+            scoped_owner_ids=scoped_owner_ids,
+            scoped_task_ids=scoped_task_ids,
+            known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
             excluded_owner_ids=excluded_owner_ids,
+            git=git,
+            runtime_context=runtime_context,
+            reconciled_runtime_state=reconciled_runtime_state,
         )
-
-    plan = precomputed_plan or _build_watch_cycle_plan(
-        config=config,
-        store=store,
-        batch=batch,
-        tags=tags,
-        any_tag=any_tag,
-        recovery_slots=recovery_slots,
-        recovery_mode=recovery_mode,
-        max_recovery_attempts=max_recovery_attempts,
-        scoped_owner_ids=scoped_owner_ids,
-        scoped_task_ids=scoped_task_ids,
-        known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
-        excluded_owner_ids=excluded_owner_ids,
-        git=git,
-        runtime_context=runtime_context,
-        reconciled_runtime_state=reconciled_runtime_state,
-    )
     running_task_ids = list(plan.running_task_ids)
     anonymous_worker_count = plan.anonymous_worker_count
     starting_worker_count = getattr(plan, "starting_worker_count", 0)
@@ -12206,15 +12355,19 @@ def _run_cycle(
     slots = plan.slots
     effective_scoped_owner_ids = getattr(plan.analysis, "effective_scoped_owner_ids", None) or scoped_owner_ids
     if not dry_run and not skip_stale_no_progress_reconcile:
-        scope_selectors = _build_watch_scope_selectors(
-            scoped_owner_ids=scoped_owner_ids,
-            scoped_task_ids=scoped_task_ids,
-            effective_scoped_owner_ids=effective_scoped_owner_ids,
-        )
-        reconcile_stale_watch_no_progress_parks(
-            store,
-            scopes=_watch_progress_scopes_from_selectors(scope_selectors),
-        )
+        cycle_phase = _start_watch_cycle_phase(long_phase_reporter, "stale-no-progress-reconcile")
+        try:
+            scope_selectors = _build_watch_scope_selectors(
+                scoped_owner_ids=scoped_owner_ids,
+                scoped_task_ids=scoped_task_ids,
+                effective_scoped_owner_ids=effective_scoped_owner_ids,
+            )
+            reconcile_stale_watch_no_progress_parks(
+                store,
+                scopes=_watch_progress_scopes_from_selectors(scope_selectors),
+            )
+        finally:
+            cycle_phase.finish()
     work_done = False
     confirmed_start_count = 0
     recovery_started_this_cycle = False
@@ -12227,11 +12380,6 @@ def _run_cycle(
     reserved_recovery_slots = 0
     remaining_new_worker_starts = max(0, new_worker_start_cap) if new_worker_start_cap is not None else None
     project_analysis_invalidated = False
-    long_phase_reporter = _WatchLongPhaseReporter(
-        log=log,
-        threshold_seconds=config.watch.long_phase_threshold_seconds,
-        interval_seconds=config.watch.heartbeat_interval_seconds,
-    )
     lifecycle_heartbeat_factory = _make_watch_lifecycle_heartbeat_factory(
         long_phase_reporter,
         worker_heartbeat=worker_heartbeat,
@@ -12268,28 +12416,32 @@ def _run_cycle(
             ),
         )
 
-    if emit_cycle_header:
-        _emit_worker_heartbeat()
-        log.emit(
-            "WAKE",
-            _format_wake_message(
-                running=running,
-                runnable_pending=pending_count,
-                blocked_pending=blocked_pending_count,
-                slots=slots,
-                running_task_ids=running_task_ids,
-                anonymous_worker_count=anonymous_worker_count,
-                starting_worker_count=starting_worker_count,
-            ),
-        )
-        scope_message = _format_scope_message(tags, any_tag=any_tag, scoped_owner_ids=effective_scoped_owner_ids)
-        if scope_message is not None:
-            log.emit("INFO", scope_message)
-        usage_message = _format_watch_usage_message(config, store, runtime_context=runtime_context)
-        if usage_message is not None:
-            log.emit("INFO", usage_message)
-    else:
-        _emit_worker_heartbeat()
+    cycle_phase = _start_watch_cycle_phase(long_phase_reporter, "cycle-header")
+    try:
+        if emit_cycle_header:
+            _emit_worker_heartbeat()
+            log.emit(
+                "WAKE",
+                _format_wake_message(
+                    running=running,
+                    runnable_pending=pending_count,
+                    blocked_pending=blocked_pending_count,
+                    slots=slots,
+                    running_task_ids=running_task_ids,
+                    anonymous_worker_count=anonymous_worker_count,
+                    starting_worker_count=starting_worker_count,
+                ),
+            )
+            scope_message = _format_scope_message(tags, any_tag=any_tag, scoped_owner_ids=effective_scoped_owner_ids)
+            if scope_message is not None:
+                log.emit("INFO", scope_message)
+            usage_message = _format_watch_usage_message(config, store, runtime_context=runtime_context)
+            if usage_message is not None:
+                log.emit("INFO", usage_message)
+        else:
+            _emit_worker_heartbeat()
+    finally:
+        cycle_phase.finish()
 
     def _reserve_watch_launch(worker_label: str, subject_task_id: str) -> LaunchPermit | None:
         try:
@@ -12453,12 +12605,6 @@ def _run_cycle(
     git = git if git is not None else Git(config.project_dir, env=runtime_context.env)
     analysis = plan.analysis
     target_branch = analysis.target_branch
-    _check_canonical_checkout_boundary("watch-pass-start")
-    for gap in analysis.scope_gaps:
-        log.emit_attention(
-            attention_key=f"scope-gap:{gap.owner_id}:{gap.blocking_child_id}",
-            message=_format_scope_gap_message(gap, tags=tags, any_tag=any_tag),
-        )
     lifecycle_rows = list(analysis.lifecycle_rows)
     recovery_lane_entry_by_failed_id = analysis.recovery_lane_entry_by_failed_id
     worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
@@ -12687,7 +12833,6 @@ def _run_cycle(
         ),
         runtime_context=runtime_context,
     )
-    current_branch = git.current_branch()
     merge_git: Git | None = None
     merge_actions_available = True
     merge_skip_reason = "merge-not-default-branch"
@@ -12713,29 +12858,12 @@ def _run_cycle(
             log.emit("ERROR", f"isolated merge checkout rebuild failed: {exc}")
             return False
 
-    if isolation_enabled and not dry_run:
-        try:
-            merge_git = _run_with_optional_stdout_suppressed(
-                quiet,
-                lambda: ensure_watch_main_checkout(config, git, target_branch),
-            )
-        except GitError as exc:
-            log.emit(
-                "WARN",
-                f"isolated merge checkout refresh failed; rebuilding: {exc}",
-            )
-            _rebuild_isolated_checkout()
-
     merge_halted_for_cycle = False
     active_main_verify_remediation: MainIntegrationVerifyRemediation | None = None
     active_main_verify_remediation_task_id: str | None = None
     merge_verify_git: Git | None = None
     latest_main_verify_state: Any | None = None
     latest_main_verify_git: Git | None = None
-    if isolation_enabled:
-        merge_verify_git = merge_git
-    elif current_branch == target_branch:
-        merge_verify_git = git
 
     def _set_active_main_verify_remediation(
         remediation: MainIntegrationVerifyRemediation | None,
@@ -12752,65 +12880,91 @@ def _run_cycle(
             active_main_verify_remediation = None
             active_main_verify_remediation_task_id = None
 
-    if merge_verify_git is not None:
-        main_verify = _run_watch_main_integration_verify(
-            config=config,
-            store=store,
-            git=merge_verify_git,
-            log=log,
-            quiet=quiet,
-            suppress_verify_stdout=suppress_main_verify_stdout,
-            target_branch=target_branch,
-            reason="watch-main-verify",
-            red_reruns=2,
-            env=runtime_context.env,
-            worker_heartbeat=worker_heartbeat,
-        )
-        main_verify_dispatch_state_changed = _retire_cleared_main_verify_remediations(
-            store=store,
-            log=log,
-            check=main_verify,
-            dry_run=dry_run,
-        )
-        main_verify_file_result = _coerce_main_verify_remediation_file_result(
-            _maybe_file_main_verify_remediation(
-                dry_run=dry_run,
+    with _watch_cycle_phase(long_phase_reporter, "lifecycle-preflight"):
+        _check_canonical_checkout_boundary("watch-pass-start")
+        for gap in analysis.scope_gaps:
+            log.emit_attention(
+                attention_key=f"scope-gap:{gap.owner_id}:{gap.blocking_child_id}",
+                message=_format_scope_gap_message(gap, tags=tags, any_tag=any_tag),
+            )
+        current_branch = git.current_branch()
+        if isolation_enabled and not dry_run:
+            try:
+                merge_git = _run_with_optional_stdout_suppressed(
+                    quiet,
+                    lambda: ensure_watch_main_checkout(config, git, target_branch),
+                )
+            except GitError as exc:
+                log.emit(
+                    "WARN",
+                    f"isolated merge checkout refresh failed; rebuilding: {exc}",
+                )
+                _rebuild_isolated_checkout()
+
+        if isolation_enabled:
+            merge_verify_git = merge_git
+        elif current_branch == target_branch:
+            merge_verify_git = git
+
+        if merge_verify_git is not None:
+            main_verify = _run_watch_main_integration_verify(
                 config=config,
                 store=store,
-                tags=tags,
-                any_tag=any_tag,
+                git=merge_verify_git,
+                log=log,
+                quiet=quiet,
+                suppress_verify_stdout=suppress_main_verify_stdout,
+                target_branch=target_branch,
+                reason="watch-main-verify",
+                red_reruns=2,
+                env=runtime_context.env,
+                worker_heartbeat=worker_heartbeat,
+            )
+            main_verify_dispatch_state_changed = _retire_cleared_main_verify_remediations(
+                store=store,
                 log=log,
                 check=main_verify,
-                return_result=True,
-            ),
-        )
-        if main_verify_dispatch_state_changed or main_verify_file_result.dispatch_state_changed:
-            project_analysis_invalidated = True
-            work_done = True
-        main_verify_state = main_verify_file_result.refreshed_state or getattr(main_verify, "state", None)
-        latest_main_verify_state = main_verify_state
-        latest_main_verify_git = git
-        if main_verify.merges_halted and main_verify_state is not None:
-            merge_halted_for_cycle = True
-            _emit_main_verify_attention(
-                log=log,
-                state=main_verify_state,
-                now=datetime.now(UTC),
-                git=git,
-                target_branch=target_branch,
+                dry_run=dry_run,
             )
-            remediation = getattr(main_verify, "remediation", None)
-            _set_active_main_verify_remediation(remediation)
-        elif getattr(main_verify, "needs_attention", False) and main_verify_state is not None:
-            _emit_main_verify_attention(
-                log=log,
-                state=main_verify_state,
-                now=datetime.now(UTC),
-                git=git,
-                target_branch=target_branch,
+            main_verify_file_result = _coerce_main_verify_remediation_file_result(
+                _maybe_file_main_verify_remediation(
+                    dry_run=dry_run,
+                    config=config,
+                    store=store,
+                    tags=tags,
+                    any_tag=any_tag,
+                    log=log,
+                    check=main_verify,
+                    return_result=True,
+                ),
             )
-        else:
-            _clear_main_verify_attention(log=log, state=main_verify_state)
+            if main_verify_dispatch_state_changed or main_verify_file_result.dispatch_state_changed:
+                project_analysis_invalidated = True
+                work_done = True
+            main_verify_state = main_verify_file_result.refreshed_state or getattr(main_verify, "state", None)
+            latest_main_verify_state = main_verify_state
+            latest_main_verify_git = git
+            if main_verify.merges_halted and main_verify_state is not None:
+                merge_halted_for_cycle = True
+                _emit_main_verify_attention(
+                    log=log,
+                    state=main_verify_state,
+                    now=datetime.now(UTC),
+                    git=git,
+                    target_branch=target_branch,
+                )
+                remediation = getattr(main_verify, "remediation", None)
+                _set_active_main_verify_remediation(remediation)
+            elif getattr(main_verify, "needs_attention", False) and main_verify_state is not None:
+                _emit_main_verify_attention(
+                    log=log,
+                    state=main_verify_state,
+                    now=datetime.now(UTC),
+                    git=git,
+                    target_branch=target_branch,
+                )
+            else:
+                _clear_main_verify_attention(log=log, state=main_verify_state)
 
     active_main_verify_terminal_attempt_consumed = False
 
@@ -12923,453 +13077,452 @@ def _run_cycle(
         work_done = True
         return True
 
-    if lifecycle_rows:
-        action_plan = list(analysis.action_plan)
-        impl_based_on_ids = collect_non_dropped_implement_source_ids(store.get_all())
-        has_merge_action = any(action.get("type") in {"merge", "merge_with_followups"} for _, _, action in action_plan)
-        can_merge = merge_actions_available
-        if has_merge_action:
-            if isolation_enabled:
-                if dry_run:
-                    can_merge = True
-                else:
-                    can_merge = merge_git is not None
-            else:
-                can_merge = _run_with_optional_stdout_suppressed(
-                    quiet,
-                    lambda: _require_default_branch(git, current_branch, "merge"),
-                )
-        execution_decisions = plan_lifecycle_execution(
-            action_plan,
-            free_worker_slots=0 if direct_phase_only else _free_worker_start_slots(),
-            get_action=lambda item: item[2],
-        )
-        if can_merge and not merge_halted_for_cycle:
-            execution_decisions = reproject_selected_merge_actions(
-                execution_decisions,
-                reproject_action=lambda item: dict(item[2])
-                if item[2].get("pending_merge_finalization") is True
-                else determine_next_action(
-                    config,
-                    store,
-                    git,
-                    item[1],
-                    target_branch,
-                    impl_based_on_ids=impl_based_on_ids,
-                    selected_for_merge=True,
-                ),
+    with _watch_cycle_phase(long_phase_reporter, "lifecycle"):
+        if lifecycle_rows:
+            action_plan = list(analysis.action_plan)
+            impl_based_on_ids = collect_non_dropped_implement_source_ids(store.get_all())
+            has_merge_action = any(
+                action.get("type") in {"merge", "merge_with_followups"} for _, _, action in action_plan
             )
-        lifecycle_summary = format_cycle_lifecycle_action_summary(
-            (decision.item[0].owner_task, decision.action) for decision in execution_decisions
-        )
-        if emit_lifecycle_summary and lifecycle_summary is not None:
-            log.emit("INFO", lifecycle_summary)
-
-        batch_processed = 0
-        if (
-            isolation_enabled
-            and not dry_run
-            and can_merge
-            and not merge_halted_for_cycle
-            and verify_gate_enabled(config)
-        ):
-            leading_merge_decisions: list[Any] = []
-            for merge_batch_decision in execution_decisions:
-                action_type = dict(merge_batch_decision.action).get("type")
-                if action_type not in {"merge", "merge_with_followups"}:
-                    break
-                leading_merge_decisions.append(merge_batch_decision)
-            if leading_merge_decisions:
-                try:
-                    merge_git = _run_with_optional_stdout_suppressed(
+            can_merge = merge_actions_available
+            if has_merge_action:
+                if isolation_enabled:
+                    if dry_run:
+                        can_merge = True
+                    else:
+                        can_merge = merge_git is not None
+                else:
+                    can_merge = _run_with_optional_stdout_suppressed(
                         quiet,
-                        lambda: ensure_watch_main_checkout(config, git, target_branch),
+                        lambda: _require_default_branch(git, current_branch, "merge"),
                     )
-                    batch_work_done, merge_halted_for_cycle, active_main_verify_remediation = _run_isolated_merge_batch(
+            execution_decisions = plan_lifecycle_execution(
+                action_plan,
+                free_worker_slots=0 if direct_phase_only else _free_worker_start_slots(),
+                get_action=lambda item: item[2],
+            )
+            if can_merge and not merge_halted_for_cycle:
+                execution_decisions = reproject_selected_merge_actions(
+                    execution_decisions,
+                    reproject_action=lambda item: (
+                        dict(item[2])
+                        if item[2].get("pending_merge_finalization") is True
+                        else determine_next_action(
+                            config,
+                            store,
+                            git,
+                            item[1],
+                            target_branch,
+                            impl_based_on_ids=impl_based_on_ids,
+                            selected_for_merge=True,
+                        )
+                    ),
+                )
+            lifecycle_summary = format_cycle_lifecycle_action_summary(
+                (decision.item[0].owner_task, decision.action) for decision in execution_decisions
+            )
+            if emit_lifecycle_summary and lifecycle_summary is not None:
+                log.emit("INFO", lifecycle_summary)
+
+            batch_processed = 0
+            if (
+                isolation_enabled
+                and not dry_run
+                and can_merge
+                and not merge_halted_for_cycle
+                and verify_gate_enabled(config)
+            ):
+                leading_merge_decisions: list[Any] = []
+                for merge_batch_decision in execution_decisions:
+                    action_type = dict(merge_batch_decision.action).get("type")
+                    if action_type not in {"merge", "merge_with_followups"}:
+                        break
+                    leading_merge_decisions.append(merge_batch_decision)
+                if leading_merge_decisions:
+                    try:
+                        merge_git = _run_with_optional_stdout_suppressed(
+                            quiet,
+                            lambda: ensure_watch_main_checkout(config, git, target_branch),
+                        )
+                        batch_work_done, merge_halted_for_cycle, active_main_verify_remediation = (
+                            _run_isolated_merge_batch(
+                                config=config,
+                                store=store,
+                                git=git,
+                                merge_git=merge_git,
+                                current_branch=current_branch,
+                                target_branch=target_branch,
+                                decisions=leading_merge_decisions,
+                                quiet=quiet,
+                                dry_run=dry_run,
+                                log=log,
+                                tags=tags,
+                                any_tag=any_tag,
+                                env=runtime_context.env,
+                                reserve_rebase_launch=lambda subject_id: _reserve_watch_launch("rebase", subject_id),
+                                create_rebase_task=_create_rebase_from_task,
+                                prepare_rebase_task=lambda rebase_task, permit: _prepare_watch_reserved_task(
+                                    rebase_task,
+                                    permit=permit,
+                                    rollback_on_failure=False,
+                                ),
+                                free_worker_start_slots=(lambda: 0) if direct_phase_only else _free_worker_start_slots,
+                                spawn_rebase_worker=lambda rebase_task: _watch_spawn_worker(rebase_task, "rebase"),
+                                release_reserved_task=_release_watch_reserved_task,
+                                observe_dispatch=_observe_dispatch,
+                                note_handled_child_task_id=step1_handled_child_task_ids.add,
+                                defer_lifecycle_start=deferred_lifecycle_starts.append,
+                                worker_heartbeat=worker_heartbeat,
+                            )
+                        )
+                        _set_active_main_verify_remediation(active_main_verify_remediation)
+                        if batch_work_done:
+                            work_done = True
+                        batch_processed = len(leading_merge_decisions)
+                    except GitError as exc:
+                        log.emit("ERROR", f"isolated merge batch failed: {exc}")
+                        batch_processed = len(leading_merge_decisions)
+
+            for lifecycle_execution_decision in execution_decisions[batch_processed:]:
+                _emit_worker_heartbeat()
+                row, task, action = lifecycle_execution_decision.item
+                action = dict(lifecycle_execution_decision.action)
+                display_task = row.owner_task
+                action_type = action.get("type")
+                if (
+                    direct_phase_only
+                    and not lifecycle_execution_decision.selected
+                    and is_worker_consuming_advance_action(str(action_type))
+                ):
+                    continue
+                if action_type not in {
+                    "merge",
+                    "merge_with_followups",
+                } and _consume_active_main_verify_remediation_terminal_attempt(
+                    task,
+                    reason=f"lifecycle selected {action_type or 'non-merge'}",
+                ):
+                    continue
+                if classify_advance_action(action) == "needs_attention":
+                    original_attention_reason = get_needs_attention_reason(action)
+                    attention_key: str
+                    recovery_entry = (
+                        recovery_lane_entry_by_failed_id.get(get_action_subject_task_id(action) or "")
+                        if classify_advance_action(action) == "needs_attention"
+                        else None
+                    )
+                    if recovery_entry is not None and recovery_entry.attention_action is not None:
+                        display_task = recovery_entry.owner_task
+                        action = _reroot_failed_recovery_attention_action(
+                            owner_task=display_task,
+                            failed_task=recovery_entry.task,
+                            attention_action=action,
+                        )
+                        attention_key = (
+                            f"failed-recovery-attention:{display_task.id}:{recovery_entry.decision.reason_code}"
+                        )
+                    else:
+                        display_task = _resolve_watch_attention_display_task(store, row)
+                        attention_key = f"advance-attention:{display_task.id}:{action_type}"
+                    # Lineage-progress attention comes from the advance action plan only.
+                    log.emit_attention(
+                        attention_key=attention_key,
+                        message=_watch_needs_attention_message(display_task, action),
+                    )
+                    if original_attention_reason == "rebase-failed-needs-manual-resolution":
+                        owner_action = determine_next_action(
+                            config,
+                            store,
+                            git,
+                            task,
+                            target_branch,
+                            impl_based_on_ids=impl_based_on_ids,
+                        )
+                        if not show_skipped and classify_advance_action(owner_action) != "needs_attention":
+                            work_done = True
+                    continue
+
+                if classify_advance_action(action) == "skip":
+                    resolved_merge_state = _watch_resolve_already_merged_state_for_pending_finalization(
+                        git=git,
+                        task=task,
+                        target_branch=target_branch,
+                    )
+                    pending_finalization_action = _watch_pending_merge_finalization_action(
                         config=config,
                         store=store,
-                        git=git,
-                        merge_git=merge_git,
-                        current_branch=current_branch,
+                        task=task,
                         target_branch=target_branch,
-                        decisions=leading_merge_decisions,
-                        quiet=quiet,
+                        resolved_merge_state=resolved_merge_state,
+                        live_target_sha=_watch_ref_sha_if_available(git, target_branch),
+                    )
+                    if pending_finalization_action is not None:
+                        action = pending_finalization_action
+                        action_type = str(action.get("type", "unknown"))
+                    else:
+                        pending_finalization_action = None
+                if classify_advance_action(action) == "skip":
+                    if _maybe_repair_target_already_merged_skip(
+                        store=store,
+                        git=git,
+                        task=task,
+                        display_task=display_task,
+                        action=action,
+                        target_branch=target_branch,
                         dry_run=dry_run,
                         log=log,
-                        tags=tags,
-                        any_tag=any_tag,
-                        env=runtime_context.env,
-                        reserve_rebase_launch=lambda subject_id: _reserve_watch_launch("rebase", subject_id),
-                        create_rebase_task=_create_rebase_from_task,
-                        prepare_rebase_task=lambda rebase_task, permit: _prepare_watch_reserved_task(
-                            rebase_task,
-                            permit=permit,
-                            rollback_on_failure=False,
-                        ),
-                        free_worker_start_slots=(lambda: 0) if direct_phase_only else _free_worker_start_slots,
-                        spawn_rebase_worker=lambda rebase_task: _watch_spawn_worker(rebase_task, "rebase"),
-                        release_reserved_task=_release_watch_reserved_task,
-                        observe_dispatch=_observe_dispatch,
-                        note_handled_child_task_id=step1_handled_child_task_ids.add,
-                        defer_lifecycle_start=deferred_lifecycle_starts.append,
-                        worker_heartbeat=worker_heartbeat,
-                    )
-                    _set_active_main_verify_remediation(active_main_verify_remediation)
-                    if batch_work_done:
+                    ):
                         work_done = True
-                    batch_processed = len(leading_merge_decisions)
-                except GitError as exc:
-                    log.emit("ERROR", f"isolated merge batch failed: {exc}")
-                    batch_processed = len(leading_merge_decisions)
-
-        for lifecycle_execution_decision in execution_decisions[batch_processed:]:
-            _emit_worker_heartbeat()
-            row, task, action = lifecycle_execution_decision.item
-            action = dict(lifecycle_execution_decision.action)
-            display_task = row.owner_task
-            action_type = action.get("type")
-            if (
-                direct_phase_only
-                and not lifecycle_execution_decision.selected
-                and is_worker_consuming_advance_action(str(action_type))
-            ):
-                continue
-            if action_type not in {
-                "merge",
-                "merge_with_followups",
-            } and _consume_active_main_verify_remediation_terminal_attempt(
-                task,
-                reason=f"lifecycle selected {action_type or 'non-merge'}",
-            ):
-                continue
-            if classify_advance_action(action) == "needs_attention":
-                original_attention_reason = get_needs_attention_reason(action)
-                attention_key: str
-                recovery_entry = (
-                    recovery_lane_entry_by_failed_id.get(get_action_subject_task_id(action) or "")
-                    if classify_advance_action(action) == "needs_attention"
-                    else None
-                )
-                if recovery_entry is not None and recovery_entry.attention_action is not None:
-                    display_task = recovery_entry.owner_task
-                    action = _reroot_failed_recovery_attention_action(
-                        owner_task=display_task,
-                        failed_task=recovery_entry.task,
-                        attention_action=action,
-                    )
-                    attention_key = f"failed-recovery-attention:{display_task.id}:{recovery_entry.decision.reason_code}"
-                else:
-                    display_task = _resolve_watch_attention_display_task(store, row)
-                    attention_key = f"advance-attention:{display_task.id}:{action_type}"
-                # Lineage-progress attention comes from the advance action plan only.
-                log.emit_attention(
-                    attention_key=attention_key,
-                    message=_watch_needs_attention_message(display_task, action),
-                )
-                if original_attention_reason == "rebase-failed-needs-manual-resolution":
-                    owner_action = determine_next_action(
-                        config,
-                        store,
-                        git,
-                        task,
-                        target_branch,
-                        impl_based_on_ids=impl_based_on_ids,
-                    )
-                    if not show_skipped and classify_advance_action(owner_action) != "needs_attention":
-                        work_done = True
-                continue
-
-            if classify_advance_action(action) == "skip":
-                resolved_merge_state = _watch_resolve_already_merged_state_for_pending_finalization(
-                    git=git,
-                    task=task,
-                    target_branch=target_branch,
-                )
-                pending_finalization_action = _watch_pending_merge_finalization_action(
-                    config=config,
-                    store=store,
-                    task=task,
-                    target_branch=target_branch,
-                    resolved_merge_state=resolved_merge_state,
-                    live_target_sha=_watch_ref_sha_if_available(git, target_branch),
-                )
-                if pending_finalization_action is not None:
-                    action = pending_finalization_action
-                    action_type = str(action.get("type", "unknown"))
-                else:
-                    pending_finalization_action = None
-            if classify_advance_action(action) == "skip":
-                if _maybe_repair_target_already_merged_skip(
-                    store=store,
-                    git=git,
-                    task=task,
-                    display_task=display_task,
-                    action=action,
-                    target_branch=target_branch,
-                    dry_run=dry_run,
-                    log=log,
-                ):
-                    work_done = True
-                    continue
-                log.emit(
-                    "SKIP",
-                    _watch_skip_message(display_task, action),
-                    dedupe_key=f"advance-skip:{action_type}:{display_task.id}",
-                )
-                continue
-
-            if not _shared_lifecycle_actions.should_execute_lifecycle_action(
-                action,
-                free_worker_slots=_free_worker_start_slots(),
-            ):
-                _observe_dispatch(display_task.id, "capacity_blocked", str(action_type))
-                no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
-                    store=store,
-                    subject_task=display_task,
-                    action=action,
-                    action_task=task,
-                    failed_task=None,
-                    no_progress_cycles=config.watch.no_progress_cycles,
-                    persist=not dry_run,
-                )
-                if no_progress_attention is not None:
-                    log.emit_attention(
-                        attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
-                        message=_watch_needs_attention_message(display_task, no_progress_attention),
-                    )
-                    continue
-                log.emit(
-                    "SKIP",
-                    f"{display_task.id}: no watch worker slots available for {action_type}",
-                    dedupe_key=f"advance-capacity-skip:{action_type}:{display_task.id}",
-                )
-                continue
-
-            if action_type in {"merge", "merge_with_followups"}:
-                if task.id is not None:
-                    fresh_task = store.get(task.id)
-                    if fresh_task is not None:
-                        task = fresh_task
-                    if display_task.id == task.id:
-                        display_task = task
-                freeze_exempt = merge_halted_for_cycle and _is_active_main_verify_fix_remediation_merge(
-                    task,
-                    active_main_verify_remediation,
-                    active_task_id=active_main_verify_remediation_task_id,
-                )
-                if merge_halted_for_cycle and not freeze_exempt:
+                        continue
                     log.emit(
                         "SKIP",
-                        f"{display_task.id}: merges halted while local main verify is red",
-                        dedupe_key=f"main-integration-verify-skip:{display_task.id}",
+                        _watch_skip_message(display_task, action),
+                        dedupe_key=f"advance-skip:{action_type}:{display_task.id}",
                     )
                     continue
-                if freeze_exempt:
-                    log.emit(
-                        "INFO",
-                        f"{display_task.id}: merging active local main verify remediation despite red-main freeze",
+
+                if not _shared_lifecycle_actions.should_execute_lifecycle_action(
+                    action,
+                    free_worker_slots=_free_worker_start_slots(),
+                ):
+                    _observe_dispatch(display_task.id, "capacity_blocked", str(action_type))
+                    no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
+                        store=store,
+                        subject_task=display_task,
+                        action=action,
+                        action_task=task,
+                        failed_task=None,
+                        no_progress_cycles=config.watch.no_progress_cycles,
+                        persist=not dry_run,
                     )
-                if not can_merge:
-                    if isolation_enabled and merge_skip_reason == "merge-isolated-checkout-unavailable":
+                    if no_progress_attention is not None:
+                        log.emit_attention(
+                            attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
+                            message=_watch_needs_attention_message(display_task, no_progress_attention),
+                        )
+                        continue
+                    log.emit(
+                        "SKIP",
+                        f"{display_task.id}: no watch worker slots available for {action_type}",
+                        dedupe_key=f"advance-capacity-skip:{action_type}:{display_task.id}",
+                    )
+                    continue
+
+                if action_type in {"merge", "merge_with_followups"}:
+                    if task.id is not None:
+                        fresh_task = store.get(task.id)
+                        if fresh_task is not None:
+                            task = fresh_task
+                        if display_task.id == task.id:
+                            display_task = task
+                    freeze_exempt = merge_halted_for_cycle and _is_active_main_verify_fix_remediation_merge(
+                        task,
+                        active_main_verify_remediation,
+                        active_task_id=active_main_verify_remediation_task_id,
+                    )
+                    if merge_halted_for_cycle and not freeze_exempt:
                         log.emit(
                             "SKIP",
-                            "merge actions skipped: isolated checkout unavailable",
-                            dedupe_key="merge-isolated-checkout-unavailable",
+                            f"{display_task.id}: merges halted while local main verify is red",
+                            dedupe_key=f"main-integration-verify-skip:{display_task.id}",
+                        )
+                        continue
+                    if freeze_exempt:
+                        log.emit(
+                            "INFO",
+                            f"{display_task.id}: merging active local main verify remediation despite red-main freeze",
+                        )
+                    if not can_merge:
+                        if isolation_enabled and merge_skip_reason == "merge-isolated-checkout-unavailable":
+                            log.emit(
+                                "SKIP",
+                                "merge actions skipped: isolated checkout unavailable",
+                                dedupe_key="merge-isolated-checkout-unavailable",
+                            )
+                            if freeze_exempt:
+                                _consume_active_main_verify_remediation_terminal_attempt(
+                                    task,
+                                    reason="isolated checkout unavailable before merge",
+                                )
+                            continue
+                        log.emit(
+                            "SKIP",
+                            "merge actions skipped: not on default branch",
+                            dedupe_key="merge-not-default-branch",
                         )
                         if freeze_exempt:
                             _consume_active_main_verify_remediation_terminal_attempt(
                                 task,
-                                reason="isolated checkout unavailable before merge",
+                                reason="merge unavailable before execution",
                             )
                         continue
-                    log.emit(
-                        "SKIP",
-                        "merge actions skipped: not on default branch",
-                        dedupe_key="merge-not-default-branch",
+                    merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
+                    effective_merge_state = (
+                        effective_no_work_merge_state(task, merge_unit.state)
+                        if merge_unit is not None
+                        else task.merge_status
                     )
-                    if freeze_exempt:
-                        _consume_active_main_verify_remediation_terminal_attempt(
-                            task,
-                            reason="merge unavailable before execution",
+                    if task.status != "completed" or effective_merge_state in {"merged", "empty", "redundant"}:
+                        log.emit(
+                            "SKIP",
+                            f"{display_task.id}: merge candidate no longer mergeable after watch reconciliation",
+                            dedupe_key=f"merge-stale-skip:{display_task.id}",
                         )
-                    continue
-                merge_unit = store.resolve_merge_unit_for_task(task.id) if task.id is not None else None
-                effective_merge_state = (
-                    effective_no_work_merge_state(task, merge_unit.state)
-                    if merge_unit is not None
-                    else task.merge_status
-                )
-                if task.status != "completed" or effective_merge_state in {"merged", "empty", "redundant"}:
-                    log.emit(
-                        "SKIP",
-                        f"{display_task.id}: merge candidate no longer mergeable after watch reconciliation",
-                        dedupe_key=f"merge-stale-skip:{display_task.id}",
-                    )
-                    if freeze_exempt:
-                        _consume_active_main_verify_remediation_terminal_attempt(
-                            task,
-                            reason="merge candidate no longer mergeable",
-                        )
-                    continue
-                if dry_run:
+                        if freeze_exempt:
+                            _consume_active_main_verify_remediation_terminal_attempt(
+                                task,
+                                reason="merge candidate no longer mergeable",
+                            )
+                        continue
+                    if dry_run:
+                        merge_event = None
+                        if display_task.id is not None:
+                            merge_event = _resolve_watch_merge_log_event(
+                                store,
+                                task_id=display_task.id,
+                                target_branch=target_branch,
+                            )
+                        if merge_event is not None:
+                            log.emit(
+                                "MERGE",
+                                f"{merge_event.display_task_id} -> {merge_event.target_branch} [dry-run]",
+                            )
+                        work_done = True
+                        continue
+                    if isolation_enabled:
+                        try:
+                            merge_git = _run_with_optional_stdout_suppressed(
+                                quiet,
+                                lambda: ensure_watch_main_checkout(config, git, target_branch),
+                            )
+                        except GitError as exc:
+                            log.emit(
+                                "WARN",
+                                f"isolated merge checkout refresh failed; rebuilding: {exc}",
+                            )
+                            if not _rebuild_isolated_checkout():
+                                if freeze_exempt:
+                                    _consume_active_main_verify_remediation_terminal_attempt(
+                                        task,
+                                        reason="isolated checkout rebuild failed before merge",
+                                    )
+                                continue
+                    merge_execution_git = merge_git if (isolation_enabled and merge_git is not None) else git
+                    merge_execution_branch = target_branch if isolation_enabled else current_branch
                     merge_event = None
+                    merge_status_before: str | None = None
                     if display_task.id is not None:
                         merge_event = _resolve_watch_merge_log_event(
                             store,
                             task_id=display_task.id,
                             target_branch=target_branch,
                         )
-                    if merge_event is not None:
-                        log.emit(
-                            "MERGE",
-                            f"{merge_event.display_task_id} -> {merge_event.target_branch} [dry-run]",
+                        if merge_event is not None:
+                            merge_status_before = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
+                                "merge_status"
+                            )
+
+                    def _execute_current_merge() -> _MergeActionResult:
+                        heartbeat = _make_watch_merge_heartbeat(
+                            long_phase_reporter,
+                            phase="merge:execute",
+                            subject_id=str(display_task.id),
+                            worker_heartbeat=worker_heartbeat,
                         )
-                    work_done = True
-                    continue
-                if isolation_enabled:
-                    try:
-                        merge_git = _run_with_optional_stdout_suppressed(
-                            quiet,
-                            lambda: ensure_watch_main_checkout(config, git, target_branch),
+                        try:
+                            return _execute_merge_action(
+                                config,
+                                store,
+                                git,
+                                cast(DbTask, task),
+                                action,
+                                target_branch=target_branch,
+                                current_branch=current_branch,
+                                merge_git=merge_execution_git,
+                                merge_current_branch=merge_execution_branch,
+                                already_merged_behavior="mark_merged",
+                                merge_source=MERGE_SOURCE_WATCH,
+                                quiet_mechanics=True,
+                                heartbeat_threshold_seconds=config.watch.long_phase_threshold_seconds,
+                                heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
+                                on_heartbeat=heartbeat,
+                                active_scope_tags=tags,
+                            )
+                        finally:
+                            _finish_watch_merge_heartbeat(heartbeat)
+
+                    merge_result = _run_with_optional_stdout_suppressed(quiet, _execute_current_merge)
+                    rc = merge_result.rc
+                    consumed_exempt_terminal_attempt = False
+                    if rc == 0:
+                        for warning in getattr(merge_result, "promotion_warnings", ()):
+                            log.emit("WARN", warning)
+                    elif freeze_exempt and active_main_verify_remediation is not None:
+                        consumed_exempt_terminal_attempt = _consume_active_main_verify_remediation_terminal_attempt(
+                            task,
+                            reason="failed merge",
                         )
-                    except GitError as exc:
-                        log.emit(
-                            "WARN",
-                            f"isolated merge checkout refresh failed; rebuilding: {exc}",
-                        )
-                        if not _rebuild_isolated_checkout():
-                            if freeze_exempt:
-                                _consume_active_main_verify_remediation_terminal_attempt(
-                                    task,
-                                    reason="isolated checkout rebuild failed before merge",
-                                )
-                            continue
-                merge_execution_git = merge_git if (isolation_enabled and merge_git is not None) else git
-                merge_execution_branch = target_branch if isolation_enabled else current_branch
-                merge_event = None
-                merge_status_before: str | None = None
-                if display_task.id is not None:
-                    merge_event = _resolve_watch_merge_log_event(
-                        store,
-                        task_id=display_task.id,
-                        target_branch=target_branch,
-                    )
-                    if merge_event is not None:
-                        merge_status_before = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
+                    if rc == 0 and merge_event is not None:
+                        merge_status_after = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
                             "merge_status"
                         )
-                def _execute_current_merge() -> _MergeActionResult:
-                    heartbeat = _make_watch_merge_heartbeat(
-                        long_phase_reporter,
-                        phase="merge:execute",
-                        subject_id=str(display_task.id),
-                        worker_heartbeat=worker_heartbeat,
-                    )
-                    try:
-                        return _execute_merge_action(
-                            config,
-                            store,
-                            git,
-                            cast(DbTask, task),
-                            action,
-                            target_branch=target_branch,
-                            current_branch=current_branch,
-                            merge_git=merge_execution_git,
-                            merge_current_branch=merge_execution_branch,
-                            already_merged_behavior="mark_merged",
-                            merge_source=MERGE_SOURCE_WATCH,
-                            quiet_mechanics=True,
-                            heartbeat_threshold_seconds=config.watch.long_phase_threshold_seconds,
-                            heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
-                            on_heartbeat=heartbeat,
-                            active_scope_tags=tags,
-                        )
-                    finally:
-                        _finish_watch_merge_heartbeat(heartbeat)
-
-                merge_result = _run_with_optional_stdout_suppressed(quiet, _execute_current_merge)
-                rc = merge_result.rc
-                consumed_exempt_terminal_attempt = False
-                if rc == 0:
-                    for warning in getattr(merge_result, "promotion_warnings", ()):
-                        log.emit("WARN", warning)
-                elif freeze_exempt and active_main_verify_remediation is not None:
-                    consumed_exempt_terminal_attempt = _consume_active_main_verify_remediation_terminal_attempt(
-                        task,
-                        reason="failed merge",
-                    )
-                if rc == 0 and merge_event is not None:
-                    merge_status_after = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
-                        "merge_status"
-                    )
-                    if (
-                        merge_status_before != "merged"
-                        and merge_status_after == "merged"
-                        and not log.was_merge_logged(merge_event.merge_key)
-                    ):
-                        log.emit("MERGE", f"{merge_event.display_task_id} -> {merge_event.target_branch}")
-                        log.note_merge_logged(merge_event.merge_key)
-                if rc == 0 and merge_execution_git is not None:
-                    main_verify = _run_watch_main_integration_verify(
-                        config=config,
-                        store=store,
-                        git=merge_execution_git,
-                        log=log,
-                        quiet=quiet,
-                        suppress_verify_stdout=suppress_main_verify_stdout,
-                        target_branch=target_branch,
-                        reason="watch-post-merge",
-                        red_reruns=2,
-                        env=runtime_context.env,
-                        worker_heartbeat=worker_heartbeat,
-                    )
-                    main_verify_dispatch_state_changed = _retire_cleared_main_verify_remediations(
-                        store=store,
-                        log=log,
-                        check=main_verify,
-                        dry_run=dry_run,
-                    )
-                    _handle_post_merge_main_verify_remediation_verdict(
-                        config=config,
-                        store=store,
-                        log=log,
-                        task=task,
-                        display_task=display_task,
-                        check=main_verify,
-                    )
-                    main_verify_file_result = _coerce_main_verify_remediation_file_result(
-                        _maybe_file_main_verify_remediation(
-                            dry_run=dry_run,
+                        if (
+                            merge_status_before != "merged"
+                            and merge_status_after == "merged"
+                            and not log.was_merge_logged(merge_event.merge_key)
+                        ):
+                            log.emit("MERGE", f"{merge_event.display_task_id} -> {merge_event.target_branch}")
+                            log.note_merge_logged(merge_event.merge_key)
+                    if rc == 0 and merge_execution_git is not None:
+                        main_verify = _run_watch_main_integration_verify(
                             config=config,
                             store=store,
-                            tags=tags,
-                            any_tag=any_tag,
+                            git=merge_execution_git,
+                            log=log,
+                            quiet=quiet,
+                            suppress_verify_stdout=suppress_main_verify_stdout,
+                            target_branch=target_branch,
+                            reason="watch-post-merge",
+                            red_reruns=2,
+                            env=runtime_context.env,
+                            worker_heartbeat=worker_heartbeat,
+                        )
+                        main_verify_dispatch_state_changed = _retire_cleared_main_verify_remediations(
+                            store=store,
                             log=log,
                             check=main_verify,
-                            return_result=True,
-                        ),
-                    )
-                    if main_verify_dispatch_state_changed or main_verify_file_result.dispatch_state_changed:
-                        project_analysis_invalidated = True
-                        work_done = True
-                    main_verify_state = main_verify_file_result.refreshed_state or getattr(main_verify, "state", None)
-                    latest_main_verify_state = main_verify_state
-                    latest_main_verify_git = git
-                    if main_verify.merges_halted and main_verify_state is not None:
-                        merge_halted_for_cycle = True
-                        _emit_main_verify_attention(
-                            log=log,
-                            state=main_verify_state,
-                            now=datetime.now(UTC),
-                            git=git,
-                            target_branch=target_branch,
+                            dry_run=dry_run,
                         )
-                        remediation = getattr(main_verify, "remediation", None)
-                        _set_active_main_verify_remediation(remediation)
-                    else:
-                        merge_halted_for_cycle = False
-                        _set_active_main_verify_remediation(None)
-                        if getattr(main_verify, "needs_attention", False) and main_verify_state is not None:
+                        _handle_post_merge_main_verify_remediation_verdict(
+                            config=config,
+                            store=store,
+                            log=log,
+                            task=task,
+                            display_task=display_task,
+                            check=main_verify,
+                        )
+                        main_verify_file_result = _coerce_main_verify_remediation_file_result(
+                            _maybe_file_main_verify_remediation(
+                                dry_run=dry_run,
+                                config=config,
+                                store=store,
+                                tags=tags,
+                                any_tag=any_tag,
+                                log=log,
+                                check=main_verify,
+                                return_result=True,
+                            ),
+                        )
+                        if main_verify_dispatch_state_changed or main_verify_file_result.dispatch_state_changed:
+                            project_analysis_invalidated = True
+                            work_done = True
+                        main_verify_state = main_verify_file_result.refreshed_state or getattr(
+                            main_verify, "state", None
+                        )
+                        latest_main_verify_state = main_verify_state
+                        latest_main_verify_git = git
+                        if main_verify.merges_halted and main_verify_state is not None:
+                            merge_halted_for_cycle = True
                             _emit_main_verify_attention(
                                 log=log,
                                 state=main_verify_state,
@@ -13377,235 +13530,326 @@ def _run_cycle(
                                 git=git,
                                 target_branch=target_branch,
                             )
+                            remediation = getattr(main_verify, "remediation", None)
+                            _set_active_main_verify_remediation(remediation)
                         else:
-                            _clear_main_verify_attention(log=log, state=main_verify_state)
-                merge_materialized_work = _emit_merge_result_follow_lines(
-                    log,
-                    merge_result,
-                    source_task_id=str(display_task.id),
-                )
-                if getattr(merge_result, "status", None) == "blocked_dirty_checkout":
-                    log.emit_attention(
-                        attention_key="merge-blocked-dirty-checkout",
-                        message="merges blocked: main checkout has uncommitted changes - commit or stash them first",
-                    )
-                    break
-                if getattr(merge_result, "status", None) in {
-                    "blocked_candidate_verify",
-                    "blocked_candidate_verify_unavailable",
-                }:
-                    _emit_blocked_candidate_verify_attention(
-                        log=log,
-                        display_task=display_task,
-                        merge_result=merge_result,
-                    )
-                    continue
-                if getattr(merge_result, "status", None) in {
-                    "deferred_blocker_materialization_failed",
-                    "merge_side_effect_materialization_failed",
-                }:
-                    block_reason = (
-                        getattr(merge_result, "block_reason", None)
-                        or "mandatory merge side-effect materialization failed"
-                    )
-                    log.emit(
-                        "ERROR",
-                        f"{display_task.id}: {block_reason}; source remains unmerged",
-                        dedupe_key=f"merge-deferred-blocker-materialization-failed:{display_task.id}",
-                    )
-                    if merge_materialized_work:
-                        work_done = True
-                    continue
-                if getattr(merge_result, "status", None) == "isolated_merge_failed":
-                    block_reason = getattr(merge_result, "block_reason", None) or "promotion failed"
-                    log.emit(
-                        "ERROR",
-                        f"{display_task.id}: isolated merge promotion failed: {block_reason}; source remains unmerged",
-                        dedupe_key=f"isolated-merge-promotion-failed:{display_task.id}",
-                    )
-                    if merge_materialized_work:
-                        work_done = True
-                    continue
-                if getattr(merge_result, "status", None) == "isolated_promotion_rollback_failed_target_uncertain":
-                    block_reason = getattr(merge_result, "block_reason", None) or "target state is uncertain"
-                    log.emit(
-                        "ERROR",
-                        f"{display_task.id}: {block_reason}; operator attention required before retry",
-                        dedupe_key=f"isolated-merge-promotion-rollback-failed:{display_task.id}",
-                    )
-                    if merge_materialized_work:
-                        work_done = True
-                    continue
-                if getattr(merge_result, "status", None) in {
-                    "isolated_post_promotion_proof_persistence_failed",
-                    "post_merge_proof_persistence_failed",
-                    "already_merged_proof_persistence_failed",
-                }:
-                    block_reason = (
-                        getattr(merge_result, "block_reason", None)
-                        or "merge finalization proof was not stored"
-                    )
-                    log.emit(
-                        "ERROR",
-                        f"{display_task.id}: {block_reason}",
-                        dedupe_key=f"merge-post-promotion-proof-failed:{display_task.id}",
-                    )
-                    work_done = True
-                    continue
-                if getattr(merge_result, "status", None) in {
-                    "isolated_post_promotion_finalization_failed",
-                    "isolated_post_promotion_rollback_failed",
-                    "isolated_post_promotion_checkpoint_persistence_failed",
-                    "isolated_post_promotion_merge_state_finalization_failed",
-                    "post_merge_state_persistence_failed",
-                    "already_merged_state_persistence_failed",
-                }:
-                    block_reason = (
-                        getattr(merge_result, "block_reason", None)
-                        or "target was promoted but merge finalization failed"
-                    )
-                    log.emit(
-                        "ERROR",
-                        f"{display_task.id}: {block_reason}; replay will finalize promoted target state",
-                        dedupe_key=f"merge-post-promotion-finalization-failed:{display_task.id}",
-                    )
-                    work_done = True
-                    break
-                if is_pre_promotion_merge_refusal_status(getattr(merge_result, "status", None)):
-                    block_reason = (
-                        getattr(merge_result, "block_reason", None)
-                        or "merge refused before target promotion; target is unchanged"
-                    )
-                    log.emit(
-                        "ERROR",
-                        f"{display_task.id}: {block_reason}",
-                        dedupe_key=f"merge-pre-promotion-refusal:{display_task.id}",
-                    )
-                    if merge_materialized_work:
-                        work_done = True
-                    continue
-                if is_pending_merge_finalization_refusal_status(getattr(merge_result, "status", None)):
-                    block_reason = (
-                        getattr(merge_result, "block_reason", None)
-                        or "pending merge finalization refused before state finalization"
-                    )
-                    log.emit(
-                        "ERROR",
-                        f"{display_task.id}: {block_reason}",
-                        dedupe_key=f"pending-merge-finalization-refused:{display_task.id}",
-                    )
-                    if merge_materialized_work:
-                        work_done = True
-                    merge_halted_for_cycle = True
-                    break
-                if rc != 0 and merge_materialized_work:
-                    work_done = True
-                if rc == 0:
-                    work_done = True
-                elif consumed_exempt_terminal_attempt:
-                    continue
-                else:
-                    conflict_assessment: _IsolatedMergeFailureAssessment | None = None
-                    if isolation_enabled and task.branch is not None:
-
-                        def _cleanup_non_batch_failed_merge_checkout() -> None:
-                            try:
-                                cleanup_failed_merge_checkout(merge_execution_git)
-                            except GitError as cleanup_error:
-                                log.emit(
-                                    "WARN",
-                                    (
-                                        f"{display_task.id}: isolated checkout cleanup failed after conflict: "
-                                        f"{cleanup_error}"
-                                    ),
+                            merge_halted_for_cycle = False
+                            _set_active_main_verify_remediation(None)
+                            if getattr(main_verify, "needs_attention", False) and main_verify_state is not None:
+                                _emit_main_verify_attention(
+                                    log=log,
+                                    state=main_verify_state,
+                                    now=datetime.now(UTC),
+                                    git=git,
+                                    target_branch=target_branch,
                                 )
-                                _rebuild_isolated_checkout()
-
-                        rebase_route = _route_isolated_merge_conflict_to_rebase(
-                            merge_git=merge_execution_git,
-                            task=task,
-                            display_task=display_task,
-                            assessment_target_branch=target_branch,
+                            else:
+                                _clear_main_verify_attention(log=log, state=main_verify_state)
+                    merge_materialized_work = _emit_merge_result_follow_lines(
+                        log,
+                        merge_result,
+                        source_task_id=str(display_task.id),
+                    )
+                    if getattr(merge_result, "status", None) == "blocked_dirty_checkout":
+                        log.emit_attention(
+                            attention_key="merge-blocked-dirty-checkout",
+                            message="merges blocked: main checkout has uncommitted changes - commit or stash them first",
+                        )
+                        break
+                    if getattr(merge_result, "status", None) in {
+                        "blocked_candidate_verify",
+                        "blocked_candidate_verify_unavailable",
+                    }:
+                        _emit_blocked_candidate_verify_attention(
                             log=log,
-                            reserve_launch=lambda subject_id: _reserve_watch_launch("rebase", subject_id),
-                            create_rebase_task=_create_rebase_from_task,
-                            refresh_rebase_task=lambda task_id: store.get(task_id),
-                            prepare_reserved_task=lambda rebase_task, permit: _prepare_watch_reserved_task(
-                                rebase_task,
-                                permit=permit,
-                                rollback_on_failure=True,
-                            ),
-                            free_worker_start_slots=(lambda: 0) if direct_phase_only else _free_worker_start_slots,
-                            spawn_rebase_worker=lambda rebase_task: _watch_spawn_worker(rebase_task, "rebase"),
-                            release_reserved_task=_release_watch_reserved_task,
-                            observe_dispatch=_observe_dispatch,
-                            note_handled_child_task_id=step1_handled_child_task_ids.add,
-                            defer_lifecycle_start=deferred_lifecycle_starts.append,
-                            cleanup_after_conflict=_cleanup_non_batch_failed_merge_checkout,
-                        )
-                        conflict_assessment = rebase_route.assessment
-                        if rebase_route.work_done:
-                            work_done = True
-                        if rebase_route.handled:
-                            continue
-                    if (
-                        conflict_assessment is not None
-                        and conflict_assessment.reason == "branch already merged"
-                        and task.id is not None
-                    ):
-                        if _watch_pending_merge_finalization_action(
-                            config=config,
-                            store=store,
-                            task=task,
-                            target_branch=target_branch,
-                            resolved_merge_state="merged",
-                            live_target_sha=_watch_ref_sha_if_available(git, target_branch),
-                        ) is not None:
-                            log.emit(
-                                "SKIP",
-                                f"{display_task.id}: branch already merged; pending merge finalization will replay",
-                            )
-                            continue
-                        repaired = reconcile_task_branch_merge_truth(
-                            store,
-                            git,
-                            str(task.id),
-                            target_branch=target_branch,
-                            include_diff_stats=True,
-                            persist=True,
-                        )
-                        if repaired.ok and repaired.merge_status == "merged":
-                            log.emit(
-                                "REPAIR",
-                                f"{display_task.id}: marked merged after shared reconciliation against {target_branch}",
-                            )
-                            work_done = True
-                            continue
-                    if conflict_assessment is not None and conflict_assessment.reason is not None:
-                        log.emit(
-                            "SKIP",
-                            (f"{display_task.id}: merge failed ({conflict_assessment.reason}); not routing to rebase"),
-                            dedupe_key=f"merge-failed-non-conflict:{display_task.id}",
+                            display_task=display_task,
+                            merge_result=merge_result,
                         )
                         continue
-                    log.emit(
-                        "SKIP",
-                        f"{display_task.id}: merge failed",
-                        dedupe_key=f"merge-failed:{display_task.id}",
-                    )
-                continue
-            if not dry_run and display_task.id is not None:
-                if _maybe_emit_active_watch_recovery_backoff(
-                    store=store,
-                    log=log,
-                    subject_task=display_task,
-                    action=action,
-                ):
+                    if getattr(merge_result, "status", None) in {
+                        "deferred_blocker_materialization_failed",
+                        "merge_side_effect_materialization_failed",
+                    }:
+                        block_reason = (
+                            getattr(merge_result, "block_reason", None)
+                            or "mandatory merge side-effect materialization failed"
+                        )
+                        log.emit(
+                            "ERROR",
+                            f"{display_task.id}: {block_reason}; source remains unmerged",
+                            dedupe_key=f"merge-deferred-blocker-materialization-failed:{display_task.id}",
+                        )
+                        if merge_materialized_work:
+                            work_done = True
+                        continue
+                    if getattr(merge_result, "status", None) == "isolated_merge_failed":
+                        block_reason = getattr(merge_result, "block_reason", None) or "promotion failed"
+                        log.emit(
+                            "ERROR",
+                            f"{display_task.id}: isolated merge promotion failed: {block_reason}; source remains unmerged",
+                            dedupe_key=f"isolated-merge-promotion-failed:{display_task.id}",
+                        )
+                        if merge_materialized_work:
+                            work_done = True
+                        continue
+                    if getattr(merge_result, "status", None) == "isolated_promotion_rollback_failed_target_uncertain":
+                        block_reason = getattr(merge_result, "block_reason", None) or "target state is uncertain"
+                        log.emit(
+                            "ERROR",
+                            f"{display_task.id}: {block_reason}; operator attention required before retry",
+                            dedupe_key=f"isolated-merge-promotion-rollback-failed:{display_task.id}",
+                        )
+                        if merge_materialized_work:
+                            work_done = True
+                        continue
+                    if getattr(merge_result, "status", None) in {
+                        "isolated_post_promotion_proof_persistence_failed",
+                        "post_merge_proof_persistence_failed",
+                        "already_merged_proof_persistence_failed",
+                    }:
+                        block_reason = (
+                            getattr(merge_result, "block_reason", None) or "merge finalization proof was not stored"
+                        )
+                        log.emit(
+                            "ERROR",
+                            f"{display_task.id}: {block_reason}",
+                            dedupe_key=f"merge-post-promotion-proof-failed:{display_task.id}",
+                        )
+                        work_done = True
+                        continue
+                    if getattr(merge_result, "status", None) in {
+                        "isolated_post_promotion_finalization_failed",
+                        "isolated_post_promotion_rollback_failed",
+                        "isolated_post_promotion_checkpoint_persistence_failed",
+                        "isolated_post_promotion_merge_state_finalization_failed",
+                        "post_merge_state_persistence_failed",
+                        "already_merged_state_persistence_failed",
+                    }:
+                        block_reason = (
+                            getattr(merge_result, "block_reason", None)
+                            or "target was promoted but merge finalization failed"
+                        )
+                        log.emit(
+                            "ERROR",
+                            f"{display_task.id}: {block_reason}; replay will finalize promoted target state",
+                            dedupe_key=f"merge-post-promotion-finalization-failed:{display_task.id}",
+                        )
+                        work_done = True
+                        break
+                    if is_pre_promotion_merge_refusal_status(getattr(merge_result, "status", None)):
+                        block_reason = (
+                            getattr(merge_result, "block_reason", None)
+                            or "merge refused before target promotion; target is unchanged"
+                        )
+                        log.emit(
+                            "ERROR",
+                            f"{display_task.id}: {block_reason}",
+                            dedupe_key=f"merge-pre-promotion-refusal:{display_task.id}",
+                        )
+                        if merge_materialized_work:
+                            work_done = True
+                        continue
+                    if is_pending_merge_finalization_refusal_status(getattr(merge_result, "status", None)):
+                        block_reason = (
+                            getattr(merge_result, "block_reason", None)
+                            or "pending merge finalization refused before state finalization"
+                        )
+                        log.emit(
+                            "ERROR",
+                            f"{display_task.id}: {block_reason}",
+                            dedupe_key=f"pending-merge-finalization-refused:{display_task.id}",
+                        )
+                        if merge_materialized_work:
+                            work_done = True
+                        merge_halted_for_cycle = True
+                        break
+                    if rc != 0 and merge_materialized_work:
+                        work_done = True
+                    if rc == 0:
+                        work_done = True
+                    elif consumed_exempt_terminal_attempt:
+                        continue
+                    else:
+                        conflict_assessment: _IsolatedMergeFailureAssessment | None = None
+                        if isolation_enabled and task.branch is not None:
+
+                            def _cleanup_non_batch_failed_merge_checkout() -> None:
+                                try:
+                                    cleanup_failed_merge_checkout(merge_execution_git)
+                                except GitError as cleanup_error:
+                                    log.emit(
+                                        "WARN",
+                                        (
+                                            f"{display_task.id}: isolated checkout cleanup failed after conflict: "
+                                            f"{cleanup_error}"
+                                        ),
+                                    )
+                                    _rebuild_isolated_checkout()
+
+                            rebase_route = _route_isolated_merge_conflict_to_rebase(
+                                merge_git=merge_execution_git,
+                                task=task,
+                                display_task=display_task,
+                                assessment_target_branch=target_branch,
+                                log=log,
+                                reserve_launch=lambda subject_id: _reserve_watch_launch("rebase", subject_id),
+                                create_rebase_task=_create_rebase_from_task,
+                                refresh_rebase_task=lambda task_id: store.get(task_id),
+                                prepare_reserved_task=lambda rebase_task, permit: _prepare_watch_reserved_task(
+                                    rebase_task,
+                                    permit=permit,
+                                    rollback_on_failure=True,
+                                ),
+                                free_worker_start_slots=(lambda: 0) if direct_phase_only else _free_worker_start_slots,
+                                spawn_rebase_worker=lambda rebase_task: _watch_spawn_worker(rebase_task, "rebase"),
+                                release_reserved_task=_release_watch_reserved_task,
+                                observe_dispatch=_observe_dispatch,
+                                note_handled_child_task_id=step1_handled_child_task_ids.add,
+                                defer_lifecycle_start=deferred_lifecycle_starts.append,
+                                cleanup_after_conflict=_cleanup_non_batch_failed_merge_checkout,
+                            )
+                            conflict_assessment = rebase_route.assessment
+                            if rebase_route.work_done:
+                                work_done = True
+                            if rebase_route.handled:
+                                continue
+                        if (
+                            conflict_assessment is not None
+                            and conflict_assessment.reason == "branch already merged"
+                            and task.id is not None
+                        ):
+                            if (
+                                _watch_pending_merge_finalization_action(
+                                    config=config,
+                                    store=store,
+                                    task=task,
+                                    target_branch=target_branch,
+                                    resolved_merge_state="merged",
+                                    live_target_sha=_watch_ref_sha_if_available(git, target_branch),
+                                )
+                                is not None
+                            ):
+                                log.emit(
+                                    "SKIP",
+                                    f"{display_task.id}: branch already merged; pending merge finalization will replay",
+                                )
+                                continue
+                            repaired = reconcile_task_branch_merge_truth(
+                                store,
+                                git,
+                                str(task.id),
+                                target_branch=target_branch,
+                                include_diff_stats=True,
+                                persist=True,
+                            )
+                            if repaired.ok and repaired.merge_status == "merged":
+                                log.emit(
+                                    "REPAIR",
+                                    f"{display_task.id}: marked merged after shared reconciliation against {target_branch}",
+                                )
+                                work_done = True
+                                continue
+                        if conflict_assessment is not None and conflict_assessment.reason is not None:
+                            log.emit(
+                                "SKIP",
+                                (
+                                    f"{display_task.id}: merge failed ({conflict_assessment.reason}); not routing to rebase"
+                                ),
+                                dedupe_key=f"merge-failed-non-conflict:{display_task.id}",
+                            )
+                            continue
+                        log.emit(
+                            "SKIP",
+                            f"{display_task.id}: merge failed",
+                            dedupe_key=f"merge-failed:{display_task.id}",
+                        )
                     continue
-                no_progress_attention = None
-                if action_type != "reconcile_verify_gate_evidence":
-                    no_progress_attention = _maybe_park_watch_no_progress(
-                        config=config,
+                if not dry_run and display_task.id is not None:
+                    if _maybe_emit_active_watch_recovery_backoff(
+                        store=store,
+                        log=log,
+                        subject_task=display_task,
+                        action=action,
+                    ):
+                        continue
+                    no_progress_attention = None
+                    if action_type != "reconcile_verify_gate_evidence":
+                        no_progress_attention = _maybe_park_watch_no_progress(
+                            config=config,
+                            store=store,
+                            subject_task=display_task,
+                            action=action,
+                            action_task=task,
+                            failed_task=None,
+                            no_progress_cycles=config.watch.no_progress_cycles,
+                        )
+                    if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
+                        _maybe_emit_active_watch_recovery_backoff(
+                            store=store,
+                            log=log,
+                            subject_task=display_task,
+                            action=action,
+                        )
+                        continue
+                    if no_progress_attention is not None:
+                        log.emit_attention(
+                            attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
+                            message=_watch_needs_attention_message(display_task, no_progress_attention),
+                        )
+                        continue
+
+                exec_result = execute_advance_action(task=task, action=action, context=executor_context)
+                child_id = exec_result.handled_task_id
+                guarded_pending_task_id = exec_result.guarded_pending_task_id
+
+                if exec_result.status == "skip":
+                    if display_task.id is not None and _watch_worker_capacity_skip(
+                        str(action_type),
+                        exec_result.message,
+                        exec_result,
+                    ):
+                        _observe_dispatch(display_task.id, "capacity_blocked", str(action_type))
+                    elif display_task.id is not None and _watch_action_attempted_direct_work(
+                        str(action_type), exec_result
+                    ):
+                        _observe_dispatch(display_task.id, "direct_blocked", str(action_type), exec_result.message)
+                    elif display_task.id is not None and _watch_action_attempted_worker_launch(
+                        str(action_type), exec_result
+                    ):
+                        _observe_dispatch(display_task.id, "launch_blocked", str(action_type), exec_result.message)
+                    if guarded_pending_task_id is not None:
+                        step1_handled_child_task_ids.add(str(guarded_pending_task_id))
+                    message = exec_result.message
+                    if action_type == "improve" and display_task.id is not None:
+                        message = f"{display_task.id}: {message}"
+                    _maybe_emit_recurring_guarded_pending_skip_attention(
+                        store=store,
+                        log=log,
+                        guarded_pending_task_id=guarded_pending_task_id,
+                        guard_message=exec_result.message,
+                    )
+                    attention = resolve_execution_needs_attention(task, exec_result)
+                    if attention is not None and display_task.id is not None:
+                        attention_task = getattr(attention, "task", display_task)
+                        attention_fallback = (
+                            _resolve_incomplete_owner_task(store, cast(Any, row))
+                            if "subject_task_id" not in attention.action
+                            else attention_task
+                        )
+                        display_task = resolve_subject_task(
+                            store,
+                            attention.action,
+                            row,
+                            fallback_task=attention_fallback,
+                        )
+                        # Orthogonal to advance-plan classification: the action tried to run
+                        # and the execution layer reported a worker/startup attention state.
+                        log.emit_attention(
+                            attention_key=f"advance-attention:{display_task.id}:{attention.action['type']}",
+                            message=_watch_needs_attention_message(display_task, attention.action),
+                        )
+                        continue
+                    no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
                         store=store,
                         subject_task=display_task,
                         action=action,
@@ -13613,356 +13857,266 @@ def _run_cycle(
                         failed_task=None,
                         no_progress_cycles=config.watch.no_progress_cycles,
                     )
-                if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
-                    _maybe_emit_active_watch_recovery_backoff(
-                        store=store,
-                        log=log,
-                        subject_task=display_task,
-                        action=action,
-                    )
-                    continue
-                if no_progress_attention is not None:
-                    log.emit_attention(
-                        attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
-                        message=_watch_needs_attention_message(display_task, no_progress_attention),
-                    )
-                    continue
-
-            exec_result = execute_advance_action(task=task, action=action, context=executor_context)
-            child_id = exec_result.handled_task_id
-            guarded_pending_task_id = exec_result.guarded_pending_task_id
-
-            if exec_result.status == "skip":
-                if display_task.id is not None and _watch_worker_capacity_skip(
-                    str(action_type),
-                    exec_result.message,
-                    exec_result,
-                ):
-                    _observe_dispatch(display_task.id, "capacity_blocked", str(action_type))
-                elif display_task.id is not None and _watch_action_attempted_direct_work(str(action_type), exec_result):
-                    _observe_dispatch(display_task.id, "direct_blocked", str(action_type), exec_result.message)
-                elif display_task.id is not None and _watch_action_attempted_worker_launch(
-                    str(action_type), exec_result
-                ):
-                    _observe_dispatch(display_task.id, "launch_blocked", str(action_type), exec_result.message)
-                if guarded_pending_task_id is not None:
-                    step1_handled_child_task_ids.add(str(guarded_pending_task_id))
-                message = exec_result.message
-                if action_type == "improve" and display_task.id is not None:
-                    message = f"{display_task.id}: {message}"
-                _maybe_emit_recurring_guarded_pending_skip_attention(
-                    store=store,
-                    log=log,
-                    guarded_pending_task_id=guarded_pending_task_id,
-                    guard_message=exec_result.message,
-                )
-                attention = resolve_execution_needs_attention(task, exec_result)
-                if attention is not None and display_task.id is not None:
-                    attention_task = getattr(attention, "task", display_task)
-                    attention_fallback = (
-                        _resolve_incomplete_owner_task(store, cast(Any, row))
-                        if "subject_task_id" not in attention.action
-                        else attention_task
-                    )
-                    display_task = resolve_subject_task(
-                        store,
-                        attention.action,
-                        row,
-                        fallback_task=attention_fallback,
-                    )
-                    # Orthogonal to advance-plan classification: the action tried to run
-                    # and the execution layer reported a worker/startup attention state.
-                    log.emit_attention(
-                        attention_key=f"advance-attention:{display_task.id}:{attention.action['type']}",
-                        message=_watch_needs_attention_message(display_task, attention.action),
-                    )
-                    continue
-                no_progress_attention = _observe_selected_watch_no_progress_without_dispatch(
-                    store=store,
-                    subject_task=display_task,
-                    action=action,
-                    action_task=task,
-                    failed_task=None,
-                    no_progress_cycles=config.watch.no_progress_cycles,
-                )
-                if no_progress_attention is not None and display_task.id is not None:
-                    log.emit_attention(
-                        attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
-                        message=_watch_needs_attention_message(display_task, no_progress_attention),
-                    )
-                    continue
-                log.emit(
-                    "SKIP",
-                    message,
-                    dedupe_key=f"advance-worker-skip:{action_type}:{display_task.id}:{message}",
-                )
-                continue
-
-            if exec_result.status == "error":
-                if guarded_pending_task_id is not None:
-                    step1_handled_child_task_ids.add(str(guarded_pending_task_id))
-                if display_task.id is not None and _watch_action_attempted_direct_work(str(action_type), exec_result):
-                    _observe_dispatch(display_task.id, "direct_error", str(action_type), exec_result.message)
-                elif display_task.id is not None and _watch_action_attempted_worker_launch(
-                    str(action_type), exec_result
-                ):
-                    _observe_dispatch(display_task.id, "launch_blocked", str(action_type), exec_result.message)
-                if not exec_result.attempted_spawn and display_task.id is not None:
-                    event = "REPAIR" if action_type == "reconcile_branch_divergence" else "ERROR"
-                    log.emit(
-                        event,
-                        f"{display_task.id}: {exec_result.message}",
-                        dedupe_key=f"advance-worker-error:{action_type}:{display_task.id}:{exec_result.message}",
-                    )
-                if child_id is not None and action_type in {
-                    "create_review",
-                    "improve",
-                    "create_implement",
-                    "needs_rebase",
-                    "run_review",
-                    "run_improve",
-                }:
-                    step1_handled_child_task_ids.add(str(child_id))
-                continue
-
-            if exec_result.status == "dry_run":
-                if guarded_pending_task_id is not None:
-                    step1_handled_child_task_ids.add(str(guarded_pending_task_id))
-                if exec_result.worker_label == "iterate" and child_id is not None:
-                    log.emit("START", f"{child_id} iterate [dry-run]")
-                    started_task_ids.add(str(child_id))
-                elif action_type == "create_review" and display_task.id is not None:
-                    log.emit("START", f"(new) review for {display_task.id} [dry-run]")
-                elif action_type == "run_review" and child_id is not None:
-                    log.emit("START", f"{child_id} review [dry-run]")
-                    started_task_ids.add(str(child_id))
-                elif action_type == "improve":
-                    failed_id = exec_result.failed_improve.id if exec_result.failed_improve is not None else None
-                    if exec_result.improve_mode == "resume" and failed_id is not None:
-                        log.emit("START", f"(resume) improve for {failed_id} [dry-run]")
-                    elif exec_result.improve_mode == "retry" and failed_id is not None:
-                        log.emit("START", f"(retry) improve for {failed_id} [dry-run]")
-                    elif display_task.id is not None:
-                        log.emit("START", f"(new) improve for {display_task.id} [dry-run]")
-                elif action_type == "run_improve" and child_id is not None:
-                    log.emit("START", f"{child_id} improve [dry-run]")
-                    started_task_ids.add(str(child_id))
-                elif action_type == "create_implement" and display_task.id is not None:
-                    log.emit("START", f"(new) implement for {display_task.id} [dry-run]")
-                elif action_type == "needs_rebase" and display_task.id is not None:
-                    log.emit("START", f"(new) rebase for {display_task.id} [dry-run]")
-                elif action_type == "reconcile_branch_divergence" and display_task.id is not None:
-                    if exec_result.worker_label == "rebase" and child_id is not None:
-                        log.emit("START", f"{child_id} rebase [dry-run]")
-                        started_task_ids.add(str(child_id))
-                    else:
-                        log.emit("START", f"{display_task.id} reconcile divergence [dry-run]")
-                _consume_worker_slot_if_needed(exec_result)
-                work_done = True
-                continue
-
-            if (
-                child_id is not None
-                and exec_result.worker_label != "iterate"
-                and action_type in {"create_review", "improve", "create_implement", "needs_rebase"}
-            ):
-                step1_handled_child_task_ids.add(str(child_id))
-            if guarded_pending_task_id is not None:
-                step1_handled_child_task_ids.add(str(guarded_pending_task_id))
-
-            if exec_result.status == "success" and action_type == "clear_off_topic_verify_blocker":
-                refreshed_display_task = store.get(str(display_task.id)) if display_task.id is not None else None
-                no_progress_attention = _finalize_watch_no_progress_after_execution(
-                    config=config,
-                    store=store,
-                    subject_task=display_task,
-                    action=action,
-                    action_task_before=task,
-                    action_task_after=refreshed_display_task,
-                    failed_task=None,
-                    no_progress_cycles=config.watch.no_progress_cycles,
-                )
-                if display_task.id is not None:
-                    log.emit(
-                        "REPAIR",
-                        f"{display_task.id}: {exec_result.success_message or exec_result.message}",
-                        dedupe_key=f"advance-clear-off-topic:{display_task.id}",
-                    )
-                    if no_progress_attention is not None:
+                    if no_progress_attention is not None and display_task.id is not None:
                         log.emit_attention(
                             attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
                             message=_watch_needs_attention_message(display_task, no_progress_attention),
                         )
-                work_done = True
-            elif exec_result.status == "success" and _watch_execution_requires_dispatch_confirmation(exec_result):
-                assert child_id is not None
-                step1_handled_child_task_ids.add(str(child_id))
-                work_done = True
-                if exec_result.worker_label == "iterate":
-                    start_message = f"{child_id} iterate"
-                elif action_type in {"create_review", "run_review"}:
-                    start_message = f"{child_id} review"
-                elif action_type in {"improve", "run_improve"}:
-                    start_message = f"{child_id} improve"
-                elif action_type == "create_implement":
-                    start_message = f"{child_id} implement"
-                elif action_type == "needs_rebase" or exec_result.worker_label == "rebase":
-                    start_message = f"{child_id} rebase"
-                else:
-                    start_message = f"{child_id} {exec_result.worker_label or 'worker'}"
-                deferred_lifecycle_starts.append(
-                    _DeferredWatchDispatchStart(
-                        settle=_PendingWatchDispatchSettle(
-                            task_id=str(child_id),
-                            task_before=_snapshot_watch_dispatch_task(exec_result.created_task),
-                            start_label=f"{display_task.id} {action_type}",
-                            dedupe_key=f"advance-undispatched:{action_type}:{display_task.id}:{child_id}",
-                        ),
+                        continue
+                    log.emit(
+                        "SKIP",
+                        message,
+                        dedupe_key=f"advance-worker-skip:{action_type}:{display_task.id}:{message}",
+                    )
+                    continue
+
+                if exec_result.status == "error":
+                    if guarded_pending_task_id is not None:
+                        step1_handled_child_task_ids.add(str(guarded_pending_task_id))
+                    if display_task.id is not None and _watch_action_attempted_direct_work(
+                        str(action_type), exec_result
+                    ):
+                        _observe_dispatch(display_task.id, "direct_error", str(action_type), exec_result.message)
+                    elif display_task.id is not None and _watch_action_attempted_worker_launch(
+                        str(action_type), exec_result
+                    ):
+                        _observe_dispatch(display_task.id, "launch_blocked", str(action_type), exec_result.message)
+                    if not exec_result.attempted_spawn and display_task.id is not None:
+                        event = "REPAIR" if action_type == "reconcile_branch_divergence" else "ERROR"
+                        log.emit(
+                            event,
+                            f"{display_task.id}: {exec_result.message}",
+                            dedupe_key=f"advance-worker-error:{action_type}:{display_task.id}:{exec_result.message}",
+                        )
+                    if child_id is not None and action_type in {
+                        "create_review",
+                        "improve",
+                        "create_implement",
+                        "needs_rebase",
+                        "run_review",
+                        "run_improve",
+                    }:
+                        step1_handled_child_task_ids.add(str(child_id))
+                    continue
+
+                if exec_result.status == "dry_run":
+                    if guarded_pending_task_id is not None:
+                        step1_handled_child_task_ids.add(str(guarded_pending_task_id))
+                    if exec_result.worker_label == "iterate" and child_id is not None:
+                        log.emit("START", f"{child_id} iterate [dry-run]")
+                        started_task_ids.add(str(child_id))
+                    elif action_type == "create_review" and display_task.id is not None:
+                        log.emit("START", f"(new) review for {display_task.id} [dry-run]")
+                    elif action_type == "run_review" and child_id is not None:
+                        log.emit("START", f"{child_id} review [dry-run]")
+                        started_task_ids.add(str(child_id))
+                    elif action_type == "improve":
+                        failed_id = exec_result.failed_improve.id if exec_result.failed_improve is not None else None
+                        if exec_result.improve_mode == "resume" and failed_id is not None:
+                            log.emit("START", f"(resume) improve for {failed_id} [dry-run]")
+                        elif exec_result.improve_mode == "retry" and failed_id is not None:
+                            log.emit("START", f"(retry) improve for {failed_id} [dry-run]")
+                        elif display_task.id is not None:
+                            log.emit("START", f"(new) improve for {display_task.id} [dry-run]")
+                    elif action_type == "run_improve" and child_id is not None:
+                        log.emit("START", f"{child_id} improve [dry-run]")
+                        started_task_ids.add(str(child_id))
+                    elif action_type == "create_implement" and display_task.id is not None:
+                        log.emit("START", f"(new) implement for {display_task.id} [dry-run]")
+                    elif action_type == "needs_rebase" and display_task.id is not None:
+                        log.emit("START", f"(new) rebase for {display_task.id} [dry-run]")
+                    elif action_type == "reconcile_branch_divergence" and display_task.id is not None:
+                        if exec_result.worker_label == "rebase" and child_id is not None:
+                            log.emit("START", f"{child_id} rebase [dry-run]")
+                            started_task_ids.add(str(child_id))
+                        else:
+                            log.emit("START", f"{display_task.id} reconcile divergence [dry-run]")
+                    _consume_worker_slot_if_needed(exec_result)
+                    work_done = True
+                    continue
+
+                if (
+                    child_id is not None
+                    and exec_result.worker_label != "iterate"
+                    and action_type in {"create_review", "improve", "create_implement", "needs_rebase"}
+                ):
+                    step1_handled_child_task_ids.add(str(child_id))
+                if guarded_pending_task_id is not None:
+                    step1_handled_child_task_ids.add(str(guarded_pending_task_id))
+
+                if exec_result.status == "success" and action_type == "clear_off_topic_verify_blocker":
+                    refreshed_display_task = store.get(str(display_task.id)) if display_task.id is not None else None
+                    no_progress_attention = _finalize_watch_no_progress_after_execution(
+                        config=config,
+                        store=store,
                         subject_task=display_task,
                         action=action,
                         action_task_before=task,
+                        action_task_after=refreshed_display_task,
                         failed_task=None,
-                        owner_task_id=display_task.id,
-                        action_type=str(action_type),
-                        start_message=start_message,
-                        worker_consuming=exec_result.worker_consuming,
+                        no_progress_cycles=config.watch.no_progress_cycles,
                     )
-                )
-            elif exec_result.status == "success" and action_type == "reconcile_branch_divergence":
-                refreshed_display_task = store.get(str(display_task.id)) if display_task.id is not None else None
-                no_progress_attention = _finalize_watch_no_progress_after_execution(
-                    config=config,
-                    store=store,
-                    subject_task=display_task,
-                    action=action,
-                    action_task_before=task,
-                    action_task_after=refreshed_display_task,
-                    failed_task=None,
-                    no_progress_cycles=config.watch.no_progress_cycles,
-                )
-                if display_task.id is not None:
-                    _observe_dispatch(display_task.id, "direct", str(action_type))
-                    log.emit(
-                        "REPAIR",
-                        f"{display_task.id}: {exec_result.success_message or exec_result.message}",
-                        dedupe_key=f"advance-reconcile:{display_task.id}",
+                    if display_task.id is not None:
+                        log.emit(
+                            "REPAIR",
+                            f"{display_task.id}: {exec_result.success_message or exec_result.message}",
+                            dedupe_key=f"advance-clear-off-topic:{display_task.id}",
+                        )
+                        if no_progress_attention is not None:
+                            log.emit_attention(
+                                attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
+                                message=_watch_needs_attention_message(display_task, no_progress_attention),
+                            )
+                    work_done = True
+                elif exec_result.status == "success" and _watch_execution_requires_dispatch_confirmation(exec_result):
+                    assert child_id is not None
+                    step1_handled_child_task_ids.add(str(child_id))
+                    work_done = True
+                    if exec_result.worker_label == "iterate":
+                        start_message = f"{child_id} iterate"
+                    elif action_type in {"create_review", "run_review"}:
+                        start_message = f"{child_id} review"
+                    elif action_type in {"improve", "run_improve"}:
+                        start_message = f"{child_id} improve"
+                    elif action_type == "create_implement":
+                        start_message = f"{child_id} implement"
+                    elif action_type == "needs_rebase" or exec_result.worker_label == "rebase":
+                        start_message = f"{child_id} rebase"
+                    else:
+                        start_message = f"{child_id} {exec_result.worker_label or 'worker'}"
+                    deferred_lifecycle_starts.append(
+                        _DeferredWatchDispatchStart(
+                            settle=_PendingWatchDispatchSettle(
+                                task_id=str(child_id),
+                                task_before=_snapshot_watch_dispatch_task(exec_result.created_task),
+                                start_label=f"{display_task.id} {action_type}",
+                                dedupe_key=f"advance-undispatched:{action_type}:{display_task.id}:{child_id}",
+                            ),
+                            subject_task=display_task,
+                            action=action,
+                            action_task_before=task,
+                            failed_task=None,
+                            owner_task_id=display_task.id,
+                            action_type=str(action_type),
+                            start_message=start_message,
+                            worker_consuming=exec_result.worker_consuming,
+                        )
                     )
-                    if no_progress_attention is not None:
+                elif exec_result.status == "success" and action_type == "reconcile_branch_divergence":
+                    refreshed_display_task = store.get(str(display_task.id)) if display_task.id is not None else None
+                    no_progress_attention = _finalize_watch_no_progress_after_execution(
+                        config=config,
+                        store=store,
+                        subject_task=display_task,
+                        action=action,
+                        action_task_before=task,
+                        action_task_after=refreshed_display_task,
+                        failed_task=None,
+                        no_progress_cycles=config.watch.no_progress_cycles,
+                    )
+                    if display_task.id is not None:
+                        _observe_dispatch(display_task.id, "direct", str(action_type))
+                        log.emit(
+                            "REPAIR",
+                            f"{display_task.id}: {exec_result.success_message or exec_result.message}",
+                            dedupe_key=f"advance-reconcile:{display_task.id}",
+                        )
+                        if no_progress_attention is not None:
+                            log.emit_attention(
+                                attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
+                                message=_watch_needs_attention_message(display_task, no_progress_attention),
+                            )
+                    work_done = True
+                elif exec_result.status == "success":
+                    if display_task.id is not None and _watch_action_attempted_direct_work(str(action_type)):
+                        _observe_dispatch(display_task.id, "direct", str(action_type))
+                    refreshed_display_task = store.get(str(display_task.id)) if display_task.id is not None else None
+                    no_progress_attention = _finalize_watch_no_progress_after_execution(
+                        config=config,
+                        store=store,
+                        subject_task=display_task,
+                        action=action,
+                        action_task_before=task,
+                        action_task_after=refreshed_display_task,
+                        failed_task=None,
+                        no_progress_cycles=config.watch.no_progress_cycles,
+                    )
+                    if exec_result.work_done:
+                        work_done = True
+                    if no_progress_attention is not None and display_task.id is not None:
                         log.emit_attention(
                             attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
                             message=_watch_needs_attention_message(display_task, no_progress_attention),
                         )
-                work_done = True
-            elif exec_result.status == "success":
-                if display_task.id is not None and _watch_action_attempted_direct_work(str(action_type)):
-                    _observe_dispatch(display_task.id, "direct", str(action_type))
-                refreshed_display_task = store.get(str(display_task.id)) if display_task.id is not None else None
-                no_progress_attention = _finalize_watch_no_progress_after_execution(
-                    config=config,
-                    store=store,
-                    subject_task=display_task,
-                    action=action,
-                    action_task_before=task,
-                    action_task_after=refreshed_display_task,
-                    failed_task=None,
-                    no_progress_cycles=config.watch.no_progress_cycles,
-                )
-                if exec_result.work_done:
-                    work_done = True
-                if no_progress_attention is not None and display_task.id is not None:
-                    log.emit_attention(
-                        attention_key=f"advance-attention:{display_task.id}:{action_type}:watch-no-progress",
-                        message=_watch_needs_attention_message(display_task, no_progress_attention),
-                    )
 
-    _consume_active_main_verify_remediation_terminal_attempt(
-        None,
-        reason="no lifecycle merge opportunity",
-        require_candidate_lineage=False,
-    )
+        _consume_active_main_verify_remediation_terminal_attempt(
+            None,
+            reason="no lifecycle merge opportunity",
+            require_candidate_lineage=False,
+        )
 
-    _settle_deferred_dispatch_starts(
-        deferred_lifecycle_starts,
-        count_confirmed_start=False,
-        count_recovery_start=False,
-    )
+        _settle_deferred_dispatch_starts(
+            deferred_lifecycle_starts,
+            count_confirmed_start=False,
+            count_recovery_start=False,
+        )
 
     if not dry_run:
-        target_sha = resolve_ref_if_possible(git, target_branch).sha
-        auto_rearm_result = _evaluate_blind_parked_auto_rearm(
-            config=config,
-            store=store,
-            git=git,
-            target_branch=target_branch,
-            target_sha=target_sha,
-            tags=tags,
-            any_tag=any_tag,
-            scoped_owner_ids=effective_scoped_owner_ids,
-            scoped_task_ids=scoped_task_ids,
-            startup_scoped_owner_ids=scoped_owner_ids,
-        )
-        for auto_rearm_decision in auto_rearm_result.decisions:
-            render_task_id = auto_rearm_decision.render_task_id
-            if auto_rearm_decision.status == "rearmed" and render_task_id is not None:
-                log.emit(
-                    "REARM",
-                    (f"{render_task_id}: blind auto-rearm cleared {auto_rearm_decision.candidate.attention_reason}"),
-                    dedupe_key=(
-                        f"blind-auto-rearm:{auto_rearm_decision.render_scope_kind or 'canonical_owner'}:"
-                        f"{render_task_id}:{auto_rearm_decision.candidate.attention_reason}"
-                    ),
-                )
-                work_done = True
-        if auto_rearm_result.rearmed_owner_ids:
-            project_analysis_invalidated = True
-            analysis = _analyze_watch_cycle(
+        cycle_phase = _start_watch_cycle_phase(long_phase_reporter, "blind-parked-auto-rearm")
+        try:
+            target_sha = resolve_ref_if_possible(git, target_branch).sha
+            auto_rearm_result = _evaluate_blind_parked_auto_rearm(
                 config=config,
                 store=store,
                 git=git,
-                slots=slots,
+                target_branch=target_branch,
+                target_sha=target_sha,
                 tags=tags,
                 any_tag=any_tag,
-                recovery_slots=recovery_slots,
-                recovery_mode=recovery_mode,
-                max_recovery_attempts=max_recovery_attempts,
-                scoped_owner_ids=scoped_owner_ids,
+                scoped_owner_ids=effective_scoped_owner_ids,
                 scoped_task_ids=scoped_task_ids,
-                known_effective_scoped_owner_ids=effective_scoped_owner_ids,
-                excluded_owner_ids=excluded_owner_ids,
+                startup_scoped_owner_ids=scoped_owner_ids,
             )
-
-    def _finish_direct_phase_result() -> _CycleResult:
-        nonlocal project_analysis_invalidated
-        project_analysis_invalidated = project_analysis_invalidated or (work_done and not dry_run)
-        _check_canonical_checkout_boundary("watch-pass-end")
-        _finalize_main_verify_attention(
-            log=log,
-            state=latest_main_verify_state,
-            now=datetime.now(UTC),
-            git=latest_main_verify_git,
-            target_branch=target_branch,
-        )
-        _emit_cycle_attention_summary(log)
-        if end_cycle:
-            log.end_cycle()
-        _live_pids, end_running_task_ids, end_anonymous_worker_count, end_starting_worker_count = (
-            _collect_live_running_state(config, store)
-        )
-        direct_pending_count = (
-            0
-            if scoped_mode
-            else len(
-                _pending_runnable_tasks(
-                    store,
+            for auto_rearm_decision in auto_rearm_result.decisions:
+                render_task_id = auto_rearm_decision.render_task_id
+                if auto_rearm_decision.status == "rearmed" and render_task_id is not None:
+                    log.emit(
+                        "REARM",
+                        (
+                            f"{render_task_id}: blind auto-rearm cleared "
+                            f"{auto_rearm_decision.candidate.attention_reason}"
+                        ),
+                        dedupe_key=(
+                            f"blind-auto-rearm:{auto_rearm_decision.render_scope_kind or 'canonical_owner'}:"
+                            f"{render_task_id}:{auto_rearm_decision.candidate.attention_reason}"
+                        ),
+                    )
+                    work_done = True
+            if auto_rearm_result.rearmed_owner_ids:
+                project_analysis_invalidated = True
+                analysis = _analyze_watch_cycle(
                     config=config,
+                    store=store,
+                    git=git,
+                    slots=slots,
                     tags=tags,
                     any_tag=any_tag,
+                    recovery_slots=recovery_slots,
+                    recovery_mode=recovery_mode,
+                    max_recovery_attempts=max_recovery_attempts,
+                    scoped_owner_ids=scoped_owner_ids,
+                    scoped_task_ids=scoped_task_ids,
+                    known_effective_scoped_owner_ids=effective_scoped_owner_ids,
                     excluded_owner_ids=excluded_owner_ids,
                 )
-            )
-        )
-        scoped_active = (
-            _scoped_watch_active_count(
+        finally:
+            cycle_phase.finish()
+
+    def _finish_direct_phase_result() -> _CycleResult:
+        nonlocal effective_scoped_owner_ids, project_analysis_invalidated
+        scoped_activity = (
+            _reported_scoped_watch_activity(
+                log=log,
                 config=config,
                 store=store,
                 batch=batch,
@@ -13978,214 +14132,254 @@ def _run_cycle(
                 runtime_context=runtime_context,
             )
             if scoped_mode and scoped_owner_ids is not None
-            else 0
+            else None
         )
-        return _CycleResult(
-            work_done=work_done,
-            running=len(end_running_task_ids),
-            pending=direct_pending_count,
-            scoped_done=(scoped_active == 0) if scoped_mode else None,
-            scoped_active=scoped_active,
-            effective_scoped_owner_ids=effective_scoped_owner_ids,
-            anonymous_worker_count=end_anonymous_worker_count,
-            starting_worker_count=end_starting_worker_count,
-            expected_starts=expected_starts,
-            confirmed_start_count=confirmed_start_count,
-            active_recovery_subject_ids=analysis.active_recovery_subject_ids,
-            project_analysis_invalidated=project_analysis_invalidated,
-            needs_replan=project_analysis_invalidated,
-        )
+        if scoped_activity is not None:
+            effective_scoped_owner_ids = scoped_activity.effective_scoped_owner_ids
+        cycle_phase = _start_watch_cycle_phase(long_phase_reporter, "cycle-finalize")
+        try:
+            project_analysis_invalidated = project_analysis_invalidated or (work_done and not dry_run)
+            _check_canonical_checkout_boundary("watch-pass-end")
+            _finalize_main_verify_attention(
+                log=log,
+                state=latest_main_verify_state,
+                now=datetime.now(UTC),
+                git=latest_main_verify_git,
+                target_branch=target_branch,
+            )
+            _emit_cycle_attention_summary(log)
+            if end_cycle:
+                log.end_cycle()
+            _live_pids, end_running_task_ids, end_anonymous_worker_count, end_starting_worker_count = (
+                _collect_live_running_state(config, store)
+            )
+            direct_pending_count = (
+                0
+                if scoped_mode
+                else len(
+                    _pending_runnable_tasks(
+                        store,
+                        config=config,
+                        tags=tags,
+                        any_tag=any_tag,
+                        excluded_owner_ids=excluded_owner_ids,
+                    )
+                )
+            )
+            scoped_active = scoped_activity.active_count if scoped_activity is not None else 0
+            return _CycleResult(
+                work_done=work_done,
+                running=len(end_running_task_ids),
+                pending=direct_pending_count,
+                scoped_done=(scoped_active == 0) if scoped_mode else None,
+                scoped_active=scoped_active,
+                effective_scoped_owner_ids=effective_scoped_owner_ids,
+                anonymous_worker_count=end_anonymous_worker_count,
+                starting_worker_count=end_starting_worker_count,
+                expected_starts=expected_starts,
+                confirmed_start_count=confirmed_start_count,
+                active_recovery_subject_ids=analysis.active_recovery_subject_ids,
+                project_analysis_invalidated=project_analysis_invalidated,
+                needs_replan=project_analysis_invalidated,
+            )
+        finally:
+            cycle_phase.finish()
 
     # 2) Recovery queue for failed tasks.
-    pending_recovery_task_ids = set(analysis.pending_recovery_task_ids)
-    actionable_failed = list(analysis.actionable_failed)
-    parked_recovery_subject_ids: set[str] = set()
-    for owner_task, decision, attention_action in analysis.recovery_attention_rows:
-        owner_id = owner_task.id or "unknown"
-        log.emit_attention(
-            attention_key=f"failed-recovery-attention:{owner_id}:{decision.reason_code}",
-            message=_watch_needs_attention_message(owner_task, attention_action),
-        )
-        if decision.reason_code == "rebase-failed-needs-manual-resolution" or (
-            decision.reason_code == "manual_failure_reason"
-            and owner_task.id is not None
-            and owner_task.id != decision.task_id
-        ):
-            work_done = True
-    for owner_task, failed, decision, recovery_action in getattr(analysis, "recovery_undispatched_rows", ()):
-        owner_id = owner_task.id or "unknown"
-        action_type = str(recovery_action.get("type", "needs_attention"))
-        reason = str(recovery_action.get("reason", decision.reason_code or "undispatched"))
-        log.emit(
-            "START_UNDISPATCHED",
-            (
-                f"{failed.id}: recovery {decision.action} via {decision.launch_mode} was not dispatchable "
-                f"(owner={owner_id}, action={action_type}, reason={reason})"
-            ),
-            dedupe_key=f"recovery-undispatched:{failed.id}:{decision.action}:{reason}",
-        )
-        _observe_dispatch(
-            owner_task.id,
-            "launch_blocked",
-            action_type,
-            (
-                f"recovery {decision.action} via {decision.launch_mode} was not dispatchable "
-                f"(action={action_type}, reason={reason})"
-            ),
-        )
-        if failed.id is not None and str(failed.id) not in seen_active_recovery_subject_ids:
-            work_done = True
-    explicitly_undispatched_recovery_subject_ids = {
-        str(failed.id)
-        for _owner_task, failed, _decision, _recovery_action in getattr(analysis, "recovery_undispatched_rows", ())
-        if failed.id is not None
-    }
-    for owner_task, failed, decision, recovery_action in analysis.recovery_visible_skips:
-        if (
-            not restart_failed
-            and not show_skipped
-            and decision.reason_code in {"recovery_already_running", "recovery_already_pending"}
-        ):
-            if failed.id is not None and str(failed.id) not in seen_active_recovery_subject_ids:
+    with _watch_cycle_phase(long_phase_reporter, "recovery-plan"):
+        pending_recovery_task_ids = set(analysis.pending_recovery_task_ids)
+        actionable_failed = list(analysis.actionable_failed)
+        parked_recovery_subject_ids: set[str] = set()
+        for owner_task, decision, attention_action in analysis.recovery_attention_rows:
+            owner_id = owner_task.id or "unknown"
+            log.emit_attention(
+                attention_key=f"failed-recovery-attention:{owner_id}:{decision.reason_code}",
+                message=_watch_needs_attention_message(owner_task, attention_action),
+            )
+            if decision.reason_code == "rebase-failed-needs-manual-resolution" or (
+                decision.reason_code == "manual_failure_reason"
+                and owner_task.id is not None
+                and owner_task.id != decision.task_id
+            ):
                 work_done = True
-        if recovery_slots > 0 and show_skipped:
-            description = str(recovery_action.get("description", "")).strip()
+        for owner_task, failed, decision, recovery_action in getattr(analysis, "recovery_undispatched_rows", ()):
+            owner_id = owner_task.id or "unknown"
+            action_type = str(recovery_action.get("type", "needs_attention"))
+            reason = str(recovery_action.get("reason", decision.reason_code or "undispatched"))
             log.emit(
-                "SKIP",
-                description or f"{owner_task.id} failed {failed.task_type}: {decision.reason_code}",
-                dedupe_key=(
-                    f"recovery-skip:{owner_task.id}:"
-                    f"{str(recovery_action.get('reason', decision.reason_code or 'skip'))}"
+                "START_UNDISPATCHED",
+                (
+                    f"{failed.id}: recovery {decision.action} via {decision.launch_mode} was not dispatchable "
+                    f"(owner={owner_id}, action={action_type}, reason={reason})"
+                ),
+                dedupe_key=f"recovery-undispatched:{failed.id}:{decision.action}:{reason}",
+            )
+            _observe_dispatch(
+                owner_task.id,
+                "launch_blocked",
+                action_type,
+                (
+                    f"recovery {decision.action} via {decision.launch_mode} was not dispatchable "
+                    f"(action={action_type}, reason={reason})"
                 ),
             )
-    if not dry_run:
-        for _row, failed, decision, recovery_action, _worker_consuming, action_task in actionable_failed:
-            if failed.id is None:
-                continue
-            candidate = build_watch_progress_candidate(
-                store,
-                subject_task=failed,
-                action=recovery_action,
-                action_task=action_task,
-                failed_task=failed,
-            )
-            if get_active_watch_no_progress_attention(store, candidate=candidate) is not None:
-                parked_recovery_subject_ids.add(str(failed.id))
-                if decision.recovery_task_id is not None:
-                    pending_recovery_task_ids.add(decision.recovery_task_id)
-    dispatch_selection_mode = recovery_mode
-    dispatch_preview = build_dispatch_preview(
-        store,
-        config=config,
-        git=git,
-        target_branch=target_branch,
-        owner_rows=analysis.owner_rows,
-        read_context=analysis.watch_read_context,
-        tags=tags,
-        any_tag=any_tag,
-        max_recovery_attempts=max_recovery_attempts,
-        selection_mode=dispatch_selection_mode,
-        include_pending=scoped_owner_ids is None,
-    )
-    dispatch_candidate_entries = _filter_watch_dispatch_preview_entries(
-        dispatch_preview.runnable_entries,
-        store=store,
-        started_task_ids=started_task_ids,
-        pending_recovery_task_ids=pending_recovery_task_ids,
-        step1_handled_child_task_ids=step1_handled_child_task_ids,
-        excluded_owner_ids=excluded_owner_ids,
-    )
-    dispatch_recovery_preview_entries = _filter_watch_dispatch_preview_entries(
-        dispatch_preview.recovery_entries,
-        store=store,
-        started_task_ids=started_task_ids,
-        pending_recovery_task_ids=pending_recovery_task_ids,
-        step1_handled_child_task_ids=step1_handled_child_task_ids,
-        excluded_owner_ids=excluded_owner_ids,
-    )
-    dispatch_recovery_task_ids = {
-        str(entry.task.id) for entry in dispatch_recovery_preview_entries if entry.task.id is not None
-    }
-    active_backoff_recovery_subject_ids: set[str] = set()
-    if not dry_run:
-        for _row, failed, _decision, recovery_action, _worker_consuming, _action_task in actionable_failed:
-            if failed.id is None:
-                continue
-            if str(failed.id) not in dispatch_recovery_task_ids:
-                continue
-            if str(failed.id) in parked_recovery_subject_ids:
-                continue
+            if failed.id is not None and str(failed.id) not in seen_active_recovery_subject_ids:
+                work_done = True
+        explicitly_undispatched_recovery_subject_ids = {
+            str(failed.id)
+            for _owner_task, failed, _decision, _recovery_action in getattr(analysis, "recovery_undispatched_rows", ())
+            if failed.id is not None
+        }
+        for owner_task, failed, decision, recovery_action in analysis.recovery_visible_skips:
             if (
-                _resolve_active_watch_recovery_backoff(
+                not restart_failed
+                and not show_skipped
+                and decision.reason_code in {"recovery_already_running", "recovery_already_pending"}
+            ):
+                if failed.id is not None and str(failed.id) not in seen_active_recovery_subject_ids:
+                    work_done = True
+            if recovery_slots > 0 and show_skipped:
+                description = str(recovery_action.get("description", "")).strip()
+                log.emit(
+                    "SKIP",
+                    description or f"{owner_task.id} failed {failed.task_type}: {decision.reason_code}",
+                    dedupe_key=(
+                        f"recovery-skip:{owner_task.id}:"
+                        f"{str(recovery_action.get('reason', decision.reason_code or 'skip'))}"
+                    ),
+                )
+        if not dry_run:
+            for _row, failed, decision, recovery_action, _worker_consuming, action_task in actionable_failed:
+                if failed.id is None:
+                    continue
+                candidate = build_watch_progress_candidate(
+                    store,
+                    subject_task=failed,
+                    action=recovery_action,
+                    action_task=action_task,
+                    failed_task=failed,
+                )
+                if get_active_watch_no_progress_attention(store, candidate=candidate) is not None:
+                    parked_recovery_subject_ids.add(str(failed.id))
+                    if decision.recovery_task_id is not None:
+                        pending_recovery_task_ids.add(decision.recovery_task_id)
+        dispatch_selection_mode = recovery_mode
+        dispatch_preview = build_dispatch_preview(
+            store,
+            config=config,
+            git=git,
+            target_branch=target_branch,
+            owner_rows=analysis.owner_rows,
+            read_context=analysis.watch_read_context,
+            tags=tags,
+            any_tag=any_tag,
+            max_recovery_attempts=max_recovery_attempts,
+            selection_mode=dispatch_selection_mode,
+            include_pending=scoped_owner_ids is None,
+        )
+        dispatch_candidate_entries = _filter_watch_dispatch_preview_entries(
+            dispatch_preview.runnable_entries,
+            store=store,
+            started_task_ids=started_task_ids,
+            pending_recovery_task_ids=pending_recovery_task_ids,
+            step1_handled_child_task_ids=step1_handled_child_task_ids,
+            excluded_owner_ids=excluded_owner_ids,
+        )
+        dispatch_recovery_preview_entries = _filter_watch_dispatch_preview_entries(
+            dispatch_preview.recovery_entries,
+            store=store,
+            started_task_ids=started_task_ids,
+            pending_recovery_task_ids=pending_recovery_task_ids,
+            step1_handled_child_task_ids=step1_handled_child_task_ids,
+            excluded_owner_ids=excluded_owner_ids,
+        )
+        dispatch_recovery_task_ids = {
+            str(entry.task.id) for entry in dispatch_recovery_preview_entries if entry.task.id is not None
+        }
+        active_backoff_recovery_subject_ids: set[str] = set()
+        if not dry_run:
+            for _row, failed, _decision, recovery_action, _worker_consuming, _action_task in actionable_failed:
+                if failed.id is None:
+                    continue
+                if str(failed.id) not in dispatch_recovery_task_ids:
+                    continue
+                if str(failed.id) in parked_recovery_subject_ids:
+                    continue
+                if (
+                    _resolve_active_watch_recovery_backoff(
+                        store=store,
+                        subject_task=failed,
+                        action=recovery_action,
+                    )
+                    is not None
+                ):
+                    active_backoff_recovery_subject_ids.add(str(failed.id))
+        dispatch_launchable_entries = tuple(
+            entry
+            for entry in dispatch_candidate_entries
+            if entry.lane != "recovery"
+            or str(entry.task.id) not in parked_recovery_subject_ids
+            and str(entry.task.id) not in active_backoff_recovery_subject_ids
+        )
+        pending_tasks = (
+            []
+            if scoped_owner_ids is not None
+            else [
+                entry.task
+                for entry in dispatch_launchable_entries
+                if entry.lane == "pending" and entry.task.id is not None
+            ]
+        )
+        dispatch_plan = plan_watch_dispatch_entries(
+            dispatch_launchable_entries,
+            slots=slots,
+            recovery_slot_cap=recovery_slots,
+            selection_mode=dispatch_selection_mode,
+            include_pending=scoped_owner_ids is None,
+        )
+        planned_dispatch_entries = tuple(getattr(dispatch_plan, "entries", dispatch_launchable_entries))
+        reserved_recovery_slots = dispatch_plan.recovery_worker_slots
+        if remaining_new_worker_starts is not None:
+            reserved_recovery_slots = min(reserved_recovery_slots, remaining_new_worker_starts)
+        pending_slots = 0 if scoped_owner_ids is not None else dispatch_plan.pending_slots
+        known_non_actionable_recovery_subject_ids = frozenset(
+            str(failed.id)
+            for _owner_task, failed, _decision, _action in (
+                (*getattr(analysis, "recovery_undispatched_rows", ()), *analysis.recovery_visible_skips)
+            )
+            if failed.id is not None
+        )
+        planned_recovery_actionable_failed, unmapped_planned_recovery_entries = (
+            _map_planned_recovery_entries_to_actionable_failed(
+                planned_dispatch_entries,
+                actionable_failed=actionable_failed,
+                known_non_actionable_failed_ids=known_non_actionable_recovery_subject_ids,
+            )
+        )
+        launchable_recovery_subject_ids = {
+            str(failed.id)
+            for _row, failed, _decision, _action, _worker_consuming, _action_task in planned_recovery_actionable_failed
+            if failed.id is not None
+            and str(failed.id) not in parked_recovery_subject_ids
+            and str(failed.id) not in active_backoff_recovery_subject_ids
+        }
+        nonparked_recovery_subject_ids = set(launchable_recovery_subject_ids) | set(
+            analysis.active_recovery_subject_ids
+        )
+        if not dry_run:
+            for _row, failed, _decision, recovery_action, _worker_consuming, _action_task in actionable_failed:
+                if failed.id is None:
+                    continue
+                if str(failed.id) not in dispatch_recovery_task_ids:
+                    continue
+                if str(failed.id) not in active_backoff_recovery_subject_ids:
+                    continue
+                _maybe_emit_active_watch_recovery_backoff(
                     store=store,
+                    log=log,
                     subject_task=failed,
                     action=recovery_action,
                 )
-                is not None
-            ):
-                active_backoff_recovery_subject_ids.add(str(failed.id))
-    dispatch_launchable_entries = tuple(
-        entry
-        for entry in dispatch_candidate_entries
-        if entry.lane != "recovery"
-        or str(entry.task.id) not in parked_recovery_subject_ids
-        and str(entry.task.id) not in active_backoff_recovery_subject_ids
-    )
-    pending_tasks = (
-        []
-        if scoped_owner_ids is not None
-        else [
-            entry.task for entry in dispatch_launchable_entries if entry.lane == "pending" and entry.task.id is not None
-        ]
-    )
-    dispatch_plan = plan_watch_dispatch_entries(
-        dispatch_launchable_entries,
-        slots=slots,
-        recovery_slot_cap=recovery_slots,
-        selection_mode=dispatch_selection_mode,
-        include_pending=scoped_owner_ids is None,
-    )
-    planned_dispatch_entries = tuple(getattr(dispatch_plan, "entries", dispatch_launchable_entries))
-    reserved_recovery_slots = dispatch_plan.recovery_worker_slots
-    if remaining_new_worker_starts is not None:
-        reserved_recovery_slots = min(reserved_recovery_slots, remaining_new_worker_starts)
-    pending_slots = 0 if scoped_owner_ids is not None else dispatch_plan.pending_slots
-    known_non_actionable_recovery_subject_ids = frozenset(
-        str(failed.id)
-        for _owner_task, failed, _decision, _action in (
-            (*getattr(analysis, "recovery_undispatched_rows", ()), *analysis.recovery_visible_skips)
-        )
-        if failed.id is not None
-    )
-    planned_recovery_actionable_failed, unmapped_planned_recovery_entries = (
-        _map_planned_recovery_entries_to_actionable_failed(
-            planned_dispatch_entries,
-            actionable_failed=actionable_failed,
-            known_non_actionable_failed_ids=known_non_actionable_recovery_subject_ids,
-        )
-    )
-    launchable_recovery_subject_ids = {
-        str(failed.id)
-        for _row, failed, _decision, _action, _worker_consuming, _action_task in planned_recovery_actionable_failed
-        if failed.id is not None
-        and str(failed.id) not in parked_recovery_subject_ids
-        and str(failed.id) not in active_backoff_recovery_subject_ids
-    }
-    nonparked_recovery_subject_ids = set(launchable_recovery_subject_ids) | set(analysis.active_recovery_subject_ids)
-    if not dry_run:
-        for _row, failed, _decision, recovery_action, _worker_consuming, _action_task in actionable_failed:
-            if failed.id is None:
-                continue
-            if str(failed.id) not in dispatch_recovery_task_ids:
-                continue
-            if str(failed.id) not in active_backoff_recovery_subject_ids:
-                continue
-            _maybe_emit_active_watch_recovery_backoff(
-                store=store,
-                log=log,
-                subject_task=failed,
-                action=recovery_action,
-            )
 
     def _fail_closed_for_planned_recovery_entry(
         entry: DispatchPreviewEntry,
@@ -15057,124 +15251,128 @@ def _run_cycle(
         )
         return local_fail_closed, local_replan_requested
 
-    if direct_phase_only:
-        direct_recovery_rows = tuple(row for row in actionable_failed if not row[4])
-        direct_recovery_failed_closed = False
-        direct_recovery_replan = False
-        if direct_recovery_rows:
-            direct_recovery_failed_closed, direct_recovery_replan = _dispatch_planned_recovery_entries(
-                direct_recovery_rows,
-                pending_slots_for_replan=0,
-                allow_replan=True,
-            )
-        if direct_recovery_failed_closed or (direct_recovery_replan and not dry_run):
-            project_analysis_invalidated = True
-        return _finish_direct_phase_result()
-
-    for row, failed, decision, recovery_action, _worker_consuming_recovery, action_task in actionable_failed:
-        if failed.id is None:
-            continue
-        recovery_action_type = str(recovery_action.get("type", ""))
-        if str(failed.id) not in launchable_recovery_subject_ids:
-            continue
-        if str(failed.id) in parked_recovery_subject_ids:
-            if not dry_run:
-                candidate = build_watch_progress_candidate(
-                    store,
-                    subject_task=failed,
-                    action=recovery_action,
-                    action_task=action_task,
-                    failed_task=failed,
+    with _watch_cycle_phase(long_phase_reporter, "recovery-dispatch"):
+        if direct_phase_only:
+            direct_recovery_rows = tuple(row for row in actionable_failed if not row[4])
+            direct_recovery_failed_closed = False
+            direct_recovery_replan = False
+            if direct_recovery_rows:
+                direct_recovery_failed_closed, direct_recovery_replan = _dispatch_planned_recovery_entries(
+                    direct_recovery_rows,
+                    pending_slots_for_replan=0,
+                    allow_replan=True,
                 )
-                active_attention = get_active_watch_no_progress_attention(store, candidate=candidate)
-                if active_attention is not None:
-                    log.emit_attention(
-                        attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
-                        message=_watch_needs_attention_message(failed, active_attention),
+            if direct_recovery_failed_closed or (direct_recovery_replan and not dry_run):
+                project_analysis_invalidated = True
+
+        else:
+            for row, failed, decision, recovery_action, _worker_consuming_recovery, action_task in actionable_failed:
+                if failed.id is None:
+                    continue
+                recovery_action_type = str(recovery_action.get("type", ""))
+                if str(failed.id) not in launchable_recovery_subject_ids:
+                    continue
+                if str(failed.id) in parked_recovery_subject_ids:
+                    if not dry_run:
+                        candidate = build_watch_progress_candidate(
+                            store,
+                            subject_task=failed,
+                            action=recovery_action,
+                            action_task=action_task,
+                            failed_task=failed,
+                        )
+                        active_attention = get_active_watch_no_progress_attention(store, candidate=candidate)
+                        if active_attention is not None:
+                            log.emit_attention(
+                                attention_key=f"recovery-attention:{failed.id}:{recovery_action_type}:watch-no-progress",
+                                message=_watch_needs_attention_message(failed, active_attention),
+                            )
+                    continue
+                if not dry_run and str(failed.id) in active_backoff_recovery_subject_ids:
+                    _maybe_emit_active_watch_recovery_backoff(
+                        store=store,
+                        log=log,
+                        subject_task=failed,
+                        action=recovery_action,
                     )
-            continue
-        if not dry_run and str(failed.id) in active_backoff_recovery_subject_ids:
-            _maybe_emit_active_watch_recovery_backoff(
-                store=store,
-                log=log,
-                subject_task=failed,
-                action=recovery_action,
-            )
-    processed_planned_recovery_task_ids: set[str] = set()
-    planned_recovery_dispatch_failed_closed = False
-    if unmapped_planned_recovery_entries:
-        invariant_violating_entries = tuple(
-            entry
-            for entry in unmapped_planned_recovery_entries
-            if entry.task.id is None or str(entry.task.id) not in explicitly_undispatched_recovery_subject_ids
-        )
-        if invariant_violating_entries:
-            planned_recovery_dispatch_failed_closed = True
-        for entry in invariant_violating_entries:
-            _fail_closed_for_planned_recovery_entry(
-                entry,
-                stage="initial-plan",
-                reason="missing-actionable-failed",
-            )
-    replan_recovery_dispatch = False
-    if not planned_recovery_dispatch_failed_closed:
-        planned_recovery_dispatch_failed_closed, replan_recovery_dispatch = _dispatch_planned_recovery_entries(
-            planned_recovery_actionable_failed,
-            pending_slots_for_replan=pending_slots,
-            allow_replan=True,
-            processed_task_ids=processed_planned_recovery_task_ids,
-        )
+            processed_planned_recovery_task_ids: set[str] = set()
+            planned_recovery_dispatch_failed_closed = False
+            if unmapped_planned_recovery_entries:
+                invariant_violating_entries = tuple(
+                    entry
+                    for entry in unmapped_planned_recovery_entries
+                    if entry.task.id is None or str(entry.task.id) not in explicitly_undispatched_recovery_subject_ids
+                )
+                if invariant_violating_entries:
+                    planned_recovery_dispatch_failed_closed = True
+                for entry in invariant_violating_entries:
+                    _fail_closed_for_planned_recovery_entry(
+                        entry,
+                        stage="initial-plan",
+                        reason="missing-actionable-failed",
+                    )
+            replan_recovery_dispatch = False
+            if not planned_recovery_dispatch_failed_closed:
+                planned_recovery_dispatch_failed_closed, replan_recovery_dispatch = _dispatch_planned_recovery_entries(
+                    planned_recovery_actionable_failed,
+                    pending_slots_for_replan=pending_slots,
+                    allow_replan=True,
+                    processed_task_ids=processed_planned_recovery_task_ids,
+                )
 
-    if replan_recovery_dispatch and slots > 0 and not planned_recovery_dispatch_failed_closed:
-        remaining_dispatch_entries = tuple(
-            entry
-            for entry in dispatch_launchable_entries
-            if entry.lane != "recovery"
-            or entry.task.id is None
-            or str(entry.task.id) not in processed_planned_recovery_task_ids
-        )
-        replanned_dispatch_plan = plan_watch_dispatch_entries(
-            remaining_dispatch_entries,
-            slots=slots,
-            recovery_slot_cap=recovery_slots,
-            selection_mode=dispatch_selection_mode,
-            include_pending=scoped_owner_ids is None,
-        )
-        replanned_dispatch_entries = tuple(getattr(replanned_dispatch_plan, "entries", remaining_dispatch_entries))
-        replanned_actionable_failed, unmapped_replanned_recovery_entries = (
-            _map_planned_recovery_entries_to_actionable_failed(
-                replanned_dispatch_entries,
-                actionable_failed=actionable_failed,
-                known_non_actionable_failed_ids=known_non_actionable_recovery_subject_ids,
-            )
-        )
-        if unmapped_replanned_recovery_entries:
-            invariant_violating_entries = tuple(
-                entry
-                for entry in unmapped_replanned_recovery_entries
-                if entry.task.id is None or str(entry.task.id) not in explicitly_undispatched_recovery_subject_ids
-            )
-            if invariant_violating_entries:
-                planned_recovery_dispatch_failed_closed = True
-            for entry in invariant_violating_entries:
-                _fail_closed_for_planned_recovery_entry(
-                    entry,
-                    stage="replan",
-                    reason="missing-actionable-failed",
+            if replan_recovery_dispatch and slots > 0 and not planned_recovery_dispatch_failed_closed:
+                remaining_dispatch_entries = tuple(
+                    entry
+                    for entry in dispatch_launchable_entries
+                    if entry.lane != "recovery"
+                    or entry.task.id is None
+                    or str(entry.task.id) not in processed_planned_recovery_task_ids
                 )
-        elif replanned_actionable_failed:
-            replanned_reserved_recovery_slots = replanned_dispatch_plan.recovery_worker_slots
-            if remaining_new_worker_starts is not None:
-                replanned_reserved_recovery_slots = min(
-                    replanned_reserved_recovery_slots,
-                    remaining_new_worker_starts,
+                replanned_dispatch_plan = plan_watch_dispatch_entries(
+                    remaining_dispatch_entries,
+                    slots=slots,
+                    recovery_slot_cap=recovery_slots,
+                    selection_mode=dispatch_selection_mode,
+                    include_pending=scoped_owner_ids is None,
                 )
-            reserved_recovery_slots = replanned_reserved_recovery_slots
-            planned_recovery_dispatch_failed_closed, _ = _dispatch_planned_recovery_entries(
-                replanned_actionable_failed,
-                pending_slots_for_replan=0,
-                allow_replan=False,
-            )
+                replanned_dispatch_entries = tuple(getattr(replanned_dispatch_plan, "entries", remaining_dispatch_entries))
+                replanned_actionable_failed, unmapped_replanned_recovery_entries = (
+                    _map_planned_recovery_entries_to_actionable_failed(
+                        replanned_dispatch_entries,
+                        actionable_failed=actionable_failed,
+                        known_non_actionable_failed_ids=known_non_actionable_recovery_subject_ids,
+                    )
+                )
+                if unmapped_replanned_recovery_entries:
+                    invariant_violating_entries = tuple(
+                        entry
+                        for entry in unmapped_replanned_recovery_entries
+                        if entry.task.id is None or str(entry.task.id) not in explicitly_undispatched_recovery_subject_ids
+                    )
+                    if invariant_violating_entries:
+                        planned_recovery_dispatch_failed_closed = True
+                    for entry in invariant_violating_entries:
+                        _fail_closed_for_planned_recovery_entry(
+                            entry,
+                            stage="replan",
+                            reason="missing-actionable-failed",
+                        )
+                elif replanned_actionable_failed:
+                    replanned_reserved_recovery_slots = replanned_dispatch_plan.recovery_worker_slots
+                    if remaining_new_worker_starts is not None:
+                        replanned_reserved_recovery_slots = min(
+                            replanned_reserved_recovery_slots,
+                            remaining_new_worker_starts,
+                        )
+                    reserved_recovery_slots = replanned_reserved_recovery_slots
+                    planned_recovery_dispatch_failed_closed, _ = _dispatch_planned_recovery_entries(
+                        replanned_actionable_failed,
+                        pending_slots_for_replan=0,
+                        allow_replan=False,
+                    )
+
+    if direct_phase_only:
+        return _finish_direct_phase_result()
 
     def _fail_closed_for_planned_pending_entry(
         entry: DispatchPreviewEntry,
@@ -15234,150 +15432,274 @@ def _run_cycle(
             return [], 0, True, ()
         return list(pending_tasks), pending_plan.pending_slots, False, tuple(pending_entries)
 
-    if planned_recovery_dispatch_failed_closed:
-        pending_slots = 0
-        pending_tasks = []
-        pending_entries_for_preflight: tuple[DispatchPreviewEntry, ...] = ()
-        pending_dispatch_failed_closed = False
-    elif scoped_owner_ids is None and recovery_mode != "recovery_only":
-        pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight = (
-            _recompute_pending_dispatch()
-        )
-    else:
-        pending_entries_for_preflight = ()
-        pending_dispatch_failed_closed = False
-
-    if (
-        scoped_owner_ids is None
-        and recovery_mode == "recovery_only"
-        and pending_slots <= 0
-        and not recovery_started_this_cycle
-    ):
-        if not nonparked_recovery_subject_ids:
+    with _watch_cycle_phase(long_phase_reporter, "pending-dispatch"):
+        if planned_recovery_dispatch_failed_closed:
+            pending_slots = 0
+            pending_tasks = []
+            pending_entries_for_preflight: tuple[DispatchPreviewEntry, ...] = ()
+            pending_dispatch_failed_closed = False
+        elif scoped_owner_ids is None and recovery_mode != "recovery_only":
             pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight = (
                 _recompute_pending_dispatch()
             )
+        else:
+            pending_entries_for_preflight = ()
+            pending_dispatch_failed_closed = False
 
-    # 3) Start new queued tasks (consumes slots)
-    def consume_pending_slot() -> None:
-        nonlocal pending_slots, slots
-        pending_slots -= 1
-        slots = max(0, slots - 1)
+        if (
+            scoped_owner_ids is None
+            and recovery_mode == "recovery_only"
+            and pending_slots <= 0
+            and not recovery_started_this_cycle
+        ):
+            if not nonparked_recovery_subject_ids:
+                pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight = (
+                    _recompute_pending_dispatch()
+                )
 
-    def _settle_pending_dispatch_wave(
-        deferred_pending_starts: list[_DeferredWatchDispatchStart],
-    ) -> None:
-        nonlocal confirmed_start_count, work_done
-        if not deferred_pending_starts:
-            return
-        settled_starts = _settle_watch_dispatch_starts(
-            config=config,
-            store=store,
-            pending_starts=[deferred.settle for deferred in deferred_pending_starts],
-        )
-        for deferred, settle_result in zip(deferred_pending_starts, settled_starts, strict=True):
-            started, no_progress_attention = _emit_deferred_watch_dispatch_outcome(
+        # 3) Start new queued tasks (consumes slots)
+        def consume_pending_slot() -> None:
+            nonlocal pending_slots, slots
+            pending_slots -= 1
+            slots = max(0, slots - 1)
+
+        def _settle_pending_dispatch_wave(
+            deferred_pending_starts: list[_DeferredWatchDispatchStart],
+        ) -> None:
+            nonlocal confirmed_start_count, work_done
+            if not deferred_pending_starts:
+                return
+            settled_starts = _settle_watch_dispatch_starts(
                 config=config,
                 store=store,
-                log=log,
-                deferred=deferred,
-                settle_result=settle_result,
+                pending_starts=[deferred.settle for deferred in deferred_pending_starts],
             )
-            if not started:
+            for deferred, settle_result in zip(deferred_pending_starts, settled_starts, strict=True):
+                started, no_progress_attention = _emit_deferred_watch_dispatch_outcome(
+                    config=config,
+                    store=store,
+                    log=log,
+                    deferred=deferred,
+                    settle_result=settle_result,
+                )
+                if not started:
+                    _emit_settle_no_progress_attention(
+                        deferred=deferred,
+                        no_progress_attention=no_progress_attention,
+                        attention_key_prefix="pending-attention",
+                    )
+                    continue
+                consume_pending_slot()
+                work_done = True
+                started_task_ids.add(deferred.settle.task_id)
+                confirmed_start_count += 1
                 _emit_settle_no_progress_attention(
                     deferred=deferred,
                     no_progress_attention=no_progress_attention,
                     attention_key_prefix="pending-attention",
                 )
-                continue
-            consume_pending_slot()
-            work_done = True
-            started_task_ids.add(deferred.settle.task_id)
-            confirmed_start_count += 1
-            _emit_settle_no_progress_attention(
-                deferred=deferred,
-                no_progress_attention=no_progress_attention,
-                attention_key_prefix="pending-attention",
+
+        quiet_skip = None
+        if not scoped_mode:
+            quiet_skip = _top_quiet_pending_task(
+                store,
+                config=config,
+                excluded_task_ids=started_task_ids | pending_recovery_task_ids | step1_handled_child_task_ids,
+                excluded_owner_ids=excluded_owner_ids,
+                tags=tags,
+                any_tag=any_tag,
+            )
+        if quiet_skip is not None:
+            quiet_task, quiet_available_at = quiet_skip
+            quiet_available_text = format_quiet_available_at(quiet_available_at) or quiet_available_at.isoformat()
+            log.emit(
+                "SKIP",
+                f"{quiet_task.id} held by quiet period until {quiet_available_text}",
+                dedupe_key=f"quiet:{quiet_task.id}:{quiet_available_at.astimezone(UTC).isoformat()}",
             )
 
-    quiet_skip = None
-    if not scoped_mode:
-        quiet_skip = _top_quiet_pending_task(
-            store,
-            config=config,
-            excluded_task_ids=started_task_ids | pending_recovery_task_ids | step1_handled_child_task_ids,
-            excluded_owner_ids=excluded_owner_ids,
-            tags=tags,
-            any_tag=any_tag,
-        )
-    if quiet_skip is not None:
-        quiet_task, quiet_available_at = quiet_skip
-        quiet_available_text = format_quiet_available_at(quiet_available_at) or quiet_available_at.isoformat()
-        log.emit(
-            "SKIP",
-            f"{quiet_task.id} held by quiet period until {quiet_available_text}",
-            dedupe_key=f"quiet:{quiet_task.id}:{quiet_available_at.astimezone(UTC).isoformat()}",
-        )
-
-    if pending_slots > 0 and not pending_dispatch_failed_closed:
-        log.emit("QUEUE", "pending queue active")
-    if pending_slots > 0 and not pending_dispatch_failed_closed:
-        pending_task_index = 0
-
-        def _suppress_pending_candidate_and_recompute(task_id: str) -> bool:
-            nonlocal pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight
-            nonlocal pending_task_index
-            pending_preflight_rejected_task_ids.add(task_id)
-            pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight = (
-                _recompute_pending_dispatch()
-            )
+        if pending_slots > 0 and not pending_dispatch_failed_closed:
+            log.emit("QUEUE", "pending queue active")
+        if pending_slots > 0 and not pending_dispatch_failed_closed:
             pending_task_index = 0
-            return pending_dispatch_failed_closed
 
-        while pending_slots > 0 and pending_task_index < len(pending_tasks):
-            wave_budget = pending_slots
-            wave_fill_count = 0
-            deferred_pending_starts: list[_DeferredWatchDispatchStart] = []
-            while pending_task_index < len(pending_tasks) and wave_fill_count < wave_budget:
-                task = pending_tasks[pending_task_index]
-                pending_task_index += 1
-                assert task.id is not None
-                if str(task.id) in started_task_ids:
-                    continue
-                if str(task.id) in pending_recovery_task_ids:
-                    continue
-                if str(task.id) in step1_handled_child_task_ids:
-                    continue
-                preflight = _preflight_pending_dispatch_candidate(
-                    config=config,
-                    store=store,
-                    log=log,
-                    git=git,
-                    task=task,
-                    tags=tags,
-                    any_tag=any_tag,
-                    max_recovery_attempts=max_recovery_attempts,
-                    selection_mode=_watch_supervisor_pending_selection_mode(recovery_mode),
-                    target_branch=target_branch,
-                    owner_rows=analysis.owner_rows,
-                    read_context=analysis.watch_read_context,
-                    suppression_context=_WatchDispatchSuppressionContext(
-                        started_task_ids=frozenset(started_task_ids | pending_preflight_rejected_task_ids),
-                        pending_recovery_task_ids=frozenset(pending_recovery_task_ids),
-                        step1_handled_child_task_ids=frozenset(step1_handled_child_task_ids),
-                        excluded_owner_ids=excluded_owner_ids,
-                    ),
+            def _suppress_pending_candidate_and_recompute(task_id: str) -> bool:
+                nonlocal pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight
+                nonlocal pending_task_index
+                pending_preflight_rejected_task_ids.add(task_id)
+                pending_tasks, pending_slots, pending_dispatch_failed_closed, pending_entries_for_preflight = (
+                    _recompute_pending_dispatch()
                 )
-                if not preflight.dispatchable:
-                    if _suppress_pending_candidate_and_recompute(str(task.id)):
-                        break
-                    continue
-                refreshed_pending_task = preflight.task
-                assert refreshed_pending_task is not None
-                task = refreshed_pending_task
-                task_type = task.task_type or "implement"
-                pending_action = _pending_queue_dispatch_action(task)
-                if task_type == "implement":
+                pending_task_index = 0
+                return pending_dispatch_failed_closed
+
+            while pending_slots > 0 and pending_task_index < len(pending_tasks):
+                wave_budget = pending_slots
+                wave_fill_count = 0
+                deferred_pending_starts: list[_DeferredWatchDispatchStart] = []
+                while pending_task_index < len(pending_tasks) and wave_fill_count < wave_budget:
+                    task = pending_tasks[pending_task_index]
+                    pending_task_index += 1
+                    assert task.id is not None
+                    if str(task.id) in started_task_ids:
+                        continue
+                    if str(task.id) in pending_recovery_task_ids:
+                        continue
+                    if str(task.id) in step1_handled_child_task_ids:
+                        continue
+                    preflight = _preflight_pending_dispatch_candidate(
+                        config=config,
+                        store=store,
+                        log=log,
+                        git=git,
+                        task=task,
+                        tags=tags,
+                        any_tag=any_tag,
+                        max_recovery_attempts=max_recovery_attempts,
+                        selection_mode=_watch_supervisor_pending_selection_mode(recovery_mode),
+                        target_branch=target_branch,
+                        owner_rows=analysis.owner_rows,
+                        read_context=analysis.watch_read_context,
+                        suppression_context=_WatchDispatchSuppressionContext(
+                            started_task_ids=frozenset(started_task_ids | pending_preflight_rejected_task_ids),
+                            pending_recovery_task_ids=frozenset(pending_recovery_task_ids),
+                            step1_handled_child_task_ids=frozenset(step1_handled_child_task_ids),
+                            excluded_owner_ids=excluded_owner_ids,
+                        ),
+                    )
+                    if not preflight.dispatchable:
+                        if _suppress_pending_candidate_and_recompute(str(task.id)):
+                            break
+                        continue
+                    refreshed_pending_task = preflight.task
+                    assert refreshed_pending_task is not None
+                    task = refreshed_pending_task
+                    task_type = task.task_type or "implement"
+                    pending_action = _pending_queue_dispatch_action(task)
+                    if task_type == "implement":
+                        if dry_run:
+                            dry_run_prompt = _format_prompt_for_width(
+                                task.prompt,
+                                prefix=16 + len(f'{task.id} {task_type} "'),
+                                suffix=len('" [dry-run]'),
+                            )
+                            log.emit("START", f'{task.id} {task_type} "{dry_run_prompt}" [dry-run]')
+                            started_task_ids.add(str(task.id))
+                            consume_pending_slot()
+                            wave_fill_count += 1
+                            work_done = True
+                            continue
+                        if _maybe_emit_active_watch_recovery_backoff(
+                            store=store,
+                            log=log,
+                            subject_task=task,
+                            action=pending_action,
+                        ):
+                            if _suppress_pending_candidate_and_recompute(str(task.id)):
+                                break
+                            continue
+                        if _watch_task_has_live_registered_worker(config, str(task.id)):
+                            continue
+                        no_progress_attention = _maybe_park_watch_no_progress(
+                            config=config,
+                            store=store,
+                            subject_task=task,
+                            action=pending_action,
+                            action_task=task,
+                            failed_task=None,
+                            no_progress_cycles=config.watch.no_progress_cycles,
+                        )
+                        if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
+                            _maybe_emit_active_watch_recovery_backoff(
+                                store=store,
+                                log=log,
+                                subject_task=task,
+                                action=pending_action,
+                            )
+                            if _suppress_pending_candidate_and_recompute(str(task.id)):
+                                break
+                            continue
+                        if no_progress_attention is not None:
+                            log.emit_attention(
+                                attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
+                                message=_watch_needs_attention_message(task, no_progress_attention),
+                            )
+                            if _suppress_pending_candidate_and_recompute(str(task.id)):
+                                break
+                            continue
+                        if _watch_task_has_live_registered_worker(config, str(task.id)):
+                            continue
+                        iterate_args = argparse.Namespace(
+                            max_iterations=max_iterations,
+                            no_docker=False,
+                            resume=False,
+                            retry=False,
+                            auto_iterate=True,
+                        )
+                        pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
+                        reserved_launch = _reserve_watch_launch("iterate", str(task.id))
+                        if reserved_launch is None:
+                            continue
+                        if _watch_task_has_live_registered_worker(config, str(task.id)):
+                            reserved_launch.release()
+                            continue
+                        prepared_pending_task = _prepare_watch_reserved_task(
+                            task,
+                            permit=reserved_launch,
+                            rollback_on_failure=False,
+                        )
+                        if prepared_pending_task is None:
+                            log.emit(
+                                "START_FAILED",
+                                f"{task.id} {task_type}: iterate startup preparation failed",
+                                dedupe_key=f"prepare-iterate-failed:{task.id}",
+                            )
+                            work_done = True
+                            continue
+                        pending_task_before = _snapshot_watch_dispatch_task(prepared_pending_task)
+                        if _watch_task_has_live_registered_worker(config, str(task.id)):
+                            _release_watch_reserved_task(str(prepared_pending_task.id))
+                            continue
+                        rc = _spawn_worker_with_failure_log(
+                            quiet=quiet,
+                            log=log,
+                            failure_message=f"{task.id} {task_type}: iterate worker spawn failed",
+                            dedupe_key=f"spawn-iterate-failed:{task.id}",
+                            spawn_fn=lambda: _spawn_background_iterate(
+                                iterate_args,
+                                config,
+                                task,
+                                prepared_task_id=str(prepared_pending_task.id),
+                                prepared_resume=pending_recovery_mode == "resume",
+                                prepared_phase="preloop",
+                                startup_quiet=True,
+                                runtime_context=runtime_context,
+                            ),
+                        )
+                        _release_watch_reserved_task(str(prepared_pending_task.id))
+                        if rc != 0:
+                            continue
+                        deferred_pending_starts.append(
+                            _DeferredWatchDispatchStart(
+                                settle=_PendingWatchDispatchSettle(
+                                    task_id=str(task.id),
+                                    task_before=pending_task_before,
+                                    start_label=f"{task.id} {task_type}",
+                                    dedupe_key=f"pending-undispatched:{task.id}:iterate",
+                                ),
+                                subject_task=task,
+                                action=pending_action,
+                                action_task_before=task,
+                                failed_task=None,
+                                owner_task_id=task.id,
+                                action_type=str(task_type),
+                                start_message=_format_start_line(task),
+                            )
+                        )
+                        started_task_ids.add(str(task.id))
+                        wave_fill_count += 1
+                        continue
+
                     if dry_run:
                         dry_run_prompt = _format_prompt_for_width(
                             task.prompt,
@@ -15430,54 +15752,24 @@ def _run_cycle(
                         continue
                     if _watch_task_has_live_registered_worker(config, str(task.id)):
                         continue
-                    iterate_args = argparse.Namespace(
-                        max_iterations=max_iterations,
-                        no_docker=False,
-                        resume=False,
-                        retry=False,
-                        auto_iterate=True,
-                    )
-                    pending_recovery_mode = resolve_pending_recovery_execution_mode(task)
-                    reserved_launch = _reserve_watch_launch("iterate", str(task.id))
-                    if reserved_launch is None:
-                        continue
+                    worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
+                    pending_task_before = _snapshot_watch_dispatch_task(task)
                     if _watch_task_has_live_registered_worker(config, str(task.id)):
-                        reserved_launch.release()
-                        continue
-                    prepared_pending_task = _prepare_watch_reserved_task(
-                        task,
-                        permit=reserved_launch,
-                        rollback_on_failure=False,
-                    )
-                    if prepared_pending_task is None:
-                        log.emit(
-                            "START_FAILED",
-                            f"{task.id} {task_type}: iterate startup preparation failed",
-                            dedupe_key=f"prepare-iterate-failed:{task.id}",
-                        )
-                        work_done = True
-                        continue
-                    pending_task_before = _snapshot_watch_dispatch_task(prepared_pending_task)
-                    if _watch_task_has_live_registered_worker(config, str(task.id)):
-                        _release_watch_reserved_task(str(prepared_pending_task.id))
                         continue
                     rc = _spawn_worker_with_failure_log(
                         quiet=quiet,
                         log=log,
-                        failure_message=f"{task.id} {task_type}: iterate worker spawn failed",
-                        dedupe_key=f"spawn-iterate-failed:{task.id}",
-                        spawn_fn=lambda: _spawn_background_iterate(
-                            iterate_args,
+                        failure_message=f"{task.id} {task_type}: worker spawn failed",
+                        dedupe_key=f"spawn-worker-failed:{task.id}",
+                        spawn_fn=lambda: _spawn_background_worker(
+                            worker_args,
                             config,
-                            task,
-                            prepared_task_id=str(prepared_pending_task.id),
-                            prepared_resume=pending_recovery_mode == "resume",
-                            prepared_phase="preloop",
+                            task_id=task.id,
+                            quiet=quiet,
                             startup_quiet=True,
                             runtime_context=runtime_context,
                         ),
                     )
-                    _release_watch_reserved_task(str(prepared_pending_task.id))
                     if rc != 0:
                         continue
                     deferred_pending_starts.append(
@@ -15486,7 +15778,7 @@ def _run_cycle(
                                 task_id=str(task.id),
                                 task_before=pending_task_before,
                                 start_label=f"{task.id} {task_type}",
-                                dedupe_key=f"pending-undispatched:{task.id}:iterate",
+                                dedupe_key=f"pending-undispatched:{task.id}:worker",
                             ),
                             subject_task=task,
                             action=pending_action,
@@ -15499,116 +15791,11 @@ def _run_cycle(
                     )
                     started_task_ids.add(str(task.id))
                     wave_fill_count += 1
-                    continue
+                _settle_pending_dispatch_wave(deferred_pending_starts)
 
-                if dry_run:
-                    dry_run_prompt = _format_prompt_for_width(
-                        task.prompt,
-                        prefix=16 + len(f'{task.id} {task_type} "'),
-                        suffix=len('" [dry-run]'),
-                    )
-                    log.emit("START", f'{task.id} {task_type} "{dry_run_prompt}" [dry-run]')
-                    started_task_ids.add(str(task.id))
-                    consume_pending_slot()
-                    wave_fill_count += 1
-                    work_done = True
-                    continue
-                if _maybe_emit_active_watch_recovery_backoff(
-                    store=store,
-                    log=log,
-                    subject_task=task,
-                    action=pending_action,
-                ):
-                    if _suppress_pending_candidate_and_recompute(str(task.id)):
-                        break
-                    continue
-                if _watch_task_has_live_registered_worker(config, str(task.id)):
-                    continue
-                no_progress_attention = _maybe_park_watch_no_progress(
-                    config=config,
-                    store=store,
-                    subject_task=task,
-                    action=pending_action,
-                    action_task=task,
-                    failed_task=None,
-                    no_progress_cycles=config.watch.no_progress_cycles,
-                )
-                if _watch_no_progress_result_deferred_for_transient_backoff(no_progress_attention):
-                    _maybe_emit_active_watch_recovery_backoff(
-                        store=store,
-                        log=log,
-                        subject_task=task,
-                        action=pending_action,
-                    )
-                    if _suppress_pending_candidate_and_recompute(str(task.id)):
-                        break
-                    continue
-                if no_progress_attention is not None:
-                    log.emit_attention(
-                        attention_key=f"pending-attention:{task.id}:{pending_action['type']}:watch-no-progress",
-                        message=_watch_needs_attention_message(task, no_progress_attention),
-                    )
-                    if _suppress_pending_candidate_and_recompute(str(task.id)):
-                        break
-                    continue
-                if _watch_task_has_live_registered_worker(config, str(task.id)):
-                    continue
-                worker_args = argparse.Namespace(no_docker=False, max_turns=None, resume=False)
-                pending_task_before = _snapshot_watch_dispatch_task(task)
-                if _watch_task_has_live_registered_worker(config, str(task.id)):
-                    continue
-                rc = _spawn_worker_with_failure_log(
-                    quiet=quiet,
-                    log=log,
-                    failure_message=f"{task.id} {task_type}: worker spawn failed",
-                    dedupe_key=f"spawn-worker-failed:{task.id}",
-                    spawn_fn=lambda: _spawn_background_worker(
-                        worker_args,
-                        config,
-                        task_id=task.id,
-                        quiet=quiet,
-                        startup_quiet=True,
-                        runtime_context=runtime_context,
-                    ),
-                )
-                if rc != 0:
-                    continue
-                deferred_pending_starts.append(
-                    _DeferredWatchDispatchStart(
-                        settle=_PendingWatchDispatchSettle(
-                            task_id=str(task.id),
-                            task_before=pending_task_before,
-                            start_label=f"{task.id} {task_type}",
-                            dedupe_key=f"pending-undispatched:{task.id}:worker",
-                        ),
-                        subject_task=task,
-                        action=pending_action,
-                        action_task_before=task,
-                        failed_task=None,
-                        owner_task_id=task.id,
-                        action_type=str(task_type),
-                        start_message=_format_start_line(task),
-                    )
-                )
-                started_task_ids.add(str(task.id))
-                wave_fill_count += 1
-            _settle_pending_dispatch_wave(deferred_pending_starts)
-
-    pending_count = (
-        0
-        if scoped_mode
-        else len(
-            _pending_runnable_tasks(
-                store,
-                config=config,
-                tags=tags,
-                any_tag=any_tag,
-                excluded_owner_ids=excluded_owner_ids,
-            )
-        )
-    )
-    scoped_active = (
-        _scoped_watch_active_count(
+    scoped_activity = (
+        _reported_scoped_watch_activity(
+            log=log,
             config=config,
             store=store,
             batch=batch,
@@ -15624,22 +15811,40 @@ def _run_cycle(
             runtime_context=runtime_context,
         )
         if scoped_mode and scoped_owner_ids is not None
-        else 0
+        else None
     )
-    _check_canonical_checkout_boundary("watch-pass-end")
-    _finalize_main_verify_attention(
-        log=log,
-        state=latest_main_verify_state,
-        now=datetime.now(UTC),
-        git=latest_main_verify_git,
-        target_branch=target_branch,
-    )
-    _emit_cycle_attention_summary(log)
-    if end_cycle:
-        log.end_cycle()
-    _live_pids, end_running_task_ids, end_anonymous_worker_count, end_starting_worker_count = (
-        _collect_live_running_state(config, store)
-    )
+    if scoped_activity is not None:
+        effective_scoped_owner_ids = scoped_activity.effective_scoped_owner_ids
+
+    with _watch_cycle_phase(long_phase_reporter, "cycle-finalize"):
+        pending_count = (
+            0
+            if scoped_mode
+            else len(
+                _pending_runnable_tasks(
+                    store,
+                    config=config,
+                    tags=tags,
+                    any_tag=any_tag,
+                    excluded_owner_ids=excluded_owner_ids,
+                )
+            )
+        )
+        scoped_active = scoped_activity.active_count if scoped_activity is not None else 0
+        _check_canonical_checkout_boundary("watch-pass-end")
+        _finalize_main_verify_attention(
+            log=log,
+            state=latest_main_verify_state,
+            now=datetime.now(UTC),
+            git=latest_main_verify_git,
+            target_branch=target_branch,
+        )
+        _emit_cycle_attention_summary(log)
+        if end_cycle:
+            log.end_cycle()
+        _live_pids, end_running_task_ids, end_anonymous_worker_count, end_starting_worker_count = (
+            _collect_live_running_state(config, store)
+        )
     return _CycleResult(
         work_done=work_done,
         running=len(end_running_task_ids),
@@ -15678,7 +15883,10 @@ def _preview_initial_watch_cycle(
     runtime_context: RuntimeExecutionContext | None = None,
 ) -> tuple[_CycleResult, _WatchCyclePlan]:
     runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
-    plan = _build_watch_cycle_plan(
+    plan = _build_reported_watch_cycle_plan(
+        log=log,
+        threshold_seconds=config.watch.long_phase_threshold_seconds,
+        heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
         config=config,
         store=store,
         batch=batch,
@@ -16285,7 +16493,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     preview_cycle_open = False
                     pending_first_cycle_plan = None
                 if scoped_owner_ids is not None:
-                    scoped_activity = _scoped_watch_activity(
+                    scoped_activity = _reported_scoped_watch_activity(
+                        log=runtime.log,
                         config=runtime.config,
                         store=runtime.store,
                         batch=batch,

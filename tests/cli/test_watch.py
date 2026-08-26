@@ -545,6 +545,51 @@ def _task_count(store) -> int:
     return int(row["c"])
 
 
+def _non_cycle_event_lines(log_text: str, event: str) -> list[str]:
+    lines: list[str] = []
+    for line in log_text.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) < 3 or fields[1] != event:
+            continue
+        message_fields = fields[2].split()
+        if len(message_fields) >= 2 and message_fields[1] == watch_module._WATCH_CYCLE_PHASE_SUBJECT_ID:
+            continue
+        lines.append(line)
+    return lines
+
+
+def _non_cycle_start_lines(log_text: str) -> list[str]:
+    return _non_cycle_event_lines(log_text, "START")
+
+
+def _non_cycle_done_lines(log_text: str) -> list[str]:
+    return _non_cycle_event_lines(log_text, "DONE")
+
+
+def _cycle_phase_events(log_text: str) -> list[tuple[str, str]]:
+    events: list[tuple[str, str]] = []
+    for line in log_text.splitlines():
+        fields = line.split(maxsplit=2)
+        if len(fields) < 3 or fields[1] not in {"START", "DONE"}:
+            continue
+        message_fields = fields[2].split()
+        if len(message_fields) >= 2 and message_fields[1] == watch_module._WATCH_CYCLE_PHASE_SUBJECT_ID:
+            events.append((fields[1], message_fields[0]))
+    return events
+
+
+def _assert_cycle_level_phases_do_not_overlap(log_text: str) -> None:
+    open_phase: str | None = None
+    for event, phase in _cycle_phase_events(log_text):
+        if event == "START":
+            assert open_phase is None, f"{phase} started before {open_phase} finished"
+            open_phase = phase
+            continue
+        assert open_phase == phase
+        open_phase = None
+    assert open_phase is None
+
+
 def _set_task_urgent_bumped_at(store, task_id: str, bumped_at: datetime) -> None:
     with store._connect() as conn:  # noqa: SLF001 - test helper for raw queue-order column
         conn.execute(
@@ -1037,7 +1082,10 @@ def test_watch_supervisor_manifest_resolves_relative_paths_and_cli_overrides(tmp
         ("version: 1\nprojects:\n  - name: 123\n    path: .\n", "name must be a string"),
         ("version: 1\nprojects:\n  - name: core\n    path: 123\n", "path must be a string"),
         ("version: 1\nprojects:\n  - name: core\n    project_id: 123\n", "project_id must be a string"),
-        ("version: 1\nprojects:\n  - name: core\n    path: .\n    tags: [release, true]\n", "tags must contain only strings"),
+        (
+            "version: 1\nprojects:\n  - name: core\n    path: .\n    tags: [release, true]\n",
+            "tags must contain only strings",
+        ),
         ("version: 1\nprojects:\n  - name: core\n    path: .\n    tag_mode: true\n", "tag_mode must be a string"),
         ("version: 1\nprojects:\n  - name: core\n    path: ''\n", "path must not be empty"),
         ("version: 1\nprojects:\n  - name: core\n    path: '   '\n", "path must not be empty"),
@@ -2189,16 +2237,18 @@ def test_watch_project_runtime_reconcile_runtime_state_preserves_legacy_order(tm
         ) as reconcile_recovery,
         patch(
             "gza.cli.watch._shared_collect_live_running_state_details",
-            side_effect=lambda cfg, st: calls.append("collect")
-            or _LiveRunningState(
-                live_pids=frozenset({321, 654}),
-                live_active_task_pids=frozenset({321}),
-                live_starting_task_pids=frozenset({654}),
-                live_starting_worker_ids=("w-starting",),
-                anonymous_worker_pids=frozenset(),
-                running_task_ids=("gza-1",),
-                anonymous_worker_count=2,
-                starting_worker_count=1,
+            side_effect=lambda cfg, st: (
+                calls.append("collect")
+                or _LiveRunningState(
+                    live_pids=frozenset({321, 654}),
+                    live_active_task_pids=frozenset({321}),
+                    live_starting_task_pids=frozenset({654}),
+                    live_starting_worker_ids=("w-starting",),
+                    anonymous_worker_pids=frozenset(),
+                    running_task_ids=("gza-1",),
+                    anonymous_worker_count=2,
+                    starting_worker_count=1,
+                )
             ),
         ) as collect_live,
     ):
@@ -2346,8 +2396,7 @@ def _make_aggregate_runtime(
             f"db_path: {db_path}\n"
             "provider: codex\n"
             "model: gpt-5.5\n"
-            f"max_concurrent: {max_concurrent}\n"
-            + max_resume_attempts_config,
+            f"max_concurrent: {max_concurrent}\n" + max_resume_attempts_config,
             encoding="utf-8",
         )
     config = Config.load(project_dir)
@@ -3087,6 +3136,64 @@ def test_run_cycle_direct_phase_only_stops_before_worker_dispatch(tmp_path: Path
     assert store.get(queued.id).status == "pending"
 
 
+def test_run_cycle_direct_phase_only_finishes_recovery_dispatch_before_finalize(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch(
+            "gza.cli.watch.check_canonical_checkout_invariant",
+            return_value=SimpleNamespace(
+                restored=False,
+                needs_attention=False,
+                dirty_tracked_paths=[],
+                current_branch="main",
+                expected_branch="main",
+            ),
+        ),
+        patch(
+            "gza.cli.watch._run_watch_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            precomputed_plan=_empty_scoped_watch_plan(),
+            direct_phase_only=True,
+            skip_runtime_reconcile=True,
+            skip_stale_no_progress_reconcile=True,
+            git=_make_watch_git(),
+        )
+
+    lines = log_path.read_text().splitlines()
+    done_recovery_dispatch = next(
+        index
+        for index, line in enumerate(lines)
+        if "DONE      recovery-dispatch cycle elapsed " in line
+    )
+    start_cycle_finalize = next(
+        index
+        for index, line in enumerate(lines)
+        if "START     cycle-finalize cycle" in line
+    )
+    done_cycle_finalize = next(
+        index
+        for index, line in enumerate(lines)
+        if "DONE      cycle-finalize cycle elapsed " in line
+    )
+
+    assert done_recovery_dispatch < start_cycle_finalize < done_cycle_finalize
+    assert not any("START     pending-dispatch cycle" in line for line in lines)
+
+
 def test_run_cycle_direct_phase_only_scoped_completion_reuses_runtime_context_and_git(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3108,17 +3215,20 @@ def test_run_cycle_direct_phase_only_scoped_completion_reuses_runtime_context_an
     monkeypatch.setenv("GIT_DIR", str(tmp_path / "ambient.git"))
     monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "ambient-worktree"))
 
-    def scoped_active_spy(**kwargs: object) -> int:
+    def scoped_activity_spy(**kwargs: object) -> watch_module._ScopedWatchActivity:
         assert kwargs["git"] is sentinel_git
         assert kwargs["runtime_context"] is runtime_context
-        return 0
+        return watch_module._ScopedWatchActivity(
+            active_count=0,
+            effective_scoped_owner_ids=(scoped.id,),
+        )
 
     with (
         patch(
             "gza.cli.watch._run_watch_main_integration_verify",
             return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
         ),
-        patch("gza.cli.watch._scoped_watch_active_count", side_effect=scoped_active_spy) as scoped_active,
+        patch("gza.cli.watch._scoped_watch_activity", side_effect=scoped_activity_spy) as scoped_activity,
         patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("pending worker started")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("pending worker started")),
     ):
@@ -3137,10 +3247,10 @@ def test_run_cycle_direct_phase_only_scoped_completion_reuses_runtime_context_an
             git=sentinel_git,
             runtime_context=runtime_context,
             precomputed_plan=plan,
-        )
+    )
 
     assert result.scoped_done is True
-    assert scoped_active.call_count == 1
+    assert scoped_activity.call_count == 1
     assert runtime_context.env["PATH"] == "/captured/bin"
     assert runtime_context.env["PROJECT_TOKEN"] == "captured"
     assert os.environ["PATH"] == "/ambient/bin"
@@ -3167,17 +3277,20 @@ def test_run_cycle_normal_scoped_completion_reuses_runtime_context_and_git(
     monkeypatch.setenv("GZA_DB_PATH", str(tmp_path / "ambient.db"))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "ambient-gitconfig"))
 
-    def scoped_active_spy(**kwargs: object) -> int:
+    def scoped_activity_spy(**kwargs: object) -> watch_module._ScopedWatchActivity:
         assert kwargs["git"] is sentinel_git
         assert kwargs["runtime_context"] is runtime_context
-        return 0
+        return watch_module._ScopedWatchActivity(
+            active_count=0,
+            effective_scoped_owner_ids=(scoped.id,),
+        )
 
     with (
         patch(
             "gza.cli.watch._run_watch_main_integration_verify",
             return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
         ),
-        patch("gza.cli.watch._scoped_watch_active_count", side_effect=scoped_active_spy) as scoped_active,
+        patch("gza.cli.watch._scoped_watch_activity", side_effect=scoped_activity_spy) as scoped_activity,
         patch("gza.cli.watch._spawn_background_iterate", side_effect=AssertionError("pending worker started")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("pending worker started")),
     ):
@@ -3195,10 +3308,10 @@ def test_run_cycle_normal_scoped_completion_reuses_runtime_context_and_git(
             git=sentinel_git,
             runtime_context=runtime_context,
             precomputed_plan=plan,
-        )
+    )
 
     assert result.scoped_done is True
-    assert scoped_active.call_count == 1
+    assert scoped_activity.call_count == 1
     assert runtime_context.env["PATH"] == "/captured/bin"
     assert os.environ["PATH"] == "/ambient/bin"
     assert os.environ["GZA_DB_PATH"] == str(tmp_path / "ambient.db")
@@ -3808,7 +3921,9 @@ def test_run_cycle_uses_reconciled_occupancy_for_legacy_capacity_snapshot(tmp_pa
         return plan
 
     with (
-        patch("gza.cli._common.reconcile_in_progress_tasks", side_effect=lambda cfg, **kwargs: calls.append("reconcile")),
+        patch(
+            "gza.cli._common.reconcile_in_progress_tasks", side_effect=lambda cfg, **kwargs: calls.append("reconcile")
+        ),
         patch("gza.cli._common.prune_terminal_dead_workers", return_value=None),
         patch("gza.cli._common.reconcile_dead_pending_recovery_tasks", return_value=None),
         patch("gza.cli.watch._shared_collect_live_running_state_details", side_effect=collect_live_once),
@@ -3835,6 +3950,61 @@ def test_run_cycle_uses_reconciled_occupancy_for_legacy_capacity_snapshot(tmp_pa
     assert built_plans[0].anonymous_worker_count == 2
     assert built_plans[0].starting_worker_count == 1
     assert built_plans[0].slots == min(4, config.max_concurrent) - 1
+
+
+def test_run_cycle_logs_start_and_done_for_long_in_process_cycle_phase(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    monotonic_values = iter(
+        [
+            0.0,
+            0.1,
+            1.0,
+            1.1,
+            2.0,
+            2.1,
+            3.0,
+            3.1,
+            10.0,
+            80.0,
+            90.0,
+            90.1,
+            91.0,
+            91.1,
+            92.0,
+            92.1,
+            93.0,
+            93.1,
+        ]
+    )
+
+    with (
+        patch("gza.cli.watch.time.monotonic", side_effect=lambda: next(monotonic_values)),
+        patch("gza.cli.watch.resolve_ref_if_possible", return_value=SimpleNamespace(sha="target-sha")),
+        patch(
+            "gza.cli.watch._evaluate_blind_parked_auto_rearm",
+            return_value=watch_module._BlindParkedAutoRearmResult(decisions=()),
+        ),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            precomputed_plan=_empty_scoped_watch_plan(),
+            skip_runtime_reconcile=True,
+            skip_stale_no_progress_reconcile=True,
+            git=_make_watch_git(),
+        )
+
+    log_text = log_path.read_text()
+    assert "START     blind-parked-auto-rearm cycle" in log_text
+    assert "DONE      blind-parked-auto-rearm cycle elapsed 1m10s" in log_text
 
 
 def test_project_runtime_direct_phase_consumes_supplied_analysis_without_rerunning_worker_reconcile(
@@ -4500,6 +4670,20 @@ def test_watch_long_phase_reporter_records_completed_prior_duration_only_on_fini
     assert "last run of this phase took 30s" not in log_text
 
 
+def test_watch_long_phase_reporter_emits_done_with_elapsed_duration(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    times = iter([10.0, 85.0])
+
+    with patch("gza.cli.watch.time.monotonic", side_effect=lambda: next(times)):
+        reporter = _WatchLongPhaseReporter(log=log, threshold_seconds=60, interval_seconds=60)
+        reporter.start("verify:main", "main").finish()
+
+    log_text = log_path.read_text()
+    assert "START     verify:main main" in log_text
+    assert "DONE      verify:main main elapsed 1m15s" in log_text
+
+
 def test_watch_long_phase_reporter_retains_history_across_watch_cycles(tmp_path: Path) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
@@ -4531,6 +4715,156 @@ def test_watch_long_phase_reporter_finalizes_exceptional_completion_in_finally(t
         reporter.start("verify:unit", "gza-2")
 
     assert "last run of this phase took 20s" in log_path.read_text()
+
+
+def test_preview_initial_watch_cycle_reports_cycle_plan_before_plan_construction(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    start_seen_before_operation = False
+    plan = _empty_scoped_watch_plan()
+
+    def fake_build_plan(**_kwargs: object) -> _WatchCyclePlan:
+        nonlocal start_seen_before_operation
+        start_seen_before_operation = "START     cycle-plan cycle" in log_path.read_text()
+        return plan
+
+    with (
+        patch("gza.cli.watch._build_watch_cycle_plan", side_effect=fake_build_plan),
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
+    ):
+        result, preview_plan = watch_module._preview_initial_watch_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            log=log,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=config.max_resume_attempts,
+            show_skipped=False,
+            auto_restart_on_drift=True,
+            installed_package_drift=None,
+            git=_make_watch_git(),
+        )
+
+    log_text = log_path.read_text()
+    assert start_seen_before_operation is True
+    assert result.work_done is False
+    assert preview_plan is plan
+    assert run_cycle.call_args.kwargs["precomputed_plan"] is plan
+    assert log_text.count("START     cycle-plan cycle") == 1
+    assert re.search(r"DONE      cycle-plan cycle elapsed \d+s", log_text)
+
+
+def test_preview_initial_watch_cycle_reports_cycle_plan_done_when_plan_construction_raises(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    sentinel = RuntimeError("plan failed")
+    start_seen_before_operation = False
+
+    def fake_build_plan(**_kwargs: object) -> _WatchCyclePlan:
+        nonlocal start_seen_before_operation
+        start_seen_before_operation = "START     cycle-plan cycle" in log_path.read_text()
+        raise sentinel
+
+    with (
+        patch("gza.cli.watch._build_watch_cycle_plan", side_effect=fake_build_plan),
+        pytest.raises(RuntimeError) as raised,
+    ):
+        watch_module._preview_initial_watch_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            log=log,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=config.max_resume_attempts,
+            show_skipped=False,
+            auto_restart_on_drift=True,
+            installed_package_drift=None,
+            git=_make_watch_git(),
+        )
+
+    log_text = log_path.read_text()
+    assert raised.value is sentinel
+    assert start_seen_before_operation is True
+    assert log_text.count("START     cycle-plan cycle") == 1
+    assert re.search(r"DONE      cycle-plan cycle elapsed \d+s", log_text)
+
+
+def test_run_cycle_consuming_reported_precomputed_plan_does_not_emit_duplicate_cycle_plan(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    plan = _empty_scoped_watch_plan()
+
+    with patch("gza.cli.watch._build_watch_cycle_plan", return_value=plan):
+        precomputed_plan = watch_module._build_reported_watch_cycle_plan(
+            log=log,
+            threshold_seconds=config.watch.long_phase_threshold_seconds,
+            heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
+            config=config,
+            store=store,
+            batch=1,
+            tags=None,
+            any_tag=False,
+            recovery_slots=1,
+            recovery_mode=None,
+            max_recovery_attempts=config.max_resume_attempts,
+            git=_make_watch_git(),
+        )
+
+    with (
+        patch(
+            "gza.cli.watch.check_canonical_checkout_invariant",
+            return_value=SimpleNamespace(
+                restored=False,
+                needs_attention=False,
+                dirty_tracked_paths=[],
+                current_branch="main",
+                expected_branch="main",
+            ),
+        ),
+        patch(
+            "gza.cli.watch._run_watch_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+        patch("gza.cli.watch._build_watch_cycle_plan", side_effect=AssertionError("plan should be precomputed")),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            precomputed_plan=precomputed_plan,
+            direct_phase_only=True,
+            skip_runtime_reconcile=True,
+            skip_stale_no_progress_reconcile=True,
+            git=_make_watch_git(),
+        )
+
+    log_text = log_path.read_text()
+    assert log_text.count("START     cycle-plan cycle") == 1
+    assert len(re.findall(r"DONE      cycle-plan cycle elapsed \d+s", log_text)) == 1
 
 
 def test_watch_lifecycle_heartbeat_factory_preserves_finish_protocol(tmp_path: Path) -> None:
@@ -4600,8 +4934,7 @@ def test_watch_candidate_batch_heartbeat_identifies_merge_units(tmp_path: Path) 
     assert subject == "batch:gza-1001,gza-1002"
     assert "START     verify:candidate-batch batch:gza-1001,gza-1002" in log_text
     assert (
-        "BUSY      verify:candidate-batch batch:gza-1001,gza-1002 elapsed 2m00s "
-        "cpu +0s out +0 bytes (NO PROGRESS)"
+        "BUSY      verify:candidate-batch batch:gza-1001,gza-1002 elapsed 2m00s cpu +0s out +0 bytes (NO PROGRESS)"
     ) in log_text
 
 
@@ -4661,6 +4994,398 @@ def test_watch_lifecycle_heartbeat_factory_records_exceptional_verify_completion
         heartbeat_for_phase("verify:unit", task)
 
     assert "last run of this phase took 20s" in log_path.read_text()
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "lifecycle",
+        "recovery-plan",
+        "recovery-dispatch",
+        "pending-dispatch",
+        "cycle-finalize",
+    ],
+)
+def test_watch_cycle_phase_records_done_when_body_raises(tmp_path: Path, phase: str) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    sentinel = RuntimeError(f"{phase} failed")
+    times = iter([500.0, 507.0])
+
+    with (
+        patch("gza.cli.watch.time.monotonic", side_effect=lambda: next(times)),
+        pytest.raises(RuntimeError) as raised,
+    ):
+        with watch_module._watch_cycle_phase(
+            _WatchLongPhaseReporter(log=log, threshold_seconds=60, interval_seconds=60),
+            phase,
+        ):
+            raise sentinel
+
+    assert raised.value is sentinel
+    log_text = log_path.read_text()
+    assert f"START     {phase} cycle" in log_text
+    assert f"DONE      {phase} cycle elapsed 7s" in log_text
+
+
+@pytest.mark.parametrize(
+    ("phase", "raise_from", "direct_phase_only", "dry_run"),
+    [
+        ("lifecycle", "plan_lifecycle_execution", False, True),
+        ("recovery-plan", "recovery_plan_preview", False, True),
+        ("recovery-dispatch", "execute_recovery_action", True, False),
+        ("pending-dispatch", "pending_dispatch_preview", False, True),
+        ("cycle-finalize", "collect_live_running_state", False, True),
+    ],
+)
+def test_run_cycle_phase_records_done_when_phase_operation_raises(
+    tmp_path: Path,
+    phase: str,
+    raise_from: str,
+    direct_phase_only: bool,
+    dry_run: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    sentinel = RuntimeError(f"{phase} failed")
+
+    owner = store.add(f"{phase} owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = f"feature/watch-{phase}"
+    owner.has_commits = True
+    owner.merge_status = "unmerged"
+    store.update(owner)
+
+    row = LineageOwnerRow(
+        owner_task=owner,
+        members=(owner,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="reconcile_branch_divergence",
+        unresolved_tasks=(owner,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=owner if raise_from == "plan_lifecycle_execution" else None,
+        recovery_action_task=owner if raise_from == "execute_recovery_action" else None,
+        recovery_leaf_task=owner if raise_from == "execute_recovery_action" else None,
+    )
+    recovery_decision = FailedRecoveryDecision(
+        task_id=owner.id,
+        action="retry",
+        reason_code="watch-test",
+        reason_text="watch test",
+        launch_mode="none",
+        attempt_index=1,
+        attempt_limit=1,
+    )
+    action_plan = ()
+    if raise_from == "plan_lifecycle_execution":
+        action_plan = (
+            (row, owner, {"type": "reconcile_branch_divergence", "description": "Reconcile branch publication"}),
+        )
+    actionable_failed = ()
+    if raise_from == "execute_recovery_action":
+        actionable_failed = (
+            (
+                row,
+                owner,
+                recovery_decision,
+                {"type": "reconcile_branch_divergence", "description": "Reconcile branch publication"},
+                False,
+                owner,
+            ),
+        )
+    plan = _WatchCyclePlan(
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        pending_count=0,
+        blocked_pending_count=0,
+        running=0,
+        effective_batch=1,
+        slots=1,
+        analysis=_WatchCycleAnalysis(
+            target_branch="main",
+            scope_gaps=(),
+            owner_rows=(row,),
+            watch_read_context=RecoveryReadContext(),
+            lifecycle_rows=(row,) if action_plan else (),
+            recovery_rows=(row,) if actionable_failed else (),
+            recovery_lane_entry_by_failed_id={},
+            action_plan=action_plan,
+            recovery_attention_rows=(),
+            recovery_visible_skips=(),
+            actionable_failed=actionable_failed,
+            pending_recovery_task_ids=frozenset(),
+        ),
+    )
+
+    def _dispatch_preview(*_args: object, **kwargs: object) -> DispatchPreview:
+        if raise_from == "recovery_plan_preview" and kwargs.get("include_recovery") is not False:
+            raise sentinel
+        if raise_from == "pending_dispatch_preview" and kwargs.get("include_recovery") is False:
+            raise sentinel
+        return DispatchPreview(entries=())
+
+    def _execute_advance_action(*_args: object, **_kwargs: object) -> AdvanceActionExecutionResult:
+        if raise_from == "execute_recovery_action":
+            raise sentinel
+        return AdvanceActionExecutionResult(
+            action_type="reconcile_branch_divergence",
+            status="success",
+            message="Reconciled",
+            worker_label="worker",
+            worker_consuming=False,
+        )
+
+    live_state = ([], [], 0, 0)
+
+    def _collect_live_state(*_args: object, **_kwargs: object) -> tuple[list[object], list[object], int, int]:
+        if raise_from == "collect_live_running_state":
+            raise sentinel
+        return live_state
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch(
+            "gza.cli.watch.check_canonical_checkout_invariant",
+            return_value=SimpleNamespace(
+                restored=False,
+                needs_attention=False,
+                dirty_tracked_paths=[],
+                current_branch="main",
+                expected_branch="main",
+            ),
+        ),
+        patch("gza.cli.watch.plan_lifecycle_execution", side_effect=sentinel)
+        if raise_from == "plan_lifecycle_execution"
+        else contextlib.nullcontext(),
+        patch("gza.cli.watch.build_dispatch_preview", side_effect=_dispatch_preview),
+        patch("gza.cli.watch._maybe_park_watch_no_progress", return_value=None),
+        patch("gza.cli.watch.execute_advance_action", side_effect=_execute_advance_action),
+        patch("gza.cli.watch._collect_live_running_state", side_effect=_collect_live_state),
+        pytest.raises(RuntimeError) as raised,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=dry_run,
+            log=log,
+            precomputed_plan=plan,
+            direct_phase_only=direct_phase_only,
+            skip_runtime_reconcile=True,
+            skip_stale_no_progress_reconcile=True,
+        )
+
+    assert raised.value is sentinel
+    log_text = log_path.read_text()
+    assert f"START     {phase} cycle" in log_text
+    assert re.search(rf"DONE      {re.escape(phase)} cycle elapsed \d+s", log_text)
+
+
+def _run_empty_scoped_cycle_for_phase_order(
+    tmp_path: Path,
+    *,
+    direct_phase_only: bool,
+) -> str:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    owner = store.add("Scoped owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = "feature/scoped-phase-order"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    store.update(owner)
+    plan = _empty_scoped_watch_plan_with_effective_scope((owner.id,))
+
+    with (
+        patch("gza.cli.watch._build_watch_cycle_plan", return_value=plan),
+        patch(
+            "gza.cli.watch.check_canonical_checkout_invariant",
+            return_value=SimpleNamespace(
+                restored=False,
+                needs_attention=False,
+                dirty_tracked_paths=[],
+                current_branch="main",
+                expected_branch="main",
+            ),
+        ),
+        patch(
+            "gza.cli.watch._run_watch_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+        patch("gza.cli.watch.build_dispatch_preview", return_value=DispatchPreview(entries=())),
+        patch("gza.cli.watch._collect_live_running_state", return_value=([], [], 0, 0)),
+    ):
+        result = _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+            precomputed_plan=plan,
+            direct_phase_only=direct_phase_only,
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(owner.id,),
+            skip_runtime_reconcile=True,
+            skip_stale_no_progress_reconcile=True,
+            git=_make_watch_git(),
+        )
+
+    assert result.scoped_done is True
+    return log_path.read_text()
+
+
+def test_run_cycle_scoped_direct_completion_analysis_finishes_before_finalize(
+    tmp_path: Path,
+) -> None:
+    log_text = _run_empty_scoped_cycle_for_phase_order(tmp_path, direct_phase_only=True)
+
+    events = _cycle_phase_events(log_text)
+    assert events.index(("START", "scoped-completion-analysis")) < events.index(
+        ("DONE", "scoped-completion-analysis")
+    )
+    assert events.index(("DONE", "scoped-completion-analysis")) < events.index(("START", "cycle-finalize"))
+    _assert_cycle_level_phases_do_not_overlap(log_text)
+
+
+def test_run_cycle_scoped_normal_completion_analysis_finishes_before_finalize(
+    tmp_path: Path,
+) -> None:
+    log_text = _run_empty_scoped_cycle_for_phase_order(tmp_path, direct_phase_only=False)
+
+    events = _cycle_phase_events(log_text)
+    assert events.index(("START", "scoped-completion-analysis")) < events.index(
+        ("DONE", "scoped-completion-analysis")
+    )
+    assert events.index(("DONE", "scoped-completion-analysis")) < events.index(("START", "cycle-finalize"))
+    _assert_cycle_level_phases_do_not_overlap(log_text)
+
+
+def test_run_cycle_scoped_completion_analysis_done_when_selector_recovery_closure_raises(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    owner = store.add("Scoped owner", task_type="implement")
+    assert owner.id is not None
+    owner.status = "completed"
+    owner.completed_at = datetime.now(UTC)
+    owner.branch = "feature/scoped-phase-failure"
+    owner.has_commits = True
+    owner.merge_status = "merged"
+    store.update(owner)
+    plan = _empty_scoped_watch_plan_with_effective_scope((owner.id,))
+    sentinel = RuntimeError("selector closure failed")
+    start_seen_before_failure = False
+
+    def fail_selector_recovery_closure(**_kwargs: object) -> dict[str, frozenset[str]]:
+        nonlocal start_seen_before_failure
+        start_seen_before_failure = "START     scoped-completion-analysis cycle" in log_path.read_text()
+        raise sentinel
+
+    with (
+        patch("gza.cli.watch._build_watch_cycle_plan", return_value=plan),
+        patch("gza.cli.watch._scoped_selector_recovery_closure_by_owner", side_effect=fail_selector_recovery_closure),
+        patch(
+            "gza.cli.watch.check_canonical_checkout_invariant",
+            return_value=SimpleNamespace(
+                restored=False,
+                needs_attention=False,
+                dirty_tracked_paths=[],
+                current_branch="main",
+                expected_branch="main",
+            ),
+        ),
+        patch(
+            "gza.cli.watch._run_watch_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, state=SimpleNamespace(task=None, alert_message=None)),
+        ),
+        pytest.raises(RuntimeError) as raised,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+            precomputed_plan=plan,
+            direct_phase_only=True,
+            scoped_owner_ids=(owner.id,),
+            scoped_task_ids=(owner.id,),
+            skip_runtime_reconcile=True,
+            skip_stale_no_progress_reconcile=True,
+            git=_make_watch_git(),
+        )
+
+    assert raised.value is sentinel
+    log_text = log_path.read_text()
+    assert start_seen_before_failure is True
+    assert "START     scoped-completion-analysis cycle" in log_text
+    assert re.search(r"DONE      scoped-completion-analysis cycle elapsed \d+s", log_text)
+    assert "START     cycle-finalize cycle" not in log_text
+    _assert_cycle_level_phases_do_not_overlap(log_text)
+
+
+def test_run_cycle_lifecycle_preflight_records_done_when_canonical_checkout_raises(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    sentinel = RuntimeError("canonical checkout failed")
+    start_seen_before_operation = False
+
+    def _raise_from_canonical_checkout(*_args: object, **_kwargs: object) -> object:
+        nonlocal start_seen_before_operation
+        start_seen_before_operation = "START     lifecycle-preflight cycle" in log_path.read_text()
+        raise sentinel
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli._common.reconcile_dead_pending_recovery_tasks"),
+        patch("gza.cli.watch.check_canonical_checkout_invariant", side_effect=_raise_from_canonical_checkout),
+        pytest.raises(RuntimeError) as raised,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+            precomputed_plan=_empty_scoped_watch_plan(),
+            direct_phase_only=True,
+            skip_runtime_reconcile=True,
+            skip_stale_no_progress_reconcile=True,
+            git=_make_watch_git(),
+        )
+
+    assert raised.value is sentinel
+    assert start_seen_before_operation is True
+    log_text = log_path.read_text()
+    assert "START     lifecycle-preflight cycle" in log_text
+    assert re.search(r"DONE      lifecycle-preflight cycle elapsed \d+s", log_text)
 
 
 def test_watch_long_phase_reporter_does_not_report_partial_heartbeat_as_last_run(tmp_path: Path) -> None:
@@ -4943,7 +5668,9 @@ def test_watch_worker_heartbeat_uses_fake_darwin_descendant_cpu_progress(tmp_pat
     log_file = tmp_path / task.log_file
     log_file.parent.mkdir(parents=True, exist_ok=True)
     log_file.write_text("start\n")
-    _register_watch_worker(config, worker_id="w-darwin", task_id=str(task.id), started_at=task.started_at, log_file=task.log_file)
+    _register_watch_worker(
+        config, worker_id="w-darwin", task_id=str(task.id), started_at=task.started_at, log_file=task.log_file
+    )
     log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
     ps_outputs = iter(
         [
@@ -4994,7 +5721,9 @@ def test_watch_worker_heartbeat_reports_concurrent_workers_independently(tmp_pat
         path = tmp_path / task.log_file
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("start\n")
-        _register_watch_worker(config, worker_id=f"w-{name}", task_id=str(task.id), started_at=started_at, log_file=task.log_file)
+        _register_watch_worker(
+            config, worker_id=f"w-{name}", task_id=str(task.id), started_at=started_at, log_file=task.log_file
+        )
     log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
     now = 1000.0
     monitor = _WatchWorkerHeartbeatMonitor(
@@ -6203,8 +6932,12 @@ def test_watch_supervisor_dispatch_lanes_reserve_recovery_from_one_global_budget
 ) -> None:
     runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
     runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
-    a_recovery = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
-    b_recovery = _runtime_candidate(runtime_b, runtime_b.store.add("B recovery", task_type="implement"), lane="recovery")
+    a_recovery = _runtime_candidate(
+        runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery"
+    )
+    b_recovery = _runtime_candidate(
+        runtime_b, runtime_b.store.add("B recovery", task_type="implement"), lane="recovery"
+    )
     a_pending = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
     b_pending = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
 
@@ -6232,8 +6965,12 @@ def test_watch_supervisor_dispatch_lanes_recovery_only_uses_all_free_capacity_an
 ) -> None:
     runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
     runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
-    a_recovery = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
-    b_recovery = _runtime_candidate(runtime_b, runtime_b.store.add("B recovery", task_type="implement"), lane="recovery")
+    a_recovery = _runtime_candidate(
+        runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery"
+    )
+    b_recovery = _runtime_candidate(
+        runtime_b, runtime_b.store.add("B recovery", task_type="implement"), lane="recovery"
+    )
     a_pending = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
 
     with contextlib.ExitStack() as stack:
@@ -6259,7 +6996,9 @@ def test_watch_supervisor_dispatch_lanes_pending_only_disables_global_recovery_l
 ) -> None:
     runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
     runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
-    a_recovery = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
+    a_recovery = _runtime_candidate(
+        runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery"
+    )
     a_pending = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
     b_pending = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
 
@@ -6383,7 +7122,9 @@ def test_watch_supervisor_dispatch_lanes_donate_unused_recovery_capacity_to_pend
 ) -> None:
     runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
     runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
-    a_recovery = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
+    a_recovery = _runtime_candidate(
+        runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery"
+    )
     a_pending_1 = _runtime_candidate(runtime_a, runtime_a.store.add("A pending 1", task_type="plan"), lane="pending")
     a_pending_2 = _runtime_candidate(runtime_a, runtime_a.store.add("A pending 2", task_type="plan"), lane="pending")
     b_pending = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
@@ -6418,7 +7159,9 @@ def test_watch_supervisor_dispatch_lanes_reuse_capacity_without_exceeding_runtim
 ) -> None:
     runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
     runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
-    a_recovery = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
+    a_recovery = _runtime_candidate(
+        runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery"
+    )
     a_pending = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
     b_pending = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
     local_occupancy = {
@@ -6476,8 +7219,12 @@ def test_watch_supervisor_lane_planning_does_not_mutate_strategy_state(
 ) -> None:
     runtime_a = _make_aggregate_runtime(tmp_path / f"{lane}-{strategy_name}-a", project_name="a")
     runtime_b = _make_aggregate_runtime(tmp_path / f"{lane}-{strategy_name}-b", project_name="b")
-    recovery_a = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
-    recovery_b = _runtime_candidate(runtime_b, runtime_b.store.add("B recovery", task_type="implement"), lane="recovery")
+    recovery_a = _runtime_candidate(
+        runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery"
+    )
+    recovery_b = _runtime_candidate(
+        runtime_b, runtime_b.store.add("B recovery", task_type="implement"), lane="recovery"
+    )
     pending_a = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
     pending_b = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
     weights = {"a": 2, "b": 1} if strategy_name == "weighted-round-robin" else None
@@ -6495,17 +7242,11 @@ def test_watch_supervisor_lane_planning_does_not_mutate_strategy_state(
         strategy if lane == "pending" else create_watch_dispatch_strategy("project-priority", project_order=("a", "b"))
     )
     recovery_slots_config = 2 if lane == "recovery" else 0
-    recovery_mode: Literal["recovery_only", "pending_only"] = (
-        "recovery_only" if lane == "recovery" else "pending_only"
-    )
+    recovery_mode: Literal["recovery_only", "pending_only"] = "recovery_only" if lane == "recovery" else "pending_only"
 
     with contextlib.ExitStack() as stack:
-        stack.enter_context(
-            _patch_runtime_lane_candidates(runtime_a, recovery=(recovery_a,), pending=(pending_a,))
-        )
-        stack.enter_context(
-            _patch_runtime_lane_candidates(runtime_b, recovery=(recovery_b,), pending=(pending_b,))
-        )
+        stack.enter_context(_patch_runtime_lane_candidates(runtime_a, recovery=(recovery_a,), pending=(pending_a,)))
+        stack.enter_context(_patch_runtime_lane_candidates(runtime_b, recovery=(recovery_b,), pending=(pending_b,)))
         plan_watch_supervisor_dispatch_lanes(
             [runtime_a, runtime_b],
             dispatch_slots=2,
@@ -6523,8 +7264,12 @@ def test_watch_supervisor_preview_does_not_change_following_incremental_recovery
     tmp_path: Path,
 ) -> None:
     def run(preview_first: bool) -> list[tuple[str, str]]:
-        runtime_a = _make_aggregate_runtime(tmp_path / ("preview" if preview_first else "direct") / "a", project_name="a")
-        runtime_b = _make_aggregate_runtime(tmp_path / ("preview" if preview_first else "direct") / "b", project_name="b")
+        runtime_a = _make_aggregate_runtime(
+            tmp_path / ("preview" if preview_first else "direct") / "a", project_name="a"
+        )
+        runtime_b = _make_aggregate_runtime(
+            tmp_path / ("preview" if preview_first else "direct") / "b", project_name="b"
+        )
         recovery_a = _runtime_candidate(
             runtime_a,
             runtime_a.store.add("A recovery", task_type="implement"),
@@ -6559,12 +7304,8 @@ def test_watch_supervisor_preview_does_not_change_following_incremental_recovery
             )
 
         with contextlib.ExitStack() as stack:
-            stack.enter_context(
-                _patch_runtime_lane_candidates(runtime_a, recovery=(recovery_a,), pending=(pending_a,))
-            )
-            stack.enter_context(
-                _patch_runtime_lane_candidates(runtime_b, recovery=(recovery_b,), pending=(pending_b,))
-            )
+            stack.enter_context(_patch_runtime_lane_candidates(runtime_a, recovery=(recovery_a,), pending=(pending_a,)))
+            stack.enter_context(_patch_runtime_lane_candidates(runtime_b, recovery=(recovery_b,), pending=(pending_b,)))
             if preview_first:
                 plan_watch_supervisor_dispatch_lanes(
                     [runtime_a, runtime_b],
@@ -6611,8 +7352,12 @@ def test_watch_supervisor_recovery_lane_reuses_slot_after_not_dispatchable_head(
 ) -> None:
     runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
     runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
-    candidate_a = _runtime_candidate(runtime_a, runtime_a.store.add("A stale recovery", task_type="implement"), lane="recovery")
-    candidate_b = _runtime_candidate(runtime_b, runtime_b.store.add("B fills recovery slot", task_type="implement"), lane="recovery")
+    candidate_a = _runtime_candidate(
+        runtime_a, runtime_a.store.add("A stale recovery", task_type="implement"), lane="recovery"
+    )
+    candidate_b = _runtime_candidate(
+        runtime_b, runtime_b.store.add("B fills recovery slot", task_type="implement"), lane="recovery"
+    )
     budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=1)
     selections: list[str] = []
 
@@ -6671,7 +7416,9 @@ def test_watch_supervisor_recovery_lane_refreshes_selected_runtime_head_after_su
 ) -> None:
     runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
     first = _runtime_candidate(runtime, runtime.store.add("First recovery", task_type="implement"), lane="recovery")
-    second = _runtime_candidate(runtime, runtime.store.add("Refreshed recovery", task_type="implement"), lane="recovery")
+    second = _runtime_candidate(
+        runtime, runtime.store.add("Refreshed recovery", task_type="implement"), lane="recovery"
+    )
     budget = SupervisorLaunchBudget([runtime], supervisor_batch=2)
     dispatched: list[str] = []
     head_calls: list[str] = []
@@ -6725,7 +7472,9 @@ def test_watch_supervisor_donates_recovery_capacity_to_pending_after_recovery_he
 ) -> None:
     runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
     recovery = _runtime_candidate(runtime, runtime.store.add("Only recovery", task_type="implement"), lane="recovery")
-    pending = _runtime_candidate(runtime, runtime.store.add("Pending after recovery drain", task_type="plan"), lane="pending")
+    pending = _runtime_candidate(
+        runtime, runtime.store.add("Pending after recovery drain", task_type="plan"), lane="pending"
+    )
     budget = SupervisorLaunchBudget([runtime], supervisor_batch=2)
     recovery_drained = False
 
@@ -6790,9 +7539,15 @@ def test_watch_supervisor_virtual_recovery_start_reduces_pending_capacity(
 ) -> None:
     runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
     runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
-    recovery = _runtime_candidate(runtime_a, runtime_a.store.add("Recovery dry-run", task_type="implement"), lane="recovery")
-    pending_a = _runtime_candidate(runtime_a, runtime_a.store.add("Pending A dry-run", task_type="plan"), lane="pending")
-    pending_b = _runtime_candidate(runtime_b, runtime_b.store.add("Pending B dry-run", task_type="plan"), lane="pending")
+    recovery = _runtime_candidate(
+        runtime_a, runtime_a.store.add("Recovery dry-run", task_type="implement"), lane="recovery"
+    )
+    pending_a = _runtime_candidate(
+        runtime_a, runtime_a.store.add("Pending A dry-run", task_type="plan"), lane="pending"
+    )
+    pending_b = _runtime_candidate(
+        runtime_b, runtime_b.store.add("Pending B dry-run", task_type="plan"), lane="pending"
+    )
     budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=2)
 
     def recovery_head(**_kwargs: object) -> ProjectDispatchCandidate | None:
@@ -6850,7 +7605,9 @@ def test_watch_supervisor_incremental_dry_run_preserves_strategy_and_pending_hea
     tmp_path: Path,
     strategy_name: str,
 ) -> None:
-    def build_case(case_name: str) -> tuple[
+    def build_case(
+        case_name: str,
+    ) -> tuple[
         WatchProjectRuntime,
         WatchProjectRuntime,
         ProjectDispatchCandidate,
@@ -6994,7 +7751,9 @@ def test_watch_supervisor_dry_run_recovery_start_consumes_runtime_capacity_befor
 ) -> None:
     runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a", max_concurrent=1)
     runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b", max_concurrent=1)
-    recovery_a = _runtime_candidate(runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery")
+    recovery_a = _runtime_candidate(
+        runtime_a, runtime_a.store.add("A recovery", task_type="implement"), lane="recovery"
+    )
     pending_a = _runtime_candidate(runtime_a, runtime_a.store.add("A pending", task_type="plan"), lane="pending")
     pending_b = _runtime_candidate(runtime_b, runtime_b.store.add("B pending", task_type="plan"), lane="pending")
     budget = SupervisorLaunchBudget([runtime_a, runtime_b], supervisor_batch=2, dry_run=True)
@@ -7218,13 +7977,17 @@ def test_watch_supervisor_weighted_strategy_records_actual_incremental_selection
 ) -> None:
     runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
     runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
-    stale_a = _runtime_candidate(runtime_a, runtime_a.store.add("A stale recovery", task_type="implement"), lane="recovery")
+    stale_a = _runtime_candidate(
+        runtime_a, runtime_a.store.add("A stale recovery", task_type="implement"), lane="recovery"
+    )
     replacement_a = _runtime_candidate(
         runtime_a,
         runtime_a.store.add("A stale preplanned replacement", task_type="implement"),
         lane="recovery",
     )
-    candidate_b = _runtime_candidate(runtime_b, runtime_b.store.add("B actual recovery", task_type="implement"), lane="recovery")
+    candidate_b = _runtime_candidate(
+        runtime_b, runtime_b.store.add("B actual recovery", task_type="implement"), lane="recovery"
+    )
     strategy = create_watch_dispatch_strategy(
         "weighted-round-robin",
         project_order=("a", "b"),
@@ -11093,7 +11856,7 @@ def test_watch_cycle_recovery_only_direct_reconcile_blocks_pending_pickup(
     spawn_worker.assert_not_called()
     log_text = log_path.read_text()
     assert "RECOVR" in log_text
-    assert "START" not in log_text
+    assert _non_cycle_start_lines(log_text) == []
     assert str(pending_plan.id) not in log_text
 
 
@@ -11775,7 +12538,7 @@ def test_watch_cycle_planned_recovery_mapping_drift_fails_closed_without_pending
     assert "watch stopped further dispatch for this pass" in log_text
     assert str(planned_only_failed.id) in log_text
     assert str(pending_plan.id) not in log_text
-    assert "START" not in log_text
+    assert _non_cycle_start_lines(log_text) == []
 
 
 def test_watch_cycle_replan_executes_resume_recovery_entries(
@@ -13677,6 +14440,7 @@ def test_watch_cycle_pending_wave_settles_two_unproven_starts_in_single_window(t
         patch("gza.cli.watch.time.monotonic", side_effect=lambda: next(monotonic_values)),
         patch("gza.cli.watch.time.sleep", side_effect=lambda seconds: sleep_calls.append(seconds)),
         patch("gza.cli.watch._settle_watch_dispatch_starts", wraps=_REAL_SETTLE_WATCH_DISPATCH_STARTS) as settle_spy,
+        patch("gza.cli.watch._start_watch_cycle_phase", return_value=SimpleNamespace(finish=lambda: None)),
     ):
         result = _run_cycle(
             config=config,
@@ -20724,7 +21488,9 @@ def test_watch_cycle_isolated_batch_persists_prepared_attempt_before_promotion(
     merge_git = MagicMock(name="isolated_batch_git")
     merge_git.repo_dir = config.main_checkout_integration_path
     merge_git.rev_parse.return_value = "candidate-head"
-    merge_git.rev_parse_if_exists.side_effect = lambda ref: "watchtestsourcesha" if ref == task.branch else "candidate-head"
+    merge_git.rev_parse_if_exists.side_effect = lambda ref: (
+        "watchtestsourcesha" if ref == task.branch else "candidate-head"
+    )
     decision = SimpleNamespace(item=(SimpleNamespace(owner_task=task), task, action), action=action)
 
     def promote_side_effect(*_args: object, **_kwargs: object) -> tuple[()]:
@@ -20839,7 +21605,9 @@ def test_watch_cycle_isolated_batch_prepared_attempt_failure_aborts_before_promo
     merge_git = MagicMock(name="isolated_batch_git")
     merge_git.repo_dir = config.main_checkout_integration_path
     merge_git.rev_parse.return_value = "candidate-head"
-    merge_git.rev_parse_if_exists.side_effect = lambda ref: "watchtestsourcesha" if ref == task.branch else "candidate-head"
+    merge_git.rev_parse_if_exists.side_effect = lambda ref: (
+        "watchtestsourcesha" if ref == task.branch else "candidate-head"
+    )
     decision = SimpleNamespace(item=(SimpleNamespace(owner_task=task), task, action), action=action)
 
     with (
@@ -20965,7 +21733,9 @@ def test_watch_cycle_isolated_batch_checkpoint_failure_recovers_as_missing_proof
     merge_git = MagicMock(name="isolated_batch_git")
     merge_git.repo_dir = config.main_checkout_integration_path
     merge_git.rev_parse.return_value = "candidate-head"
-    merge_git.rev_parse_if_exists.side_effect = lambda ref: "watchtestsourcesha" if ref == task.branch else "candidate-head"
+    merge_git.rev_parse_if_exists.side_effect = lambda ref: (
+        "watchtestsourcesha" if ref == task.branch else "candidate-head"
+    )
     decision = SimpleNamespace(item=(SimpleNamespace(owner_task=task), task, action), action=action)
 
     with (
@@ -21337,8 +22107,7 @@ def test_watch_cycle_isolated_batch_ordinary_followup_partial_failure_replays_mi
         ("promotion", "isolated merge batch promotion failed: promote failed"),
         (
             "checkpoint",
-            "isolated merge batch checkpoint persistence failed after target promotion: "
-            "checkpoint locked",
+            "isolated merge batch checkpoint persistence failed after target promotion: checkpoint locked",
         ),
         (
             "finalization",
@@ -21595,7 +22364,9 @@ def test_watch_cycle_isolated_batch_later_failure_reused_only_logs_without_work_
         patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
         patch(
             "gza.cli.watch._materialize_max_cycle_deferred_blockers_for_staged_action",
-            return_value=replace(staged, reused_followups=(reused_followup,), reused_deferred_blockers=(reused_blocker,)),
+            return_value=replace(
+                staged, reused_followups=(reused_followup,), reused_deferred_blockers=(reused_blocker,)
+            ),
         ),
         patch("gza.cli.watch._promote_isolated_merge_to_target_branch", side_effect=GitError("promote failed")),
     ):
@@ -21827,18 +22598,25 @@ def test_watch_cycle_isolated_batch_post_promotion_failure_replay_records_action
         return real_finalize(*args, **kwargs)
 
     decisions = [
-        SimpleNamespace(item=(SimpleNamespace(owner_task=task), task, actions[str(task.id)]), action=actions[str(task.id)])
+        SimpleNamespace(
+            item=(SimpleNamespace(owner_task=task), task, actions[str(task.id)]), action=actions[str(task.id)]
+        )
         for task in tasks
     ]
 
     with (
-        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=lambda *args, **_kwargs: staged_entries[args[3].id]),
+        patch(
+            "gza.cli.watch._stage_isolated_merge_action",
+            side_effect=lambda *args, **_kwargs: staged_entries[args[3].id],
+        ),
         patch(
             "gza.cli.watch.check_candidate_integration_verify",
             return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
         ),
         patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
-        patch("gza.cli.watch._materialize_max_cycle_deferred_blockers_for_staged_action", side_effect=materialize_reused),
+        patch(
+            "gza.cli.watch._materialize_max_cycle_deferred_blockers_for_staged_action", side_effect=materialize_reused
+        ),
         patch("gza.cli.watch._promote_isolated_merge_to_target_branch", return_value=()),
         patch(
             "gza.cli.watch.promote_candidate_integration_verify_evidence",
@@ -36884,7 +37662,7 @@ def test_watch_cycle_skips_parked_retry_limit_lineage_without_recomputing_or_spa
     log_text = log_path.read_text()
     assert "ATTENTION" in log_text
     assert "reason=retry-limit-reached" in log_text
-    assert not any(line.split(maxsplit=2)[1] == "START" for line in log_text.splitlines())
+    assert _non_cycle_start_lines(log_text) == []
 
 
 def test_blind_parked_auto_rearm_skips_unchanged_target_sha_without_spending_attempt(tmp_path: Path) -> None:
@@ -37288,7 +38066,7 @@ def test_watch_cycle_surfaces_verify_noop_branch_tip_attention_once_without_resp
     assert text.count("1 task still need attention (unchanged)") == 1
     assert f"reason={PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE}" in text
     assert str(impl.id) in text
-    assert "START" not in text
+    assert _non_cycle_start_lines(text) == []
 
 
 def test_watch_dry_run_surfaces_resolution_review_metadata_attention(
@@ -37380,7 +38158,7 @@ def test_watch_dry_run_surfaces_resolution_review_metadata_attention(
     assert f"{impl.id}->verify_gate" in text.replace("→", "->")
     assert "resolution-review-metadata-invalid" not in text
     assert str(impl.id) in text
-    assert "START" not in text
+    assert _non_cycle_start_lines(text) == []
 
 
 def test_watch_cycle_does_not_rerun_verify_only_noop_recovery_after_parked_attention(
@@ -39483,7 +40261,7 @@ def test_run_cycle_pending_dispatch_refreshes_live_proof_before_no_progress_muta
     assert result.work_done is False
     assert store.get(pending.id).status == "pending"
     assert store.list_watch_progress_observations(subject_kind="task", subject_id=pending.id) == []
-    assert "START " not in (tmp_path / ".gza" / "watch.log").read_text()
+    assert _non_cycle_start_lines((tmp_path / ".gza" / "watch.log").read_text()) == []
 
 
 def test_run_cycle_pending_implement_releases_permit_when_live_proof_appears_after_acquire(
@@ -39526,7 +40304,7 @@ def test_run_cycle_pending_implement_releases_permit_when_live_proof_appears_aft
     assert no_progress.call_count == 1
     assert permit.released is True
     assert store.get(pending.id).status == "pending"
-    assert "START " not in (tmp_path / ".gza" / "watch.log").read_text()
+    assert _non_cycle_start_lines((tmp_path / ".gza" / "watch.log").read_text()) == []
 
 
 def test_run_cycle_pending_implement_releases_prepared_reservation_when_live_proof_appears_before_spawn(
@@ -39565,7 +40343,7 @@ def test_run_cycle_pending_implement_releases_prepared_reservation_when_live_pro
     release_reserved.assert_called_once_with(pending.id)
     assert permit.released is True
     assert store.get(pending.id).status == "pending"
-    assert "START " not in (tmp_path / ".gza" / "watch.log").read_text()
+    assert _non_cycle_start_lines((tmp_path / ".gza" / "watch.log").read_text()) == []
 
 
 def test_run_cycle_pending_non_implement_rechecks_live_proof_after_snapshot_before_spawn(
@@ -39601,7 +40379,7 @@ def test_run_cycle_pending_non_implement_rechecks_live_proof_after_snapshot_befo
 
     assert result.work_done is False
     assert store.get(pending.id).status == "pending"
-    assert "START " not in (tmp_path / ".gza" / "watch.log").read_text()
+    assert _non_cycle_start_lines((tmp_path / ".gza" / "watch.log").read_text()) == []
 
 
 class _RuntimeDispatchPermit:
@@ -40115,9 +40893,7 @@ def test_watch_project_runtime_dispatch_uses_activation_snapshot_after_env_mutat
     setup_config(tmp_path)
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(
-        config_path.read_text(encoding="utf-8")
-        + "project_id: runtimesnapshot\n"
-        + "project_prefix: runtimesnap\n",
+        config_path.read_text(encoding="utf-8") + "project_id: runtimesnapshot\n" + "project_prefix: runtimesnap\n",
         encoding="utf-8",
     )
     (tmp_path / ".env").write_text("PATH=/activated/bin\nTOKEN=activated\n", encoding="utf-8")
@@ -40482,7 +41258,7 @@ def test_watch_project_runtime_pending_dispatch_validates_route_before_reporting
     assert "BLOCKED" in log_text
     assert "'model' is required" in log_text
     assert "provider 'claude'" in log_text
-    assert "START" not in log_text
+    assert _non_cycle_start_lines(log_text) == []
     assert "[dry-run]" not in log_text
 
     next_head = runtime.pending_dispatch_head(max_recovery_attempts=1)
@@ -40539,7 +41315,7 @@ def test_watch_project_runtime_run_cycle_pending_validates_route_before_reportin
     assert "BLOCKED" in log_text
     assert "'model' is required" in log_text
     assert "provider 'claude'" in log_text
-    assert "START" not in log_text
+    assert _non_cycle_start_lines(log_text) == []
     assert "[dry-run]" not in log_text
 
 
@@ -41345,8 +42121,7 @@ def test_supervisor_dispatch_holds_global_reservation_while_waiting_on_real_loca
             assert first_attempting_local_permit.wait(timeout=1)
             assert not first_acquired_local_permit.is_set()
             assert [
-                (reservation.runtime_key, reservation.task_id)
-                for reservation in budget._reservations.values()
+                (reservation.runtime_key, reservation.task_id) for reservation in budget._reservations.values()
             ] == [(runtime_a.key, task_a.id)]
 
             competing_thread.start()
@@ -42245,7 +43020,7 @@ def test_watch_project_runtime_rejects_deleted_pending_candidate_before_reportin
     assert result.status == "not_dispatchable"
     assert result.work_done is False
     log_path = tmp_path / ".gza" / "watch-runtime.log"
-    assert not log_path.exists() or "START" not in log_path.read_text()
+    assert not log_path.exists() or _non_cycle_start_lines(log_path.read_text()) == []
 
 
 def test_watch_project_runtime_rejects_foreign_candidate_before_store_mutation_or_launch(
@@ -42318,7 +43093,7 @@ def test_watch_project_runtime_rejects_same_key_foreign_candidate_before_reporti
     assert store_a.get(pending_a.id).status == "pending"
     assert store_b.get(pending_b.id).status == "pending"
     log_path = project_a / ".gza" / "watch-runtime.log"
-    assert not log_path.exists() or "START" not in log_path.read_text()
+    assert not log_path.exists() or _non_cycle_start_lines(log_path.read_text()) == []
 
 
 @pytest.mark.parametrize("dry_run", [True, False])
@@ -42347,7 +43122,7 @@ def test_watch_project_runtime_rejects_replaced_runtime_candidate_before_reporti
     assert result.work_done is False
     assert store.get(pending.id).status == "pending"
     log_path = tmp_path / ".gza" / "watch-runtime.log"
-    assert not log_path.exists() or "START" not in log_path.read_text()
+    assert not log_path.exists() or _non_cycle_start_lines(log_path.read_text()) == []
 
 
 def test_watch_project_runtime_pending_dispatch_uses_owning_config_store_and_registry(
@@ -45968,7 +46743,7 @@ def test_watch_cycle_improve_transient_terminal_defers_same_cycle_relaunch(
     log_text = log_path.read_text()
     assert "BACKOFF" in log_text
     assert f"{impl.id} improve delayed 60s" in log_text
-    assert "START" not in log_text
+    assert _non_cycle_start_lines(log_text) == []
 
 
 def test_watch_cycle_pending_improve_retry_respects_active_transient_backoff_without_observation(
@@ -50258,7 +51033,7 @@ def test_watch_cycle_logs_one_quiet_skip_per_stable_hold_window(tmp_path: Path) 
     assert len(quiet_skip_lines) == 1
     assert older_quiet.id in quiet_skip_lines[0]
     assert newer_quiet.id not in quiet_skip_lines[0]
-    assert "START" not in log_path.read_text()
+    assert _non_cycle_start_lines(log_path.read_text()) == []
     spawn_iterate.assert_not_called()
     spawn_worker.assert_not_called()
 
@@ -50732,9 +51507,7 @@ def test_watch_reexec_argv_preserves_keyed_selector_inputs_for_reparse(tmp_path:
     assert "--watch-tag" in argv
     assert "--watch-all-tags" in argv
     assert "--watch-weight" in argv
-    assert ["--strategy", "weighted-round-robin"] == argv[
-        argv.index("--strategy") : argv.index("--strategy") + 2
-    ]
+    assert ["--strategy", "weighted-round-robin"] == argv[argv.index("--strategy") : argv.index("--strategy") + 2]
     assert "--tag" not in argv
     assert "--all-tags" not in argv
 
@@ -50866,9 +51639,7 @@ def test_watch_reexec_argv_preserves_explicit_cli_global_override_as_override(
 
     assert ["--watch-config", str(manifest_path)] == argv[6:8]
     assert ["--batch", "2"] == argv[argv.index("--batch") : argv.index("--batch") + 2]
-    assert ["--recovery-slots", "0"] == argv[
-        argv.index("--recovery-slots") : argv.index("--recovery-slots") + 2
-    ]
+    assert ["--recovery-slots", "0"] == argv[argv.index("--recovery-slots") : argv.index("--recovery-slots") + 2]
 
 
 def test_cmd_watch_resumed_reexec_adopts_same_token_live_watch_lease(tmp_path: Path) -> None:
@@ -51059,6 +51830,77 @@ def test_cmd_watch_scoped_planning_and_execution_use_runtime_owned_git_without_r
     git_ctor.assert_called_once()
     assert git_ctor.call_args.args == (tmp_path,)
     assert git_ctor.call_args.kwargs["env"]["GZA_DB_PATH"] == str((tmp_path / ".gza" / "gza.db").resolve())
+
+
+def test_cmd_watch_scoped_boundary_precompute_reports_cycle_plan_before_plan_construction(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    scoped = store.add("Scoped owner", task_type="implement")
+    assert scoped.id is not None
+    log_path = tmp_path / ".gza" / "watch.log"
+    args = _watch_args(tmp_path, [scoped.id], max_idle=1)
+    plan = _empty_scoped_watch_plan_with_effective_scope((scoped.id,))
+    start_seen_before_operation = False
+
+    def fake_build_plan(**_kwargs: object) -> _WatchCyclePlan:
+        nonlocal start_seen_before_operation
+        start_seen_before_operation = "START     cycle-plan cycle" in log_path.read_text()
+        return plan
+
+    def fake_dispatch(**kwargs: object) -> _CycleResult:
+        assert kwargs["precomputed_plan"] is plan
+        return _CycleResult(False, 0, 0, scoped_done=True, effective_scoped_owner_ids=(scoped.id,))
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._resolve_watch_scope_owner_ids", return_value=(scoped.id,)),
+        patch("gza.cli.watch._build_watch_cycle_plan", side_effect=fake_build_plan),
+        patch("gza.cli.watch._dispatch_scoped_watch_once", side_effect=fake_dispatch),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    log_text = log_path.read_text()
+    assert rc == 0
+    assert start_seen_before_operation is True
+    assert log_text.count("START     cycle-plan cycle") == 1
+    assert re.search(r"DONE      cycle-plan cycle elapsed \d+s", log_text)
+
+
+def test_cmd_watch_scoped_boundary_precompute_reports_cycle_plan_done_when_plan_construction_raises(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    scoped = store.add("Scoped owner", task_type="implement")
+    assert scoped.id is not None
+    log_path = tmp_path / ".gza" / "watch.log"
+    args = _watch_args(tmp_path, [scoped.id], max_idle=1)
+    sentinel = RuntimeError("scoped plan failed")
+    start_seen_before_operation = False
+
+    def fake_build_plan(**_kwargs: object) -> _WatchCyclePlan:
+        nonlocal start_seen_before_operation
+        start_seen_before_operation = "START     cycle-plan cycle" in log_path.read_text()
+        raise sentinel
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._resolve_watch_scope_owner_ids", return_value=(scoped.id,)),
+        patch("gza.cli.watch._build_watch_cycle_plan", side_effect=fake_build_plan),
+        patch("gza.cli.watch._dispatch_scoped_watch_once", side_effect=AssertionError("dispatch should not run")),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        pytest.raises(RuntimeError) as raised,
+    ):
+        cmd_watch(args)
+
+    log_text = log_path.read_text()
+    assert raised.value is sentinel
+    assert start_seen_before_operation is True
+    assert log_text.count("START     cycle-plan cycle") == 1
+    assert re.search(r"DONE      cycle-plan cycle elapsed \d+s", log_text)
 
 
 def test_cmd_watch_scoped_confirmed_execution_reuses_preview_runtime_after_ambient_mutation(
@@ -51825,7 +52667,7 @@ def test_watch_cycle_scoped_mode_does_not_start_unrelated_pending_tasks(tmp_path
     assert scoped.id in log_text
     assert unrelated.id not in log_text
     assert "QUEUE" not in log_text
-    assert "START" not in log_text
+    assert _non_cycle_start_lines(log_text) == []
 
 
 def test_watch_cycle_scoped_mode_keeps_recovery_enabled_with_zero_recovery_slots(tmp_path: Path) -> None:
@@ -51888,7 +52730,7 @@ def test_watch_cycle_scoped_mode_keeps_recovery_enabled_with_zero_recovery_slots
     assert scoped.id in log_text
     assert unrelated.id not in log_text
     assert "QUEUE" not in log_text
-    assert "START" not in log_text
+    assert _non_cycle_start_lines(log_text) == []
 
 
 def test_watch_cycle_scoped_pending_only_suppresses_recovery_with_zero_recovery_slots(tmp_path: Path) -> None:
@@ -51952,7 +52794,7 @@ def test_watch_cycle_scoped_pending_only_suppresses_recovery_with_zero_recovery_
     assert f"scope: owners={scoped.id} mode=explicit" in log_text
     assert unrelated.id not in log_text
     assert "QUEUE" not in log_text
-    assert "START" not in log_text
+    assert _non_cycle_start_lines(log_text) == []
 
 
 def _setup_stale_failed_leaf_live_reroot_scope(tmp_path: Path) -> tuple[Config, SqliteTaskStore, Task, Task, Task]:
@@ -53366,8 +54208,8 @@ def test_cmd_watch_scoped_live_reroot_primes_scope_before_first_transition_bound
     assert rc == 0
     sleep.assert_not_called()
     log_text = (tmp_path / ".gza" / "watch.log").read_text()
-    assert "START" not in log_text
-    assert "DONE" not in log_text
+    assert _non_cycle_start_lines(log_text) == []
+    assert _non_cycle_done_lines(log_text) == []
     assert "FAIL" not in log_text
     assert "SIBLING_BOOM" not in log_text
     assert store.list_watch_recovery_backoffs(subject_kind="lineage", subject_id=sibling.id) == []
@@ -54591,7 +55433,7 @@ def test_watch_cycle_scoped_recovery_only_skips_global_pending_fallback(tmp_path
     log_text = log_path.read_text()
     assert unrelated.id not in log_text
     assert "QUEUE" not in log_text
-    assert "START" not in log_text
+    assert _non_cycle_start_lines(log_text) == []
 
 
 def test_watch_cycle_scoped_mode_keeps_computed_lifecycle_action_active_without_slots(tmp_path: Path) -> None:
@@ -55385,7 +56227,7 @@ def test_cmd_watch_declining_first_start_aborts_without_dispatch_mutations(tmp_p
     assert len(store.get_all()) == len(before_all_tasks)
     assert current_git_health_alert(store) is None
     assert load_git_health_state(store) is None
-    assert " DONE " not in log_text
+    assert _non_cycle_done_lines(log_text) == []
     assert GIT_HEALTH_PROMPT not in log_text
     spawn_iterate.assert_not_called()
     flush_mock.assert_called_once_with()
@@ -61198,7 +62040,7 @@ def test_cmd_watch_first_start_green_probe_clears_prior_git_health_alert_before_
     log_path = tmp_path / ".gza" / "watch.log"
     if log_path.exists():
         log_text = log_path.read_text()
-        assert " DONE " not in log_text
+        assert _non_cycle_done_lines(log_text) == []
         assert GIT_HEALTH_PROMPT not in log_text
 
 

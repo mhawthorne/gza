@@ -722,6 +722,16 @@ state to win over already-mergeable fresh code.
   be rendered distinctly, such as `cpu unavailable`, and MUST NOT be treated as observed
   flat progress. This heartbeat stream is separate from the restart-safe watch-progress
   backstop state.
+- In-process cycle-level phases MUST use the non-task subject `cycle`. Each emitted
+  `START <phase> cycle` line for a cycle phase MUST be paired with
+  `DONE <phase> cycle elapsed <duration>` when that phase boundary exits, including
+  exceptional exits that propagate to the caller. This cycle-level start/done pairing is
+  the completion event for the in-process phase boundary; it does not change or replace
+  the background worker heartbeat ticker described below.
+- Scoped completion checks MUST analyze scoped activity in a standalone
+  `scoped-completion-analysis` cycle-level phase before `cycle-finalize`. That phase
+  includes scoped plan construction, selector recovery closure, and active owner counting,
+  and MUST NOT overlap another cycle-level phase.
 - Background workers are long phases even when watch is sleeping between cycles. Watch
   MUST track each live registered worker independently across sleep intervals, including
   workers that were already running when watch started. Worker heartbeat subjects MUST
