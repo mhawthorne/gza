@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -7139,6 +7139,47 @@ _WATCH_MANIFEST_TOP_LEVEL_KEYS = frozenset(
 _WATCH_MANIFEST_PROJECT_KEYS = frozenset({"name", "path", "project_id", "tags", "tag_mode", "weight"})
 
 
+class _WatchSupervisorManifestLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects ambiguous duplicate manifest keys."""
+
+
+def _construct_watch_manifest_mapping(
+    loader: _WatchSupervisorManifestLoader,
+    node: yaml.nodes.MappingNode,
+    deep: bool = False,
+) -> dict[object, object]:
+    loader.flatten_mapping(node)
+    seen: dict[object, yaml.nodes.Node] = {}
+    pairs: list[tuple[object, object]] = []
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if not isinstance(key, Hashable):
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                "found unhashable key",
+                key_node.start_mark,
+            )
+        if key in seen:
+            mark = key_node.start_mark
+            raise yaml.constructor.ConstructorError(
+                "while constructing a mapping",
+                node.start_mark,
+                f"found duplicate key {key!r} at line {mark.line + 1}, column {mark.column + 1}",
+                key_node.start_mark,
+            )
+        seen[key] = key_node
+        value = loader.construct_object(value_node, deep=deep)
+        pairs.append((key, value))
+    return dict(pairs)
+
+
+_WatchSupervisorManifestLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_watch_manifest_mapping,
+)
+
+
 def _reject_unknown_watch_manifest_keys(
     mapping: Mapping[Any, object],
     *,
@@ -7261,7 +7302,7 @@ def _load_watch_supervisor_manifest(path_arg: object) -> WatchSupervisorSelectio
         raise ValueError(f"--watch-config not found: {manifest_path}")
     try:
         with manifest_path.open("r", encoding="utf-8") as handle:
-            loaded = yaml.safe_load(handle) or {}
+            loaded = yaml.load(handle, Loader=_WatchSupervisorManifestLoader) or {}
     except OSError as exc:
         raise ValueError(f"could not read --watch-config {manifest_path}: {exc}") from exc
     except yaml.YAMLError as exc:

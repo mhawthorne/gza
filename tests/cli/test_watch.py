@@ -938,7 +938,9 @@ def test_watch_supervisor_manifest_recovery_slots_accepts_non_negative_integers(
         encoding="utf-8",
     )
 
-    selection = resolve_watch_supervisor_selection(_watch_args(tmp_path, [], watch_config=str(manifest_path)))
+    selection = resolve_watch_supervisor_selection(
+        _watch_args(tmp_path, [], watch_config=str(manifest_path), batch=None, poll=None)
+    )
 
     assert selection.recovery_slots == expected_recovery_slots
 
@@ -1029,6 +1031,199 @@ def test_cmd_watch_invalid_manifest_does_not_fall_through_to_legacy_args(
     assert rc == 1
     load_config.assert_not_called()
     get_store_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("manifest_text", "duplicate_key"),
+    [
+        (
+            "\n".join(
+                [
+                    "version: 1",
+                    "batch: 1",
+                    "batch: 2",
+                    "projects:",
+                    "  - name: core",
+                    "    path: .",
+                ]
+            ),
+            "batch",
+        ),
+        (
+            "\n".join(
+                [
+                    "version: 1",
+                    "strategy: round-robin",
+                    "strategy: project-priority",
+                    "projects:",
+                    "  - name: core",
+                    "    path: .",
+                ]
+            ),
+            "strategy",
+        ),
+        (
+            "\n".join(
+                [
+                    "version: 1",
+                    "projects:",
+                    "  - name: core",
+                    "    path: .",
+                    "    path: ./other",
+                ]
+            ),
+            "path",
+        ),
+        (
+            "\n".join(
+                [
+                    "version: 1",
+                    "projects:",
+                    "  - name: core",
+                    "    path: .",
+                    "    tags: [release]",
+                    "    tags: [ops]",
+                ]
+            ),
+            "tags",
+        ),
+    ],
+)
+def test_cmd_watch_rejects_duplicate_manifest_keys_before_runtime_construction(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    manifest_text: str,
+    duplicate_key: str,
+) -> None:
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(f"{manifest_text}\n", encoding="utf-8")
+    args = _watch_args(tmp_path, [], watch_config=str(manifest_path))
+
+    with (
+        patch("gza.cli.watch.Config.load") as load_config,
+        patch("gza.cli.watch.get_store") as get_store_mock,
+        patch("gza.cli.watch.WatchProjectRuntime.create") as runtime_create,
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Error:" in captured.out
+    assert "--watch-config" in captured.out
+    assert "duplicate key" in captured.out
+    assert duplicate_key in captured.out
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    load_config.assert_not_called()
+    get_store_mock.assert_not_called()
+    runtime_create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("manifest_text", "depth_context"),
+    [
+        (
+            "\n".join(
+                [
+                    "? [version]",
+                    ": 1",
+                    "version: 1",
+                    "projects:",
+                    "  - name: core",
+                    "    path: .",
+                ]
+            ),
+            "top-level",
+        ),
+        (
+            "\n".join(
+                [
+                    "version: 1",
+                    "projects:",
+                    "  - name: core",
+                    "    ? [path]",
+                    "    : .",
+                    "    path: .",
+                ]
+            ),
+            "project",
+        ),
+    ],
+)
+def test_cmd_watch_rejects_unhashable_manifest_keys_before_runtime_construction(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    manifest_text: str,
+    depth_context: str,
+) -> None:
+    manifest_path = tmp_path / f"{depth_context}-watch.yaml"
+    manifest_path.write_text(f"{manifest_text}\n", encoding="utf-8")
+    args = _watch_args(tmp_path, [], watch_config=str(manifest_path))
+
+    with (
+        patch("gza.cli.watch.Config.load") as load_config,
+        patch("gza.cli.watch.get_store") as get_store_mock,
+        patch("gza.cli.watch.WatchProjectRuntime.create") as runtime_create,
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Error:" in captured.out
+    assert "--watch-config" in captured.out
+    assert "could not parse" in captured.out
+    assert "unhashable key" in captured.out
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    load_config.assert_not_called()
+    get_store_mock.assert_not_called()
+    runtime_create.assert_not_called()
+
+
+def test_watch_supervisor_manifest_valid_nested_project_mappings_still_parse(tmp_path: Path) -> None:
+    core_dir = tmp_path / "core"
+    api_dir = tmp_path / "api"
+    core_dir.mkdir()
+    api_dir.mkdir()
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "batch: 2",
+                "strategy: round-robin",
+                "projects:",
+                "  - name: core",
+                "    path: core",
+                "    project_id: coreproject",
+                "    tags: [release, ops]",
+                "    tag_mode: all",
+                "    weight: 1",
+                "  - name: api",
+                "    path: api",
+                "    tags: [api]",
+                "    tag_mode: any",
+                "    weight: 2",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    selection = resolve_watch_supervisor_selection(
+        _watch_args(tmp_path, [], watch_config=str(manifest_path), batch=None, poll=None)
+    )
+
+    assert selection.batch == 2
+    assert selection.strategy == "round-robin"
+    assert [project.key for project in selection.projects] == ["core", "api"]
+    assert selection.projects[0].path == core_dir.resolve()
+    assert selection.projects[0].project_id == "coreproject"
+    assert selection.projects[0].tags == ("release", "ops")
+    assert selection.projects[0].any_tag is False
+    assert selection.projects[1].path == api_dir.resolve()
+    assert selection.projects[1].tags == ("api",)
+    assert selection.projects[1].any_tag is True
+    assert selection.projects[1].weight == 2
 
 
 @pytest.mark.parametrize(
