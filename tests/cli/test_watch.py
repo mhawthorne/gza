@@ -135,6 +135,7 @@ from gza.cli.watch import (
     _watch_needs_attention_message,
     _watch_no_progress_result_deferred_for_transient_backoff,
     _watch_reexec_argv,
+    _watch_log_path,
     _WatchCycleAnalysis,
     _WatchCyclePlan,
     _WatchLog,
@@ -55848,11 +55849,12 @@ def _assert_release_failure_cleanup(
     signal_calls: list[tuple[signal.Signals, object]],
     original_sigint: object,
     original_sigterm: object,
+    log_filename: str = "watch.log",
 ) -> None:
     assert rc == 1
     captured = capsys.readouterr()
     assert "failed to release watch-supervisor leases for: test" in captured.err
-    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    log_text = (tmp_path / ".gza" / log_filename).read_text()
     assert "failed to release watch-supervisor leases for: test" in log_text
     store = make_store(tmp_path)
     assert store.get_active_watch_session() is None
@@ -55924,6 +55926,7 @@ def test_cmd_watch_restart_failed_dry_run_release_failure_returns_error_and_clea
         signal_calls=signal_calls,
         original_sigint=original_sigint,
         original_sigterm=original_sigterm,
+        log_filename="watch.dry-run.log",
     )
 
 
@@ -55971,6 +55974,7 @@ def test_cmd_watch_restart_failed_dry_run_git_health_hold_release_failure_return
         signal_calls=signal_calls,
         original_sigint=original_sigint,
         original_sigterm=original_sigterm,
+        log_filename="watch.dry-run.log",
     )
 
 
@@ -57881,6 +57885,75 @@ def test_cmd_watch_dry_run_actionable_cycles_do_not_count_toward_max_idle(tmp_pa
 
     assert rc == 0
     assert run_cycle.call_count == 3
+
+
+def test_watch_log_path_resolves_by_dry_run_mode(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+
+    assert _watch_log_path(config, dry_run=False) == tmp_path / ".gza" / "watch.log"
+    assert _watch_log_path(config, dry_run=True) == tmp_path / ".gza" / "watch.dry-run.log"
+
+
+def test_cmd_watch_dry_run_leaves_existing_live_watch_log_byte_identical(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    make_store(tmp_path)
+    live_log = tmp_path / ".gza" / "watch.log"
+    original_bytes = b"22:14:57 WAKE   existing live watch entry\n\x00binary-proof\n"
+    live_log.write_bytes(original_bytes)
+    dry_run_log = tmp_path / ".gza" / "watch.dry-run.log"
+
+    args = _watch_args(tmp_path, [], dry_run=True, max_idle=1)
+
+    def run_cycle_once(**kwargs: object) -> _CycleResult:
+        log = kwargs["log"]
+        assert isinstance(log, _WatchLog)
+        log.emit("INFO", "dry-run marker")
+        return _CycleResult(False, 0, 0)
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.check_git_health", return_value=SimpleNamespace(dispatch_halted=False)),
+        patch("gza.cli.watch._run_cycle", side_effect=run_cycle_once),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert live_log.read_bytes() == original_bytes
+    assert "dry-run marker" in dry_run_log.read_text()
+
+
+def test_cmd_watch_second_dry_run_appends_to_dry_run_log(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    make_store(tmp_path)
+    dry_run_log = tmp_path / ".gza" / "watch.dry-run.log"
+
+    def run_dry_run(marker: str) -> None:
+        args = _watch_args(tmp_path, [], dry_run=True, max_idle=1)
+
+        def run_cycle_once(**kwargs: object) -> _CycleResult:
+            log = kwargs["log"]
+            assert isinstance(log, _WatchLog)
+            log.emit("INFO", marker)
+            return _CycleResult(False, 0, 0)
+
+        with (
+            patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+            patch("gza.cli.watch.check_git_health", return_value=SimpleNamespace(dispatch_halted=False)),
+            patch("gza.cli.watch._run_cycle", side_effect=run_cycle_once),
+            patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        ):
+            assert cmd_watch(args) == 0
+
+    run_dry_run("first dry-run marker")
+    after_first = dry_run_log.read_text()
+    run_dry_run("second dry-run marker")
+
+    after_second = dry_run_log.read_text()
+    assert after_second.startswith(after_first)
+    assert "first dry-run marker" in after_second
+    assert "second dry-run marker" in after_second
 
 
 def test_cmd_watch_restart_failed_dry_run_restores_signal_handlers(tmp_path: Path) -> None:
@@ -60998,7 +61071,7 @@ def test_cmd_watch_dry_run_git_health_red_returns_without_hold_loop(tmp_path: Pa
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.status == "pending"
-    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    log_text = (tmp_path / ".gza" / "watch.dry-run.log").read_text()
     assert "HOLD" in log_text
     assert "ATTENTION" in log_text
     assert "git worktree health RED - dispatch halted" in log_text
@@ -61166,7 +61239,7 @@ def test_cmd_watch_recovery_only_dry_run_reports_git_health_hold(tmp_path: Path)
 
     assert rc == 0
     dry_run_report.assert_not_called()
-    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    log_text = (tmp_path / ".gza" / "watch.dry-run.log").read_text()
     assert "HOLD" in log_text
     assert "ATTENTION" in log_text
     assert "git worktree health RED - dispatch halted" in log_text
@@ -61221,7 +61294,7 @@ def test_cmd_watch_scoped_dry_run_reports_git_health_hold(tmp_path: Path) -> Non
     assert rc == 0
     check_git_health.assert_called_once()
     run_cycle.assert_not_called()
-    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    log_text = (tmp_path / ".gza" / "watch.dry-run.log").read_text()
     assert "ATTENTION" in log_text
     assert "git worktree health RED - dispatch halted" in log_text
 
@@ -61278,7 +61351,7 @@ def test_cmd_watch_scoped_recovery_only_dry_run_reports_git_health_hold(tmp_path
     check_git_health.assert_called_once()
     dry_run_report.assert_not_called()
     run_cycle.assert_not_called()
-    log_text = (tmp_path / ".gza" / "watch.log").read_text()
+    log_text = (tmp_path / ".gza" / "watch.dry-run.log").read_text()
     assert "ATTENTION" in log_text
     assert "git worktree health RED - dispatch halted" in log_text
 
@@ -62084,7 +62157,7 @@ def test_cmd_watch_dry_run_pending_preview_does_not_report_started_in_sleep_delt
     assert refreshed is not None
     assert refreshed.status == "pending"
 
-    log_lines = (tmp_path / ".gza" / "watch.log").read_text().splitlines()
+    log_lines = (tmp_path / ".gza" / "watch.dry-run.log").read_text().splitlines()
     assert any(
         line.strip()
         and len(line.split(maxsplit=2)) >= 2

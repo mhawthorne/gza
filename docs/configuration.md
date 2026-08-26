@@ -2140,7 +2140,7 @@ need to break out promptly from a long or blocked watch pass.
 | `--max-resume-attempts N` | Override `max_resume_attempts` for this watch run: `0` disables automatic failed-task recovery; any positive value enables the fixed bounded shared policy used by both plain watch and the recovery lane |
 | `--dry-run` | Show what watch would do without executing; with `--recovery-only`, print the full failed-recovery report and exit for unscoped runs, while scoped `watch <task_id>... --recovery-only --dry-run` runs one scoped preview pass and exits |
 | `--show-skipped` | With `--recovery-only`, include skipped failed tasks in the dry-run recovery report and live watch logs |
-| `--quiet` | Write events to `.gza/watch.log` only |
+| `--quiet` | Suppress stdout and write events only to the selected watch log: `.gza/watch.log` for live watch, or `.gza/watch.dry-run.log` for `--dry-run` |
 | `--[no-]auto-restart-on-drift` | When installed `gza` code changes while watch is running, re-exec at the next cycle boundary to load the new code without waiting for running or pending work to drain (default: enabled) |
 | `--tag TAG` | Only advance, resume, and start tasks matching tag filters (repeatable); use `gza queue --tag TAG --pending` to preview the matching pending pickup order, or plain `gza queue --tag TAG` for the shared recovery+pending preview. Scoped watch reports out-of-scope derived blockers but does not start them |
 | `--all-tags` | With repeated `--tag` values, require all requested tags instead of the default any-tag matching |
@@ -2207,7 +2207,8 @@ When enabled, `watch.parked_auto_rearm.budget` caps blind auto-rearm attempts pe
 `watch.transient_recovery_backoff_max` caps the persisted transient-recovery cooldown schedule that `gza watch` enforces before relaunching the same transient failed recovery or improve action. The schedule starts from `watch.failure_backoff_initial`, follows the bounded `60s, 120s, 300s, 600s, ...` shape at the defaults, and then clamps at this maximum.
 
 When a non-global scope is active, watch emits an explicit scope line to console and
-`.gza/watch.log`: `INFO      scope: tags=<comma-separated-tags> mode=any|all` for tag
+the selected watch log (`.gza/watch.log` for live watch, `.gza/watch.dry-run.log` for
+`--dry-run`): `INFO      scope: tags=<comma-separated-tags> mode=any|all` for tag
 scope, or `INFO      scope: owners=<comma-separated-effective-selector-ids> mode=explicit`
 for positional selector scope.
 
@@ -2237,7 +2238,7 @@ Manual-operator advance outcomes such as `needs_discussion`, `max_cycles_reached
 
 The first watch pass still requires confirmation unless you pass `--yes` / `-y`. If that pass finds work to do and stdout is not a terminal (for example when piping watch output through `tee`), watch aborts with guidance to re-run with `-y` instead of waiting on an invisible prompt.
 
-Multiline watch log messages are rendered with continuation indentation so wake, repair, and recovery output stays readable in both stdout and `.gza/watch.log`. `WAKE` lines now include a `live workers:` block when running workers can be identified, listing active task IDs and any anonymous workers that do not currently map to a live task row.
+Multiline watch log messages are rendered with continuation indentation so wake, repair, and recovery output stays readable in both stdout and the selected watch log (`.gza/watch.log` for live watch, `.gza/watch.dry-run.log` for `--dry-run`). `WAKE` lines now include a `live workers:` block when running workers can be identified, listing active task IDs and any anonymous workers that do not currently map to a live task row.
 
 Watch-surfaced ordinary merge and rebase failure blocks include the merge subject task ID and source branch on the non-resolve error, abort, and abort-warning lines so concurrent merge-lane failures can be triaged without reverse-mapping a branch name by hand.
 

@@ -5814,6 +5814,11 @@ class _WatchLog:
             console.print(_render_watch_stdout(line), soft_wrap=True, highlight=False)
 
 
+def _watch_log_path(config: Config, *, dry_run: bool) -> Path:
+    filename = "watch.dry-run.log" if dry_run else "watch.log"
+    return config.project_dir / ".gza" / filename
+
+
 @dataclass
 class _InstalledWatchSignalHandlers:
     old_sigint: Any = None
@@ -15977,7 +15982,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
         )
 
     store = get_store(config, open_mode="watch_lease_activation")
-    log = _WatchLog(config.project_dir / ".gza" / "watch.log", quiet=quiet)
+    log = _WatchLog(_watch_log_path(config, dry_run=dry_run), quiet=quiet)
     runtime_context = RuntimeExecutionContext.from_config(config)
     # Warms the usage cache for the whole run; the cycle header only reads it.
     start_usage_warmer(config, store, runtime_context=runtime_context)

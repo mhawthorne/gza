@@ -96,6 +96,8 @@ the assertion inventory first. Examples:
   that ignores a cached red checkpoint and leaves behind fresh evidence.
 - `WS-S7-BOUNDED-WORK-CREATION` — watch-owned stateful work creation MUST stay bounded
   to deduped supervisor-owned surfaces such as local-target verify remediation.
+- `WS-S8-DRY-RUN-LOG-SEPARATION` — dry-run watch output MUST append to
+  `.gza/watch.dry-run.log` without mutating the live `.gza/watch.log`.
 
 List the assertions before checking them, so the report can show total coverage.
 

@@ -421,6 +421,7 @@ def test_watch_dry_run_halts_for_corrupt_linked_worktree_metadata_and_clears_aft
     seeded_ids = {task.id for task in store.get_all()}
     seeded_statuses = {task.id: task.status for task in store.get_all()}
     log_path = project_dir / ".gza" / "watch.log"
+    dry_run_log_path = project_dir / ".gza" / "watch.dry-run.log"
 
     corrupt_value, broken_probe = _corrupt_linked_worktree_commondir_for_probe_failure(
         project_dir,
@@ -455,6 +456,8 @@ def test_watch_dry_run_halts_for_corrupt_linked_worktree_metadata_and_clears_aft
 
     if log_path.exists():
         log_path.unlink()
+    if dry_run_log_path.exists():
+        dry_run_log_path.unlink()
 
     with patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()):
         held_rc = cmd_watch(args)
@@ -475,7 +478,8 @@ def test_watch_dry_run_halts_for_corrupt_linked_worktree_metadata_and_clears_aft
     assert refreshed_pending.log_file is None
     assert current_git_health_alert(store) is None
 
-    held_log = log_path.read_text()
+    assert not log_path.exists()
+    held_log = dry_run_log_path.read_text()
     assert held_log.count(" HOLD ") == 1
     assert held_log.count(" ATTENTION ") == 1
     assert held_log.count("git worktree health RED - dispatch halted") == 1
@@ -498,7 +502,7 @@ def test_watch_dry_run_halts_for_corrupt_linked_worktree_metadata_and_clears_aft
         assert callable(handler)
         handler(signal.SIGTERM, None)
 
-    log_path.unlink(missing_ok=True)
+    dry_run_log_path.unlink(missing_ok=True)
     with (
         patch("gza.cli.watch.signal.signal", side_effect=register_signal),
         patch("gza.cli.watch._sleep_interruptibly", side_effect=fake_sleep),
@@ -513,7 +517,8 @@ def test_watch_dry_run_halts_for_corrupt_linked_worktree_metadata_and_clears_aft
     assert resumed_pending.status == "pending"
     assert current_git_health_alert(store) is None
 
-    resumed_log = log_path.read_text()
+    assert not log_path.exists()
+    resumed_log = dry_run_log_path.read_text()
     assert "git worktree health RED - dispatch halted" not in resumed_log
     assert " HOLD " not in resumed_log
     assert " ATTENTION " not in resumed_log

@@ -29,7 +29,7 @@ gza watch [--batch N] [--poll S] [--max-idle T] [--max-iterations N] \
 | `--recovery-slots N` | 1 | Slots per cycle reserved for worker-consuming failed-task recovery before pending pickup |
 | `--recovery-only` | false | Preset: dedicate the full batch, or all free supervisor dispatch slots in multi-project mode, to failed-task recovery and suppress pending pickup until actionable recovery drains |
 | `--pending-only` | false | Preset: disable failed-task recovery and use all slots for pending work |
-| `--dry-run` | false | Show what each cycle would do without executing |
+| `--dry-run` | false | Show what each cycle would do without executing; file output goes to `.gza/watch.dry-run.log` instead of the live `.gza/watch.log` |
 
 Deprecated compatibility aliases remain accepted for now: `--restart-failed` maps to
 `--recovery-only`, and `--restart-failed-batch N` maps to `--recovery-slots N`.
@@ -165,7 +165,8 @@ HH:MM:SS EVENT  task-id type "truncated prompt..." [details]
 ### Log Destination
 
 - **stdout**: Always, for interactive use
-- **File**: Also appended to `.gza/watch.log` for `tail -f` from another terminal
+- **File**: Also appended to the selected watch log for `tail -f` from another terminal:
+  `.gza/watch.log` for live watch, or `.gza/watch.dry-run.log` for `--dry-run`
 - Consider `--quiet` flag for headless use (file only)
 
 ### Detecting Events
@@ -178,7 +179,7 @@ These aren't part of watch itself, but are the complementary commands for monito
 
 - **`gza history --status failed`** — show failed tasks. Already works.
 - **`gza advance --unimplemented`** — show completed plans/explores without implement children. Already works.
-- **Activity log** — `tail -f .gza/watch.log` shows failures in real time with `FAIL` events.
+- **Activity log** — `tail -f .gza/watch.log` shows live failures in real time with `FAIL` events; dry-run previews append to `.gza/watch.dry-run.log`.
 
 ## Signal Handling
 

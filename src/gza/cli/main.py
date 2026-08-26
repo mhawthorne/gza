@@ -1227,7 +1227,7 @@ def main() -> int:
     watch_parser.add_argument(
         "--quiet",
         action="store_true",
-        help="Write events to .gza/watch.log only",
+        help="Write events only to the watch log file (.gza/watch.log, or .gza/watch.dry-run.log with --dry-run)",
     )
     watch_parser.add_argument(
         "--auto-restart-on-drift",
