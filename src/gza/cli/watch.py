@@ -7,6 +7,7 @@ import functools
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import signal
@@ -303,6 +304,8 @@ from .git_ops import (
     is_pre_promotion_merge_refusal_status,
 )
 from .query import _resolve_incomplete_owner_task
+
+logger = logging.getLogger(__name__)
 
 _WATCH_EVENT_LABEL_WIDTH = len("ATTENTION")
 _WATCH_PARKED_LINEAGE_POLICY: Literal["skip"] = "skip"
@@ -14360,14 +14363,51 @@ def _watch_failed_recovery_scan_is_current(
     if not store.supports_watch_failed_recovery_scans():
         return False
     marker = store.get_watch_failed_recovery_scan_state(target_branch=target_branch)
-    if marker is not None and marker.target_sha == target_sha:
-        return True
-
     units = store.list_watch_failed_recovery_scan_units(
         target_branch=target_branch,
-        target_sha=target_sha,
     )
-    if units:
+    incomplete_reasons: list[str] = []
+    current_fingerprint = _watch_failed_recovery_scan_unit_fingerprint(units)
+    target_unchanged = marker is not None and marker.target_sha == target_sha
+    initial_or_same_target_probe_units = [
+        unit
+        for unit in units
+        if unit.state != "merged" or (unit.merge_source is None and unit.pr_state == "open")
+    ]
+    if marker is None:
+        stale_units = initial_or_same_target_probe_units
+    elif not target_unchanged:
+        stale_units = list(units)
+    elif marker.unit_fingerprint != current_fingerprint:
+        stale_units = initial_or_same_target_probe_units
+    else:
+        stale_units = []
+    if target_unchanged and not stale_units:
+        for unit in units:
+            if unit.head_sha is None:
+                incomplete_reasons.append(
+                    f"branch '{unit.source_branch}' lacks durable source-head proof for target '{target_branch}'"
+                )
+                continue
+            try:
+                current_head = git.rev_parse_if_exists(unit.source_branch)
+            except GitError as exc:
+                incomplete_reasons.append(
+                    f"branch '{unit.source_branch}' source-head proof unavailable against "
+                    f"'{target_branch}': {exc}"
+                )
+                continue
+            if current_head is None:
+                incomplete_reasons.append(
+                    f"branch '{unit.source_branch}' source-head proof unavailable against '{target_branch}'"
+                )
+                continue
+            if current_head != unit.head_sha:
+                stale_units.append(unit)
+        if not stale_units and not incomplete_reasons:
+            return True
+
+    if stale_units:
         cohorts = [
             BranchCohort(
                 branch=unit.source_branch,
@@ -14381,14 +14421,26 @@ def _watch_failed_recovery_scan_is_current(
                 merge_unit_target_branch=unit.target_branch,
                 merge_unit_head_sha=unit.head_sha,
             )
-            for unit in units
+            for unit in stale_units
         ]
         results = reconcile_branch_merge_truth(
             git,
             cohorts,
             target_branch=target_branch,
             include_diff_stats=False,
+            preserve_recorded_merged=False,
         )
+        for cohort, result in zip(cohorts, results, strict=True):
+            proof_errors: list[str] = []
+            if result.skipped_reason is not None:
+                proof_errors.append(
+                    f"branch '{cohort.branch}' recovery reconciliation skipped: {result.skipped_reason}"
+                )
+            if result.head_sha is None or result.base_sha is None:
+                proof_errors.append(
+                    f"branch '{cohort.branch}' recovery reconciliation lacked durable head/base proof"
+                )
+            result.errors.extend(proof_errors)
         _persist_branch_updates(
             store,
             cohorts,
@@ -14397,7 +14449,12 @@ def _watch_failed_recovery_scan_is_current(
             target_branch,
             sync_completed_at=datetime.now(UTC),
         )
-        for unit, result in zip(units, results, strict=True):
+        for cohort, result in zip(cohorts, results, strict=True):
+            if result.errors:
+                incomplete_reasons.append(
+                    f"branch '{cohort.branch}' failed recovery reconciliation: {'; '.join(result.errors)}"
+                )
+        for unit, result in zip(stale_units, results, strict=True):
             if not (unit.state == "merged" and unit.merge_source is None and unit.pr_state == "open"):
                 continue
             if result.head_sha is not None or result.base_sha is not None:
@@ -14405,11 +14462,50 @@ def _watch_failed_recovery_scan_is_current(
             if result.ok and (result.merge_status != "merged" or "marked merged" not in result.actions):
                 repaired_state = result.merge_status if result.merge_status != "merged" else "unmerged"
                 store.set_merge_unit_state(unit.id, repaired_state or "unmerged")
+        units = store.list_watch_failed_recovery_scan_units(target_branch=target_branch)
+        current_fingerprint = _watch_failed_recovery_scan_unit_fingerprint(units)
+    if incomplete_reasons:
+        logger.warning(
+            "watch failed-recovery scan for target %s at %s incomplete; keeping previous marker: %s",
+            target_branch,
+            target_sha,
+            "; ".join(incomplete_reasons),
+        )
+        return False
     store.record_watch_failed_recovery_scan(
         target_branch=target_branch,
         target_sha=target_sha,
+        unit_fingerprint=current_fingerprint,
     )
     return True
+
+
+def _watch_failed_recovery_scan_unit_fingerprint(units: Sequence[object]) -> str:
+    """Return stable unit-level proof fingerprint for an authoritative recovery scan."""
+    payload = [
+        {
+            "id": getattr(unit, "id", None),
+            "source_branch": getattr(unit, "source_branch", None),
+            "target_branch": getattr(unit, "target_branch", None),
+            "state": getattr(unit, "state", None),
+            "owner_task_id": getattr(unit, "owner_task_id", None),
+            "head_sha": getattr(unit, "head_sha", None),
+            "base_sha": getattr(unit, "base_sha", None),
+            "merge_source": getattr(unit, "merge_source", None),
+            "pr_state": getattr(unit, "pr_state", None),
+            "superseded_by_unit_id": getattr(unit, "superseded_by_unit_id", None),
+        }
+        for unit in sorted(
+            units,
+            key=lambda item: (
+                str(getattr(item, "source_branch", "")),
+                str(getattr(item, "target_branch", "")),
+                str(getattr(item, "id", "")),
+            ),
+        )
+    ]
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 @contextlib.contextmanager

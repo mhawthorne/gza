@@ -216,11 +216,15 @@ _MAIN_VERIFY_REMEDIATION_CONSUMED_TASK_IDS_REQUIRED_COLUMNS: tuple[str, ...] = (
     "task_id",
     "consumed_at",
 )
-_WATCH_FAILED_RECOVERY_SCANS_REQUIRED_COLUMNS: tuple[str, ...] = (
+_WATCH_FAILED_RECOVERY_SCAN_BASE_COLUMNS: tuple[str, ...] = (
     "project_id",
     "target_branch",
     "target_sha",
     "scanned_at",
+)
+_WATCH_FAILED_RECOVERY_SCANS_REQUIRED_COLUMNS: tuple[str, ...] = (
+    *_WATCH_FAILED_RECOVERY_SCAN_BASE_COLUMNS,
+    "unit_fingerprint",
 )
 
 # Legacy base36 alphabet used only by v25 migration helpers.
@@ -2253,10 +2257,11 @@ class WatchRecoveryBackoff:
 
 @dataclass(frozen=True)
 class WatchFailedRecoveryScanState:
-    """Persisted target-head marker for watch failed-task recovery scans."""
+    """Persisted target-head and unit-proof marker for watch failed-task recovery scans."""
 
     target_branch: str
     target_sha: str
+    unit_fingerprint: str = ""
     scanned_at: datetime | None = None
 
 
@@ -2995,17 +3000,7 @@ CREATE TABLE IF NOT EXISTS watch_failed_recovery_scans (
     project_id TEXT NOT NULL,
     target_branch TEXT NOT NULL,
     target_sha TEXT NOT NULL,
-    scanned_at TEXT NOT NULL,
-    PRIMARY KEY(project_id, target_branch)
-);
-"""
-
-# Migration from v69 to v70: target-head marker for watch failed-recovery scans.
-MIGRATION_V69_TO_V70 = """
-CREATE TABLE IF NOT EXISTS watch_failed_recovery_scans (
-    project_id TEXT NOT NULL,
-    target_branch TEXT NOT NULL,
-    target_sha TEXT NOT NULL,
+    unit_fingerprint TEXT NOT NULL DEFAULT '',
     scanned_at TEXT NOT NULL,
     PRIMARY KEY(project_id, target_branch)
 );
@@ -3020,8 +3015,20 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project_based_on
     ON tasks(project_id, based_on);
 """
 
+# Migration from v70 to v71: unit-granular proof for watch failed-recovery scans.
+MIGRATION_V70_TO_V71 = """
+CREATE TABLE IF NOT EXISTS watch_failed_recovery_scans (
+    project_id TEXT NOT NULL,
+    target_branch TEXT NOT NULL,
+    target_sha TEXT NOT NULL,
+    scanned_at TEXT NOT NULL,
+    PRIMARY KEY(project_id, target_branch)
+);
+ALTER TABLE watch_failed_recovery_scans ADD COLUMN unit_fingerprint TEXT NOT NULL DEFAULT '';
+"""
+
 # Schema version for migrations
-SCHEMA_VERSION = 70
+SCHEMA_VERSION = 71
 
 # Migration versions that require manual intervention (gza migrate).
 # These are NOT run automatically in _ensure_db.
@@ -3866,9 +3873,7 @@ _QUERY_ONLY_REQUIRED_PARKED_TASK_REARM_COLUMNS: tuple[str, ...] = (
     "last_auto_attempt_at",
     "last_auto_attempt_target_sha",
 )
-_QUERY_ONLY_REQUIRED_WATCH_FAILED_RECOVERY_SCAN_COLUMNS: tuple[str, ...] = (
-    _WATCH_FAILED_RECOVERY_SCANS_REQUIRED_COLUMNS
-)
+_QUERY_ONLY_REQUIRED_WATCH_FAILED_RECOVERY_SCAN_COLUMNS: tuple[str, ...] = _WATCH_FAILED_RECOVERY_SCANS_REQUIRED_COLUMNS
 _QUERY_ONLY_REQUIRED_TASK_COLUMNS: tuple[str, ...] = (
     "project_id",
     "id",
@@ -3960,6 +3965,7 @@ _QUERY_ONLY_COMPATIBLE_AUTO_MIGRATION_VERSIONS: frozenset[int] = frozenset(
         68,
         69,
         70,
+        71,
     }
 )
 
@@ -4373,9 +4379,9 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
                 "Auto-migration to v64 incomplete: missing required column "
                 f"main_verify_remediation_consumed_task_ids.{missing_columns[0]}"
             )
-    if target_version >= 70:
+    if target_version >= 71:
         if not _table_exists(conn, "watch_failed_recovery_scans"):
-            raise RuntimeError("Auto-migration to v70 incomplete: missing required table watch_failed_recovery_scans")
+            raise RuntimeError("Auto-migration to v71 incomplete: missing required table watch_failed_recovery_scans")
         missing_columns = _missing_required_columns(
             conn,
             "watch_failed_recovery_scans",
@@ -4383,7 +4389,7 @@ def _validate_auto_migration_target(conn: sqlite3.Connection, target_version: in
         )
         if missing_columns:
             raise RuntimeError(
-                "Auto-migration to v70 incomplete: missing required column "
+                "Auto-migration to v71 incomplete: missing required column "
                 f"watch_failed_recovery_scans.{missing_columns[0]}"
             )
 
@@ -5067,7 +5073,7 @@ def _ensure_required_auto_migration_artifacts(
                 "main_verify_remediation_consumed_task_ids: missing required column "
                 f"{missing_columns[0]}. Use a writable database to repair the v64 schema."
             )
-    if target_version >= 70:
+    if target_version >= 71:
         if not _table_exists(conn, "watch_failed_recovery_scans"):
             try:
                 conn.execute(
@@ -5076,6 +5082,7 @@ def _ensure_required_auto_migration_artifacts(
                         project_id TEXT NOT NULL,
                         target_branch TEXT NOT NULL,
                         target_sha TEXT NOT NULL,
+                        unit_fingerprint TEXT NOT NULL DEFAULT '',
                         scanned_at TEXT NOT NULL,
                         PRIMARY KEY(project_id, target_branch)
                     )
@@ -5083,11 +5090,7 @@ def _ensure_required_auto_migration_artifacts(
                 )
             except sqlite3.OperationalError as exc:
                 if _is_readonly_snapshot_operational_error(exc):
-                    raise SchemaIntegrityError(
-                        "Query-only DB open detected missing required table "
-                        "watch_failed_recovery_scans; use a writable database "
-                        "to complete migration to v70, then retry."
-                    ) from exc
+                    return
                 raise SchemaIntegrityError(
                     "Schema integrity check failed while repairing required table "
                     "watch_failed_recovery_scans: use a writable database."
@@ -5101,7 +5104,7 @@ def _ensure_required_auto_migration_artifacts(
             raise SchemaIntegrityError(
                 "Schema integrity check failed for required table "
                 "watch_failed_recovery_scans: missing required column "
-                f"{missing_columns[0]}. Use a writable database to repair the v70 schema."
+                f"{missing_columns[0]}. Use a writable database to repair the v71 schema."
             )
 
 
@@ -5469,6 +5472,8 @@ SCHEMA += (
     + MIGRATION_V55_TO_V56  # watch_recovery_backoffs
     + MIGRATION_V57_TO_V58  # parked_task_rearms
     + MIGRATION_V61_TO_V62  # project_leases
+    + MIGRATION_V69_TO_V70  # scoped landed-evidence and based_on lookup indexes
+    + MIGRATION_V70_TO_V71  # watch_failed_recovery_scans
 )
 
 # Migration from v1 to v2
@@ -5787,6 +5792,7 @@ _MIGRATIONS: list[tuple[int, str | None]] = [
     (68, MIGRATION_V67_TO_V68),
     (69, MIGRATION_V68_TO_V69),
     (70, MIGRATION_V69_TO_V70),
+    (71, MIGRATION_V70_TO_V71),
 ]
 
 _SHARED_DB_IMPORT_MARKER = "shared-db-import.json"
@@ -6964,11 +6970,6 @@ class SqliteTaskStore:
             if self._query_only_table_exists.get("watch_failed_recovery_scans", False):
                 self._startup_warnings.append(
                     "Query-only DB open detected incomplete watch_failed_recovery_scans schema; "
-                    "watch failed-recovery scan cache will be unavailable."
-                )
-            else:
-                self._startup_warnings.append(
-                    "Query-only DB open detected missing required table watch_failed_recovery_scans; "
                     "watch failed-recovery scan cache will be unavailable."
                 )
         run_steps_issue = self._query_only_run_steps_warning()
@@ -10407,6 +10408,7 @@ class SqliteTaskStore:
         return WatchFailedRecoveryScanState(
             target_branch=str(row["target_branch"]),
             target_sha=str(row["target_sha"]),
+            unit_fingerprint=str(row["unit_fingerprint"]) if "unit_fingerprint" in row.keys() else "",
             scanned_at=_parse_db_timestamp(row["scanned_at"]),
         )
 
@@ -11675,6 +11677,7 @@ class SqliteTaskStore:
         *,
         target_branch: str,
         target_sha: str,
+        unit_fingerprint: str = "",
         scanned_at: datetime | None = None,
     ) -> WatchFailedRecoveryScanState | None:
         """Persist the completed failed-recovery scan marker for a target branch."""
@@ -11689,15 +11692,17 @@ class SqliteTaskStore:
                     project_id,
                     target_branch,
                     target_sha,
+                    unit_fingerprint,
                     scanned_at
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(project_id, target_branch)
                 DO UPDATE SET
                     target_sha = excluded.target_sha,
+                    unit_fingerprint = excluded.unit_fingerprint,
                     scanned_at = excluded.scanned_at
                 """,
-                (self._project_id, target_branch, target_sha, completed_at),
+                (self._project_id, target_branch, target_sha, unit_fingerprint, completed_at),
             )
         return self.get_watch_failed_recovery_scan_state(target_branch=target_branch)
 
@@ -11705,9 +11710,8 @@ class SqliteTaskStore:
         self,
         *,
         target_branch: str,
-        target_sha: str,
     ) -> list[MergeUnit]:
-        """Return active units whose failed-recovery scan proof is stale."""
+        """Return active units relevant to failed-recovery scan proof."""
         if not self.supports_merge_units():
             return []
         with self._connect() as conn:
@@ -11718,21 +11722,9 @@ class SqliteTaskStore:
                 WHERE project_id = ?
                   AND target_branch = ?
                   AND {active_merge_unit_where_sql("merge_units")}
-                  AND (
-                      (
-                          state != 'merged'
-                          AND (base_sha IS NULL OR base_sha != ?)
-                      )
-                      OR (
-                          state = 'merged'
-                          AND merge_source IS NULL
-                          AND pr_state = 'open'
-                          AND (base_sha IS NULL OR base_sha != ?)
-                      )
-                  )
                 ORDER BY updated_at ASC, id ASC
                 """,
-                (self._project_id, target_branch, target_sha, target_sha),
+                (self._project_id, target_branch),
             ).fetchall()
         return [unit for row in rows if (unit := self._row_to_merge_unit(row)) is not None]
 

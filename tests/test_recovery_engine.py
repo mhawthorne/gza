@@ -2,6 +2,7 @@ import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -41,6 +42,7 @@ from gza.recovery_engine import (
     should_hide_failed_recovery_decision,
 )
 from gza.recovery_read_context import RecoveryReadContext
+from gza.unstick import discover_parked_tasks
 from tests.cli.conftest import make_store, setup_config
 
 
@@ -243,6 +245,9 @@ class _StubMergeGit(Git):
     def is_merged(self, branch: str, into: str) -> bool:
         return into == self.default_branch and branch in self.merged_branches
 
+    def merge_base(self, ref1: str, ref2: str) -> str:
+        return f"merge-base:{ref1}:{ref2}"
+
     def count_commits_ahead_checked(self, branch: str, base: str) -> int | None:
         if base != self.default_branch:
             return None
@@ -259,6 +264,43 @@ class _StubMergeGit(Git):
 
     def is_on_first_parent_history(self, commit: str, target: str) -> bool:
         return target == self.default_branch and commit in self.empty_merged_branches
+
+
+class _PoisonedAuthoritativeRecoveryGit(Git):
+    def __init__(self) -> None:
+        self.repo_dir = Path("/dev/null")
+        self._cache = None
+        self._gza_recovery_scan_db_authoritative = True
+
+    def _raise(self, method: str) -> NoReturn:
+        raise AssertionError(f"{method} should not run when recovery scan DB proof is authoritative")
+
+    def local_branch_names(self) -> frozenset[str]:
+        return frozenset({"feature/db-authoritative-live-unmerged"})
+
+    def branch_exists(self, branch: str) -> bool:
+        return bool(branch)
+
+    def is_merged(self, branch: str, into: str | None = None, use_cherry: bool = False) -> bool:
+        self._raise("is_merged")
+
+    def merge_base(self, ref1: str, ref2: str) -> str:
+        self._raise("merge_base")
+
+    def rev_parse_if_exists(self, ref: str) -> str | None:
+        self._raise("rev_parse_if_exists")
+
+    def resolve_fresh_merge_source(self, branch: str):
+        self._raise("resolve_fresh_merge_source")
+
+    def count_commits_ahead_checked(self, branch: str, base: str) -> int | None:
+        self._raise("count_commits_ahead_checked")
+
+    def has_non_empty_source_diff_against_target(self, source_ref: str, target: str) -> bool | None:
+        self._raise("has_non_empty_source_diff_against_target")
+
+    def can_merge(self, branch: str, into: str) -> bool:
+        return False
 
 
 class _ReachabilityOnlyMergedGit(_StubMergeGit):
@@ -871,6 +913,156 @@ def test_affirmative_landed_proof_still_suppresses_failed_sidequests_across_surf
         row.recovery_leaf_task.id
         for row in rows
         if row.recovery_leaf_task is not None and row.recovery_leaf_task.id is not None
+    }
+
+    live_candidates, _ = discover_parked_tasks(
+        store,
+        config=Config.load(tmp_path),
+        git=git,
+        target_branch="main",
+    )
+    setattr(git, "_gza_recovery_scan_db_authoritative", True)
+    cached_candidates, _ = discover_parked_tasks(
+        store,
+        config=Config.load(tmp_path),
+        git=git,
+        target_branch="main",
+    )
+    assert {candidate.subject_task.id for candidate in cached_candidates} == {
+        candidate.subject_task.id for candidate in live_candidates
+    }
+
+
+@pytest.mark.parametrize("live_state", ["merged", "unmerged"])
+def test_discover_parked_tasks_cache_current_preserves_no_unit_failed_branch_live_classification(
+    tmp_path: Path,
+    live_state: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    owner = _completed_impl(store, merge_status="merged")
+    assert owner.id is not None
+    owner.branch = f"feature/no-unit-{live_state}-owner"
+    store.update(owner)
+    owner_unit = store.create_merge_unit(
+        source_branch=owner.branch,
+        target_branch="main",
+        owner_task_id=owner.id,
+        state="merged",
+    )
+    store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+    failed = _failed_sidequest(store, task_type="rebase", impl_id=owner.id, reason="WORKER_DIED")
+    failed.branch = f"feature/no-unit-{live_state}-sidequest"
+    failed.has_commits = live_state == "merged"
+    failed.session_id = f"sess-no-unit-{live_state}"
+    failed.num_steps_computed = 1
+    store.update(failed)
+
+    git = (
+        _StubMergeGit(merged_side_branches={failed.branch})
+        if live_state == "merged"
+        else _StubMergeGit()
+    )
+    live_candidates, _ = discover_parked_tasks(
+        store,
+        config=Config.load(tmp_path),
+        git=git,
+        target_branch="main",
+    )
+    setattr(git, "_gza_recovery_scan_db_authoritative", True)
+    cached_candidates, _ = discover_parked_tasks(
+        store,
+        config=Config.load(tmp_path),
+        git=git,
+        target_branch="main",
+    )
+    assert {candidate.subject_task.id for candidate in cached_candidates} == {
+        candidate.subject_task.id for candidate in live_candidates
+    }
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["same_branch", "same_unit", "no_unit_sidequest", "live_unmerged"],
+)
+def test_discover_parked_tasks_authoritative_scan_uses_db_proof_without_live_git_probes(
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+
+    if scenario == "live_unmerged":
+        failed = store.add("Failed implementation", task_type="implement")
+        assert failed.id is not None
+        failed.status = "failed"
+        failed.failure_reason = "MAX_TURNS"
+        failed.branch = "feature/db-authoritative-live-unmerged"
+        failed.has_commits = True
+        failed.session_id = "sess-db-authoritative-live-unmerged"
+        failed.completed_at = datetime.now(UTC)
+        store.update(failed)
+        unit = store.create_merge_unit(
+            source_branch=failed.branch,
+            target_branch="main",
+            owner_task_id=failed.id,
+            state="unmerged",
+            head_sha="failed-head",
+            base_sha="target-head",
+        )
+        store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
+        live_git = _StubMergeGit()
+        live_git._cache = None
+        live_git.can_merge = lambda branch, into: False  # type: ignore[method-assign]
+    else:
+        owner = _completed_impl(store, merge_status="merged")
+        assert owner.id is not None
+        owner.branch = f"feature/db-authoritative-{scenario}"
+        store.update(owner)
+        owner_unit = store.create_merge_unit(
+            source_branch=owner.branch,
+            target_branch="main",
+            owner_task_id=owner.id,
+            state="merged",
+            head_sha="owner-head",
+            base_sha="target-head",
+        )
+        store.attach_task_to_merge_unit(owner.id, owner_unit.id, "owner")
+
+        failed = _failed_sidequest(
+            store,
+            task_type="improve" if scenario == "same_branch" else "rebase",
+            impl_id=owner.id,
+            reason="WORKER_DIED",
+        )
+        failed.branch = owner.branch
+        failed.same_branch = scenario == "same_branch"
+        failed.has_commits = True
+        failed.session_id = f"sess-db-authoritative-{scenario}"
+        failed.num_steps_computed = 1
+        store.update(failed)
+        if scenario in {"same_branch", "same_unit"}:
+            store.attach_task_to_merge_unit(failed.id, owner_unit.id, failed.task_type)
+        live_git = _StubMergeGit(merged_side_branches={owner.branch})
+
+    live_candidates, _ = discover_parked_tasks(
+        store,
+        config=config,
+        git=live_git,
+        target_branch="main",
+    )
+    authoritative_candidates, _ = discover_parked_tasks(
+        store,
+        config=config,
+        git=_PoisonedAuthoritativeRecoveryGit(),
+        target_branch="main",
+    )
+
+    assert {candidate.subject_task.id for candidate in authoritative_candidates} == {
+        candidate.subject_task.id for candidate in live_candidates
     }
 
 

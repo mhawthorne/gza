@@ -516,6 +516,15 @@ Each watch cycle MUST execute these phases in order:
    configured for the project, that is an explicit no-gate
    exception: watch MAY record an `unavailable` checkpoint with
    `exit_status="not configured"` but MUST NOT halt merges or emit red-main attention for it.
+   Watch MAY persist a completed failed-recovery scan marker for the current target branch,
+   but that marker is authoritative only when it proves the target head and every active
+   branch/unit classification at branch granularity. The proof MUST be invalidated by new
+   units, source-head changes, and target movement; target movement MUST revalidate
+   branch content equivalence rather than relying only on stable merge-base ancestry.
+   Incomplete reconciliation, missing head/base proof, or classifier exceptions MUST keep
+   the previous marker and force the ordinary live fail-closed recovery classification path.
+   Only a current complete marker MAY let failed-task discovery reuse DB-backed
+   classifications instead of per-lineage Git probes.
    For this supervisor-owned remediation lane, dedup is by failure identity: normalized
    failure signature only. The exact local-target tree fingerprint from bounded rerun
    evidence remains prompt context, but watch MUST reuse one open remediation task for

@@ -62,6 +62,18 @@ class BranchCohort:
         return tuple(task for task in self.tasks if task.branch == self.branch and task.has_commits)
 
     @property
+    def branch_tasks(self) -> tuple[Task, ...]:
+        return tuple(task for task in self.tasks if task.branch == self.branch)
+
+    @property
+    def proof_tasks(self) -> tuple[Task, ...]:
+        if self.code_tasks:
+            return self.code_tasks
+        if self.merge_unit_id is not None:
+            return self.branch_tasks
+        return ()
+
+    @property
     def merge_status_owner_tasks(self) -> tuple[Task, ...]:
         return tuple(task for task in self.code_tasks if task_owns_merge_status(task))
 
@@ -402,26 +414,20 @@ def reconcile_branch_merge_truth(
     for cohort in cohorts:
         result = BranchSyncResult(
             branch=cohort.branch,
-            task_ids=tuple(task.id for task in cohort.code_tasks if task.id is not None),
+            task_ids=tuple(task.id for task in cohort.proof_tasks if task.id is not None),
             reconciled=True,
         )
         results.append(result)
-        code_tasks = cohort.code_tasks
-        if not code_tasks:
+        proof_tasks = cohort.proof_tasks
+        if not proof_tasks:
             result.skipped_reason = "no code-bearing task rows"
             continue
 
         owner_tasks = cohort.merge_status_owner_tasks
-        source_owner_task = owner_tasks[0] if owner_tasks else code_tasks[0]
+        source_owner_task = owner_tasks[0] if owner_tasks else proof_tasks[0]
         source_has_commits = source_owner_task.has_commits
-        desired_merge_status = owner_tasks[0].merge_status if owner_tasks else code_tasks[0].merge_status
+        desired_merge_status = owner_tasks[0].merge_status if owner_tasks else proof_tasks[0].merge_status
         proof_target_ref = target_branch
-        if (
-            merge_state_is_terminal_for_lifecycle(cohort.merge_unit_state)
-            and cohort.merge_unit_target_branch == target_branch
-        ):
-            result.merge_status = cohort.merge_unit_state
-            continue
         if cohort.branch in unchanged_proof_branches:
             # Both the branch head and the target head are byte-identical to the
             # SHAs recorded when this unit was last proven, so re-running the git
@@ -435,23 +441,36 @@ def reconcile_branch_merge_truth(
         try:
             local_branch_exists = git.branch_exists(cohort.branch)
             reconcile_ref = cohort.branch if local_branch_exists else None
-            if reconcile_ref is None:
-                target_merged = None
-            else:
-                target_merged = git.is_merged(reconcile_ref, into=proof_target_ref)
         except GitError as exc:
             result.errors.append(str(exc))
             result.merge_status = desired_merge_status
             continue
 
         head_resolution = resolve_ref_if_possible(git, reconcile_ref)
-        base_resolution = resolve_ref_if_possible(git, target_branch)
         result.head_sha = head_resolution.sha
-        result.base_sha = base_resolution.sha
         if head_resolution.warning is not None:
             result.warnings.append(head_resolution.warning)
-        if base_resolution.warning is not None:
-            result.warnings.append(base_resolution.warning)
+        if reconcile_ref is not None:
+            merge_base = None
+            merge_base_probe = getattr(git, "merge_base", None)
+            if callable(merge_base_probe):
+                try:
+                    resolved_merge_base = merge_base_probe(reconcile_ref, target_branch)
+                except Exception as exc:
+                    result.warnings.append(
+                        f"degraded merge-unit provenance: could not resolve merge-base for "
+                        f"'{cohort.branch}' against '{target_branch}': {exc}; preserving any stored base_sha"
+                    )
+                else:
+                    if isinstance(resolved_merge_base, str) and resolved_merge_base:
+                        merge_base = resolved_merge_base
+            if merge_base is not None:
+                result.base_sha = merge_base
+        if result.base_sha is None:
+            base_resolution = resolve_ref_if_possible(git, target_branch)
+            result.base_sha = base_resolution.sha
+            if base_resolution.warning is not None:
+                result.warnings.append(base_resolution.warning)
         if (result.head_sha is None) ^ (result.base_sha is None):
             if result.head_sha is None:
                 result.warnings.append(
@@ -463,6 +482,25 @@ def reconcile_branch_merge_truth(
                     f"degraded merge-unit provenance: could not resolve base SHA for '{target_branch}'; "
                     "preserving any stored base_sha"
                 )
+
+        if (
+            merge_state_is_terminal_for_lifecycle(cohort.merge_unit_state)
+            and cohort.merge_unit_target_branch == target_branch
+        ):
+            if cohort.merge_unit_state in {"empty", "redundant"} or preserve_recorded_merged:
+                result.merge_status = cohort.merge_unit_state
+                continue
+
+        try:
+            target_merged = (
+                None
+                if reconcile_ref is None
+                else git.is_merged(reconcile_ref, into=proof_target_ref)
+            )
+        except GitError as exc:
+            result.errors.append(str(exc))
+            result.merge_status = desired_merge_status
+            continue
 
         if target_merged is True and reconcile_ref is not None:
             desired_merge_status = classify_proven_merged_state(
@@ -521,7 +559,13 @@ def reconcile_branch_merge_truth(
                     on_warning=result.warnings.append,
                 )
                 classify_state = classification.state
-            except Exception:
+            except Exception as exc:
+                task_detail = f" tasks {', '.join(result.task_ids)}" if result.task_ids else ""
+                result.errors.append(
+                    f"branch '{cohort.branch}'{task_detail} classification failed "
+                    f"against '{proof_target_ref}': could not be proven against the canonical target; "
+                    f"could not determine unique commit count: {exc}"
+                )
                 classify_state = "unknown"
             if classify_state in {"empty", "redundant"}:
                 desired_merge_status = classify_state
@@ -872,7 +916,8 @@ def _persist_branch_updates(
             continue
         if result.skipped_reason is not None:
             continue
-        if not cohort.code_tasks:
+        persistence_tasks = cohort.code_tasks or (cohort.branch_tasks if cohort.merge_unit_id is not None else ())
+        if not persistence_tasks:
             continue
         pending_finalization_error = _cohort_pending_mandatory_merge_finalization_error(
             store,
@@ -884,11 +929,15 @@ def _persist_branch_updates(
             result.errors.append(pending_finalization_error)
             continue
         if _cohort_has_pending_mandatory_merge_finalization(store, cohort, update, target_branch):
+            result.errors.append(
+                f"pending mandatory merge finalization for branch '{cohort.branch}' "
+                f"against '{target_branch}' prevented persistence"
+            )
             continue
         try:
             _persist_branch_state(
                 store,
-                cohort.code_tasks,
+                persistence_tasks,
                 target_branch,
                 merge_unit_id=cohort.merge_unit_id,
                 merge_status=update.merge_status,
