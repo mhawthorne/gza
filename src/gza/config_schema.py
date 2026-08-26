@@ -147,6 +147,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "Shared automatic failed-task recovery toggle: 0 disables; any positive value enables the fixed bounded resume/retry policy used by advance, iterate improve recovery, and watch.",
     ),
     ConfigKeySpec("max_review_cycles", "int", 3, "Cap for review/improve loops in lifecycle automation."),
+    ConfigKeySpec(
+        "on_max_cycles",
+        "str",
+        "park",
+        "Policy for completed review/improve loops at max_review_cycles: `park` preserves the current manual-attention stop; `merge_and_defer` is accepted for opt-in staged rollout once the merge-and-defer executor path is enabled.",
+    ),
     ConfigKeySpec("max_plan_review_cycles", "int", 2, "Cap for plan_review/plan_improve loops in lifecycle automation."),
     ConfigKeySpec(
         "max_failed_plan_review_retries",

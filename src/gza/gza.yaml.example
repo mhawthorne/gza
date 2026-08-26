@@ -535,6 +535,12 @@ provider: codex
 # Default: effective watch batch or 5
 # max_concurrent: 5
 
+# Policy for completed review/improve loops at max_review_cycles: `park` preserves the current
+# manual-attention stop; `merge_and_defer` is accepted for opt-in staged rollout once the merge-
+# and-defer executor path is enabled.
+# Default: park
+# on_max_cycles: park
+
 # Port the local gza server listens on. 0 picks any free port, at the cost of a URL that changes
 # on every restart.
 # Default: 8765

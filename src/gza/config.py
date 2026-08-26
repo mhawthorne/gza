@@ -90,6 +90,8 @@ RENAMED_AUTONOMOUS_VERIFY_TIMEOUT_KEY = "autonomous_verify_timeout_seconds"
 DEFAULT_ADVANCE_MODE = "default"
 DEFAULT_MAX_RESUME_ATTEMPTS = 1
 DEFAULT_MAX_REVIEW_CYCLES = 3
+ON_MAX_CYCLES_VALUES = ("park", "merge_and_defer")
+DEFAULT_ON_MAX_CYCLES = "park"
 DEFAULT_MAX_PLAN_REVIEW_CYCLES = 2
 DEFAULT_MAX_FAILED_PLAN_REVIEW_RETRIES = 3
 DEFAULT_MAX_NOOP_IMPROVE_CYCLES = 1
@@ -159,7 +161,7 @@ VALID_CONFIG_FIELDS = {
     "verify_command", "unit_verify_command", "inner_verify_command",
     "advance_create_reviews", "advance_create_plan_reviews", "require_review_before_merge",
     "require_plan_review_before_implement", "pr_integration", "advance_mode", "max_resume_attempts",
-    "max_review_cycles", "max_plan_review_cycles", "max_failed_plan_review_retries",
+    "max_review_cycles", "on_max_cycles", "max_plan_review_cycles", "max_failed_plan_review_retries",
     "max_noop_improve_cycles", "max_plan_slices",
     "advance_off_topic_verify_unblock",
     "plan_slice_target_timeout_minutes", "max_failed_closing_review_retries", "max_concurrent",
@@ -249,6 +251,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "max_resume_attempts": None,
     "max_concurrent": None,
     "max_review_cycles": None,
+    "on_max_cycles": None,
     "max_plan_review_cycles": None,
     "max_failed_plan_review_retries": None,
     "max_noop_improve_cycles": None,
@@ -407,6 +410,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "max_resume_attempts": None,
     "max_concurrent": None,
     "max_review_cycles": None,
+    "on_max_cycles": None,
     "max_plan_review_cycles": None,
     "max_failed_plan_review_retries": None,
     "max_noop_improve_cycles": None,
@@ -1596,6 +1600,7 @@ class Config:
     max_resume_attempts: int = DEFAULT_MAX_RESUME_ATTEMPTS
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
     max_review_cycles: int = DEFAULT_MAX_REVIEW_CYCLES
+    on_max_cycles: str = DEFAULT_ON_MAX_CYCLES
     max_plan_review_cycles: int = DEFAULT_MAX_PLAN_REVIEW_CYCLES
     max_failed_plan_review_retries: int = DEFAULT_MAX_FAILED_PLAN_REVIEW_RETRIES
     max_noop_improve_cycles: int = DEFAULT_MAX_NOOP_IMPROVE_CYCLES
@@ -2675,6 +2680,12 @@ class Config:
         max_review_cycles = _load_strict_int_field(data, "max_review_cycles", DEFAULT_MAX_REVIEW_CYCLES)
         if max_review_cycles <= 0:
             raise ConfigError("'max_review_cycles' must be positive")
+        on_max_cycles = data.get("on_max_cycles", DEFAULT_ON_MAX_CYCLES)
+        if not isinstance(on_max_cycles, str) or on_max_cycles not in ON_MAX_CYCLES_VALUES:
+            raise ConfigError(
+                "'on_max_cycles' must be one of: "
+                f"{', '.join(ON_MAX_CYCLES_VALUES)}"
+            )
         max_plan_review_cycles = _load_strict_int_field(
             data,
             "max_plan_review_cycles",
@@ -3258,6 +3269,7 @@ class Config:
             max_resume_attempts=max_resume_attempts,
             max_concurrent=max_concurrent,
             max_review_cycles=max_review_cycles,
+            on_max_cycles=on_max_cycles,
             max_plan_review_cycles=max_plan_review_cycles,
             max_failed_plan_review_retries=max_failed_plan_review_retries,
             max_noop_improve_cycles=max_noop_improve_cycles,
@@ -3849,6 +3861,9 @@ class Config:
                 errors.append("'max_review_cycles' must be an integer")
             elif data["max_review_cycles"] <= 0:
                 errors.append("'max_review_cycles' must be positive")
+        if "on_max_cycles" in data:
+            if not isinstance(data["on_max_cycles"], str) or data["on_max_cycles"] not in ON_MAX_CYCLES_VALUES:
+                errors.append("'on_max_cycles' must be one of: park, merge_and_defer")
         if "max_plan_review_cycles" in data:
             if not _is_strict_int(data["max_plan_review_cycles"]):
                 errors.append("'max_plan_review_cycles' must be an integer")

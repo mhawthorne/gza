@@ -4943,6 +4943,60 @@ class TestTmuxConfigValidation:
         assert config.tmux.terminal_size == [160, 40]
 
 
+class TestOnMaxCyclesConfigValidation:
+    """Tests for on_max_cycles config parsing and validation."""
+
+    def _write_config(self, tmp_path: Path, extra: str) -> None:
+        config_path = tmp_path / "gza.yaml"
+        config_path.write_text(f"project_name: test\nprovider: codex\nmodel: gpt-5.5\n{extra}")
+
+    def test_config_on_max_cycles_default_parks(self, tmp_path: Path) -> None:
+        """Config.load keeps max-cycle review loops parked by default during opt-in rollout."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "")
+
+        config = Config.load(tmp_path)
+
+        assert config.on_max_cycles == "park"
+
+    @pytest.mark.parametrize("value", ["park", "merge_and_defer"])
+    def test_config_on_max_cycles_allowed_values_load(self, tmp_path: Path, value: str) -> None:
+        """Config.load exposes each supported max-cycle policy value exactly."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, f"on_max_cycles: {value}\n")
+
+        config = Config.load(tmp_path)
+
+        assert config.on_max_cycles == value
+
+    def test_config_on_max_cycles_local_override_loads(self, tmp_path: Path) -> None:
+        """Local overrides may opt a project into merge-and-defer without changing gza.yaml."""
+        from gza.config import Config
+
+        self._write_config(tmp_path, "on_max_cycles: park\n")
+        (tmp_path / "gza.local.yaml").write_text("on_max_cycles: merge_and_defer\n")
+
+        config = Config.load(tmp_path)
+
+        assert config.on_max_cycles == "merge_and_defer"
+        assert config.source_map["on_max_cycles"] == "local"
+
+    def test_config_on_max_cycles_unknown_value_rejected(self, tmp_path: Path) -> None:
+        """Config.load and Config.validate reject unknown max-cycle policies without aliases."""
+        from gza.config import Config, ConfigError
+
+        self._write_config(tmp_path, "on_max_cycles: defer\n")
+
+        is_valid, errors, _warnings = Config.validate(tmp_path)
+        assert is_valid is False
+        assert "'on_max_cycles' must be one of: park, merge_and_defer" in errors
+
+        with pytest.raises(ConfigError, match="on_max_cycles"):
+            Config.load(tmp_path)
+
+
 class TestWatchConfigValidation:
     """Tests for watch config section parsing and validation."""
 
