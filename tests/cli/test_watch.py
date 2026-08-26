@@ -14,11 +14,12 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal, Sequence
+from typing import Any, Literal
 from unittest.mock import ANY, MagicMock, call, patch
 
 import pytest
@@ -61,13 +62,13 @@ from gza.cli.git_ops import (
     ensure_watch_main_checkout,
 )
 from gza.cli.watch import (
-    AggregateWatchOccupancy,
     MAIN_VERIFY_REMEDIATION_ATTEMPT_LIMIT,
     MAIN_VERIFY_REMEDIATION_DUPLICATE_DROP_REASON,
     MAIN_VERIFY_REMEDIATION_EXHAUSTED_FAILURE_REASON,
     MAIN_VERIFY_REMEDIATION_EXHAUSTED_REASON,
     MAIN_VERIFY_REMEDIATION_MOOT_GREEN_REASON,
     SCOPED_WATCH_COMPLETE_MESSAGE,
+    AggregateWatchOccupancy,
     ProjectCycleAnalysis,
     ProjectDirectResult,
     ProjectDispatchCandidate,
@@ -76,11 +77,11 @@ from gza.cli.watch import (
     ProjectRuntimeReconcileResult,
     SupervisorLaunchBudget,
     WatchProjectRuntime,
-    WatchRuntimeIdentity,
     WatchProjectSelection,
+    WatchRuntimeIdentity,
     WatchSlotAllocation,
-    aggregate_reconciled_watch_occupancy,
-    aggregate_watch_project_occupancy,
+    WatchSupervisorProjectSelector,
+    WatchSupervisorSelection,
     _active_failure_backoff_owner_ids,
     _build_watch_cycle_plan,
     _collect_advance_completed_tasks,
@@ -136,6 +137,8 @@ from gza.cli.watch import (
     _WatchLog,
     _WatchLongPhaseReporter,
     _WatchWorkerHeartbeatMonitor,
+    aggregate_reconciled_watch_occupancy,
+    aggregate_watch_project_occupancy,
     allocate_watch_slots,
     cmd_main_verify,
     cmd_watch,
@@ -145,6 +148,7 @@ from gza.cli.watch import (
     format_red_duration,
     plan_watch_supervisor_dispatch_lanes,
     resolve_watch_supervisor_recovery_slot_limit,
+    resolve_watch_supervisor_selection,
 )
 from gza.concurrency import MaxConcurrentTasksError, _LiveRunningState, launch_permit, take_task_launch_permit
 from gza.config import Config, ConfigError
@@ -172,7 +176,6 @@ from gza.git_health import (
     load_git_health_state,
 )
 from gza.lineage_query import LineageOwnerRow
-from gza.watch_strategies import create_watch_dispatch_strategy
 from gza.main_integration_verify import (
     MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS,
     MAIN_INTEGRATION_VERIFY_LAUNCH_FAILED_EXIT_STATUS,
@@ -226,6 +229,7 @@ from gza.watch_progress import (
     get_active_watch_no_progress_attention,
     reconcile_stale_watch_no_progress_parks,
 )
+from gza.watch_strategies import create_watch_dispatch_strategy
 from gza.workers import WorkerMetadata, WorkerRegistry
 
 from .conftest import invoke_gza, make_store, setup_config
@@ -772,6 +776,12 @@ def _watch_args(tmp_path: Path, task_ids: list[str], **overrides: object) -> arg
         "dispatch_mode": None,
         "recovery_slots": None,
         "watch_lease_token": None,
+        "watch_projects": None,
+        "watch_tags": None,
+        "watch_all_tags": None,
+        "watch_weights": None,
+        "watch_strategy": None,
+        "watch_config": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -783,6 +793,823 @@ def _wait_for_dispatch_start_from_store(store):
         f"task {kwargs['task_id']} reached running state",
         store.get(str(kwargs["task_id"])),
     )
+
+
+def test_watch_supervisor_cli_selectors_preserve_order_and_keyed_associations(tmp_path: Path) -> None:
+    server_dir = tmp_path / "server"
+    server_dir.mkdir()
+
+    selection = resolve_watch_supervisor_selection(
+        _watch_args(
+            tmp_path,
+            [],
+            watch_projects=["core=.", "server=server"],
+            watch_tags=["server=api", "core=release", "server=ops"],
+            watch_all_tags=["server"],
+            watch_weights=["core=2"],
+            watch_strategy="weighted-round-robin",
+        )
+    )
+
+    assert isinstance(selection, WatchSupervisorSelection)
+    assert [project.key for project in selection.projects] == ["core", "server"]
+    assert selection.strategy == "weighted-round-robin"
+    assert selection.projects[0] == WatchSupervisorProjectSelector(
+        key="core",
+        ref=str(tmp_path.resolve()),
+        path=tmp_path.resolve(),
+        tags=("release",),
+        any_tag=True,
+        weight=2,
+        source="cli",
+    )
+    assert selection.projects[1] == WatchSupervisorProjectSelector(
+        key="server",
+        ref=str(server_dir.resolve()),
+        path=server_dir.resolve(),
+        tags=("api", "ops"),
+        any_tag=False,
+        weight=1,
+        source="cli",
+    )
+
+
+def test_watch_supervisor_manifest_resolves_relative_paths_and_cli_overrides(tmp_path: Path) -> None:
+    manifest_dir = tmp_path / "ops"
+    manifest_dir.mkdir()
+    core_dir = tmp_path / "core"
+    core_dir.mkdir()
+    manifest_path = manifest_dir / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "batch: 4",
+                "poll: 30",
+                "max_idle: 90",
+                "strategy: project-priority",
+                "projects:",
+                "  - name: core",
+                "    path: ../core",
+                "    project_id: gza",
+                "    tags: [manifest]",
+                "    tag_mode: all",
+                "    weight: 4",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    selection = resolve_watch_supervisor_selection(
+        _watch_args(
+            tmp_path,
+            [],
+            batch=7,
+            poll=None,
+            watch_config=str(manifest_path),
+            watch_tags=["core=cli"],
+            watch_weights=["core=2"],
+            watch_strategy="weighted-round-robin",
+        )
+    )
+
+    assert selection.batch == 7
+    assert selection.poll == 30
+    assert selection.max_idle == 90
+    assert selection.max_idle_present is True
+    assert selection.strategy == "weighted-round-robin"
+    assert selection.manifest_path == manifest_path.resolve()
+    assert selection.projects[0].path == core_dir.resolve()
+    assert selection.projects[0].project_id == "gza"
+    assert selection.projects[0].tags == ("cli",)
+    assert selection.projects[0].any_tag is True
+    assert selection.projects[0].weight == 2
+
+
+@pytest.mark.parametrize(
+    ("manifest_text", "error_match"),
+    [
+        ("version: true\nprojects:\n  - name: core\n    path: .\n", "version: 1"),
+        ("version: 1\nprojects:\n  - name: 123\n    path: .\n", "name must be a string"),
+        ("version: 1\nprojects:\n  - name: core\n    path: 123\n", "path must be a string"),
+        ("version: 1\nprojects:\n  - name: core\n    project_id: 123\n", "project_id must be a string"),
+        ("version: 1\nprojects:\n  - name: core\n    path: .\n    tags: [release, true]\n", "tags must contain only strings"),
+        ("version: 1\nprojects:\n  - name: core\n    path: .\n    tag_mode: true\n", "tag_mode must be a string"),
+        ("version: 1\nprojects:\n  - name: core\n    path: ''\n", "path must not be empty"),
+        ("version: 1\nprojects:\n  - name: core\n    path: '   '\n", "path must not be empty"),
+        ("version: 1\nbatcch: 2\nprojects:\n  - name: core\n    path: .\n", "top-level.*batcch"),
+        ("version: 1\nprojects:\n  - name: core\n    path: .\n    tag_mod: all\n", "project 'core'.*tag_mod"),
+        ("version: 1\n", "projects must be a non-empty list"),
+        ("version: 1\nprojects: []\n", "projects must be a non-empty list"),
+    ],
+)
+def test_watch_supervisor_manifest_rejects_malformed_schema(
+    tmp_path: Path,
+    manifest_text: str,
+    error_match: str,
+) -> None:
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(manifest_text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match=error_match):
+        resolve_watch_supervisor_selection(_watch_args(tmp_path, [], watch_config=str(manifest_path)))
+
+
+@pytest.mark.parametrize(
+    ("manifest_recovery_slots", "expected_recovery_slots"),
+    [(0, 0), (3, 3)],
+)
+def test_watch_supervisor_manifest_recovery_slots_accepts_non_negative_integers(
+    tmp_path: Path,
+    manifest_recovery_slots: int,
+    expected_recovery_slots: int,
+) -> None:
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                f"recovery_slots: {manifest_recovery_slots}",
+                "projects:",
+                "  - name: core",
+                "    path: .",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    selection = resolve_watch_supervisor_selection(_watch_args(tmp_path, [], watch_config=str(manifest_path)))
+
+    assert selection.recovery_slots == expected_recovery_slots
+
+
+def test_watch_supervisor_cli_recovery_slots_overrides_manifest(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "recovery_slots: 1",
+                "projects:",
+                "  - name: core",
+                "    path: .",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    selection = resolve_watch_supervisor_selection(
+        _watch_args(tmp_path, [], watch_config=str(manifest_path), recovery_slots=4)
+    )
+
+    assert selection.recovery_slots == 4
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "error_match"),
+    [
+        ("true", "recovery_slots must be an integer"),
+        ("1.5", "recovery_slots must be an integer"),
+        ("-1", "recovery_slots must be a non-negative integer"),
+    ],
+)
+def test_watch_supervisor_manifest_recovery_slots_rejects_invalid_values(
+    tmp_path: Path,
+    raw_value: str,
+    error_match: str,
+) -> None:
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                f"recovery_slots: {raw_value}",
+                "projects:",
+                "  - name: core",
+                "    path: .",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=error_match):
+        resolve_watch_supervisor_selection(_watch_args(tmp_path, [], watch_config=str(manifest_path)))
+
+
+@pytest.mark.parametrize(
+    "manifest_text",
+    [
+        "version: true\nprojects:\n  - name: core\n    path: .\n",
+        "version: 1\nprojects:\n  - name: 123\n    path: .\n",
+        "version: 1\nprojects:\n  - name: core\n    path: 123\n",
+        "version: 1\nprojects:\n  - name: core\n    project_id: 123\n",
+        "version: 1\nprojects:\n  - name: core\n    path: .\n    tags: [release, true]\n",
+        "version: 1\nprojects:\n  - name: core\n    path: .\n    tag_mode: true\n",
+        "version: 1\nprojects:\n  - name: core\n    path: ''\n",
+        "version: 1\nbatcch: 2\nprojects:\n  - name: core\n    path: .\n",
+        "version: 1\nprojects:\n  - name: core\n    path: .\n    tag_mod: all\n",
+        "version: 1\n",
+        "version: 1\nprojects: []\n",
+    ],
+)
+def test_cmd_watch_invalid_manifest_does_not_fall_through_to_legacy_args(
+    tmp_path: Path,
+    manifest_text: str,
+) -> None:
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(manifest_text, encoding="utf-8")
+    args = _watch_args(tmp_path, [], watch_config=str(manifest_path))
+
+    with (
+        patch("gza.cli.watch.Config.load") as load_config,
+        patch("gza.cli.watch.get_store") as get_store_mock,
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 1
+    load_config.assert_not_called()
+    get_store_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("watch_config", "manifest_text", "error_match"),
+    [
+        ("~definitely-no-such-gza-user/watch.yaml", None, "--watch-config"),
+        (
+            "{tmp_path}/watch.yaml",
+            "version: 1\nprojects:\n  - name: core\n    path: ~definitely-no-such-gza-user/project\n",
+            "--watch-config project 'core' path",
+        ),
+    ],
+)
+def test_cmd_watch_path_expansion_failures_are_validation_errors_before_config_load(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    watch_config: str,
+    manifest_text: str | None,
+    error_match: str,
+) -> None:
+    watch_config = watch_config.format(tmp_path=tmp_path)
+    if manifest_text is not None:
+        (tmp_path / "watch.yaml").write_text(manifest_text, encoding="utf-8")
+    args = _watch_args(tmp_path, [], watch_config=watch_config)
+
+    with (
+        patch("gza.cli.watch.Config.load") as load_config,
+        patch("gza.cli.watch.get_store") as get_store_mock,
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Error:" in captured.out
+    assert re.search(error_match, captured.out)
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    load_config.assert_not_called()
+    get_store_mock.assert_not_called()
+
+
+def test_cmd_watch_cli_project_path_expansion_failure_is_validation_error_before_config_load(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    args = _watch_args(tmp_path, [], watch_projects=["core=~definitely-no-such-gza-user/project"])
+
+    with (
+        patch("gza.cli.watch.Config.load") as load_config,
+        patch("gza.cli.watch.get_store") as get_store_mock,
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Error:" in captured.out
+    assert "--watch-project 'core'" in captured.out
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    load_config.assert_not_called()
+    get_store_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("patch_target", "expected_context"),
+    [
+        ("pathlib.Path.exists", "--watch-config"),
+        ("pathlib.Path.resolve", "--watch-config project 'core' path"),
+    ],
+)
+def test_cmd_watch_path_os_runtime_failures_are_validation_errors_before_config_load(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    patch_target: str,
+    expected_context: str,
+) -> None:
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text("version: 1\nprojects:\n  - name: core\n    path: .\n", encoding="utf-8")
+    args = _watch_args(tmp_path, [], watch_config=str(manifest_path))
+    injected_exc: BaseException = (
+        OSError("path existence unavailable")
+        if patch_target.endswith("exists")
+        else RuntimeError("path resolution unavailable")
+    )
+
+    with (
+        patch(patch_target, side_effect=injected_exc),
+        patch("gza.cli.watch.Config.load") as load_config,
+        patch("gza.cli.watch.get_store") as get_store_mock,
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Error:" in captured.out
+    assert expected_context in captured.out
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    load_config.assert_not_called()
+    get_store_mock.assert_not_called()
+
+
+def test_watch_supervisor_cli_project_list_replaces_manifest_projects(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "projects:",
+                "  - name: manifest",
+                "    path: manifest-project",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    cli_dir = tmp_path / "cli-project"
+    cli_dir.mkdir()
+
+    selection = resolve_watch_supervisor_selection(
+        _watch_args(tmp_path, [], watch_config=str(manifest_path), watch_projects=[f"cli={cli_dir}"])
+    )
+
+    assert [project.key for project in selection.projects] == ["cli"]
+    assert selection.projects[0].path == cli_dir.resolve()
+
+
+def test_watch_supervisor_rejects_duplicate_project_names(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="duplicate watch project name: core"):
+        resolve_watch_supervisor_selection(_watch_args(tmp_path, [], watch_projects=["core=.", "core=server"]))
+
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "projects:",
+                "  - name: core",
+                "    path: .",
+                "  - name: core",
+                "    path: server",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="duplicate watch project name: core"):
+        resolve_watch_supervisor_selection(_watch_args(tmp_path, [], watch_config=str(manifest_path)))
+
+
+@pytest.mark.parametrize("raw_weight", ["core=0", "core=-1", "core=two"])
+def test_watch_supervisor_rejects_invalid_cli_weights(tmp_path: Path, raw_weight: str) -> None:
+    with pytest.raises(ValueError, match="watch-weight"):
+        resolve_watch_supervisor_selection(
+            _watch_args(
+                tmp_path,
+                [],
+                watch_projects=["core=."],
+                watch_weights=[raw_weight],
+                watch_strategy="weighted-round-robin",
+            )
+        )
+
+
+def test_watch_supervisor_rejects_cli_weights_without_weighted_strategy(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires --strategy weighted-round-robin"):
+        resolve_watch_supervisor_selection(
+            _watch_args(tmp_path, [], watch_projects=["core=."], watch_weights=["core=2"])
+        )
+
+
+def test_watch_supervisor_rejects_unknown_keyed_overrides(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unknown watch project: missing"):
+        resolve_watch_supervisor_selection(
+            _watch_args(tmp_path, [], watch_projects=["core=."], watch_tags=["missing=tag"])
+        )
+    with pytest.raises(ValueError, match="unknown watch project: missing"):
+        resolve_watch_supervisor_selection(
+            _watch_args(tmp_path, [], watch_projects=["core=."], watch_all_tags=["missing"])
+        )
+    with pytest.raises(ValueError, match="unknown watch project: missing"):
+        resolve_watch_supervisor_selection(
+            _watch_args(tmp_path, [], watch_projects=["core=."], watch_weights=["missing=1"])
+        )
+
+
+def test_watch_supervisor_global_tags_are_rejected_only_for_multiple_projects(tmp_path: Path) -> None:
+    single = resolve_watch_supervisor_selection(_watch_args(tmp_path, [], watch_projects=["core=."], tags=["global"]))
+    assert [project.key for project in single.projects] == ["core"]
+
+    with pytest.raises(ValueError, match="multi-project watch requires keyed"):
+        resolve_watch_supervisor_selection(
+            _watch_args(tmp_path, [], watch_projects=["core=.", "server=server"], tags=["global"])
+        )
+
+
+def test_cmd_watch_single_manifest_tags_preserve_global_all_tags_mode(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "projects:",
+                "  - name: core",
+                "    path: .",
+                "    tags: [release, urgent]",
+                "    tag_mode: any",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = _watch_args(tmp_path, [], watch_config=str(manifest_path), all_tags=True, max_idle=1)
+
+    with (
+        patch("gza.cli.watch.get_store", return_value=store),
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
+        patch("gza.cli.watch._heartbeat_watch_session"),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch.time.sleep"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_args.kwargs["tags"] == ("release", "urgent")
+    assert run_cycle.call_args.kwargs["any_tag"] is False
+
+
+def test_cmd_watch_single_keyed_tags_preserve_global_all_tags_mode(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    args = _watch_args(
+        tmp_path,
+        [],
+        watch_projects=["core=."],
+        watch_tags=["core=release", "core=urgent"],
+        all_tags=True,
+        max_idle=1,
+    )
+
+    with (
+        patch("gza.cli.watch.get_store", return_value=store),
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
+        patch("gza.cli.watch._heartbeat_watch_session"),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch.time.sleep"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_args.kwargs["tags"] == ("release", "urgent")
+    assert run_cycle.call_args.kwargs["any_tag"] is False
+
+
+@pytest.mark.parametrize(
+    ("tag_mode", "expected_any_tag"),
+    [
+        ("any", True),
+        ("all", False),
+    ],
+)
+def test_cmd_watch_single_manifest_only_tags_apply_manifest_tag_mode(
+    tmp_path: Path,
+    tag_mode: str,
+    expected_any_tag: bool,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "projects:",
+                "  - name: core",
+                "    path: .",
+                "    tags: [release, urgent]",
+                f"    tag_mode: {tag_mode}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = _watch_args(tmp_path, [], watch_config=str(manifest_path), max_idle=1)
+
+    with (
+        patch("gza.cli.watch.get_store", return_value=store),
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
+        patch("gza.cli.watch._heartbeat_watch_session"),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch.time.sleep"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_args.kwargs["tags"] == ("release", "urgent")
+    assert run_cycle.call_args.kwargs["any_tag"] is expected_any_tag
+
+
+@pytest.mark.parametrize("manifest_recovery_slots", [0, 3])
+def test_cmd_watch_single_manifest_recovery_slots_project_to_legacy_runtime(
+    tmp_path: Path,
+    manifest_recovery_slots: int,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                f"recovery_slots: {manifest_recovery_slots}",
+                "projects:",
+                "  - name: core",
+                "    path: .",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = _watch_args(tmp_path, [], watch_config=str(manifest_path), recovery_slots=None, max_idle=1)
+
+    with (
+        patch("gza.cli.watch.get_store", return_value=store),
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch.time.sleep"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_args.kwargs["recovery_slots"] == manifest_recovery_slots
+
+
+def test_cmd_watch_single_manifest_recovery_slots_yields_to_explicit_cli_override(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "recovery_slots: 0",
+                "projects:",
+                "  - name: core",
+                "    path: .",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = _watch_args(tmp_path, [], watch_config=str(manifest_path), recovery_slots=2, max_idle=1)
+
+    with (
+        patch("gza.cli.watch.get_store", return_value=store),
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch.time.sleep"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert run_cycle.call_args.kwargs["recovery_slots"] == 2
+
+
+@pytest.mark.parametrize(
+    ("manifest_lines", "expected_max_idle"),
+    [
+        ([], 1),
+        (["max_idle: null"], None),
+    ],
+)
+def test_cmd_watch_single_manifest_max_idle_omission_inherits_and_null_disables(
+    tmp_path: Path,
+    manifest_lines: list[str],
+    expected_max_idle: int | None,
+) -> None:
+    setup_config(tmp_path)
+    _append_watch_config(tmp_path, "watch:\n  max_idle: 1\n")
+    config = Config.load(tmp_path)
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                *manifest_lines,
+                "projects:",
+                "  - name: core",
+                "    path: .",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = _watch_args(
+        tmp_path,
+        [],
+        watch_config=str(manifest_path),
+        max_idle=None,
+        max_iterations=2,
+    )
+    selection = resolve_watch_supervisor_selection(args)
+
+    watch_module._apply_watch_supervisor_selection_to_legacy_args(args, selection)
+
+    assert watch_module._resolve_watch_max_idle(args, config) == expected_max_idle
+
+
+def test_watch_supervisor_no_selection_preserves_legacy_watch_mode(tmp_path: Path) -> None:
+    selection = resolve_watch_supervisor_selection(
+        _watch_args(tmp_path, [], batch=None, poll=None, tags=["legacy"], all_tags=True)
+    )
+
+    assert selection.projects == ()
+    assert selection.strategy is None
+    assert selection.batch is None
+    assert selection.poll is None
+    assert selection.max_idle is None
+    assert selection.max_idle_present is False
+    assert selection.recovery_slots is None
+
+
+def test_cmd_watch_single_cli_path_selector_loads_selected_config_with_path(tmp_path: Path) -> None:
+    selected_dir = tmp_path / "selected"
+    selected_dir.mkdir()
+    setup_config(selected_dir)
+    store = make_store(selected_dir)
+    args = _watch_args(
+        tmp_path,
+        [],
+        watch_projects=[f"core={selected_dir}"],
+        batch=None,
+        poll=None,
+        max_idle=1,
+    )
+    real_config_load = Config.load
+    loaded_project_dirs: list[Path] = []
+
+    def load_config(project_dir: Path, **kwargs: object) -> Config:
+        loaded_project_dirs.append(project_dir)
+        return real_config_load(project_dir, **kwargs)
+
+    with (
+        patch("gza.cli.watch.Config.load", side_effect=load_config),
+        patch("gza.cli.watch.get_store", return_value=store),
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch.time.sleep"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert loaded_project_dirs == [selected_dir.resolve()]
+    assert isinstance(args.project_dir, Path)
+
+
+def test_cmd_watch_single_manifest_path_selector_loads_selected_config_with_path(tmp_path: Path) -> None:
+    manifest_dir = tmp_path / "ops"
+    manifest_dir.mkdir()
+    selected_dir = tmp_path / "selected"
+    selected_dir.mkdir()
+    setup_config(selected_dir)
+    store = make_store(selected_dir)
+    manifest_path = manifest_dir / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "projects:",
+                "  - name: core",
+                "    path: ../selected",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = _watch_args(tmp_path, [], watch_config=str(manifest_path), batch=None, poll=None, max_idle=1)
+    real_config_load = Config.load
+    loaded_project_dirs: list[Path] = []
+
+    def load_config(project_dir: Path, **kwargs: object) -> Config:
+        loaded_project_dirs.append(project_dir)
+        return real_config_load(project_dir, **kwargs)
+
+    with (
+        patch("gza.cli.watch.Config.load", side_effect=load_config),
+        patch("gza.cli.watch.get_store", return_value=store),
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)),
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch.time.sleep"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert loaded_project_dirs == [selected_dir.resolve()]
+    assert isinstance(args.project_dir, Path)
+
+
+def test_cmd_watch_single_manifest_path_selector_accepts_matching_project_id(tmp_path: Path) -> None:
+    manifest_dir = tmp_path / "ops"
+    manifest_dir.mkdir()
+    selected_dir = tmp_path / "selected"
+    selected_dir.mkdir()
+    setup_config(selected_dir, project_name="selected-project")
+    _append_watch_config(selected_dir, "project_id: selectedproject\n")
+    store = SqliteTaskStore.from_config(Config.load(selected_dir))
+    manifest_path = manifest_dir / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "projects:",
+                "  - name: core",
+                "    path: ../selected",
+                "    project_id: selectedproject",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = _watch_args(tmp_path, [], watch_config=str(manifest_path), batch=None, poll=None, max_idle=1)
+
+    with (
+        patch("gza.cli.watch.get_store", return_value=store) as get_store_mock,
+        patch("gza.cli.watch._run_cycle", return_value=_CycleResult(False, 0, 0)) as run_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+        patch("gza.cli.watch.time.sleep"),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    get_store_mock.assert_called_once()
+    assert run_cycle.call_count == 1
+
+
+def test_cmd_watch_single_manifest_path_selector_rejects_project_id_mismatch_before_store(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manifest_dir = tmp_path / "ops"
+    manifest_dir.mkdir()
+    selected_dir = tmp_path / "selected"
+    selected_dir.mkdir()
+    setup_config(selected_dir, project_name="loaded-project")
+    _append_watch_config(selected_dir, "project_id: loadedproject\n")
+    manifest_path = manifest_dir / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "projects:",
+                "  - name: core",
+                "    path: ../selected",
+                "    project_id: assertedproject",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = _watch_args(tmp_path, [], watch_config=str(manifest_path))
+
+    with (
+        patch("gza.cli.watch.get_store") as get_store_mock,
+        patch("gza.cli.watch.WatchProjectRuntime.create") as runtime_create,
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "project identity mismatch" in captured.out
+    assert "assertedproject" in captured.out
+    assert "loadedproject" in captured.out
+    get_store_mock.assert_not_called()
+    runtime_create.assert_not_called()
+
+
+def test_cmd_watch_single_registry_id_selector_exits_without_traceback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    args = _watch_args(tmp_path, [], watch_projects=["core=gza"])
+
+    with patch("gza.cli.watch.Config.load") as load_config:
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "registry-ID watch execution is not enabled yet" in captured.out
+    load_config.assert_not_called()
 
 
 def test_watch_project_runtime_owns_project_local_state(tmp_path: Path) -> None:
@@ -46612,6 +47439,226 @@ def test_watch_reexec_argv_omits_empty_watch_lease_token(tmp_path: Path) -> None
 
     assert "--resumed-reexec" in argv
     assert "--watch-lease-token" not in argv
+
+
+def test_watch_reexec_argv_preserves_manifest_anchor_and_manifest_identity_for_reparse(
+    tmp_path: Path,
+) -> None:
+    selected_dir = tmp_path / "selected"
+    selected_dir.mkdir()
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "batch: 4",
+                "poll: 9",
+                "recovery_slots: 3",
+                "projects:",
+                "  - name: core",
+                "    path: selected",
+                "    project_id: selectedproject",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = _watch_args(
+        tmp_path,
+        [],
+        batch=None,
+        poll=None,
+        recovery_slots=None,
+        watch_config=str(manifest_path),
+    )
+    args.watch_reexec_invocation = watch_module._capture_watch_reexec_invocation(args)
+    selection = resolve_watch_supervisor_selection(args)
+    watch_module._apply_watch_supervisor_selection_to_legacy_args(args, selection)
+
+    argv = _watch_reexec_argv(args)
+
+    assert argv[4:6] == ["--project", str(tmp_path)]
+    assert ["--watch-config", str(manifest_path)] == argv[6:8]
+    assert "--batch" not in argv
+    assert "--poll" not in argv
+    assert "--recovery-slots" not in argv
+    assert "--resumed-reexec" in argv
+
+    from gza.cli.main import main
+
+    with (
+        patch.object(sys, "argv", ["gza", *argv[3:]]),
+        patch("gza.cli.main.cmd_watch", return_value=0) as parsed_cmd_watch,
+    ):
+        assert main() == 0
+
+    reparsed_args = parsed_cmd_watch.call_args.args[0]
+    reparsed_selection = resolve_watch_supervisor_selection(reparsed_args)
+    assert reparsed_args.project_dir == tmp_path
+    assert reparsed_selection.manifest_path == manifest_path.resolve()
+    assert reparsed_selection.projects[0].project_id == "selectedproject"
+    assert reparsed_selection.projects[0].path == selected_dir.resolve()
+
+
+def test_watch_reexec_argv_preserves_keyed_selector_inputs_for_reparse(tmp_path: Path) -> None:
+    selected_dir = tmp_path / "selected"
+    selected_dir.mkdir()
+    args = _watch_args(
+        tmp_path,
+        [],
+        watch_projects=[f"core={selected_dir}"],
+        watch_tags=["core=release", "core=urgent"],
+        watch_all_tags=["core"],
+        watch_weights=["core=2"],
+        watch_strategy="weighted-round-robin",
+    )
+    args.watch_reexec_invocation = watch_module._capture_watch_reexec_invocation(args)
+    selection = resolve_watch_supervisor_selection(args)
+    watch_module._apply_watch_supervisor_selection_to_legacy_args(args, selection)
+
+    argv = _watch_reexec_argv(args)
+
+    assert argv[4:6] == ["--project", str(tmp_path)]
+    assert "--watch-project" in argv
+    assert "--watch-tag" in argv
+    assert "--watch-all-tags" in argv
+    assert "--watch-weight" in argv
+    assert ["--strategy", "weighted-round-robin"] == argv[
+        argv.index("--strategy") : argv.index("--strategy") + 2
+    ]
+    assert "--tag" not in argv
+    assert "--all-tags" not in argv
+
+    from gza.cli.main import main
+
+    with (
+        patch.object(sys, "argv", ["gza", *argv[3:]]),
+        patch("gza.cli.main.cmd_watch", return_value=0) as parsed_cmd_watch,
+    ):
+        assert main() == 0
+
+    reparsed_selection = resolve_watch_supervisor_selection(parsed_cmd_watch.call_args.args[0])
+    assert reparsed_selection.projects[0].tags == ("release", "urgent")
+    assert reparsed_selection.projects[0].any_tag is False
+    assert reparsed_selection.projects[0].weight == 2
+
+
+def _reparse_watch_reexec_argv_through_main(argv: list[str]) -> argparse.Namespace:
+    from gza.cli.main import main
+
+    with (
+        patch.object(sys, "argv", ["gza", *argv[3:]]),
+        patch("gza.cli.main.cmd_watch", return_value=0) as parsed_cmd_watch,
+    ):
+        assert main() == 0
+    return parsed_cmd_watch.call_args.args[0]
+
+
+def test_watch_reexec_reparse_preserves_single_manifest_unkeyed_tag_override(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "projects:",
+                "  - name: core",
+                "    path: .",
+                "    tags: [manifest]",
+                "    tag_mode: any",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = _watch_args(
+        tmp_path,
+        [],
+        watch_config=str(manifest_path),
+        tags=["cli-a", "cli-b"],
+        all_tags=True,
+    )
+    args.watch_reexec_invocation = watch_module._capture_watch_reexec_invocation(args)
+    selection = resolve_watch_supervisor_selection(args)
+    args.watch_reexec_invocation = replace(
+        args.watch_reexec_invocation,
+        resolved_project_count=len(selection.projects),
+    )
+    watch_module._apply_watch_supervisor_selection_to_legacy_args(args, selection)
+    before = (tuple(args.tags or ()), not args.all_tags)
+
+    reparsed_args = _reparse_watch_reexec_argv_through_main(_watch_reexec_argv(args))
+    reparsed_selection = resolve_watch_supervisor_selection(reparsed_args)
+    watch_module._apply_watch_supervisor_selection_to_legacy_args(reparsed_args, reparsed_selection)
+
+    assert before == (("cli-a", "cli-b"), False)
+    assert (tuple(reparsed_args.tags or ()), not reparsed_args.all_tags) == before
+
+
+def test_watch_reexec_reparse_preserves_single_keyed_project_unkeyed_tags(
+    tmp_path: Path,
+) -> None:
+    selected_dir = tmp_path / "selected"
+    selected_dir.mkdir()
+    args = _watch_args(
+        tmp_path,
+        [],
+        watch_projects=[f"core={selected_dir}"],
+        watch_tags=["core=manifest"],
+        tags=["cli"],
+        all_tags=True,
+    )
+    args.watch_reexec_invocation = watch_module._capture_watch_reexec_invocation(args)
+    selection = resolve_watch_supervisor_selection(args)
+    args.watch_reexec_invocation = replace(
+        args.watch_reexec_invocation,
+        resolved_project_count=len(selection.projects),
+    )
+    watch_module._apply_watch_supervisor_selection_to_legacy_args(args, selection)
+    before = (tuple(args.tags or ()), not args.all_tags)
+
+    reparsed_args = _reparse_watch_reexec_argv_through_main(_watch_reexec_argv(args))
+    reparsed_selection = resolve_watch_supervisor_selection(reparsed_args)
+    watch_module._apply_watch_supervisor_selection_to_legacy_args(reparsed_args, reparsed_selection)
+
+    assert before == (("cli",), False)
+    assert (tuple(reparsed_args.tags or ()), not reparsed_args.all_tags) == before
+
+
+def test_watch_reexec_argv_preserves_explicit_cli_global_override_as_override(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "batch: 4",
+                "recovery_slots: 1",
+                "projects:",
+                "  - name: core",
+                "    path: .",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = _watch_args(
+        tmp_path,
+        [],
+        batch=2,
+        recovery_slots=0,
+        watch_config=str(manifest_path),
+    )
+    args.watch_reexec_invocation = watch_module._capture_watch_reexec_invocation(args)
+    selection = resolve_watch_supervisor_selection(args)
+    watch_module._apply_watch_supervisor_selection_to_legacy_args(args, selection)
+
+    argv = _watch_reexec_argv(args)
+
+    assert ["--watch-config", str(manifest_path)] == argv[6:8]
+    assert ["--batch", "2"] == argv[argv.index("--batch") : argv.index("--batch") + 2]
+    assert ["--recovery-slots", "0"] == argv[
+        argv.index("--recovery-slots") : argv.index("--recovery-slots") + 2
+    ]
 
 
 def test_cmd_watch_resumed_reexec_adopts_same_token_live_watch_lease(tmp_path: Path) -> None:

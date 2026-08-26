@@ -2126,6 +2126,12 @@ need to break out promptly from a long or blocked watch pass.
 | failure backoff | After each newly observed non-auto-resumable failure, `gza watch` logs an exponential cooldown for the failing owner unit using `watch.failure_backoff_initial` and `watch.failure_backoff_max`; repeated failures from one owner only advance that owner's streak/backoff; unrelated units remain dispatchable, and `watch.failure_halt_after` applies when the retained distinct failing-owner count for the project reaches the configured threshold; an owner leaves that count when owner-scoped work completes and the failure-backoff state resets |
 | `--poll SECS` | Poll interval in seconds (default: `watch.poll` or `300`) |
 | `--max-idle SECS` | Exit after consecutive idle watch-loop time (default: `watch.max_idle`, no limit when unset) |
+| `--watch-config PATH` | Load a version 1 watch supervisor manifest. One path-backed selected project can execute today; more than one selected project and registry-ID-only selectors are validated and then refused before execution |
+| `--watch-project NAME=PATH_OR_PROJECT_ID` | Replace any manifest project list with an ordered CLI project list. Path selectors can execute when exactly one project is selected; registry-ID-only selectors are a validated future surface and are refused before execution |
+| `--watch-tag NAME=TAG` | Apply a keyed tag filter to a named watch project (repeatable). Explicit unkeyed `--tag` overrides keyed or manifest tags only when the resolved selection contains exactly one project |
+| `--watch-all-tags NAME` | Require all keyed `--watch-tag` values for the named project instead of the default any-tag matching |
+| `--watch-weight NAME=N` | Set a positive integer project weight; valid only with `--strategy weighted-round-robin` |
+| `--strategy STRATEGY` | Select the cross-project dispatch strategy for supervisor selections: `round-robin`, `weighted-round-robin`, or `project-priority` |
 | `--max-iterations N` | Iterate loop cap for implement tasks launched by watch (default: `watch.max_iterations` or `10`) |
 | `--recovery-slots N` | Slots per watch pass reserved for worker-consuming failed-task recovery before pending pickup (default: `watch.recovery_slots` or `1`) |
 | `--recovery-only` | Send the full batch to failed-task recovery, or all free supervisor dispatch slots in multi-project mode; pending pickup waits until recovery drains |
@@ -2153,6 +2159,38 @@ watch:
 ```
 
 `watch.no_activity_timeout` controls when watch reconciliation marks a silent registered worker for a pending or in-progress task `NO_ACTIVITY` because its task log or startup evidence has stopped receiving writes. `watch.max_idle` keeps its existing meaning: it exits the `gza watch` loop itself after consecutive idle cycles. These settings are independent.
+
+For a version 1 `--watch-config` manifest, supervisor-global `batch`, `poll`, `max_idle`, and `recovery_slots` apply before the selected project's `watch` defaults, while explicit CLI flags still win over the manifest. Omitted `max_idle` inherits the selected project setting; `max_idle: null` explicitly disables the idle-exit limit for that supervisor run. Manifest `recovery_slots` must be a non-negative integer, so `0` intentionally disables the recovery reservation unless a CLI recovery mode changes it.
+
+Version 1 watch supervisor manifests are YAML mappings with this shape:
+
+```yaml
+version: 1
+batch: 4              # optional supervisor-global value
+poll: 30              # optional supervisor-global value
+max_idle: null        # optional; null disables the idle-exit limit
+recovery_slots: 1     # optional non-negative integer
+strategy: round-robin # optional: round-robin, weighted-round-robin, or project-priority
+projects:
+  - name: core
+    path: ../gza      # relative paths resolve from the manifest file directory
+    project_id: gza   # optional assertion after the selected config loads
+    tags: [release, urgent]
+    tag_mode: all     # optional: any or all; default is any
+    weight: 2         # optional positive integer for weighted-round-robin
+```
+
+`projects` is ordered. The order is the tie-breaker for `round-robin` and the priority order for `project-priority`. Each project entry must have a unique `name` and either `path` or `project_id`; if both are present, `project_id` is an assertion on the config loaded from `path`. Relative manifest paths resolve against the manifest file, not the current shell directory.
+
+CLI project selectors replace the manifest project list instead of merging into it:
+
+```bash
+gza watch --watch-config ops/watch.yaml --watch-project core=/work/gza
+```
+
+Keyed CLI tags, all-tags mode, weights, and strategy override the selected manifest values for matching project names. When the final resolved selection contains exactly one project, explicit unkeyed `--tag` values and `--all-tags` override any manifest or keyed tag policy for that one project, and drift re-exec preserves that explicit unkeyed scope. When the selection contains more than one project, unkeyed `--tag`, unkeyed `--all-tags`, and positional task IDs are rejected because their project ownership is ambiguous.
+
+The current execution surface is intentionally narrower than the version 1 schema: a single path-backed selected project can run through the existing watch runtime. A manifest or CLI selection with more than one project exits before runtime construction with `multi-project watch supervisor execution is not enabled yet`. A selector that only names a registry `project_id` exits before runtime construction with a registry-ID limitation message; use `NAME=PATH` for the currently executable form.
 
 `watch.no_progress_cycles` sets the restart-safe no-progress backstop threshold for `gza watch`. When watch selects the same unchanged worker-launch or recovery action for the same merge unit or lineage across that many cycles without durable progress, it parks the subject with `watch-no-progress-backstop` instead of respawning the no-op forever. Direct verify-evidence reconciliation counts as durable progress when it updates the canonical owner's verify state, even if the recredited evidence is non-green and the next lifecycle action remains remedial. Parks are cleared automatically once that exact executed-action basis no longer holds, including never-started pending launches and stale resolved merge-unit residue.
 

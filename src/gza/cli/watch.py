@@ -22,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal, TypeVar, cast
 
+import yaml
 from rich.text import Text
 
 from .. import colors as _colors, lineage
@@ -181,7 +182,7 @@ from ..watch_progress import (
     reconcile_stale_watch_no_progress_parks,
     record_background_watch_execution_start,
 )
-from ..watch_strategies import WatchDispatchStrategy
+from ..watch_strategies import WATCH_DISPATCH_STRATEGY_REGISTRY, WatchDispatchStrategy
 from ..workers import WorkerRegistry
 from . import _lifecycle_actions as _shared_lifecycle_actions
 from ._common import (
@@ -209,6 +210,7 @@ from ._common import (
     resolve_improve_action,
     set_task_queue_position_scoped,
     set_task_urgency,
+    validate_cli_tag_values,
 )
 from ._lifecycle_actions import (
     LifecycleActionEntry,
@@ -3970,16 +3972,32 @@ def _should_reexec_watch(
 
 
 def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
-    argv = [sys.executable, "-m", "gza", "watch", "--project", str(args.project_dir)]
+    invocation = getattr(args, "watch_reexec_invocation", None)
+    if not isinstance(invocation, _WatchReexecInvocation):
+        invocation = _capture_watch_reexec_invocation(args)
+    argv = [sys.executable, "-m", "gza", "watch", "--project", str(invocation.project_dir)]
+    preserve_unkeyed_tag_scope = _watch_reexec_preserves_unkeyed_tag_scope(invocation, args)
     scoped_mode = bool(getattr(args, "task_ids", None))
-    if getattr(args, "batch", None) is not None:
-        argv.extend(["--batch", str(args.batch)])
-    if getattr(args, "poll", None) is not None:
-        argv.extend(["--poll", str(args.poll)])
-    if getattr(args, "max_idle", None) is not None:
-        argv.extend(["--max-idle", str(args.max_idle)])
-    if getattr(args, "max_iterations", None) is not None:
-        argv.extend(["--max-iterations", str(args.max_iterations)])
+    if invocation.watch_config is not None:
+        argv.extend(["--watch-config", invocation.watch_config])
+    for raw_project in invocation.watch_projects:
+        argv.extend(["--watch-project", raw_project])
+    for raw_tag in invocation.watch_tags:
+        argv.extend(["--watch-tag", raw_tag])
+    for raw_name in invocation.watch_all_tags:
+        argv.extend(["--watch-all-tags", raw_name])
+    for raw_weight in invocation.watch_weights:
+        argv.extend(["--watch-weight", raw_weight])
+    if invocation.watch_strategy is not None:
+        argv.extend(["--strategy", invocation.watch_strategy])
+    if invocation.batch is not None:
+        argv.extend(["--batch", str(invocation.batch)])
+    if invocation.poll is not None:
+        argv.extend(["--poll", str(invocation.poll)])
+    if invocation.max_idle is not None:
+        argv.extend(["--max-idle", str(invocation.max_idle)])
+    if invocation.max_iterations is not None:
+        argv.extend(["--max-iterations", str(invocation.max_iterations)])
     requested_dispatch_mode = getattr(args, "dispatch_mode", None)
     if requested_dispatch_mode is None and hasattr(args, "recovery_mode"):
         requested_dispatch_mode = getattr(args, "recovery_mode", None)
@@ -3987,7 +4005,7 @@ def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
         requested_dispatch_mode = "recovery_only"
     dispatch_mode = _normalize_watch_dispatch_selection_mode(
         dispatch_mode=cast(str | None, requested_dispatch_mode),
-        recovery_slots=getattr(args, "recovery_slots", None),
+        recovery_slots=invocation.recovery_slots,
         scoped_mode=scoped_mode,
     )
     if dispatch_mode == "recovery_only":
@@ -3996,10 +4014,10 @@ def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
         argv.append("--recovery-first")
     elif dispatch_mode == "pending_only":
         argv.append("--pending-only")
-    if getattr(args, "recovery_slots", None) is not None:
-        argv.extend(["--recovery-slots", str(args.recovery_slots)])
-    if getattr(args, "max_resume_attempts", None) is not None:
-        argv.extend(["--max-resume-attempts", str(args.max_resume_attempts)])
+    if invocation.recovery_slots is not None:
+        argv.extend(["--recovery-slots", str(invocation.recovery_slots)])
+    if invocation.max_resume_attempts is not None:
+        argv.extend(["--max-resume-attempts", str(invocation.max_resume_attempts)])
     if getattr(args, "dry_run", False):
         argv.append("--dry-run")
     if getattr(args, "show_skipped", False):
@@ -4012,10 +4030,11 @@ def _watch_reexec_argv(args: argparse.Namespace) -> list[str]:
     watch_lease_token = getattr(args, "watch_lease_token", None)
     if isinstance(watch_lease_token, str) and watch_lease_token:
         argv.extend(["--watch-lease-token", watch_lease_token])
-    for tag in getattr(args, "tags", None) or ():
-        argv.extend(["--tag", tag])
-    if getattr(args, "all_tags", False):
-        argv.append("--all-tags")
+    if preserve_unkeyed_tag_scope:
+        for tag in invocation.unkeyed_tags:
+            argv.extend(["--tag", tag])
+        if invocation.unkeyed_all_tags:
+            argv.append("--all-tags")
     if not getattr(args, "auto_restart_on_drift", True):
         argv.append("--no-auto-restart-on-drift")
     for task_id in getattr(args, "task_ids", None) or ():
@@ -7055,6 +7074,499 @@ class WatchProjectSelection:
     project_dir: Path
     tags: tuple[str, ...] | None = None
     any_tag: bool = False
+
+
+@dataclass(frozen=True)
+class WatchSupervisorProjectSelector:
+    """Normalized parser/manifest selection for one supervised project."""
+
+    key: str
+    ref: str
+    path: Path | None = None
+    project_id: str | None = None
+    tags: tuple[str, ...] | None = None
+    any_tag: bool = True
+    weight: int = 1
+    source: str = "cli"
+
+
+@dataclass(frozen=True)
+class WatchSupervisorSelection:
+    """Validated watch supervisor selection before fleet runtime construction."""
+
+    projects: tuple[WatchSupervisorProjectSelector, ...]
+    strategy: str | None = None
+    batch: int | None = None
+    poll: int | None = None
+    max_idle: int | None = None
+    max_idle_present: bool = False
+    recovery_slots: int | None = None
+    manifest_path: Path | None = None
+
+    @property
+    def multi_project(self) -> bool:
+        return len(self.projects) > 1
+
+
+_WATCH_SELECTOR_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+@dataclass(frozen=True)
+class _WatchReexecInvocation:
+    """Original watch invocation inputs needed to replay supervisor precedence after exec."""
+
+    project_dir: Path
+    batch: int | None
+    poll: int | None
+    max_idle: int | None
+    max_iterations: int | None
+    recovery_slots: int | None
+    max_resume_attempts: int | None
+    watch_config: str | None
+    watch_projects: tuple[str, ...]
+    watch_tags: tuple[str, ...]
+    watch_all_tags: tuple[str, ...]
+    watch_weights: tuple[str, ...]
+    watch_strategy: str | None
+    unkeyed_tags: tuple[str, ...]
+    unkeyed_all_tags: bool
+    resolved_project_count: int | None = None
+
+
+_WATCH_MANIFEST_TOP_LEVEL_KEYS = frozenset(
+    {"version", "projects", "strategy", "batch", "poll", "max_idle", "recovery_slots"}
+)
+_WATCH_MANIFEST_PROJECT_KEYS = frozenset({"name", "path", "project_id", "tags", "tag_mode", "weight"})
+
+
+def _reject_unknown_watch_manifest_keys(
+    mapping: Mapping[Any, object],
+    *,
+    allowed: frozenset[str],
+    context: str,
+) -> None:
+    for raw_key in mapping:
+        if not isinstance(raw_key, str):
+            raise ValueError(f"--watch-config {context} field {raw_key!r} must be a string")
+        if raw_key not in allowed:
+            raise ValueError(f"--watch-config {context} contains unsupported field: {raw_key}")
+
+
+def _split_watch_key_value(raw: object, *, flag: str) -> tuple[str, str]:
+    text = str(raw)
+    if "=" not in text:
+        raise ValueError(f"{flag} must use NAME=VALUE syntax")
+    key, value = text.split("=", 1)
+    key = key.strip()
+    value = value.strip()
+    if not key:
+        raise ValueError(f"{flag} selector name must not be empty")
+    if not _WATCH_SELECTOR_NAME_RE.fullmatch(key):
+        raise ValueError(f"{flag} selector name {key!r} may only contain letters, numbers, '.', '_', and '-'")
+    if not value:
+        raise ValueError(f"{flag} value for {key!r} must not be empty")
+    return key, value
+
+
+def _validate_watch_selector_name(raw: object, *, field: str = "name") -> str:
+    if not isinstance(raw, str):
+        raise ValueError(f"watch project {field} must be a string")
+    name = str(raw).strip()
+    if not name:
+        raise ValueError(f"watch project {field} must not be empty")
+    if not _WATCH_SELECTOR_NAME_RE.fullmatch(name):
+        raise ValueError(
+            f"watch project {field} {name!r} may only contain letters, numbers, '.', '_', and '-'"
+        )
+    return name
+
+
+def _normalize_watch_path_error(context: str, exc: BaseException) -> ValueError:
+    return ValueError(f"{context}: {exc}")
+
+
+def _expand_watch_path(raw: str, *, context: str) -> Path:
+    try:
+        return Path(raw).expanduser()
+    except (OSError, RuntimeError) as exc:
+        raise _normalize_watch_path_error(context, exc) from exc
+
+
+def _resolve_watch_path(path: Path, *, context: str) -> Path:
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise _normalize_watch_path_error(context, exc) from exc
+
+
+def _watch_path_exists(path: Path, *, context: str) -> bool:
+    try:
+        return path.exists()
+    except (OSError, RuntimeError) as exc:
+        raise _normalize_watch_path_error(context, exc) from exc
+
+
+def _resolve_manifest_project_path(raw: object, *, manifest_path: Path, project_context: str) -> Path:
+    if not isinstance(raw, str):
+        raise ValueError(f"--watch-config {project_context} path must be a string")
+    path_text = raw.strip()
+    if not path_text:
+        raise ValueError(f"--watch-config {project_context} path must not be empty")
+    context = f"--watch-config {project_context} path"
+    path = _expand_watch_path(path_text, context=context)
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    return _resolve_watch_path(path, context=context)
+
+
+def _positive_int(raw: object, *, field: str) -> int:
+    if type(raw) is not int:
+        raise ValueError(f"{field} must be an integer")
+    if raw < 1:
+        raise ValueError(f"{field} must be a positive integer")
+    return raw
+
+
+def _optional_positive_int(raw: object, *, field: str) -> int | None:
+    if raw is None:
+        return None
+    return _positive_int(raw, field=field)
+
+
+def _non_negative_int(raw: object, *, field: str) -> int:
+    if type(raw) is not int:
+        raise ValueError(f"{field} must be an integer")
+    if raw < 0:
+        raise ValueError(f"{field} must be a non-negative integer")
+    return raw
+
+
+def _normalize_watch_strategy(raw: object | None) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError("--strategy must be a string")
+    strategy = str(raw).strip()
+    if strategy not in WATCH_DISPATCH_STRATEGY_REGISTRY:
+        valid = ", ".join(sorted(WATCH_DISPATCH_STRATEGY_REGISTRY))
+        raise ValueError(f"--strategy must be one of: {valid}")
+    return strategy
+
+
+def _load_watch_supervisor_manifest(path_arg: object) -> WatchSupervisorSelection:
+    manifest_path = _expand_watch_path(str(path_arg), context="--watch-config")
+    if not manifest_path.is_absolute():
+        manifest_path = _resolve_watch_path(Path.cwd() / manifest_path, context="--watch-config")
+    if not _watch_path_exists(manifest_path, context="--watch-config"):
+        raise ValueError(f"--watch-config not found: {manifest_path}")
+    try:
+        with manifest_path.open("r", encoding="utf-8") as handle:
+            loaded = yaml.safe_load(handle) or {}
+    except OSError as exc:
+        raise ValueError(f"could not read --watch-config {manifest_path}: {exc}") from exc
+    except yaml.YAMLError as exc:
+        raise ValueError(f"could not parse --watch-config {manifest_path}: {exc}") from exc
+    if not isinstance(loaded, Mapping):
+        raise ValueError("--watch-config must contain a mapping")
+    _reject_unknown_watch_manifest_keys(
+        loaded,
+        allowed=_WATCH_MANIFEST_TOP_LEVEL_KEYS,
+        context="top-level",
+    )
+    version = loaded.get("version")
+    if type(version) is not int or version != 1:
+        raise ValueError("--watch-config must declare version: 1")
+
+    if "projects" not in loaded:
+        raise ValueError("--watch-config projects must be a non-empty list")
+    raw_projects = loaded.get("projects")
+    if not isinstance(raw_projects, list) or not raw_projects:
+        raise ValueError("--watch-config projects must be a non-empty list")
+    projects: list[WatchSupervisorProjectSelector] = []
+    seen: set[str] = set()
+    for index, raw_project in enumerate(raw_projects, start=1):
+        if not isinstance(raw_project, Mapping):
+            raise ValueError(f"--watch-config project #{index} must be a mapping")
+        project_data = cast(Mapping[str, object], raw_project)
+        project_context = f"project #{index}"
+        raw_context_name = project_data.get("name")
+        if isinstance(raw_context_name, str) and raw_context_name.strip():
+            project_context = f"project {raw_context_name.strip()!r}"
+        _reject_unknown_watch_manifest_keys(
+            project_data,
+            allowed=_WATCH_MANIFEST_PROJECT_KEYS,
+            context=project_context,
+        )
+        if "name" not in project_data:
+            raise ValueError(f"--watch-config project #{index} is missing name")
+        key = _validate_watch_selector_name(project_data["name"], field="name")
+        if key in seen:
+            raise ValueError(f"duplicate watch project name: {key}")
+        seen.add(key)
+        raw_path = project_data.get("path")
+        raw_project_id = project_data.get("project_id")
+        if raw_path is None and raw_project_id is None:
+            raise ValueError(f"--watch-config project {key!r} must define path or project_id")
+        if raw_project_id is not None and not isinstance(raw_project_id, str):
+            raise ValueError(f"--watch-config project {key!r} project_id must be a string")
+        project_id = raw_project_id.strip() if raw_project_id is not None else None
+        if project_id == "":
+            raise ValueError(f"--watch-config project {key!r} project_id must not be empty")
+        path = (
+            _resolve_manifest_project_path(raw_path, manifest_path=manifest_path, project_context=project_context)
+            if raw_path is not None
+            else None
+        )
+        ref = str(path) if path is not None else cast(str, project_id)
+        raw_tags = project_data.get("tags", None)
+        if raw_tags is None:
+            tags = None
+        elif isinstance(raw_tags, list):
+            if not all(isinstance(tag, str) for tag in raw_tags):
+                raise ValueError(f"--watch-config project {key!r} tags must contain only strings")
+            tags = validate_cli_tag_values(cast(list[str], raw_tags)) or None
+        else:
+            raise ValueError(f"--watch-config project {key!r} tags must be a list")
+        raw_tag_mode = project_data.get("tag_mode", "any")
+        if not isinstance(raw_tag_mode, str):
+            raise ValueError(f"--watch-config project {key!r} tag_mode must be a string")
+        tag_mode = raw_tag_mode.strip()
+        if tag_mode not in {"any", "all"}:
+            raise ValueError(f"--watch-config project {key!r} tag_mode must be 'any' or 'all'")
+        projects.append(
+            WatchSupervisorProjectSelector(
+                key=key,
+                ref=ref,
+                path=path,
+                project_id=project_id,
+                tags=tags,
+                any_tag=tag_mode == "any",
+                weight=_positive_int(project_data.get("weight", 1), field=f"watch project {key!r} weight"),
+                source=str(manifest_path),
+            )
+        )
+
+    return WatchSupervisorSelection(
+        projects=tuple(projects),
+        strategy=_normalize_watch_strategy(loaded.get("strategy")),
+        batch=_optional_positive_int(loaded.get("batch"), field="watch manifest batch"),
+        poll=_optional_positive_int(loaded.get("poll"), field="watch manifest poll"),
+        max_idle=_optional_positive_int(loaded.get("max_idle"), field="watch manifest max_idle"),
+        max_idle_present="max_idle" in loaded,
+        recovery_slots=(
+            _non_negative_int(loaded["recovery_slots"], field="watch manifest recovery_slots")
+            if "recovery_slots" in loaded
+            else None
+        ),
+        manifest_path=manifest_path,
+    )
+
+
+def _path_for_cli_watch_ref(raw_ref: str, *, anchor_dir: Path, key: str) -> Path | None:
+    ref_path = _expand_watch_path(raw_ref, context=f"--watch-project {key!r}")
+    path_like = ref_path.is_absolute() or raw_ref.startswith((".", "~")) or "/" in raw_ref or "\\" in raw_ref
+    candidate = ref_path if ref_path.is_absolute() else anchor_dir / ref_path
+    if path_like or _watch_path_exists(candidate, context=f"--watch-project {key!r}"):
+        return _resolve_watch_path(candidate, context=f"--watch-project {key!r}")
+    return None
+
+
+def _cli_watch_project_selectors(args: argparse.Namespace) -> tuple[WatchSupervisorProjectSelector, ...]:
+    raw_projects = tuple(getattr(args, "watch_projects", None) or ())
+    if not raw_projects:
+        return ()
+    anchor_dir = _expand_watch_path(str(getattr(args, "project_dir", None) or Path.cwd()), context="--project")
+    if not anchor_dir.is_absolute():
+        anchor_dir = _resolve_watch_path(Path.cwd() / anchor_dir, context="--project")
+    projects: list[WatchSupervisorProjectSelector] = []
+    seen: set[str] = set()
+    for raw in raw_projects:
+        key, ref = _split_watch_key_value(raw, flag="--watch-project")
+        if key in seen:
+            raise ValueError(f"duplicate watch project name: {key}")
+        seen.add(key)
+        path = _path_for_cli_watch_ref(ref, anchor_dir=anchor_dir, key=key)
+        projects.append(
+            WatchSupervisorProjectSelector(
+                key=key,
+                ref=str(path) if path is not None else ref,
+                path=path,
+                project_id=None if path is not None else ref,
+                source="cli",
+            )
+        )
+    return tuple(projects)
+
+
+def _capture_watch_reexec_invocation(args: argparse.Namespace) -> _WatchReexecInvocation:
+    return _WatchReexecInvocation(
+        project_dir=_expand_watch_path(str(getattr(args, "project_dir", None) or Path.cwd()), context="--project"),
+        batch=getattr(args, "batch", None),
+        poll=getattr(args, "poll", None),
+        max_idle=getattr(args, "max_idle", None),
+        max_iterations=getattr(args, "max_iterations", None),
+        recovery_slots=getattr(args, "recovery_slots", None),
+        max_resume_attempts=getattr(args, "max_resume_attempts", None),
+        watch_config=getattr(args, "watch_config", None),
+        watch_projects=tuple(getattr(args, "watch_projects", None) or ()),
+        watch_tags=tuple(getattr(args, "watch_tags", None) or ()),
+        watch_all_tags=tuple(getattr(args, "watch_all_tags", None) or ()),
+        watch_weights=tuple(getattr(args, "watch_weights", None) or ()),
+        watch_strategy=getattr(args, "watch_strategy", None),
+        unkeyed_tags=tuple(getattr(args, "tags", None) or ()),
+        unkeyed_all_tags=bool(getattr(args, "all_tags", False)),
+    )
+
+
+def _watch_reexec_preserves_unkeyed_tag_scope(
+    invocation: _WatchReexecInvocation,
+    args: argparse.Namespace,
+) -> bool:
+    if invocation.resolved_project_count is not None:
+        return invocation.resolved_project_count <= 1
+    if not (
+        invocation.watch_config is not None
+        or invocation.watch_projects
+        or invocation.watch_tags
+        or invocation.watch_all_tags
+        or invocation.watch_weights
+        or invocation.watch_strategy is not None
+    ):
+        return True
+    replay_args = argparse.Namespace(
+        project_dir=invocation.project_dir,
+        watch_config=invocation.watch_config,
+        watch_projects=list(invocation.watch_projects) or None,
+        watch_tags=list(invocation.watch_tags) or None,
+        watch_all_tags=list(invocation.watch_all_tags) or None,
+        watch_weights=list(invocation.watch_weights) or None,
+        watch_strategy=invocation.watch_strategy,
+        batch=invocation.batch,
+        poll=invocation.poll,
+        max_idle=invocation.max_idle,
+        recovery_slots=invocation.recovery_slots,
+        tags=list(invocation.unkeyed_tags) or None,
+        all_tags=invocation.unkeyed_all_tags,
+    )
+    try:
+        return len(resolve_watch_supervisor_selection(replay_args).projects) <= 1
+    except ValueError:
+        return False
+
+
+def resolve_watch_supervisor_selection(args: argparse.Namespace) -> WatchSupervisorSelection:
+    """Load and validate watch supervisor selector flags without constructing runtimes."""
+
+    manifest = (
+        _load_watch_supervisor_manifest(getattr(args, "watch_config"))
+        if getattr(args, "watch_config", None)
+        else WatchSupervisorSelection(projects=())
+    )
+    cli_projects = _cli_watch_project_selectors(args)
+    projects = cli_projects or manifest.projects
+    project_by_key = {project.key: project for project in projects}
+
+    cli_tags: dict[str, list[str]] = {}
+    for raw in getattr(args, "watch_tags", None) or ():
+        key, tag = _split_watch_key_value(raw, flag="--watch-tag")
+        if key not in project_by_key:
+            raise ValueError(f"--watch-tag references unknown watch project: {key}")
+        cli_tags.setdefault(key, []).append(tag)
+
+    cli_all_tags: set[str] = set()
+    for raw_name in getattr(args, "watch_all_tags", None) or ():
+        key = _validate_watch_selector_name(raw_name)
+        if key not in project_by_key:
+            raise ValueError(f"--watch-all-tags references unknown watch project: {key}")
+        cli_all_tags.add(key)
+
+    cli_weights: dict[str, int] = {}
+    for raw in getattr(args, "watch_weights", None) or ():
+        key, raw_weight = _split_watch_key_value(raw, flag="--watch-weight")
+        if key not in project_by_key:
+            raise ValueError(f"--watch-weight references unknown watch project: {key}")
+        if key in cli_weights:
+            raise ValueError(f"duplicate --watch-weight for watch project: {key}")
+        try:
+            weight = int(raw_weight)
+        except ValueError as exc:
+            raise ValueError(f"--watch-weight for {key!r} must be an integer") from exc
+        cli_weights[key] = _positive_int(weight, field=f"--watch-weight for {key!r}")
+
+    strategy = _normalize_watch_strategy(getattr(args, "watch_strategy", None)) or manifest.strategy
+    if cli_weights and (strategy or "round-robin") != "weighted-round-robin":
+        raise ValueError("--watch-weight requires --strategy weighted-round-robin")
+
+    overridden: list[WatchSupervisorProjectSelector] = []
+    for project in projects:
+        tags = project.tags
+        any_tag = project.any_tag
+        weight = project.weight
+        if project.key in cli_tags:
+            tags = validate_cli_tag_values(tuple(cli_tags[project.key])) or None
+            any_tag = True
+        if project.key in cli_all_tags:
+            any_tag = False
+        if project.key in cli_weights:
+            weight = cli_weights[project.key]
+        overridden.append(replace(project, tags=tags, any_tag=any_tag, weight=weight))
+
+    if len(overridden) > 1 and (getattr(args, "tags", None) or getattr(args, "all_tags", False)):
+        raise ValueError("multi-project watch requires keyed --watch-tag/--watch-all-tags instead of --tag/--all-tags")
+
+    return WatchSupervisorSelection(
+        projects=tuple(overridden),
+        strategy=strategy,
+        batch=getattr(args, "batch", None) if getattr(args, "batch", None) is not None else manifest.batch,
+        poll=getattr(args, "poll", None) if getattr(args, "poll", None) is not None else manifest.poll,
+        max_idle=getattr(args, "max_idle", None) if getattr(args, "max_idle", None) is not None else manifest.max_idle,
+        max_idle_present=getattr(args, "max_idle", None) is not None or manifest.max_idle_present,
+        recovery_slots=(
+            getattr(args, "recovery_slots", None)
+            if getattr(args, "recovery_slots", None) is not None
+            else manifest.recovery_slots
+        ),
+        manifest_path=manifest.manifest_path,
+    )
+
+
+def _apply_watch_supervisor_selection_to_legacy_args(
+    args: argparse.Namespace,
+    selection: WatchSupervisorSelection,
+) -> None:
+    """Project a zero/one-project supervisor selection onto the existing watch path."""
+
+    if getattr(args, "batch", None) is None and selection.batch is not None:
+        args.batch = selection.batch
+    if getattr(args, "poll", None) is None and selection.poll is not None:
+        args.poll = selection.poll
+    if getattr(args, "max_idle", None) is None and selection.max_idle_present:
+        args.max_idle = selection.max_idle
+        args.watch_manifest_max_idle_present = True
+    if getattr(args, "recovery_slots", None) is None and selection.recovery_slots is not None:
+        args.recovery_slots = selection.recovery_slots
+    if len(selection.projects) != 1:
+        return
+    project = selection.projects[0]
+    if project.path is None:
+        raise ValueError(
+            f"watch project {project.key!r} uses registry project_id {project.project_id or project.ref!r}, "
+            "but registry-ID watch execution is not enabled yet; use NAME=PATH"
+        )
+    args.project_dir = project.path
+    args.watch_asserted_project_id = project.project_id
+    if not getattr(args, "tags", None) and project.tags is not None:
+        args.tags = list(project.tags)
+        if not getattr(args, "all_tags", False):
+            args.all_tags = not project.any_tag
+
+
+def _resolve_watch_max_idle(args: argparse.Namespace, config: Config) -> int | None:
+    if args.max_idle is not None:
+        return args.max_idle
+    if getattr(args, "watch_manifest_max_idle_present", False):
+        return None
+    return config.watch.max_idle
 
 
 @dataclass(frozen=True)
@@ -14809,11 +15321,38 @@ def _clear_watch_session(
 
 def cmd_watch(args: argparse.Namespace) -> int:
     """Run continuous scheduler loop that maintains N concurrent workers."""
+    try:
+        args.watch_reexec_invocation = _capture_watch_reexec_invocation(args)
+        supervisor_selection = resolve_watch_supervisor_selection(args)
+        args.watch_reexec_invocation = replace(
+            args.watch_reexec_invocation,
+            resolved_project_count=len(supervisor_selection.projects),
+        )
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+    if supervisor_selection.multi_project:
+        print("Error: multi-project watch supervisor execution is not enabled yet")
+        return 1
+    try:
+        _apply_watch_supervisor_selection_to_legacy_args(args, supervisor_selection)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
+
     config = Config.load(args.project_dir)
+    asserted_project_id = getattr(args, "watch_asserted_project_id", None)
+    if asserted_project_id is not None and config.project_id != asserted_project_id:
+        print(
+            "Error: watch project identity mismatch: "
+            f"selector asserted project_id {asserted_project_id!r} but loaded {config.project_id!r} "
+            f"from {config.project_dir}"
+        )
+        return 1
 
     batch = args.batch if args.batch is not None else config.watch.batch
     poll = args.poll if args.poll is not None else config.watch.poll
-    max_idle = args.max_idle if args.max_idle is not None else config.watch.max_idle
+    max_idle = _resolve_watch_max_idle(args, config)
     max_iterations = args.max_iterations if args.max_iterations is not None else config.watch.max_iterations
     requested_dispatch_mode = getattr(args, "dispatch_mode", None)
     if requested_dispatch_mode is None and hasattr(args, "recovery_mode"):

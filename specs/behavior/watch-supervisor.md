@@ -98,6 +98,10 @@ that use priority semantics.
   exactly one execution project, including an explicit single `--watch-project`
   selection. An invocation that resolves more than one execution project MUST reject an
   unkeyed global tag or global all-tags flag because ownership is ambiguous.
+- For a single selected execution project, explicit unkeyed CLI tag policy overrides
+  manifest or keyed selector defaults. In particular, a global `--all-tags` flag MUST
+  preserve all-tag intersection mode even when the selected manifest or keyed selector
+  supplies tags whose default mode is any-tag matching.
 - Positional raw task/merge-unit selectors are valid only when the invocation resolves
   exactly one execution project. A multi-project invocation MUST reject positional raw task
   IDs or merge-unit selectors before runtime construction because raw IDs can collide

@@ -37,6 +37,7 @@ from ..db import (
 from ..learnings import DEFAULT_LEARNINGS_WINDOW
 from ..metrics import enabled as metrics_enabled, render_cli_summary, snapshot
 from ..task_types import CLI_ADD_TASK_TYPES
+from ..watch_strategies import WATCH_DISPATCH_STRATEGY_REGISTRY
 from ._common import (
     GzaArgumentParser,
     SortingHelpFormatter,
@@ -1113,6 +1114,46 @@ def main() -> int:
         metavar="SECS",
         dest="max_idle",
         help="Exit after SECS of consecutive idle watch cycles (default: watch.max_idle)",
+    )
+    watch_parser.add_argument(
+        "--watch-project",
+        action="append",
+        dest="watch_projects",
+        metavar="NAME=PATH",
+        help="Select a named watch project path or registry project_id; one selected path can run now, multiple projects and registry IDs are validated but refused before execution",
+    )
+    watch_parser.add_argument(
+        "--watch-tag",
+        action="append",
+        dest="watch_tags",
+        metavar="NAME=TAG",
+        help="Apply a tag filter to a named watch project (repeatable); unkeyed --tag overrides this only when exactly one project is selected",
+    )
+    watch_parser.add_argument(
+        "--watch-all-tags",
+        action="append",
+        dest="watch_all_tags",
+        metavar="NAME",
+        help="Require all keyed --watch-tag values for the named watch project",
+    )
+    watch_parser.add_argument(
+        "--watch-weight",
+        action="append",
+        dest="watch_weights",
+        metavar="NAME=N",
+        help="Set a positive weighted-round-robin weight for a named watch project; requires --strategy weighted-round-robin",
+    )
+    watch_parser.add_argument(
+        "--strategy",
+        choices=sorted(WATCH_DISPATCH_STRATEGY_REGISTRY),
+        dest="watch_strategy",
+        help="Cross-project dispatch strategy used by validated supervisor selections",
+    )
+    watch_parser.add_argument(
+        "--watch-config",
+        metavar="PATH",
+        dest="watch_config",
+        help="Load a version 1 watch supervisor manifest; one path-backed project can run now, multiple projects and registry-ID-only selectors are refused before execution",
     )
     watch_parser.add_argument(
         "--max-iterations",
