@@ -156,7 +156,13 @@ from ..runner import (
 from ..runtime_context import RuntimeExecutionContext
 from ..source_followup import collect_non_dropped_implement_source_ids
 from ..status_ops import apply_manual_task_status
-from ..sync_ops import reconcile_task_branch_merge_truth
+from ..sync_ops import (
+    BranchCohort,
+    _git_reconcile_update,
+    _persist_branch_updates,
+    reconcile_branch_merge_truth,
+    reconcile_task_branch_merge_truth,
+)
 from ..task_query import (
     ScopedTagScopeGap,
     TaskQueryPresets,
@@ -14341,6 +14347,88 @@ def _analyze_watch_cycle(
         )
 
 
+def _watch_failed_recovery_scan_is_current(
+    *,
+    store: SqliteTaskStore,
+    git: Git,
+    target_branch: str,
+    target_sha: str | None,
+) -> bool:
+    """Refresh target-movement invalidation state for failed-recovery scans."""
+    if not target_sha:
+        return False
+    if not store.supports_watch_failed_recovery_scans():
+        return False
+    marker = store.get_watch_failed_recovery_scan_state(target_branch=target_branch)
+    if marker is not None and marker.target_sha == target_sha:
+        return True
+
+    units = store.list_watch_failed_recovery_scan_units(
+        target_branch=target_branch,
+        target_sha=target_sha,
+    )
+    if units:
+        cohorts = [
+            BranchCohort(
+                branch=unit.source_branch,
+                tasks=tuple(store.list_tasks_for_merge_unit(unit.id)),
+                merge_unit_id=unit.id,
+                merge_unit_state=(
+                    "unmerged"
+                    if unit.state == "merged" and unit.merge_source is None and unit.pr_state == "open"
+                    else unit.state
+                ),
+                merge_unit_target_branch=unit.target_branch,
+                merge_unit_head_sha=unit.head_sha,
+            )
+            for unit in units
+        ]
+        results = reconcile_branch_merge_truth(
+            git,
+            cohorts,
+            target_branch=target_branch,
+            include_diff_stats=False,
+        )
+        _persist_branch_updates(
+            store,
+            cohorts,
+            results,
+            [_git_reconcile_update(result) for result in results],
+            target_branch,
+            sync_completed_at=datetime.now(UTC),
+        )
+        for unit, result in zip(units, results, strict=True):
+            if not (unit.state == "merged" and unit.merge_source is None and unit.pr_state == "open"):
+                continue
+            if result.head_sha is not None or result.base_sha is not None:
+                store.refresh_merge_unit_head(unit.id, result.head_sha, result.base_sha)
+            if result.ok and (result.merge_status != "merged" or "marked merged" not in result.actions):
+                repaired_state = result.merge_status if result.merge_status != "merged" else "unmerged"
+                store.set_merge_unit_state(unit.id, repaired_state or "unmerged")
+    store.record_watch_failed_recovery_scan(
+        target_branch=target_branch,
+        target_sha=target_sha,
+    )
+    return True
+
+
+@contextlib.contextmanager
+def _watch_recovery_scan_authoritative_git(git: Git, enabled: bool) -> Iterator[None]:
+    previous = getattr(git, "_gza_recovery_scan_db_authoritative", None)
+    if enabled:
+        setattr(git, "_gza_recovery_scan_db_authoritative", True)
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                delattr(git, "_gza_recovery_scan_db_authoritative")
+            except AttributeError:
+                pass
+        else:
+            setattr(git, "_gza_recovery_scan_db_authoritative", previous)
+
+
 def _evaluate_blind_parked_auto_rearm(
     *,
     config: Config,
@@ -14365,14 +14453,21 @@ def _evaluate_blind_parked_auto_rearm(
         effective_scoped_owner_ids=scoped_owner_ids,
     )
     cooldown = timedelta(hours=policy.cooldown_hours)
-    candidates, _stale_cleared = discover_parked_tasks(
-        store,
-        config=config,
+    scan_current = _watch_failed_recovery_scan_is_current(
+        store=store,
         git=git,
         target_branch=target_branch,
-        task_ids=scoped_owner_ids or (),
-        selector_kinds=_selector_kinds_from_selectors(scope_selectors),
+        target_sha=target_sha,
     )
+    with _watch_recovery_scan_authoritative_git(git, scan_current):
+        candidates, _stale_cleared = discover_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch=target_branch,
+            task_ids=scoped_owner_ids or (),
+            selector_kinds=_selector_kinds_from_selectors(scope_selectors),
+        )
     scoped_owner_id_set = frozenset(scoped_owner_ids or ())
     scope_kind_by_effective_id = (
         {selector.effective_owner_id: selector.scope_kind for selector in scope_selectors}

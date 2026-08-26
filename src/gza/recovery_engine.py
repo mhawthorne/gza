@@ -207,6 +207,7 @@ class _MergeContext:
     existing_branches: frozenset[str] | None = None
     resolution_error: str | None = None
     live_unmerged_recheck: bool = False
+    recovery_scan_db_authoritative: bool = False
     branch_resolution: FailedTaskBranchClassificationCache = field(default_factory=dict)
     repository_inspection_warnings: list[str] = field(default_factory=list)
     _warning_keys: set[str] = field(default_factory=set)
@@ -1673,6 +1674,8 @@ def classify_failed_task_landed_same_unit_suppression(
     """
     if failed_task.id is None or failed_task.status != "failed":
         return "visible"
+    if merge_context is not None and merge_context.recovery_scan_db_authoritative:
+        git = None
 
     if leaf_merge_unit is None:
         leaf_merge_unit = (
@@ -1870,7 +1873,12 @@ def build_merge_context_from_git(git: Git, target_branch: str | None) -> _MergeC
     should use this instead of _load_merge_context so no ambient Config.load(discover=True)
     or Git() construction occurs.
     """
-    merge_context = _MergeContext(git=git, default_branch=target_branch, live_unmerged_recheck=True)
+    merge_context = _MergeContext(
+        git=git,
+        default_branch=target_branch,
+        live_unmerged_recheck=True,
+        recovery_scan_db_authoritative=bool(getattr(git, "_gza_recovery_scan_db_authoritative", False)),
+    )
     try:
         merge_context.existing_branches = frozenset(git.local_branch_names())
     except (GitError, OSError, ValueError) as exc:
@@ -2151,6 +2159,7 @@ def _is_resolved_by_landed_lineage(
 
     if (
         merge_context.git is not None
+        and not merge_context.recovery_scan_db_authoritative
         and target_branch is not None
         and task.branch
         and task.task_type not in _MERGED_TARGET_RESOLUTION_TYPES
@@ -2667,6 +2676,7 @@ def _failed_task_requires_operator_recovery(
         if (
             (merge_state is None or (merge_state == "unmerged" and merge_context.live_unmerged_recheck))
             and merge_context.git is not None
+            and not merge_context.recovery_scan_db_authoritative
             and task.branch
         ):
             try:
@@ -2965,7 +2975,7 @@ def decide_failed_task_recovery(
         )
         if read_context is not None and read_context.merge_context is None:
             read_context.merge_context = _mc
-        if _mc.git is not None:
+        if _mc.git is not None and not _mc.recovery_scan_db_authoritative:
             try:
                 target_branch: str | None = _resolve_merge_context_target_branch(store, _mc)
             except MergeTargetResolutionError as exc:

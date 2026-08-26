@@ -142,6 +142,7 @@ from gza.cli.watch import (
     _watch_iterate_impl_target,
     _watch_log_path,
     _watch_needs_attention_message,
+    _watch_failed_recovery_scan_is_current,
     _watch_no_progress_result_deferred_for_transient_backoff,
     _watch_reexec_argv,
     _WatchCycleAnalysis,
@@ -901,6 +902,163 @@ def _setup_retry_limit_parked_lineage(tmp_path: Path) -> tuple[object, Config, D
 
     config = Config.load(tmp_path)
     return store, config, impl, exhausted_improve
+
+
+def _completed_watch_scan_task(store: SqliteTaskStore, branch: str) -> DbTask:
+    task = store.add(f"Task {branch}", task_type="implement")
+    store.mark_completed(task, branch=branch, has_commits=True)
+    refreshed = store.get(str(task.id))
+    assert refreshed is not None
+    return refreshed
+
+
+def test_watch_failed_recovery_scan_unchanged_target_sha_skips_reconciliation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    store.record_watch_failed_recovery_scan(target_branch="main", target_sha="target-new")
+    git = _make_watch_git()
+
+    reconcile = MagicMock(side_effect=AssertionError("reconciliation should be skipped"))
+    monkeypatch.setattr(watch_module, "reconcile_branch_merge_truth", reconcile)
+
+    assert _watch_failed_recovery_scan_is_current(
+        store=store,
+        git=git,
+        target_branch="main",
+        target_sha="target-new",
+    )
+    reconcile.assert_not_called()
+
+
+def test_blind_parked_auto_rearm_uses_db_authoritative_scan_when_target_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.watch.parked_auto_rearm.enabled = True
+    store.record_watch_failed_recovery_scan(target_branch="main", target_sha="target-new")
+    git = _make_watch_git()
+
+    monkeypatch.setattr(
+        watch_module,
+        "reconcile_branch_merge_truth",
+        MagicMock(side_effect=AssertionError("reconciliation should be skipped")),
+    )
+
+    def discover_with_authoritative_git(*args: object, **kwargs: object) -> tuple[tuple[object, ...], int]:
+        assert getattr(git, "_gza_recovery_scan_db_authoritative") is True
+        return ((), 0)
+
+    monkeypatch.setattr(watch_module, "discover_parked_tasks", discover_with_authoritative_git)
+
+    result = _evaluate_blind_parked_auto_rearm(
+        config=config,
+        store=store,
+        git=git,
+        target_branch="main",
+        target_sha="target-new",
+        tags=None,
+        any_tag=False,
+        scoped_owner_ids=None,
+    )
+
+    assert result.decisions == ()
+    assert not hasattr(git, "_gza_recovery_scan_db_authoritative")
+
+
+def test_watch_failed_recovery_scan_moved_target_rechecks_only_stale_base_units(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    stale = _completed_watch_scan_task(store, "feature/watch-stale-scan")
+    current = _completed_watch_scan_task(store, "feature/watch-current-scan")
+    assert stale.id is not None and current.id is not None
+    stale_unit = store.resolve_merge_unit_for_task(stale.id)
+    current_unit = store.resolve_merge_unit_for_task(current.id)
+    assert stale_unit is not None and current_unit is not None
+    store.refresh_merge_unit_head(stale_unit.id, head_sha="stale-head", base_sha="target-old")
+    store.refresh_merge_unit_head(current_unit.id, head_sha="current-head", base_sha="target-new")
+
+    git = _make_watch_git()
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: (
+            "target-new"
+            if ref == "main"
+            else "stale-head-live"
+            if ref == "feature/watch-stale-scan"
+            else "current-head-live"
+            if ref == "feature/watch-current-scan"
+            else None
+        )
+    )
+
+    assert _watch_failed_recovery_scan_is_current(
+        store=store,
+        git=git,
+        target_branch="main",
+        target_sha="target-new",
+    )
+
+    git.branch_exists.assert_called_once_with("feature/watch-stale-scan")
+    refreshed_stale = store.get_merge_unit(stale_unit.id)
+    refreshed_current = store.get_merge_unit(current_unit.id)
+    assert refreshed_stale is not None and refreshed_stale.base_sha == "target-new"
+    assert refreshed_current is not None and refreshed_current.base_sha == "target-new"
+
+
+def test_watch_failed_recovery_scan_detects_external_merge_and_rechecks_phantom_merge(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    landed = _completed_watch_scan_task(store, "feature/watch-external-merge")
+    phantom = _completed_watch_scan_task(store, "feature/watch-phantom-merge")
+    assert landed.id is not None and phantom.id is not None
+    landed_unit = store.resolve_merge_unit_for_task(landed.id)
+    phantom_unit = store.resolve_merge_unit_for_task(phantom.id)
+    assert landed_unit is not None and phantom_unit is not None
+    store.refresh_merge_unit_head(landed_unit.id, head_sha="landed-head", base_sha="target-old")
+    store.refresh_merge_unit_head(phantom_unit.id, head_sha="phantom-head", base_sha="target-old")
+    store.set_merge_unit_state(phantom_unit.id, "merged", merge_source=None, pr_state="open")
+
+    git = _make_watch_git()
+    git.is_merged = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda branch, into: branch == "feature/watch-external-merge" and into == "main"
+    )
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: (
+            "target-new"
+            if ref == "main"
+            else "landed-head-live"
+            if ref == "feature/watch-external-merge"
+            else "phantom-head-live"
+            if ref == "feature/watch-phantom-merge"
+            else None
+        )
+    )
+
+    assert _watch_failed_recovery_scan_is_current(
+        store=store,
+        git=git,
+        target_branch="main",
+        target_sha="target-new",
+    )
+
+    refreshed_landed = store.get_merge_unit(landed_unit.id)
+    refreshed_phantom = store.get_merge_unit(phantom_unit.id)
+    assert refreshed_landed is not None
+    assert refreshed_landed.state == "merged"
+    assert refreshed_landed.merge_source == "external"
+    assert refreshed_phantom is not None
+    assert refreshed_phantom.state == "unmerged"
+    assert refreshed_phantom.merge_source is None
+    assert refreshed_phantom.pr_state == "open"
 
 
 def _setup_verify_fix_failed_parked_owner(tmp_path: Path) -> tuple[object, Config, DbTask, str]:
