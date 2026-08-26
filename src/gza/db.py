@@ -7779,6 +7779,7 @@ class SqliteTaskStore:
                 conn,
                 impl_task_id=params.based_on,
                 prompt_prefix=prompt_prefix,
+                expected=params,
             )
             if existing is not None:
                 if not self._capped_review_blocker_can_be_reused_conn(conn, existing):
@@ -7801,12 +7802,103 @@ class SqliteTaskStore:
 
             return self._add_task_conn(conn, replace(params, tags=normalized_required_tags)), True
 
+    def create_or_reuse_followup_task(
+        self,
+        *,
+        prompt_prefix: str,
+        params: NewTaskParams,
+    ) -> tuple[Task, bool]:
+        """Atomically create or reuse one exact ordinary review follow-up task."""
+        if params.based_on is None:
+            raise ValueError("Cannot create follow-up task without review based_on.")
+        if params.depends_on is None:
+            raise ValueError("Cannot create follow-up task without implementation depends_on.")
+        if params.task_type != "implement":
+            raise ValueError("Follow-up tasks must be implement tasks.")
+        with self._write_transaction() as conn:
+            existing = self._find_followup_task_conn(
+                conn,
+                review_task_id=params.based_on,
+                prompt_prefix=prompt_prefix,
+                expected=params,
+            )
+            if existing is not None:
+                if not self._capped_review_blocker_can_be_reused_conn(conn, existing):
+                    raise ValueError(
+                        f"Existing follow-up task {existing.id or '<unknown>'} "
+                        f"cannot be reused from status {existing.status!r} "
+                        f"and merge status {existing.merge_status!r}."
+                    )
+                return existing, False
+
+            return self._add_task_conn(conn, params), True
+
+    def _find_followup_task_conn(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        review_task_id: str,
+        prompt_prefix: str,
+        expected: NewTaskParams,
+    ) -> Task | None:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM tasks
+            WHERE project_id = ?
+              AND based_on = ?
+              AND task_type = 'implement'
+            ORDER BY created_at ASC
+            """,
+            (self._project_id, review_task_id),
+        ).fetchall()
+        matches = [
+            child
+            for child in self._rows_to_tasks(conn, rows)
+            if child.prompt.strip().startswith(prompt_prefix)
+        ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            match_ids = ", ".join(str(child.id) for child in matches)
+            raise ValueError(
+                f"Ambiguous follow-up task identity for review {review_task_id}: "
+                f"{len(matches)} children match {prompt_prefix!r} ({match_ids})."
+            )
+        existing = matches[0]
+        self._validate_followup_reuse_shape(existing, expected)
+        return existing
+
+    @staticmethod
+    def _validate_followup_reuse_shape(existing: Task, expected: NewTaskParams) -> None:
+        mismatches: list[str] = []
+        if existing.prompt != expected.prompt:
+            mismatches.append("prompt")
+        if existing.based_on != expected.based_on:
+            mismatches.append("based_on")
+        if existing.depends_on != expected.depends_on:
+            mismatches.append("depends_on")
+        if existing.task_type != expected.task_type:
+            mismatches.append("task_type")
+        if existing.urgent != expected.urgent:
+            mismatches.append("urgent")
+        if existing.create_pr != expected.create_pr:
+            mismatches.append("create_pr")
+        if existing.review_scope != expected.review_scope:
+            mismatches.append("review_scope")
+        if mismatches:
+            raise ValueError(
+                f"Existing follow-up task {existing.id or '<unknown>'} "
+                f"does not match required replay identity: {', '.join(mismatches)}."
+            )
+
     def _find_capped_review_blocker_task_conn(
         self,
         conn: sqlite3.Connection,
         *,
         impl_task_id: str,
         prompt_prefix: str,
+        expected: NewTaskParams,
     ) -> Task | None:
         rows = conn.execute(
             """
@@ -7819,10 +7911,45 @@ class SqliteTaskStore:
             """,
             (self._project_id, impl_task_id),
         ).fetchall()
-        for child in self._rows_to_tasks(conn, rows):
-            if child.prompt.strip().startswith(prompt_prefix):
-                return child
-        return None
+        matches = [
+            child
+            for child in self._rows_to_tasks(conn, rows)
+            if child.prompt.strip().startswith(prompt_prefix)
+        ]
+        if not matches:
+            return None
+        if len(matches) > 1:
+            match_ids = ", ".join(str(child.id) for child in matches)
+            raise ValueError(
+                f"Ambiguous capped review blocker task identity for {impl_task_id}: "
+                f"{len(matches)} children match {prompt_prefix!r} ({match_ids})."
+            )
+        existing = matches[0]
+        self._validate_capped_review_blocker_reuse_shape(existing, expected)
+        return existing
+
+    @staticmethod
+    def _validate_capped_review_blocker_reuse_shape(existing: Task, expected: NewTaskParams) -> None:
+        mismatches: list[str] = []
+        if existing.prompt != expected.prompt:
+            mismatches.append("prompt")
+        if existing.based_on != expected.based_on:
+            mismatches.append("based_on")
+        if existing.depends_on != expected.depends_on:
+            mismatches.append("depends_on")
+        if existing.task_type != expected.task_type:
+            mismatches.append("task_type")
+        if existing.urgent != expected.urgent:
+            mismatches.append("urgent")
+        if existing.create_pr != expected.create_pr:
+            mismatches.append("create_pr")
+        if existing.review_scope != expected.review_scope:
+            mismatches.append("review_scope")
+        if mismatches:
+            raise ValueError(
+                f"Existing capped review blocker task {existing.id or '<unknown>'} "
+                f"does not match required replay identity: {', '.join(mismatches)}."
+            )
 
     def _capped_review_blocker_can_be_reused_conn(
         self,

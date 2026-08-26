@@ -6,9 +6,15 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from gza.db import SqliteTaskStore
+from gza.db import MERGE_SOURCE_EXTERNAL, SqliteTaskStore
 from gza.git import GitError
 from gza.github import GitHub, GitHubError, PullRequestDetails
+from gza.review_tasks import (
+    build_followup_prompt,
+    create_or_reuse_capped_review_blocker_task,
+    format_followup_finding_context,
+)
+from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.sync_ops import (
     _UNSET,
     BranchCohort,
@@ -39,6 +45,35 @@ def _completed_branch_task(store: SqliteTaskStore, prompt: str, branch: str):
     task.merge_status = "unmerged"
     store.update(task)
     return task
+
+
+def _completed_review(store: SqliteTaskStore, impl, output: str | None = None):
+    review = store.add(f"Review {impl.id}", task_type="review", depends_on=impl.id)
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = output
+    store.update(review)
+    return review
+
+
+def _add_exact_followup_child(store: SqliteTaskStore, review, impl, finding_id: str = "F1"):
+    finding = ReviewFinding(
+        id=finding_id,
+        severity="FOLLOWUP",
+        title="Preserve replay",
+        body="Recommended follow-up: preserve replay.",
+        evidence=None,
+        impact=None,
+        fix_or_followup="preserve replay",
+        tests=None,
+    )
+    return store.add(
+        build_followup_prompt(review.id, impl.id, finding),
+        task_type="implement",
+        based_on=review.id,
+        depends_on=impl.id,
+        review_scope=format_followup_finding_context(finding),
+    )
 
 
 def test_build_branch_cohorts_for_task_ids_expands_same_branch_chains(tmp_path):
@@ -2367,6 +2402,203 @@ def test_persist_branch_updates_drops_merge_source_for_empty_unit_and_advances_s
     assert refreshed_task.sync_last_synced_at == sync_completed_at
     assert result.errors == []
     assert build_default_branch_cohorts(store, recent_days=30, cooldown_seconds=300) == []
+
+
+def test_persist_branch_updates_does_not_intercept_unproven_inline_changes_requested_review(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/unproven-inline-capped")
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "unmerged")
+    _completed_review(
+        store,
+        task,
+        "## Review\n\nVerdict: CHANGES_REQUESTED\n\n## Blockers\n\n### B1\nFix it.\n",
+    )
+
+    _persist_branch_updates(
+        store,
+        [
+            BranchCohort(
+                branch=task.branch,
+                tasks=(task,),
+                merge_unit_id=unit.id,
+                merge_unit_state="unmerged",
+            )
+        ],
+        [BranchSyncResult(branch=task.branch, task_ids=(task.id,), merge_status="merged")],
+        [_BranchPersistenceUpdate(merge_status="merged", merge_source=MERGE_SOURCE_EXTERNAL)],
+        "main",
+    )
+
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "merged"
+    assert refreshed_unit.merge_source == MERGE_SOURCE_EXTERNAL
+
+
+def test_persist_branch_updates_does_not_intercept_unproven_report_file_review(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/unproven-file-capped")
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "unmerged")
+    review = _completed_review(store, task, None)
+    review.report_file = "reviews/unproven-file-capped.md"
+    store.update(review)
+
+    _persist_branch_updates(
+        store,
+        [
+            BranchCohort(
+                branch=task.branch,
+                tasks=(task,),
+                merge_unit_id=unit.id,
+                merge_unit_state="unmerged",
+            )
+        ],
+        [BranchSyncResult(branch=task.branch, task_ids=(task.id,), merge_status="merged")],
+        [_BranchPersistenceUpdate(merge_status="merged", merge_source=MERGE_SOURCE_EXTERNAL)],
+        "main",
+    )
+
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "merged"
+    assert refreshed_unit.merge_source == MERGE_SOURCE_EXTERNAL
+
+
+@pytest.mark.parametrize("report_file_exists", [True, False])
+def test_persist_branch_updates_preserves_file_only_ordinary_followup_replay_when_content_unavailable(
+    tmp_path,
+    report_file_exists,
+):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/file-followup-replay")
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "unmerged")
+    review = _completed_review(store, task, None)
+    review.report_file = "reviews/file-followup-replay.md"
+    store.update(review)
+    if report_file_exists:
+        report_path = tmp_path / review.report_file
+        report_path.parent.mkdir(parents=True)
+        report_path.write_text(
+            "## Review\n\nVerdict: APPROVED_WITH_FOLLOWUPS\n\n"
+            "## Follow-Ups\n\n### F1 Preserve replay\nRecommended follow-up: preserve replay.\n"
+        )
+    _add_exact_followup_child(store, review, task)
+    result = BranchSyncResult(branch=task.branch, task_ids=(task.id,), merge_status="merged")
+
+    _persist_branch_updates(
+        store,
+        [
+            BranchCohort(
+                branch=task.branch,
+                tasks=(task,),
+                merge_unit_id=unit.id,
+                merge_unit_state="unmerged",
+            )
+        ],
+        [result],
+        [_BranchPersistenceUpdate(merge_status="merged", merge_source=MERGE_SOURCE_EXTERNAL)],
+        "main",
+    )
+
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+    assert refreshed_unit.merge_source is None
+    assert result.errors == [
+        "Pending ordinary follow-up replay cannot be proven because the live target SHA for main is unavailable."
+    ]
+
+
+def test_persist_branch_updates_allows_file_only_external_reconcile_without_durable_followup_child(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/file-followup-no-child")
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "unmerged")
+    review = _completed_review(store, task, None)
+    review.report_file = "reviews/file-followup-no-child.md"
+    store.update(review)
+    result = BranchSyncResult(branch=task.branch, task_ids=(task.id,), merge_status="merged")
+
+    _persist_branch_updates(
+        store,
+        [
+            BranchCohort(
+                branch=task.branch,
+                tasks=(task,),
+                merge_unit_id=unit.id,
+                merge_unit_state="unmerged",
+            )
+        ],
+        [result],
+        [_BranchPersistenceUpdate(merge_status="merged", merge_source=MERGE_SOURCE_EXTERNAL)],
+        "main",
+    )
+
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "merged"
+    assert refreshed_unit.merge_source == MERGE_SOURCE_EXTERNAL
+    assert result.errors == []
+
+
+def test_persist_branch_updates_preserves_proven_pending_capped_finalization(tmp_path):
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/proven-capped-sync")
+    assert task.id is not None
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "unmerged")
+    review_output = (
+        "## Review\n\nVerdict: CHANGES_REQUESTED\n\n"
+        "## Blockers\n\n"
+        "### B1 Persist finalization\n"
+        "Evidence: finalization failed after side effects.\n"
+        "Impact: sync must not erase pending replay.\n"
+        "Required fix: replay exact child.\n"
+        "Required tests: cover sync preservation.\n"
+    )
+    review = _completed_review(store, task, review_output)
+    finding = parse_review_report(review_output).findings[0]
+    create_or_reuse_capped_review_blocker_task(
+        store,
+        review_task=review,
+        impl_task=task,
+        finding=finding,
+        persisted_review_output=review_output,
+        active_scope_tags=("backend",),
+        trigger_source="watch",
+    )
+
+    _persist_branch_updates(
+        store,
+        [
+            BranchCohort(
+                branch=task.branch,
+                tasks=(task,),
+                merge_unit_id=unit.id,
+                merge_unit_state="unmerged",
+            )
+        ],
+        [BranchSyncResult(branch=task.branch, task_ids=(task.id,), merge_status="merged")],
+        [_BranchPersistenceUpdate(merge_status="merged", merge_source=MERGE_SOURCE_EXTERNAL)],
+        "main",
+    )
+
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+    assert refreshed_unit.merge_source is None
 
 
 def test_persist_branch_updates_persists_redundant_without_merged_provenance(tmp_path):

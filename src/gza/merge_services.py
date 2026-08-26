@@ -13,6 +13,7 @@ from .db import MERGE_SOURCE_MANUAL, MERGE_SOURCE_MANUAL_FORCE, SqliteTaskStore,
 from .git import Git, GitError, ResolvedMergeSourceRef
 from .merge_state import resolve_task_merge_source
 from .review_scope import declares_spec_coherence_review_mode
+from .review_tasks import CappedReviewBlockerMaterializationError, FollowupMaterializationError
 from .review_verdict import ReviewFinding, get_review_content, get_review_report, summarize_review_blockers
 
 
@@ -73,6 +74,7 @@ class ManualMergeExecutionRequest:
     no_followups: bool = False
     quiet_mechanics: bool = False
     materialize_side_effects: bool = True
+    authorized_source_ref_sha: str | None = None
     pre_materialized_deferred_blockers: tuple[list[DbTask], list[DbTask]] | None = None
     pre_materialized_deferred_blockers_printed: bool = False
     pending_squash_reconcile: Any = None
@@ -91,12 +93,13 @@ class ManualMergeExecutionHooks:
     materialize_followups: Callable[[DbTask], tuple[list[DbTask], list[DbTask]]]
     print_followups: Callable[[DbTask, tuple[list[DbTask], list[DbTask]]], None]
     emit: Callable[[str], None] = print
+    before_irreversible_side_effect: Callable[[DbTask], ManualMergeExecutionResult | None] | None = None
 
 
 @dataclass(frozen=True)
 class ManualMergeExecutionResult:
     rc: int
-    status: str = "merged"
+    status: str
     block_reason: str | None = None
     pending_squash_reconcile: Any = None
     created_followups: list[DbTask] | None = None
@@ -456,11 +459,16 @@ def check_manual_merge_preflight(
                     f"Error: Branch '{merge_source_ref}' is already merged into current branch "
                     f"'{current_branch}', but still unmerged from default branch '{default_branch}'"
                 ),
+                block_reason=(
+                    f"branch '{merge_source_ref}' is already merged into '{current_branch}' "
+                    f"but not default branch '{default_branch}'"
+                ),
             )
         return ManualMergePreflightResult(
             ok=False,
             status="already_merged",
             message=f"Error: Branch '{merge_source_ref}' is already merged into {current_branch}",
+            block_reason=f"branch '{merge_source_ref}' is already merged into '{current_branch}'",
         )
 
     if git.has_changes(include_untracked=False):
@@ -518,23 +526,77 @@ def execute_manual_merge(
             )
         return ManualMergeExecutionResult(
             rc=1,
+            status="already_merged_refusal",
             block_reason=preflight.block_reason,
         )
 
     created_deferred_blockers: list[DbTask] = []
     reused_deferred_blockers: list[DbTask] = []
+    created_followups: list[DbTask] = []
+    reused_followups: list[DbTask] = []
+    if hooks.before_irreversible_side_effect is not None:
+        side_effect_result = hooks.before_irreversible_side_effect(request.merge_subject)
+        if side_effect_result is not None:
+            return side_effect_result
     if request.materialize_side_effects:
-        deferred_blockers = request.pre_materialized_deferred_blockers
-        if deferred_blockers is None:
-            deferred_blockers = hooks.materialize_deferred_blockers(request.merge_subject)
-        if deferred_blockers is None:
-            return ManualMergeExecutionResult(rc=1)
-        created_deferred_blockers, reused_deferred_blockers = deferred_blockers
-        if not request.pre_materialized_deferred_blockers_printed:
-            hooks.print_deferred_blockers(request.merge_subject, deferred_blockers)
+        try:
+            deferred_blockers = request.pre_materialized_deferred_blockers
+            if deferred_blockers is None:
+                deferred_blockers = hooks.materialize_deferred_blockers(request.merge_subject)
+            if deferred_blockers is None:
+                block_reason = "deferred blocker materialization returned no result; source remains unmerged"
+                hooks.emit(f"Error: {block_reason}")
+                return ManualMergeExecutionResult(
+                    rc=1,
+                    status="deferred_blocker_materialization_missing",
+                    block_reason=block_reason,
+                )
+            created_deferred_blockers, reused_deferred_blockers = deferred_blockers
+            if not request.pre_materialized_deferred_blockers_printed:
+                hooks.print_deferred_blockers(request.merge_subject, deferred_blockers)
+            if not request.no_followups:
+                created_followups, reused_followups = hooks.materialize_followups(request.merge_subject)
+                hooks.print_followups(request.merge_subject, (created_followups, reused_followups))
+        except Exception as exc:
+            if isinstance(exc, FollowupMaterializationError):
+                created_followups.extend(exc.created)
+                reused_followups.extend(exc.reused)
+            elif isinstance(exc, CappedReviewBlockerMaterializationError):
+                created_deferred_blockers.extend(exc.created)
+                reused_deferred_blockers.extend(exc.reused)
+            block_reason = f"mandatory merge side-effect materialization failed: {exc}; source remains unmerged"
+            hooks.emit(f"Error: {block_reason}")
+            return ManualMergeExecutionResult(
+                rc=1,
+                status="merge_side_effect_materialization_failed",
+                block_reason=block_reason,
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_deferred_blockers=created_deferred_blockers,
+                reused_deferred_blockers=reused_deferred_blockers,
+            )
 
     try:
         pending_squash_reconcile = request.pending_squash_reconcile
+        if request.authorized_source_ref_sha is not None:
+            rev_parse_if_exists = getattr(request.git, "rev_parse_if_exists", None)
+            current_source_sha = rev_parse_if_exists(request.merge_source_ref) if callable(rev_parse_if_exists) else None
+            if current_source_sha != request.authorized_source_ref_sha:
+                block_reason = (
+                    "merge source ref changed after lifecycle authorization; "
+                    f"expected {request.authorized_source_ref_sha}, got {current_source_sha or 'unavailable'}; "
+                    "target is unchanged; retry after refreshing merge authorization"
+                )
+                hooks.emit(f"Error: {block_reason}")
+                return ManualMergeExecutionResult(
+                    rc=1,
+                    status="merge_source_ref_changed",
+                    block_reason=block_reason,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
         if not request.quiet_mechanics:
             hooks.emit(f"Merging '{request.merge_source_ref}' into '{request.current_branch}'...")
 
@@ -589,8 +651,6 @@ def execute_manual_merge(
             except GitError as exc:
                 hooks.emit(f"Warning: Could not delete branch: {exc}")
 
-        created_followups: list[DbTask] = []
-        reused_followups: list[DbTask] = []
         if request.git.repo_dir == request.config.project_dir and request.materialize_side_effects:
             mark_merge_subject_merged(
                 request.store,
@@ -598,11 +658,9 @@ def execute_manual_merge(
                 merge_unit_id=request.merge_unit_id,
                 merge_source=request.merge_source,
             )
-            if not request.no_followups:
-                created_followups, reused_followups = hooks.materialize_followups(request.merge_subject)
-                hooks.print_followups(request.merge_subject, (created_followups, reused_followups))
         return ManualMergeExecutionResult(
             rc=0,
+            status="merged",
             pending_squash_reconcile=pending_squash_reconcile,
             created_followups=created_followups,
             reused_followups=reused_followups,
@@ -619,6 +677,7 @@ def execute_manual_merge(
             f"\nAborting {operation} for {request.merge_subject.id} "
             f"(branch {request.merge_branch}) and restoring clean state..."
         )
+        cleanup_failed = False
         try:
             try:
                 request.git.merge_abort()
@@ -627,11 +686,22 @@ def execute_manual_merge(
                 request.git.reset_hard_head()
                 hooks.emit("✓ Merge cleanup reset tracked files to HEAD")
         except GitError as abort_error:
+            cleanup_failed = True
             hooks.emit(
                 f"Warning: Could not abort {operation} for {request.merge_subject.id} "
                 f"(branch {request.merge_branch}): {abort_error}"
             )
-        return ManualMergeExecutionResult(rc=1)
+        if cleanup_failed:
+            return ManualMergeExecutionResult(
+                rc=1,
+                status="merge_cleanup_failed",
+                block_reason=f"merge failed and cleanup failed: {exc}",
+            )
+        return ManualMergeExecutionResult(
+            rc=1,
+            status="merge_failed",
+            block_reason=f"merge failed: {exc}",
+        )
 
 
 def mark_merge_subject_merged(

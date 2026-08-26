@@ -313,6 +313,16 @@ def _disable_usage_warmers(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_ambient_gza_db_path(monkeypatch):
+    """Prevent developer-shell shared DB selection from leaking into tests.
+
+    Individual tests that cover environment-driven DB selection set GZA_DB_PATH
+    explicitly after this fixture runs, so production behavior stays covered.
+    """
+    monkeypatch.delenv("GZA_DB_PATH", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_home_dir(tmp_path: Path, monkeypatch):
     """Isolate HOME so user-level config tests do not read developer-machine state."""
     home_dir = tmp_path / ".isolated-home"

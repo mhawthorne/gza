@@ -808,6 +808,17 @@ def _persist_branch_updates(
             continue
         if not cohort.code_tasks:
             continue
+        pending_finalization_error = _cohort_pending_mandatory_merge_finalization_error(
+            store,
+            cohort,
+            update,
+            target_branch,
+        )
+        if pending_finalization_error is not None:
+            result.errors.append(pending_finalization_error)
+            continue
+        if _cohort_has_pending_mandatory_merge_finalization(store, cohort, update, target_branch):
+            continue
         try:
             _persist_branch_state(
                 store,
@@ -833,6 +844,63 @@ def _persist_branch_updates(
             result.errors.append(
                 f"failed to persist sync state for branch '{cohort.branch}'{merge_unit_detail}: {exc}"
             )
+
+
+def _cohort_has_pending_mandatory_merge_finalization(
+    store: SqliteTaskStore,
+    cohort: BranchCohort,
+    update: _BranchPersistenceUpdate,
+    target_branch: str,
+) -> bool:
+    return (
+        _cohort_pending_mandatory_merge_finalization_action(store, cohort, update, target_branch)
+        is not None
+    )
+
+
+def _cohort_pending_mandatory_merge_finalization_error(
+    store: SqliteTaskStore,
+    cohort: BranchCohort,
+    update: _BranchPersistenceUpdate,
+    target_branch: str,
+) -> str | None:
+    action = _cohort_pending_mandatory_merge_finalization_action(store, cohort, update, target_branch)
+    if action is None or action.get("type") != "needs_attention":
+        return None
+    return str(action.get("description") or "pending mandatory merge finalization cannot be proven")
+
+
+def _cohort_pending_mandatory_merge_finalization_action(
+    store: SqliteTaskStore,
+    cohort: BranchCohort,
+    update: _BranchPersistenceUpdate,
+    target_branch: str,
+) -> dict[str, Any] | None:
+    if update.merge_status != "merged":
+        return None
+    if cohort.merge_unit_id is None or cohort.merge_unit_state == "merged":
+        return None
+    if cohort.merge_unit_target_branch and cohort.merge_unit_target_branch != target_branch:
+        return None
+    from .advance_engine import pending_merge_finalization_action
+
+    for task in cohort.merge_status_owner_tasks:
+        if task.id is None or task.status != "completed" or not task.has_commits:
+            continue
+        unit = store.resolve_merge_unit_for_task(task.id)
+        if unit is None or unit.id != cohort.merge_unit_id or unit.state == "merged":
+            continue
+        action = pending_merge_finalization_action(
+            None,
+            store,
+            task,
+            target_branch=target_branch,
+            require_already_merged=True,
+            resolved_merge_state="merged",
+        )
+        if action is not None:
+            return action
+    return None
 
 
 def _resolve_persist_merge_unit(

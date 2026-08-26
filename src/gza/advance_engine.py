@@ -30,6 +30,14 @@ from gza.flaky_investigations import (
 from gza.git import GitError, ResolvedMergeSourceRef
 from gza.lifecycle_completion import merge_state_is_terminal_for_lifecycle
 from gza.lineage import resolve_impl_task, walk_ancestors, walk_based_on_descendants
+from gza.merge_finalization_proof import (
+    MergeFinalizationFamily,
+    matching_merge_finalization_proofs,
+    merge_finalization_child_task_ids,
+    merge_finalization_finding_ids,
+    merge_finalization_prepared_attempts_for_review,
+    merge_finalization_proofs_for_live_attempt,
+)
 from gza.merge_state import (
     is_local_merge_proof_ref,
     resolve_task_merge_source,
@@ -91,7 +99,12 @@ from gza.review_scope import (
 )
 from gza.review_tasks import (
     SPEC_COHERENCE_REVIEW_SCOPE,
+    build_followup_prompt,
     build_review_blocker_dispute_metadata,
+    capped_review_blocker_task_matches_identity,
+    extract_capped_review_blocker_persisted_output,
+    extract_capped_review_blocker_prompt_parts,
+    extract_followup_prompt_parts,
     find_existing_review_blocker_adjudication_task,
     find_existing_verify_fix_task,
     persist_off_topic_verify_clearance,
@@ -111,6 +124,7 @@ from gza.review_verdict import (
     get_review_finding_fingerprint_details,
     get_review_report,
     is_verify_timeout_only_review,
+    parse_review_report,
     summarize_review_blockers,
 )
 from gza.review_verify_state import (
@@ -772,6 +786,7 @@ def _resolve_and_persist_post_merge_rebase_state(
     task: DbTask,
     target_branch: str,
     *,
+    config: Any | None = None,
     merge_source: ResolvedMergeSourceRef | None = None,
 ) -> PostMergeRebaseState:
     """Resolve local stale-rebase cleanup state and persist proven merge truth."""
@@ -799,6 +814,16 @@ def _resolve_and_persist_post_merge_rebase_state(
         and task.has_commits
         and task_owns_merge_status(task)
     ):
+        if pending_merge_finalization_action(
+            config,
+            store,
+            task,
+            target_branch=target_branch,
+            require_already_merged=True,
+            resolved_merge_state=resolved_merge_state,
+            live_target_sha=state.target_tip_sha,
+        ) is not None:
+            return state
         merge_unit = store.resolve_merge_unit_for_task(task.id)
         if merge_unit is None and bool(task.branch):
             merge_unit = store.get_or_create_merge_unit_for_task(task)
@@ -817,6 +842,519 @@ def _resolve_and_persist_post_merge_rebase_state(
         else:
             store.set_merge_status(task.id, "merged")
     return state
+
+
+def _review_report_for_replay(config: Any | None, review_task: DbTask) -> ParsedReviewReport:
+    if config is not None:
+        return get_review_report(Path(config.project_dir), review_task)
+    output = review_task.output_content
+    if not output:
+        return ParsedReviewReport(verdict=None, findings=(), format_version="unknown")
+    return parse_review_report(output)
+
+
+def _review_content_available_for_replay(config: Any | None, review_task: DbTask) -> bool:
+    if review_task.output_content:
+        return True
+    if not review_task.report_file:
+        return False
+    if config is None:
+        return False
+    return get_review_content(Path(config.project_dir), review_task) is not None
+
+
+def _merge_finalization_impl_candidates(store: SqliteTaskStore, task: DbTask) -> tuple[DbTask, ...]:
+    if task.id is None:
+        return ()
+    candidates: list[DbTask] = [task]
+    merge_unit = store.resolve_merge_unit_for_task(task.id)
+    if merge_unit is not None and merge_unit.owner_task_id and merge_unit.owner_task_id != task.id:
+        owner = store.get(merge_unit.owner_task_id)
+        if owner is not None:
+            candidates.append(owner)
+    return tuple(candidates)
+
+
+def _pending_merge_replay_needs_attention(reason: str, description: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "type": "needs_attention",
+        "reason": reason,
+        "description": description,
+        "pending_merge_finalization": True,
+        **extra,
+    }
+
+
+def _pending_merge_missing_proof_attention(
+    store: SqliteTaskStore,
+    *,
+    action_family: MergeFinalizationFamily,
+    impl_task_id: str,
+    review_task_id: str,
+    target_branch: str,
+    live_target_sha: str,
+    merge_unit_id: str | None,
+    family_label: str,
+    review_task: DbTask | None = None,
+) -> dict[str, Any] | None:
+    attempts = merge_finalization_prepared_attempts_for_review(
+        store,
+        action_family=action_family,
+        impl_task_id=impl_task_id,
+        review_task_id=review_task_id,
+        target_branch=target_branch,
+        merge_unit_id=merge_unit_id,
+    )
+    promoted_attempts = [
+        attempt
+        for attempt in attempts
+        if attempt.promotion_observed or attempt.previous_target_sha != live_target_sha
+    ]
+    if not promoted_attempts:
+        return None
+    return _pending_merge_replay_needs_attention(
+        f"pending-merge-finalization-{family_label}-missing-proof",
+        (
+            f"Pending {family_label.replace('-', ' ')} replay for review {review_task_id} "
+            "requires operator attention because mandatory children were materialized and "
+            f"target {target_branch} was promoted, but no matching merge-finalization proof was stored."
+        ),
+        orphan_only=True,
+        review_task=review_task,
+    )
+
+
+def _has_matching_followup_children_for_replay(
+    store: SqliteTaskStore,
+    *,
+    review_task: DbTask,
+    impl_task: DbTask,
+) -> bool:
+    if review_task.id is None or impl_task.id is None:
+        return False
+    for child in store.get_based_on_children(review_task.id):
+        if child.task_type != "implement":
+            continue
+        parts = extract_followup_prompt_parts(child.prompt)
+        if parts is None:
+            continue
+        _finding_id, child_review_id, child_impl_id = parts
+        if child_review_id == review_task.id and child_impl_id == impl_task.id:
+            return True
+    return False
+
+
+def _existing_followup_children_for_replay(
+    store: SqliteTaskStore,
+    *,
+    review_task: DbTask,
+    impl_task: DbTask,
+    findings: tuple[ReviewFinding, ...],
+) -> tuple[DbTask, ...] | None:
+    if review_task.id is None or impl_task.id is None or not findings:
+        return None
+    children = store.get_based_on_children(review_task.id)
+    matched: list[DbTask] = []
+    for finding in findings:
+        prefix = build_followup_prompt(review_task.id, impl_task.id, finding)
+        matches = [
+            child
+            for child in children
+            if child.task_type == "implement"
+            and child.depends_on == impl_task.id
+            and child.prompt == prefix
+        ]
+        if len(matches) != 1:
+            return None
+        matched.append(matches[0])
+    return tuple(matched)
+
+
+def _pending_followup_finalization_action(
+    config: Any | None,
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    target_branch: str | None,
+    live_target_sha: str | None,
+    merge_unit_id: str | None,
+) -> dict[str, Any] | None:
+    proven_actions: list[dict[str, Any]] = []
+    missing_proof_actions: list[dict[str, Any]] = []
+    invalid_traces: list[str] = []
+    orphan_traces: list[str] = []
+    for impl_task in _merge_finalization_impl_candidates(store, task):
+        reviews = [
+            review
+            for review in get_implementation_review_evidence(store, impl_task)
+            if review.status == "completed" and review.id is not None
+        ]
+        for review_task in sorted(
+            reviews,
+            key=lambda review: _normalize_time(review.completed_at or review.created_at),
+            reverse=True,
+        ):
+            if target_branch is None:
+                invalid_traces.append(f"review {review_task.id} cannot prove target branch")
+                continue
+            impl_task_id = impl_task.id
+            review_task_id = review_task.id
+            if impl_task_id is None or review_task_id is None:
+                invalid_traces.append(f"review {review_task.id} cannot prove persisted task identity")
+                continue
+            has_matching_children = _has_matching_followup_children_for_replay(
+                store, review_task=review_task, impl_task=impl_task
+            )
+            if not isinstance(live_target_sha, str) or not live_target_sha:
+                if has_matching_children:
+                    return _pending_merge_replay_needs_attention(
+                        "pending-merge-finalization-live-target-unavailable",
+                        (
+                            "Pending ordinary follow-up replay cannot be proven because the live "
+                            f"target SHA for {target_branch} is unavailable."
+                        ),
+                        review_task=review_task,
+                    )
+                continue
+            candidate_proofs = merge_finalization_proofs_for_live_attempt(
+                store,
+                action_family="ordinary_followup",
+                impl_task_id=impl_task_id,
+                review_task_id=review_task_id,
+                target_branch=target_branch,
+                live_target_sha=live_target_sha,
+                merge_unit_id=merge_unit_id,
+            )
+            if not candidate_proofs:
+                missing_proof_attention = _pending_merge_missing_proof_attention(
+                    store,
+                    action_family="ordinary_followup",
+                    impl_task_id=impl_task_id,
+                    review_task_id=review_task_id,
+                    target_branch=target_branch,
+                    live_target_sha=live_target_sha,
+                    merge_unit_id=merge_unit_id,
+                    family_label="ordinary-followup",
+                    review_task=review_task,
+                )
+                if missing_proof_attention is not None:
+                    missing_proof_actions.append(missing_proof_attention)
+                continue
+            report = _review_report_for_replay(config, review_task)
+            if (
+                report.verdict is None
+                and not _review_content_available_for_replay(config, review_task)
+            ):
+                return _pending_merge_replay_needs_attention(
+                    "pending-merge-finalization-review-content-unavailable",
+                    (
+                        f"Pending ordinary follow-up replay for review {review_task.id} "
+                        "cannot be proven because the review report content is unavailable."
+                    ),
+                        review_task=review_task,
+                    )
+            if report.verdict is None:
+                invalid_traces.append(f"review {review_task.id} has malformed or unknown ordinary follow-up verdict")
+                continue
+            if report.verdict != "APPROVED_WITH_FOLLOWUPS":
+                invalid_traces.append(
+                    f"review {review_task.id} has verdict {report.verdict}, not APPROVED_WITH_FOLLOWUPS"
+                )
+                continue
+            followups = tuple(finding for finding in report.findings if finding.severity == "FOLLOWUP")
+            if not followups:
+                invalid_traces.append(f"review {review_task.id} has no parsed follow-up findings")
+                continue
+            if has_matching_children:
+                proven_children = _existing_followup_children_for_replay(
+                    store,
+                    review_task=review_task,
+                    impl_task=impl_task,
+                    findings=followups,
+                )
+                if proven_children is None:
+                    invalid_traces.append(f"review {review_task.id} has invalid ordinary follow-up replay children")
+                    continue
+                proofs = matching_merge_finalization_proofs(
+                    store,
+                    action_family="ordinary_followup",
+                    impl_task_id=impl_task_id,
+                    review_task_id=review_task_id,
+                    finding_ids=merge_finalization_finding_ids(followups),
+                    child_task_ids=merge_finalization_child_task_ids(proven_children),
+                    target_branch=target_branch,
+                    live_target_sha=live_target_sha,
+                    merge_unit_id=merge_unit_id,
+                )
+                if len(proofs) != 1:
+                    trace = (
+                        f"review {review_task.id} has {len(proofs)} matching ordinary follow-up promotion proofs"
+                    )
+                    if len(proofs) == 0:
+                        orphan_traces.append(trace)
+                    else:
+                        invalid_traces.append(trace)
+                    continue
+                proven_actions.append(
+                    {
+                        "type": "merge_with_followups",
+                        "description": _merge_review_description("APPROVED_WITH_FOLLOWUPS", None),
+                        "review_task": review_task,
+                        "followup_findings": followups,
+                        "pending_merge_finalization": True,
+                        "proven_followup_tasks": proven_children,
+                        "merge_finalization_proof_id": proofs[0].artifact.id,
+                        "merge_finalization_proof_sha": proofs[0].artifact.sha256,
+                    }
+                )
+            else:
+                invalid_traces.append(f"review {review_task.id} has no ordinary follow-up replay children")
+    if len(proven_actions) == 1 and not invalid_traces:
+        return proven_actions[0]
+    if missing_proof_actions and not proven_actions and not invalid_traces:
+        return missing_proof_actions[0]
+    if proven_actions or invalid_traces or orphan_traces or missing_proof_actions:
+        detail_parts = [*invalid_traces]
+        if not proven_actions:
+            detail_parts.extend(orphan_traces)
+            detail_parts.extend(
+                str(action.get("description") or action.get("reason") or "missing ordinary follow-up proof")
+                for action in missing_proof_actions
+            )
+        detail = "; ".join(detail_parts) if detail_parts else f"{len(proven_actions)} ordinary follow-up proofs"
+        return _pending_merge_replay_needs_attention(
+            "pending-merge-finalization-ordinary-followup-ambiguous",
+            f"Pending ordinary follow-up replay is ambiguous or invalid: {detail}.",
+            orphan_only=bool(orphan_traces) and not proven_actions and not invalid_traces,
+        )
+    return None
+
+
+def _pending_capped_blocker_finalization_action(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    target_branch: str | None,
+    live_target_sha: str | None,
+    merge_unit_id: str | None,
+) -> dict[str, Any] | None:
+    impl_task_ids = [candidate.id for candidate in _merge_finalization_impl_candidates(store, task) if candidate.id]
+
+    groups: dict[tuple[str, str], list[DbTask]] = {}
+    for impl_task_id in impl_task_ids:
+        for child in store.get_based_on_children(impl_task_id):
+            if child.task_type != "implement":
+                continue
+            parts = extract_capped_review_blocker_prompt_parts(child.prompt)
+            if parts is None:
+                continue
+            _finding_id, review_task_id, prompt_impl_task_id = parts
+            if prompt_impl_task_id != impl_task_id:
+                continue
+            groups.setdefault((impl_task_id, review_task_id), []).append(child)
+
+    proven_actions: list[dict[str, Any]] = []
+    missing_proof_actions: list[dict[str, Any]] = []
+    invalid_traces: list[str] = []
+    orphan_traces: list[str] = []
+    for (impl_task_id, review_task_id), children in groups.items():
+        if target_branch is None:
+            invalid_traces.append(f"review {review_task_id} cannot prove target branch")
+            continue
+        if not isinstance(live_target_sha, str) or not live_target_sha:
+            return _pending_merge_replay_needs_attention(
+                "pending-merge-finalization-live-target-unavailable",
+                (
+                    "Pending capped blocker replay cannot be proven because the live "
+                    f"target SHA for {target_branch} is unavailable."
+                ),
+            )
+        candidate_proofs = merge_finalization_proofs_for_live_attempt(
+            store,
+            action_family="max_cycles_deferred",
+            impl_task_id=impl_task_id,
+            review_task_id=review_task_id,
+            target_branch=target_branch,
+            live_target_sha=live_target_sha,
+            merge_unit_id=merge_unit_id,
+        )
+        if not candidate_proofs:
+            missing_proof_attention = _pending_merge_missing_proof_attention(
+                store,
+                action_family="max_cycles_deferred",
+                impl_task_id=impl_task_id,
+                review_task_id=review_task_id,
+                target_branch=target_branch,
+                live_target_sha=live_target_sha,
+                merge_unit_id=merge_unit_id,
+                family_label="capped-blocker",
+            )
+            if missing_proof_attention is not None:
+                missing_proof_actions.append(missing_proof_attention)
+            continue
+        review_task = store.get(review_task_id)
+        if review_task is None or review_task.status != "completed":
+            invalid_traces.append(f"review {review_task_id} is missing or incomplete")
+            continue
+        if declares_spec_coherence_review_mode(review_task.review_scope):
+            invalid_traces.append(f"review {review_task_id} is spec-coherence mode")
+            continue
+        outputs = {
+            output
+            for child in children
+            if (output := extract_capped_review_blocker_persisted_output(child.prompt)) is not None
+        }
+        if len(outputs) != 1:
+            invalid_traces.append(f"review {review_task_id} has ambiguous persisted outputs")
+            continue
+        persisted_output = next(iter(outputs))
+        report = parse_review_report(persisted_output)
+        if report.verdict != "CHANGES_REQUESTED":
+            invalid_traces.append(f"review {review_task_id} is not CHANGES_REQUESTED")
+            continue
+        blockers = tuple(finding for finding in report.findings if finding.severity == "BLOCKER")
+        if not blockers:
+            invalid_traces.append(f"review {review_task_id} has no parsed blockers")
+            continue
+        children_by_finding: dict[str, list[DbTask]] = {}
+        for child in children:
+            parts = extract_capped_review_blocker_prompt_parts(child.prompt)
+            if parts is None:
+                continue
+            finding_id, _review_task_id, _impl_task_id = parts
+            children_by_finding.setdefault(finding_id, []).append(child)
+        blocker_ids = {finding.id for finding in blockers}
+        if set(children_by_finding) != blocker_ids:
+            invalid_traces.append(f"review {review_task_id} blocker task set does not match parsed blockers")
+            continue
+        proven_children: list[DbTask] = []
+        for finding in blockers:
+            matches = children_by_finding.get(finding.id, [])
+            if len(matches) != 1:
+                proven_children = []
+                break
+            child = matches[0]
+            if not capped_review_blocker_task_matches_identity(
+                child,
+                review_task_id=review_task_id,
+                impl_task_id=impl_task_id,
+                finding=finding,
+                persisted_review_output=persisted_output,
+            ):
+                proven_children = []
+                break
+            proven_children.append(child)
+        if not proven_children:
+            invalid_traces.append(f"review {review_task_id} has malformed or duplicated blocker replay children")
+            continue
+        proofs = matching_merge_finalization_proofs(
+            store,
+            action_family="max_cycles_deferred",
+            impl_task_id=impl_task_id,
+            review_task_id=review_task_id,
+            finding_ids=merge_finalization_finding_ids(blockers),
+            child_task_ids=merge_finalization_child_task_ids(proven_children),
+            target_branch=target_branch,
+            live_target_sha=live_target_sha,
+            merge_unit_id=merge_unit_id,
+        )
+        if len(proofs) != 1:
+            trace = f"review {review_task_id} has {len(proofs)} matching capped blocker promotion proofs"
+            if len(proofs) == 0:
+                orphan_traces.append(trace)
+            else:
+                invalid_traces.append(trace)
+            continue
+        proven_actions.append(
+            {
+                "type": "merge",
+                "description": "Merge and defer blockers after max review cycles",
+                "review_task": review_task,
+                "max_cycles_merge_and_defer": True,
+                "deferred_blocker_findings": blockers,
+                "persisted_review_output": persisted_output,
+                "review_output": persisted_output,
+                "pending_merge_finalization": True,
+                "proven_deferred_blocker_tasks": tuple(proven_children),
+                "merge_finalization_proof_id": proofs[0].artifact.id,
+                "merge_finalization_proof_sha": proofs[0].artifact.sha256,
+            }
+        )
+    if len(proven_actions) == 1 and not invalid_traces:
+        return proven_actions[0]
+    if missing_proof_actions and not proven_actions and not invalid_traces:
+        return missing_proof_actions[0]
+    if proven_actions or invalid_traces or orphan_traces or missing_proof_actions:
+        detail_parts = [*invalid_traces]
+        if not proven_actions:
+            detail_parts.extend(orphan_traces)
+            detail_parts.extend(
+                str(action.get("description") or action.get("reason") or "missing capped blocker proof")
+                for action in missing_proof_actions
+            )
+        detail = "; ".join(detail_parts) if detail_parts else f"{len(proven_actions)} capped blocker proofs"
+        return _pending_merge_replay_needs_attention(
+            "pending-merge-finalization-capped-blocker-ambiguous",
+            f"Pending capped blocker replay is ambiguous or invalid: {detail}.",
+            orphan_only=bool(orphan_traces) and not proven_actions and not invalid_traces,
+        )
+    return None
+
+
+def pending_merge_finalization_action(
+    config: Any | None,
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    target_branch: str | None = None,
+    require_already_merged: bool = False,
+    resolved_merge_state: str | None = None,
+    live_target_sha: str | None = None,
+) -> dict[str, Any] | None:
+    """Return the authoritative merge action needed to finalize an already-promoted unit."""
+    if task.id is None or task.status != "completed" or not task.has_commits:
+        return None
+    merge_unit = store.resolve_merge_unit_for_task(task.id)
+    if merge_unit is None or merge_unit.state == "merged":
+        return None
+    if target_branch is not None and merge_unit.target_branch and merge_unit.target_branch != target_branch:
+        return None
+    if require_already_merged:
+        if not merge_state_is_terminal_for_lifecycle(resolved_merge_state):
+            return None
+
+    followup_action = _pending_followup_finalization_action(
+        config,
+        store,
+        task,
+        target_branch=target_branch,
+        live_target_sha=live_target_sha,
+        merge_unit_id=merge_unit.id,
+    )
+    capped_action = _pending_capped_blocker_finalization_action(
+        store,
+        task,
+        target_branch=target_branch,
+        live_target_sha=live_target_sha,
+        merge_unit_id=merge_unit.id,
+    )
+    attention_actions = [
+        action for action in (followup_action, capped_action) if action is not None and action.get("type") == "needs_attention"
+    ]
+    for action in attention_actions:
+        if action.get("orphan_only") is not True:
+            return action
+    proven = [action for action in (followup_action, capped_action) if action is not None and action.get("type") != "needs_attention"]
+    if len(proven) == 2:
+        return _pending_merge_replay_needs_attention(
+            "pending-merge-finalization-multiple-proof-families",
+            "Pending merge finalization has both ordinary follow-up and capped blocker proofs.",
+        )
+    if len(proven) != 1:
+        if attention_actions:
+            return attention_actions[0]
+        return None
+    return proven[0]
 
 
 def is_resumable_failure_reason(failure_reason: str | None) -> bool:
@@ -5382,6 +5920,31 @@ def _verify_gate_in_merge_scope(ctx: AdvanceContext) -> bool:
     )
 
 
+def _pending_merge_finalization_action(ctx: AdvanceContext) -> dict[str, Any] | None:
+    if ctx.post_merge_rebase_state is None or not ctx.post_merge_rebase_state.already_merged:
+        return None
+    return pending_merge_finalization_action(
+        ctx.config,
+        ctx.store,
+        ctx.task,
+        target_branch=ctx.target_branch,
+        require_already_merged=True,
+        resolved_merge_state=ctx.post_merge_rebase_state.resolved_merge_state,
+        live_target_sha=ctx.post_merge_rebase_state.target_tip_sha,
+    )
+
+
+def _pending_merge_finalization_required(ctx: AdvanceContext) -> bool:
+    return _pending_merge_finalization_action(ctx) is not None
+
+
+def _pending_merge_finalization_rule_action(ctx: AdvanceContext) -> dict[str, Any]:
+    action = _pending_merge_finalization_action(ctx)
+    if action is None:
+        return {"type": "skip", "description": "SKIP: no pending merge finalization"}
+    return action
+
+
 def _verify_gate_action(ctx: AdvanceContext, *, phase: str, explicit_refresh: bool = False) -> dict[str, Any]:
     decision = getattr(ctx, "verify_gate_decision", None)
     if decision is None:
@@ -5813,6 +6376,7 @@ def _resolve_pre_closing_review_git_context(
             git,
             task,
             target_branch,
+            config=config,
             merge_source=merge_source,
         )
     else:
@@ -7161,6 +7725,11 @@ ADVANCE_RULES: list[AdvanceRule] = [
             reason="merge-source-needs-manual-resolution",
             subject_task_id=ctx.task.id,
         ),
+    ),
+    AdvanceRule(
+        name="pending_merge_finalization_replay",
+        matches=_pending_merge_finalization_required,
+        action=_pending_merge_finalization_rule_action,
     ),
     AdvanceRule(
         name="empty_branch",

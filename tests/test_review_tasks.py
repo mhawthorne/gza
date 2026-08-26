@@ -25,6 +25,7 @@ from gza.review_tasks import (
     backfill_changed_diff_rebase_review_scope_provenance,
     backfill_resolution_review_scope_provenance,
     build_auto_review_prompt,
+    build_capped_review_blocker_prompt,
     build_capped_review_blocker_prompt_prefix,
     build_deferred_blocker_prompt_prefix,
     build_followup_prompt,
@@ -66,7 +67,7 @@ from gza.review_tasks import (
     resolve_verify_fix_representative_task,
     resolve_verify_fix_task_identity,
 )
-from gza.review_verdict import ReviewFinding
+from gza.review_verdict import ReviewFinding, parse_review_report
 from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
 
 
@@ -137,6 +138,31 @@ def _finding(finding_id: str = "F1", severity: str = "FOLLOWUP") -> ReviewFindin
         fix_or_followup="Fix it",
         tests="Tests",
     )
+
+
+def _capped_review_output(*finding_ids: str) -> str:
+    sections = ["## Review", "", "Verdict: CHANGES_REQUESTED", "", "## Blockers", ""]
+    for finding_id in finding_ids or ("B1",):
+        sections.extend(
+            [
+                f"### {finding_id} Finding",
+                "Evidence: Evidence",
+                "Impact: Impact",
+                "Required fix: Fix it",
+                "Required tests: Tests",
+                "",
+            ]
+        )
+    return "\n".join(sections)
+
+
+def _capped_prompt(
+    review_task_id: str,
+    impl_task_id: str,
+    finding: ReviewFinding,
+    raw_review: str = "raw review",
+) -> str:
+    return build_capped_review_blocker_prompt(review_task_id, impl_task_id, finding, raw_review)
 
 
 def test_review_task_creation_rejects_uncovered_review_before_store_add(tmp_path: Path) -> None:
@@ -3111,11 +3137,13 @@ class TestFollowupTasks:
             open_state_citation=None,
         )
         existing = store.add(
-            build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, finding.id)
-            + " reconcile tags",
+            _capped_prompt(review_task.id, impl_task.id, finding),
             task_type="implement",
             based_on=impl_task.id,
             depends_on=impl_task.id,
+            review_scope=format_blocker_finding_context(finding),
+            create_pr=True,
+            urgent=True,
             tags=("legacy-extra",),
         )
         assert existing.id is not None
@@ -3166,11 +3194,13 @@ class TestFollowupTasks:
             open_state_citation=None,
         )
         store.add(
-            build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, finding.id)
-            + " add reserved tag",
+            _capped_prompt(review_task.id, impl_task.id, finding),
             task_type="implement",
             based_on=impl_task.id,
             depends_on=impl_task.id,
+            review_scope=format_blocker_finding_context(finding),
+            create_pr=True,
+            urgent=True,
             tags=("legacy-extra",),
         )
 
@@ -3224,11 +3254,13 @@ class TestFollowupTasks:
             open_state_citation=None,
         )
         existing = store.add(
-            build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, finding.id)
-            + " do not reuse",
+            _capped_prompt(review_task.id, impl_task.id, finding),
             task_type="implement",
             based_on=impl_task.id,
             depends_on=impl_task.id,
+            review_scope=format_blocker_finding_context(finding),
+            create_pr=True,
+            urgent=True,
             tags=(DEFERRED_REVIEW_BLOCKER_TAG,),
         )
         assert existing.id is not None
@@ -3294,11 +3326,13 @@ class TestFollowupTasks:
             open_state_citation=None,
         )
         existing = store.add(
-            build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, finding.id)
-            + " reuse current active work",
+            _capped_prompt(review_task.id, impl_task.id, finding),
             task_type="implement",
             based_on=impl_task.id,
             depends_on=impl_task.id,
+            review_scope=format_blocker_finding_context(finding),
+            create_pr=True,
+            urgent=True,
             tags=("legacy-extra",),
         )
         assert existing.id is not None
@@ -3383,11 +3417,13 @@ class TestFollowupTasks:
             open_state_citation=None,
         )
         existing = store.add(
-            build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, finding.id)
-            + " reuse safely",
+            _capped_prompt(review_task.id, impl_task.id, finding),
             task_type="implement",
             based_on=impl_task.id,
             depends_on=impl_task.id,
+            review_scope=format_blocker_finding_context(finding),
+            create_pr=True,
+            urgent=True,
             tags=("legacy-extra",),
         )
         assert existing.id is not None
@@ -3537,38 +3573,21 @@ class TestFollowupTasks:
         assert impl_task.id is not None
         review_task = store.add("Review capped merge", task_type="review", based_on=impl_task.id)
         assert review_task.id is not None
-        first = ReviewFinding(
-            id="B1",
-            severity="BLOCKER",
-            title="First blocker",
-            body="First body",
-            evidence=None,
-            impact=None,
-            fix_or_followup="fix first",
-            tests=None,
-            open_state_citation=None,
-        )
-        second = ReviewFinding(
-            id="B2",
-            severity="BLOCKER",
-            title="Second blocker",
-            body="Second body",
-            evidence=None,
-            impact=None,
-            fix_or_followup="fix second",
-            tests=None,
-            open_state_citation=None,
-        )
+        review_output = _capped_review_output("B1", "B2")
+        review_task.status = "completed"
+        review_task.output_content = review_output
+        store.update(review_task)
+        first, second = parse_review_report(review_output).findings
         created, reused = create_or_reuse_capped_review_blocker_tasks(
             store,
             review_task=review_task,
             impl_task=impl_task,
-            findings=(first,),
-            persisted_review_output="raw review text\n",
+            findings=(first, second),
+            persisted_review_output=review_output,
             active_scope_tags=("scoped",),
             trigger_source="advance",
         )
-        assert len(created) == 1
+        assert len(created) == 2
         assert reused == []
 
         replay_created, replay_reused = create_or_reuse_capped_review_blocker_tasks(
@@ -3576,28 +3595,31 @@ class TestFollowupTasks:
             review_task=review_task,
             impl_task=impl_task,
             findings=(first, second),
-            persisted_review_output="raw review text\n",
+            persisted_review_output=review_output,
             active_scope_tags=("scoped",),
             trigger_source="advance",
         )
 
-        assert [task.id for task in replay_reused] == [created[0].id]
-        assert len(replay_created) == 1
+        assert replay_created == []
+        assert [task.id for task in replay_reused] == [task.id for task in created]
         second_replay_created, second_replay_reused = create_or_reuse_capped_review_blocker_tasks(
             store,
             review_task=review_task,
             impl_task=impl_task,
             findings=(first, second),
-            persisted_review_output="raw review text\n",
+            persisted_review_output=review_output,
             active_scope_tags=("scoped",),
             trigger_source="advance",
         )
 
         assert second_replay_created == []
-        assert [task.id for task in second_replay_reused] == [created[0].id, replay_created[0].id]
+        assert [task.id for task in second_replay_reused] == [task.id for task in created]
         impl_children = store.get_based_on_children(impl_task.id)
         review_children = store.get_based_on_children(review_task.id)
         assert len([child for child in impl_children if child.task_type == "implement"]) == 2
+        for child in impl_children:
+            if child.task_type == "implement":
+                assert set(child.tags) == {"release", "scoped", DEFERRED_REVIEW_BLOCKER_TAG}
         assert review_children == []
 
     def test_create_or_reuse_capped_review_blocker_task_serializes_same_identity_two_writers(
@@ -3865,15 +3887,18 @@ class TestFollowupTasks:
             open_state_citation=None,
         )
         created_task = _task(id="gza-704", task_type="implement")
+        review_output = _capped_review_output("B1")
+        review_task.output_content = review_output
         store.get_based_on_children.return_value = []
+        store.get.return_value = review_task
         store.create_or_reuse_capped_review_blocker_task.return_value = (created_task, True)
 
         created, reused = common_create_capped_review_blocker_tasks(
             store,
             review_task=review_task,
             impl_task=impl_task,
-            findings=(finding,),
-            persisted_review_output="raw review",
+            findings=tuple(parse_review_report(review_output).findings),
+            persisted_review_output=review_output,
             active_scope_tags=("release",),
             trigger_source="advance",
         )

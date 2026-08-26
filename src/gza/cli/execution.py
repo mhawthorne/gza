@@ -722,6 +722,7 @@ def _reconcile_iterate_already_merged(
 
 def _iterate_rebase_target_already_merged(
     *,
+    config: Config,
     store: SqliteTaskStore,
     git_runtime: Git,
     task: DbTask,
@@ -733,6 +734,7 @@ def _iterate_rebase_target_already_merged(
         git_runtime,
         task,
         target_branch,
+        config=config,
         merge_source=_resolve_current_merge_source(git_runtime, task.branch) if task.branch else None,
     ).already_merged
 
@@ -5621,6 +5623,7 @@ def _cmd_iterate_impl(
                 if not iterate_task.branch:
                     return None, None
                 if _iterate_rebase_target_already_merged(
+                    config=config,
                     store=store,
                     git_runtime=preflight_context.git_runtime,
                     task=iterate_task,
@@ -6891,6 +6894,7 @@ def _cmd_iterate_impl(
                 _append_summary_row(summary_rows, iteration_index=iteration, task_type="rebase", task=None, status="failed")
                 break
             elif _iterate_rebase_target_already_merged(
+                config=config,
                 store=store,
                 git_runtime=git_runtime,
                 task=impl_task,

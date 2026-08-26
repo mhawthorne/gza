@@ -32,6 +32,7 @@ from gza.advance_engine import (
     failed_recovery_decision_to_action,
     get_action_subject_task_id,
     needs_attention_recommended_next_step,
+    pending_merge_finalization_action,
     prime_lifecycle_git_facts,
     require_needs_attention_subject,
     resolve_advance_context,
@@ -44,6 +45,10 @@ from gza.config import Config
 from gza.db import NewTaskParams, SqliteTaskStore, Task as DbTask
 from gza.git import Git, GitError
 from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows, query_lineage_owner_rows_in_read_session
+from gza.merge_finalization_proof import (
+    persist_merge_finalization_attempt_proof,
+    persist_merge_finalization_prepared_attempt,
+)
 from gza.plan_review_materialization import (
     PLAN_REVIEW_ARTIFACT_SCHEMA_VERSION,
     PLAN_REVIEW_MATERIALIZATION_ARTIFACT_KIND,
@@ -60,10 +65,12 @@ from gza.review_scope import (
 )
 from gza.review_tasks import (
     OFF_TOPIC_VERIFY_INVESTIGATION_ARTIFACT_KIND,
+    build_followup_prompt,
     build_verify_fix_prompt,
+    create_or_reuse_capped_review_blocker_task,
     create_or_reuse_verify_fix_task,
 )
-from gza.review_verdict import ParsedReviewReport, ReviewFinding
+from gza.review_verdict import ParsedReviewReport, ReviewFinding, parse_review_report
 from gza.review_verify_state import (
     VerifyEpoch,
     persist_verify_gate_artifact,
@@ -827,6 +834,124 @@ def _blocker_report(
             ),
         ),
         format_version="v2",
+    )
+
+
+def _review_finding(finding_id: str, severity: str) -> ReviewFinding:
+    return ReviewFinding(
+        id=finding_id,
+        severity=severity,  # type: ignore[arg-type]
+        title=f"{finding_id} title",
+        body="body",
+        evidence="evidence",
+        impact="impact",
+        fix_or_followup="fix",
+        tests="tests",
+        open_state_citation="src/gza/example.py:1",
+    )
+
+
+def _review_output_with_findings(
+    verdict: str,
+    *,
+    blockers: tuple[str, ...] = (),
+    followups: tuple[str, ...] = (),
+) -> str:
+    sections = ["## Review", "", f"Verdict: {verdict}", ""]
+    if blockers:
+        sections.extend(["## Blockers", ""])
+        for finding_id in blockers:
+            sections.extend(
+                [
+                    f"### {finding_id} {finding_id} title",
+                    "Evidence: evidence",
+                    "Impact: impact",
+                    "Required fix: fix",
+                    "Required tests: tests",
+                    "Open-state citation: src/gza/example.py:1",
+                    "",
+                ]
+            )
+    if followups:
+        sections.extend(["## Follow-Ups", ""])
+        for finding_id in followups:
+            sections.extend(
+                [
+                    f"### {finding_id} {finding_id} title",
+                    "Evidence: evidence",
+                    "Impact: impact",
+                    "Follow-up: fix",
+                    "Required tests: tests",
+                    "Open-state citation: src/gza/example.py:1",
+                    "",
+                ]
+            )
+    return "\n".join(sections)
+
+
+def _persist_test_merge_finalization_proof(
+    store: SqliteTaskStore,
+    *,
+    action_family: str,
+    impl: DbTask,
+    review: DbTask,
+    findings: tuple[ReviewFinding, ...],
+    children: tuple[DbTask, ...],
+    target_sha: str = "same-sha",
+    previous_target_sha: str = "previous-sha",
+    target_branch: str = "main",
+) -> None:
+    assert impl.id is not None
+    assert impl.branch is not None
+    assert review.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    persist_merge_finalization_attempt_proof(
+        store,
+        action_family=action_family,  # type: ignore[arg-type]
+        impl_task_id=impl.id,
+        review_task_id=review.id,
+        finding_ids=tuple(finding.id for finding in findings),
+        child_task_ids=tuple(child.id for child in children if child.id is not None),
+        source_branch=impl.branch,
+        source_ref=impl.branch,
+        source_ref_sha="source-sha",
+        target_branch=target_branch,
+        previous_target_sha=previous_target_sha,
+        promoted_target_sha=target_sha,
+        merge_unit_id=unit.id if unit is not None else None,
+    )
+
+
+def _persist_test_merge_finalization_prepared_attempt(
+    store: SqliteTaskStore,
+    *,
+    action_family: str,
+    impl: DbTask,
+    review: DbTask,
+    findings: tuple[ReviewFinding, ...],
+    children: tuple[DbTask, ...],
+    previous_target_sha: str = "target-before",
+    target_branch: str = "main",
+    promotion_observed: bool = False,
+) -> None:
+    assert impl.id is not None
+    assert impl.branch is not None
+    assert review.id is not None
+    unit = store.resolve_merge_unit_for_task(impl.id)
+    persist_merge_finalization_prepared_attempt(
+        store,
+        action_family=action_family,  # type: ignore[arg-type]
+        impl_task_id=impl.id,
+        review_task_id=review.id,
+        finding_ids=tuple(finding.id for finding in findings),
+        child_task_ids=tuple(child.id for child in children if child.id is not None),
+        source_branch=impl.branch,
+        source_ref=impl.branch,
+        source_ref_sha="source-sha",
+        target_branch=target_branch,
+        previous_target_sha=previous_target_sha,
+        merge_unit_id=unit.id if unit is not None else None,
+        promotion_observed=promotion_observed,
     )
 
 
@@ -16103,6 +16228,1161 @@ def test_post_merge_rebase_state_does_not_persist_merged_for_in_progress_impleme
     refreshed = store.get(impl.id)
     assert refreshed is not None
     assert refreshed.merge_status == "unmerged"
+
+
+def test_post_merge_rebase_state_without_proven_capped_replay_persists_ordinary_merge(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 0
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pending-capped-finalization",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = "## Review\n\nVerdict: CHANGES_REQUESTED\n\n## Blockers\n\n### B1\nFix it.\n"
+    store.update(review)
+
+    git = _FakeGit(
+        can_merge=True,
+        ref_shas={
+            impl.branch: "same-sha",
+            "main": "same-sha",
+        },
+    )
+
+    state = _resolve_and_persist_post_merge_rebase_state(store, git, impl, "main", config=config)
+
+    assert state.already_merged is True
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state in {"merged", "redundant"}
+    assert refreshed_unit.merge_source is None
+
+
+def test_already_merged_unproven_capped_unit_reconciles_without_debt(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 0
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/replay-capped-before-skip",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    store.get_or_create_merge_unit_for_task(impl)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = "## Review\n\nVerdict: CHANGES_REQUESTED\n\n## Blockers\n\n### B1\nFix it.\n"
+    store.update(review)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "skip"
+    assert action.get("max_cycles_merge_and_defer") is not True
+    assert not store.get_based_on_children(impl.id)
+
+
+@pytest.mark.parametrize("policy", [None, "park"])
+def test_already_merged_unproven_capped_unit_policy_absent_or_park_reconciles_without_debt(
+    tmp_path: Path,
+    policy: str | None,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    if policy is not None:
+        config.on_max_cycles = policy
+    config.max_review_cycles = 0
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/unproven-capped-{policy or 'absent'}",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    store.get_or_create_merge_unit_for_task(impl)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = "## Review\n\nVerdict: CHANGES_REQUESTED\n\n## Blockers\n\n### B1\nFix it.\n"
+    store.update(review)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "skip"
+    assert action.get("max_cycles_merge_and_defer") is not True
+    assert not store.get_based_on_children(impl.id)
+
+
+def test_already_merged_spec_coherence_changes_requested_never_replays_capped_debt(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 0
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/spec-coherence-unproven-capped",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    store.get_or_create_merge_unit_for_task(impl)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.review_scope = build_spec_coherence_review_scope(
+        implementation_task_id=impl.id,
+        reviewed_head_sha="head-sha",
+        changed_paths=("specs/behavior/lifecycle-engine.md",),
+    )
+    review.output_content = "## Review\n\nVerdict: CHANGES_REQUESTED\n\n## Blockers\n\n### B1\nFix it.\n"
+    store.update(review)
+
+    finding = parse_review_report(review.output_content).findings[0]
+    child, _created = create_or_reuse_capped_review_blocker_task(
+        store,
+        config=config,
+        review_task=review,
+        impl_task=impl,
+        finding=finding,
+        persisted_review_output=review.output_content,
+        active_scope_tags=("release",),
+        trigger_source="advance",
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="max_cycles_deferred",
+        impl=impl,
+        review=review,
+        findings=(finding,),
+        children=(child,),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_attention"
+    assert action["reason"] == "pending-merge-finalization-capped-blocker-ambiguous"
+    assert "spec-coherence mode" in action["description"]
+
+
+def test_already_merged_proven_capped_unit_replays_original_review_even_after_newer_review(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 0
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/proven-capped-before-skip",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    store.get_or_create_merge_unit_for_task(impl)
+    original_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    original_review.output_content = (
+        "## Review\n\nVerdict: CHANGES_REQUESTED\n\n"
+        "## Blockers\n\n"
+        "### B1 Original blocker\n"
+        "Evidence: original evidence.\n"
+        "Impact: original impact.\n"
+        "Required fix: original fix.\n"
+        "Required tests: original tests.\n"
+    )
+    store.update(original_review)
+    original_finding = parse_review_report(original_review.output_content).findings[0]
+    blocker_child, created_now = create_or_reuse_capped_review_blocker_task(
+        store,
+        config=config,
+        review_task=original_review,
+        impl_task=impl,
+        finding=original_finding,
+        persisted_review_output=original_review.output_content,
+        active_scope_tags=("release", "backend"),
+        trigger_source="watch",
+    )
+    assert created_now is True
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="max_cycles_deferred",
+        impl=impl,
+        review=original_review,
+        findings=(original_finding,),
+        children=(blocker_child,),
+    )
+    newer_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC))
+    newer_review.output_content = (
+        "## Review\n\nVerdict: CHANGES_REQUESTED\n\n"
+        "## Blockers\n\n"
+        "### B9 Newer blocker\n"
+        "Evidence: newer evidence.\n"
+        "Impact: newer impact.\n"
+        "Required fix: newer fix.\n"
+        "Required tests: newer tests.\n"
+    )
+    store.update(newer_review)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "merge"
+    assert action["max_cycles_merge_and_defer"] is True
+    assert action["pending_merge_finalization"] is True
+    assert action["review_task"].id == original_review.id
+    assert [finding.id for finding in action["deferred_blocker_findings"]] == ["B1"]
+    assert action["proven_deferred_blocker_tasks"] == (blocker_child,)
+    assert {"release", "backend", "deferred-review-blocker"} <= set(blocker_child.tags)
+
+
+def test_already_merged_pending_followup_unit_replays_followup_merge_before_skip(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/replay-followups-before-skip",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    store.get_or_create_merge_unit_for_task(impl)
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = "## Review\n\nVerdict: APPROVED_WITH_FOLLOWUPS\n"
+    store.update(review)
+    finding = _review_finding("F1", "FOLLOWUP")
+    followup = store.add(
+        build_followup_prompt(review.id, impl.id, finding),
+        task_type="implement",
+        based_on=review.id,
+        depends_on=impl.id,
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="ordinary_followup",
+        impl=impl,
+        review=review,
+        findings=(finding,),
+        children=(followup,),
+    )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: ParsedReviewReport(
+            verdict="APPROVED_WITH_FOLLOWUPS",
+            findings=(finding,),
+            format_version="v2",
+        ),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "merge_with_followups"
+    assert action["pending_merge_finalization"] is True
+    assert action["review_task"].id == review.id
+    assert [finding.id for finding in action["followup_findings"]] == ["F1"]
+
+
+def test_pending_ordinary_followup_replay_ignores_stale_unavailable_review(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/ordinary-stale-unavailable-review",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    store.get_or_create_merge_unit_for_task(impl)
+    stale_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    stale_finding = _review_finding("F1", "FOLLOWUP")
+    stale_child = store.add(
+        build_followup_prompt(stale_review.id, impl.id, stale_finding),
+        task_type="implement",
+        based_on=stale_review.id,
+        depends_on=impl.id,
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="ordinary_followup",
+        impl=impl,
+        review=stale_review,
+        findings=(stale_finding,),
+        children=(stale_child,),
+        target_sha="old-target-sha",
+    )
+    current_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC))
+    current_review.output_content = _review_output_with_findings("APPROVED_WITH_FOLLOWUPS", followups=("F2",))
+    store.update(current_review)
+    current_finding = parse_review_report(current_review.output_content).findings[0]
+    current_child = store.add(
+        build_followup_prompt(current_review.id, impl.id, current_finding),
+        task_type="implement",
+        based_on=current_review.id,
+        depends_on=impl.id,
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="ordinary_followup",
+        impl=impl,
+        review=current_review,
+        findings=(current_finding,),
+        children=(current_child,),
+        target_sha="same-sha",
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "merge_with_followups"
+    assert action["pending_merge_finalization"] is True
+    assert action["review_task"].id == current_review.id
+    assert action["proven_followup_tasks"] == (current_child,)
+
+
+def test_pending_ordinary_followup_replay_current_unavailable_review_needs_attention(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/ordinary-current-unavailable-review",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    finding = _review_finding("F1", "FOLLOWUP")
+    child = store.add(
+        build_followup_prompt(review.id, impl.id, finding),
+        task_type="implement",
+        based_on=review.id,
+        depends_on=impl.id,
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="ordinary_followup",
+        impl=impl,
+        review=review,
+        findings=(finding,),
+        children=(child,),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_attention"
+    assert action["reason"] == "pending-merge-finalization-review-content-unavailable"
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+    assert refreshed_unit.merge_source is None
+
+
+@pytest.mark.parametrize("family", ["ordinary", "capped"])
+def test_pending_finalization_missing_post_promotion_proof_needs_attention_and_stays_visible(
+    tmp_path: Path,
+    family: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/{family}-missing-post-promotion-proof",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+    if family == "ordinary":
+        output = _review_output_with_findings("APPROVED_WITH_FOLLOWUPS", followups=("F1",))
+        review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+        review.output_content = output
+        store.update(review)
+        finding = parse_review_report(output).findings[0]
+        child = store.add(
+            build_followup_prompt(review.id, impl.id, finding),
+            task_type="implement",
+            based_on=review.id,
+            depends_on=impl.id,
+        )
+        action_family = "ordinary_followup"
+        expected_reason = "pending-merge-finalization-ordinary-followup-missing-proof"
+    else:
+        output = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",))
+        review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+        review.output_content = output
+        store.update(review)
+        finding = parse_review_report(output).findings[0]
+        child, _created = create_or_reuse_capped_review_blocker_task(
+            store,
+            config=config,
+            review_task=review,
+            impl_task=impl,
+            finding=finding,
+            persisted_review_output=output,
+            active_scope_tags=("release",),
+            trigger_source="advance",
+        )
+        action_family = "max_cycles_deferred"
+        expected_reason = "pending-merge-finalization-capped-blocker-missing-proof"
+    _persist_test_merge_finalization_prepared_attempt(
+        store,
+        action_family=action_family,
+        impl=impl,
+        review=review,
+        findings=(finding,),
+        children=(child,),
+        previous_target_sha="target-before",
+    )
+    git = _FakeGit(
+        can_merge=True,
+        is_merged_by_ref={(impl.branch, "main"): True},
+        ref_shas={impl.branch: "target-after", "main": "target-after"},
+    )
+
+    action = pending_merge_finalization_action(
+        config,
+        store,
+        impl,
+        target_branch="main",
+        require_already_merged=True,
+        resolved_merge_state="merged",
+        live_target_sha="target-after",
+    )
+
+    assert action is not None
+    assert action["type"] == "needs_attention"
+    assert action["reason"] == expected_reason
+    assert "no matching merge-finalization proof was stored" in action["description"]
+
+    advance_action = evaluate_advance_rules(config, store, git, impl, "main")
+    assert advance_action["type"] == "needs_attention"
+    assert advance_action["reason"] == expected_reason
+
+    state = _resolve_and_persist_post_merge_rebase_state(store, git, impl, "main", config=config)
+    assert state.resolved_merge_state in {"merged", "redundant"}
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+    assert refreshed_unit.merge_source is None
+    assert not store.list_artifacts(impl.id, kind="merge_finalization_attempt_proof")
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=False),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+    assert any(row.owner_task.id == impl.id for row in rows)
+
+
+@pytest.mark.parametrize("family", ["ordinary", "capped"])
+def test_pending_finalization_pre_promotion_failure_children_without_target_movement_do_not_need_attention(
+    tmp_path: Path,
+    family: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/{family}-pre-promotion-no-target-move",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+    if family == "ordinary":
+        output = _review_output_with_findings("APPROVED_WITH_FOLLOWUPS", followups=("F1",))
+        review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+        review.output_content = output
+        store.update(review)
+        finding = parse_review_report(output).findings[0]
+        child = store.add(
+            build_followup_prompt(review.id, impl.id, finding),
+            task_type="implement",
+            based_on=review.id,
+            depends_on=impl.id,
+        )
+        action_family = "ordinary_followup"
+    else:
+        output = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",))
+        review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+        review.output_content = output
+        store.update(review)
+        finding = parse_review_report(output).findings[0]
+        child, _created = create_or_reuse_capped_review_blocker_task(
+            store,
+            config=config,
+            review_task=review,
+            impl_task=impl,
+            finding=finding,
+            persisted_review_output=output,
+            active_scope_tags=("release",),
+            trigger_source="advance",
+        )
+        action_family = "max_cycles_deferred"
+    _persist_test_merge_finalization_prepared_attempt(
+        store,
+        action_family=action_family,
+        impl=impl,
+        review=review,
+        findings=(finding,),
+        children=(child,),
+        previous_target_sha="target-before",
+    )
+
+    action = pending_merge_finalization_action(
+        config,
+        store,
+        impl,
+        target_branch="main",
+        require_already_merged=True,
+        resolved_merge_state="merged",
+        live_target_sha="target-before",
+    )
+
+    assert action is None
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+    assert refreshed_unit.merge_source is None
+    assert not store.list_artifacts(impl.id, kind="merge_finalization_attempt_proof")
+
+
+@pytest.mark.parametrize(
+    ("report_case", "review_output", "expected_detail"),
+    [
+        (
+            "malformed",
+            "This persisted report is nonempty but has no recognized verdict or findings.\n",
+            "malformed or unknown ordinary follow-up verdict",
+        ),
+        (
+            "verdict-mismatch",
+            _review_output_with_findings("APPROVED"),
+            "not APPROVED_WITH_FOLLOWUPS",
+        ),
+    ],
+)
+def test_pending_ordinary_followup_replay_invalid_report_evidence_needs_attention_without_repair(
+    tmp_path: Path,
+    report_case: str,
+    review_output: str,
+    expected_detail: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/ordinary-invalid-report-{report_case}",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = review_output
+    store.update(review)
+    finding = _review_finding("F1", "FOLLOWUP")
+    child = store.add(
+        build_followup_prompt(review.id, impl.id, finding),
+        task_type="implement",
+        based_on=review.id,
+        depends_on=impl.id,
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="ordinary_followup",
+        impl=impl,
+        review=review,
+        findings=(finding,),
+        children=(child,),
+    )
+    git = _FakeGit(
+        can_merge=True,
+        is_merged_by_ref={(impl.branch, "main"): True},
+        ref_shas={impl.branch: "same-sha", "main": "same-sha"},
+    )
+
+    action = pending_merge_finalization_action(
+        config,
+        store,
+        impl,
+        target_branch="main",
+        require_already_merged=True,
+        resolved_merge_state="merged",
+        live_target_sha="same-sha",
+    )
+
+    assert action is not None
+    assert action["type"] == "needs_attention"
+    assert action["reason"] == "pending-merge-finalization-ordinary-followup-ambiguous"
+    assert expected_detail in action["description"]
+
+    advance_action = evaluate_advance_rules(config, store, git, impl, "main")
+    assert advance_action["type"] == "needs_attention"
+    assert advance_action["reason"] == "pending-merge-finalization-ordinary-followup-ambiguous"
+
+    state = _resolve_and_persist_post_merge_rebase_state(store, git, impl, "main", config=config)
+    assert state.resolved_merge_state in {"merged", "redundant"}
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+    assert refreshed_unit.merge_source is None
+
+    rows = query_lineage_owner_rows(
+        store,
+        LineageOwnerQuery(limit=None, include_skipped=False),
+        config=config,
+        git=git,
+        target_branch="main",
+    )
+    assert any(row.owner_task.id == impl.id for row in rows)
+
+
+def test_pending_ordinary_followup_replay_missing_live_target_sha_blocks_reconciliation(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/ordinary-missing-live-target",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = _review_output_with_findings("APPROVED_WITH_FOLLOWUPS", followups=("F1",))
+    store.update(review)
+    finding = parse_review_report(review.output_content).findings[0]
+    child = store.add(
+        build_followup_prompt(review.id, impl.id, finding),
+        task_type="implement",
+        based_on=review.id,
+        depends_on=impl.id,
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="ordinary_followup",
+        impl=impl,
+        review=review,
+        findings=(finding,),
+        children=(child,),
+        target_sha="historical-target-sha",
+    )
+
+    action = pending_merge_finalization_action(
+        config,
+        store,
+        impl,
+        target_branch="main",
+        require_already_merged=True,
+        resolved_merge_state="merged",
+        live_target_sha=None,
+    )
+
+    assert action is not None
+    assert action["type"] == "needs_attention"
+    assert action["reason"] == "pending-merge-finalization-live-target-unavailable"
+
+    state = _resolve_and_persist_post_merge_rebase_state(
+        store,
+        _FakeGit(
+            can_merge=True,
+            is_merged_by_ref={(impl.branch, "main"): True},
+            ref_shas={impl.branch: "source-sha"},
+        ),
+        impl,
+        "main",
+        config=config,
+    )
+
+    assert state.resolved_merge_state == "merged"
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+    assert refreshed_unit.merge_source is None
+
+
+@pytest.mark.parametrize(
+    "proof_case",
+    ["exact", "prompt-mutated", "duplicated", "multiple-groups", "absent"],
+)
+def test_pending_capped_finalization_replay_distinguishes_absent_exact_and_ambiguous(
+    tmp_path: Path,
+    proof_case: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/capped-proof-{proof_case}",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+    review_output = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",))
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = review_output
+    store.update(review)
+    finding = parse_review_report(review_output).findings[0]
+    if proof_case != "absent":
+        child, created_now = create_or_reuse_capped_review_blocker_task(
+            store,
+            config=config,
+            review_task=review,
+            impl_task=impl,
+            finding=finding,
+            persisted_review_output=review_output,
+            active_scope_tags=("release",),
+            trigger_source="advance",
+        )
+        assert created_now is True
+        if proof_case in {"exact", "prompt-mutated", "duplicated"}:
+            _persist_test_merge_finalization_proof(
+                store,
+                action_family="max_cycles_deferred",
+                impl=impl,
+                review=review,
+                findings=(finding,),
+                children=(child,),
+            )
+        if proof_case == "prompt-mutated":
+            child.prompt += "\nmutated"
+            store.update(child)
+        elif proof_case == "duplicated":
+            store.add(
+                child.prompt,
+                task_type="implement",
+                based_on=impl.id,
+                depends_on=impl.id,
+                review_scope=child.review_scope,
+                create_pr=True,
+                urgent=True,
+            )
+        elif proof_case == "multiple-groups":
+            second_output = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B2",))
+            second_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC))
+            second_review.output_content = second_output
+            store.update(second_review)
+            second_finding = parse_review_report(second_output).findings[0]
+            second_child, _second_created = create_or_reuse_capped_review_blocker_task(
+                store,
+                config=config,
+                review_task=second_review,
+                impl_task=impl,
+                finding=second_finding,
+                persisted_review_output=second_output,
+                active_scope_tags=("release",),
+                trigger_source="advance",
+            )
+            _persist_test_merge_finalization_proof(
+                store,
+                action_family="max_cycles_deferred",
+                impl=impl,
+                review=review,
+                findings=(finding,),
+                children=(child,),
+            )
+            _persist_test_merge_finalization_proof(
+                store,
+                action_family="max_cycles_deferred",
+                impl=impl,
+                review=second_review,
+                findings=(second_finding,),
+                children=(second_child,),
+            )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
+        impl,
+        "main",
+    )
+
+    if proof_case == "exact":
+        assert action["type"] == "merge"
+        assert action["pending_merge_finalization"] is True
+        assert action["max_cycles_merge_and_defer"] is True
+    elif proof_case == "absent":
+        assert action["type"] == "skip"
+        assert action.get("pending_merge_finalization") is not True
+    else:
+        assert action["type"] == "needs_attention"
+        assert "pending-merge-finalization" in action["reason"]
+        refreshed_unit = store.get_merge_unit(unit.id)
+        assert refreshed_unit is not None
+        assert refreshed_unit.state == "unmerged"
+        assert refreshed_unit.merge_source is None
+
+
+def test_pending_capped_replay_ignores_stale_malformed_group_for_current_proof(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/capped-stale-malformed-group",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    store.get_or_create_merge_unit_for_task(impl)
+    stale_output = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",))
+    stale_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    stale_review.output_content = stale_output
+    store.update(stale_review)
+    stale_finding = parse_review_report(stale_output).findings[0]
+    stale_child, _created = create_or_reuse_capped_review_blocker_task(
+        store,
+        config=config,
+        review_task=stale_review,
+        impl_task=impl,
+        finding=stale_finding,
+        persisted_review_output=stale_output,
+        active_scope_tags=("release",),
+        trigger_source="advance",
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="max_cycles_deferred",
+        impl=impl,
+        review=stale_review,
+        findings=(stale_finding,),
+        children=(stale_child,),
+        target_sha="old-target-sha",
+    )
+    stale_child.prompt += "\nmalformed stale child"
+    store.update(stale_child)
+    current_output = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B2",))
+    current_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC))
+    current_review.output_content = current_output
+    store.update(current_review)
+    current_finding = parse_review_report(current_output).findings[0]
+    current_child, _created = create_or_reuse_capped_review_blocker_task(
+        store,
+        config=config,
+        review_task=current_review,
+        impl_task=impl,
+        finding=current_finding,
+        persisted_review_output=current_output,
+        active_scope_tags=("release",),
+        trigger_source="advance",
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="max_cycles_deferred",
+        impl=impl,
+        review=current_review,
+        findings=(current_finding,),
+        children=(current_child,),
+        target_sha="same-sha",
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "merge"
+    assert action["max_cycles_merge_and_defer"] is True
+    assert action["pending_merge_finalization"] is True
+    assert action["review_task"].id == current_review.id
+    assert action["proven_deferred_blocker_tasks"] == (current_child,)
+
+
+def test_pending_capped_replay_current_malformed_group_needs_attention(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/capped-current-malformed-group",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+    output = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",))
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = output
+    store.update(review)
+    finding = parse_review_report(output).findings[0]
+    child, _created = create_or_reuse_capped_review_blocker_task(
+        store,
+        config=config,
+        review_task=review,
+        impl_task=impl,
+        finding=finding,
+        persisted_review_output=output,
+        active_scope_tags=("release",),
+        trigger_source="advance",
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="max_cycles_deferred",
+        impl=impl,
+        review=review,
+        findings=(finding,),
+        children=(child,),
+    )
+    child.prompt += "\nmalformed current child"
+    store.update(child)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_attention"
+    assert action["reason"] == "pending-merge-finalization-capped-blocker-ambiguous"
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+    assert refreshed_unit.merge_source is None
+
+
+def test_pending_capped_replay_missing_live_target_sha_blocks_reconciliation(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/capped-missing-live-target",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+    output = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",))
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = output
+    store.update(review)
+    finding = parse_review_report(output).findings[0]
+    child, _created = create_or_reuse_capped_review_blocker_task(
+        store,
+        config=config,
+        review_task=review,
+        impl_task=impl,
+        finding=finding,
+        persisted_review_output=output,
+        active_scope_tags=("release",),
+        trigger_source="advance",
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="max_cycles_deferred",
+        impl=impl,
+        review=review,
+        findings=(finding,),
+        children=(child,),
+        target_sha="historical-target-sha",
+    )
+
+    action = pending_merge_finalization_action(
+        config,
+        store,
+        impl,
+        target_branch="main",
+        require_already_merged=True,
+        resolved_merge_state="merged",
+        live_target_sha=None,
+    )
+
+    assert action is not None
+    assert action["type"] == "needs_attention"
+    assert action["reason"] == "pending-merge-finalization-live-target-unavailable"
+
+    state = _resolve_and_persist_post_merge_rebase_state(
+        store,
+        _FakeGit(
+            can_merge=True,
+            is_merged_by_ref={(impl.branch, "main"): True},
+            ref_shas={impl.branch: "source-sha"},
+        ),
+        impl,
+        "main",
+        config=config,
+    )
+
+    assert state.resolved_merge_state == "merged"
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+    assert refreshed_unit.merge_source is None
+
+
+def test_pending_ordinary_followup_replay_uses_merge_unit_owner_for_representative(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    owner = _make_completed_unmerged_impl(
+        store,
+        branch="feature/ordinary-owner",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    representative = _make_completed_unmerged_impl(
+        store,
+        branch="feature/ordinary-owner",
+        when=datetime(2026, 5, 10, 10, 30, tzinfo=UTC),
+    )
+    unit = store.get_or_create_merge_unit_for_task(owner)
+    assert unit is not None
+    store.attach_task_to_merge_unit(representative.id, unit.id, "implementation")
+    review = _add_completed_review(store, owner, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    review.output_content = _review_output_with_findings("APPROVED_WITH_FOLLOWUPS", followups=("F1",))
+    store.update(review)
+    finding = parse_review_report(review.output_content).findings[0]
+    followup = store.add(
+        build_followup_prompt(review.id, owner.id, finding),
+        task_type="implement",
+        based_on=review.id,
+        depends_on=owner.id,
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="ordinary_followup",
+        impl=owner,
+        review=review,
+        findings=(finding,),
+        children=(followup,),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={representative.branch: "same-sha", "main": "same-sha"}),
+        representative,
+        "main",
+    )
+
+    assert action["type"] == "merge_with_followups"
+    assert action["pending_merge_finalization"] is True
+    assert action["review_task"].id == review.id
+    assert action["proven_followup_tasks"] == (followup,)
+
+
+def test_pending_finalization_with_exact_ordinary_and_capped_proofs_needs_attention(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/mixed-proof-families",
+        when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC),
+    )
+    unit = store.get_or_create_merge_unit_for_task(impl)
+    assert unit is not None
+    followup_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 11, 0, tzinfo=UTC))
+    followup_review.output_content = _review_output_with_findings("APPROVED_WITH_FOLLOWUPS", followups=("F1",))
+    store.update(followup_review)
+    followup_finding = parse_review_report(followup_review.output_content).findings[0]
+    followup_child = store.add(
+        build_followup_prompt(followup_review.id, impl.id, followup_finding),
+        task_type="implement",
+        based_on=followup_review.id,
+        depends_on=impl.id,
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="ordinary_followup",
+        impl=impl,
+        review=followup_review,
+        findings=(followup_finding,),
+        children=(followup_child,),
+    )
+    capped_output = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",))
+    capped_review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 12, 0, tzinfo=UTC))
+    capped_review.output_content = capped_output
+    store.update(capped_review)
+    capped_child, _created = create_or_reuse_capped_review_blocker_task(
+        store,
+        config=config,
+        review_task=capped_review,
+        impl_task=impl,
+        finding=parse_review_report(capped_output).findings[0],
+        persisted_review_output=capped_output,
+        active_scope_tags=("release",),
+        trigger_source="advance",
+    )
+    _persist_test_merge_finalization_proof(
+        store,
+        action_family="max_cycles_deferred",
+        impl=impl,
+        review=capped_review,
+        findings=(parse_review_report(capped_output).findings[0],),
+        children=(capped_child,),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, ref_shas={impl.branch: "same-sha", "main": "same-sha"}),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_attention"
+    assert action["reason"] == "pending-merge-finalization-multiple-proof-families"
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "unmerged"
+    assert refreshed_unit.merge_source is None
 
 
 def test_failed_rebase_uses_local_tip_even_when_origin_is_fresher(

@@ -412,6 +412,7 @@ def test_codex_usage_launch_uses_runtime_path_cwd_and_environment(
             raise AssertionError("completed usage process should not be terminated")
 
     monkeypatch.setattr("gza.providers.codex.shutil.which", lambda name, path=None: "/runtime/bin/codex")
+
     with patch("gza.providers.codex.subprocess.Popen", FakeProcess):
         usage = _read_codex_usage(timeout_seconds=10.0, gza_version="test", env=env, cwd=runtime_cwd)
 

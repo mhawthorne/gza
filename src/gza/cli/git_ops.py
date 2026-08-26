@@ -15,6 +15,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, TypeVar, cast
 
+from rich.console import Console
+
 import gza.colors as _colors
 from gza.query import get_base_task_slug as _get_base_task_slug
 
@@ -24,6 +26,7 @@ from ..advance_engine import (
     _resolve_current_merge_source,
     is_current_red_verify_gate_action,
     is_red_verify_gate_family_action,
+    pending_merge_finalization_action,
     resolve_post_merge_rebase_state,
 )
 from ..branch_publication import load_branch_publication_state
@@ -87,6 +90,15 @@ from ..main_integration_verify import (
     promote_candidate_integration_verify_evidence,
     verify_gate_enabled,
 )
+from ..merge_finalization_proof import (
+    MergeFinalizationFamily,
+    MergeFinalizationPromotionKind,
+    get_merge_finalization_proof,
+    merge_finalization_child_task_ids,
+    merge_finalization_finding_ids,
+    persist_merge_finalization_attempt_proof,
+    persist_merge_finalization_prepared_attempt,
+)
 from ..merge_services import (
     ManualMergeExecutionHooks,
     ManualMergeExecutionRequest,
@@ -140,6 +152,16 @@ from ..recovery_engine import (
 )
 from ..recovery_read_context import RecoveryReadContext
 from ..review_scope import declares_resolution_review_mode, declares_spec_coherence_review_mode
+from ..review_tasks import (
+    DEFERRED_REVIEW_BLOCKER_TAG,
+    CappedReviewBlockerMaterializationError,
+    FollowupMaterializationError,
+    build_capped_review_blocker_prompt_prefix,
+    build_followup_prompt,
+    capped_review_blocker_task_identity_mismatches,
+    format_followup_finding_context,
+    validate_capped_review_blocker_action,
+)
 from ..review_verdict import (
     ReviewFinding,
     get_review_content,
@@ -186,6 +208,7 @@ from ._common import (
     _REUSE_WORKER_SESSION_ENV,
     DuplicateReviewError,
     _create_implementation_task_from_source,
+    _create_or_reuse_capped_review_blocker_tasks,
     _create_or_reuse_deferred_blocker_tasks,
     _create_or_reuse_followup_tasks,
     _create_plan_improve_task,
@@ -230,7 +253,6 @@ from .advance_engine import (
 )
 from .advance_executor import (
     AdvanceActionExecutionContext,
-    AdvanceActionExecutionResult,
     BranchDivergenceReconcileResult,
     execute_advance_action,
     resolve_execution_needs_attention,
@@ -292,7 +314,9 @@ def _classify_rebase_git_failure(error: BaseException) -> str:
         return "INFRASTRUCTURE_ERROR"
     return "GIT_ERROR"
 
+
 _T = TypeVar("_T")
+
 
 def _print_mixed_recovery_preview_entries(
     *,
@@ -355,6 +379,35 @@ class _CandidateVerifyPromotionProof:
         return self.verified_head_sha is not None and self.verified_tree_fingerprint is not None
 
 
+class _IsolatedPromotionRollbackFailed(GitError):
+    """Target promotion failed after the target ref moved and rollback failed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        target_branch: str,
+        previous_target_oid: str,
+        candidate_oid: str,
+    ) -> None:
+        super().__init__(message)
+        self.target_branch = target_branch
+        self.previous_target_oid = previous_target_oid
+        self.candidate_oid = candidate_oid
+
+
+@dataclass(frozen=True)
+class _IsolatedPromotionRollbackClassification:
+    status: Literal[
+        "isolated_post_promotion_rollback_failed",
+        "isolated_merge_failed",
+        "isolated_promotion_rollback_failed_target_uncertain",
+    ]
+    block_reason: str
+    target_oid: str | None
+    target_at_candidate: bool = False
+
+
 def _materialize_merge_followups(
     store: SqliteTaskStore,
     config: Config,
@@ -367,6 +420,26 @@ def _materialize_merge_followups(
         merge_subject,
         create_followups=_create_or_reuse_followup_tasks,
     )
+
+
+def _merge_single_side_effect_failure_result(exc: Exception) -> "_MergeSingleTaskResult":
+    result = _mandatory_merge_side_effects_failed_result(exc=exc)
+    return _MergeSingleTaskResult(
+        rc=result.rc,
+        status=result.status,
+        block_reason=result.block_reason,
+        created_followups=tuple(result.created_followups),
+        reused_followups=tuple(result.reused_followups),
+        created_deferred_blockers=tuple(result.created_deferred_blockers),
+        reused_deferred_blockers=tuple(result.reused_deferred_blockers),
+    )
+
+
+def _print_followup_tasks(merge_subject: DbTask, created: Iterable[DbTask], reused: Iterable[DbTask]) -> None:
+    for followup_task in created:
+        print(f"FOLLOW {followup_task.id} created from {merge_subject.id}")
+    for followup_task in reused:
+        print(f"FOLLOW {followup_task.id} reused from {merge_subject.id}")
 
 
 def _latest_completed_review_for_merge_subject(
@@ -465,10 +538,7 @@ def _merge_execution_status_error(
 ) -> str | None:
     if execution_task.status in {"completed", "unmerged"}:
         return None
-    return (
-        f"Task {merge_subject_id} is not completed or unmerged "
-        f"(execution status: {execution_task.status})"
-    )
+    return f"Task {merge_subject_id} is not completed or unmerged (execution status: {execution_task.status})"
 
 
 @dataclass(frozen=True)
@@ -505,10 +575,14 @@ def complete_branch_unpushable_after_reconcile(
     if task.log_file:
         log_path = config.project_dir / Path(task.log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-    task_logger = TaskExecutionLogger(resolve_ops_log_path(config, log_path), echo=True) if log_path is not None else None
+    task_logger = (
+        TaskExecutionLogger(resolve_ops_log_path(config, log_path), echo=True) if log_path is not None else None
+    )
     default_branch = git.default_branch()
     publication_state = load_branch_publication_state(store, task.id)
-    publication_retry_task = task if _should_retry_pr_publication_after_reconcile(task) else replace(task, create_pr=False)
+    publication_retry_task = (
+        task if _should_retry_pr_publication_after_reconcile(task) else replace(task, create_pr=False)
+    )
     verify_fix_worktree_path = None
     if task.task_type == "verify_fix" and task.slug:
         configured_worktree_root = getattr(config, "worktree_path", None)
@@ -569,10 +643,7 @@ def _reconcile_diverged_branch_with_origin(
     if not git.branch_exists(target_branch):
         return BranchDivergenceReconcileResult(
             status="error",
-            message=(
-                f"Cannot reconcile divergence for '{task.branch}': missing local target branch "
-                f"'{target_branch}'"
-            ),
+            message=(f"Cannot reconcile divergence for '{task.branch}': missing local target branch '{target_branch}'"),
         )
 
     branch = task.branch
@@ -652,9 +723,7 @@ def _reconcile_diverged_branch_with_origin(
             if remote_sha_after_fetch == remote_sha_before_push:
                 return BranchDivergenceReconcileResult(
                     status="error",
-                    message=(
-                        f"Force-with-lease push failed for '{branch}' without a remote ref change: {push_error}"
-                    ),
+                    message=(f"Force-with-lease push failed for '{branch}' without a remote ref change: {push_error}"),
                 )
             remote_sha_before_push = remote_sha_after_fetch
             needs_mechanical_rebase = True
@@ -724,9 +793,7 @@ def _reconcile_diverged_branch_with_origin(
             remote=remote,
         )
         publish_detail = (
-            "and pushed with --force-with-lease"
-            if publish_result.pushed
-            else "and verified origin was already aligned"
+            "and pushed with --force-with-lease" if publish_result.pushed else "and verified origin was already aligned"
         )
         return BranchDivergenceReconcileResult(
             status="reconciled",
@@ -822,6 +889,11 @@ class _MergeSingleTaskResult:
     status: str = "merged"
     block_reason: str | None = None
     pending_squash_reconcile: _PendingSquashBranchReconcile | None = None
+    created_followups: tuple[DbTask, ...] = ()
+    reused_followups: tuple[DbTask, ...] = ()
+    created_deferred_blockers: tuple[DbTask, ...] = ()
+    reused_deferred_blockers: tuple[DbTask, ...] = ()
+    authorized_merge_action: dict[str, Any] | None = None
 
 
 def _coerce_merge_single_task_result(result: int | _MergeSingleTaskResult) -> _MergeSingleTaskResult:
@@ -839,6 +911,10 @@ def _coerce_manual_merge_execution_result(result: ManualMergeExecutionResult) ->
             _PendingSquashBranchReconcile | None,
             result.pending_squash_reconcile,
         ),
+        created_followups=tuple(result.created_followups or ()),
+        reused_followups=tuple(result.reused_followups or ()),
+        created_deferred_blockers=tuple(result.created_deferred_blockers or ()),
+        reused_deferred_blockers=tuple(result.reused_deferred_blockers or ()),
     )
 
 
@@ -922,9 +998,7 @@ def _remove_watch_merge_checkout(git: Git, checkout_path: Path) -> None:
     remove_worktree_registration_for_path(git, checkout_path)
 
     if _find_worktree_entry_for_path(git, checkout_path) is not None:
-        raise GitError(
-            f"isolated watch checkout is still registered at '{checkout_path}' after cleanup"
-        )
+        raise GitError(f"isolated watch checkout is still registered at '{checkout_path}' after cleanup")
 
 
 def ensure_watch_main_checkout(
@@ -965,18 +1039,14 @@ def ensure_watch_main_checkout(
 
     current_branch = workspace_git.current_branch()
     if current_branch != "HEAD":
-        raise GitError(
-            f"isolated watch checkout expected detached HEAD at '{target_branch}', found '{current_branch}'"
-        )
+        raise GitError(f"isolated watch checkout expected detached HEAD at '{target_branch}', found '{current_branch}'")
     entry = _find_worktree_entry_for_path(git, checkout_path)
     if entry is None:
         raise GitError(f"isolated watch checkout is not registered at '{checkout_path}'")
     if not entry.get("detached"):
         raise GitError("isolated watch checkout must remain detached from shared branch refs")
     if entry.get("branch") == f"refs/heads/{target_branch}":
-        raise GitError(
-            f"isolated watch checkout must not directly check out shared branch '{target_branch}'"
-        )
+        raise GitError(f"isolated watch checkout must not directly check out shared branch '{target_branch}'")
     if workspace_git.has_changes(include_untracked=True):
         raise GitError("isolated watch checkout is dirty after refresh")
 
@@ -1025,9 +1095,7 @@ def _promote_isolated_merge_to_target_branch(
     promotion_warnings: list[str] = []
 
     if attached_target_git is not None and attached_target_git.has_changes(include_untracked=False):
-        attached_stash_ref = attached_target_git.stash_push(
-            f"gza isolated merge promotion for {target_branch}"
-        )
+        attached_stash_ref = attached_target_git.stash_push(f"gza isolated merge promotion for {target_branch}")
         attached_stash_parked = attached_stash_ref is not None
 
     target_ref_updated = False
@@ -1067,13 +1135,8 @@ def _promote_isolated_merge_to_target_branch(
                         attached_target_checkout,
                         attached_stash_ref,
                     )
-            if (
-                not attached_stash_restored_cleanly
-                and attached_target_git.has_changes(include_untracked=False)
-            ):
-                raise GitError(
-                    f"shared checkout '{attached_target_checkout}' for '{target_branch}' remained dirty"
-                )
+            if not attached_stash_restored_cleanly and attached_target_git.has_changes(include_untracked=False):
+                raise GitError(f"shared checkout '{attached_target_checkout}' for '{target_branch}' remained dirty")
         merge_git.reset_hard(target_ref)
     except GitError as exc:
         cleanup_failures: list[str] = []
@@ -1081,8 +1144,12 @@ def _promote_isolated_merge_to_target_branch(
             try:
                 repo_git.update_ref(target_ref, previous_target_oid, merged_head_oid)
             except GitError as rollback_error:
-                raise GitError(
-                    f"failed to advance '{target_branch}' and rollback also failed: {rollback_error}"
+                raise _IsolatedPromotionRollbackFailed(
+                    f"failed to advance '{target_branch}' after target moved from {previous_target_oid} "
+                    f"to {merged_head_oid} and rollback also failed: {rollback_error}",
+                    target_branch=target_branch,
+                    previous_target_oid=previous_target_oid,
+                    candidate_oid=merged_head_oid,
                 ) from exc
             if attached_target_git is not None:
                 try:
@@ -1117,6 +1184,46 @@ def _promote_isolated_merge_to_target_branch(
     return tuple(promotion_warnings)
 
 
+def _classify_isolated_promotion_rollback_failed(
+    repo_git: Git,
+    exc: _IsolatedPromotionRollbackFailed,
+) -> _IsolatedPromotionRollbackClassification:
+    target_ref = f"refs/heads/{exc.target_branch}"
+    target_oid = _rev_parse_if_exists_if_supported(repo_git, target_ref)
+    if target_oid is None:
+        try:
+            target_oid = repo_git.rev_parse(target_ref)
+        except GitError:
+            target_oid = None
+    if target_oid == exc.candidate_oid:
+        return _IsolatedPromotionRollbackClassification(
+            status="isolated_post_promotion_rollback_failed",
+            block_reason=(
+                f"isolated promotion rollback failed after target advanced to verified candidate "
+                f"{exc.candidate_oid}: {exc}"
+            ),
+            target_oid=target_oid,
+            target_at_candidate=True,
+        )
+    if target_oid == exc.previous_target_oid:
+        return _IsolatedPromotionRollbackClassification(
+            status="isolated_merge_failed",
+            block_reason=(
+                f"isolated promotion failed and target returned to previous tip {exc.previous_target_oid}: {exc}"
+            ),
+            target_oid=target_oid,
+        )
+    observed = target_oid or "unknown"
+    return _IsolatedPromotionRollbackClassification(
+        status="isolated_promotion_rollback_failed_target_uncertain",
+        block_reason=(
+            f"isolated promotion rollback failed and target '{exc.target_branch}' is at {observed}; "
+            f"expected previous tip {exc.previous_target_oid} or candidate {exc.candidate_oid}: {exc}"
+        ),
+        target_oid=target_oid,
+    )
+
+
 def _advance_uses_iterate(config: Config) -> bool:
     """Whether advance should launch implement work through the iterate loop."""
     return getattr(config, "advance_mode", "default") == "iterate"
@@ -1149,9 +1256,7 @@ def _candidate_verify_promotion_proof(
 ) -> _CandidateVerifyPromotionProof:
     verified_head_sha = _rev_parse_if_exists_if_supported(git, "HEAD") or _rev_parse_if_supported(git, "HEAD")
     verified_tree_fingerprint = candidate_verify.evidence.tree_fingerprint
-    live_tree_fingerprint = (
-        _compute_tree_fingerprint(git) if verified_tree_fingerprint is not None else None
-    )
+    live_tree_fingerprint = _compute_tree_fingerprint(git) if verified_tree_fingerprint is not None else None
 
     if (
         candidate_verify.evidence.verify_status == "passed"
@@ -1296,13 +1401,12 @@ def _print_squash_reconcile_result(
             "Warning: Squash merge landed and the remote push succeeded, "
             f"but the local tracking ref '{tracking_ref}' could not be updated: {reason}"
         )
-        print(f"Refresh the local tracking ref with: {_tracking_ref_refresh_command(remote=result.remote, branch=result.branch)}")
+        print(
+            f"Refresh the local tracking ref with: {_tracking_ref_refresh_command(remote=result.remote, branch=result.branch)}"
+        )
         return
 
-    print(
-        f"Warning: Squash merge landed, but {result.remote}/{result.branch} "
-        f"could not be reconciled: {reason}"
-    )
+    print(f"Warning: Squash merge landed, but {result.remote}/{result.branch} could not be reconciled: {reason}")
     if result.status == "failed_push_rejected":
         print(
             f"{result.remote}/{result.branch} changed since it was last observed; "
@@ -1389,7 +1493,7 @@ def _collect_advance_completed_tasks(
             seen_task_ids.add(owner.id)
     else:
         all_unmerged = store.get_unmerged()
-        tasks = [t for t in all_unmerged if t.status == 'completed']
+        tasks = [t for t in all_unmerged if t.status == "completed"]
         if isinstance(target_branch, str):
             filtered_tasks: list[DbTask] = []
             for task in tasks:
@@ -1401,8 +1505,8 @@ def _collect_advance_completed_tasks(
                 filtered_tasks.append(task)
             tasks = filtered_tasks
 
-    if advance_type != 'implement':
-        completed_plans = store.get_history(limit=None, status='completed', task_type='plan')
+    if advance_type != "implement":
+        completed_plans = store.get_history(limit=None, status="completed", task_type="plan")
         existing_ids = {t.id for t in tasks}
         for plan_task in completed_plans:
             if plan_task.id in impl_based_on_ids:
@@ -1411,10 +1515,10 @@ def _collect_advance_completed_tasks(
                 continue
             tasks.append(plan_task)
 
-    if advance_type == 'plan':
-        tasks = [t for t in tasks if t.task_type == 'plan']
-    elif advance_type == 'implement':
-        tasks = [t for t in tasks if t.task_type == 'implement']
+    if advance_type == "plan":
+        tasks = [t for t in tasks if t.task_type == "plan"]
+    elif advance_type == "implement":
+        tasks = [t for t in tasks if t.task_type == "implement"]
 
     return tasks, impl_based_on_ids
 
@@ -1527,6 +1631,13 @@ def _resolve_merge_subject_query_only(
 
 
 def _merge_option_relationship_error(args: argparse.Namespace) -> str | None:
+    removed_flags = [flag for flag in ("rebase", "remote", "resolve") if bool(getattr(args, flag, False))]
+    if removed_flags:
+        rendered = ", ".join(f"--{flag}" for flag in removed_flags)
+        return (
+            f"Error: removed merge option(s) {rendered}; use `gza rebase <task-id> --run` "
+            "for standalone rebases or `gza land <task-id>` for full landing orchestration"
+        )
     if getattr(args, "ignore_verify_gate", False) and not getattr(args, "force", False):
         return "Error: --ignore-verify-gate requires --force"
     return None
@@ -1547,6 +1658,8 @@ def _merge_single_task(
     heartbeat_threshold_seconds: int | None = None,
     heartbeat_interval_seconds: int | None = None,
     on_heartbeat: LongPhaseHeartbeat | None = None,
+    before_irreversible_side_effect: Callable[[Mapping[str, Any] | None], "_MergeActionResult | None"] | None = None,
+    resolved_subject: _ResolvedMergeSubject | None = None,
 ) -> _MergeSingleTaskResult:
     """Merge a single task's branch."""
     option_error = _merge_option_relationship_error(args)
@@ -1565,7 +1678,7 @@ def _merge_single_task(
 
     process_monitor_factory = _process_monitor_factory if on_heartbeat is not None else None
     target_branch = git.default_branch()
-    resolved = _resolve_merge_subject(store, git, task_id, target_branch=target_branch)
+    resolved = resolved_subject or _resolve_merge_subject(store, git, task_id, target_branch=target_branch)
     if resolved is None:
         print(f"Error: Task {task_id} not found")
         return _MergeSingleTaskResult(rc=1)
@@ -1575,6 +1688,8 @@ def _merge_single_task(
     merge_branch = resolved.merge_branch or execution_task.branch
     merge_source_ref = resolved.merge_source_ref
     merge_unit_id = resolved.merge_unit_id
+    created_followups: list[DbTask] = []
+    reused_followups: list[DbTask] = []
 
     # Validate task state
     status_error = _merge_execution_status_error(merge_subject.id, execution_task)
@@ -1591,6 +1706,17 @@ def _merge_single_task(
     if resolved.merge_source_warning:
         print(f"Error: {resolved.merge_source_warning}")
         return _MergeSingleTaskResult(rc=1)
+
+    def _materialize_manual_followups_before_state() -> _MergeSingleTaskResult | None:
+        nonlocal created_followups, reused_followups
+        if not materialize_side_effects or getattr(args, "no_followups", False):
+            return None
+        try:
+            created_followups, reused_followups = _materialize_merge_followups(store, config, merge_subject)
+        except Exception as exc:
+            return _merge_single_side_effect_failure_result(exc)
+        _print_followup_tasks(merge_subject, created_followups, reused_followups)
+        return None
 
     # Handle --mark-only flag
     if args.mark_only:
@@ -1612,20 +1738,35 @@ def _merge_single_task(
             if deferred_blockers[0] or deferred_blockers[1]:
                 merge_source = manual_force_merge_source(merge_source)
 
+        if before_irreversible_side_effect is not None:
+            side_effect_result = before_irreversible_side_effect(None)
+            if side_effect_result is not None:
+                return _MergeSingleTaskResult(
+                    rc=side_effect_result.rc,
+                    status=side_effect_result.status,
+                    block_reason=side_effect_result.block_reason,
+                    created_followups=tuple(side_effect_result.created_followups),
+                    reused_followups=tuple(side_effect_result.reused_followups),
+                    created_deferred_blockers=tuple(side_effect_result.created_deferred_blockers),
+                    reused_deferred_blockers=tuple(side_effect_result.reused_deferred_blockers),
+                )
+
+        followup_error = _materialize_manual_followups_before_state()
+        if followup_error is not None:
+            return followup_error
+
         mark_merge_subject_merged(
             store,
             merge_subject=merge_subject,
             merge_unit_id=merge_unit_id,
             merge_source=merge_source,
         )
-        if not getattr(args, "no_followups", False):
-            created_followups, reused_followups = _materialize_merge_followups(store, config, merge_subject)
-            for followup_task in created_followups:
-                print(f"FOLLOW {followup_task.id} created from {merge_subject.id}")
-            for followup_task in reused_followups:
-                print(f"FOLLOW {followup_task.id} reused from {merge_subject.id}")
         print(f"✓ Marked task {merge_subject.id} as merged (branch '{merge_branch}' preserved)")
-        return _MergeSingleTaskResult(rc=0)
+        return _MergeSingleTaskResult(
+            rc=0,
+            created_followups=tuple(created_followups),
+            reused_followups=tuple(reused_followups),
+        )
 
     direct_prerequisite_types = {"verify_gate", "reconcile_verify_gate_evidence"}
     planned_action = determine_next_action(
@@ -1662,7 +1803,9 @@ def _merge_single_task(
             action=planned_action,
             context=prerequisite_context,
         )
-        message = prerequisite_result.success_message or prerequisite_result.message or planned_action.get("description", "")
+        message = (
+            prerequisite_result.success_message or prerequisite_result.message or planned_action.get("description", "")
+        )
         if message:
             print(message)
         if prerequisite_result.status != "success":
@@ -1679,6 +1822,7 @@ def _merge_single_task(
         print("Error: merge prerequisite loop did not converge")
         return _MergeSingleTaskResult(rc=1)
     effective_merge_source = merge_source
+    authorized_merge_action: dict[str, Any] | None = None
     pregate_deferred_blockers: tuple[list[DbTask], list[DbTask]] | None = None
     pregate_deferred_blockers_printed = False
 
@@ -1686,10 +1830,7 @@ def _merge_single_task(
         if is_current_red_verify_gate_action(planned_action):
             if not (getattr(args, "force", False) and getattr(args, "ignore_verify_gate", False)):
                 description = str(planned_action.get("description") or "verify gate is red")
-                print(
-                    "Error: "
-                    f"{description}. Red verify gates require --force --ignore-verify-gate."
-                )
+                print(f"Error: {description}. Red verify gates require --force --ignore-verify-gate.")
                 return _MergeSingleTaskResult(rc=1)
             effective_merge_source = manual_force_merge_source(merge_source)
             proof = planned_action["red_verify_gate_proof"]
@@ -1768,6 +1909,28 @@ def _merge_single_task(
             print(f"Error: {description}")
             return _MergeSingleTaskResult(rc=1)
 
+    if planned_action.get("type") in {"merge", "merge_with_followups"}:
+        authorized_merge_action = dict(planned_action)
+    authorized_source_ref_sha: str | None = None
+    if authorized_merge_action is not None and _merge_finalization_family_for_action(authorized_merge_action) is not None:
+        try:
+            authorized_source_ref_sha = _require_ref_sha_for_merge_finalization_proof(
+                git,
+                merge_source_ref,
+                label="authorized source",
+            )
+        except Exception as exc:
+            block_reason = _pre_promotion_merge_refusal_reason(
+                phase="pre-merge authorized source proof",
+                exc=exc,
+            )
+            print(f"Error: {block_reason}")
+            return _MergeSingleTaskResult(
+                rc=1,
+                status="merge_source_ref_unavailable",
+                block_reason=block_reason,
+            )
+
     def _build_commit_message(subject: DbTask) -> str:
         assert subject.id is not None, "Task ID must be set before squash merge commit"
         return build_task_commit_message(
@@ -1795,6 +1958,22 @@ def _merge_single_task(
         for followup_task in reused_followups:
             print(f"FOLLOW {followup_task.id} reused from {subject.id}")
 
+    def _run_before_irreversible_side_effect(_subject: DbTask) -> ManualMergeExecutionResult | None:
+        if before_irreversible_side_effect is None:
+            return None
+        side_effect_result = before_irreversible_side_effect(authorized_merge_action)
+        if side_effect_result is None:
+            return None
+        return ManualMergeExecutionResult(
+            rc=side_effect_result.rc,
+            status=side_effect_result.status,
+            block_reason=side_effect_result.block_reason,
+            created_followups=list(side_effect_result.created_followups),
+            reused_followups=list(side_effect_result.reused_followups),
+            created_deferred_blockers=list(side_effect_result.created_deferred_blockers),
+            reused_deferred_blockers=list(side_effect_result.reused_deferred_blockers),
+        )
+
     result = execute_manual_merge(
         ManualMergeExecutionRequest(
             store=store,
@@ -1812,6 +1991,7 @@ def _merge_single_task(
             no_followups=getattr(args, "no_followups", False),
             quiet_mechanics=quiet_mechanics,
             materialize_side_effects=materialize_side_effects,
+            authorized_source_ref_sha=authorized_source_ref_sha,
             pre_materialized_deferred_blockers=pregate_deferred_blockers,
             pre_materialized_deferred_blockers_printed=pregate_deferred_blockers_printed,
             process_monitor_factory=process_monitor_factory,
@@ -1837,9 +2017,11 @@ def _merge_single_task(
             print_deferred_blockers=_print_deferred_blocker_tasks,
             materialize_followups=lambda subject: _materialize_merge_followups(store, config, subject),
             print_followups=_print_followups,
+            before_irreversible_side_effect=_run_before_irreversible_side_effect,
         ),
     )
-    return _coerce_manual_merge_execution_result(result)
+    coerced = _coerce_manual_merge_execution_result(result)
+    return replace(coerced, authorized_merge_action=authorized_merge_action)
 
 
 def cmd_merge(args: argparse.Namespace) -> int:
@@ -1861,12 +2043,9 @@ def cmd_merge(args: argparse.Namespace) -> int:
 
     # --mark-only is a DB-only escape hatch for users who merge manually;
     # it does not run git operations so the default-branch rule does not apply.
-    if getattr(args, 'mark_only', False):
+    if getattr(args, "mark_only", False):
         if current_branch != default:
-            print(
-                f"Note: --mark-only on non-default branch "
-                f"'{current_branch}' (default is '{default}')"
-            )
+            print(f"Note: --mark-only on non-default branch '{current_branch}' (default is '{default}')")
     else:
         if not _require_default_branch(git, current_branch, "merge"):
             return 1
@@ -1874,7 +2053,7 @@ def cmd_merge(args: argparse.Namespace) -> int:
     # Determine the list of task IDs to merge
     task_ids = [resolve_id(config, tid) for tid in args.task_ids]
 
-    use_all = getattr(args, 'all', False)
+    use_all = getattr(args, "all", False)
     if use_all:
         seen_ids = set(task_ids)
         for task in reversed(store.get_unmerged()):
@@ -1940,7 +2119,9 @@ def cmd_merge(args: argparse.Namespace) -> int:
     if failed_task_id is not None:
         remaining = [tid for tid in task_ids if tid not in merged_tasks and tid != failed_task_id]
         if remaining:
-            print(f"⚠ Stopped at task {failed_task_id}. Remaining tasks not processed: {', '.join(str(tid) for tid in remaining)}")
+            print(
+                f"⚠ Stopped at task {failed_task_id}. Remaining tasks not processed: {', '.join(str(tid) for tid in remaining)}"
+            )
         return 1
 
     return 0
@@ -2064,9 +2245,7 @@ def invoke_provider_resolve(
 
     runtime = _resolve_runtime_skill_dir(config.project_dir, effective_provider, env=runtime_context.env)
     if not runtime:
-        task_logger.error(
-            f"Error: Provider '{effective_provider}' does not support runtime skills for auto-resolve."
-        )
+        task_logger.error(f"Error: Provider '{effective_provider}' does not support runtime skills for auto-resolve.")
         return False
 
     target_name, _runtime_dir = runtime
@@ -2384,11 +2563,7 @@ def _run_task_backed_rebase(
             changed_diff=comparison.changed_diff,
             head_sha=head_ref.sha if head_ref.sha is not None else DB_UNSET,
             base_sha=base_ref.sha if base_ref.sha is not None else DB_UNSET,
-            completion_reason=(
-                REBASE_SUPERSEDED_COMPLETION_REASON
-                if superseded_by_concurrent_rebase
-                else None
-            ),
+            completion_reason=(REBASE_SUPERSEDED_COMPLETION_REASON if superseded_by_concurrent_rebase else None),
         )
         if outcome_callback is not None:
             outcome_callback(
@@ -2413,11 +2588,16 @@ def _run_task_backed_rebase(
         if target_parent_id and comparison.changed_diff:
             store.invalidate_review_state(target_parent_id)
             parent = store.get(target_parent_id)
-            if parent and parent.id is not None and _task_merge_unit_state(
-                store,
-                parent,
-                target_branch=rebase_target,
-            ) == "merged":
+            if (
+                parent
+                and parent.id is not None
+                and _task_merge_unit_state(
+                    store,
+                    parent,
+                    target_branch=rebase_target,
+                )
+                == "merged"
+            ):
                 store.set_merge_status(parent.id, "unmerged")
         elif target_parent_id:
             refresh_preserved_rebase_review_verify_heads(
@@ -2444,18 +2624,12 @@ def _run_task_backed_rebase(
                     f"{target_parent_id}: {reconciliation.skipped_reason}"
                 )
             for error in reconciliation.errors:
-                logger.warning(
-                    "Parent merge-status reconciliation for "
-                    f"{target_parent_id} failed: {error}"
-                )
+                logger.warning(f"Parent merge-status reconciliation for {target_parent_id} failed: {error}")
 
         logger.info(f"Changed Diff: {comparison.detail}")
 
         if superseded_by_concurrent_rebase:
-            logger.info(
-                f"✓ Superseded/no-op rebase for {branch}; "
-                f"branch already contains {supersession_proof_target}"
-            )
+            logger.info(f"✓ Superseded/no-op rebase for {branch}; branch already contains {supersession_proof_target}")
         elif resolved_by_provider:
             logger.info(f"✓ Successfully rebased {branch} with provider assistance")
         else:
@@ -2535,7 +2709,7 @@ def cmd_rebase(args: argparse.Namespace) -> int:
     print(f"On branch {current_branch}")
 
     # Determine rebase target: use --onto if provided, else current branch
-    rebase_target = getattr(args, 'onto', None) or current_branch
+    rebase_target = getattr(args, "onto", None) or current_branch
     task_target = f"origin/{rebase_target}" if getattr(args, "remote", False) else rebase_target
 
     if execution_mode == "background":
@@ -2685,7 +2859,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
     git_cmd.append("--color=always")
 
     # Process arguments - check if first arg is a task ID
-    diff_args = args.diff_args if hasattr(args, 'diff_args') and args.diff_args else []
+    diff_args = args.diff_args if hasattr(args, "diff_args") and args.diff_args else []
 
     if diff_args and not diff_args[0].startswith("-") and _looks_like_task_id(diff_args[0]):
         # First argument is a full prefixed decimal task ID ("prefix-decimal").
@@ -2745,7 +2919,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
                 if git_proc.stderr:
                     stderr = git_proc.stderr.read().decode()
                     if stderr:
-                        print(stderr, file=sys.stderr, end='')
+                        print(stderr, file=sys.stderr, end="")
                 return git_proc.returncode
             return pager_proc.returncode
         else:
@@ -2883,6 +3057,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     results = list(preliminary_results)
     partial_failure = False
     if cohorts:
+
         def _progress(message: str) -> None:
             print(f"[sync] {message}")
 
@@ -3117,12 +3292,11 @@ def _cmd_advance_unimplemented(
 
     if not create:
         if any(_is_directly_implementable_plan(task) for task in pending_tasks):
-            print("Completed plan rows can be run directly with 'gza implement <task_id>' or auto-started with 'gza advance'.")
-        if any(not _is_directly_implementable_plan(task) for task in pending_tasks):
             print(
-                "Use 'gza advance --unimplemented --create' to queue implement tasks "
-                "for listed explore rows."
+                "Completed plan rows can be run directly with 'gza implement <task_id>' or auto-started with 'gza advance'."
             )
+        if any(not _is_directly_implementable_plan(task) for task in pending_tasks):
+            print("Use 'gza advance --unimplemented --create' to queue implement tasks for listed explore rows.")
         return 0
 
     # Create queued implement tasks
@@ -3164,6 +3338,35 @@ class _MergeActionResult:
     candidate_verify: CandidateIntegrationVerifyCheck | None = None
 
 
+PRE_PROMOTION_MERGE_REFUSAL_STATUSES = frozenset(
+    {
+        "pre_merge_proof_persistence_failed",
+        "merge_source_ref_unavailable",
+        "merge_source_ref_changed",
+    }
+)
+PENDING_MERGE_FINALIZATION_REFUSAL_STATUSES = frozenset(
+    {
+        "pending_merge_finalization_proof_stale",
+    }
+)
+
+
+def is_pre_promotion_merge_refusal_status(status: object) -> bool:
+    return isinstance(status, str) and status in PRE_PROMOTION_MERGE_REFUSAL_STATUSES
+
+
+def is_pending_merge_finalization_refusal_status(status: object) -> bool:
+    return isinstance(status, str) and status in PENDING_MERGE_FINALIZATION_REFUSAL_STATUSES
+
+
+def _pre_promotion_merge_refusal_reason(*, phase: str, exc: Exception | str) -> str:
+    return (
+        f"{phase} failed before target promotion: {exc}; "
+        "target is unchanged; retry after refreshing merge authorization"
+    )
+
+
 @dataclass(frozen=True)
 class _StagedIsolatedMergeAction:
     merge_subject: DbTask
@@ -3172,11 +3375,19 @@ class _StagedIsolatedMergeAction:
     pending_squash_reconcile: _PendingSquashBranchReconcile | None
     review_task: DbTask | None
     followup_findings: tuple[ReviewFinding, ...]
-    created_investigation_task_ids: tuple[str, ...]
-    reused_investigation_task_ids: tuple[str, ...]
+    created_followups: tuple[DbTask, ...] = ()
+    reused_followups: tuple[DbTask, ...] = ()
+    created_investigation_task_ids: tuple[str, ...] = ()
+    reused_investigation_task_ids: tuple[str, ...] = ()
     created_deferred_blockers: tuple[DbTask, ...] = ()
     reused_deferred_blockers: tuple[DbTask, ...] = ()
     merge_action_metadata: Mapping[str, Any] = field(default_factory=dict)
+    source_ref: str | None = None
+    source_ref_sha: str | None = None
+    previous_target_sha: str | None = None
+    promoted_target_sha: str | None = None
+    promotion_kind: MergeFinalizationPromotionKind = "normal"
+    target_branch: str = "main"
 
 
 @dataclass
@@ -3291,9 +3502,33 @@ def _materialize_merge_followup_side_effects(
     merge_subject: DbTask,
     review_task: DbTask | None,
     followup_findings: tuple[ReviewFinding, ...],
+    action: Mapping[str, Any],
 ) -> tuple[list[DbTask], list[DbTask]]:
     if review_task is None or not followup_findings:
         return [], []
+    proven_tasks = action.get("proven_followup_tasks")
+    if action.get("pending_merge_finalization") is True and proven_tasks is not None:
+        _validate_proven_followup_replay_tasks(
+            store,
+            review_task=review_task,
+            impl_task=merge_subject,
+            findings=followup_findings,
+            proven_tasks=proven_tasks,
+        )
+        created, reused = _create_or_reuse_followup_tasks(
+            store,
+            config=config,
+            review_task=review_task,
+            impl_task=merge_subject,
+            findings=followup_findings,
+            trigger_source="manual",
+        )
+        _require_reused_proven_task_ids(
+            reused,
+            proven_tasks,
+            kind="ordinary follow-up",
+        )
+        return created, reused
     return _create_or_reuse_followup_tasks(
         store,
         config=config,
@@ -3304,11 +3539,944 @@ def _materialize_merge_followup_side_effects(
     )
 
 
+def _validate_proven_followup_replay_tasks(
+    store: SqliteTaskStore,
+    *,
+    review_task: DbTask,
+    impl_task: DbTask,
+    findings: tuple[ReviewFinding, ...],
+    proven_tasks: object,
+) -> None:
+    if review_task.id is None or impl_task.id is None:
+        raise ValueError("pending follow-up finalization replay requires persisted review and implementation tasks")
+    if not isinstance(proven_tasks, (list, tuple)) or not all(isinstance(task, DbTask) for task in proven_tasks):
+        raise ValueError("pending follow-up finalization replay contains malformed proven follow-up tasks")
+    typed_proven_tasks = cast("tuple[DbTask, ...]", tuple(proven_tasks))
+    expected_by_id: dict[str, DbTask] = {}
+    if len(typed_proven_tasks) != len(findings):
+        raise ValueError("pending follow-up finalization replay has the wrong number of proven follow-up tasks")
+    seen_ids: set[str] = set()
+    for finding, proven_task in zip(findings, typed_proven_tasks, strict=True):
+        if proven_task.id is None:
+            raise ValueError("pending follow-up finalization replay contains a proven task without an ID")
+        if proven_task.id in seen_ids:
+            raise ValueError(f"pending follow-up finalization replay contains duplicate task {proven_task.id}")
+        seen_ids.add(proven_task.id)
+        expected_prompt = build_followup_prompt(review_task.id, impl_task.id, finding)
+        current = store.get(proven_task.id)
+        if current is None:
+            raise ValueError(f"proven follow-up task {proven_task.id} disappeared before merge finalization")
+        mismatches: list[str] = []
+        if current.prompt != expected_prompt:
+            mismatches.append("prompt")
+        if current.based_on != review_task.id:
+            mismatches.append("based_on")
+        if current.depends_on != impl_task.id:
+            mismatches.append("depends_on")
+        if current.task_type != "implement":
+            mismatches.append("task_type")
+        if current.urgent:
+            mismatches.append("urgent")
+        if current.create_pr:
+            mismatches.append("create_pr")
+        if current.review_scope != format_followup_finding_context(finding):
+            mismatches.append("review_scope")
+        if mismatches:
+            raise ValueError(
+                f"proven follow-up task {proven_task.id} does not match required replay identity: "
+                f"{', '.join(mismatches)}"
+            )
+        expected_by_id[proven_task.id] = current
+    if set(expected_by_id) != seen_ids:
+        raise ValueError("pending follow-up finalization replay contains ambiguous proven follow-up tasks")
+
+
+def _require_reused_proven_task_ids(
+    reused: Iterable[DbTask],
+    proven_tasks: object,
+    *,
+    kind: str,
+) -> None:
+    assert isinstance(proven_tasks, (list, tuple))
+    proven_ids = {task.id for task in proven_tasks if isinstance(task, DbTask) and task.id is not None}
+    reused_ids = {task.id for task in reused if task.id is not None}
+    if reused_ids != proven_ids:
+        raise ValueError(
+            f"pending {kind} finalization replay reused {sorted(reused_ids)!r}; "
+            f"expected exactly {sorted(proven_ids)!r}"
+        )
+
+
+def _validated_merge_followup_action_metadata(
+    store: SqliteTaskStore,
+    action: Mapping[str, Any],
+) -> tuple[DbTask | None, tuple[ReviewFinding, ...]]:
+    raw_findings = action.get("followup_findings")
+    if action.get("type") != "merge_with_followups" and not raw_findings:
+        return None, ()
+
+    raw_review = action.get("review_task")
+    if not isinstance(raw_review, DbTask):
+        raise ValueError("merge_with_followups action requires a persisted review_task")
+    if raw_review.id is None or store.get(raw_review.id) is None:
+        raise ValueError("merge_with_followups action requires a persisted review_task")
+    if raw_review.task_type != "review":
+        raise ValueError("merge_with_followups action review_task must be a review task")
+
+    if not isinstance(raw_findings, (list, tuple)) or not raw_findings:
+        raise ValueError("merge_with_followups action requires nonempty followup_findings")
+
+    findings: list[ReviewFinding] = []
+    seen_ids: set[str] = set()
+    for finding in raw_findings:
+        if not isinstance(finding, ReviewFinding):
+            raise ValueError("merge_with_followups action contains malformed followup_findings")
+        if finding.severity != "FOLLOWUP":
+            raise ValueError("merge_with_followups action requires FOLLOWUP severity findings")
+        finding_id = finding.id.strip() if isinstance(finding.id, str) else ""
+        if not finding_id or finding_id != finding.id:
+            raise ValueError("merge_with_followups action contains noncanonical finding identities")
+        if finding_id in seen_ids:
+            raise ValueError("merge_with_followups action contains duplicate finding identities")
+        seen_ids.add(finding_id)
+        findings.append(finding)
+
+    return raw_review, tuple(findings)
+
+
+def _followup_findings_for_proof(action: Mapping[str, Any]) -> tuple[ReviewFinding, ...]:
+    raw_findings = action.get("followup_findings")
+    if not isinstance(raw_findings, (list, tuple)) or not all(
+        isinstance(finding, ReviewFinding) for finding in raw_findings
+    ):
+        raise ValueError("ordinary merge finalization proof requires follow-up findings")
+    return tuple(raw_findings)
+
+
+def _mandatory_merge_side_effects_failed_result(
+    *,
+    exc: Exception,
+    created_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
+    reused_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
+    created_investigation_task_ids: list[str] | tuple[str, ...] | None = None,
+    reused_investigation_task_ids: list[str] | tuple[str, ...] | None = None,
+    created_deferred_blockers: list[DbTask] | tuple[DbTask, ...] | None = None,
+    reused_deferred_blockers: list[DbTask] | tuple[DbTask, ...] | None = None,
+) -> _MergeActionResult:
+    partial_created = tuple(getattr(exc, "created", ()))
+    partial_reused = tuple(getattr(exc, "reused", ()))
+    if isinstance(exc, FollowupMaterializationError):
+        created_followups = (*tuple(created_followups or ()), *partial_created)
+        reused_followups = (*tuple(reused_followups or ()), *partial_reused)
+        block_reason = f"ordinary follow-up materialization failed: {exc}; source remains unmerged"
+    elif isinstance(exc, CappedReviewBlockerMaterializationError):
+        created_deferred_blockers = (*tuple(created_deferred_blockers or ()), *partial_created)
+        reused_deferred_blockers = (*tuple(reused_deferred_blockers or ()), *partial_reused)
+        block_reason = f"max-cycle deferred blocker materialization failed: {exc}; source remains unmerged"
+    else:
+        block_reason = f"mandatory merge side-effect materialization failed: {exc}; source remains unmerged"
+    print(f"Error: {block_reason}")
+    return _MergeActionResult(
+        rc=1,
+        created_followups=list(created_followups or ()),
+        reused_followups=list(reused_followups or ()),
+        created_investigation_task_ids=list(created_investigation_task_ids or ()),
+        reused_investigation_task_ids=list(reused_investigation_task_ids or ()),
+        created_deferred_blockers=list(created_deferred_blockers or ()),
+        reused_deferred_blockers=list(reused_deferred_blockers or ()),
+        status="merge_side_effect_materialization_failed",
+        block_reason=block_reason,
+    )
+
+
+def _post_merge_state_persistence_failed_result(
+    *,
+    exc: Exception,
+    status: str,
+    phase: str,
+    created_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
+    reused_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
+    created_investigation_task_ids: list[str] | tuple[str, ...] | None = None,
+    reused_investigation_task_ids: list[str] | tuple[str, ...] | None = None,
+    created_deferred_blockers: list[DbTask] | tuple[DbTask, ...] | None = None,
+    reused_deferred_blockers: list[DbTask] | tuple[DbTask, ...] | None = None,
+) -> _MergeActionResult:
+    block_reason = (
+        f"{phase} failed after target was already changed: {exc}; "
+        "replay will finalize promoted target state"
+    )
+    print(f"Error: {block_reason}")
+    return _MergeActionResult(
+        rc=1,
+        created_followups=list(created_followups or ()),
+        reused_followups=list(reused_followups or ()),
+        created_investigation_task_ids=list(created_investigation_task_ids or ()),
+        reused_investigation_task_ids=list(reused_investigation_task_ids or ()),
+        created_deferred_blockers=list(created_deferred_blockers or ()),
+        reused_deferred_blockers=list(reused_deferred_blockers or ()),
+        status=status,
+        block_reason=block_reason,
+    )
+
+
+def _post_merge_proof_persistence_failed_result(
+    *,
+    exc: Exception,
+    status: str,
+    phase: str,
+    created_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
+    reused_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
+    created_investigation_task_ids: list[str] | tuple[str, ...] | None = None,
+    reused_investigation_task_ids: list[str] | tuple[str, ...] | None = None,
+    created_deferred_blockers: list[DbTask] | tuple[DbTask, ...] | None = None,
+    reused_deferred_blockers: list[DbTask] | tuple[DbTask, ...] | None = None,
+) -> _MergeActionResult:
+    block_reason = (
+        f"{phase} failed after target was already changed: {exc}; "
+        "merge finalization proof was not stored, so automatic replay cannot be promised; "
+        "operator attention required before retry or manual recovery"
+    )
+    print(f"Error: {block_reason}")
+    return _MergeActionResult(
+        rc=1,
+        created_followups=list(created_followups or ()),
+        reused_followups=list(reused_followups or ()),
+        created_investigation_task_ids=list(created_investigation_task_ids or ()),
+        reused_investigation_task_ids=list(reused_investigation_task_ids or ()),
+        created_deferred_blockers=list(created_deferred_blockers or ()),
+        reused_deferred_blockers=list(reused_deferred_blockers or ()),
+        status=status,
+        block_reason=block_reason,
+    )
+
+
+def _pre_promotion_merge_refusal_result(
+    *,
+    exc: Exception | str,
+    status: str,
+    phase: str,
+    created_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
+    reused_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
+    created_investigation_task_ids: list[str] | tuple[str, ...] | None = None,
+    reused_investigation_task_ids: list[str] | tuple[str, ...] | None = None,
+    created_deferred_blockers: list[DbTask] | tuple[DbTask, ...] | None = None,
+    reused_deferred_blockers: list[DbTask] | tuple[DbTask, ...] | None = None,
+) -> _MergeActionResult:
+    block_reason = _pre_promotion_merge_refusal_reason(phase=phase, exc=exc)
+    print(f"Error: {block_reason}")
+    return _MergeActionResult(
+        rc=1,
+        created_followups=list(created_followups or ()),
+        reused_followups=list(reused_followups or ()),
+        created_investigation_task_ids=list(created_investigation_task_ids or ()),
+        reused_investigation_task_ids=list(reused_investigation_task_ids or ()),
+        created_deferred_blockers=list(created_deferred_blockers or ()),
+        reused_deferred_blockers=list(reused_deferred_blockers or ()),
+        status=status,
+        block_reason=block_reason,
+    )
+
+
+def _pending_merge_finalization_refusal_result(
+    *,
+    exc: Exception | str,
+    created_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
+    reused_followups: list[DbTask] | tuple[DbTask, ...] | None = None,
+    created_investigation_task_ids: list[str] | tuple[str, ...] | None = None,
+    reused_investigation_task_ids: list[str] | tuple[str, ...] | None = None,
+    created_deferred_blockers: list[DbTask] | tuple[DbTask, ...] | None = None,
+    reused_deferred_blockers: list[DbTask] | tuple[DbTask, ...] | None = None,
+) -> _MergeActionResult:
+    block_reason = (
+        f"pending merge finalization refused before state finalization: {exc}; "
+        "merge state and provenance were left unchanged"
+    )
+    print(f"Error: {block_reason}")
+    return _MergeActionResult(
+        rc=1,
+        created_followups=list(created_followups or ()),
+        reused_followups=list(reused_followups or ()),
+        created_investigation_task_ids=list(created_investigation_task_ids or ()),
+        reused_investigation_task_ids=list(reused_investigation_task_ids or ()),
+        created_deferred_blockers=list(created_deferred_blockers or ()),
+        reused_deferred_blockers=list(reused_deferred_blockers or ()),
+        status="pending_merge_finalization_proof_stale",
+        block_reason=block_reason,
+    )
+
+
+def _authoritative_merge_unit_still_unmerged(store: SqliteTaskStore, task: DbTask) -> bool:
+    if task.id is None:
+        return False
+    merge_unit = store.resolve_merge_unit_for_task(task.id)
+    if merge_unit is None or merge_unit.state == "merged":
+        return False
+    return any(
+        child.task_type == "implement" and DEFERRED_REVIEW_BLOCKER_TAG in set(child.tags or ())
+        for child in store.get_based_on_children(task.id)
+    )
+
+
+def _pending_merge_finalization_action_for_advance(
+    config: Config,
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    target_branch: str | None,
+    resolved_merge_state: str | None,
+    live_target_sha: str | None,
+) -> dict[str, Any] | None:
+    return pending_merge_finalization_action(
+        config,
+        store,
+        task,
+        target_branch=target_branch,
+        require_already_merged=True,
+        resolved_merge_state=resolved_merge_state,
+        live_target_sha=live_target_sha,
+    )
+
+
+def _already_merged_behavior_for_advance_action(action: Mapping[str, Any]) -> str:
+    if action.get("pending_merge_finalization") is True and action.get("type") in {"merge", "merge_with_followups"}:
+        return "mark_merged"
+    if action.get("type") == "merge" and action.get("max_cycles_merge_and_defer") is True:
+        return "mark_merged"
+    return "error"
+
+
+def _capped_review_blocker_findings_for_action(action: Mapping[str, Any]) -> tuple[ReviewFinding, ...]:
+    present_keys = [
+        key
+        for key in (
+            "deferred_blocker_findings",
+            "blocker_findings",
+            "max_cycles_blocker_findings",
+            "findings",
+        )
+        if action.get(key) is not None
+    ]
+    if len(present_keys) > 1:
+        raise ValueError(
+            "max-cycle merge-and-defer action has ambiguous blocker finding metadata: "
+            f"{', '.join(present_keys)}"
+        )
+    if action.get("followup_findings") is not None:
+        raise ValueError("max-cycle merge-and-defer action cannot include ordinary follow-up metadata")
+    for key in (
+        "deferred_blocker_findings",
+        "blocker_findings",
+        "max_cycles_blocker_findings",
+        "findings",
+    ):
+        raw_findings = action.get(key)
+        if raw_findings is None:
+            continue
+        if not isinstance(raw_findings, (list, tuple)):
+            raise ValueError(f"max-cycle merge-and-defer action requires {key} to be a list or tuple")
+        if not all(isinstance(finding, ReviewFinding) for finding in raw_findings):
+            raise ValueError(f"max-cycle merge-and-defer action contains malformed blocker findings in {key}")
+        return tuple(raw_findings)
+    return ()
+
+
+def _validated_capped_review_action_metadata(
+    store: SqliteTaskStore,
+    *,
+    config: Config,
+    action: Mapping[str, Any],
+) -> tuple[DbTask, tuple[ReviewFinding, ...], str] | None:
+    if action.get("max_cycles_merge_and_defer") is True and action.get("type") != "merge":
+        raise ValueError("max-cycle merge-and-defer metadata is only valid on merge actions")
+    if not (action.get("type") == "merge" and action.get("max_cycles_merge_and_defer") is True):
+        return None
+    review_task = action.get("review_task")
+    if not isinstance(review_task, DbTask):
+        raise ValueError("max-cycle merge-and-defer action requires a review_task")
+    persisted_review_output = action.get("persisted_review_output")
+    if not isinstance(persisted_review_output, str):
+        persisted_review_output = action.get("review_output")
+    if not isinstance(persisted_review_output, str):
+        raise ValueError("max-cycle merge-and-defer action requires persisted review output")
+    blocker_findings = _capped_review_blocker_findings_for_action(action)
+    if not blocker_findings:
+        raise ValueError("max-cycle merge-and-defer action requires blocker findings")
+    parsed_blockers = validate_capped_review_blocker_action(
+        store,
+        config=config,
+        review_task=review_task,
+        findings=blocker_findings,
+        persisted_review_output=persisted_review_output,
+    )
+    return review_task, parsed_blockers, persisted_review_output
+
+
+def _materialize_max_cycle_deferred_blockers_for_action(
+    store: SqliteTaskStore,
+    *,
+    config: Config,
+    merge_subject: DbTask,
+    action: Mapping[str, Any],
+    active_scope_tags: tuple[str, ...] | None,
+    trigger_source: str,
+) -> tuple[list[DbTask], list[DbTask]]:
+    if not (action.get("type") == "merge" and action.get("max_cycles_merge_and_defer") is True):
+        return [], []
+
+    proven_tasks = action.get("proven_deferred_blocker_tasks")
+    if action.get("pending_merge_finalization") is True and proven_tasks is not None:
+        if not isinstance(proven_tasks, (list, tuple)) or not all(
+            isinstance(task, DbTask) for task in proven_tasks
+        ):
+            raise ValueError("pending max-cycle finalization replay contains malformed proven blocker tasks")
+        review_task = action.get("review_task")
+        if not isinstance(review_task, DbTask):
+            raise ValueError("pending max-cycle finalization replay requires a review_task")
+        persisted_review_output = action.get("persisted_review_output")
+        if not isinstance(persisted_review_output, str):
+            persisted_review_output = action.get("review_output")
+        if not isinstance(persisted_review_output, str):
+            raise ValueError("pending max-cycle finalization replay requires persisted review output")
+        blocker_findings = _capped_review_blocker_findings_for_action(action)
+        if not blocker_findings:
+            raise ValueError("pending max-cycle finalization replay requires blocker findings")
+        blocker_findings = validate_capped_review_blocker_action(
+            store,
+            config=config,
+            review_task=review_task,
+            findings=blocker_findings,
+            persisted_review_output=persisted_review_output,
+        )
+        reused = _validate_proven_capped_replay_tasks(
+            store,
+            review_task=review_task,
+            impl_task=merge_subject,
+            findings=blocker_findings,
+            persisted_review_output=persisted_review_output,
+            proven_tasks=proven_tasks,
+        )
+        _created, reconciled_reused = _create_or_reuse_capped_review_blocker_tasks(
+            store,
+            config=config,
+            review_task=review_task,
+            impl_task=merge_subject,
+            findings=blocker_findings,
+            persisted_review_output=persisted_review_output,
+            active_scope_tags=active_scope_tags,
+            trigger_source=trigger_source,
+        )
+        _require_reused_proven_task_ids(
+            reconciled_reused,
+            reused,
+            kind="max-cycle deferred blocker",
+        )
+        return [], list(reconciled_reused)
+
+    review_task = action.get("review_task")
+    if not isinstance(review_task, DbTask):
+        raise ValueError("max-cycle merge-and-defer action requires a review_task")
+    persisted_review_output = action.get("persisted_review_output")
+    if not isinstance(persisted_review_output, str):
+        persisted_review_output = action.get("review_output")
+    if not isinstance(persisted_review_output, str):
+        raise ValueError("max-cycle merge-and-defer action requires persisted review output")
+    blocker_findings = _capped_review_blocker_findings_for_action(action)
+    if not blocker_findings:
+        raise ValueError("max-cycle merge-and-defer action requires blocker findings")
+    blocker_findings = validate_capped_review_blocker_action(
+        store,
+        config=config,
+        review_task=review_task,
+        findings=blocker_findings,
+        persisted_review_output=persisted_review_output,
+    )
+
+    return _create_or_reuse_capped_review_blocker_tasks(
+        store,
+        config=config,
+        review_task=review_task,
+        impl_task=merge_subject,
+        findings=blocker_findings,
+        persisted_review_output=persisted_review_output,
+        active_scope_tags=active_scope_tags,
+        trigger_source=trigger_source,
+    )
+
+
+def _validate_proven_capped_replay_tasks(
+    store: SqliteTaskStore,
+    *,
+    review_task: DbTask,
+    impl_task: DbTask,
+    findings: tuple[ReviewFinding, ...],
+    persisted_review_output: str,
+    proven_tasks: object,
+) -> tuple[DbTask, ...]:
+    if review_task.id is None or impl_task.id is None:
+        raise ValueError("pending max-cycle finalization replay requires persisted review and implementation tasks")
+    assert isinstance(proven_tasks, (list, tuple))
+    if len(proven_tasks) != len(findings):
+        raise ValueError("pending max-cycle finalization replay has the wrong number of proven blocker tasks")
+    seen_ids: set[str] = set()
+    current_tasks: list[DbTask] = []
+    for finding, proven_task in zip(findings, proven_tasks, strict=True):
+        assert isinstance(proven_task, DbTask)
+        if proven_task.id is None:
+            raise ValueError("pending max-cycle finalization replay contains a proven task without an ID")
+        if proven_task.id in seen_ids:
+            raise ValueError(f"pending max-cycle finalization replay contains duplicate task {proven_task.id}")
+        seen_ids.add(proven_task.id)
+        current = store.get(proven_task.id)
+        if current is None:
+            raise ValueError(f"proven max-cycle deferred blocker task {proven_task.id} disappeared before finalization")
+        prompt_prefix = build_capped_review_blocker_prompt_prefix(review_task.id, impl_task.id, finding.id)
+        matching_children = [
+            child
+            for child in store.get_based_on_children(impl_task.id)
+            if child.task_type == "implement" and child.prompt.strip().startswith(prompt_prefix)
+        ]
+        if len(matching_children) != 1 or matching_children[0].id != proven_task.id:
+            match_ids = ", ".join(str(child.id) for child in matching_children)
+            raise ValueError(
+                f"Ambiguous capped review blocker task identity for {impl_task.id}: "
+                f"{len(matching_children)} children match {prompt_prefix!r} ({match_ids})."
+            )
+        mismatches = list(
+            capped_review_blocker_task_identity_mismatches(
+                current,
+                review_task_id=review_task.id,
+                impl_task_id=impl_task.id,
+                finding=finding,
+                persisted_review_output=persisted_review_output,
+            )
+        )
+        if task_is_merged(store, current) or current.status in {"dropped", "superseded"}:
+            mismatches.append("cannot be reused")
+        if mismatches:
+            raise ValueError(
+                f"proven max-cycle deferred blocker task {proven_task.id} does not match required replay identity: "
+                f"{', '.join(mismatches)}"
+            )
+        current_tasks.append(current)
+    return tuple(current_tasks)
+
+
+def _deferred_blocker_materialization_failed_result(
+    *,
+    exc: Exception,
+    created_followups: list[DbTask] | None = None,
+    reused_followups: list[DbTask] | None = None,
+    created_investigation_task_ids: list[str] | tuple[str, ...] | None = None,
+    reused_investigation_task_ids: list[str] | tuple[str, ...] | None = None,
+    created_deferred_blockers: list[DbTask] | tuple[DbTask, ...] | None = None,
+    reused_deferred_blockers: list[DbTask] | tuple[DbTask, ...] | None = None,
+) -> _MergeActionResult:
+    partial_created = getattr(exc, "created", ())
+    partial_reused = getattr(exc, "reused", ())
+    if partial_created or partial_reused:
+        created_deferred_blockers = (*tuple(created_deferred_blockers or ()), *tuple(partial_created))
+        reused_deferred_blockers = (*tuple(reused_deferred_blockers or ()), *tuple(partial_reused))
+    block_reason = f"max-cycle deferred blocker materialization failed: {exc}"
+    print(f"Error: {block_reason}")
+    return _MergeActionResult(
+        rc=1,
+        created_followups=list(created_followups or ()),
+        reused_followups=list(reused_followups or ()),
+        created_investigation_task_ids=list(created_investigation_task_ids or ()),
+        reused_investigation_task_ids=list(reused_investigation_task_ids or ()),
+        created_deferred_blockers=list(created_deferred_blockers or ()),
+        reused_deferred_blockers=list(reused_deferred_blockers or ()),
+        status="deferred_blocker_materialization_failed",
+        block_reason=block_reason,
+    )
+
+
+def _format_task_ids(tasks: Iterable[DbTask]) -> str:
+    return ", ".join(str(task.id) for task in tasks if task.id is not None)
+
+
+def _print_advance_deferred_blocker_lines(
+    console: Console,
+    merge_result: object,
+    *,
+    indent: str = "      ",
+) -> None:
+    ac = _colors.WORK_COLORS
+    created_ids = _format_task_ids(getattr(merge_result, "created_deferred_blockers", ()))
+    if created_ids:
+        console.print(f"{indent}[{ac.merge}]✓ Created deferred blocker task(s): {created_ids}[/{ac.merge}]")
+    reused_ids = _format_task_ids(getattr(merge_result, "reused_deferred_blockers", ()))
+    if reused_ids:
+        console.print(f"{indent}[{ac.waiting}]↺ Reused deferred blocker task(s): {reused_ids}[/{ac.waiting}]")
+
+
+def _materialize_mandatory_merge_side_effects_for_staged_action(
+    store: SqliteTaskStore,
+    *,
+    config: Config,
+    staged: _StagedIsolatedMergeAction,
+    active_scope_tags: tuple[str, ...] | None,
+    trigger_source: str,
+) -> _StagedIsolatedMergeAction:
+    created_followups, reused_followups = _materialize_merge_followup_side_effects(
+        store,
+        config=config,
+        merge_subject=staged.merge_subject,
+        review_task=staged.review_task,
+        followup_findings=staged.followup_findings,
+        action=staged.merge_action_metadata,
+    )
+    created_blockers, reused_blockers = _materialize_max_cycle_deferred_blockers_for_action(
+        store,
+        config=config,
+        merge_subject=staged.merge_subject,
+        action=staged.merge_action_metadata,
+        active_scope_tags=active_scope_tags,
+        trigger_source=trigger_source,
+    )
+    return replace(
+        staged,
+        created_followups=tuple(created_followups),
+        reused_followups=tuple(reused_followups),
+        created_deferred_blockers=tuple(created_blockers),
+        reused_deferred_blockers=tuple(reused_blockers),
+    )
+
+
+def _materialize_max_cycle_deferred_blockers_for_staged_action(
+    store: SqliteTaskStore,
+    *,
+    config: Config,
+    staged: _StagedIsolatedMergeAction,
+    active_scope_tags: tuple[str, ...] | None,
+    trigger_source: str,
+) -> _StagedIsolatedMergeAction:
+    return _materialize_mandatory_merge_side_effects_for_staged_action(
+        store,
+        config=config,
+        staged=staged,
+        active_scope_tags=active_scope_tags,
+        trigger_source=trigger_source,
+    )
+
+
 def merge_source_for_action(action: Mapping[str, Any], default_merge_source: str) -> str:
     """Return persisted merge provenance for an action execution."""
     if action.get("type") == "merge" and action.get("max_cycles_merge_and_defer") is True:
         return MERGE_SOURCE_MAX_CYCLES_DEFERRED
     return default_merge_source
+
+
+def _merge_finalization_family_for_action(action: Mapping[str, Any]) -> MergeFinalizationFamily | None:
+    if action.get("type") == "merge" and action.get("max_cycles_merge_and_defer") is True:
+        return "max_cycles_deferred"
+    if action.get("type") == "merge_with_followups":
+        return "ordinary_followup"
+    return None
+
+
+def _require_ref_sha_for_merge_finalization_proof(git: Git, ref: str, *, label: str) -> str:
+    rev_parse_if_exists = getattr(git, "rev_parse_if_exists", None)
+    value = rev_parse_if_exists(ref) if callable(rev_parse_if_exists) else None
+    if not isinstance(value, str) or not value:
+        raise GitError(f"could not prove {label} ref {ref!r} for merge finalization replay")
+    return value
+
+
+def _require_authorized_source_ref_unchanged(git: Git, ref: str, authorized_sha: str) -> str:
+    current_sha = _require_ref_sha_for_merge_finalization_proof(git, ref, label="current source")
+    if current_sha != authorized_sha:
+        raise GitError(
+            "merge source ref changed after lifecycle authorization; "
+            f"expected {authorized_sha}, got {current_sha}"
+        )
+    return current_sha
+
+
+def _require_authorized_source_contained_in_target(
+    git: Git,
+    *,
+    source_sha: str,
+    target_sha: str,
+    target_branch: str,
+) -> None:
+    is_ancestor = getattr(git, "is_ancestor", None)
+    if not callable(is_ancestor) or not is_ancestor(source_sha, target_sha):
+        raise GitError(
+            "could not prove already-merged finalization contains the authorized source "
+            f"{source_sha} in target {target_branch} at {target_sha}"
+        )
+
+
+def _ref_tree_sha_for_merge_finalization_proof(git: Git, ref: str | None) -> str | None:
+    if not ref:
+        return None
+    resolve_refs = getattr(git, "resolve_refs", None)
+    if callable(resolve_refs):
+        resolved = resolve_refs((ref,), peel="tree")
+        value = resolved.get(ref) if isinstance(resolved, Mapping) else None
+        return value if isinstance(value, str) and value else None
+    return None
+
+
+def _require_ref_tree_sha_for_merge_finalization_proof(git: Git, ref: str, *, label: str) -> str:
+    value = _ref_tree_sha_for_merge_finalization_proof(git, ref)
+    if not value:
+        raise GitError(f"could not prove {label} tree {ref!r} for merge finalization replay")
+    return value
+
+
+def _validate_pending_merge_finalization_proof_for_state(
+    store: SqliteTaskStore,
+    git: Git,
+    *,
+    merge_subject: DbTask,
+    action: Mapping[str, Any],
+    target_branch: str,
+    merge_unit_id: str | None,
+    created_followups: Iterable[DbTask],
+    reused_followups: Iterable[DbTask],
+    created_deferred_blockers: Iterable[DbTask],
+    reused_deferred_blockers: Iterable[DbTask],
+) -> None:
+    """Re-read and validate replay proof immediately before merge-state writes."""
+    if action.get("pending_merge_finalization") is not True:
+        return
+    family = _merge_finalization_family_for_action(action)
+    if family is None:
+        return
+    if merge_subject.id is None:
+        raise GitError("pending merge finalization proof requires a persisted implementation task")
+    raw_proof_id = action.get("merge_finalization_proof_id")
+    raw_proof_sha = action.get("merge_finalization_proof_sha")
+    if not isinstance(raw_proof_id, int) or not isinstance(raw_proof_sha, str) or not raw_proof_sha:
+        raise GitError("pending merge finalization replay is missing immutable proof identity")
+    proof = get_merge_finalization_proof(
+        store,
+        artifact_id=raw_proof_id,
+        impl_task_id=merge_subject.id,
+    )
+    if proof is None:
+        raise GitError(f"pending merge finalization proof artifact {raw_proof_id} disappeared or is malformed")
+    if proof.artifact.sha256 != raw_proof_sha:
+        raise GitError(
+            f"pending merge finalization proof artifact {raw_proof_id} changed after planning"
+        )
+    identity_family, review_task, findings, child_tasks = _merge_finalization_identity_for_action(
+        merge_subject=merge_subject,
+        action=action,
+        created_followups=created_followups,
+        reused_followups=reused_followups,
+        created_deferred_blockers=created_deferred_blockers,
+        reused_deferred_blockers=reused_deferred_blockers,
+    )
+    assert review_task.id is not None
+    expected_finding_ids = merge_finalization_finding_ids(findings)
+    expected_child_task_ids = merge_finalization_child_task_ids(child_tasks)
+    mismatches: list[str] = []
+    if proof.action_family != identity_family or proof.action_family != family:
+        mismatches.append("action_family")
+    if proof.impl_task_id != merge_subject.id:
+        mismatches.append("impl_task_id")
+    if proof.review_task_id != review_task.id:
+        mismatches.append("review_task_id")
+    if proof.finding_ids != expected_finding_ids:
+        mismatches.append("finding_ids")
+    if proof.child_task_ids != expected_child_task_ids:
+        mismatches.append("child_task_ids")
+    if merge_subject.branch and proof.source_branch != merge_subject.branch:
+        mismatches.append("source_branch")
+    if proof.target_branch != target_branch:
+        mismatches.append("target_branch")
+    if merge_unit_id is not None and proof.merge_unit_id != merge_unit_id:
+        mismatches.append("merge_unit_id")
+    live_target_sha = _require_ref_sha_for_merge_finalization_proof(
+        git,
+        target_branch,
+        label="pending replay target",
+    )
+    if live_target_sha != proof.promoted_target_sha:
+        mismatches.append("promoted_target_sha")
+    if not mismatches:
+        if proof.promotion_kind == "squash":
+            if not proof.promoted_target_tree_sha:
+                raise GitError("pending squash merge finalization proof is missing promoted target tree identity")
+            live_target_tree_sha = _require_ref_tree_sha_for_merge_finalization_proof(
+                git,
+                live_target_sha,
+                label="pending replay target",
+            )
+            if live_target_tree_sha != proof.promoted_target_tree_sha:
+                raise GitError(
+                    "pending squash merge finalization proof no longer matches live target tree: "
+                    f"expected {proof.promoted_target_tree_sha}, got {live_target_tree_sha}"
+                )
+        else:
+            current_source_sha = _require_ref_sha_for_merge_finalization_proof(
+                git,
+                proof.source_ref,
+                label="pending replay source",
+            )
+            if current_source_sha != proof.source_ref_sha:
+                raise GitError(
+                    "pending merge finalization proof no longer matches live finalization identity: source_ref_sha"
+                )
+            _require_authorized_source_contained_in_target(
+                git,
+                source_sha=proof.source_ref_sha,
+                target_sha=live_target_sha,
+                target_branch=target_branch,
+            )
+        return
+    raise GitError(
+        "pending merge finalization proof no longer matches live finalization identity: "
+        f"{', '.join(mismatches)}"
+    )
+
+
+def _ref_sha_for_merge_finalization_proof(git: Git, ref: str | None) -> str | None:
+    if not ref:
+        return None
+    rev_parse_if_exists = getattr(git, "rev_parse_if_exists", None)
+    value = rev_parse_if_exists(ref) if callable(rev_parse_if_exists) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _persist_merge_finalization_attempt_proof_for_action(
+    store: SqliteTaskStore,
+    git: Git,
+    *,
+    merge_subject: DbTask,
+    action: Mapping[str, Any],
+    target_branch: str,
+    previous_target_sha: str,
+    promoted_target_sha: str,
+    promotion_kind: MergeFinalizationPromotionKind = "normal",
+    promoted_target_tree_sha: str | None = None,
+    source_ref: str,
+    source_ref_sha: str | None = None,
+    merge_unit_id: str | None,
+    created_followups: Iterable[DbTask],
+    reused_followups: Iterable[DbTask],
+    created_deferred_blockers: Iterable[DbTask],
+    reused_deferred_blockers: Iterable[DbTask],
+) -> None:
+    family = _merge_finalization_family_for_action(action)
+    if family is None:
+        return
+    if merge_subject.id is None or not merge_subject.branch:
+        raise ValueError("merge finalization proof requires a persisted implementation task and source branch")
+    review_task = action.get("review_task")
+    if not isinstance(review_task, DbTask) or review_task.id is None:
+        raise ValueError("merge finalization proof requires a persisted review task")
+    if family == "ordinary_followup":
+        findings = _followup_findings_for_proof(action)
+        child_tasks = (*tuple(created_followups), *tuple(reused_followups))
+    else:
+        findings = _capped_review_blocker_findings_for_action(action)
+        child_tasks = (*tuple(created_deferred_blockers), *tuple(reused_deferred_blockers))
+    finding_ids = merge_finalization_finding_ids(cast("Iterable[ReviewFinding]", findings))
+    child_task_ids = merge_finalization_child_task_ids(child_tasks)
+    if not finding_ids or len(child_task_ids) != len(finding_ids):
+        raise ValueError("merge finalization proof requires exact finding and child task identities")
+    if source_ref_sha is None:
+        source_ref_sha = _require_ref_sha_for_merge_finalization_proof(git, source_ref, label="source")
+    persist_merge_finalization_attempt_proof(
+        store,
+        action_family=family,
+        impl_task_id=merge_subject.id,
+        review_task_id=review_task.id,
+        finding_ids=finding_ids,
+        child_task_ids=child_task_ids,
+        source_branch=merge_subject.branch,
+        source_ref=source_ref,
+        source_ref_sha=source_ref_sha,
+        target_branch=target_branch,
+        previous_target_sha=previous_target_sha,
+        promoted_target_sha=promoted_target_sha,
+        promotion_kind=promotion_kind,
+        promoted_target_tree_sha=promoted_target_tree_sha,
+        merge_unit_id=merge_unit_id,
+    )
+
+
+def _merge_finalization_identity_for_action(
+    *,
+    merge_subject: DbTask,
+    action: Mapping[str, Any],
+    created_followups: Iterable[DbTask],
+    reused_followups: Iterable[DbTask],
+    created_deferred_blockers: Iterable[DbTask],
+    reused_deferred_blockers: Iterable[DbTask],
+) -> tuple[MergeFinalizationFamily, DbTask, tuple[ReviewFinding, ...], tuple[DbTask, ...]]:
+    family = _merge_finalization_family_for_action(action)
+    if family is None:
+        raise ValueError("merge finalization identity requires a finalization action")
+    if merge_subject.id is None or not merge_subject.branch:
+        raise ValueError("merge finalization identity requires a persisted implementation task and source branch")
+    review_task = action.get("review_task")
+    if not isinstance(review_task, DbTask) or review_task.id is None:
+        raise ValueError("merge finalization identity requires a persisted review task")
+    if family == "ordinary_followup":
+        findings = tuple(_followup_findings_for_proof(action))
+        child_tasks = (*tuple(created_followups), *tuple(reused_followups))
+    else:
+        findings = tuple(_capped_review_blocker_findings_for_action(action))
+        child_tasks = (*tuple(created_deferred_blockers), *tuple(reused_deferred_blockers))
+    finding_ids = merge_finalization_finding_ids(findings)
+    child_task_ids = merge_finalization_child_task_ids(child_tasks)
+    if not finding_ids or len(child_task_ids) != len(finding_ids):
+        raise ValueError("merge finalization identity requires exact finding and child task identities")
+    return family, review_task, findings, tuple(child_tasks)
+
+
+def _persist_merge_finalization_prepared_attempt_for_action(
+    store: SqliteTaskStore,
+    *,
+    merge_subject: DbTask,
+    action: Mapping[str, Any],
+    target_branch: str,
+    previous_target_sha: str,
+    source_ref: str,
+    source_ref_sha: str,
+    merge_unit_id: str | None,
+    promotion_observed: bool = False,
+    promotion_kind: MergeFinalizationPromotionKind = "normal",
+    created_followups: Iterable[DbTask],
+    reused_followups: Iterable[DbTask],
+    created_deferred_blockers: Iterable[DbTask],
+    reused_deferred_blockers: Iterable[DbTask],
+) -> None:
+    family = _merge_finalization_family_for_action(action)
+    if family is None:
+        return
+    family, review_task, findings, child_tasks = _merge_finalization_identity_for_action(
+        merge_subject=merge_subject,
+        action=action,
+        created_followups=created_followups,
+        reused_followups=reused_followups,
+        created_deferred_blockers=created_deferred_blockers,
+        reused_deferred_blockers=reused_deferred_blockers,
+    )
+    assert merge_subject.id is not None
+    assert merge_subject.branch is not None
+    assert review_task.id is not None
+    persist_merge_finalization_prepared_attempt(
+        store,
+        action_family=family,
+        impl_task_id=merge_subject.id,
+        review_task_id=review_task.id,
+        finding_ids=merge_finalization_finding_ids(findings),
+        child_task_ids=merge_finalization_child_task_ids(child_tasks),
+        source_branch=merge_subject.branch,
+        source_ref=source_ref,
+        source_ref_sha=source_ref_sha,
+        target_branch=target_branch,
+        previous_target_sha=previous_target_sha,
+        merge_unit_id=merge_unit_id,
+        promotion_observed=promotion_observed,
+        promotion_kind=promotion_kind,
+    )
 
 
 def _finalize_staged_isolated_merge_action(
@@ -3321,13 +4489,18 @@ def _finalize_staged_isolated_merge_action(
     quiet_mechanics: bool,
 ) -> _MergeActionResult:
     assert staged.merge_subject.id is not None
-    created_followups, reused_followups = _materialize_merge_followup_side_effects(
-        store,
-        config=config,
-        merge_subject=staged.merge_subject,
-        review_task=staged.review_task,
-        followup_findings=staged.followup_findings,
-    )
+    if staged.created_followups or staged.reused_followups:
+        created_followups = list(staged.created_followups)
+        reused_followups = list(staged.reused_followups)
+    else:
+        created_followups, reused_followups = _materialize_merge_followup_side_effects(
+            store,
+            config=config,
+            merge_subject=staged.merge_subject,
+            review_task=staged.review_task,
+            followup_findings=staged.followup_findings,
+            action=staged.merge_action_metadata,
+        )
     pending = staged.pending_squash_reconcile
     if pending is not None:
         _print_squash_reconcile_result(
@@ -3340,14 +4513,101 @@ def _finalize_staged_isolated_merge_action(
                 remote=pending.remote,
             ),
             suppress_success=quiet_mechanics,
-        )
-    effective_merge_source = merge_source_for_action(staged.merge_action_metadata, merge_source)
-    mark_merge_subject_merged(
-        store,
-        merge_subject=staged.merge_subject,
-        merge_unit_id=staged.merge_unit_id,
-        merge_source=effective_merge_source,
     )
+    effective_merge_source = merge_source_for_action(staged.merge_action_metadata, merge_source)
+    if (
+        staged.merge_action_metadata.get("pending_merge_finalization") is not True
+        and _merge_finalization_family_for_action(staged.merge_action_metadata) is not None
+    ):
+        try:
+            source_ref = staged.source_ref or staged.merge_branch
+            if not source_ref or not staged.previous_target_sha:
+                raise GitError("could not prove isolated merge finalization source or previous target")
+            promoted_target_sha = staged.promoted_target_sha or _require_ref_sha_for_merge_finalization_proof(
+                git,
+                staged.target_branch,
+                label="promoted target",
+            )
+            _persist_merge_finalization_attempt_proof_for_action(
+                store,
+                git,
+                merge_subject=staged.merge_subject,
+                action=staged.merge_action_metadata,
+                target_branch=staged.target_branch,
+                previous_target_sha=staged.previous_target_sha,
+                promoted_target_sha=promoted_target_sha,
+                promotion_kind=staged.promotion_kind,
+                promoted_target_tree_sha=(
+                    _require_ref_tree_sha_for_merge_finalization_proof(
+                        git,
+                        promoted_target_sha,
+                        label="promoted target",
+                    )
+                    if staged.promotion_kind == "squash"
+                    else None
+                ),
+                source_ref=source_ref,
+                source_ref_sha=staged.source_ref_sha,
+                merge_unit_id=staged.merge_unit_id,
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_deferred_blockers=staged.created_deferred_blockers,
+                reused_deferred_blockers=staged.reused_deferred_blockers,
+            )
+        except Exception as exc:
+            return _post_merge_proof_persistence_failed_result(
+                exc=exc,
+                status="isolated_post_promotion_proof_persistence_failed",
+                phase="isolated merge-finalization proof persistence",
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_investigation_task_ids=staged.created_investigation_task_ids,
+                reused_investigation_task_ids=staged.reused_investigation_task_ids,
+                created_deferred_blockers=staged.created_deferred_blockers,
+                reused_deferred_blockers=staged.reused_deferred_blockers,
+            )
+    try:
+        try:
+            _validate_pending_merge_finalization_proof_for_state(
+                store,
+                git,
+                merge_subject=staged.merge_subject,
+                action=staged.merge_action_metadata,
+                target_branch=staged.target_branch,
+                merge_unit_id=staged.merge_unit_id,
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_deferred_blockers=staged.created_deferred_blockers,
+                reused_deferred_blockers=staged.reused_deferred_blockers,
+            )
+        except Exception as exc:
+            return _pending_merge_finalization_refusal_result(
+                exc=exc,
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_investigation_task_ids=staged.created_investigation_task_ids,
+                reused_investigation_task_ids=staged.reused_investigation_task_ids,
+                created_deferred_blockers=staged.created_deferred_blockers,
+                reused_deferred_blockers=staged.reused_deferred_blockers,
+            )
+        mark_merge_subject_merged(
+            store,
+            merge_subject=staged.merge_subject,
+            merge_unit_id=staged.merge_unit_id,
+            merge_source=effective_merge_source,
+        )
+    except Exception as exc:
+        return _post_merge_state_persistence_failed_result(
+            exc=exc,
+            status="isolated_post_promotion_merge_state_finalization_failed",
+            phase="isolated merge-state finalization",
+            created_followups=created_followups,
+            reused_followups=reused_followups,
+            created_investigation_task_ids=staged.created_investigation_task_ids,
+            reused_investigation_task_ids=staged.reused_investigation_task_ids,
+            created_deferred_blockers=staged.created_deferred_blockers,
+            reused_deferred_blockers=staged.reused_deferred_blockers,
+        )
     return _MergeActionResult(
         rc=0,
         created_followups=created_followups,
@@ -3377,21 +4637,16 @@ def _stage_isolated_merge_action(
     heartbeat_threshold_seconds: int | None = None,
     heartbeat_interval_seconds: int | None = None,
     on_heartbeat: LongPhaseHeartbeat | None = None,
+    active_scope_tags: tuple[str, ...] | None = None,
 ) -> _StagedIsolatedMergeAction | _MergeActionResult:
     created_investigation_task_ids = tuple(
-        task_id
-        for task_id in action.get("created_investigation_task_ids", ())
-        if isinstance(task_id, str) and task_id
+        task_id for task_id in action.get("created_investigation_task_ids", ()) if isinstance(task_id, str) and task_id
     )
     reused_investigation_task_ids = tuple(
-        task_id
-        for task_id in action.get("reused_investigation_task_ids", ())
-        if isinstance(task_id, str) and task_id
+        task_id for task_id in action.get("reused_investigation_task_ids", ()) if isinstance(task_id, str) and task_id
     )
     resolved_subject = (
-        _resolve_merge_subject(store, merge_git, task.id or "", target_branch=target_branch)
-        if task.id
-        else None
+        _resolve_merge_subject(store, merge_git, task.id or "", target_branch=target_branch) if task.id else None
     )
     merge_subject = resolved_subject.merge_subject if resolved_subject is not None else task
     assert merge_subject.id is not None
@@ -3415,6 +4670,21 @@ def _stage_isolated_merge_action(
                 created_investigation_task_ids=list(created_investigation_task_ids),
                 reused_investigation_task_ids=list(reused_investigation_task_ids),
             )
+    try:
+        _validated_capped_review_action_metadata(store, config=config, action=action)
+        review_task, followup_findings = _validated_merge_followup_action_metadata(store, action)
+    except Exception as exc:
+        if action.get("max_cycles_merge_and_defer") is True:
+            return _deferred_blocker_materialization_failed_result(
+                exc=exc,
+                created_investigation_task_ids=created_investigation_task_ids,
+                reused_investigation_task_ids=reused_investigation_task_ids,
+            )
+        return _mandatory_merge_side_effects_failed_result(
+            exc=exc,
+            created_investigation_task_ids=created_investigation_task_ids,
+            reused_investigation_task_ids=reused_investigation_task_ids,
+        )
     if merge_current_branch != target_branch:
         print(
             f"Error: Advance merge for task {merge_subject.id} targets '{target_branch}', "
@@ -3433,19 +4703,130 @@ def _stage_isolated_merge_action(
         and resolved_subject.merge_source_ref
         and merge_git.is_merged(resolved_subject.merge_source_ref, merge_current_branch)
     ):
+        proof_source_ref = resolved_subject.merge_source_ref
+        proof_source_ref_sha: str | None = None
+        if _merge_finalization_family_for_action(action) is not None:
+            try:
+                proof_source_ref_sha = _require_ref_sha_for_merge_finalization_proof(
+                    merge_git,
+                    proof_source_ref,
+                    label="authorized source",
+                )
+            except Exception as exc:
+                return _pre_promotion_merge_refusal_result(
+                    exc=exc,
+                    status="pre_merge_proof_persistence_failed",
+                    phase="pre-merge finalization source proof",
+                    created_investigation_task_ids=created_investigation_task_ids,
+                    reused_investigation_task_ids=reused_investigation_task_ids,
+                )
+        created_followups: list[DbTask] = []
+        reused_followups: list[DbTask] = []
+        created_deferred_blockers: list[DbTask] = []
+        reused_deferred_blockers: list[DbTask] = []
+        try:
+            created_followups, reused_followups = _materialize_merge_followup_side_effects(
+                store,
+                config=config,
+                merge_subject=merge_subject,
+                review_task=review_task,
+                followup_findings=followup_findings,
+                action=action,
+            )
+            created_deferred_blockers, reused_deferred_blockers = _materialize_max_cycle_deferred_blockers_for_action(
+                store,
+                config=config,
+                merge_subject=merge_subject,
+                action=action,
+                active_scope_tags=active_scope_tags,
+                trigger_source=merge_source,
+            )
+            if _merge_finalization_family_for_action(action) is not None:
+                if not proof_source_ref or not proof_source_ref_sha:
+                    raise GitError("could not prove already-merged finalization source ref")
+                _require_authorized_source_ref_unchanged(merge_git, proof_source_ref, proof_source_ref_sha)
+                target_sha = _require_ref_sha_for_merge_finalization_proof(
+                    merge_git,
+                    target_branch,
+                    label="target",
+                )
+                _require_authorized_source_contained_in_target(
+                    merge_git,
+                    source_sha=proof_source_ref_sha,
+                    target_sha=target_sha,
+                    target_branch=target_branch,
+                )
+        except Exception as exc:
+            if action.get("max_cycles_merge_and_defer") is True and not followup_findings:
+                return _deferred_blocker_materialization_failed_result(
+                    exc=exc,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_investigation_task_ids=created_investigation_task_ids,
+                    reused_investigation_task_ids=reused_investigation_task_ids,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            return _mandatory_merge_side_effects_failed_result(
+                exc=exc,
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_investigation_task_ids=created_investigation_task_ids,
+                reused_investigation_task_ids=reused_investigation_task_ids,
+                created_deferred_blockers=created_deferred_blockers,
+                reused_deferred_blockers=reused_deferred_blockers,
+            )
         effective_merge_source = merge_source_for_action(action, merge_source)
-        mark_merge_subject_merged(
-            store,
-            merge_subject=merge_subject,
-            merge_unit_id=resolved_subject.merge_unit_id,
-            merge_source=effective_merge_source,
-        )
+        try:
+            try:
+                _validate_pending_merge_finalization_proof_for_state(
+                    store,
+                    merge_git,
+                    merge_subject=merge_subject,
+                    action=action,
+                    target_branch=target_branch,
+                    merge_unit_id=resolved_subject.merge_unit_id,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            except Exception as exc:
+                return _pending_merge_finalization_refusal_result(
+                    exc=exc,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_investigation_task_ids=created_investigation_task_ids,
+                    reused_investigation_task_ids=reused_investigation_task_ids,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            mark_merge_subject_merged(
+                store,
+                merge_subject=merge_subject,
+                merge_unit_id=resolved_subject.merge_unit_id,
+                merge_source=effective_merge_source,
+            )
+        except Exception as exc:
+            return _post_merge_state_persistence_failed_result(
+                exc=exc,
+                status="already_merged_state_persistence_failed",
+                phase="already-merged state finalization",
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_investigation_task_ids=created_investigation_task_ids,
+                reused_investigation_task_ids=reused_investigation_task_ids,
+                created_deferred_blockers=created_deferred_blockers,
+                reused_deferred_blockers=reused_deferred_blockers,
+            )
         return _MergeActionResult(
             rc=0,
-            created_followups=[],
-            reused_followups=[],
+            created_followups=created_followups,
+            reused_followups=reused_followups,
             created_investigation_task_ids=list(created_investigation_task_ids),
             reused_investigation_task_ids=list(reused_investigation_task_ids),
+            created_deferred_blockers=created_deferred_blockers,
+            reused_deferred_blockers=reused_deferred_blockers,
             status="already_merged",
         )
     merge_args = _build_auto_merge_args(
@@ -3455,11 +4836,7 @@ def _stage_isolated_merge_action(
         target_branch,
     )
     pending_squash_reconcile: _PendingSquashBranchReconcile | None = None
-    if (
-        getattr(merge_args, "squash", False)
-        and resolved_subject is not None
-        and resolved_subject.merge_branch
-    ):
+    if getattr(merge_args, "squash", False) and resolved_subject is not None and resolved_subject.merge_branch:
         pending_squash_reconcile = _capture_pre_squash_reconcile_state(
             git,
             branch=resolved_subject.merge_branch,
@@ -3481,6 +4858,7 @@ def _stage_isolated_merge_action(
             heartbeat_threshold_seconds=heartbeat_threshold_seconds,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
             on_heartbeat=on_heartbeat,
+            resolved_subject=resolved_subject,
         )
     )
     if merge_result.rc != 0:
@@ -3492,23 +4870,30 @@ def _stage_isolated_merge_action(
             reused_investigation_task_ids=list(reused_investigation_task_ids),
             status=merge_result.status,
             block_reason=merge_result.block_reason,
-    )
-    review_task = action.get("review_task") if isinstance(action.get("review_task"), DbTask) else None
-    followup_findings = tuple(
-        finding
-        for finding in action.get("followup_findings", ())
-        if isinstance(finding, ReviewFinding)
-    )
+        )
+    authorized_action = merge_result.authorized_merge_action or dict(action)
+    try:
+        _validated_capped_review_action_metadata(store, config=config, action=authorized_action)
+        review_task, followup_findings = _validated_merge_followup_action_metadata(store, authorized_action)
+    except Exception as exc:
+        return _mandatory_merge_side_effects_failed_result(
+            exc=exc,
+            created_investigation_task_ids=created_investigation_task_ids,
+            reused_investigation_task_ids=reused_investigation_task_ids,
+        )
     return _StagedIsolatedMergeAction(
         merge_subject=merge_subject,
         merge_unit_id=resolved_subject.merge_unit_id if resolved_subject is not None else None,
         merge_branch=resolved_subject.merge_branch if resolved_subject is not None else task.branch,
+        target_branch=target_branch,
         pending_squash_reconcile=pending_squash_reconcile or merge_result.pending_squash_reconcile,
         review_task=review_task,
         followup_findings=followup_findings,
         created_investigation_task_ids=created_investigation_task_ids,
         reused_investigation_task_ids=reused_investigation_task_ids,
-        merge_action_metadata=dict(action),
+        merge_action_metadata=dict(authorized_action),
+        source_ref=resolved_subject.merge_source_ref if resolved_subject is not None else task.branch,
+        promotion_kind="squash" if getattr(merge_args, "squash", False) else "normal",
     )
 
 
@@ -3529,6 +4914,7 @@ def _execute_merge_action(
     heartbeat_threshold_seconds: int | None = None,
     heartbeat_interval_seconds: int | None = None,
     on_heartbeat: LongPhaseHeartbeat | None = None,
+    active_scope_tags: tuple[str, ...] | None = None,
 ) -> _MergeActionResult:
     """Execute a merge-style advance action and materialize follow-up tasks if needed."""
     created_followups: list[DbTask] = []
@@ -3536,18 +4922,17 @@ def _execute_merge_action(
     created_deferred_blockers: list[DbTask] = []
     reused_deferred_blockers: list[DbTask] = []
     created_investigation_task_ids = [
-        task_id
-        for task_id in action.get("created_investigation_task_ids", ())
-        if isinstance(task_id, str) and task_id
+        task_id for task_id in action.get("created_investigation_task_ids", ()) if isinstance(task_id, str) and task_id
     ]
     reused_investigation_task_ids = [
-        task_id
-        for task_id in action.get("reused_investigation_task_ids", ())
-        if isinstance(task_id, str) and task_id
+        task_id for task_id in action.get("reused_investigation_task_ids", ()) if isinstance(task_id, str) and task_id
     ]
     execution_git = merge_git or git
     execution_branch = merge_current_branch or current_branch
-    resolved_subject = _resolve_merge_subject(store, execution_git, task.id or "", target_branch=target_branch) if task.id else None
+    isolated_promotion = merge_git is not None and merge_git.repo_dir != git.repo_dir
+    resolved_subject = (
+        _resolve_merge_subject(store, execution_git, task.id or "", target_branch=target_branch) if task.id else None
+    )
     merge_subject = resolved_subject.merge_subject if resolved_subject is not None else task
     assert merge_subject.id is not None
 
@@ -3586,44 +4971,323 @@ def _execute_merge_action(
             reused_investigation_task_ids=reused_investigation_task_ids,
         )
 
-    review_task = action.get("review_task") if isinstance(action.get("review_task"), DbTask) else None
-    followup_findings = tuple(
-        finding
-        for finding in action.get("followup_findings", ())
-        if isinstance(finding, ReviewFinding)
-    )
+    try:
+        _validated_capped_review_action_metadata(store, config=config, action=action)
+        review_task, followup_findings = _validated_merge_followup_action_metadata(store, action)
+    except Exception as exc:
+        if action.get("max_cycles_merge_and_defer") is True:
+            return _deferred_blocker_materialization_failed_result(
+                exc=exc,
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_investigation_task_ids=created_investigation_task_ids,
+                reused_investigation_task_ids=reused_investigation_task_ids,
+                created_deferred_blockers=created_deferred_blockers,
+                reused_deferred_blockers=reused_deferred_blockers,
+            )
+        return _mandatory_merge_side_effects_failed_result(
+            exc=exc,
+            created_followups=created_followups,
+            reused_followups=reused_followups,
+            created_investigation_task_ids=created_investigation_task_ids,
+            reused_investigation_task_ids=reused_investigation_task_ids,
+            created_deferred_blockers=created_deferred_blockers,
+            reused_deferred_blockers=reused_deferred_blockers,
+        )
 
     assert task.id is not None
     effective_merge_source = merge_source_for_action(action, merge_source)
+    mandatory_side_effects_materialized = False
+    proof_source_ref = resolved_subject.merge_source_ref if resolved_subject is not None else task.branch
+    proof_source_ref_sha: str | None = None
+    promotion_kind: MergeFinalizationPromotionKind = "normal"
+    if _merge_finalization_family_for_action(action) is not None and not isolated_promotion:
+        if not proof_source_ref:
+            return _pre_promotion_merge_refusal_result(
+                exc=GitError("could not prove merge finalization source ref before materialization"),
+                status="pre_merge_proof_persistence_failed",
+                phase="pre-merge finalization source proof",
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_investigation_task_ids=created_investigation_task_ids,
+                reused_investigation_task_ids=reused_investigation_task_ids,
+                created_deferred_blockers=created_deferred_blockers,
+                reused_deferred_blockers=reused_deferred_blockers,
+            )
+        try:
+            proof_source_ref_sha = _require_ref_sha_for_merge_finalization_proof(
+                execution_git,
+                proof_source_ref,
+                label="authorized source",
+            )
+        except Exception as exc:
+            return _pre_promotion_merge_refusal_result(
+                exc=exc,
+                status="pre_merge_proof_persistence_failed",
+                phase="pre-merge finalization source proof",
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_investigation_task_ids=created_investigation_task_ids,
+                reused_investigation_task_ids=reused_investigation_task_ids,
+                created_deferred_blockers=created_deferred_blockers,
+                reused_deferred_blockers=reused_deferred_blockers,
+            )
+    previous_target_sha: str | None = None
+
+    def _materialize_mandatory_side_effects_before_state(
+        authorized_action: Mapping[str, Any] | None = None,
+    ) -> _MergeActionResult | None:
+        nonlocal mandatory_side_effects_materialized
+        nonlocal created_followups, reused_followups, created_deferred_blockers, reused_deferred_blockers
+        nonlocal previous_target_sha, proof_source_ref_sha
+        if mandatory_side_effects_materialized:
+            return None
+        effective_action = authorized_action or action
+        try:
+            _validated_capped_review_action_metadata(
+                store,
+                config=config,
+                action=effective_action,
+            )
+            effective_review_task, effective_followup_findings = _validated_merge_followup_action_metadata(
+                store,
+                effective_action,
+            )
+            if (
+                _merge_finalization_family_for_action(effective_action) is not None
+                and proof_source_ref_sha is None
+                and proof_source_ref
+            ):
+                proof_source_ref_sha = _require_ref_sha_for_merge_finalization_proof(
+                    execution_git,
+                    proof_source_ref,
+                    label="authorized source",
+                )
+            created_followups, reused_followups = _materialize_merge_followup_side_effects(
+                store,
+                config=config,
+                merge_subject=merge_subject,
+                review_task=effective_review_task,
+                followup_findings=effective_followup_findings,
+                action=effective_action,
+            )
+            created_deferred_blockers, reused_deferred_blockers = _materialize_max_cycle_deferred_blockers_for_action(
+                store,
+                config=config,
+                merge_subject=merge_subject,
+                action=effective_action,
+                active_scope_tags=active_scope_tags,
+                trigger_source=merge_source,
+            )
+        except Exception as exc:
+            if effective_action.get("max_cycles_merge_and_defer") is True:
+                return _deferred_blocker_materialization_failed_result(
+                    exc=exc,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_investigation_task_ids=created_investigation_task_ids,
+                    reused_investigation_task_ids=reused_investigation_task_ids,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            return _mandatory_merge_side_effects_failed_result(
+                exc=exc,
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_investigation_task_ids=created_investigation_task_ids,
+                reused_investigation_task_ids=reused_investigation_task_ids,
+                created_deferred_blockers=created_deferred_blockers,
+                reused_deferred_blockers=reused_deferred_blockers,
+            )
+        if (
+            _merge_finalization_family_for_action(effective_action) is not None
+            and effective_action.get("pending_merge_finalization") is not True
+        ):
+            try:
+                if not proof_source_ref or not proof_source_ref_sha:
+                    raise GitError("could not prove merge finalization source ref before promotion")
+                _require_authorized_source_ref_unchanged(
+                    execution_git,
+                    proof_source_ref,
+                    proof_source_ref_sha,
+                )
+            except Exception as exc:
+                return _pre_promotion_merge_refusal_result(
+                    exc=exc,
+                    status="merge_source_ref_changed",
+                    phase="pre-merge authorized source proof",
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_investigation_task_ids=created_investigation_task_ids,
+                    reused_investigation_task_ids=reused_investigation_task_ids,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            try:
+                previous_target_sha = _require_ref_sha_for_merge_finalization_proof(
+                    execution_git,
+                    target_branch,
+                    label="previous target",
+                )
+                _persist_merge_finalization_prepared_attempt_for_action(
+                    store,
+                    merge_subject=merge_subject,
+                    action=effective_action,
+                    target_branch=target_branch,
+                    previous_target_sha=previous_target_sha,
+                    source_ref=proof_source_ref,
+                    source_ref_sha=proof_source_ref_sha,
+                    merge_unit_id=resolved_subject.merge_unit_id if resolved_subject is not None else None,
+                    promotion_kind=promotion_kind,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            except Exception as exc:
+                return _pre_promotion_merge_refusal_result(
+                    exc=exc,
+                    status="pre_merge_proof_persistence_failed",
+                    phase="pre-merge target proof",
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_investigation_task_ids=created_investigation_task_ids,
+                    reused_investigation_task_ids=reused_investigation_task_ids,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+        mandatory_side_effects_materialized = True
+        return None
+
     if (
         already_merged_behavior == "mark_merged"
         and resolved_subject is not None
         and resolved_subject.merge_source_ref
         and execution_git.is_merged(resolved_subject.merge_source_ref, execution_branch)
     ):
-        mark_merge_subject_merged(
-            store,
-            merge_subject=merge_subject,
-            merge_unit_id=resolved_subject.merge_unit_id,
-            merge_source=effective_merge_source,
-        )
+        materialization_error = _materialize_mandatory_side_effects_before_state(action)
+        if materialization_error is not None:
+            return materialization_error
+        if (
+            action.get("pending_merge_finalization") is not True
+            and _merge_finalization_family_for_action(action) is not None
+        ):
+            try:
+                if not proof_source_ref or not proof_source_ref_sha:
+                    raise GitError("could not prove already-merged finalization source ref")
+                _require_authorized_source_ref_unchanged(
+                    execution_git,
+                    proof_source_ref,
+                    proof_source_ref_sha,
+                )
+                target_sha = _require_ref_sha_for_merge_finalization_proof(
+                    execution_git,
+                    target_branch,
+                    label="target",
+                )
+                _require_authorized_source_contained_in_target(
+                    execution_git,
+                    source_sha=proof_source_ref_sha,
+                    target_sha=target_sha,
+                    target_branch=target_branch,
+                )
+                _persist_merge_finalization_prepared_attempt_for_action(
+                    store,
+                    merge_subject=merge_subject,
+                    action=action,
+                    target_branch=target_branch,
+                    previous_target_sha=target_sha,
+                    source_ref=resolved_subject.merge_source_ref,
+                    source_ref_sha=proof_source_ref_sha,
+                    merge_unit_id=resolved_subject.merge_unit_id,
+                    promotion_observed=True,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+                _persist_merge_finalization_attempt_proof_for_action(
+                    store,
+                    execution_git,
+                    merge_subject=merge_subject,
+                    action=action,
+                    target_branch=target_branch,
+                    previous_target_sha=target_sha,
+                    promoted_target_sha=target_sha,
+                    source_ref=resolved_subject.merge_source_ref,
+                    source_ref_sha=proof_source_ref_sha,
+                    merge_unit_id=resolved_subject.merge_unit_id,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            except Exception as exc:
+                return _post_merge_proof_persistence_failed_result(
+                    exc=exc,
+                    status="already_merged_proof_persistence_failed",
+                    phase="already-merged finalization proof persistence",
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_investigation_task_ids=created_investigation_task_ids,
+                    reused_investigation_task_ids=reused_investigation_task_ids,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+        try:
+            try:
+                _validate_pending_merge_finalization_proof_for_state(
+                    store,
+                    execution_git,
+                    merge_subject=merge_subject,
+                    action=action,
+                    target_branch=target_branch,
+                    merge_unit_id=resolved_subject.merge_unit_id,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            except Exception as exc:
+                return _pending_merge_finalization_refusal_result(
+                    exc=exc,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_investigation_task_ids=created_investigation_task_ids,
+                    reused_investigation_task_ids=reused_investigation_task_ids,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            mark_merge_subject_merged(
+                store,
+                merge_subject=merge_subject,
+                merge_unit_id=resolved_subject.merge_unit_id,
+                merge_source=effective_merge_source,
+            )
+        except Exception as exc:
+            return _post_merge_state_persistence_failed_result(
+                exc=exc,
+                status="already_merged_state_persistence_failed",
+                phase="already-merged state finalization",
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_investigation_task_ids=created_investigation_task_ids,
+                reused_investigation_task_ids=reused_investigation_task_ids,
+                created_deferred_blockers=created_deferred_blockers,
+                reused_deferred_blockers=reused_deferred_blockers,
+            )
         return _MergeActionResult(
             rc=0,
             created_followups=created_followups,
             reused_followups=reused_followups,
             created_investigation_task_ids=created_investigation_task_ids,
             reused_investigation_task_ids=reused_investigation_task_ids,
+            created_deferred_blockers=created_deferred_blockers,
+            reused_deferred_blockers=reused_deferred_blockers,
             status="already_merged",
         )
 
-    merge_args = _build_auto_merge_args(
-        config,
-        execution_git,
-        resolved_subject.merge_source_ref if resolved_subject is not None else task.branch,
-        target_branch,
-    )
     candidate_verify_required = bool(config.main_checkout_isolate and verify_gate_enabled(config))
-    isolated_promotion = merge_git is not None and merge_git.repo_dir != git.repo_dir
     if candidate_verify_required and not isolated_promotion:
         print(
             "Error: pre-promotion candidate verify requires the isolated host merge checkout; "
@@ -3638,6 +5302,14 @@ def _execute_merge_action(
             status="blocked_candidate_verify_unavailable",
             block_reason="isolated host merge checkout unavailable for pre-promotion candidate verify",
         )
+
+    merge_args = _build_auto_merge_args(
+        config,
+        execution_git,
+        resolved_subject.merge_source_ref if resolved_subject is not None else task.branch,
+        target_branch,
+    )
+    promotion_kind = "squash" if getattr(merge_args, "squash", False) else "normal"
     staged_isolated: _StagedIsolatedMergeAction | None = None
     if isolated_promotion:
         staged_result = _stage_isolated_merge_action(
@@ -3656,6 +5328,7 @@ def _execute_merge_action(
             heartbeat_threshold_seconds=heartbeat_threshold_seconds,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
             on_heartbeat=on_heartbeat,
+            active_scope_tags=active_scope_tags,
         )
         if isinstance(staged_result, _MergeActionResult):
             return staged_result
@@ -3675,9 +5348,24 @@ def _execute_merge_action(
                 heartbeat_threshold_seconds=heartbeat_threshold_seconds,
                 heartbeat_interval_seconds=heartbeat_interval_seconds,
                 on_heartbeat=on_heartbeat,
+                materialize_side_effects=False,
+                before_irreversible_side_effect=_materialize_mandatory_side_effects_before_state,
+                resolved_subject=resolved_subject,
             )
         )
     rc = merge_result.rc
+    result_status = merge_result.status
+    result_block_reason = merge_result.block_reason
+    final_authorized_action = merge_result.authorized_merge_action or action
+    effective_merge_source = merge_source_for_action(final_authorized_action, merge_source)
+    if merge_result.created_followups:
+        created_followups = list(merge_result.created_followups)
+    if merge_result.reused_followups:
+        reused_followups = list(merge_result.reused_followups)
+    if merge_result.created_deferred_blockers:
+        created_deferred_blockers = list(merge_result.created_deferred_blockers)
+    if merge_result.reused_deferred_blockers:
+        reused_deferred_blockers = list(merge_result.reused_deferred_blockers)
     promotion_warnings: tuple[str, ...] = ()
     candidate_verify = None
     verified_head_sha: str | None = None
@@ -3706,52 +5394,265 @@ def _execute_merge_action(
         verified_head_sha = proof.verified_head_sha
         verified_tree_fingerprint = proof.verified_tree_fingerprint
     if rc == 0 and merge_git is not None and merge_git.repo_dir != git.repo_dir:
+        assert staged_isolated is not None
+        try:
+            staged_isolated = _materialize_mandatory_merge_side_effects_for_staged_action(
+                store,
+                config=config,
+                staged=staged_isolated,
+                active_scope_tags=active_scope_tags,
+                trigger_source=merge_source,
+            )
+            created_followups = list(staged_isolated.created_followups)
+            reused_followups = list(staged_isolated.reused_followups)
+            created_deferred_blockers = list(staged_isolated.created_deferred_blockers)
+            reused_deferred_blockers = list(staged_isolated.reused_deferred_blockers)
+            if (
+                staged_isolated.merge_action_metadata.get("pending_merge_finalization") is not True
+                and _merge_finalization_family_for_action(staged_isolated.merge_action_metadata) is not None
+            ):
+                source_ref = staged_isolated.source_ref or staged_isolated.merge_branch
+                if not source_ref:
+                    raise GitError("could not prove isolated merge finalization source ref before promotion")
+                source_ref_sha = _ref_sha_for_merge_finalization_proof(
+                    execution_git,
+                    source_ref,
+                ) or _ref_sha_for_merge_finalization_proof(git, source_ref)
+                if not source_ref_sha:
+                    raise GitError(f"could not prove source ref {source_ref!r} before promotion")
+                staged_isolated = replace(
+                    staged_isolated,
+                    source_ref=source_ref,
+                    source_ref_sha=source_ref_sha,
+                    previous_target_sha=_require_ref_sha_for_merge_finalization_proof(
+                        git,
+                        target_branch,
+                        label="previous target",
+                    )
+                    if _ref_sha_for_merge_finalization_proof(git, target_branch) is not None
+                    else _require_ref_sha_for_merge_finalization_proof(
+                        execution_git,
+                        target_branch,
+                        label="previous target",
+                    ),
+                )
+                assert staged_isolated.previous_target_sha is not None
+                _persist_merge_finalization_prepared_attempt_for_action(
+                    store,
+                    merge_subject=staged_isolated.merge_subject,
+                    action=staged_isolated.merge_action_metadata,
+                    target_branch=target_branch,
+                    previous_target_sha=staged_isolated.previous_target_sha,
+                    source_ref=source_ref,
+                    source_ref_sha=source_ref_sha,
+                    merge_unit_id=staged_isolated.merge_unit_id,
+                    promotion_kind=staged_isolated.promotion_kind,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+        except Exception as exc:
+            if action.get("max_cycles_merge_and_defer") is True and not staged_isolated.followup_findings:
+                return _deferred_blocker_materialization_failed_result(
+                    exc=exc,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_investigation_task_ids=created_investigation_task_ids,
+                    reused_investigation_task_ids=reused_investigation_task_ids,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            return _mandatory_merge_side_effects_failed_result(
+                exc=exc,
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_investigation_task_ids=created_investigation_task_ids,
+                reused_investigation_task_ids=reused_investigation_task_ids,
+                created_deferred_blockers=created_deferred_blockers,
+                reused_deferred_blockers=reused_deferred_blockers,
+            )
         try:
             promotion_warnings = _promote_isolated_merge_to_target_branch(
                 git,
                 execution_git,
                 target_branch,
             )
-            if candidate_verify is not None:
-                if not verified_head_sha or not verified_tree_fingerprint:
-                    raise GitError(
-                        "promoted target could not prove exact candidate identity for canonical checkpoint update"
-                    )
-                persisted_checkpoint = promote_candidate_integration_verify_evidence(
-                    store,
-                    evidence=candidate_verify.evidence,
-                    promoted_head_sha=verified_head_sha,
-                    promoted_tree_fingerprint=verified_tree_fingerprint,
-                )
-                if persisted_checkpoint is None:
-                    raise GitError(
-                        "promoted target did not exactly match the verified candidate tree; "
-                        "canonical checkpoint was not updated"
-                    )
-            assert staged_isolated is not None
-            finalized = _finalize_staged_isolated_merge_action(
-                config,
-                store,
-                git,
-                staged=staged_isolated,
-                merge_source=merge_source,
-                quiet_mechanics=quiet_mechanics,
-            )
-            created_followups = finalized.created_followups
-            reused_followups = finalized.reused_followups
-            created_deferred_blockers = finalized.created_deferred_blockers
-            reused_deferred_blockers = finalized.reused_deferred_blockers
+        except _IsolatedPromotionRollbackFailed as exc:
+            classification = _classify_isolated_promotion_rollback_failed(git, exc)
+            print(f"Error: {classification.block_reason}")
+            if classification.target_at_candidate:
+                promotion_warnings = (classification.block_reason,)
+            else:
+                rc = 1
+                result_status = classification.status
+                result_block_reason = classification.block_reason
         except GitError as exc:
-            print(f"Error finalizing isolated merge success: {exc}")
+            print(f"Error: isolated merge failed: {exc}")
             rc = 1
+            result_status = "isolated_merge_failed"
+            result_block_reason = str(exc)
+        if rc == 0:
+            if _merge_finalization_family_for_action(staged_isolated.merge_action_metadata) is not None:
+                promoted_target_sha = _ref_sha_for_merge_finalization_proof(git, target_branch) or _ref_sha_for_merge_finalization_proof(
+                    execution_git,
+                    target_branch,
+                )
+                if not promoted_target_sha:
+                    rc = 1
+                    result_status = "isolated_post_promotion_finalization_failed"
+                    result_block_reason = (
+                        "target was promoted but merge finalization proof failed: "
+                        f"could not prove promoted target ref {target_branch!r}"
+                    )
+                else:
+                    staged_isolated = replace(staged_isolated, promoted_target_sha=promoted_target_sha)
+            if rc == 0 and candidate_verify is not None:
+                try:
+                    if not verified_head_sha or not verified_tree_fingerprint:
+                        raise GitError(
+                            "promoted target could not prove exact candidate identity for canonical checkpoint update"
+                        )
+                    persisted_checkpoint = promote_candidate_integration_verify_evidence(
+                        store,
+                        evidence=candidate_verify.evidence,
+                        promoted_head_sha=verified_head_sha,
+                        promoted_tree_fingerprint=verified_tree_fingerprint,
+                    )
+                    if persisted_checkpoint is None:
+                        raise GitError(
+                            "promoted target did not exactly match the verified candidate tree; "
+                            "canonical checkpoint was not updated"
+                        )
+                except Exception as exc:
+                    checkpoint_failure = _post_merge_state_persistence_failed_result(
+                        exc=exc,
+                        status="isolated_post_promotion_checkpoint_persistence_failed",
+                        phase="isolated checkpoint persistence",
+                        created_followups=created_followups,
+                        reused_followups=reused_followups,
+                        created_investigation_task_ids=created_investigation_task_ids,
+                        reused_investigation_task_ids=reused_investigation_task_ids,
+                        created_deferred_blockers=created_deferred_blockers,
+                        reused_deferred_blockers=reused_deferred_blockers,
+                    )
+                    rc = checkpoint_failure.rc
+                    result_status = checkpoint_failure.status
+                    result_block_reason = checkpoint_failure.block_reason
+            if rc == 0:
+                finalized = _finalize_staged_isolated_merge_action(
+                    config,
+                    store,
+                    git,
+                    staged=staged_isolated,
+                    merge_source=merge_source,
+                    quiet_mechanics=quiet_mechanics,
+                )
+                created_followups = finalized.created_followups
+                reused_followups = finalized.reused_followups
+                created_deferred_blockers = finalized.created_deferred_blockers
+                reused_deferred_blockers = finalized.reused_deferred_blockers
+                if finalized.rc != 0:
+                    rc = finalized.rc
+                    result_status = finalized.status
+                    result_block_reason = finalized.block_reason
     elif rc == 0:
-        created_followups, reused_followups = _materialize_merge_followup_side_effects(
-            store,
-            config=config,
-            merge_subject=merge_subject,
-            review_task=review_task,
-            followup_findings=followup_findings,
-        )
+        resolved_merge_unit_id = resolved_subject.merge_unit_id if resolved_subject is not None else None
+        materialization_error = _materialize_mandatory_side_effects_before_state(final_authorized_action)
+        if materialization_error is not None:
+            return materialization_error
+        if (
+            final_authorized_action.get("pending_merge_finalization") is not True
+            and _merge_finalization_family_for_action(final_authorized_action) is not None
+        ):
+            try:
+                if previous_target_sha is None or not proof_source_ref or not proof_source_ref_sha:
+                    raise GitError("could not prove merge finalization source or previous target")
+                promoted_target_sha = _require_ref_sha_for_merge_finalization_proof(
+                    execution_git,
+                    target_branch,
+                    label="promoted target",
+                )
+                _persist_merge_finalization_attempt_proof_for_action(
+                    store,
+                    execution_git,
+                    merge_subject=merge_subject,
+                    action=final_authorized_action,
+                    target_branch=target_branch,
+                    previous_target_sha=previous_target_sha,
+                    promoted_target_sha=promoted_target_sha,
+                    promotion_kind=promotion_kind,
+                    promoted_target_tree_sha=(
+                        _require_ref_tree_sha_for_merge_finalization_proof(
+                            execution_git,
+                            promoted_target_sha,
+                            label="promoted target",
+                        )
+                        if promotion_kind == "squash"
+                        else None
+                    ),
+                    source_ref=proof_source_ref,
+                    source_ref_sha=proof_source_ref_sha,
+                    merge_unit_id=resolved_merge_unit_id,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            except Exception as exc:
+                return _post_merge_proof_persistence_failed_result(
+                    exc=exc,
+                    status="post_merge_proof_persistence_failed",
+                    phase="post-merge finalization proof persistence",
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_investigation_task_ids=created_investigation_task_ids,
+                    reused_investigation_task_ids=reused_investigation_task_ids,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+        try:
+            try:
+                _validate_pending_merge_finalization_proof_for_state(
+                    store,
+                    execution_git,
+                    merge_subject=merge_subject,
+                    action=final_authorized_action,
+                    target_branch=target_branch,
+                    merge_unit_id=resolved_merge_unit_id,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            except Exception as exc:
+                return _pending_merge_finalization_refusal_result(
+                    exc=exc,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_investigation_task_ids=created_investigation_task_ids,
+                    reused_investigation_task_ids=reused_investigation_task_ids,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            mark_merge_subject_merged(
+                store,
+                merge_subject=merge_subject,
+                merge_unit_id=resolved_merge_unit_id,
+                merge_source=effective_merge_source,
+            )
+        except Exception as exc:
+            return _post_merge_state_persistence_failed_result(
+                exc=exc,
+                status="post_merge_state_persistence_failed",
+                phase="post-merge state persistence",
+                created_followups=created_followups,
+                reused_followups=reused_followups,
+                created_investigation_task_ids=created_investigation_task_ids,
+                reused_investigation_task_ids=reused_investigation_task_ids,
+                created_deferred_blockers=created_deferred_blockers,
+                reused_deferred_blockers=reused_deferred_blockers,
+            )
     return _MergeActionResult(
         rc=rc,
         created_followups=created_followups,
@@ -3760,8 +5661,8 @@ def _execute_merge_action(
         reused_investigation_task_ids=reused_investigation_task_ids,
         created_deferred_blockers=created_deferred_blockers,
         reused_deferred_blockers=reused_deferred_blockers,
-        status=merge_result.status,
-        block_reason=merge_result.block_reason,
+        status=result_status,
+        block_reason=result_block_reason,
         promotion_warnings=promotion_warnings,
         candidate_verify=candidate_verify,
     )
@@ -3770,19 +5671,19 @@ def _execute_merge_action(
 def _advance_action_color(action_type: str) -> str:
     """Return a Rich color for an advance action type."""
     ac = _colors.WORK_COLORS
-    if action_type in {'merge', 'merge_with_followups'}:
+    if action_type in {"merge", "merge_with_followups"}:
         return ac.merge
     if action_type in (
-        'needs_rebase',
-        'reconcile_branch_divergence',
-        'awaiting_human',
-        'needs_discussion',
-        'max_cycles_reached',
-        'max_improve_attempts',
-        'automatic_recovery_disabled',
+        "needs_rebase",
+        "reconcile_branch_divergence",
+        "awaiting_human",
+        "needs_discussion",
+        "max_cycles_reached",
+        "max_improve_attempts",
+        "automatic_recovery_disabled",
     ):
         return ac.error
-    if action_type in ('skip', 'wait_review', 'wait_improve'):
+    if action_type in ("skip", "wait_review", "wait_improve"):
         return ac.waiting
     return ac.default
 
@@ -3827,35 +5728,38 @@ def cmd_advance(args: argparse.Namespace) -> int:
     _c_err = _ac.error
     _c_warn = _ac.waiting
     _c_default = _ac.default
+
     # Prefix for advance lines: "  #NNN " — compute available prompt width per task.
     def _prompt_avail(task_id: str | None) -> int:
         return prompt_available_width(prefix=len(task_id or "") + 4)  # "  #NNN "
     git = _git_from_runtime_context(config.project_dir, runtime_context)
 
     dry_run: bool = args.dry_run
-    auto: bool = getattr(args, 'auto', False)
-    max_tasks: int | None = getattr(args, 'max', None)
-    batch_limit: int | None = getattr(args, 'batch', None)
-    force: bool = getattr(args, 'force', False)
-    task_id: str | None = resolve_id(config, args.task_id) if getattr(args, 'task_id', None) is not None else None
-    plans_mode: bool = getattr(args, 'plans', False)
-    unimplemented_mode: bool = getattr(args, 'unimplemented', False)
-    create_mode: bool = getattr(args, 'create', False)
-    no_resume_failed: bool = getattr(args, 'no_resume_failed', False)
-    max_resume_attempts_override: int | None = getattr(args, 'max_resume_attempts', None)
-    advance_type: str | None = getattr(args, 'advance_type', None)
+    auto: bool = getattr(args, "auto", False)
+    max_tasks: int | None = getattr(args, "max", None)
+    batch_limit: int | None = getattr(args, "batch", None)
+    force: bool = getattr(args, "force", False)
+    task_id: str | None = resolve_id(config, args.task_id) if getattr(args, "task_id", None) is not None else None
+    plans_mode: bool = getattr(args, "plans", False)
+    unimplemented_mode: bool = getattr(args, "unimplemented", False)
+    create_mode: bool = getattr(args, "create", False)
+    no_resume_failed: bool = getattr(args, "no_resume_failed", False)
+    max_resume_attempts_override: int | None = getattr(args, "max_resume_attempts", None)
+    advance_type: str | None = getattr(args, "advance_type", None)
 
     # Determine effective max_resume_attempts
-    max_resume_attempts = max_resume_attempts_override if max_resume_attempts_override is not None else config.max_resume_attempts
+    max_resume_attempts = (
+        max_resume_attempts_override if max_resume_attempts_override is not None else config.max_resume_attempts
+    )
 
-    new_mode: bool = getattr(args, 'new', False)
+    new_mode: bool = getattr(args, "new", False)
 
-    max_review_cycles_override: int | None = getattr(args, 'max_review_cycles', None)
+    max_review_cycles_override: int | None = getattr(args, "max_review_cycles", None)
 
     if max_review_cycles_override is not None:
         config.max_review_cycles = max_review_cycles_override
 
-    squash_threshold_override: int | None = getattr(args, 'squash_threshold', None)
+    squash_threshold_override: int | None = getattr(args, "squash_threshold", None)
     if squash_threshold_override is not None:
         config.merge_squash_threshold = squash_threshold_override
 
@@ -3892,7 +5796,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # --unimplemented mode: list completed plans/explores without implementations
     # Legacy --plans is supported as an alias scoped to plans only.
     if unimplemented_mode or plans_mode:
-        unimplemented_types: tuple[str, ...] = ("plan",) if plans_mode and not unimplemented_mode else ("plan", "explore")
+        unimplemented_types: tuple[str, ...] = (
+            ("plan",) if plans_mode and not unimplemented_mode else ("plan", "explore")
+        )
         if plans_mode:
             print("Warning: --plans is deprecated. Use --unimplemented instead.", file=sys.stderr)
         return _cmd_advance_unimplemented(
@@ -3989,11 +5895,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if not task:
                 return phase1_error(args, f"Task {task_id} not found")
             explicit_task = task
-            if task.status == 'failed':
+            if task.status == "failed":
                 if no_resume_failed:
                     return phase1_error(args, f"Task {task_id} is not completed (status: {task.status})")
             else:
-                if task.status != 'completed':
+                if task.status != "completed":
                     return phase1_error(args, f"Task {task_id} is not completed (status: {task.status})")
             try:
                 target_branch = _resolve_advance_target_branch(store, git, task=task)
@@ -4007,14 +5913,27 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 warning_logger=logger,
             )
             if target_branch is not None:
-                if resolve_task_merge_state_for_target(
+                resolved_merge_state = resolve_task_merge_state_for_target(
                     store=store,
                     task=task,
                     git=git,
                     target_branch=target_branch,
-                ) == "merged":
+                )
+                pending_finalization_action = _pending_merge_finalization_action_for_advance(
+                    config,
+                    store,
+                    task,
+                    target_branch=target_branch,
+                    resolved_merge_state=resolved_merge_state,
+                    live_target_sha=_ref_sha_for_merge_finalization_proof(git, target_branch),
+                )
+                if (
+                    resolved_merge_state == "merged"
+                    and pending_finalization_action is None
+                ):
                     print(f"Task {task_id} is already merged")
                     return 0
+
             def _load_explicit_owner_rows() -> tuple[list[LineageOwnerRow], bool]:
                 owner_rows = list(
                     query_lineage_owner_rows(
@@ -4126,7 +6045,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
             owner_rows = _run_advance_owner_row_read_session(store, _load_all_owner_rows)
             if not no_resume_failed:
-                list_failed_tasks_for_recovery(store, warnings=failed_task_recovery_warnings, git=git, target_branch=target_branch)
+                list_failed_tasks_for_recovery(
+                    store, warnings=failed_task_recovery_warnings, git=git, target_branch=target_branch
+                )
             if no_resume_failed:
                 owner_rows = [
                     row
@@ -4163,9 +6084,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 include_pending=False,
             )
             recovery_preview_task_ids = {
-                entry.task.id
-                for entry in recovery_preview.recovery_entries
-                if entry.task.id is not None
+                entry.task.id for entry in recovery_preview.recovery_entries if entry.task.id is not None
             }
 
         # Use the currently checked-out branch as the target for conflict checks,
@@ -4177,7 +6096,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
         def _worker_args() -> argparse.Namespace:
             return argparse.Namespace(
-                no_docker=getattr(args, 'no_docker', False),
+                no_docker=getattr(args, "no_docker", False),
                 max_turns=None,
                 force=force,
             )
@@ -4220,7 +6139,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 return _create_plan_review_task(store, parent_task, config=config, trigger_source="manual")
 
             def _create_plan_improve_from_task(parent_task: DbTask, review_task: DbTask) -> DbTask:
-                return _create_plan_improve_task(store, parent_task, review_task, config=config, trigger_source="manual")
+                return _create_plan_improve_task(
+                    store, parent_task, review_task, config=config, trigger_source="manual"
+                )
 
             def _create_review_adjudication_from_task(
                 impl_task: DbTask,
@@ -4310,21 +6231,24 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     runtime_context=runtime_context,
                 ),
                 is_rebase_target_already_merged=(
-                    lambda t: resolve_post_merge_rebase_state(
-                        store,
-                        git,
-                        t,
-                        target_branch,
-                        merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
-                    ).already_merged
-                    if dry_run_mode
-                    else _resolve_and_persist_post_merge_rebase_state(
-                        store,
-                        git,
-                        t,
-                        target_branch,
-                        merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
-                    ).already_merged
+                    lambda t: (
+                        resolve_post_merge_rebase_state(
+                            store,
+                            git,
+                            t,
+                            target_branch,
+                            merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
+                        ).already_merged
+                        if dry_run_mode
+                        else _resolve_and_persist_post_merge_rebase_state(
+                            store,
+                            git,
+                            t,
+                            target_branch,
+                            config=config,
+                            merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
+                        ).already_merged
+                    )
                 ),
                 config=config,
                 git=git,
@@ -4345,7 +6269,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 ),
                 spawn_iterate_recovery=lambda task_obj, mode, prepared_task: _spawn_background_iterate_worker(
                     argparse.Namespace(
-                        no_docker=getattr(args, 'no_docker', False),
+                        no_docker=getattr(args, "no_docker", False),
                         force=force,
                     ),
                     config,
@@ -4403,9 +6327,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 use_iterate_for_needs_rebase=False,
                 can_spawn_worker=lambda _kind: effective_start_budget > 0,
                 no_worker_capacity_message=lambda worker_label: (
-                    f"SKIP: {capacity_message}"
-                    if effective_start_budget <= 0
-                    else f"SKIP: {capacity_message}"
+                    f"SKIP: {capacity_message}" if effective_start_budget <= 0 else f"SKIP: {capacity_message}"
                 ),
                 spawn_worker=_run_task_foreground,
                 spawn_resume_worker=_resume_task_foreground,
@@ -4551,13 +6473,33 @@ def cmd_advance(args: argparse.Namespace) -> int:
             task = store.get(task_id)
             if task is None:
                 return None, None, {"type": "needs_discussion", "description": f"SKIP: Task {task_id} disappeared"}
-            if target_branch is not None:
-                if resolve_task_merge_state_for_target(
+            resolved_merge_state = (
+                resolve_task_merge_state_for_target(
                     store=store,
                     task=task,
                     git=git,
                     target_branch=target_branch,
-                ) == "merged":
+                )
+                if target_branch is not None
+                else None
+            )
+            pending_finalization_action = (
+                _pending_merge_finalization_action_for_advance(
+                    config,
+                    store,
+                    task,
+                    target_branch=target_branch,
+                    resolved_merge_state=resolved_merge_state,
+                    live_target_sha=_ref_sha_for_merge_finalization_proof(git, target_branch),
+                )
+                if target_branch is not None
+                else None
+            )
+            if target_branch is not None:
+                if (
+                    resolved_merge_state == "merged"
+                    and pending_finalization_action is None
+                ):
                     return None, task, {"type": "merged", "description": "Merged"}
 
             def _load_rows() -> list[LineageOwnerRow]:
@@ -4589,15 +6531,30 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 apply_deferred_reconciliations=not dry_run,
             )
             if not rows and target_branch is not None:
-                if resolve_task_merge_state_for_target(
-                    store=store,
-                    task=task,
-                    git=git,
-                    target_branch=target_branch,
-                ) == "merged":
+                if (
+                    resolved_merge_state == "merged"
+                    and pending_finalization_action is None
+                ):
                     return None, task, {"type": "merged", "description": "Merged"}
             if not rows:
-                return None, task, {"type": "skip", "description": "SKIP: no eligible owner row remains"}
+                if target_branch is not None and pending_finalization_action is not None:
+                    rows = [
+                        LineageOwnerRow(
+                            owner_task=task,
+                            members=(task,),
+                            tree=None,
+                            lineage_status="skipped",
+                            next_action=pending_finalization_action,
+                            next_action_reason="pending merge finalization",
+                            unresolved_tasks=(task,),
+                            unresolved_leaf_summary=(),
+                            lifecycle_action_task=None,
+                            recovery_action_task=task if task.status == "failed" else None,
+                            recovery_leaf_task=task if task.status == "failed" else None,
+                        )
+                    ]
+                else:
+                    return None, task, {"type": "skip", "description": "SKIP: no eligible owner row remains"}
             row = rows[0]
             action_task = row.lifecycle_action_task or row.recovery_action_task or row.owner_task
             action = (
@@ -4626,7 +6583,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
             )[0]
             decision = reproject_selected_merge_actions(
                 [decision],
-                reproject_action=lambda item: determine_next_action(
+                reproject_action=lambda item: dict(item[2])
+                if item[2].get("pending_merge_finalization") is True
+                else determine_next_action(
                     config,
                     store,
                     git,
@@ -4640,7 +6599,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
             )[0]
             if classify_advance_action(decision.action) == "actionable" and not decision.selected:
                 selected_workers = max(0, effective_start_budget - decision.free_worker_slots)
-                if batch_limit is not None and effective_start_budget == batch_limit and selected_workers >= batch_limit:
+                if (
+                    batch_limit is not None
+                    and effective_start_budget == batch_limit
+                    and selected_workers >= batch_limit
+                ):
                     gated_description = f"batch limit reached ({selected_workers}/{batch_limit}), skipping"
                 else:
                     gated_description = f"{capacity_message}, skipping"
@@ -4655,7 +6618,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         def _execute_repeat_merge(
             task: DbTask,
             action: dict[str, Any],
-        ) -> tuple[str, str, dict[str, Any] | None, AdvanceActionExecutionResult | None]:
+        ) -> tuple[str, str, dict[str, Any] | None, _MergeActionResult | None]:
             prepared_merge_git = None
             prepared_merge_branch = None
             if isolated_merge_enabled:
@@ -4674,9 +6637,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     current_branch=actual_current_branch,
                     merge_git=prepared_merge_git,
                     merge_current_branch=prepared_merge_branch,
+                    already_merged_behavior=_already_merged_behavior_for_advance_action(action),
                     merge_source=MERGE_SOURCE_ADVANCE,
                     quiet_mechanics=True,
-            )
+                    active_scope_tags=normalize_tag_filters(tag_filters),
+                )
             if merge_result.rc == 0:
                 if target_branch == actual_current_branch:
                     main_verify = _check_main_integration_verify_with_git_env(
@@ -4687,24 +6652,70 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     )
                     if main_verify.merges_halted and main_verify.state.task.id is not None:
                         message = main_verify.state.alert_message or "main verify is red; merges halted"
-                        return "parked", f"merged; {message}", {
-                            "type": "needs_discussion",
-                            "description": f"SKIP: {message}",
-                            "needs_attention_reason": MAIN_INTEGRATION_VERIFY_REASON,
-                            "subject_task_id": main_verify.state.task.id,
-                        }, None
-                return "success", "merged", None, None
+                        return (
+                            "parked",
+                            f"merged; {message}",
+                            {
+                                "type": "needs_discussion",
+                                "description": f"SKIP: {message}",
+                                "needs_attention_reason": MAIN_INTEGRATION_VERIFY_REASON,
+                                "subject_task_id": main_verify.state.task.id,
+                            },
+                            merge_result,
+                        )
+                return "success", "merged", None, merge_result
             if getattr(merge_result, "status", None) in {
                 "blocked_candidate_verify",
                 "blocked_candidate_verify_unavailable",
             }:
                 candidate_message = format_blocked_candidate_verify_message(str(task.id), merge_result)
-                return "parked", candidate_message, {
-                    "type": "needs_discussion",
-                    "description": f"SKIP: {candidate_message}",
-                    "needs_attention_reason": "blocked-candidate-verify",
-                    "subject_task_id": task.id,
-                }, None
+                return (
+                    "parked",
+                    candidate_message,
+                    {
+                        "type": "needs_discussion",
+                        "description": f"SKIP: {candidate_message}",
+                        "needs_attention_reason": "blocked-candidate-verify",
+                        "subject_task_id": task.id,
+                    },
+                    None,
+                )
+            if getattr(merge_result, "status", None) in {
+                "deferred_blocker_materialization_failed",
+                "merge_side_effect_materialization_failed",
+                "isolated_merge_failed",
+                "isolated_post_promotion_finalization_failed",
+                "isolated_post_promotion_rollback_failed",
+                "isolated_promotion_rollback_failed_target_uncertain",
+                "isolated_post_promotion_checkpoint_persistence_failed",
+                "isolated_post_promotion_proof_persistence_failed",
+                "isolated_post_promotion_merge_state_finalization_failed",
+                "post_merge_proof_persistence_failed",
+                "post_merge_state_persistence_failed",
+                "already_merged_proof_persistence_failed",
+                "already_merged_state_persistence_failed",
+            }:
+                if getattr(merge_result, "status", None) == "isolated_merge_failed":
+                    return (
+                        "error",
+                        (
+                            "isolated merge promotion failed: "
+                            f"{getattr(merge_result, 'block_reason', None) or 'promotion failed'}"
+                        ),
+                        None,
+                        merge_result,
+                    )
+                return "error", getattr(merge_result, "block_reason", None) or "merge finalization failed", None, merge_result
+            if is_pre_promotion_merge_refusal_status(getattr(merge_result, "status", None)):
+                return "error", getattr(merge_result, "block_reason", None) or "merge refused before target promotion", None, merge_result
+            if is_pending_merge_finalization_refusal_status(getattr(merge_result, "status", None)):
+                return (
+                    "error",
+                    getattr(merge_result, "block_reason", None)
+                    or "pending merge finalization refused before state finalization",
+                    None,
+                    merge_result,
+                )
             resolved_subject = (
                 _resolve_merge_subject(store, git, task.id, target_branch=target_branch)
                 if task.id is not None
@@ -4719,11 +6730,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     else:
                         git.reset_hard_head()
                 except GitError as cleanup_error:
-                    return "error", (
-                        f"cleanup failed after merge conflict: {cleanup_error}. Manual intervention required."
-                    ), None, None
+                    return (
+                        "error",
+                        (f"cleanup failed after merge conflict: {cleanup_error}. Manual intervention required."),
+                        None,
+                        None,
+                    )
                 return "needs_rebase", "merge conflict routed to rebase", None, None
-            return "error", getattr(merge_result, "block_reason", None) or "merge failed", None, None
+            return "error", getattr(merge_result, "block_reason", None) or "merge failed", None, merge_result
 
         def _cmd_advance_repeat() -> int:
             assert task_id is not None
@@ -4793,8 +6807,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         print(f"cycle {cycle}: {action_type} -> parked: {message}")
                         print(f"Advance repeat parked: {message}")
                         return 0
-                    outcome, message, merge_attention_action, routed_exec_result = _execute_repeat_merge(action_task, action)
+                    outcome, message, merge_attention_action, merge_result = _execute_repeat_merge(action_task, action)
                     print(f"cycle {cycle}: {action_type} -> {outcome}: {message}")
+                    if merge_result is not None:
+                        _print_advance_deferred_blocker_lines(console, merge_result, indent="  ")
                     if merge_attention_action is not None:
                         print(f"Advance repeat parked: {merge_attention_action['description']}")
                         return 0
@@ -4803,12 +6819,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     signature_after = _repeat_state_signature(task_id)
                     refreshed_subject = store.get(task_id)
                     if refreshed_subject is not None and target_branch is not None:
-                        if resolve_task_merge_state_for_target(
-                            store=store,
-                            task=refreshed_subject,
-                            git=git,
-                            target_branch=target_branch,
-                        ) == "merged":
+                        if (
+                            resolve_task_merge_state_for_target(
+                                store=store,
+                                task=refreshed_subject,
+                                git=git,
+                                target_branch=target_branch,
+                            )
+                            == "merged"
+                        ):
                             print(f"Advance repeat completed: {task_id} merged")
                             return 0
                 else:
@@ -4832,12 +6851,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         return 0
                     refreshed_subject = store.get(task_id)
                     if refreshed_subject is not None and target_branch is not None:
-                        if resolve_task_merge_state_for_target(
-                            store=store,
-                            task=refreshed_subject,
-                            git=git,
-                            target_branch=target_branch,
-                        ) == "merged":
+                        if (
+                            resolve_task_merge_state_for_target(
+                                store=store,
+                                task=refreshed_subject,
+                                git=git,
+                                target_branch=target_branch,
+                            )
+                            == "merged"
+                        ):
                             print(f"Advance repeat completed: {task_id} merged")
                             return 0
 
@@ -5033,7 +7055,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
         if main_verify_attention is None:
             execution_decisions = reproject_selected_merge_actions(
                 execution_decisions,
-                reproject_action=lambda item: determine_next_action(
+                reproject_action=lambda item: dict(item[2])
+                if item[2].get("pending_merge_finalization") is True
+                else determine_next_action(
                     config,
                     store,
                     git,
@@ -5054,10 +7078,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     (row, task, action, _gated_lifecycle_skip_message(free_worker_slots=decision.free_worker_slots))
                 )
                 continue
-            if (
-                main_verify_attention is not None
-                and action["type"] in {"merge", "merge_with_followups"}
-            ):
+            if main_verify_attention is not None and action["type"] in {"merge", "merge_with_followups"}:
                 continue
             description = action["description"]
             if action["type"] in {"merge", "merge_with_followups"} and dry_run:
@@ -5100,7 +7121,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         display_task = row.owner_task
                         prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
                         console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                        _color = _advance_action_color(action['type'])
+                        _color = _advance_action_color(action["type"])
                         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
                     for row, _task, _action, description in preview_gated_rows:
                         display_task = row.owner_task
@@ -5119,7 +7140,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     display_task = row.owner_task
                     prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
                     console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                    _color = _advance_action_color(action['type'])
+                    _color = _advance_action_color(action["type"])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
                 for row, _task, _action, description in preview_gated_rows:
                     display_task = row.owner_task
@@ -5165,7 +7186,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     display_task = row.owner_task
                     prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
                     console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                    _color = _advance_action_color(action['type'])
+                    _color = _advance_action_color(action["type"])
                     console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
                     print()
                 for row, _task, _action, description in preview_gated_rows:
@@ -5178,7 +7199,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     console.print(f"      [{_c_warn}]— {description}[/{_c_warn}]")
                     print()
             if new_mode and batch_limit is not None:
-                planned_workers = count_worker_consuming_actions([action for _, _, action, _ in preview_actionable_rows])
+                planned_workers = count_worker_consuming_actions(
+                    [action for _, _, action, _ in preview_actionable_rows]
+                )
                 remaining = max(0, effective_start_budget - planned_workers)
                 if remaining > 0:
                     pending_tasks = get_runnable_pending_tasks(
@@ -5245,7 +7268,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             except (EOFError, KeyboardInterrupt):
                 print()
                 return 0
-            if answer not in ('', 'y', 'yes'):
+            if answer not in ("", "y", "yes"):
                 print("Aborted.")
                 return 0
 
@@ -5317,7 +7340,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         assert task.id is not None
         display_task = row.owner_task
         prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
-        action_type = action['type']
+        action_type = action["type"]
 
         if classify_advance_action(action) != "actionable":
             console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
@@ -5344,11 +7367,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
         _color = _advance_action_color(action_type)
         console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
 
-        if action_type in {'merge', 'merge_with_followups'}:
+        if action_type in {"merge", "merge_with_followups"}:
             if merge_halt_attention is not None:
-                console.print(
-                    f"      [{_c_warn}]SKIP: {merge_halt_attention['description'][6:]}[/{_c_warn}]"
-                )
+                console.print(f"      [{_c_warn}]SKIP: {merge_halt_attention['description'][6:]}[/{_c_warn}]")
                 skip_count += 1
                 print()
                 continue
@@ -5370,7 +7391,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     current_branch=actual_current_branch,
                     merge_git=prepared_merge_git,
                     merge_current_branch=prepared_merge_branch,
+                    already_merged_behavior=_already_merged_behavior_for_advance_action(action),
                     merge_source=MERGE_SOURCE_ADVANCE,
+                    active_scope_tags=normalize_tag_filters(tag_filters),
                 )
             if merge_result.created_followups:
                 created_ids = ", ".join(str(t.id) for t in merge_result.created_followups if t.id is not None)
@@ -5378,6 +7401,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if merge_result.reused_followups:
                 reused_ids = ", ".join(str(t.id) for t in merge_result.reused_followups if t.id is not None)
                 console.print(f"      [{_c_warn}]↺ Reused follow-up task(s): {reused_ids}[/{_c_warn}]")
+            _print_advance_deferred_blocker_lines(console, merge_result)
             created_investigation_task_ids = getattr(merge_result, "created_investigation_task_ids", ())
             reused_investigation_task_ids = getattr(merge_result, "reused_investigation_task_ids", ())
             if created_investigation_task_ids:
@@ -5426,15 +7450,49 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     skip_count += 1
                     print()
                     continue
+                if getattr(merge_result, "status", None) in {
+                    "deferred_blocker_materialization_failed",
+                    "merge_side_effect_materialization_failed",
+                    "isolated_merge_failed",
+                    "isolated_post_promotion_finalization_failed",
+                    "isolated_post_promotion_rollback_failed",
+                    "isolated_promotion_rollback_failed_target_uncertain",
+                    "isolated_post_promotion_checkpoint_persistence_failed",
+                    "isolated_post_promotion_proof_persistence_failed",
+                    "isolated_post_promotion_merge_state_finalization_failed",
+                    "post_merge_proof_persistence_failed",
+                    "post_merge_state_persistence_failed",
+                    "already_merged_proof_persistence_failed",
+                    "already_merged_state_persistence_failed",
+                }:
+                    block_reason = getattr(merge_result, "block_reason", None) or "merge finalization failed"
+                    if getattr(merge_result, "status", None) == "isolated_merge_failed":
+                        block_reason = f"isolated merge promotion failed: {block_reason}"
+                    console.print(
+                        f"      [{_c_err}]✗ {block_reason}[/{_c_err}]"
+                    )
+                    error_count += 1
+                    continue
+                if is_pre_promotion_merge_refusal_status(getattr(merge_result, "status", None)):
+                    block_reason = getattr(merge_result, "block_reason", None) or "merge refused before target promotion"
+                    console.print(f"      [{_c_err}]✗ {block_reason}[/{_c_err}]")
+                    error_count += 1
+                    continue
+                if is_pending_merge_finalization_refusal_status(getattr(merge_result, "status", None)):
+                    block_reason = (
+                        getattr(merge_result, "block_reason", None)
+                        or "pending merge finalization refused before state finalization"
+                    )
+                    console.print(f"      [{_c_err}]✗ {block_reason}[/{_c_err}]")
+                    error_count += 1
+                    continue
                 resolved_subject = (
                     _resolve_merge_subject(store, git, task.id, target_branch=target_branch)
                     if task.id is not None
                     else None
                 )
                 conflict_ref = resolved_subject.merge_source_ref if resolved_subject is not None else task.branch
-                conflict_detected = (
-                    conflict_ref is not None and not git.can_merge(conflict_ref, target_branch)
-                )
+                conflict_detected = conflict_ref is not None and not git.can_merge(conflict_ref, target_branch)
                 if conflict_detected:
                     console.print(f"      [{_c_warn}]! Merge had conflicts against '{target_branch}'[/{_c_warn}]")
                     try:
@@ -5456,9 +7514,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         context=action_context,
                     )
                     if exec_result.success_message:
-                        exec_result.success_message = (
-                            f"{exec_result.success_message} (target: {target_branch})"
-                        )
+                        exec_result.success_message = f"{exec_result.success_message} (target: {target_branch})"
                     _render_worker_action_result(task, display_task, action_type, exec_result)
                 else:
                     console.print(f"      [{_c_err}]✗ Merge failed[/{_c_err}]")
@@ -5490,7 +7546,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 break
             if _advance_uses_iterate(config) and pt.task_type == "implement":
                 iterate_args = argparse.Namespace(
-                    no_docker=getattr(args, 'no_docker', False),
+                    no_docker=getattr(args, "no_docker", False),
                     force=force,
                 )
                 rc = _spawn_prepared_background_iterate(

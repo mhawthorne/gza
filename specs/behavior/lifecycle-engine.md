@@ -723,6 +723,12 @@ failure *and* actionable merge/review work remains eligible for the latter.
   [00-overview.md](00-overview.md#vocabulary-the-data-model-abstractly). Pending,
   in-progress, and failed representatives MUST be rejected even when their owning merge
   unit is unmerged.
+- Automated merge execution MUST distinguish pre-promotion source/proof refusals from
+  post-promotion proof or state failures. If the authorized source ref is unavailable,
+  pre-merge proof cannot be established, or the source ref changes after mandatory
+  child materialization but before merge, `advance`, `repeat`, and `watch` MUST report
+  that the target is unchanged, preserve any created or reused child IDs in output, and
+  MUST NOT invoke conflict assessment or create a rebase child.
 - Manual `gza merge` retains a narrower human-override path than automation. Automated
   lifecycle actions (`advance`/`watch`) MUST still merge only review-cleared work under
   the rules above; they MUST NOT auto-merge `CHANGES_REQUESTED` reviews by deferring

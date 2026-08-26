@@ -29,6 +29,7 @@ from .. import colors as _colors, lineage
 from ..advance_engine import (
     _resolve_and_persist_post_merge_rebase_state,
     _resolve_current_merge_source,
+    pending_merge_finalization_action,
 )
 from ..canonical_checkout import (
     CANONICAL_CHECKOUT_ATTENTION_REASON,
@@ -132,6 +133,7 @@ from ..recovery_transients import (
     classify_transient_recovery_terminal,
     compute_transient_recovery_backoff_seconds,
 )
+from ..review_tasks import CappedReviewBlockerMaterializationError, FollowupMaterializationError
 from ..runner import (
     LongPhaseHeartbeat,
     LongPhaseProgress,
@@ -256,11 +258,15 @@ from .execution import _spawn_background_iterate
 from .git_ops import (
     _blocked_candidate_verify_attention_key,
     _candidate_verify_promotion_proof,
+    _classify_isolated_promotion_rollback_failed,
     _collect_advance_completed_tasks as _git_ops_collect_advance_completed_tasks,
     _execute_merge_action,
     _finalize_staged_isolated_merge_action,
+    _IsolatedPromotionRollbackFailed,
+    _materialize_max_cycle_deferred_blockers_for_staged_action,
     _merge_single_task as _git_ops_merge_single_task,
     _MergeActionResult,
+    _persist_merge_finalization_prepared_attempt_for_action,
     _prepare_create_review_action,
     _promote_isolated_merge_to_target_branch,
     _reconcile_diverged_branch_with_origin,
@@ -271,6 +277,8 @@ from .git_ops import (
     cleanup_failed_merge_checkout,
     ensure_watch_main_checkout,
     format_blocked_candidate_verify_message,
+    is_pending_merge_finalization_refusal_status,
+    is_pre_promotion_merge_refusal_status,
 )
 from .query import _resolve_incomplete_owner_task
 
@@ -1941,7 +1949,9 @@ def _maybe_file_main_verify_remediation(
     check: MainIntegrationVerifyCheck,
     return_result: bool = False,
 ) -> MainIntegrationVerifyState | _MainVerifyRemediationFileResult | None:
-    def _return(result: _MainVerifyRemediationFileResult) -> MainIntegrationVerifyState | _MainVerifyRemediationFileResult | None:
+    def _return(
+        result: _MainVerifyRemediationFileResult,
+    ) -> MainIntegrationVerifyState | _MainVerifyRemediationFileResult | None:
         return result if return_result else result.refreshed_state
 
     remediation = getattr(check, "remediation", None)
@@ -2323,6 +2333,21 @@ def _maybe_repair_target_already_merged_skip(
     owner_effective_state = effective_no_work_merge_state(owner_task, merge_unit.state)
     if merge_state_is_terminal_for_lifecycle(owner_effective_state):
         return False
+    pending_finalization_action = _watch_pending_merge_finalization_action(
+        config=None,
+        store=store,
+        task=task,
+        target_branch=target_branch,
+        resolved_merge_state="merged",
+        live_target_sha=_watch_ref_sha_if_available(git, target_branch),
+    )
+    if pending_finalization_action is not None:
+        if pending_finalization_action.get("type") == "needs_attention":
+            log.emit(
+                "ERROR",
+                f"{display_task.id}: {pending_finalization_action.get('description')}",
+            )
+        return False
 
     repaired = reconcile_task_branch_merge_truth(
         store,
@@ -2339,6 +2364,56 @@ def _maybe_repair_target_already_merged_skip(
         )
         return True
     return False
+
+
+def _watch_pending_merge_finalization_action(
+    *,
+    config: Config | None,
+    store: SqliteTaskStore,
+    task: DbTask,
+    target_branch: str,
+    resolved_merge_state: str | None,
+    live_target_sha: str | None = None,
+) -> dict[str, Any] | None:
+    return pending_merge_finalization_action(
+        config,
+        store,
+        task,
+        target_branch=target_branch,
+        require_already_merged=True,
+        resolved_merge_state=resolved_merge_state,
+        live_target_sha=live_target_sha,
+    )
+
+
+def _watch_ref_sha_if_available(git: Git, ref: str | None) -> str | None:
+    if not ref:
+        return None
+    rev_parse_if_exists = getattr(git, "rev_parse_if_exists", None)
+    value = rev_parse_if_exists(ref) if callable(rev_parse_if_exists) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _watch_resolve_already_merged_state_for_pending_finalization(
+    *,
+    git: Git,
+    task: DbTask,
+    target_branch: str,
+) -> str | None:
+    if not task.branch:
+        return None
+    try:
+        merge_source = _resolve_current_merge_source(git, task.branch)
+    except Exception:
+        return None
+    if merge_source.warning or not merge_source.ref:
+        return None
+    try:
+        if git.is_merged(merge_source.ref, into=target_branch):
+            return "merged"
+    except GitError:
+        return None
+    return None
 
 
 def _watch_needs_attention_message(task: DbTask, action: dict) -> str:
@@ -4381,6 +4456,86 @@ class _WatchBatchStagedMerge:
     staged: _StagedIsolatedMergeAction
 
 
+def _emit_staged_deferred_blocker_follow_lines(
+    log: "_WatchLog",
+    staged_entry: _WatchBatchStagedMerge,
+    *,
+    emitted_task_ids: set[str] | None = None,
+) -> bool:
+    def should_emit(task_id: str) -> bool:
+        if emitted_task_ids is None:
+            return True
+        if task_id in emitted_task_ids:
+            return False
+        emitted_task_ids.add(task_id)
+        return True
+
+    created_work = False
+    for followup_task in getattr(staged_entry.staged, "created_followups", ()):
+        if not should_emit(str(followup_task.id)):
+            continue
+        log.emit(
+            "FOLLOW",
+            _format_follow_line(str(followup_task.id), str(staged_entry.display_task.id), reused=False),
+        )
+        created_work = True
+    for followup_task in getattr(staged_entry.staged, "reused_followups", ()):
+        if not should_emit(str(followup_task.id)):
+            continue
+        log.emit(
+            "FOLLOW",
+            _format_follow_line(str(followup_task.id), str(staged_entry.display_task.id), reused=True),
+        )
+    for blocker_task in getattr(staged_entry.staged, "created_deferred_blockers", ()):
+        if not should_emit(str(blocker_task.id)):
+            continue
+        log.emit(
+            "FOLLOW",
+            _format_follow_line(str(blocker_task.id), str(staged_entry.display_task.id), reused=False),
+        )
+        created_work = True
+    for blocker_task in getattr(staged_entry.staged, "reused_deferred_blockers", ()):
+        if not should_emit(str(blocker_task.id)):
+            continue
+        log.emit(
+            "FOLLOW",
+            _format_follow_line(str(blocker_task.id), str(staged_entry.display_task.id), reused=True),
+        )
+    for investigation_task_id in getattr(staged_entry.staged, "created_investigation_task_ids", ()):
+        if not should_emit(str(investigation_task_id)):
+            continue
+        log.emit(
+            "FOLLOW",
+            _format_follow_line(
+                str(investigation_task_id), str(staged_entry.display_task.id), reused=False, investigation=True
+            ),
+        )
+        created_work = True
+    for investigation_task_id in getattr(staged_entry.staged, "reused_investigation_task_ids", ()):
+        if not should_emit(str(investigation_task_id)):
+            continue
+        log.emit(
+            "FOLLOW",
+            _format_follow_line(
+                str(investigation_task_id), str(staged_entry.display_task.id), reused=True, investigation=True
+            ),
+        )
+    return created_work
+
+
+def _emit_staged_batch_deferred_blocker_follow_lines(
+    log: "_WatchLog",
+    staged_batch: Iterable[_WatchBatchStagedMerge],
+    *,
+    emitted_task_ids: set[str] | None = None,
+) -> bool:
+    created_work = False
+    for staged_entry in staged_batch:
+        if _emit_staged_deferred_blocker_follow_lines(log, staged_entry, emitted_task_ids=emitted_task_ids):
+            created_work = True
+    return created_work
+
+
 @dataclass(frozen=True)
 class _CandidateReworkBatchContext:
     green_prefix: tuple[tuple[str, str | None], ...]
@@ -4848,6 +5003,7 @@ def _run_isolated_merge_batch(
         threshold_seconds=config.watch.long_phase_threshold_seconds,
         interval_seconds=config.watch.heartbeat_interval_seconds,
     )
+    emitted_follow_task_ids: set[str] = set()
 
     def _restore_isolated_checkout_to_tip(tip: str) -> None:
         try:
@@ -4896,6 +5052,7 @@ def _run_isolated_merge_batch(
                     heartbeat_threshold_seconds=config.watch.long_phase_threshold_seconds,
                     heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
                     on_heartbeat=heartbeat,
+                    active_scope_tags=tags,
                 )
             finally:
                 _finish_watch_merge_heartbeat(heartbeat)
@@ -4930,6 +5087,12 @@ def _run_isolated_merge_batch(
                     log.emit("FOLLOW", _format_follow_line(str(rework_task.id), str(display_task.id), reused=False))
                 return reconciled_work_done, False, None
             if stage_status == "already_merged":
+                if _emit_merge_result_follow_lines(
+                    log,
+                    staged_result,
+                    source_task_id=str(display_task.id),
+                ):
+                    reconciled_work_done = True
                 if merge_event is not None:
                     merge_status_after = (_task_snapshot(store).get(merge_event.display_task_id) or {}).get(
                         "merge_status"
@@ -4982,6 +5145,19 @@ def _run_isolated_merge_batch(
                     and rebase_route.assessment.reason == "branch already merged"
                     and task.id is not None
                 ):
+                    if _watch_pending_merge_finalization_action(
+                        config=config,
+                        store=store,
+                        task=task,
+                        target_branch=target_branch,
+                        resolved_merge_state="merged",
+                        live_target_sha=_watch_ref_sha_if_available(git, target_branch),
+                    ) is not None:
+                        log.emit(
+                            "SKIP",
+                            f"{display_task.id}: branch already merged; pending merge finalization will replay",
+                        )
+                        return reconciled_work_done, False, None
                     repaired = reconcile_task_branch_merge_truth(
                         store,
                         git,
@@ -5100,10 +5276,154 @@ def _run_isolated_merge_batch(
                 merge_result=synthetic_result,
             )
             return reconciled_work_done, False, None
-        warnings = _run_with_optional_stdout_suppressed(
-            quiet,
-            lambda: _promote_isolated_merge_to_target_branch(git, merge_git, target_branch),
+        materialized_batch: list[_WatchBatchStagedMerge] = []
+        for staged_entry in staged_batch:
+            partial_staged = staged_entry.staged
+            try:
+                materialized_staged = _materialize_max_cycle_deferred_blockers_for_staged_action(
+                    store,
+                    config=config,
+                    staged=staged_entry.staged,
+                    active_scope_tags=tags,
+                    trigger_source=MERGE_SOURCE_WATCH,
+                )
+                partial_staged = materialized_staged
+                action_metadata = materialized_staged.merge_action_metadata
+                if (
+                    action_metadata.get("pending_merge_finalization") is not True
+                    and (
+                        action_metadata.get("type") == "merge_with_followups"
+                        or (
+                            action_metadata.get("type") == "merge"
+                            and action_metadata.get("max_cycles_merge_and_defer") is True
+                        )
+                    )
+                ):
+                    source_ref = materialized_staged.source_ref or materialized_staged.merge_branch
+                    source_ref_sha = _watch_ref_sha_if_available(merge_git, source_ref) or _watch_ref_sha_if_available(
+                        git,
+                        source_ref,
+                    )
+                    previous_target_sha = _watch_ref_sha_if_available(git, target_branch) or _watch_ref_sha_if_available(
+                        merge_git,
+                        target_branch,
+                    )
+                    if not source_ref or not source_ref_sha or not previous_target_sha:
+                        raise GitError("could not prove isolated merge finalization source or previous target")
+                    _persist_merge_finalization_prepared_attempt_for_action(
+                        store,
+                        merge_subject=materialized_staged.merge_subject,
+                        action=materialized_staged.merge_action_metadata,
+                        target_branch=materialized_staged.target_branch,
+                        previous_target_sha=previous_target_sha,
+                        source_ref=source_ref,
+                        source_ref_sha=source_ref_sha,
+                        merge_unit_id=materialized_staged.merge_unit_id,
+                        created_followups=materialized_staged.created_followups,
+                        reused_followups=materialized_staged.reused_followups,
+                        created_deferred_blockers=materialized_staged.created_deferred_blockers,
+                        reused_deferred_blockers=materialized_staged.reused_deferred_blockers,
+                    )
+                    materialized_staged = replace(
+                        materialized_staged,
+                        source_ref=source_ref,
+                        source_ref_sha=source_ref_sha,
+                        previous_target_sha=previous_target_sha,
+                    )
+            except Exception as exc:
+                partial_created = tuple(getattr(exc, "created", ()))
+                partial_reused = tuple(getattr(exc, "reused", ()))
+                if isinstance(exc, FollowupMaterializationError) and (partial_created or partial_reused):
+                    partial_staged = replace(
+                        partial_staged,
+                        created_followups=(
+                            *tuple(partial_staged.created_followups),
+                            *partial_created,
+                        ),
+                        reused_followups=(
+                            *tuple(partial_staged.reused_followups),
+                            *partial_reused,
+                        ),
+                    )
+                    debt_label = "ordinary follow-up materialization"
+                elif isinstance(exc, CappedReviewBlockerMaterializationError) and (partial_created or partial_reused):
+                    partial_staged = replace(
+                        partial_staged,
+                        created_deferred_blockers=(
+                            *tuple(partial_staged.created_deferred_blockers),
+                            *partial_created,
+                        ),
+                        reused_deferred_blockers=(
+                            *tuple(partial_staged.reused_deferred_blockers),
+                            *partial_reused,
+                        ),
+                    )
+                    debt_label = "max-cycle deferred blocker materialization"
+                elif isinstance(exc, FollowupMaterializationError):
+                    debt_label = "ordinary follow-up materialization"
+                elif isinstance(exc, CappedReviewBlockerMaterializationError):
+                    debt_label = "max-cycle deferred blocker materialization"
+                else:
+                    debt_label = "merge finalization prepared-attempt persistence"
+                failed_entry = replace(staged_entry, staged=partial_staged)
+                for prior_entry in materialized_batch:
+                    if _emit_staged_deferred_blocker_follow_lines(
+                        log, prior_entry, emitted_task_ids=emitted_follow_task_ids
+                    ):
+                        reconciled_work_done = True
+                if _emit_staged_deferred_blocker_follow_lines(
+                    log, failed_entry, emitted_task_ids=emitted_follow_task_ids
+                ):
+                    reconciled_work_done = True
+                log.emit(
+                    "ERROR",
+                    (
+                        f"{staged_entry.display_task.id}: {debt_label} failed: "
+                        f"{exc}; stopping isolated merge batch"
+                    ),
+                )
+                return reconciled_work_done, False, None
+            materialized_batch.append(replace(staged_entry, staged=materialized_staged))
+        staged_batch = materialized_batch
+        try:
+            warnings = _run_with_optional_stdout_suppressed(
+                quiet,
+                lambda: _promote_isolated_merge_to_target_branch(git, merge_git, target_branch),
+            )
+        except _IsolatedPromotionRollbackFailed as exc:
+            if _emit_staged_batch_deferred_blocker_follow_lines(
+                log, staged_batch, emitted_task_ids=emitted_follow_task_ids
+            ):
+                reconciled_work_done = True
+            classification = _classify_isolated_promotion_rollback_failed(git, exc)
+            if classification.target_at_candidate:
+                warnings = (classification.block_reason,)
+            else:
+                log.emit(
+                    "ERROR",
+                    f"{classification.block_reason}; stopping isolated merge batch",
+                )
+                return reconciled_work_done, False, None
+        except Exception as exc:
+            if _emit_staged_batch_deferred_blocker_follow_lines(
+                log, staged_batch, emitted_task_ids=emitted_follow_task_ids
+            ):
+                reconciled_work_done = True
+            log.emit(
+                "ERROR",
+                f"isolated merge batch promotion failed: {exc}; stopping isolated merge batch",
+            )
+            return reconciled_work_done, False, None
+        promoted_target_sha = _watch_ref_sha_if_available(git, target_branch) or _watch_ref_sha_if_available(
+            merge_git,
+            target_branch,
         )
+        if promoted_target_sha is not None:
+            staged_batch = [
+                replace(entry, staged=replace(entry.staged, promoted_target_sha=promoted_target_sha))
+                for entry in staged_batch
+            ]
+        reconciled_work_done = True
         for rebase_dispatch in batch_conflict_rebases:
             dispatch_result = _dispatch_isolated_merge_conflict_rebase(
                 display_task=rebase_dispatch.display_task,
@@ -5124,48 +5444,82 @@ def _run_isolated_merge_batch(
                 reconciled_work_done = True
         assert proof.verified_head_sha is not None
         assert proof.verified_tree_fingerprint is not None
-        persisted = promote_candidate_integration_verify_evidence(
-            store,
-            evidence=combined_candidate.evidence,
-            promoted_head_sha=proof.verified_head_sha,
-            promoted_tree_fingerprint=proof.verified_tree_fingerprint,
-        )
-        if persisted is None:
-            raise GitError("promoted target did not exactly match the verified candidate tree")
+        try:
+            persisted = promote_candidate_integration_verify_evidence(
+                store,
+                evidence=combined_candidate.evidence,
+                promoted_head_sha=proof.verified_head_sha,
+                promoted_tree_fingerprint=proof.verified_tree_fingerprint,
+            )
+            if persisted is None:
+                raise GitError("promoted target did not exactly match the verified candidate tree")
+        except Exception as exc:
+            if _emit_staged_batch_deferred_blocker_follow_lines(
+                log, staged_batch, emitted_task_ids=emitted_follow_task_ids
+            ):
+                reconciled_work_done = True
+            log.emit(
+                "ERROR",
+                (
+                    "isolated merge batch checkpoint persistence failed after target promotion: "
+                    f"{exc}; mandatory work preserved"
+                ),
+            )
+            return reconciled_work_done, False, None
         for warning in warnings:
             log.emit("WARN", warning)
         for staged_entry in staged_batch:
-            finalized = _finalize_staged_isolated_merge_action(
-                config,
-                store,
-                git,
-                staged=staged_entry.staged,
-                merge_source=MERGE_SOURCE_WATCH,
-                quiet_mechanics=True,
+            try:
+                finalized = _finalize_staged_isolated_merge_action(
+                    config,
+                    store,
+                    git,
+                    staged=staged_entry.staged,
+                    merge_source=MERGE_SOURCE_WATCH,
+                    quiet_mechanics=True,
+                )
+            except Exception as exc:
+                finalized = _MergeActionResult(
+                    rc=1,
+                    created_followups=list(staged_entry.staged.created_followups),
+                    reused_followups=list(staged_entry.staged.reused_followups),
+                    created_investigation_task_ids=list(staged_entry.staged.created_investigation_task_ids),
+                    reused_investigation_task_ids=list(staged_entry.staged.reused_investigation_task_ids),
+                    created_deferred_blockers=list(staged_entry.staged.created_deferred_blockers),
+                    reused_deferred_blockers=list(staged_entry.staged.reused_deferred_blockers),
+                    status="isolated_post_promotion_proof_persistence_failed",
+                    block_reason=(
+                        "isolated merge finalization failed after target was already changed: "
+                        f"{exc}; automatic replay cannot be promised; operator attention required"
+                    ),
+                )
+            if getattr(finalized, "rc", 0) != 0:
+                if _emit_staged_deferred_blocker_follow_lines(
+                    log, staged_entry, emitted_task_ids=emitted_follow_task_ids
+                ):
+                    reconciled_work_done = True
+                log.emit(
+                    "ERROR",
+                    (
+                        f"{staged_entry.display_task.id}: isolated merge batch finalization failed "
+                        f"after target promotion: {finalized.block_reason}; mandatory work preserved"
+                    ),
+                )
+                return reconciled_work_done, False, None
+            finalized_staged = replace(
+                staged_entry.staged,
+                created_followups=tuple(finalized.created_followups),
+                reused_followups=tuple(finalized.reused_followups),
+                created_investigation_task_ids=tuple(finalized.created_investigation_task_ids),
+                reused_investigation_task_ids=tuple(finalized.reused_investigation_task_ids),
+                created_deferred_blockers=tuple(getattr(finalized, "created_deferred_blockers", ())),
+                reused_deferred_blockers=tuple(getattr(finalized, "reused_deferred_blockers", ())),
             )
-            for followup_task in finalized.created_followups:
-                log.emit(
-                    "FOLLOW",
-                    _format_follow_line(str(followup_task.id), str(staged_entry.display_task.id), reused=False),
-                )
-            for followup_task in finalized.reused_followups:
-                log.emit(
-                    "FOLLOW", _format_follow_line(str(followup_task.id), str(staged_entry.display_task.id), reused=True)
-                )
-            for investigation_task_id in finalized.created_investigation_task_ids:
-                log.emit(
-                    "FOLLOW",
-                    _format_follow_line(
-                        str(investigation_task_id), str(staged_entry.display_task.id), reused=False, investigation=True
-                    ),
-                )
-            for investigation_task_id in finalized.reused_investigation_task_ids:
-                log.emit(
-                    "FOLLOW",
-                    _format_follow_line(
-                        str(investigation_task_id), str(staged_entry.display_task.id), reused=True, investigation=True
-                    ),
-                )
+            emitted_entry = replace(staged_entry, staged=finalized_staged)
+            if _emit_staged_deferred_blocker_follow_lines(
+                log, emitted_entry, emitted_task_ids=emitted_follow_task_ids
+            ):
+                reconciled_work_done = True
             if staged_entry.merge_event is not None:
                 merge_status_after = (_task_snapshot(store).get(staged_entry.merge_event.display_task_id) or {}).get(
                     "merge_status"
@@ -5216,6 +5570,7 @@ def _run_isolated_merge_batch(
                     heartbeat_threshold_seconds=config.watch.long_phase_threshold_seconds,
                     heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
                     on_heartbeat=heartbeat,
+                    active_scope_tags=tags,
                 )
             finally:
                 _finish_watch_merge_heartbeat(heartbeat)
@@ -6694,6 +7049,44 @@ def _format_follow_line(
     subject = f"{task_id} investigation" if investigation else task_id
     status = "reused" if reused else "created"
     return f"{subject} queued ({status}, from {source_task_id})"
+
+
+def _emit_merge_result_follow_lines(log: _WatchLog, merge_result: object, *, source_task_id: str) -> bool:
+    created_work = False
+    for followup_task in getattr(merge_result, "created_followups", ()):
+        log.emit(
+            "FOLLOW",
+            _format_follow_line(str(followup_task.id), source_task_id, reused=False),
+        )
+        created_work = True
+    for followup_task in getattr(merge_result, "reused_followups", ()):
+        log.emit(
+            "FOLLOW",
+            _format_follow_line(str(followup_task.id), source_task_id, reused=True),
+        )
+    for blocker_task in getattr(merge_result, "created_deferred_blockers", ()):
+        log.emit(
+            "FOLLOW",
+            _format_follow_line(str(blocker_task.id), source_task_id, reused=False),
+        )
+        created_work = True
+    for blocker_task in getattr(merge_result, "reused_deferred_blockers", ()):
+        log.emit(
+            "FOLLOW",
+            _format_follow_line(str(blocker_task.id), source_task_id, reused=True),
+        )
+    for investigation_task_id in getattr(merge_result, "created_investigation_task_ids", ()):
+        log.emit(
+            "FOLLOW",
+            _format_follow_line(str(investigation_task_id), source_task_id, reused=False, investigation=True),
+        )
+        created_work = True
+    for investigation_task_id in getattr(merge_result, "reused_investigation_task_ids", ()):
+        log.emit(
+            "FOLLOW",
+            _format_follow_line(str(investigation_task_id), source_task_id, reused=True, investigation=True),
+        )
+    return created_work
 
 
 def _format_sleep_message(
@@ -8888,9 +9281,7 @@ class WatchProjectRuntime:
 
     def _validate_analysis(self, analysis: ProjectCycleAnalysis) -> None:
         if analysis.runtime_key != self.key or analysis.runtime_identity != self.runtime_identity:
-            raise ValueError(
-                f"analysis for runtime {analysis.runtime_key!r} cannot be used by runtime {self.key!r}"
-            )
+            raise ValueError(f"analysis for runtime {analysis.runtime_key!r} cannot be used by runtime {self.key!r}")
 
     def _candidate_belongs_to_runtime(self, candidate: ProjectDispatchCandidate) -> bool:
         return candidate.runtime_key == self.key and candidate.runtime_identity == self.runtime_identity
@@ -8963,7 +9354,8 @@ class WatchProjectRuntime:
                 plan_analysis.pending_recovery_task_ids if plan_analysis is not None else frozenset()
             ),
             step1_handled_child_task_ids=step1_handled_child_task_ids,
-            excluded_owner_ids=(analysis.excluded_owner_ids if analysis is not None else frozenset()) | excluded_owner_ids,
+            excluded_owner_ids=(analysis.excluded_owner_ids if analysis is not None else frozenset())
+            | excluded_owner_ids,
         )
 
     def _current_pending_dispatch_head_for_validation(
@@ -9186,7 +9578,11 @@ class WatchProjectRuntime:
         step1_handled_child_task_ids: frozenset[str] = frozenset(),
     ) -> ProjectDispatchResult:
         """Dispatch one pending candidate through this runtime's local launch machinery."""
-        if not self._candidate_belongs_to_runtime(candidate) or candidate.lane != "pending" or candidate.task.id is None:
+        if (
+            not self._candidate_belongs_to_runtime(candidate)
+            or candidate.lane != "pending"
+            or candidate.task.id is None
+        ):
             return ProjectDispatchResult(
                 runtime_key=self.key,
                 candidate=candidate,
@@ -12237,6 +12633,7 @@ def _run_cycle(
                 git,
                 t,
                 target_branch,
+                config=config,
                 merge_source=_resolve_current_merge_source(git, t.branch) if t.branch else None,
             ).already_merged
         ),
@@ -12345,9 +12742,7 @@ def _run_cycle(
                 signature=remediation.signature,
                 tree_fingerprint=_main_verify_remediation_ledger_fingerprint(remediation.tree_fingerprint),
             )
-            active_main_verify_remediation_task_id = (
-                active_state.active_task_id if active_state is not None else None
-            )
+            active_main_verify_remediation_task_id = active_state.active_task_id if active_state is not None else None
         else:
             active_main_verify_remediation = None
             active_main_verify_remediation_task_id = None
@@ -12547,7 +12942,9 @@ def _run_cycle(
         if can_merge and not merge_halted_for_cycle:
             execution_decisions = reproject_selected_merge_actions(
                 execution_decisions,
-                reproject_action=lambda item: determine_next_action(
+                reproject_action=lambda item: dict(item[2])
+                if item[2].get("pending_merge_finalization") is True
+                else determine_next_action(
                     config,
                     store,
                     git,
@@ -12632,7 +13029,10 @@ def _run_cycle(
                 and is_worker_consuming_advance_action(str(action_type))
             ):
                 continue
-            if action_type not in {"merge", "merge_with_followups"} and _consume_active_main_verify_remediation_terminal_attempt(
+            if action_type not in {
+                "merge",
+                "merge_with_followups",
+            } and _consume_active_main_verify_remediation_terminal_attempt(
                 task,
                 reason=f"lifecycle selected {action_type or 'non-merge'}",
             ):
@@ -12674,6 +13074,25 @@ def _run_cycle(
                         work_done = True
                 continue
 
+            if classify_advance_action(action) == "skip":
+                resolved_merge_state = _watch_resolve_already_merged_state_for_pending_finalization(
+                    git=git,
+                    task=task,
+                    target_branch=target_branch,
+                )
+                pending_finalization_action = _watch_pending_merge_finalization_action(
+                    config=config,
+                    store=store,
+                    task=task,
+                    target_branch=target_branch,
+                    resolved_merge_state=resolved_merge_state,
+                    live_target_sha=_watch_ref_sha_if_available(git, target_branch),
+                )
+                if pending_finalization_action is not None:
+                    action = pending_finalization_action
+                    action_type = str(action.get("type", "unknown"))
+                else:
+                    pending_finalization_action = None
             if classify_advance_action(action) == "skip":
                 if _maybe_repair_target_already_merged_skip(
                     store=store,
@@ -12858,6 +13277,7 @@ def _run_cycle(
                             heartbeat_threshold_seconds=config.watch.long_phase_threshold_seconds,
                             heartbeat_interval_seconds=config.watch.heartbeat_interval_seconds,
                             on_heartbeat=heartbeat,
+                            active_scope_tags=tags,
                         )
                     finally:
                         _finish_watch_merge_heartbeat(heartbeat)
@@ -12954,44 +13374,11 @@ def _run_cycle(
                             )
                         else:
                             _clear_main_verify_attention(log=log, state=main_verify_state)
-                for followup_task in merge_result.created_followups:
-                    log.emit(
-                        "FOLLOW",
-                        _format_follow_line(
-                            str(followup_task.id),
-                            str(display_task.id),
-                            reused=False,
-                        ),
-                    )
-                for followup_task in merge_result.reused_followups:
-                    log.emit(
-                        "FOLLOW",
-                        _format_follow_line(
-                            str(followup_task.id),
-                            str(display_task.id),
-                            reused=True,
-                        ),
-                    )
-                for investigation_task_id in getattr(merge_result, "created_investigation_task_ids", ()):
-                    log.emit(
-                        "FOLLOW",
-                        _format_follow_line(
-                            str(investigation_task_id),
-                            str(display_task.id),
-                            reused=False,
-                            investigation=True,
-                        ),
-                    )
-                for investigation_task_id in getattr(merge_result, "reused_investigation_task_ids", ()):
-                    log.emit(
-                        "FOLLOW",
-                        _format_follow_line(
-                            str(investigation_task_id),
-                            str(display_task.id),
-                            reused=True,
-                            investigation=True,
-                        ),
-                    )
+                merge_materialized_work = _emit_merge_result_follow_lines(
+                    log,
+                    merge_result,
+                    source_task_id=str(display_task.id),
+                )
                 if getattr(merge_result, "status", None) == "blocked_dirty_checkout":
                     log.emit_attention(
                         attention_key="merge-blocked-dirty-checkout",
@@ -13008,6 +13395,106 @@ def _run_cycle(
                         merge_result=merge_result,
                     )
                     continue
+                if getattr(merge_result, "status", None) in {
+                    "deferred_blocker_materialization_failed",
+                    "merge_side_effect_materialization_failed",
+                }:
+                    block_reason = (
+                        getattr(merge_result, "block_reason", None)
+                        or "mandatory merge side-effect materialization failed"
+                    )
+                    log.emit(
+                        "ERROR",
+                        f"{display_task.id}: {block_reason}; source remains unmerged",
+                        dedupe_key=f"merge-deferred-blocker-materialization-failed:{display_task.id}",
+                    )
+                    if merge_materialized_work:
+                        work_done = True
+                    continue
+                if getattr(merge_result, "status", None) == "isolated_merge_failed":
+                    block_reason = getattr(merge_result, "block_reason", None) or "promotion failed"
+                    log.emit(
+                        "ERROR",
+                        f"{display_task.id}: isolated merge promotion failed: {block_reason}; source remains unmerged",
+                        dedupe_key=f"isolated-merge-promotion-failed:{display_task.id}",
+                    )
+                    if merge_materialized_work:
+                        work_done = True
+                    continue
+                if getattr(merge_result, "status", None) == "isolated_promotion_rollback_failed_target_uncertain":
+                    block_reason = getattr(merge_result, "block_reason", None) or "target state is uncertain"
+                    log.emit(
+                        "ERROR",
+                        f"{display_task.id}: {block_reason}; operator attention required before retry",
+                        dedupe_key=f"isolated-merge-promotion-rollback-failed:{display_task.id}",
+                    )
+                    if merge_materialized_work:
+                        work_done = True
+                    continue
+                if getattr(merge_result, "status", None) in {
+                    "isolated_post_promotion_proof_persistence_failed",
+                    "post_merge_proof_persistence_failed",
+                    "already_merged_proof_persistence_failed",
+                }:
+                    block_reason = (
+                        getattr(merge_result, "block_reason", None)
+                        or "merge finalization proof was not stored"
+                    )
+                    log.emit(
+                        "ERROR",
+                        f"{display_task.id}: {block_reason}",
+                        dedupe_key=f"merge-post-promotion-proof-failed:{display_task.id}",
+                    )
+                    work_done = True
+                    continue
+                if getattr(merge_result, "status", None) in {
+                    "isolated_post_promotion_finalization_failed",
+                    "isolated_post_promotion_rollback_failed",
+                    "isolated_post_promotion_checkpoint_persistence_failed",
+                    "isolated_post_promotion_merge_state_finalization_failed",
+                    "post_merge_state_persistence_failed",
+                    "already_merged_state_persistence_failed",
+                }:
+                    block_reason = (
+                        getattr(merge_result, "block_reason", None)
+                        or "target was promoted but merge finalization failed"
+                    )
+                    log.emit(
+                        "ERROR",
+                        f"{display_task.id}: {block_reason}; replay will finalize promoted target state",
+                        dedupe_key=f"merge-post-promotion-finalization-failed:{display_task.id}",
+                    )
+                    work_done = True
+                    break
+                if is_pre_promotion_merge_refusal_status(getattr(merge_result, "status", None)):
+                    block_reason = (
+                        getattr(merge_result, "block_reason", None)
+                        or "merge refused before target promotion; target is unchanged"
+                    )
+                    log.emit(
+                        "ERROR",
+                        f"{display_task.id}: {block_reason}",
+                        dedupe_key=f"merge-pre-promotion-refusal:{display_task.id}",
+                    )
+                    if merge_materialized_work:
+                        work_done = True
+                    continue
+                if is_pending_merge_finalization_refusal_status(getattr(merge_result, "status", None)):
+                    block_reason = (
+                        getattr(merge_result, "block_reason", None)
+                        or "pending merge finalization refused before state finalization"
+                    )
+                    log.emit(
+                        "ERROR",
+                        f"{display_task.id}: {block_reason}",
+                        dedupe_key=f"pending-merge-finalization-refused:{display_task.id}",
+                    )
+                    if merge_materialized_work:
+                        work_done = True
+                    merge_halted_for_cycle = True
+                    break
+                if rc != 0 and merge_materialized_work:
+                    work_done = True
                 if rc == 0:
                     work_done = True
                 elif consumed_exempt_terminal_attempt:
@@ -13061,6 +13548,19 @@ def _run_cycle(
                         and conflict_assessment.reason == "branch already merged"
                         and task.id is not None
                     ):
+                        if _watch_pending_merge_finalization_action(
+                            config=config,
+                            store=store,
+                            task=task,
+                            target_branch=target_branch,
+                            resolved_merge_state="merged",
+                            live_target_sha=_watch_ref_sha_if_available(git, target_branch),
+                        ) is not None:
+                            log.emit(
+                                "SKIP",
+                                f"{display_task.id}: branch already merged; pending merge finalization will replay",
+                            )
+                            continue
                         repaired = reconcile_task_branch_merge_truth(
                             store,
                             git,

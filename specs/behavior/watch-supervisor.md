@@ -545,6 +545,19 @@ Each watch cycle MUST execute these phases in order:
    promoted tree exactly matches the verified candidate tree, and emit one `MERGE` line
    per landed merge unit without paying a duplicate full post-merge verify for the same
    exact tree.
+   If target promotion fails after candidate verification succeeds and rollback restores
+   the previous target tip, watch MUST report an isolated merge promotion failure with
+   the preserved failure reason, MUST NOT route the result through conflict/rebase
+   handling, and MUST leave the affected merge units unmerged with unchanged provenance.
+   If rollback fails after the target ref moved, watch MUST re-read the target ref. An
+   exact candidate tip MUST continue through post-promotion checkpoint/finalization replay;
+   an exact previous tip remains a promotion failure; any other observed tip MUST emit
+   explicit operator attention without claiming the target is untouched or routing through
+   conflict/rebase handling.
+   If a post-promotion merge finalization proof was durably stored but merge-state
+   finalization fails, watch MUST stop selecting later merges for that target in the
+   current pass so the pending finalization can replay against the promoted target before
+   another promotion advances it.
    If a member conflicts while being staged into the detached checkout, watch MUST reset
    the detached checkout to the pre-member staged tip, emit a `SKIP` line identifying the
    member conflict or conflict-routed rebase, drop only that member from the staged batch,
@@ -577,6 +590,10 @@ Each watch cycle MUST execute these phases in order:
    remaining batch under conflict semantics. A branch that is already merged into the
    target during staging MUST be reconciled as successful merge-state work, not reported
    as a conflict.
+   Pre-promotion source-proof refusals, including unavailable authorized source refs,
+   pre-merge proof failures, and source refs that change after mandatory child
+   materialization, MUST report that the target is unchanged and MUST NOT route through
+   conflict/rebase handling.
    If the isolated checkout is unavailable, or combined candidate verify is red or
    freshness is unproven, watch MUST leave the canonical target untouched. A red staged
    batch MUST trigger bounded replay from the canonical target until the first

@@ -81,6 +81,7 @@ from ..recovery_engine import FailedRecoveryDecision, classify_recovery_row, dec
 from ..review_scope import extract_review_scope_from_prompt
 from ..review_tasks import (
     DuplicateReviewError,  # noqa: F401
+    FollowupMaterializationError,
     create_or_reuse_capped_review_blocker_tasks,
     create_or_reuse_deferred_blocker_task,
     create_or_reuse_followup_task,
@@ -3200,14 +3201,17 @@ def _create_or_reuse_followup_tasks(
     created: list[DbTask] = []
     reused: list[DbTask] = []
     for finding in findings:
-        task, created_now = create_or_reuse_followup_task(
-            store,
-            config=config,
-            review_task=review_task,
-            impl_task=impl_task,
-            finding=finding,
-            trigger_source=trigger_source,
-        )
+        try:
+            task, created_now = create_or_reuse_followup_task(
+                store,
+                config=config,
+                review_task=review_task,
+                impl_task=impl_task,
+                finding=finding,
+                trigger_source=trigger_source,
+            )
+        except Exception as exc:
+            raise FollowupMaterializationError(str(exc), created=created, reused=reused) from exc
         if created_now:
             created.append(task)
         else:

@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from gza.cli._common import get_store
+from gza.cli.advance_executor import AdvanceActionExecutionResult
 from gza.config import Config
 from gza.db import SqliteTaskStore
 from gza.main_integration_verify import (
@@ -227,7 +228,7 @@ def test_advance_repeat_foreground_callbacks_use_captured_runtime_context(
         monkeypatch.setenv("PATH", "/ambient-after/bin")
         monkeypatch.setenv("PROJECT_TOKEN", "ambient-after-token")
         rc = context.spawn_resume_worker(task, "resume")
-        return git_ops.AdvanceActionExecutionResult(
+        return AdvanceActionExecutionResult(
             action_type="resume",
             status="success" if rc == 0 else "error",
             message="done",

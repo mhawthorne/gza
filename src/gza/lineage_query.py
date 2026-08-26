@@ -2288,10 +2288,35 @@ def _query_lineage_owner_rows_with_context(
                 matching_failed_leaves = [
                     task for task in matching_failed_leaves if task.id in rerootable_failed_leaf_ids
                 ]
+            pending_finalization_action = None
+            if (
+                config is not None
+                and target_branch is not None
+                and "branch_merged" in resolution.reasons
+                and owner_merge_state != "merged"
+            ):
+                from .advance_engine import pending_merge_finalization_action
+
+                pending_finalization_action = pending_merge_finalization_action(
+                    config,
+                    store,
+                    owner,
+                    target_branch=target_branch,
+                    require_already_merged=True,
+                    resolved_merge_state="merged",
+                    live_target_sha=(
+                        (value if isinstance(value, str) and value else None)
+                        if git is not None
+                        and callable(rev_parse_if_exists := getattr(git, "rev_parse_if_exists", None))
+                        and (value := rev_parse_if_exists(target_branch)) is not None
+                        else None
+                    ),
+                )
             resolved_in_query = (
                 any(reason == "recovery_chain_completed" for reason in resolution.reasons)
                 or (
                     "branch_merged" in resolution.reasons
+                    and pending_finalization_action is None
                     and (not failed_leaves or (terminal_owner_resolution and not rerootable_failed_leaves))
                     and (owner_merge_state != "merged" or terminal_owner_resolution)
                 )

@@ -29,11 +29,12 @@ from .review_scope import (
     build_resolution_review_scope,
     build_spec_coherence_review_scope,
     declares_resolution_review_mode,
+    declares_spec_coherence_review_mode,
     extract_resolution_review_scope_rebuild_fields,
     parse_resolution_review_scope,
     resolve_review_scope_for_impl,
 )
-from .review_verdict import ReviewFinding
+from .review_verdict import ReviewFinding, get_review_content, get_review_finding_fingerprint, parse_review_report
 from .review_verify_state import (
     VerifyEpoch,
     latest_verify_evidence_for_owner,
@@ -56,6 +57,8 @@ _DEFERRED_BLOCKER_PROMPT_PREFIX_RE = re.compile(
 _CAPPED_REVIEW_BLOCKER_PROMPT_PREFIX_RE = re.compile(
     r"^Capped review blocker\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+)\s+reason\s+review-max-cycles:"
 )
+_CAPPED_REVIEW_OUTPUT_BEGIN = "----- BEGIN PERSISTED REVIEW OUTPUT -----\n"
+_CAPPED_REVIEW_OUTPUT_END = "\n----- END PERSISTED REVIEW OUTPUT -----"
 _REVIEW_BLOCKER_ADJUDICATION_PROMPT_PREFIX_RE = re.compile(
     r"^Adjudicate blocker\s+(\S+)\s+from review\s+(\S+)\s+for task\s+(\S+):"
 )
@@ -85,6 +88,36 @@ _VERIFY_FIX_PROMPT_RE = re.compile(
     r"timeout=(?P<timeout>\S+) grace=(?P<grace>\S+)\]$",
     re.DOTALL,
 )
+
+
+class CappedReviewBlockerMaterializationError(RuntimeError):
+    """Carries durable capped-review blocker work completed before fan-out failed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        created: Iterable[Task] = (),
+        reused: Iterable[Task] = (),
+    ) -> None:
+        super().__init__(message)
+        self.created = list(created)
+        self.reused = list(reused)
+
+
+class FollowupMaterializationError(RuntimeError):
+    """Carries durable ordinary follow-up work completed before fan-out failed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        created: Iterable[Task] = (),
+        reused: Iterable[Task] = (),
+    ) -> None:
+        super().__init__(message)
+        self.created = list(created)
+        self.reused = list(reused)
 
 
 def _require_model_for_created_task(
@@ -2027,6 +2060,74 @@ def extract_capped_review_blocker_prompt_parts(prompt: str) -> tuple[str, str, s
     return match.group(1), match.group(2), match.group(3)
 
 
+def extract_capped_review_blocker_persisted_output(prompt: str) -> str | None:
+    """Return the exact review output embedded in a capped-review blocker prompt."""
+    start = prompt.find(_CAPPED_REVIEW_OUTPUT_BEGIN)
+    if start < 0:
+        return None
+    output_start = start + len(_CAPPED_REVIEW_OUTPUT_BEGIN)
+    end = prompt.find(_CAPPED_REVIEW_OUTPUT_END, output_start)
+    if end < 0:
+        return None
+    return prompt[output_start:end]
+
+
+def capped_review_blocker_task_matches_identity(
+    task: Task,
+    *,
+    review_task_id: str,
+    impl_task_id: str,
+    finding: ReviewFinding,
+    persisted_review_output: str,
+) -> bool:
+    """Return whether an existing task is the exact durable capped-blocker child."""
+    return not capped_review_blocker_task_identity_mismatches(
+        task,
+        review_task_id=review_task_id,
+        impl_task_id=impl_task_id,
+        finding=finding,
+        persisted_review_output=persisted_review_output,
+    )
+
+
+def capped_review_blocker_task_identity_mismatches(
+    task: Task,
+    *,
+    review_task_id: str,
+    impl_task_id: str,
+    finding: ReviewFinding,
+    persisted_review_output: str,
+) -> tuple[str, ...]:
+    """Return durable capped-blocker child shape mismatches, excluding creation provenance."""
+    finding_id = _validate_capped_review_blocker_finding(finding)
+    expected_prompt = build_capped_review_blocker_prompt(
+        review_task_id,
+        impl_task_id,
+        finding,
+        persisted_review_output,
+    )
+    mismatches: list[str] = []
+    if task.task_type != "implement":
+        mismatches.append("task_type")
+    if task.based_on != impl_task_id:
+        mismatches.append("based_on")
+    if task.depends_on != impl_task_id:
+        mismatches.append("depends_on")
+    if task.urgent is not True:
+        mismatches.append("urgent")
+    if task.create_pr is not True:
+        mismatches.append("create_pr")
+    if task.review_scope != format_blocker_finding_context(finding):
+        mismatches.append("review_scope")
+    if task.prompt != expected_prompt:
+        mismatches.append("prompt")
+    if DEFERRED_REVIEW_BLOCKER_TAG not in task.tags:
+        mismatches.append("deferred-review-blocker tag")
+    if extract_capped_review_blocker_prompt_parts(task.prompt) != (finding_id, review_task_id, impl_task_id):
+        mismatches.append("prompt identity")
+    return tuple(mismatches)
+
+
 def extract_review_blocker_adjudication_prompt_parts(prompt: str) -> tuple[str, str, str] | None:
     """Return (finding_id, review_task_id, impl_task_id) for adjudication prompts."""
     match = _REVIEW_BLOCKER_ADJUDICATION_PROMPT_PREFIX_RE.match(prompt.strip())
@@ -2326,6 +2427,26 @@ def create_or_reuse_followup_task(
     if impl_task.id is None:
         raise ValueError("Cannot create follow-up for implementation without an ID.")
 
+    prompt = build_followup_prompt(
+        review_task.id,
+        impl_task.id,
+        finding,
+    )
+    _require_model_for_created_task(config, "implement")
+    params = NewTaskParams(
+        prompt=prompt,
+        task_type="implement",
+        based_on=review_task.id,
+        depends_on=impl_task.id,
+        review_scope=format_followup_finding_context(finding),
+        tags=resolve_derived_task_tags(impl_task),
+        trigger_source=trigger_source,
+    )
+    if isinstance(store, SqliteTaskStore):
+        return store.create_or_reuse_followup_task(
+            prompt_prefix=build_followup_prompt_prefix(review_task.id, impl_task.id, finding.id),
+            params=params,
+        )
     existing = find_existing_followup_task(
         store,
         review_task_id=review_task.id,
@@ -2334,21 +2455,14 @@ def create_or_reuse_followup_task(
     )
     if existing is not None:
         return existing, False
-
-    prompt = build_followup_prompt(
-        review_task.id,
-        impl_task.id,
-        finding,
-    )
-    _require_model_for_created_task(config, "implement")
     created = store.add(
-        prompt=prompt,
-        task_type="implement",
-        based_on=review_task.id,
-        depends_on=impl_task.id,
-        review_scope=format_followup_finding_context(finding),
-        tags=resolve_derived_task_tags(impl_task),
-        trigger_source=trigger_source,
+        prompt=params.prompt,
+        task_type=params.task_type,
+        based_on=params.based_on,
+        depends_on=params.depends_on,
+        review_scope=params.review_scope,
+        tags=params.tags,
+        trigger_source=params.trigger_source,
     )
     return created, True
 
@@ -2444,6 +2558,73 @@ def _validate_capped_review_blocker_findings(findings: tuple[ReviewFinding, ...]
         seen.add(finding_id)
 
 
+def validate_capped_review_blocker_action(
+    store: SqliteTaskStore,
+    *,
+    config: Config | None = None,
+    review_task: Task,
+    findings: tuple[ReviewFinding, ...],
+    persisted_review_output: str,
+) -> tuple[ReviewFinding, ...]:
+    """Validate capped-review metadata against the persisted completed review row."""
+    _validate_capped_review_persisted_output(persisted_review_output)
+    _validate_capped_review_blocker_findings(findings)
+    if review_task.id is None:
+        raise ValueError("Max-cycle merge-and-defer requires a persisted review task.")
+    persisted_review = store.get(review_task.id)
+    if persisted_review is None:
+        raise ValueError(f"Max-cycle merge-and-defer review {review_task.id} is missing.")
+    if persisted_review.status != "completed":
+        raise ValueError(f"Max-cycle merge-and-defer review {review_task.id} is not completed.")
+    if persisted_review.task_type != "review":
+        raise ValueError(f"Max-cycle merge-and-defer review {review_task.id} is not a review task.")
+    if declares_spec_coherence_review_mode(persisted_review.review_scope):
+        raise ValueError("Max-cycle merge-and-defer cannot defer spec-coherence review blockers.")
+
+    authoritative_output = persisted_review.output_content
+    if not authoritative_output and config is not None:
+        authoritative_output = get_review_content(config.project_dir, persisted_review)
+    if not authoritative_output:
+        raise ValueError(f"Max-cycle merge-and-defer review {review_task.id} has no persisted output.")
+    if authoritative_output != persisted_review_output:
+        raise ValueError(
+            f"Max-cycle merge-and-defer review {review_task.id} output does not match persisted review content."
+        )
+
+    report = parse_review_report(persisted_review_output)
+    if report.verdict != "CHANGES_REQUESTED":
+        raise ValueError(
+            f"Max-cycle merge-and-defer requires CHANGES_REQUESTED review output, got {report.verdict!r}."
+        )
+    parsed_blockers = tuple(finding for finding in report.findings if finding.severity == "BLOCKER")
+    if not parsed_blockers:
+        raise ValueError("Max-cycle merge-and-defer requires at least one parsed BLOCKER finding.")
+
+    supplied_by_id = {finding.id: finding for finding in findings}
+    parsed_by_id = {finding.id: finding for finding in parsed_blockers}
+    if len(supplied_by_id) != len(findings):
+        raise ValueError("Max-cycle merge-and-defer supplied duplicate blocker IDs.")
+    if len(parsed_by_id) != len(parsed_blockers):
+        raise ValueError("Max-cycle merge-and-defer parsed duplicate blocker IDs.")
+    if set(supplied_by_id) != set(parsed_by_id):
+        raise ValueError(
+            "Max-cycle merge-and-defer supplied blocker IDs do not match parsed review blocker IDs."
+        )
+    for finding_id, parsed_finding in parsed_by_id.items():
+        supplied_finding = supplied_by_id[finding_id]
+        supplied_fingerprint = get_review_finding_fingerprint(supplied_finding)
+        parsed_fingerprint = get_review_finding_fingerprint(parsed_finding)
+        if supplied_fingerprint is None or parsed_fingerprint is None:
+            raise ValueError(
+                f"Max-cycle merge-and-defer blocker {finding_id} lacks a stable review fingerprint."
+            )
+        if supplied_fingerprint != parsed_fingerprint:
+            raise ValueError(
+                f"Max-cycle merge-and-defer blocker {finding_id} fingerprint does not match persisted review."
+            )
+    return parsed_blockers
+
+
 def create_or_reuse_capped_review_blocker_task(
     store: SqliteTaskStore,
     *,
@@ -2499,21 +2680,33 @@ def create_or_reuse_capped_review_blocker_tasks(
     trigger_source: str,
 ) -> tuple[list[Task], list[Task]]:
     """Create/reuse max-review-cycle blocker tasks, failing hard on persistence errors."""
-    _validate_capped_review_persisted_output(persisted_review_output)
-    _validate_capped_review_blocker_findings(findings)
+    findings = validate_capped_review_blocker_action(
+        store,
+        config=config,
+        review_task=review_task,
+        findings=findings,
+        persisted_review_output=persisted_review_output,
+    )
     created: list[Task] = []
     reused: list[Task] = []
     for finding in findings:
-        task, created_now = create_or_reuse_capped_review_blocker_task(
-            store,
-            config=config,
-            review_task=review_task,
-            impl_task=impl_task,
-            finding=finding,
-            persisted_review_output=persisted_review_output,
-            active_scope_tags=active_scope_tags,
-            trigger_source=trigger_source,
-        )
+        try:
+            task, created_now = create_or_reuse_capped_review_blocker_task(
+                store,
+                config=config,
+                review_task=review_task,
+                impl_task=impl_task,
+                finding=finding,
+                persisted_review_output=persisted_review_output,
+                active_scope_tags=active_scope_tags,
+                trigger_source=trigger_source,
+            )
+        except Exception as exc:
+            raise CappedReviewBlockerMaterializationError(
+                str(exc),
+                created=created,
+                reused=reused,
+            ) from exc
         if created_now:
             created.append(task)
         else:
