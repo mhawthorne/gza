@@ -50,13 +50,22 @@ from ..console import console, prompt_available_width, shorten_prompt
 from ..db import (
     MERGE_SOURCE_WATCH,
     DuplicateActiveChildError,
+    ExecutionProjectActivationError,
+    ExecutionProjectDisabled,
+    ExecutionProjectDisableReason,
+    ExecutionProjectResolved,
     ExecutionProjectRuntime,
+    ExecutionProjectSelector,
     MainVerifyRemediationAttemptState,
+    ManualMigrationRequired,
+    SchemaIntegrityError,
     SqliteTaskStore,
     Task as DbTask,
     WatchProgressObservation,
     WatchRecoveryBackoff,
     active_merge_unit_where_sql,
+    classify_existing_execution_db,
+    resolve_execution_projects,
     task_id_numeric_key,
 )
 from ..dispatch_preview import (
@@ -163,7 +172,9 @@ from ..unstick import (
     skip_reason_for_landed_or_moot,
 )
 from ..watch_leases import (
+    WATCH_SUPERVISOR_LEASE_NAME,
     WatchLeaseConflict,
+    WatchLeaseHeld,
     WatchLeaseReleaseError,
     WatchLeaseSet,
     WatchLeaseTarget,
@@ -5853,6 +5864,9 @@ def _watch_log_path(config: Config, *, dry_run: bool) -> Path:
     return config.project_dir / ".gza" / filename
 
 
+_WATCH_LOG_TYPE = _WatchLog
+
+
 @dataclass
 class _InstalledWatchSignalHandlers:
     old_sigint: Any = None
@@ -7578,6 +7592,19 @@ class WatchSupervisorSelection:
         return len(self.projects) > 1
 
 
+@dataclass(frozen=True)
+class WatchSupervisorRuntimeConstruction:
+    """Resolved project runtimes and disabled startup states for watch supervision."""
+
+    runtimes: tuple["WatchProjectRuntime", ...]
+    disabled: tuple[ExecutionProjectDisabled, ...] = ()
+    lease_set: WatchLeaseSet | None = None
+
+    @property
+    def runtime_by_key(self) -> Mapping[str, "WatchProjectRuntime"]:
+        return {runtime.key: runtime for runtime in self.runtimes}
+
+
 _WATCH_SELECTOR_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -8036,6 +8063,308 @@ def resolve_watch_supervisor_selection(args: argparse.Namespace) -> WatchSupervi
             else manifest.recovery_slots
         ),
         manifest_path=manifest.manifest_path,
+    )
+
+
+def _execution_project_selector_for_watch(
+    project: WatchSupervisorProjectSelector,
+) -> ExecutionProjectSelector:
+    if project.path is not None:
+        return ExecutionProjectSelector(project.key, "path", project.path)
+    project_id = project.project_id or project.ref
+    return ExecutionProjectSelector(project.key, "registry_id", project_id)
+
+
+def _disabled_watch_project_from_resolved_assertion(
+    project: WatchSupervisorProjectSelector,
+    resolved: ExecutionProjectResolved,
+) -> ExecutionProjectDisabled | None:
+    if project.project_id is None or resolved.project_id == project.project_id:
+        return None
+    return ExecutionProjectDisabled(
+        selector_key=project.key,
+        reason="project_id_mismatch",
+        message=(
+            f"Watch project {project.key!r} asserted project_id {project.project_id!r}, "
+            f"but loaded config project_id {resolved.project_id!r}."
+        ),
+        project_id=resolved.project_id,
+        root_path=resolved.root_path,
+        config_path=resolved.config_path,
+        db_path=resolved.db_path,
+    )
+
+
+def _disabled_watch_project_from_activation_error(
+    project: WatchSupervisorProjectSelector,
+    resolved: ExecutionProjectResolved,
+    exc: BaseException,
+) -> ExecutionProjectDisabled:
+    if isinstance(exc, ExecutionProjectActivationError):
+        return ExecutionProjectDisabled(
+            selector_key=project.key,
+            reason=exc.reason,
+            message=f"Execution project could not be activated for watch: {exc}",
+            project_id=resolved.project_id,
+            root_path=resolved.root_path,
+            config_path=resolved.config_path,
+            db_path=resolved.db_path,
+        )
+    if isinstance(exc, ManualMigrationRequired):
+        return ExecutionProjectDisabled(
+            selector_key=project.key,
+            reason="manual_migration_required",
+            message=f"Execution project DB requires manual migration before watch activation: {exc}",
+            project_id=resolved.project_id,
+            root_path=resolved.root_path,
+            config_path=resolved.config_path,
+            db_path=resolved.db_path,
+        )
+    reason: ExecutionProjectDisableReason
+    if isinstance(exc, UnicodeError):
+        reason = "config_invalid"
+    elif isinstance(exc, sqlite3.Error):
+        reason = "db_unavailable" if _sqlite_error_is_db_unavailable(exc) else "schema_incompatible"
+    elif isinstance(exc, OSError):
+        reason = "db_unavailable"
+    elif isinstance(exc, ConfigError):
+        reason = "config_invalid"
+    elif isinstance(exc, SchemaIntegrityError):
+        reason = _watch_disabled_reason_from_schema_integrity_error(exc)
+    else:
+        raise exc
+    return ExecutionProjectDisabled(
+        selector_key=project.key,
+        reason=reason,
+        message=f"Execution project could not be activated for watch: {exc}",
+        project_id=resolved.project_id,
+        root_path=resolved.root_path,
+        config_path=resolved.config_path,
+        db_path=resolved.db_path,
+    )
+
+
+def _reject_duplicate_watch_runtime_selection(disabled: ExecutionProjectDisabled) -> None:
+    if disabled.reason != "duplicate_selection":
+        return
+    raise ValueError(disabled.message)
+
+
+def _sqlite_error_is_db_unavailable(exc: sqlite3.Error) -> bool:
+    message = str(exc).lower()
+    return (
+        "unable to open database file" in message
+        or "database is locked" in message
+        or "database table is locked" in message
+        or "database is busy" in message
+        or "disk i/o error" in message
+        or "permission denied" in message
+        or "readonly" in message
+        or "read-only" in message
+    )
+
+
+def _watch_disabled_reason_from_schema_integrity_error(exc: SchemaIntegrityError) -> ExecutionProjectDisableReason:
+    message = str(exc).lower()
+    if "worker registry" in message or "runtime filesystem" in message:
+        return "runtime_filesystem_unavailable"
+    if "config" in message:
+        return "config_invalid"
+    if (
+        "unavailable" in message
+        or "inaccessible" in message
+        or "unable to open" in message
+        or "database is locked" in message
+        or "readonly" in message
+        or "read-only" in message
+    ):
+        return "db_unavailable"
+    return "schema_incompatible"
+
+
+def _fallback_watch_log(project_key: str, path: Path, exc: BaseException, *, quiet: bool) -> "_WatchLog":
+    message = f"WARN      [{project_key}] watch log sink disabled for {path}: {exc}"
+    console.print(message, soft_wrap=True, highlight=False, markup=False)
+    log = object.__new__(_WATCH_LOG_TYPE)
+    log.path = Path(os.devnull)
+    log.quiet = quiet
+    log._has_emitted_cycle = False
+    log._skip_keys_prev_cycle = set()
+    log._skip_keys_this_cycle = set()
+    log._merge_logged_this_cycle = set()
+    log._sticky_attention_prev_cycle = {}
+    log._sticky_attention_this_cycle = {}
+    log._visible_attention_this_cycle = {}
+    return log
+
+
+def construct_watch_project_runtimes(
+    *,
+    anchor_store: SqliteTaskStore,
+    selection: WatchSupervisorSelection,
+    quiet: bool,
+) -> WatchSupervisorRuntimeConstruction:
+    """Construct ordered project-local watch runtimes from a resolved supervisor selection.
+
+    The execution resolver performs path/config/DB preflight without using
+    all-project query fan-out. This helper activates only validated projects,
+    builds project-owned Git/log/filter state, and keeps invalid projects as
+    disabled startup states for the future fleet supervisor.
+    """
+
+    project_by_key = {project.key: project for project in selection.projects}
+    if len(project_by_key) != len(selection.projects):
+        duplicate_keys = sorted(
+            {
+                project.key
+                for project in selection.projects
+                if sum(1 for other in selection.projects if other.key == project.key) > 1
+            }
+        )
+        raise ValueError(f"Execution project selector key {', '.join(duplicate_keys)!r} was selected more than once.")
+
+    execution_selectors = tuple(_execution_project_selector_for_watch(project) for project in selection.projects)
+    resolved_projects = resolve_execution_projects(anchor_store, execution_selectors)
+    for resolved in resolved_projects:
+        if isinstance(resolved, ExecutionProjectDisabled):
+            _reject_duplicate_watch_runtime_selection(resolved)
+
+    runtimes: list[WatchProjectRuntime] = []
+    disabled_projects: list[ExecutionProjectDisabled] = []
+    activation_candidates: list[tuple[WatchSupervisorProjectSelector, ExecutionProjectResolved, SqliteTaskStore]] = []
+
+    for resolved in resolved_projects:
+        if isinstance(resolved, ExecutionProjectDisabled):
+            disabled_projects.append(resolved)
+            continue
+
+        project = project_by_key[resolved.selector_key]
+        assertion_disabled = _disabled_watch_project_from_resolved_assertion(project, resolved)
+        if assertion_disabled is not None:
+            disabled_projects.append(assertion_disabled)
+            continue
+
+        db_incompatibility = classify_existing_execution_db(resolved.db_path)
+        if db_incompatibility is not None:
+            reason, message = db_incompatibility
+            disabled_projects.append(
+                ExecutionProjectDisabled(
+                    selector_key=project.key,
+                    reason=reason,
+                    message=message,
+                    project_id=resolved.project_id,
+                    root_path=resolved.root_path,
+                    config_path=resolved.config_path,
+                    db_path=resolved.db_path,
+                )
+            )
+            continue
+
+        activation_candidates.append((project, resolved, resolved.open_lease_store()))
+
+    lease_set: WatchLeaseSet | None = None
+    if activation_candidates:
+        lease_set = acquire_watch_project_leases(
+            [
+                WatchLeaseTarget(project.key, lease_store)
+                for project, _resolved, lease_store in activation_candidates
+            ]
+        )
+
+    retained_lease_keys: list[str] = []
+    try:
+        for project, resolved, _lease_store in activation_candidates:
+            try:
+                execution_runtime = resolved.open_runtime_store()
+            except (
+                ManualMigrationRequired,
+                ExecutionProjectActivationError,
+                SchemaIntegrityError,
+                ConfigError,
+                OSError,
+                sqlite3.Error,
+                UnicodeError,
+            ) as exc:
+                disabled_projects.append(_disabled_watch_project_from_activation_error(project, resolved, exc))
+                continue
+            retained_lease_keys.append(project.key)
+            try:
+                execution_runtime.store.repair_inconsistent_unmerged_merge_units()
+                execution_runtime.store.repair_stale_unmerged_merge_unit_owners()
+            except (
+                ManualMigrationRequired,
+                ExecutionProjectActivationError,
+                SchemaIntegrityError,
+                ConfigError,
+                OSError,
+                sqlite3.Error,
+                UnicodeError,
+            ) as exc:
+                disabled_projects.append(_disabled_watch_project_from_activation_error(project, resolved, exc))
+                retained_lease_keys.remove(project.key)
+                continue
+            log_path = execution_runtime.config.project_dir / ".gza" / "watch.log"
+            try:
+                log = _WatchLog(log_path, quiet=quiet)
+            except OSError as exc:
+                log = _fallback_watch_log(project.key, log_path, exc, quiet=quiet)
+            try:
+                worker_registry = WorkerRegistry(execution_runtime.config.workers_path)
+            except OSError as exc:
+                disabled_projects.append(
+                    ExecutionProjectDisabled(
+                        selector_key=project.key,
+                        reason="runtime_filesystem_unavailable",
+                        message=f"Execution project worker registry could not be initialized for watch: {exc}",
+                        project_id=resolved.project_id,
+                        root_path=resolved.root_path,
+                        config_path=resolved.config_path,
+                        db_path=resolved.db_path,
+                    )
+                )
+                retained_lease_keys.remove(project.key)
+                continue
+            git = Git(execution_runtime.config.project_dir, env=execution_runtime.runtime_context.env)
+            runtimes.append(
+                WatchProjectRuntime.from_execution_runtime(
+                    key=project.key,
+                    runtime=execution_runtime,
+                    log=log,
+                    tags=project.tags,
+                    any_tag=project.any_tag,
+                    git=git,
+                    worker_registry=worker_registry,
+                )
+            )
+    except BaseException:
+        if lease_set is not None:
+            lease_set.release()
+        raise
+
+    if lease_set is not None:
+        held_by_key: dict[str, WatchLeaseHeld] = {held.target.key: held for held in lease_set.held}
+        retained_lease_key_set = set(retained_lease_keys)
+        released_disabled_keys = [held.target.key for held in reversed(lease_set.held) if held.target.key not in retained_lease_key_set]
+        try:
+            for key in released_disabled_keys:
+                held = held_by_key[key]
+                held.target.store.release_project_lease(
+                    lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+                    owner_token=lease_set.owner_token,
+                )
+        except BaseException:
+            lease_set.release()
+            raise
+        lease_set = WatchLeaseSet(
+            owner_pid=lease_set.owner_pid,
+            owner_token=lease_set.owner_token,
+            held=tuple(held_by_key[key] for key in retained_lease_keys if key in held_by_key),
+        )
+
+    return WatchSupervisorRuntimeConstruction(
+        runtimes=tuple(runtimes),
+        disabled=tuple(disabled_projects),
+        lease_set=lease_set,
     )
 
 
@@ -9163,6 +9492,7 @@ class WatchProjectRuntime:
     store: SqliteTaskStore
     runtime_context: RuntimeExecutionContext
     git: Git
+    worker_registry: WorkerRegistry
     log: "_WatchLog"
     runtime_identity: WatchRuntimeIdentity
     failure_backoffs: dict[str, _OwnerFailureBackoffState] = field(default_factory=dict)
@@ -9182,14 +9512,17 @@ class WatchProjectRuntime:
         store: SqliteTaskStore,
         runtime_context: RuntimeExecutionContext,
         git: Git | None = None,
+        worker_registry: WorkerRegistry | None = None,
     ) -> None:
         try:
             config_db_path = config.db_path.resolve()
             store_db_path = store.db_path.resolve()
             context_db_path = runtime_context.db_path.resolve()
             config_project_dir = config.project_dir.resolve()
+            config_workers_dir = config.workers_path.resolve()
             context_cwd = runtime_context.cwd.resolve()
             git_repo_dir = git.repo_dir.resolve() if type(git) is ProductionGit else None
+            registry_workers_dir = worker_registry.workers_dir.resolve() if worker_registry is not None else None
         except (OSError, RuntimeError, ValueError) as exc:
             raise ValueError(f"watch runtime {key!r} has unresolved ownership paths: {exc}") from exc
         mismatches: list[str] = []
@@ -9205,6 +9538,8 @@ class WatchProjectRuntime:
             )
         if context_cwd != config_project_dir:
             mismatches.append(f"context cwd {context_cwd} != project root {config_project_dir}")
+        if registry_workers_dir is not None and registry_workers_dir != config_workers_dir:
+            mismatches.append(f"worker registry {registry_workers_dir} != config workers_path {config_workers_dir}")
         if git_repo_dir is not None and git_repo_dir != config_project_dir:
             mismatches.append(f"git repo_dir {git_repo_dir} != project root {config_project_dir}")
         if type(git) is ProductionGit:
@@ -9226,6 +9561,7 @@ class WatchProjectRuntime:
         tags: tuple[str, ...] | None,
         any_tag: bool,
         git: Git | None = None,
+        worker_registry: WorkerRegistry | None = None,
     ) -> "WatchProjectRuntime":
         return cls.create(
             key=key,
@@ -9235,6 +9571,7 @@ class WatchProjectRuntime:
             tags=tags,
             any_tag=any_tag,
             git=git,
+            worker_registry=worker_registry,
             runtime_context=runtime.runtime_context,
         )
 
@@ -9249,15 +9586,18 @@ class WatchProjectRuntime:
         tags: tuple[str, ...] | None,
         any_tag: bool,
         git: Git | None = None,
+        worker_registry: WorkerRegistry | None = None,
         runtime_context: RuntimeExecutionContext | None = None,
     ) -> "WatchProjectRuntime":
         runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
+        registry = worker_registry if worker_registry is not None else WorkerRegistry(config.workers_path)
         cls._validate_runtime_ownership(
             key=key,
             config=config,
             store=store,
             runtime_context=runtime_context,
             git=git,
+            worker_registry=registry,
         )
         identity = WatchRuntimeIdentity.create(selector_key=key, config=config, store=store)
         return cls(
@@ -9271,6 +9611,7 @@ class WatchProjectRuntime:
             store=store,
             runtime_context=runtime_context,
             git=git if git is not None else Git(config.project_dir, env=runtime_context.env),
+            worker_registry=registry,
             log=log,
             runtime_identity=identity,
         )
@@ -9395,7 +9736,7 @@ class WatchProjectRuntime:
 
     def _current_live_worker_exclusion_ids(self) -> frozenset[str]:
         live_task_ids: set[str] = set()
-        registry = WorkerRegistry(self.config.workers_path)
+        registry = self.worker_registry
         for worker in registry.list_all(include_completed=False):
             if worker.status != "running" or worker.task_id is None:
                 continue

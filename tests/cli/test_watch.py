@@ -14,7 +14,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -83,6 +83,7 @@ from gza.cli.watch import (
     WatchRuntimeIdentity,
     WatchSlotAllocation,
     WatchSupervisorProjectSelector,
+    WatchSupervisorRuntimeConstruction,
     WatchSupervisorSelection,
     _active_failure_backoff_owner_ids,
     _build_watch_cycle_plan,
@@ -146,6 +147,7 @@ from gza.cli.watch import (
     allocate_watch_slots,
     cmd_main_verify,
     cmd_watch,
+    construct_watch_project_runtimes,
     dispatch_watch_supervisor_lane_incrementally,
     dispatch_watch_supervisor_lanes_incrementally,
     dispatch_watch_supervisor_pending_candidates,
@@ -160,6 +162,8 @@ from gza.db import (
     MERGE_SOURCE_MAX_CYCLES_DEFERRED,
     MERGE_SOURCE_WATCH,
     DuplicateActiveChildError,
+    SCHEMA_VERSION,
+    SchemaIntegrityError,
     SqliteTaskStore,
     Task,
     Task as DbTask,
@@ -233,6 +237,7 @@ from gza.runtime_context import RuntimeExecutionContext
 from gza.unstick import VERIFY_FIX_FAILED_REASON, select_and_clear_parked_tasks
 from gza.watch_leases import (
     WATCH_SUPERVISOR_LEASE_NAME,
+    WatchLeaseConflict,
     WatchLeaseReleaseError,
     WatchLeaseReleaseFailure,
 )
@@ -1999,6 +2004,903 @@ def test_cmd_watch_single_registry_id_selector_exits_without_traceback(
     load_config.assert_not_called()
 
 
+def _write_watch_runtime_project_config(
+    project_dir: Path,
+    *,
+    project_name: str,
+    project_id: str,
+    project_prefix: str,
+    db_path: Path,
+    max_concurrent: int = 3,
+    verify_command: str | None = None,
+    theme: str | None = None,
+    color_overrides: Mapping[str, str] | None = None,
+) -> None:
+    project_dir.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"project_name: {project_name}",
+        f"project_id: {project_id}",
+        f"project_prefix: {project_prefix}",
+        f"db_path: {db_path}",
+        "provider: codex",
+        "model: gpt-5.5",
+        "quiet_period_seconds: 0",
+        f"max_concurrent: {max_concurrent}",
+    ]
+    if verify_command is not None:
+        lines.append(f"verify_command: {verify_command}")
+    if theme is not None:
+        lines.append(f"theme: {theme}")
+    if color_overrides:
+        lines.append("colors:")
+        lines.extend(f"  {key}: {value}" for key, value in color_overrides.items())
+    (project_dir / "gza.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _watch_runtime_selection(
+    projects: Sequence[WatchSupervisorProjectSelector],
+) -> WatchSupervisorSelection:
+    return WatchSupervisorSelection(projects=tuple(projects), strategy="round-robin")
+
+
+def test_construct_watch_project_runtimes_builds_ordered_shared_db_runtimes_with_filters(
+    tmp_path: Path,
+) -> None:
+    shared_db = tmp_path / "shared" / "gza.db"
+    root_dir = tmp_path / "root"
+    server_dir = tmp_path / "root" / "server"
+    _write_watch_runtime_project_config(
+        root_dir,
+        project_name="Root",
+        project_id="root",
+        project_prefix="root",
+        db_path=shared_db,
+        max_concurrent=2,
+        verify_command="./bin/root-verify",
+    )
+    _write_watch_runtime_project_config(
+        server_dir,
+        project_name="Server",
+        project_id="server",
+        project_prefix="server",
+        db_path=shared_db,
+        max_concurrent=4,
+        verify_command="./bin/server-verify",
+    )
+    anchor_config = Config.load(root_dir)
+    anchor_store = SqliteTaskStore.from_config(anchor_config)
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="core", ref=str(root_dir), path=root_dir, tags=("release",), any_tag=True),
+            WatchSupervisorProjectSelector(
+                key="api",
+                ref=str(server_dir),
+                path=server_dir,
+                project_id="server",
+                tags=("server", "ops"),
+                any_tag=False,
+            ),
+        )
+    )
+    git_calls: list[tuple[Path, Mapping[str, str] | None]] = []
+
+    def git_spy(repo_dir: Path, *, env: Mapping[str, str] | None = None) -> Git:
+        git_calls.append((repo_dir, env))
+        return _make_watch_git()
+
+    with patch("gza.cli.watch.Git", side_effect=git_spy):
+        constructed = construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    assert isinstance(constructed, WatchSupervisorRuntimeConstruction)
+    assert constructed.disabled == ()
+    assert [runtime.key for runtime in constructed.runtimes] == ["core", "api"]
+    core, api = constructed.runtimes
+    assert core.config.db_path.resolve() == shared_db.resolve()
+    assert api.config.db_path.resolve() == shared_db.resolve()
+    assert core.store.db_path.resolve() == shared_db.resolve()
+    assert api.store.db_path.resolve() == shared_db.resolve()
+    assert core.store.project_id == "root"
+    assert api.store.project_id == "server"
+    assert core.selection == WatchProjectSelection(
+        key="core",
+        project_dir=root_dir.resolve(),
+        tags=("release",),
+        any_tag=True,
+    )
+    assert api.selection == WatchProjectSelection(
+        key="api",
+        project_dir=server_dir.resolve(),
+        tags=("ops", "server"),
+        any_tag=False,
+    )
+    assert core.config.verify_command == "./bin/root-verify"
+    assert api.config.verify_command == "./bin/server-verify"
+    assert core.config.max_concurrent == 2
+    assert api.config.max_concurrent == 4
+    assert core.log.path == root_dir.resolve() / ".gza" / "watch.log"
+    assert api.log.path == server_dir.resolve() / ".gza" / "watch.log"
+    assert core.worker_registry.workers_dir == root_dir.resolve() / ".gza" / "workers"
+    assert api.worker_registry.workers_dir == server_dir.resolve() / ".gza" / "workers"
+    assert git_calls == [
+        (root_dir.resolve(), core.runtime_context.env),
+        (server_dir.resolve(), api.runtime_context.env),
+    ]
+
+
+def test_construct_watch_project_runtimes_builds_unrelated_db_runtimes_in_selector_order(
+    tmp_path: Path,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_db = tmp_path / "first.db"
+    second_db = tmp_path / "second.db"
+    _write_watch_runtime_project_config(
+        first_dir,
+        project_name="First",
+        project_id="first",
+        project_prefix="first",
+        db_path=first_db,
+    )
+    _write_watch_runtime_project_config(
+        second_dir,
+        project_name="Second",
+        project_id="second",
+        project_prefix="second",
+        db_path=second_db,
+    )
+    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir))
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="two", ref=str(second_dir), path=second_dir),
+            WatchSupervisorProjectSelector(key="one", ref=str(first_dir), path=first_dir),
+        )
+    )
+
+    constructed = construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    assert constructed.disabled == ()
+    assert [(runtime.key, runtime.config.project_id, runtime.store.db_path.resolve()) for runtime in constructed.runtimes] == [
+        ("two", "second", second_db.resolve()),
+        ("one", "first", first_db.resolve()),
+    ]
+
+
+def test_construct_watch_project_runtimes_disables_invalid_config_and_missing_path_without_runtime_state(
+    tmp_path: Path,
+) -> None:
+    anchor_dir = tmp_path / "anchor"
+    bad_dir = tmp_path / "bad"
+    missing_dir = tmp_path / "missing"
+    _write_watch_runtime_project_config(
+        anchor_dir,
+        project_name="Anchor",
+        project_id="anchor",
+        project_prefix="anchor",
+        db_path=tmp_path / "anchor.db",
+    )
+    bad_dir.mkdir()
+    (bad_dir / "gza.yaml").write_text("project_name: Bad\nprovider: [\n", encoding="utf-8")
+    anchor_store = SqliteTaskStore.from_config(Config.load(anchor_dir))
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
+            WatchSupervisorProjectSelector(key="missing", ref=str(missing_dir), path=missing_dir),
+        )
+    )
+
+    with patch("gza.cli.watch.Git", side_effect=AssertionError("disabled project opened Git")):
+        constructed = construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    assert constructed.runtimes == ()
+    assert [disabled.selector_key for disabled in constructed.disabled] == ["bad", "missing"]
+    assert [disabled.reason for disabled in constructed.disabled] == ["config_invalid", "missing_root"]
+    assert not (bad_dir / ".gza" / "watch.log").exists()
+    assert not (missing_dir / ".gza" / "watch.log").exists()
+
+
+def test_construct_watch_project_runtimes_rejects_duplicate_alias_before_activation(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    _write_watch_runtime_project_config(
+        project_dir,
+        project_name="Project",
+        project_id="project",
+        project_prefix="project",
+        db_path=tmp_path / "project.db",
+    )
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir))
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="dup", ref=str(project_dir), path=project_dir),
+            WatchSupervisorProjectSelector(key="dup", ref=str(project_dir), path=project_dir),
+        )
+    )
+
+    with (
+        patch("gza.cli.watch.ExecutionProjectResolved.open_runtime_store") as open_runtime_store,
+        pytest.raises(ValueError, match="selected more than once"),
+    ):
+        construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    open_runtime_store.assert_not_called()
+
+
+def test_construct_watch_project_runtimes_rejects_duplicate_project_identity_before_activation(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    _write_watch_runtime_project_config(
+        project_dir,
+        project_name="Project",
+        project_id="project",
+        project_prefix="project",
+        db_path=tmp_path / "project.db",
+    )
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir))
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="one", ref=str(project_dir), path=project_dir),
+            WatchSupervisorProjectSelector(key="two", ref=str(project_dir), path=project_dir),
+        )
+    )
+
+    with (
+        patch("gza.cli.watch.ExecutionProjectResolved.open_runtime_store") as open_runtime_store,
+        pytest.raises(ValueError, match="selected more than once"),
+    ):
+        construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    open_runtime_store.assert_not_called()
+
+
+def test_construct_watch_project_runtimes_rejects_unique_then_duplicate_identity_before_activation(
+    tmp_path: Path,
+) -> None:
+    unique_dir = tmp_path / "unique"
+    duplicate_dir = tmp_path / "duplicate"
+    _write_watch_runtime_project_config(
+        unique_dir,
+        project_name="Unique",
+        project_id="unique",
+        project_prefix="unique",
+        db_path=tmp_path / "unique.db",
+    )
+    _write_watch_runtime_project_config(
+        duplicate_dir,
+        project_name="Duplicate",
+        project_id="duplicate",
+        project_prefix="duplicate",
+        db_path=tmp_path / "duplicate.db",
+    )
+    anchor_store = SqliteTaskStore.from_config(Config.load(unique_dir))
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="unique", ref=str(unique_dir), path=unique_dir),
+            WatchSupervisorProjectSelector(key="one", ref=str(duplicate_dir), path=duplicate_dir),
+            WatchSupervisorProjectSelector(key="two", ref=str(duplicate_dir), path=duplicate_dir),
+        )
+    )
+
+    with (
+        patch("gza.cli.watch.ExecutionProjectResolved.open_runtime_store") as open_runtime_store,
+        pytest.raises(ValueError, match="selected more than once"),
+    ):
+        construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    open_runtime_store.assert_not_called()
+
+
+def test_construct_watch_project_runtimes_rejects_duplicate_then_unique_identity_before_activation(
+    tmp_path: Path,
+) -> None:
+    unique_dir = tmp_path / "unique"
+    duplicate_dir = tmp_path / "duplicate"
+    _write_watch_runtime_project_config(
+        unique_dir,
+        project_name="Unique",
+        project_id="unique",
+        project_prefix="unique",
+        db_path=tmp_path / "unique.db",
+    )
+    _write_watch_runtime_project_config(
+        duplicate_dir,
+        project_name="Duplicate",
+        project_id="duplicate",
+        project_prefix="duplicate",
+        db_path=tmp_path / "duplicate.db",
+    )
+    anchor_store = SqliteTaskStore.from_config(Config.load(unique_dir))
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="one", ref=str(duplicate_dir), path=duplicate_dir),
+            WatchSupervisorProjectSelector(key="two", ref=str(duplicate_dir), path=duplicate_dir),
+            WatchSupervisorProjectSelector(key="unique", ref=str(unique_dir), path=unique_dir),
+        )
+    )
+
+    with (
+        patch("gza.cli.watch.ExecutionProjectResolved.open_runtime_store") as open_runtime_store,
+        pytest.raises(ValueError, match="selected more than once"),
+    ):
+        construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    open_runtime_store.assert_not_called()
+
+
+def test_construct_watch_project_runtimes_disables_project_id_assertion_mismatch(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    _write_watch_runtime_project_config(
+        project_dir,
+        project_name="Project",
+        project_id="actual",
+        project_prefix="actual",
+        db_path=tmp_path / "project.db",
+    )
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir))
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(
+                key="project",
+                ref=str(project_dir),
+                path=project_dir,
+                project_id="expected",
+            ),
+        )
+    )
+
+    constructed = construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    assert constructed.runtimes == ()
+    assert len(constructed.disabled) == 1
+    disabled = constructed.disabled[0]
+    assert disabled.selector_key == "project"
+    assert disabled.reason == "project_id_mismatch"
+    assert disabled.project_id == "actual"
+
+
+def test_construct_watch_project_runtimes_keeps_anchor_presentation_while_loading_runtime_configs(
+    tmp_path: Path,
+) -> None:
+    anchor_dir = tmp_path / "anchor"
+    selected_dir = tmp_path / "selected"
+    _write_watch_runtime_project_config(
+        anchor_dir,
+        project_name="Anchor",
+        project_id="anchor",
+        project_prefix="anchor",
+        db_path=tmp_path / "anchor.db",
+        color_overrides={"task_id": "bold red"},
+    )
+    _write_watch_runtime_project_config(
+        selected_dir,
+        project_name="Selected",
+        project_id="selected",
+        project_prefix="selected",
+        db_path=tmp_path / "selected.db",
+        color_overrides={"task_id": "bold green"},
+    )
+    anchor_config = Config.load(anchor_dir)
+    assert colors.TASK_COLORS.task_id == "bold red"
+    anchor_store = SqliteTaskStore.from_config(anchor_config)
+    selection = _watch_runtime_selection(
+        (WatchSupervisorProjectSelector(key="selected", ref=str(selected_dir), path=selected_dir),)
+    )
+
+    constructed = construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    assert [runtime.key for runtime in constructed.runtimes] == ["selected"]
+    assert constructed.runtimes[0].config.colors["task_id"] == "bold green"
+    assert colors.TASK_COLORS.task_id == "bold red"
+
+
+def _seed_inconsistent_unmerged_unit(store: SqliteTaskStore) -> str:
+    task = store.add("Repair-gated implementation", task_type="implement")
+    assert task.id is not None
+    unit = store.create_merge_unit(
+        source_branch="feature/repair-gated",
+        target_branch="main",
+        owner_task_id=task.id,
+        state="unmerged",
+    )
+    with store._connect() as conn:
+        conn.execute(
+            """
+            UPDATE merge_units
+            SET state = 'unmerged',
+                merged_at = ?,
+                merged_by_task_id = ?,
+                merge_source = 'watch'
+            WHERE project_id = ? AND id = ?
+            """,
+            (datetime.now(UTC).isoformat(), task.id, store.project_id, unit.id),
+        )
+    return unit.id
+
+
+def _merge_unit_has_stale_merged_provenance(store: SqliteTaskStore, unit_id: str) -> bool:
+    unit = store.get_merge_unit(unit_id)
+    assert unit is not None
+    return unit.merged_at is not None or unit.merged_by_task_id is not None or unit.merge_source is not None
+
+
+def _schema_version_and_project_row(db_path: Path, project_id: str) -> tuple[int, tuple[Any, ...] | None]:
+    with sqlite3.connect(db_path) as conn:
+        version = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()[0]
+        project_row = conn.execute(
+            """
+            SELECT id, root_path, config_path, project_name, project_prefix, db_layout_version, created_at, last_seen_at
+            FROM projects
+            WHERE id = ?
+            """,
+            (project_id,),
+        ).fetchone()
+    return version, tuple(project_row) if project_row is not None else None
+
+
+def _assert_watch_supervisor_lease_can_be_acquired(store: SqliteTaskStore, token: str) -> None:
+    lease = store.try_acquire_project_lease(
+        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+        owner_pid=os.getpid(),
+        owner_token=token,
+    )
+    assert lease is not None
+    assert store.release_project_lease(
+        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+        owner_token=token,
+    )
+
+
+def test_construct_watch_project_runtimes_defers_merge_unit_repairs_until_after_lease(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    _write_watch_runtime_project_config(
+        project_dir,
+        project_name="Project",
+        project_id="project",
+        project_prefix="project",
+        db_path=tmp_path / "project.db",
+    )
+    config = Config.load(project_dir)
+    store = SqliteTaskStore.from_config(config)
+    unit_id = _seed_inconsistent_unmerged_unit(store)
+    selection = _watch_runtime_selection(
+        (WatchSupervisorProjectSelector(key="project", ref=str(project_dir), path=project_dir),)
+    )
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        constructed = construct_watch_project_runtimes(anchor_store=store, selection=selection, quiet=True)
+
+    assert constructed.disabled == ()
+    assert [runtime.key for runtime in constructed.runtimes] == ["project"]
+    assert _merge_unit_has_stale_merged_provenance(store, unit_id) is False
+    assert constructed.lease_set is not None
+    constructed.lease_set.release()
+
+
+def test_construct_watch_project_runtimes_lease_conflict_leaves_inconsistent_merge_unit_unrepaired(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    _write_watch_runtime_project_config(
+        project_dir,
+        project_name="Project",
+        project_id="project",
+        project_prefix="project",
+        db_path=tmp_path / "project.db",
+    )
+    config = Config.load(project_dir)
+    store = SqliteTaskStore.from_config(config)
+    unit_id = _seed_inconsistent_unmerged_unit(store)
+    assert store.try_acquire_project_lease(
+        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+        owner_pid=os.getpid(),
+        owner_token="already-owned",
+    ) is not None
+    selection = _watch_runtime_selection(
+        (WatchSupervisorProjectSelector(key="project", ref=str(project_dir), path=project_dir),)
+    )
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        pytest.raises(WatchLeaseConflict),
+    ):
+        construct_watch_project_runtimes(anchor_store=store, selection=selection, quiet=True)
+
+    assert _merge_unit_has_stale_merged_provenance(store, unit_id) is True
+
+
+def test_construct_watch_project_runtimes_lease_conflict_does_not_mutate_schema_or_project_row(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    _write_watch_runtime_project_config(
+        project_dir,
+        project_name="Project",
+        project_id="project",
+        project_prefix="project",
+        db_path=tmp_path / "project.db",
+    )
+    config = Config.load(project_dir)
+    store = SqliteTaskStore.from_config(config)
+    before = _schema_version_and_project_row(store.db_path, "project")
+    assert before[1] is not None
+    assert store.try_acquire_project_lease(
+        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+        owner_pid=os.getpid(),
+        owner_token="already-owned",
+    ) is not None
+    selection = _watch_runtime_selection(
+        (WatchSupervisorProjectSelector(key="project", ref=str(project_dir), path=project_dir),)
+    )
+
+    with pytest.raises(WatchLeaseConflict):
+        construct_watch_project_runtimes(anchor_store=store, selection=selection, quiet=True)
+
+    assert _schema_version_and_project_row(store.db_path, "project") == before
+
+
+def test_construct_watch_project_runtimes_activation_invalid_utf8_disables_one_project_and_keeps_next(
+    tmp_path: Path,
+) -> None:
+    bad_dir = tmp_path / "bad"
+    good_dir = tmp_path / "good"
+    _write_watch_runtime_project_config(
+        bad_dir,
+        project_name="Bad",
+        project_id="bad",
+        project_prefix="bad",
+        db_path=tmp_path / "bad.db",
+    )
+    _write_watch_runtime_project_config(
+        good_dir,
+        project_name="Good",
+        project_id="good",
+        project_prefix="good",
+        db_path=tmp_path / "good.db",
+    )
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir))
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
+            WatchSupervisorProjectSelector(key="good", ref=str(good_dir), path=good_dir),
+        )
+    )
+    resolved = watch_module.resolve_execution_projects(
+        anchor_store,
+        tuple(watch_module._execution_project_selector_for_watch(project) for project in selection.projects),
+    )
+    (bad_dir / "gza.yaml").write_bytes(b"\xff\xfe\xfa")
+
+    with patch("gza.cli.watch.resolve_execution_projects", return_value=resolved):
+        with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+            constructed = construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    assert [(disabled.selector_key, disabled.reason) for disabled in constructed.disabled] == [
+        ("bad", "config_invalid")
+    ]
+    assert [runtime.key for runtime in constructed.runtimes] == ["good"]
+    assert constructed.lease_set is not None
+    constructed.lease_set.release()
+
+
+def test_construct_watch_project_runtimes_preserves_post_preflight_db_failure_reasons(
+    tmp_path: Path,
+) -> None:
+    unavailable_dir = tmp_path / "unavailable"
+    incompatible_dir = tmp_path / "incompatible"
+    good_dir = tmp_path / "good"
+    unavailable_parent = tmp_path / "db-parent"
+    unavailable_db = unavailable_parent / "unavailable.db"
+    incompatible_db = tmp_path / "incompatible.db"
+    unavailable_parent.mkdir()
+    _write_watch_runtime_project_config(
+        unavailable_dir,
+        project_name="Unavailable",
+        project_id="unavailable",
+        project_prefix="unavail",
+        db_path=unavailable_db,
+    )
+    _write_watch_runtime_project_config(
+        incompatible_dir,
+        project_name="Incompatible",
+        project_id="incompatible",
+        project_prefix="incompat",
+        db_path=incompatible_db,
+    )
+    _write_watch_runtime_project_config(
+        good_dir,
+        project_name="Good",
+        project_id="good",
+        project_prefix="good",
+        db_path=tmp_path / "good.db",
+    )
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir))
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="unavailable", ref=str(unavailable_dir), path=unavailable_dir),
+            WatchSupervisorProjectSelector(key="incompatible", ref=str(incompatible_dir), path=incompatible_dir),
+            WatchSupervisorProjectSelector(key="good", ref=str(good_dir), path=good_dir),
+        )
+    )
+    resolved = watch_module.resolve_execution_projects(
+        anchor_store,
+        tuple(watch_module._execution_project_selector_for_watch(project) for project in selection.projects),
+    )
+    unavailable_parent.rmdir()
+    unavailable_parent.write_text("not a directory", encoding="utf-8")
+    with sqlite3.connect(incompatible_db) as conn:
+        conn.execute("CREATE TABLE not_gza(id INTEGER)")
+
+    with patch("gza.cli.watch.resolve_execution_projects", return_value=resolved):
+        with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+            constructed = construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    assert [(disabled.selector_key, disabled.reason) for disabled in constructed.disabled] == [
+        ("unavailable", "db_unavailable"),
+        ("incompatible", "schema_incompatible"),
+    ]
+    assert [runtime.key for runtime in constructed.runtimes] == ["good"]
+    assert constructed.lease_set is not None
+    constructed.lease_set.release()
+
+
+@pytest.mark.parametrize(
+    "drift_case",
+    [
+        "missing_unavailable",
+        "incompatible_sqlite",
+        "manual_migration",
+    ],
+)
+def test_construct_watch_project_runtimes_db_path_drift_is_typed_before_drifted_db_health(
+    tmp_path: Path,
+    drift_case: str,
+) -> None:
+    project_dir = tmp_path / "project"
+    original_db = tmp_path / "original.db"
+    drift_db = tmp_path / f"{drift_case}.db"
+    _write_watch_runtime_project_config(
+        project_dir,
+        project_name="Race",
+        project_id="race",
+        project_prefix="race",
+        db_path=original_db,
+    )
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir))
+    selection = _watch_runtime_selection(
+        (WatchSupervisorProjectSelector(key="race", ref=str(project_dir), path=project_dir),)
+    )
+    resolved = watch_module.resolve_execution_projects(
+        anchor_store,
+        tuple(watch_module._execution_project_selector_for_watch(project) for project in selection.projects),
+    )
+    if drift_case == "missing_unavailable":
+        blocked_parent = tmp_path / "blocked-parent"
+        blocked_parent.write_text("not a directory\n", encoding="utf-8")
+        drift_db = blocked_parent / "drift.db"
+    elif drift_case == "incompatible_sqlite":
+        with sqlite3.connect(drift_db) as conn:
+            conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+    else:
+        SqliteTaskStore(drift_db, prefix="race", project_id="race")
+        with sqlite3.connect(drift_db) as conn:
+            conn.execute("UPDATE schema_version SET version = 24")
+    _write_watch_runtime_project_config(
+        project_dir,
+        project_name="Race",
+        project_id="race",
+        project_prefix="race",
+        db_path=drift_db,
+    )
+
+    with patch("gza.cli.watch.resolve_execution_projects", return_value=resolved):
+        constructed = construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    assert constructed.runtimes == ()
+    assert [(disabled.selector_key, disabled.reason) for disabled in constructed.disabled] == [
+        ("race", "db_path_mismatch")
+    ]
+    assert constructed.lease_set is not None
+    assert constructed.lease_set.held == ()
+    _assert_watch_supervisor_lease_can_be_acquired(anchor_store, f"after-{drift_case}")
+
+
+def test_construct_watch_project_runtimes_repair_failure_releases_disabled_project_lease(
+    tmp_path: Path,
+) -> None:
+    repair_fail_dir = tmp_path / "repair-fail"
+    good_dir = tmp_path / "good"
+    _write_watch_runtime_project_config(
+        repair_fail_dir,
+        project_name="RepairFail",
+        project_id="repairfail",
+        project_prefix="repair",
+        db_path=tmp_path / "repairfail.db",
+    )
+    _write_watch_runtime_project_config(
+        good_dir,
+        project_name="Good",
+        project_id="good",
+        project_prefix="good",
+        db_path=tmp_path / "good.db",
+    )
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir))
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="repair", ref=str(repair_fail_dir), path=repair_fail_dir),
+            WatchSupervisorProjectSelector(key="good", ref=str(good_dir), path=good_dir),
+        )
+    )
+    real_repair = SqliteTaskStore.repair_inconsistent_unmerged_merge_units
+
+    def repair_factory(store: SqliteTaskStore) -> None:
+        if store.project_id == "repairfail":
+            raise SchemaIntegrityError("repair invariant failed")
+        real_repair(store)
+
+    with (
+        patch.object(SqliteTaskStore, "repair_inconsistent_unmerged_merge_units", repair_factory),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+    ):
+        constructed = construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    assert [(disabled.selector_key, disabled.reason) for disabled in constructed.disabled] == [
+        ("repair", "schema_incompatible")
+    ]
+    assert [runtime.key for runtime in constructed.runtimes] == ["good"]
+    assert constructed.lease_set is not None
+    assert [held.target.key for held in constructed.lease_set.held] == ["good"]
+    _assert_watch_supervisor_lease_can_be_acquired(
+        SqliteTaskStore(tmp_path / "repairfail.db", prefix="repair", project_id="repairfail"),
+        "after-repair-disable",
+    )
+    constructed.lease_set.release()
+
+
+def test_construct_watch_project_runtimes_isolates_log_and_worker_registry_initialization_failures(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    log_fail_dir = tmp_path / "log-fail"
+    worker_fail_dir = tmp_path / "worker-fail"
+    good_dir = tmp_path / "good"
+    _write_watch_runtime_project_config(
+        log_fail_dir,
+        project_name="LogFail",
+        project_id="logfail",
+        project_prefix="logfail",
+        db_path=tmp_path / "logfail.db",
+    )
+    _write_watch_runtime_project_config(
+        worker_fail_dir,
+        project_name="WorkerFail",
+        project_id="workerfail",
+        project_prefix="worker",
+        db_path=tmp_path / "workerfail.db",
+    )
+    _write_watch_runtime_project_config(
+        good_dir,
+        project_name="Good",
+        project_id="good",
+        project_prefix="good",
+        db_path=tmp_path / "good.db",
+    )
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir))
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="log", ref=str(log_fail_dir), path=log_fail_dir),
+            WatchSupervisorProjectSelector(key="worker", ref=str(worker_fail_dir), path=worker_fail_dir),
+            WatchSupervisorProjectSelector(key="good", ref=str(good_dir), path=good_dir),
+        )
+    )
+    real_watch_log = watch_module._WATCH_LOG_TYPE
+    real_worker_registry = WorkerRegistry
+
+    def watch_log_factory(path: Path, *, quiet: bool) -> object:
+        if path == log_fail_dir.resolve() / ".gza" / "watch.log":
+            raise OSError("log path unavailable")
+        return real_watch_log(path, quiet=quiet)
+
+    def worker_registry_factory(workers_dir: Path) -> WorkerRegistry:
+        if workers_dir == worker_fail_dir.resolve() / ".gza" / "workers":
+            raise OSError("workers path unavailable")
+        return real_worker_registry(workers_dir)
+
+    with (
+        patch("gza.cli.watch._WatchLog", side_effect=watch_log_factory),
+        patch("gza.cli.watch.WorkerRegistry", side_effect=worker_registry_factory),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+    ):
+        constructed = construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    captured = capsys.readouterr()
+    assert "WARN      [log] watch log sink disabled" in captured.out
+    assert [(disabled.selector_key, disabled.reason) for disabled in constructed.disabled] == [
+        ("worker", "runtime_filesystem_unavailable")
+    ]
+    assert [runtime.key for runtime in constructed.runtimes] == ["log", "good"]
+    assert constructed.lease_set is not None
+    assert [held.target.key for held in constructed.lease_set.held] == ["log", "good"]
+    with sqlite3.connect(tmp_path / "workerfail.db") as conn:
+        assert conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()[0] == SCHEMA_VERSION
+    _assert_watch_supervisor_lease_can_be_acquired(
+        SqliteTaskStore(tmp_path / "workerfail.db", prefix="worker", project_id="workerfail"),
+        "after-worker-disable",
+    )
+    constructed.lease_set.release()
+
+
+@pytest.mark.parametrize("failure_site", ["git", "runtime"])
+def test_construct_watch_project_runtimes_releases_all_leases_on_runtime_construction_failure(
+    tmp_path: Path,
+    failure_site: str,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_db = tmp_path / "first.db"
+    second_db = tmp_path / "second.db"
+    _write_watch_runtime_project_config(
+        first_dir,
+        project_name="First",
+        project_id="first",
+        project_prefix="first",
+        db_path=first_db,
+    )
+    _write_watch_runtime_project_config(
+        second_dir,
+        project_name="Second",
+        project_id="second",
+        project_prefix="second",
+        db_path=second_db,
+    )
+    anchor_store = SqliteTaskStore.from_config(Config.load(first_dir))
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="first", ref=str(first_dir), path=first_dir),
+            WatchSupervisorProjectSelector(key="second", ref=str(second_dir), path=second_dir),
+        )
+    )
+
+    if failure_site == "git":
+        def git_factory(repo_dir: Path, *, env: Mapping[str, str] | None = None) -> Git:
+            if repo_dir == second_dir.resolve():
+                raise RuntimeError("git unavailable")
+            return _make_watch_git()
+
+        context = patch("gza.cli.watch.Git", side_effect=git_factory)
+        expected_error = "git unavailable"
+    else:
+        real_from_execution_runtime = WatchProjectRuntime.from_execution_runtime
+
+        def runtime_factory(**kwargs: Any) -> WatchProjectRuntime:
+            if kwargs["key"] == "second":
+                raise ValueError("runtime ownership failed")
+            return real_from_execution_runtime(**kwargs)
+
+        context = patch(
+            "gza.cli.watch.WatchProjectRuntime.from_execution_runtime",
+            side_effect=runtime_factory,
+        )
+        expected_error = "runtime ownership failed"
+
+    with context:
+        with pytest.raises((RuntimeError, ValueError), match=expected_error):
+            construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
+
+    _assert_watch_supervisor_lease_can_be_acquired(
+        SqliteTaskStore(first_db, prefix="first", project_id="first"),
+        f"after-{failure_site}-first",
+    )
+    _assert_watch_supervisor_lease_can_be_acquired(
+        SqliteTaskStore(second_db, prefix="second", project_id="second"),
+        f"after-{failure_site}-second",
+    )
+
+
 def test_watch_project_runtime_owns_project_local_state(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
@@ -2158,6 +3060,138 @@ def test_watch_project_runtime_rejects_real_git_with_unrelated_runtime_env(tmp_p
         )
 
     assert alpha_store.get_all() == []
+
+
+def test_watch_project_runtime_rejects_worker_registry_from_unrelated_project_root(tmp_path: Path) -> None:
+    alpha_dir = tmp_path / "alpha"
+    beta_dir = tmp_path / "beta"
+    alpha_dir.mkdir()
+    beta_dir.mkdir()
+    setup_config(alpha_dir, project_name="alpha")
+    setup_config(beta_dir, project_name="beta")
+    alpha_config = Config.load(alpha_dir)
+    beta_config = Config.load(beta_dir)
+    alpha_store = SqliteTaskStore.from_config(alpha_config)
+    beta_registry = MagicMock()
+    beta_registry.workers_dir = beta_config.workers_path
+
+    with pytest.raises(ValueError, match="worker registry"):
+        WatchProjectRuntime.create(
+            key="alpha",
+            config=alpha_config,
+            store=alpha_store,
+            log=_WatchLog(alpha_dir / ".gza" / "watch.log", quiet=True),
+            tags=None,
+            any_tag=False,
+            git=_make_watch_git(),
+            runtime_context=RuntimeExecutionContext.from_config(alpha_config),
+            worker_registry=beta_registry,
+        )
+
+    assert alpha_store.get_all() == []
+
+
+def test_watch_project_runtime_live_worker_exclusion_uses_owned_worker_registry(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = SqliteTaskStore.from_config(config)
+    task = store.add("Owned registry task", task_type="implement")
+    assert task.id is not None
+    spy_registry = MagicMock()
+    spy_registry.workers_dir = config.workers_path
+    spy_registry.list_all.return_value = [
+        WorkerMetadata(
+            worker_id="w-owned",
+            task_id=task.id,
+            pid=os.getpid(),
+            status="running",
+        )
+    ]
+    spy_registry.is_running.return_value = True
+    runtime = WatchProjectRuntime.create(
+        key="core",
+        config=config,
+        store=store,
+        log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+        worker_registry=spy_registry,
+    )
+
+    assert runtime._current_live_worker_exclusion_ids() == frozenset({task.id})
+    spy_registry.list_all.assert_called_once_with(include_completed=False)
+    spy_registry.is_running.assert_called_once_with("w-owned")
+
+
+def test_watch_project_runtime_live_worker_exclusion_is_project_local_for_colliding_task_ids(
+    tmp_path: Path,
+) -> None:
+    alpha_dir = tmp_path / "alpha"
+    beta_dir = tmp_path / "beta"
+    _write_watch_runtime_project_config(
+        alpha_dir,
+        project_name="Alpha",
+        project_id="alpha",
+        project_prefix="same",
+        db_path=tmp_path / "alpha.db",
+    )
+    _write_watch_runtime_project_config(
+        beta_dir,
+        project_name="Beta",
+        project_id="beta",
+        project_prefix="same",
+        db_path=tmp_path / "beta.db",
+    )
+    alpha_config = Config.load(alpha_dir)
+    beta_config = Config.load(beta_dir)
+    alpha_store = SqliteTaskStore.from_config(alpha_config)
+    beta_store = SqliteTaskStore.from_config(beta_config)
+    alpha_task = alpha_store.add("Alpha task", task_type="implement")
+    beta_task = beta_store.add("Beta task", task_type="implement")
+    assert alpha_task.id is not None
+    assert beta_task.id is not None
+    assert alpha_task.id == beta_task.id
+    alpha_registry = MagicMock()
+    alpha_registry.workers_dir = alpha_config.workers_path
+    alpha_registry.list_all.return_value = [
+        WorkerMetadata(
+            worker_id="w-alpha",
+            task_id=alpha_task.id,
+            pid=os.getpid(),
+            status="running",
+        )
+    ]
+    alpha_registry.is_running.return_value = True
+    beta_registry = MagicMock()
+    beta_registry.workers_dir = beta_config.workers_path
+    beta_registry.list_all.return_value = []
+    beta_registry.is_running.return_value = False
+    alpha_runtime = WatchProjectRuntime.create(
+        key="alpha",
+        config=alpha_config,
+        store=alpha_store,
+        log=_WatchLog(alpha_dir / ".gza" / "watch.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+        worker_registry=alpha_registry,
+    )
+    beta_runtime = WatchProjectRuntime.create(
+        key="beta",
+        config=beta_config,
+        store=beta_store,
+        log=_WatchLog(beta_dir / ".gza" / "watch.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+        worker_registry=beta_registry,
+    )
+
+    assert alpha_runtime._current_live_worker_exclusion_ids() == frozenset({alpha_task.id})
+    assert beta_runtime._current_live_worker_exclusion_ids() == frozenset()
+    alpha_registry.list_all.assert_called_once_with(include_completed=False)
+    beta_registry.list_all.assert_called_once_with(include_completed=False)
 
 
 def test_watch_project_runtime_build_plan_uses_owned_git(tmp_path: Path) -> None:
@@ -42788,6 +43822,7 @@ def test_watch_project_runtime_live_dispatch_attempt_blocks_same_pass_after_work
     assert first.id in runtime._confirmed_started_task_ids
     assert first.id in runtime._attempted_dispatch_task_ids
 
+    runtime.worker_registry = dead_registry
     with (
         patch("gza.cli.watch.launch_permit", side_effect=AssertionError("permit acquired")),
         patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("worker spawned")),

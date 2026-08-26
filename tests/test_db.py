@@ -9,6 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
@@ -20,6 +21,7 @@ from gza.db import (
     SCHEMA_VERSION,
     BehaviorCheckRun,
     DuplicateActiveChildError,
+    ExecutionProjectActivationError,
     ExecutionProjectDisabled,
     ExecutionProjectResolved,
     ExecutionProjectRuntime,
@@ -11588,10 +11590,82 @@ class TestExecutionProjectResolver:
             db_path=loop / "redirected.db",
         )
 
-        with pytest.raises(SchemaIntegrityError, match="Execution project config is invalid at activation"):
+        with pytest.raises(
+            ExecutionProjectActivationError,
+            match="Execution project config is invalid at activation",
+        ) as exc_info:
             result.open_runtime_store()
 
+        assert exc_info.value.reason == "config_invalid"
         assert not original_db.exists()
+
+    def test_path_symlink_loop_error_detects_self_referential_prefix_without_stat_eloop(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza import db as db_module
+
+        loop = tmp_path / "loop"
+        try:
+            loop.symlink_to(loop)
+        except (OSError, NotImplementedError) as exc:
+            pytest.skip(f"symlinks are not supported here: {exc}")
+
+        real_stat = db_module.os.stat
+
+        def stat_without_eloop(path: str | Path, *args: Any, **kwargs: Any) -> os.stat_result:
+            candidate = Path(path)
+            if candidate == loop or loop in candidate.parents:
+                raise FileNotFoundError(path)
+            return real_stat(path, *args, **kwargs)
+
+        with patch("gza.db.os.stat", side_effect=stat_without_eloop):
+            assert db_module._path_symlink_loop_error(loop / "redirected.db") == f"Symlink loop from {loop}"
+
+    def test_execution_runtime_activation_controls_db_path_symlink_loop_when_resolve_is_lenient(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from gza import db as db_module
+
+        project_dir = tmp_path / "project"
+        original_db = tmp_path / "original.db"
+        redirected_db = tmp_path / "redirected.db"
+        _write_project_config(
+            project_dir,
+            project_name="Race",
+            project_id="race",
+            project_prefix="race",
+            db_path=original_db,
+        )
+        anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
+        (result,) = resolve_execution_projects(anchor, (ExecutionProjectSelector("race", "path", project_dir),))
+        assert isinstance(result, ExecutionProjectResolved)
+
+        _write_project_config(
+            project_dir,
+            project_name="Race",
+            project_id="race",
+            project_prefix="race",
+            db_path=redirected_db,
+        )
+
+        def detect_loop(path: Path) -> str | None:
+            if path == redirected_db:
+                return "Too many levels of symbolic links"
+            return None
+
+        with patch("gza.db._path_symlink_loop_error", side_effect=detect_loop):
+            with pytest.raises(
+                ExecutionProjectActivationError,
+                match="Execution project config is invalid at activation",
+            ) as exc_info:
+                result.open_runtime_store()
+
+        assert exc_info.value.reason == "config_invalid"
+        assert not original_db.exists()
+        assert not redirected_db.exists()
+        assert db_module._path_symlink_loop_error(original_db) is None
 
     def test_execution_runtime_activation_controls_legacy_local_db_conflict_without_initializing_active_db(
         self,
@@ -12890,22 +12964,63 @@ class TestExecutionProjectResolver:
         assert self._sqlite_user_schema_and_rows(anchor.db_path) == before
         assert not healthy_db.exists()
 
-    @pytest.mark.parametrize("exc", [TypeError("repair type bug"), ValueError("repair value bug")])
-    def test_unexpected_store_initialization_type_or_value_error_propagates(
+    def test_execution_runtime_activation_opens_non_repairing_store(
         self,
         tmp_path: Path,
-        exc: Exception,
     ) -> None:
         anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
         project_dir = tmp_path / "project"
         project_db = tmp_path / "project.db"
         _write_project_config(project_dir, project_name="Bug", project_id="bug", db_path=project_db)
 
-        with patch.object(SqliteTaskStore, "repair_inconsistent_unmerged_merge_units", side_effect=exc):
+        with patch.object(SqliteTaskStore, "repair_inconsistent_unmerged_merge_units") as repair:
             (result,) = resolve_execution_projects(anchor, (ExecutionProjectSelector("bug", "path", project_dir),))
             assert isinstance(result, ExecutionProjectResolved)
-            with pytest.raises(type(exc), match=str(exc)):
-                result.open_runtime_store()
+            runtime = result.open_runtime_store()
+
+        assert runtime.store.project_id == "bug"
+        repair.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "drift_case",
+        [
+            "missing_unavailable",
+            "incompatible_sqlite",
+            "manual_migration",
+        ],
+    )
+    def test_execution_runtime_activation_reports_db_path_mismatch_before_drifted_db_health(
+        self,
+        tmp_path: Path,
+        drift_case: str,
+    ) -> None:
+        anchor = SqliteTaskStore(tmp_path / "anchor.db", prefix="gza", project_id="anchor")
+        project_dir = tmp_path / "project"
+        original_db = tmp_path / "original.db"
+        drift_db = tmp_path / f"{drift_case}.db"
+        _write_project_config(project_dir, project_name="Race", project_id="race", db_path=original_db)
+        SqliteTaskStore(original_db, prefix="gza", project_id="race")
+        (result,) = resolve_execution_projects(anchor, (ExecutionProjectSelector("race", "path", project_dir),))
+        assert isinstance(result, ExecutionProjectResolved)
+
+        if drift_case == "missing_unavailable":
+            blocked_parent = tmp_path / "blocked-parent"
+            blocked_parent.write_text("not a directory\n", encoding="utf-8")
+            drift_db = blocked_parent / "drift.db"
+        elif drift_case == "incompatible_sqlite":
+            with sqlite3.connect(drift_db) as conn:
+                conn.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+        else:
+            SqliteTaskStore(drift_db, prefix="gza", project_id="race")
+            with sqlite3.connect(drift_db) as conn:
+                conn.execute("UPDATE schema_version SET version = 24")
+        _write_project_config(project_dir, project_name="Race", project_id="race", db_path=drift_db)
+
+        with pytest.raises(ExecutionProjectActivationError) as exc_info:
+            result.open_runtime_store()
+
+        assert exc_info.value.reason == "db_path_mismatch"
+        assert "DB path changed at activation" in str(exc_info.value)
 
     def test_manual_migration_and_future_schema_are_disabled(self, tmp_path: Path) -> None:
         manual_dir = tmp_path / "manual"

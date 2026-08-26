@@ -1,11 +1,13 @@
 """SQLite-based task storage."""
 
+import errno
 import json
 import logging
 import os
 import re
 import shlex
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import threading
@@ -52,6 +54,7 @@ __all__ = [
     "DB_UNSET",
     "DuplicateActiveChildError",
     "ExecutionProjectDisabled",
+    "ExecutionProjectActivationError",
     "ExecutionProjectResolved",
     "ExecutionProjectRuntime",
     "ExecutionProjectSelector",
@@ -103,6 +106,7 @@ StoreOpenMode = Literal[
     "query_only",
     "registry_mutation",
     "registry_mutation_existing",
+    "watch_lease_acquisition",
     "watch_lease_activation",
 ]
 SqliteIsolationLevel = Literal["DEFERRED", "EXCLUSIVE", "IMMEDIATE"] | None
@@ -120,6 +124,7 @@ ExecutionProjectDisableReason = Literal[
     "duplicate_selection",
     "linked_worktree",
     "db_unavailable",
+    "runtime_filesystem_unavailable",
     "manual_migration_required",
     "schema_incompatible",
 ]
@@ -226,6 +231,14 @@ class SchemaIntegrityError(RuntimeError):
     """Raised when persisted DB artifacts are internally inconsistent."""
 
 
+class ExecutionProjectActivationError(SchemaIntegrityError):
+    """Raised when an execution project fails activation with a typed disabled reason."""
+
+    def __init__(self, reason: ExecutionProjectDisableReason, message: str) -> None:
+        self.reason = reason
+        super().__init__(message)
+
+
 class MergeTargetResolutionError(RuntimeError):
     """Raised when write paths cannot determine the real default merge target."""
 
@@ -280,6 +293,10 @@ class ExecutionProjectResolved:
     config: "Config"
     db_path_override: Path | None = None
 
+    def open_lease_store(self) -> "SqliteTaskStore":
+        """Open a non-mutating store handle used only to acquire the watch lease."""
+        return SqliteTaskStore.from_config(self.config, open_mode="watch_lease_acquisition")
+
     def open_runtime_store(self) -> ExecutionProjectRuntime:
         """Open the read-write runtime store after the caller owns the project lease."""
         from .config import Config, ConfigError
@@ -296,49 +313,88 @@ class ExecutionProjectResolved:
         except (RuntimeError, ValueError) as exc:
             if not _is_expected_config_load_path_error(exc):
                 raise
-            raise SchemaIntegrityError(f"Execution project config is invalid at activation: {exc}") from exc
-        except (ConfigError, OSError, yaml.YAMLError) as exc:
-            raise SchemaIntegrityError(f"Execution project config is invalid at activation: {exc}") from exc
+            raise ExecutionProjectActivationError(
+                "config_invalid", f"Execution project config is invalid at activation: {exc}"
+            ) from exc
+        except (ConfigError, OSError, UnicodeError, yaml.YAMLError) as exc:
+            raise ExecutionProjectActivationError(
+                "config_invalid", f"Execution project config is invalid at activation: {exc}"
+            ) from exc
 
         try:
             current_config_path = Config.config_path(current_config.project_dir).resolve()
         except (RuntimeError, ValueError) as exc:
             if not _is_expected_config_load_path_error(exc):
                 raise
-            raise SchemaIntegrityError(f"Execution project config path is invalid at activation: {exc}") from exc
+            raise ExecutionProjectActivationError(
+                "config_invalid", f"Execution project config path is invalid at activation: {exc}"
+            ) from exc
         except OSError as exc:
-            raise SchemaIntegrityError(f"Execution project config path is invalid at activation: {exc}") from exc
+            raise ExecutionProjectActivationError(
+                "config_invalid", f"Execution project config path is invalid at activation: {exc}"
+            ) from exc
+        current_raw_db_path = current_config.db_path
+        db_path_loop_error = _path_symlink_loop_error(current_raw_db_path)
+        if db_path_loop_error is not None:
+            raise ExecutionProjectActivationError(
+                "config_invalid", f"Execution project config is invalid at activation: {db_path_loop_error}"
+            )
         try:
-            current_db_path = current_config.db_path.resolve()
+            current_db_path = current_raw_db_path.resolve()
         except (RuntimeError, ValueError) as exc:
             if not _is_expected_config_load_path_error(exc):
                 raise
-            raise SchemaIntegrityError(f"Execution project DB path is invalid at activation: {exc}") from exc
+            raise ExecutionProjectActivationError(
+                "db_unavailable", f"Execution project DB path is invalid at activation: {exc}"
+            ) from exc
         except OSError as exc:
-            raise SchemaIntegrityError(f"Execution project DB path is invalid at activation: {exc}") from exc
+            raise ExecutionProjectActivationError(
+                "db_unavailable", f"Execution project DB path is invalid at activation: {exc}"
+            ) from exc
+        if current_db_path != self.db_path:
+            raise ExecutionProjectActivationError(
+                "db_path_mismatch",
+                f"Execution project DB path changed at activation: {current_db_path}, expected {self.db_path}."
+            )
         current_db_incompatibility = _classify_existing_execution_db(current_db_path)
         if current_db_incompatibility is not None:
             reason, message = current_db_incompatibility
-            if reason == "db_unavailable":
-                raise SchemaIntegrityError(f"Execution project config is invalid at activation: {message}")
+            if reason == "manual_migration_required":
+                try:
+                    pending_versions = _pending_manual_migration_versions(current_db_path)
+                except sqlite3.Error as exc:
+                    if _is_execution_db_availability_sqlite_error(exc):
+                        raise ExecutionProjectActivationError(
+                            "db_unavailable",
+                            f"Execution project DB became unavailable while rereading manual migration state: {exc}",
+                        ) from exc
+                    raise ExecutionProjectActivationError(
+                        "schema_incompatible",
+                        f"Execution project DB schema changed while rereading manual migration state: {exc}",
+                    ) from exc
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise ExecutionProjectActivationError(
+                        "db_unavailable",
+                        f"Execution project DB changed while rereading manual migration state: {exc}",
+                    ) from exc
+                raise ManualMigrationRequired(pending_versions or sorted(_MANUAL_MIGRATION_VERSIONS))
+            raise ExecutionProjectActivationError(reason, message)
         if current_config_path != self.config_path:
-            raise SchemaIntegrityError(
+            raise ExecutionProjectActivationError(
+                "config_invalid",
                 f"Execution project config resolved to {current_config_path} at activation, expected {self.config_path}."
             )
         if current_config.project_id != self.project_id:
-            raise SchemaIntegrityError(
+            raise ExecutionProjectActivationError(
+                "project_id_mismatch",
                 f"Execution project project_id changed at activation: {current_config.project_id}, expected {self.project_id}."
             )
         if current_config.project_prefix != self.project_prefix:
-            raise SchemaIntegrityError(
+            raise ExecutionProjectActivationError(
+                "config_invalid",
                 "Execution project project_prefix changed at activation: "
                 f"{current_config.project_prefix}, expected {self.project_prefix}."
             )
-        if current_db_path != self.db_path:
-            raise SchemaIntegrityError(
-                f"Execution project DB path changed at activation: {current_db_path}, expected {self.db_path}."
-            )
-
         db_incompatibility = _classify_existing_execution_db(self.db_path)
         if db_incompatibility is not None:
             reason, message = db_incompatibility
@@ -347,23 +403,28 @@ class ExecutionProjectResolved:
                     pending_versions = _pending_manual_migration_versions(self.db_path)
                 except sqlite3.Error as exc:
                     if _is_execution_db_availability_sqlite_error(exc):
-                        raise SchemaIntegrityError(
+                        raise ExecutionProjectActivationError(
+                            "db_unavailable",
                             f"Execution project DB became unavailable while rereading manual migration state: {exc}"
                         ) from exc
-                    raise SchemaIntegrityError(
+                    raise ExecutionProjectActivationError(
+                        "schema_incompatible",
                         f"Execution project DB schema changed while rereading manual migration state: {exc}"
                     ) from exc
                 except (OSError, RuntimeError, ValueError) as exc:
-                    raise SchemaIntegrityError(
+                    raise ExecutionProjectActivationError(
+                        "db_unavailable",
                         f"Execution project DB changed while rereading manual migration state: {exc}"
                     ) from exc
                 raise ManualMigrationRequired(pending_versions or sorted(_MANUAL_MIGRATION_VERSIONS))
-            raise SchemaIntegrityError(message)
+            raise ExecutionProjectActivationError(reason, message)
         runtime_context = RuntimeExecutionContext.from_config(current_config)
         try:
-            store = SqliteTaskStore.from_config(current_config)
+            store = SqliteTaskStore.from_config(current_config, open_mode="watch_lease_activation")
         except ConfigError as exc:
-            raise SchemaIntegrityError(f"Execution project config is invalid at activation: {exc}") from exc
+            raise ExecutionProjectActivationError(
+                "config_invalid", f"Execution project config is invalid at activation: {exc}"
+            ) from exc
         return ExecutionProjectRuntime(config=current_config, store=store, runtime_context=runtime_context)
 
 
@@ -461,6 +522,37 @@ def _is_expected_config_load_path_error(exc: RuntimeError | ValueError) -> bool:
         or "embedded null byte" in message
         or "source code string cannot contain null bytes" in message
     )
+
+
+def _path_symlink_loop_error(path: Path) -> str | None:
+    """Return a controlled diagnostic if any existing path prefix hits ELOOP."""
+    for candidate in (path, *path.parents):
+        try:
+            stat_result = os.lstat(candidate)
+        except OSError:
+            stat_result = None
+        if stat_result is not None and stat.S_ISLNK(stat_result.st_mode):
+            try:
+                link_target = Path(os.readlink(candidate))
+            except OSError as exc:
+                if exc.errno == errno.ELOOP:
+                    return str(exc)
+            else:
+                if not link_target.is_absolute():
+                    link_target = candidate.parent / link_target
+                try:
+                    same_parent = os.path.samefile(candidate.parent, link_target.parent)
+                except OSError:
+                    same_parent = False
+                if same_parent and os.path.normcase(link_target.name) == os.path.normcase(candidate.name):
+                    return f"Symlink loop from {candidate!s}"
+        try:
+            os.stat(candidate)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                return str(exc)
+            continue
+    return None
 
 
 def _path_is_dir(path: Path) -> tuple[bool, str | None]:
@@ -5665,6 +5757,8 @@ class SqliteTaskStore:
             self._ensure_db_registry_mutation_bootstrap()
         elif self._open_mode == "registry_mutation_existing":
             self._ensure_db_registry_mutation_existing()
+        elif self._open_mode == "watch_lease_acquisition":
+            pass
         elif self._open_mode == "watch_lease_activation":
             self._ensure_db()
             self._ensure_project_row()
@@ -6156,6 +6250,8 @@ class SqliteTaskStore:
         """Return whether project-scoped lease storage is available."""
         if self._open_mode == "query_only":
             return self._query_only_table_exists.get("project_leases", False)
+        if self._open_mode == "watch_lease_acquisition" and not self.db_path.exists():
+            return False
         with self._connect() as conn:
             return _table_exists(conn, "project_leases")
 
@@ -10882,6 +10978,15 @@ class SqliteTaskStore:
     ) -> ProjectLease | None:
         """Acquire a project-scoped lease, renewing same-token owners or stealing dead owners."""
         if not self.supports_project_leases():
+            if self._open_mode == "watch_lease_acquisition" and not self.db_path.exists():
+                self._ensure_db()
+            if self.supports_project_leases():
+                return self.try_acquire_project_lease(
+                    lease_name=lease_name,
+                    owner_pid=owner_pid,
+                    owner_token=owner_token,
+                    acquired_at=acquired_at,
+                )
             raise RuntimeError("project leases are not available on this database")
         acquired_at_text = _format_db_timestamp(acquired_at or datetime.now(UTC))
         assert acquired_at_text is not None
