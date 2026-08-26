@@ -37,6 +37,10 @@ _ORIGINAL_PID_ALIVE = concurrency_module._pid_alive
 _ORIGINAL_WORKER_IS_RUNNING = workers_module.WorkerRegistry.is_running
 _ORIGINAL_READ_LINUX_PROC_STAT = workers_module._read_linux_proc_stat
 _ORIGINAL_READ_PID_START_TICKS = workers_module._read_pid_start_ticks
+_ORIGINAL_SUBPROCESS_RUN = subprocess.run
+_ORIGINAL_SUBPROCESS_POPEN = subprocess.Popen
+_ORIGINAL_SUBPROCESS_CHECK_CALL = subprocess.check_call
+_ORIGINAL_SUBPROCESS_CHECK_OUTPUT = subprocess.check_output
 
 # Keep the runtime guard on for the default unit lane. Any future exemption
 # must stay narrow, temporary, and point at a dedicated follow-up implement
@@ -261,6 +265,19 @@ def pytest_runtest_call(item: pytest.Item):
     return result
 
 
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_teardown(item: pytest.Item):
+    del item
+    try:
+        result = yield
+    finally:
+        subprocess.run = _ORIGINAL_SUBPROCESS_RUN
+        subprocess.Popen = _ORIGINAL_SUBPROCESS_POPEN
+        subprocess.check_call = _ORIGINAL_SUBPROCESS_CHECK_CALL
+        subprocess.check_output = _ORIGINAL_SUBPROCESS_CHECK_OUTPUT
+    return result
+
+
 @pytest.fixture(autouse=True)
 def _guard_unit_subprocesses(request: pytest.FixtureRequest):
     if not UNIT_RUNTIME_SUBPROCESS_GUARD_ENABLED:
@@ -304,8 +321,8 @@ def _isolate_home_dir(tmp_path: Path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_shared_db_env(monkeypatch):
-    """Keep ambient shared-DB overrides out of temporary project tests."""
+def _isolate_ambient_db_path(monkeypatch):
+    """Keep externally selected project DBs from contaminating tmp-project tests."""
     monkeypatch.delenv("GZA_DB_PATH", raising=False)
 
 

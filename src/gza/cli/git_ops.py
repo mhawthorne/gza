@@ -124,6 +124,12 @@ from ..rebase_publish import (
     branch_contains_rebase_target,
     publish_rebased_branch,
 )
+from ..rebase_service import (
+    RebaseExecutionOutcome,
+    RebaseExecutionStatus,
+    RebaseServiceRequest,
+    execute_task_backed_rebase_service,
+)
 from ..recovery_engine import (
     _MergeContext,
     _resolve_merged_target_task,
@@ -2147,6 +2153,7 @@ def _run_task_backed_rebase(
     parent_task_id: str | None = None,
     failure_hint_lines: list[str] | None = None,
     runtime_context: RuntimeExecutionContext | None = None,
+    outcome_callback: Callable[[RebaseExecutionOutcome], None] | None = None,
 ) -> int:
     """Execute a foreground rebase flow with single-task log/state ownership."""
     runtime_context = runtime_context or RuntimeExecutionContext.from_config(config)
@@ -2332,15 +2339,19 @@ def _run_task_backed_rebase(
             )
             print()
             return 1
+        outcome_status: RebaseExecutionStatus
         if superseded_by_concurrent_rebase:
             output_content = (
                 f"Superseded/no-op: '{branch}' already contains '{supersession_proof_target}' "
                 "after a concurrent rebase; this task's isolated rebased tip was not imported."
             )
+            outcome_status = "completed_no_op"
         elif resolved_by_provider:
             output_content = f"Resolved conflicts and rebased '{branch}' onto '{rebase_target}'."
+            outcome_status = "provider_conflict_resolved"
         else:
             output_content = f"Rebased '{branch}' onto '{rebase_target}'."
+            outcome_status = "completed_mechanical"
 
         has_commits = _branch_has_commits(config, branch, env=_git_runtime_env(rebase_exec_git))
         head_ref = resolve_ref_if_possible(rebase_exec_git, branch)
@@ -2379,6 +2390,24 @@ def _run_task_backed_rebase(
                 else None
             ),
         )
+        if outcome_callback is not None:
+            outcome_callback(
+                RebaseExecutionOutcome(
+                    status=outcome_status,
+                    source_head_before=rebase_diff_baseline.old_tip,
+                    target_head_before=rebase_diff_baseline.target_at_start,
+                    source_head_after=head_ref.sha,
+                    target_head_after=base_ref.sha,
+                    changed_diff=comparison.changed_diff,
+                    completion_reason=(
+                        REBASE_SUPERSEDED_COMPLETION_REASON
+                        if superseded_by_concurrent_rebase
+                        else None
+                    ),
+                    provider_conflict_resolved=resolved_by_provider,
+                    superseded=superseded_by_concurrent_rebase,
+                )
+            )
 
         target_parent_id = parent_task_id or rebase_task.based_on
         if target_parent_id and comparison.changed_diff:
@@ -2554,39 +2583,37 @@ def cmd_rebase(args: argparse.Namespace) -> int:
         )
 
     try:
-        rebase_task = _create_rebase_task(
-            store,
-            task_id,
-            task.branch,
-            task_target,
+        rebase_result = execute_task_backed_rebase_service(
             config=config,
-            trigger_source="manual",
+            store=store,
+            git=git,
+            request=RebaseServiceRequest(
+                parent_task_id=task_id,
+                branch=task.branch,
+                target_branch=rebase_target,
+                remote=bool(getattr(args, "remote", False)),
+                trigger_source="manual",
+                run=execution_mode == "run",
+                skip_if_target_contained=False,
+                reuse_completed=False,
+                duplicate_as_result=False,
+            ),
+            create_rebase_task=_create_rebase_task,
+            executor=_run_task_backed_rebase if execution_mode == "run" else None,
+            runtime_context=runtime_context,
         )
     except DuplicateActiveChildError as exc:
         return phase1_error(args, format_duplicate_rebase_message(exc, parent_task_id=task_id))
     except ConfigError as exc:
         return phase1_error(args, str(exc))
-    assert rebase_task.id is not None
-    rebase_task.branch = task.branch
-    store.update(rebase_task)
-
     if execution_mode == "queue":
-        print(f"✓ Created rebase task {rebase_task.id}")
+        print(f"✓ Created rebase task {rebase_result.rebase_task_id}")
         print(f"  Parent: {task.id}")
         print(f"  Branch: {task.branch}")
         print(f"  Target: {task_target}")
         return 0
 
-    return _run_task_backed_rebase(
-        config=config,
-        store=store,
-        rebase_task=rebase_task,
-        branch=task.branch,
-        target_branch=rebase_target,
-        remote=bool(getattr(args, "remote", False)),
-        parent_task_id=task.id,
-        runtime_context=runtime_context,
-    )
+    return rebase_result.exit_code
 
 
 def cmd_checkout(args: argparse.Namespace) -> int:

@@ -59,6 +59,13 @@ Rebase tasks go through the **code task path** in `runner.py:_run_inner` (not th
   - `0` means the normalized implementation patch before and after the rebase is identical, so prior review evidence may be preserved
   - `1` means the patch changed or equivalence could not be proven, so prior review evidence must be refreshed
   - legacy `NULL` values are treated conservatively as changed
+- Foreground task-backed rebase execution also persists a generic
+  `rebase_execution_outcome` task artifact. That artifact is schema-versioned and keyed
+  by the parent task, rebase task, branch, target ref, source/target heads, completion
+  status, `changed_diff`, supersession, and provider-resolution flags. Landing uses this
+  artifact to distinguish mechanical/no-op rebases from provider conflict resolution
+  without parsing logs, and exact-key reuse is invalidated by any source or target head
+  change.
 
 ## Docker considerations
 
@@ -123,7 +130,7 @@ main working tree. Bare `gza rebase <task-id>` now only creates the pending chil
    no-op rather than the losing isolated summary, fails closed on local/remote ref lookup
    uncertainty, surfaces ancestry-proof failures as `GIT_ERROR` diagnostics instead of
    only the stale-import mismatch, and force-pushes host-side.
-7. The completed rebase row persists the same `changed_diff` signal used by runner-owned rebase tasks, and review invalidation only happens when that signal is not `False`.
+7. The completed rebase row persists the same `changed_diff` signal used by runner-owned rebase tasks, and review invalidation only happens when that signal is not `False`. Foreground service-backed execution also persists the generic `rebase_execution_outcome` artifact described above for landing/review-selection identity.
 8. After rebase publication succeeds and the task is ready to be recorded as completed, the host reconciles the parent implementation merge unit through the shared task-scoped sync path using the canonical local target branch as the merge-proof ref. Publication mode can still differ (`--remote` may publish to `origin` host-side before completion is recorded), but completion-time merge proof does not switch to any `origin/*` ref. This lets empty-net-diff, squash-merged, or cherry-picked rebases flip the implementation back to authoritative `merged` state before the next `advance`, `watch`, or `iterate` pass reads the lineage.
 9. The canonical temporary worktree and the private rebase checkout are both removed on all
    exit paths (success, failure, exception) via cleanup in the host flow.
