@@ -165,8 +165,10 @@ HH:MM:SS EVENT  task-id type "truncated prompt..." [details]
 ### Log Destination
 
 - **stdout**: Always, for interactive use
-- **File**: Also appended to the selected watch log for `tail -f` from another terminal:
-  `.gza/watch.log` for live watch, or `.gza/watch.dry-run.log` for `--dry-run`
+- **File**: Also written to the selected watch log for `tail -f` from another terminal:
+  `.gza/watch.log` for live watch, or `.gza/watch.dry-run.log` for `--dry-run`.
+  Each invocation rotates an existing non-empty selected log to a timestamped archive
+  before writing a fresh file.
 - Consider `--quiet` flag for headless use (file only)
 
 ### Detecting Events
@@ -179,7 +181,7 @@ These aren't part of watch itself, but are the complementary commands for monito
 
 - **`gza history --status failed`** — show failed tasks. Already works.
 - **`gza advance --unimplemented`** — show completed plans/explores without implement children. Already works.
-- **Activity log** — `tail -f .gza/watch.log` shows live failures in real time with `FAIL` events; dry-run previews append to `.gza/watch.dry-run.log`.
+- **Activity log** — `tail -f .gza/watch.log` shows live failures in real time with `FAIL` events; dry-run previews write to `.gza/watch.dry-run.log`. Each invocation starts a fresh selected log and keeps the previous non-empty file as a timestamped archive.
 
 ## Signal Handling
 

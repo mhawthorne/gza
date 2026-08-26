@@ -2213,7 +2213,12 @@ When a non-global scope is active, watch emits an explicit scope line to console
 the selected watch log (`.gza/watch.log` for live watch, `.gza/watch.dry-run.log` for
 `--dry-run`): `INFO      scope: tags=<comma-separated-tags> mode=any|all` for tag
 scope, or `INFO      scope: owners=<comma-separated-effective-selector-ids> mode=explicit`
-for positional selector scope.
+for positional selector scope. Each watch invocation starts a fresh selected log; if
+the selected path already contains data, watch first renames it to a timestamped
+archive such as `.gza/watch.2026-08-26T14-05-06.log` or
+`.gza/watch.dry-run.2026-08-26T14-05-06.log`. Watch never overwrites an existing
+archive; if a rapid restart has already used the current whole-second timestamp, it
+waits for a distinct timestamp before rotating the selected log.
 
 You can scope watch to explicit merge units with `gza watch <task_id> [<task_id> ...]`.
 Each supplied task ID is first paired with its canonical lineage / merge-unit owner, and watch keeps

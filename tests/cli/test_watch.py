@@ -56240,6 +56240,14 @@ def test_cmd_watch_refuses_when_live_watch_lease_exists(
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
+    live_log = tmp_path / ".gza" / "watch.log"
+    live_log_bytes = b"22:14:57 WAKE   existing live watch entry\n\x00binary-proof\n"
+    archive_path = tmp_path / ".gza" / "watch.2026-08-20T01-02-03.log"
+    archive_bytes = b"21:00:00 INFO   existing live archive\n"
+    live_log.parent.mkdir(exist_ok=True)
+    live_log.write_bytes(live_log_bytes)
+    archive_path.write_bytes(archive_bytes)
+    before_logs = {path.name: path.read_bytes() for path in sorted((tmp_path / ".gza").glob("watch*.log"))}
     assert (
         store.try_acquire_project_lease(
             lease_name=WATCH_SUPERVISOR_LEASE_NAME,
@@ -56260,6 +56268,7 @@ def test_cmd_watch_refuses_when_live_watch_lease_exists(
     captured = capsys.readouterr()
     assert rc == 1
     assert "watch-supervisor lease" in captured.out
+    assert {path.name: path.read_bytes() for path in sorted((tmp_path / ".gza").glob("watch*.log"))} == before_logs
     assert (
         store.try_acquire_project_lease(
             lease_name=WATCH_SUPERVISOR_LEASE_NAME,
@@ -57234,6 +57243,98 @@ def test_cmd_watch_startup_failure_releases_watch_lease(tmp_path: Path) -> None:
     )
 
 
+def test_cmd_watch_log_rotation_failure_releases_watch_lease(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [])
+
+    with patch("gza.cli.watch._rotate_watch_log_if_non_empty", side_effect=RuntimeError("rotation failed")):
+        with pytest.raises(RuntimeError, match="rotation failed"):
+            cmd_watch(args)
+
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-rotation-failure",
+        )
+        is not None
+    )
+
+
+@pytest.mark.parametrize(
+    "failure_site",
+    [
+        "usage_warmer",
+        "startup_warning_emit",
+        "runtime_create",
+        "installed_fingerprint",
+    ],
+)
+def test_cmd_watch_post_acquisition_startup_failure_releases_watch_lease(
+    tmp_path: Path,
+    failure_site: str,
+) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [])
+    failure = RuntimeError(f"{failure_site} failed")
+    if failure_site == "startup_warning_emit":
+        _append_watch_config(tmp_path, "\nmax_concurrent: 1\n")
+        args = _watch_args(tmp_path, [], batch=2)
+        failure = OSError("startup warning emit failed")
+
+    real_release = watch_module.WatchLeaseSet.release
+    release_calls: list[watch_module.WatchLeaseSet] = []
+
+    def recording_release(lease_set: watch_module.WatchLeaseSet) -> object:
+        release_calls.append(lease_set)
+        return real_release(lease_set)
+
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(patch("gza.cli.watch._run_cycle", side_effect=AssertionError("watch body should not run")))
+        stack.enter_context(patch("gza.cli.watch.WatchLeaseSet.release", autospec=True, side_effect=recording_release))
+        if failure_site == "usage_warmer":
+            stack.enter_context(patch("gza.cli.watch.start_usage_warmer", side_effect=failure))
+        else:
+            stack.enter_context(patch("gza.cli.watch.start_usage_warmer", return_value=None))
+        if failure_site == "startup_warning_emit":
+            stack.enter_context(patch("gza.cli.watch._WatchLog.emit", side_effect=failure))
+        if failure_site == "runtime_create":
+            stack.enter_context(patch("gza.cli.watch.WatchProjectRuntime.create", side_effect=failure))
+        if failure_site == "installed_fingerprint":
+            stack.enter_context(patch("gza.cli.watch._installed_gza_package_fingerprint", side_effect=failure))
+
+        with pytest.raises(type(failure), match=str(failure)):
+            cmd_watch(args)
+
+    assert len(release_calls) == 1
+    store = make_store(tmp_path)
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token=f"after-{failure_site}-failure",
+        )
+        is not None
+    )
+
+
+def test_cmd_watch_post_acquisition_startup_failure_groups_release_failure(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    args = _watch_args(tmp_path, [])
+
+    with (
+        patch("gza.cli.watch.start_usage_warmer", side_effect=RuntimeError("usage warmer failed")),
+        patch("gza.cli.watch.WatchLeaseSet.release", side_effect=_release_error()),
+    ):
+        with pytest.raises(BaseExceptionGroup) as exc_info:
+            cmd_watch(args)
+
+    assert "watch startup failed and watch-supervisor lease release also failed" in str(exc_info.value)
+    assert any(isinstance(exc, RuntimeError) and str(exc) == "usage warmer failed" for exc in exc_info.value.exceptions)
+    assert any(isinstance(exc, WatchLeaseReleaseError) for exc in exc_info.value.exceptions)
+
+
 def test_cmd_watch_first_signal_install_failure_releases_watch_lease(tmp_path: Path) -> None:
     setup_config(tmp_path)
     args = _watch_args(tmp_path, [])
@@ -57777,6 +57878,14 @@ def test_cmd_watch_sigterm_during_drift_handoff_argv_suppresses_exec_and_cleans_
 
 def test_cmd_watch_scoped_resolution_failure_happens_before_watch_lease_acquire(tmp_path: Path) -> None:
     setup_config(tmp_path)
+    live_log = tmp_path / ".gza" / "watch.log"
+    live_log_bytes = b"22:14:57 WAKE   existing live watch entry\n\x00binary-proof\n"
+    archive_path = tmp_path / ".gza" / "watch.2026-08-20T01-02-03.log"
+    archive_bytes = b"21:00:00 INFO   existing live archive\n"
+    live_log.parent.mkdir(exist_ok=True)
+    live_log.write_bytes(live_log_bytes)
+    archive_path.write_bytes(archive_bytes)
+    before_logs = {path.name: path.read_bytes() for path in sorted((tmp_path / ".gza").glob("watch*.log"))}
     args = _watch_args(tmp_path, ["missing-task"])
 
     with (
@@ -57790,6 +57899,7 @@ def test_cmd_watch_scoped_resolution_failure_happens_before_watch_lease_acquire(
 
     assert rc == 1
     acquire_leases.assert_not_called()
+    assert {path.name: path.read_bytes() for path in sorted((tmp_path / ".gza").glob("watch*.log"))} == before_logs
 
 
 def test_cmd_watch_cli_batch_derives_runtime_cap_when_max_concurrent_unset(tmp_path: Path) -> None:
@@ -58737,6 +58847,86 @@ def test_watch_log_path_resolves_by_dry_run_mode(tmp_path: Path) -> None:
     assert _watch_log_path(config, dry_run=True) == tmp_path / ".gza" / "watch.dry-run.log"
 
 
+def test_watch_log_rotates_existing_non_empty_log_and_opens_empty_replacement(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log_path.parent.mkdir()
+    original_bytes = b"22:14:57 WAKE   existing live watch entry\n\x00binary-proof\n"
+    log_path.write_bytes(original_bytes)
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return datetime(2026, 8, 26, 14, 5, 6, tzinfo=UTC)
+
+    real_rename = os.rename
+    rename_calls: list[tuple[Path, Path]] = []
+
+    def recording_rename(src: Path, dst: Path) -> None:
+        rename_calls.append((src, dst))
+        real_rename(src, dst)
+
+    with (
+        patch("gza.cli.watch.datetime", FixedDatetime),
+        patch("gza.cli.watch.os.link", side_effect=AssertionError("rotation must use rename")),
+        patch("gza.cli.watch.os.rename", side_effect=recording_rename),
+    ):
+        _WatchLog(log_path, quiet=True, rotate_existing=True)
+
+    archive_path = tmp_path / ".gza" / "watch.2026-08-26T14-05-06.log"
+    assert rename_calls == [(log_path, archive_path)]
+    assert archive_path.exists()
+    assert re.fullmatch(r"watch\.\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}\.log", archive_path.name)
+    assert archive_path.read_bytes() == original_bytes
+    assert log_path.read_bytes() == b""
+
+
+def test_watch_log_rotation_waits_for_distinct_archive_second_without_overwrite(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log_path.parent.mkdir()
+    original_bytes = b"22:14:57 WAKE   racing live watch entry\n\x00binary-proof\n"
+    preserved_archive_bytes = b"21:00:00 INFO   already archived by first startup\n"
+    log_path.write_bytes(original_bytes)
+    first_archive_path = tmp_path / ".gza" / "watch.2026-08-26T14-05-06.log"
+    second_archive_path = tmp_path / ".gza" / "watch.2026-08-26T14-05-07.log"
+    first_archive_path.write_bytes(preserved_archive_bytes)
+
+    class ControlledDatetime(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            cls.calls += 1
+            if cls.calls == 1:
+                return datetime(2026, 8, 26, 14, 5, 6, tzinfo=UTC)
+            return datetime(2026, 8, 26, 14, 5, 7, tzinfo=UTC)
+
+    with (
+        patch("gza.cli.watch.datetime", ControlledDatetime),
+        patch("gza.cli.watch.time.sleep") as sleep_mock,
+    ):
+        _WatchLog(log_path, quiet=True, rotate_existing=True)
+
+    sleep_mock.assert_called_once_with(0.05)
+    assert first_archive_path.read_bytes() == preserved_archive_bytes
+    assert second_archive_path.read_bytes() == original_bytes
+    assert log_path.read_bytes() == b""
+
+
+def test_watch_log_does_not_rotate_absent_or_empty_log(tmp_path: Path) -> None:
+    absent_log = tmp_path / "absent" / ".gza" / "watch.log"
+    _WatchLog(absent_log, quiet=True, rotate_existing=True)
+    assert absent_log.exists()
+    assert absent_log.read_bytes() == b""
+    assert list(absent_log.parent.glob("watch.*.log")) == []
+
+    empty_log = tmp_path / "empty" / ".gza" / "watch.log"
+    empty_log.parent.mkdir(parents=True)
+    empty_log.touch()
+    _WatchLog(empty_log, quiet=True, rotate_existing=True)
+    assert empty_log.read_bytes() == b""
+    assert list(empty_log.parent.glob("watch.*.log")) == []
+
+
 def test_cmd_watch_dry_run_leaves_existing_live_watch_log_byte_identical(tmp_path: Path) -> None:
     setup_config(tmp_path)
     make_store(tmp_path)
@@ -58766,9 +58956,15 @@ def test_cmd_watch_dry_run_leaves_existing_live_watch_log_byte_identical(tmp_pat
     assert "dry-run marker" in dry_run_log.read_text()
 
 
-def test_cmd_watch_second_dry_run_appends_to_dry_run_log(tmp_path: Path) -> None:
+def test_cmd_watch_second_dry_run_rotates_only_dry_run_log(tmp_path: Path) -> None:
     setup_config(tmp_path)
     make_store(tmp_path)
+    live_log = tmp_path / ".gza" / "watch.log"
+    live_archive = tmp_path / ".gza" / "watch.2026-08-20T01-02-03.log"
+    live_bytes = b"22:14:57 WAKE   existing live watch entry\n"
+    live_archive_bytes = b"21:00:00 INFO   existing live archive\n"
+    live_log.write_bytes(live_bytes)
+    live_archive.write_bytes(live_archive_bytes)
     dry_run_log = tmp_path / ".gza" / "watch.dry-run.log"
 
     def run_dry_run(marker: str) -> None:
@@ -58789,13 +58985,41 @@ def test_cmd_watch_second_dry_run_appends_to_dry_run_log(tmp_path: Path) -> None
             assert cmd_watch(args) == 0
 
     run_dry_run("first dry-run marker")
-    after_first = dry_run_log.read_text()
-    run_dry_run("second dry-run marker")
+    first_bytes = dry_run_log.read_bytes()
+    colliding_archive_path = tmp_path / ".gza" / "watch.dry-run.2026-08-26T14-05-06.log"
+    colliding_archive_bytes = b"20:00:00 INFO   earlier dry-run archive\n"
+    colliding_archive_path.write_bytes(colliding_archive_bytes)
 
-    after_second = dry_run_log.read_text()
-    assert after_second.startswith(after_first)
-    assert "first dry-run marker" in after_second
-    assert "second dry-run marker" in after_second
+    class ControlledDatetime(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            cls.calls += 1
+            if cls.calls == 1:
+                return datetime(2026, 8, 26, 14, 5, 6, tzinfo=UTC)
+            return datetime(2026, 8, 26, 14, 5, 7, tzinfo=UTC)
+
+    with (
+        patch("gza.cli.watch.datetime", ControlledDatetime),
+        patch("gza.cli.watch.time.sleep") as sleep_mock,
+    ):
+        run_dry_run("second dry-run marker")
+
+    archive_path = tmp_path / ".gza" / "watch.dry-run.2026-08-26T14-05-07.log"
+    sleep_mock.assert_called_once_with(0.05)
+    assert colliding_archive_path.read_bytes() == colliding_archive_bytes
+    assert archive_path.read_bytes() == first_bytes
+    assert "first dry-run marker" in archive_path.read_text()
+    assert "second dry-run marker" in dry_run_log.read_text()
+    assert live_log.read_bytes() == live_bytes
+    assert live_archive.read_bytes() == live_archive_bytes
+    assert sorted(path.name for path in (tmp_path / ".gza").glob("watch.*.log")) == [
+        "watch.2026-08-20T01-02-03.log",
+        "watch.dry-run.2026-08-26T14-05-06.log",
+        "watch.dry-run.2026-08-26T14-05-07.log",
+        "watch.dry-run.log",
+    ]
 
 
 def test_cmd_watch_restart_failed_dry_run_restores_signal_handlers(tmp_path: Path) -> None:

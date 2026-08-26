@@ -5735,9 +5735,11 @@ def _task_snapshot(store: SqliteTaskStore) -> dict[str, dict[str, str | None]]:
 
 
 class _WatchLog:
-    def __init__(self, path: Path, *, quiet: bool = False) -> None:
+    def __init__(self, path: Path, *, quiet: bool = False, rotate_existing: bool = False) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if rotate_existing:
+            _rotate_watch_log_if_non_empty(self.path)
         self.quiet = quiet
         self._has_emitted_cycle = False
         self._skip_keys_prev_cycle: set[str] = set()
@@ -5809,6 +5811,41 @@ class _WatchLog:
             f.write(line + "\n")
         if not self.quiet:
             console.print(_render_watch_stdout(line), soft_wrap=True, highlight=False)
+
+
+def _rotate_watch_log_if_non_empty(path: Path) -> None:
+    while True:
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            path.touch()
+            return
+        if stat.st_size == 0:
+            return
+
+        timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S")
+        archive_path = path.with_name(f"{path.stem}.{timestamp}{path.suffix}")
+        try:
+            archive_path.touch(exist_ok=False)
+        except FileExistsError:
+            time.sleep(0.05)
+            continue
+        try:
+            os.rename(path, archive_path)
+        except FileNotFoundError:
+            try:
+                archive_path.unlink()
+            except FileNotFoundError:
+                pass
+            continue
+        except BaseException:
+            try:
+                archive_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        path.touch()
+        return
 
 
 def _watch_log_path(config: Config, *, dry_run: bool) -> Path:
@@ -5939,6 +5976,21 @@ def _release_watch_lease_set_for_cleanup(
     except WatchLeaseReleaseError as exc:
         return [exc, *_emit_watch_error_safely(log, quiet, str(exc))]
     return []
+
+
+def _release_watch_lease_set_after_startup_failure(
+    watch_lease_set: WatchLeaseSet | None,
+    startup_error: BaseException,
+) -> None:
+    if watch_lease_set is None:
+        return
+    try:
+        watch_lease_set.release()
+    except WatchLeaseReleaseError as cleanup_error:
+        raise BaseExceptionGroup(
+            "watch startup failed and watch-supervisor lease release also failed",
+            [startup_error, cleanup_error],
+        ) from startup_error
 
 
 def _emit_transition_events(
@@ -16190,29 +16242,14 @@ def cmd_watch(args: argparse.Namespace) -> int:
         )
 
     store = get_store(config, open_mode="watch_lease_activation")
-    log = _WatchLog(_watch_log_path(config, dry_run=dry_run), quiet=quiet)
     runtime_context = RuntimeExecutionContext.from_config(config)
-    # Warms the usage cache for the whole run; the cycle header only reads it.
-    start_usage_warmer(config, store, runtime_context=runtime_context)
-    if startup_cap_warning is not None:
-        log.emit("WARN", startup_cap_warning)
-    runtime = WatchProjectRuntime.create(
-        key=config.project_name,
-        config=config,
-        store=store,
-        log=log,
-        tags=tag_filters,
-        any_tag=any_tag,
-        runtime_context=runtime_context,
-    )
-    installed_package_drift = _InstalledPackageDriftState(startup_fingerprint=_installed_gza_package_fingerprint())
     if raw_task_ids:
         try:
             scoped_owner_ids = _resolve_watch_scope_owner_ids(
-                runtime.store,
+                store,
                 raw_task_ids,
                 max_recovery_attempts=max_recovery_attempts,
-                config=runtime.config,
+                config=config,
             )
         except ValueError as exc:
             print(f"Error: {exc}")
@@ -16227,7 +16264,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     watch_lease_set: WatchLeaseSet | None = None
     try:
         watch_lease_set = acquire_watch_project_leases(
-            [WatchLeaseTarget(runtime.config.project_name, runtime.store)],
+            [WatchLeaseTarget(config.project_name, store)],
             owner_token=watch_lease_token,
         )
     except WatchLeaseConflict as exc:
@@ -16235,10 +16272,27 @@ def cmd_watch(args: argparse.Namespace) -> int:
         return 1
     args.watch_lease_token = watch_lease_set.owner_token
     try:
+        log = _WatchLog(_watch_log_path(config, dry_run=dry_run), quiet=quiet, rotate_existing=True)
+        # Warms the usage cache for the whole run; the cycle header only reads it.
+        start_usage_warmer(config, store, runtime_context=runtime_context)
+        if startup_cap_warning is not None:
+            log.emit("WARN", startup_cap_warning)
+        runtime = WatchProjectRuntime.create(
+            key=config.project_name,
+            config=config,
+            store=store,
+            log=log,
+            tags=tag_filters,
+            any_tag=any_tag,
+            runtime_context=runtime_context,
+        )
+        installed_package_drift = _InstalledPackageDriftState(
+            startup_fingerprint=_installed_gza_package_fingerprint()
+        )
         runtime.store.repair_inconsistent_unmerged_merge_units()
         runtime.store.repair_stale_unmerged_merge_unit_owners()
-    except BaseException:
-        _release_watch_lease_set_for_cleanup(watch_lease_set, log=runtime.log, quiet=quiet)
+    except BaseException as exc:
+        _release_watch_lease_set_after_startup_failure(watch_lease_set, exc)
         raise
     effective_scoped_owner_ids = scoped_owner_ids
     stop_requested = False

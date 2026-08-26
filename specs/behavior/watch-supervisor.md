@@ -67,9 +67,12 @@ This document answers questions the engine spec intentionally does not:
   lifecycle follow-on materialization and local-target verify remediation. When watch
   creates such work, it MUST do so through deduped supervisor rules, not ad hoc per-pass
   task creation.
-- **S8 — Dry-run logs stay separate.** In single-project mode, dry-run watch output MUST
-  append to `.gza/watch.dry-run.log`; non-dry watch output MUST append to
-  `.gza/watch.log`. A dry run MUST NOT mutate the live operational watch log.
+- **S8 — Dry-run logs stay separate.** In single-project mode, each watch invocation MUST
+  rotate the selected non-empty log before writing a fresh file: dry-run watch output uses
+  `.gza/watch.dry-run.log`; non-dry watch output uses `.gza/watch.log`. A dry run MUST NOT
+  mutate the live operational watch log or its archives. Rotation MUST NOT overwrite an
+  existing archive; when the current whole-second archive name is already taken, watch
+  waits for a distinct rotation timestamp.
 
 ## Multi-project supervisor contract
 
