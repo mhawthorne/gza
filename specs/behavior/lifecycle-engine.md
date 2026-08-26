@@ -378,6 +378,14 @@ closed and be treated as changed.
   they completed after a changed-diff rebase; they are eligible only through the full
   live-head fallback above.
 - Stale-review refresh rules MUST run before `review_max_cycles` evaluation.
+- With `on_max_cycles=merge_and_defer`, a capped current ordinary plain-full or
+  resolution `CHANGES_REQUESTED` review MAY enter the existing pre-merge verify
+  gate before `review_max_cycles` handling. This candidate MUST still be current
+  for the live implementation head, merge-source eligible, and outside the plan
+  cap, verify exhaustion, no-op improve, adjudication, duplicate-blocker, and
+  spec-coherence lanes. Missing or stale verify evidence MUST run the normal
+  pre-merge verify path; red or unavailable evidence MUST remain on the existing
+  verify-fix or attention path.
 - `max_review_cycles` MUST count only completed review/improve cycles inside the current
   durable-progress epoch. The epoch resets only when persisted evidence shows a new
   reviewed head or other durable branch progress boundary; historical pre-boundary churn
@@ -555,7 +563,8 @@ When a current review exists for the implementation lineage:
 **Bounds (see [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2), each a policy knob:**
 
 - Review→improve cycles reach `max_review_cycles` within the current durable-progress
-  epoch → `max_cycles_reached`.
+  epoch → `max_cycles_reached`; under `on_max_cycles=merge_and_defer`, eligible
+  ordinary current-head candidates first traverse the pre-merge verify gate above.
 - **A. Ordinary no-op improves do not bypass the two-gate model.** A no-op improve does
   not, by itself, authorize merge. If code changed, both the review gate and verify gate
   become stale and MUST be re-run in the normal order: verify first, then review.
@@ -1283,7 +1292,7 @@ is a spec change. The accompanying human message is free text.
 | `improve-no-op` | needs_discussion | §6 consecutive no-op improves ≥ bound after adjudication/compatibility handling is exhausted |
 | `review-blocker-adjudication-needed` | needs_discussion | §6 adjudication for a disputed non-verify CODE blocker returned `NEEDS_HUMAN`, failed, or could not be parsed safely |
 | `duplicate-blocker-no-progress` | needs_discussion | §6 same primary blocker repeats across cycles |
-| `review-max-cycles-reached` | max_cycles_reached | §6 current-head review→improve cycles ≥ `max_review_cycles` with no stale-review refresh available |
+| `review-max-cycles-reached` | max_cycles_reached | §6 current-head review→improve cycles ≥ `max_review_cycles` with no stale-review refresh available; `merge_and_defer` candidates first traverse pre-merge verify gating |
 | `review-verdict-needs-manual-attention` | needs_discussion | §6 verdict unclassifiable, or `APPROVED_WITH_FOLLOWUPS` with zero parsed follow-ups |
 | `review-needs-manual-creation` | needs_discussion | §8 implementation-owned lineage requires review, no review exists, `advance_create_reviews` off |
 | `main-integration-verify-red` | needs_discussion | §8 local target verify failed after target HEAD changed; halt further merges until it is green again |

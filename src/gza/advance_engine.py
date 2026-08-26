@@ -113,6 +113,7 @@ from gza.review_tasks import (
     repair_resolution_review_scope_provenance,
     resolve_verify_fix_representative_task,
     review_blocker_dispute_matches_current,
+    validate_capped_review_blocker_action,
 )
 from gza.review_verdict import (
     ParsedReviewReport,
@@ -5430,6 +5431,90 @@ def has_valid_review_for_merge(ctx: AdvanceContext) -> bool:
     return ctx.review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}
 
 
+def _review_blocker_summary_matches_parsed_blockers(
+    summary: ReviewBlockerSummary | None,
+    blockers: tuple[ReviewFinding, ...],
+) -> bool:
+    if summary is None:
+        return False
+    return (
+        summary.blocker_count == len(blockers)
+        and summary.unknown_or_code_count == len(blockers)
+        and summary.verify_timeout_count == 0
+        and summary.verify_failure_count == 0
+    )
+
+
+def _eligible_capped_review_blockers_for_merge(ctx: AdvanceContext) -> tuple[ReviewFinding, ...] | None:
+    review_task = ctx.latest_completed_review
+    if review_task is None:
+        return None
+    persisted_review_output = get_review_content(Path(ctx.config.project_dir), review_task)
+    if not isinstance(persisted_review_output, str) or not persisted_review_output.strip():
+        return None
+
+    parsed_report = parse_review_report(persisted_review_output)
+    parsed_blockers = tuple(finding for finding in parsed_report.findings if finding.severity == "BLOCKER")
+    if not _review_blocker_summary_matches_parsed_blockers(ctx.latest_review_blocker_summary, parsed_blockers):
+        return None
+
+    try:
+        return validate_capped_review_blocker_action(
+            ctx.store,
+            config=ctx.config,
+            review_task=review_task,
+            findings=parsed_blockers,
+            persisted_review_output=persisted_review_output,
+        )
+    except ValueError:
+        return None
+
+
+def review_max_cycles_merge_candidate(ctx: AdvanceContext) -> bool:
+    """Return whether a capped ordinary review may seek merge authority after verify."""
+    if getattr(ctx.config, "on_max_cycles", "park") != "merge_and_defer":
+        return False
+    if not _is_implementation_owned_lineage(ctx):
+        return False
+    if not _can_emit_live_merge_action(ctx):
+        return False
+    if ctx.review_cleared or ctx.review_blockers_revalidated:
+        return False
+    if ctx.review_verdict != "CHANGES_REQUESTED":
+        return False
+    if ctx.completed_review_cycles < ctx.max_review_cycles:
+        return False
+    if ctx.latest_completed_review is None:
+        return False
+    if _review_mode(ctx.latest_completed_review) not in {"plain_full", "resolution"}:
+        return False
+    if ctx.review_invalidated_by_progress or ctx.closing_review_action is not None:
+        return False
+    if ctx.current_review_head_probe_warning is not None:
+        return False
+    if not (
+        ctx.current_review_head_is_live
+        and ctx.latest_reviewed_head_sha is not None
+        and ctx.current_review_head_sha == ctx.latest_reviewed_head_sha
+    ):
+        return False
+    if ctx.active_improve_running is not None or ctx.active_improve_pending is not None:
+        return False
+    if ctx.consecutive_noop_improves >= ctx.max_noop_improve_cycles:
+        return False
+    if ctx.review_blocker_adjudication_needed:
+        return False
+    if ctx.active_review_blocker_adjudication is not None:
+        return False
+    if ctx.review_blocker_adjudication_candidate is not None:
+        return False
+    if ctx.duplicate_blocker_streak is not None:
+        return False
+    if _eligible_capped_review_blockers_for_merge(ctx) is None:
+        return False
+    return True
+
+
 def has_current_passing_verify_for_merge(ctx: AdvanceContext) -> bool:
     """Return whether canonical verify evidence currently permits merge."""
     if not _is_implementation_owned_lineage(ctx):
@@ -5916,7 +6001,7 @@ def _verify_gate_in_merge_scope(ctx: AdvanceContext) -> bool:
     return (
         _is_implementation_owned_lineage(ctx)
         and execution_status_allows_merge(ctx)
-        and has_valid_review_for_merge(ctx)
+        and (has_valid_review_for_merge(ctx) or review_max_cycles_merge_candidate(ctx))
     )
 
 
