@@ -390,8 +390,8 @@ provider: codex
 #   backoff.
 #   Default: 10
 #   failure_halt_after: 10
-#   Cadence for watch `BUSY` heartbeat lines during long-running verify, merge, rebase, and agent
-#   execution phases.
+#   Cadence for watch `BUSY` heartbeat lines during long-running verify, merge, rebase, agent
+#   execution, and in-process cycle phases.
 #   Default: 60
 #   heartbeat_interval_seconds: 60
 #   Seconds before a watch-supervised long phase starts emitting operator-visible heartbeat

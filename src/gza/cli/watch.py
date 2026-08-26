@@ -148,6 +148,7 @@ from ..runner import (
     LongPhaseProgress,
     _long_phase_no_progress,
     _read_process_tree_cpu_seconds,
+    _sample_long_phase_cpu_delta,
     finish_long_phase_heartbeat,
     require_execution_route_for_task,
 )
@@ -5752,6 +5753,7 @@ class _WatchLog:
         if rotate_existing:
             _rotate_watch_log_if_non_empty(self.path)
         self.quiet = quiet
+        self._lock = threading.RLock()
         self._has_emitted_cycle = False
         self._skip_keys_prev_cycle: set[str] = set()
         self._skip_keys_this_cycle: set[str] = set()
@@ -5761,67 +5763,76 @@ class _WatchLog:
         self._visible_attention_this_cycle: dict[str, str] = {}
 
     def begin_cycle(self) -> None:
-        if self._has_emitted_cycle:
-            with open(self.path, "a") as f:
-                f.write("\n")
-            if not self.quiet:
-                console.print()
-        self._skip_keys_this_cycle.clear()
-        self._merge_logged_this_cycle.clear()
-        self._sticky_attention_this_cycle.clear()
-        self._visible_attention_this_cycle.clear()
-        self._has_emitted_cycle = True
+        with self._lock:
+            if self._has_emitted_cycle:
+                with open(self.path, "a") as f:
+                    f.write("\n")
+                if not self.quiet:
+                    console.print()
+            self._skip_keys_this_cycle.clear()
+            self._merge_logged_this_cycle.clear()
+            self._sticky_attention_this_cycle.clear()
+            self._visible_attention_this_cycle.clear()
+            self._has_emitted_cycle = True
 
     def end_cycle(self) -> None:
-        self._skip_keys_prev_cycle = set(self._skip_keys_this_cycle)
-        self._sticky_attention_prev_cycle = dict(self._sticky_attention_this_cycle)
+        with self._lock:
+            self._skip_keys_prev_cycle = set(self._skip_keys_this_cycle)
+            self._sticky_attention_prev_cycle = dict(self._sticky_attention_this_cycle)
 
     def emit_attention(self, *, attention_key: str, message: str) -> None:
-        self._visible_attention_this_cycle[attention_key] = message
-        previous_message = self._sticky_attention_this_cycle.get(attention_key)
-        if previous_message == message:
-            return
-        self._sticky_attention_this_cycle[attention_key] = message
-        if self._sticky_attention_prev_cycle.get(attention_key) == message:
-            return
-        self.emit("ATTENTION", message)
+        with self._lock:
+            self._visible_attention_this_cycle[attention_key] = message
+            previous_message = self._sticky_attention_this_cycle.get(attention_key)
+            if previous_message == message:
+                return
+            self._sticky_attention_this_cycle[attention_key] = message
+            if self._sticky_attention_prev_cycle.get(attention_key) == message:
+                return
+            self.emit("ATTENTION", message)
 
     def clear_attention(self, attention_key: str) -> None:
-        self._visible_attention_this_cycle.pop(attention_key, None)
-        self._sticky_attention_this_cycle.pop(attention_key, None)
+        with self._lock:
+            self._visible_attention_this_cycle.pop(attention_key, None)
+            self._sticky_attention_this_cycle.pop(attention_key, None)
 
     def clear_attention_prefix(self, attention_key_prefix: str) -> None:
-        for attention_key in tuple(self._visible_attention_this_cycle):
-            if attention_key.startswith(attention_key_prefix):
-                self._visible_attention_this_cycle.pop(attention_key, None)
-        for attention_key in tuple(self._sticky_attention_this_cycle):
-            if attention_key.startswith(attention_key_prefix):
-                self._sticky_attention_this_cycle.pop(attention_key, None)
+        with self._lock:
+            for attention_key in tuple(self._visible_attention_this_cycle):
+                if attention_key.startswith(attention_key_prefix):
+                    self._visible_attention_this_cycle.pop(attention_key, None)
+            for attention_key in tuple(self._sticky_attention_this_cycle):
+                if attention_key.startswith(attention_key_prefix):
+                    self._sticky_attention_this_cycle.pop(attention_key, None)
 
     def visible_attention_messages(self) -> tuple[str, ...]:
-        return tuple(self._visible_attention_this_cycle.values())
+        with self._lock:
+            return tuple(self._visible_attention_this_cycle.values())
 
     def note_merge_logged(self, merge_key: str) -> None:
-        self._merge_logged_this_cycle.add(merge_key)
+        with self._lock:
+            self._merge_logged_this_cycle.add(merge_key)
 
     def was_merge_logged(self, merge_key: str) -> bool:
-        return merge_key in self._merge_logged_this_cycle
+        with self._lock:
+            return merge_key in self._merge_logged_this_cycle
 
     def emit(self, event: str, message: str, *, dedupe_key: str | None = None) -> None:
-        if event in {"SKIP", "BACKOFF"} and dedupe_key is not None:
-            self._skip_keys_this_cycle.add(dedupe_key)
-            if dedupe_key in self._skip_keys_prev_cycle:
-                return
-        prefix = f"{_format_hms()} {event:<{_WATCH_EVENT_LABEL_WIDTH}} "
-        continuation_prefix = " " * len(prefix)
-        parts = message.splitlines() or [""]
-        line = "\n".join(
-            (prefix if idx == 0 else continuation_prefix) + part.rstrip() for idx, part in enumerate(parts)
-        ).rstrip()
-        with open(self.path, "a") as f:
-            f.write(line + "\n")
-        if not self.quiet:
-            console.print(_render_watch_stdout(line), soft_wrap=True, highlight=False)
+        with self._lock:
+            if event in {"SKIP", "BACKOFF"} and dedupe_key is not None:
+                self._skip_keys_this_cycle.add(dedupe_key)
+                if dedupe_key in self._skip_keys_prev_cycle:
+                    return
+            prefix = f"{_format_hms()} {event:<{_WATCH_EVENT_LABEL_WIDTH}} "
+            continuation_prefix = " " * len(prefix)
+            parts = message.splitlines() or [""]
+            line = "\n".join(
+                (prefix if idx == 0 else continuation_prefix) + part.rstrip() for idx, part in enumerate(parts)
+            ).rstrip()
+            with open(self.path, "a") as f:
+                f.write(line + "\n")
+            if not self.quiet:
+                console.print(_render_watch_stdout(line), soft_wrap=True, highlight=False)
 
 
 def _rotate_watch_log_if_non_empty(path: Path) -> None:
@@ -6394,38 +6405,67 @@ def _format_watch_cpu_delta(seconds: float) -> str:
 class _WatchLongPhaseReporter:
     _duration_history_by_log: dict[Path, dict[tuple[str, str], float]] = {}
 
-    def __init__(self, *, log: _WatchLog, threshold_seconds: int, interval_seconds: int) -> None:
+    def __init__(
+        self,
+        *,
+        log: _WatchLog,
+        threshold_seconds: int,
+        interval_seconds: int,
+        clock: Callable[[], float] | None = None,
+        cpu_sampler: Callable[[int], float | None] | None = None,
+    ) -> None:
         self.log = log
         self.threshold_seconds = threshold_seconds
         self.interval_seconds = interval_seconds
+        self._clock = clock or time.monotonic
+        self._cpu_sampler = cpu_sampler or _read_process_tree_cpu_seconds
         self._last_durations = self._duration_history_by_log.setdefault(log.path, {})
         self._starts: dict[tuple[str, str], float] = {}
 
-    def start(self, phase: str, subject_id: str) -> "_WatchLongPhaseHeartbeat":
+    def start(
+        self,
+        phase: str,
+        subject_id: str,
+        *,
+        in_process_ticker: bool = False,
+    ) -> "_WatchLongPhaseHeartbeat":
         key = (phase, subject_id)
-        self._starts[key] = time.monotonic()
+        started_at = self._clock()
+        self._starts[key] = started_at
         prior = self._last_durations.get(key)
         prior_suffix = f" (last run of this phase took {_format_watch_duration(prior)})" if prior is not None else ""
         self.log.emit("START", f"{phase} {subject_id}{prior_suffix}")
 
-        return _WatchLongPhaseHeartbeat(self, phase, subject_id)
+        heartbeat = _WatchLongPhaseHeartbeat(self, phase, subject_id)
+        if in_process_ticker:
+            heartbeat.start_in_process_ticker(started_at=started_at)
+        return heartbeat
 
     def finish(self, phase: str, subject_id: str) -> None:
         key = (phase, subject_id)
         started = self._starts.pop(key, None)
         if started is not None:
-            elapsed = time.monotonic() - started
+            elapsed = self._clock() - started
             self._last_durations[key] = elapsed
             self.log.emit("DONE", f"{phase} {subject_id} elapsed {_format_watch_duration(elapsed)}")
 
-    def _format_busy_line(self, phase: str, subject_id: str, progress: LongPhaseProgress) -> str:
+    def _format_busy_line(
+        self,
+        phase: str,
+        subject_id: str,
+        progress: LongPhaseProgress,
+        *,
+        output_available: bool = True,
+    ) -> str:
         elapsed = _format_watch_duration(progress.elapsed_seconds)
         cpu = (
             "cpu unavailable"
             if progress.cpu_delta_seconds is None
             else f"cpu +{_format_watch_cpu_delta(progress.cpu_delta_seconds)}"
         )
-        if progress.output_lines_delta > 0:
+        if not output_available:
+            output = "out unavailable"
+        elif progress.output_lines_delta > 0:
             output = f"out +{progress.output_lines_delta} lines"
         else:
             output = f"out +{progress.output_bytes_delta} bytes"
@@ -6439,14 +6479,83 @@ class _WatchLongPhaseHeartbeat:
         self._phase = phase
         self._subject_id = subject_id
         self._finished = False
+        self._finish_lock = threading.Lock()
+        self._ticker_stop: threading.Event | None = None
+        self._ticker_thread: threading.Thread | None = None
 
     def __call__(self, progress: LongPhaseProgress) -> None:
-        self._reporter.log.emit("BUSY", self._reporter._format_busy_line(self._phase, self._subject_id, progress))
+        self._emit_busy(progress)
+
+    def _emit_busy(self, progress: LongPhaseProgress, *, output_available: bool = True) -> None:
+        with self._finish_lock:
+            if self._finished:
+                return
+            self._reporter.log.emit(
+                "BUSY",
+                self._reporter._format_busy_line(
+                    self._phase,
+                    self._subject_id,
+                    progress,
+                    output_available=output_available,
+                ),
+            )
+
+    def start_in_process_ticker(
+        self,
+        *,
+        started_at: float,
+    ) -> None:
+        stop = threading.Event()
+        self._ticker_stop = stop
+        process_pid = os.getpid()
+        threshold_seconds = max(0.0, float(self._reporter.threshold_seconds))
+        interval_seconds = max(0.001, float(self._reporter.interval_seconds))
+        clock = self._reporter._clock
+        cpu_sampler = self._reporter._cpu_sampler
+
+        def _loop() -> None:
+            last_cpu: float | None = None
+            wait_for = threshold_seconds
+            while not stop.is_set():
+                if stop.wait(wait_for):
+                    return
+                now = clock()
+                current_cpu = cpu_sampler(process_pid)
+                cpu_delta = None if last_cpu is None else _sample_long_phase_cpu_delta(current_cpu, last_cpu)
+                no_progress = cpu_delta is not None and cpu_delta <= 0.0
+                if stop.is_set():
+                    return
+                self._emit_busy(
+                    LongPhaseProgress(
+                        elapsed_seconds=now - started_at,
+                        cpu_delta_seconds=cpu_delta,
+                        output_bytes_delta=0,
+                        output_lines_delta=0,
+                        no_progress=no_progress,
+                    ),
+                    output_available=False,
+                )
+                last_cpu = current_cpu
+                wait_for = interval_seconds
+
+        self._ticker_thread = threading.Thread(
+            target=_loop,
+            name=f"gza-watch-phase-heartbeat:{self._phase}",
+            daemon=True,
+        )
+        self._ticker_thread.start()
 
     def finish(self) -> None:
-        if self._finished:
-            return
-        self._finished = True
+        with self._finish_lock:
+            if self._finished:
+                return
+            self._finished = True
+            ticker_stop = self._ticker_stop
+            ticker_thread = self._ticker_thread
+        if ticker_stop is not None:
+            ticker_stop.set()
+        if ticker_thread is not None:
+            ticker_thread.join()
         self._reporter.finish(self._phase, self._subject_id)
 
 
@@ -6454,7 +6563,7 @@ _WATCH_CYCLE_PHASE_SUBJECT_ID = "cycle"
 
 
 def _start_watch_cycle_phase(reporter: _WatchLongPhaseReporter, phase: str) -> _WatchLongPhaseHeartbeat:
-    return reporter.start(phase, _WATCH_CYCLE_PHASE_SUBJECT_ID)
+    return reporter.start(phase, _WATCH_CYCLE_PHASE_SUBJECT_ID, in_process_ticker=True)
 
 
 @contextlib.contextmanager
@@ -7298,9 +7407,7 @@ class _WatchWorkerHeartbeatMonitor:
 
     def _emit_busy(self, state: _WatchWorkerHeartbeatState, now: float) -> None:
         current_cpu = self.cpu_sampler(state.pid)
-        cpu_delta: float | None = None
-        if current_cpu is not None and state.last_cpu is not None:
-            cpu_delta = max(0.0, current_cpu - state.last_cpu)
+        cpu_delta = _sample_long_phase_cpu_delta(current_cpu, state.last_cpu)
         current_log_size = _read_file_size(state.log_file)
         log_delta = 0
         if current_log_size is not None and state.last_log_size is not None:

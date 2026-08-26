@@ -2091,6 +2091,31 @@ class TestReviewContextFromChain:
         assert samples[0].cpu_delta_seconds is None
         assert samples[0].no_progress is False
 
+    def test_long_phase_heartbeat_cpu_regression_resets_before_no_progress(self) -> None:
+        samples: list[LongPhaseProgress] = []
+        child = SimpleNamespace(pid=4321)
+        now = 100.0
+        cpu_samples = iter([10.0, 8.0, 8.0])
+        heartbeat = _LongPhaseHeartbeatState(
+            process=child,
+            started_at=now,
+            threshold_seconds=60,
+            interval_seconds=60,
+            on_heartbeat=samples.append,
+            clock=lambda: now + 60.0,
+            cpu_sampler=lambda _pid: next(cpu_samples),
+        )
+
+        heartbeat.emit_due()
+        now += 60.0
+        heartbeat.emit_due()
+
+        assert len(samples) == 2
+        assert samples[0].cpu_delta_seconds is None
+        assert samples[0].no_progress is False
+        assert samples[1].cpu_delta_seconds == 0.0
+        assert samples[1].no_progress is True
+
     def test_darwin_process_tree_cpu_sampler_counts_descendant_cpu(self) -> None:
         def first_ps() -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(
@@ -2115,7 +2140,7 @@ class TestReviewContextFromChain:
             args = ["ps", "-axo", "pid=,ppid=,time="]
             returncode = 0
 
-            def communicate(self) -> tuple[str, str]:
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
                 return " 100 1 00:00:03\n 101 100 00:00:05\n", ""
 
         with (
@@ -2130,6 +2155,35 @@ class TestReviewContextFromChain:
             stderr=subprocess.PIPE,
             text=True,
         )
+
+    def test_darwin_process_tree_cpu_sampler_times_out_blocked_ps(self) -> None:
+        class FakePsProcess:
+            args = ["ps", "-axo", "pid=,ppid=,time="]
+            returncode = 0
+
+            def __init__(self) -> None:
+                self.killed = False
+
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                if timeout is not None:
+                    raise subprocess.TimeoutExpired(self.args, timeout)
+                return "", ""
+
+            def kill(self) -> None:
+                self.killed = True
+
+        fake_ps = FakePsProcess()
+
+        with patch("gza.runner._ORIGINAL_SUBPROCESS_POPEN", return_value=fake_ps) as ps_popen:
+            assert _read_darwin_process_tree_cpu_seconds(100) is None
+
+        ps_popen.assert_called_once_with(
+            ["ps", "-axo", "pid=,ppid=,time="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert fake_ps.killed is True
 
     def test_long_phase_heartbeat_uses_fake_darwin_descendant_cpu_progress(self) -> None:
         samples: list[LongPhaseProgress] = []

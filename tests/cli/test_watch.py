@@ -5627,6 +5627,32 @@ def test_watch_long_phase_reporter_emits_start_busy_and_no_progress(tmp_path: Pa
     assert "elapsed 2m00s cpu +0s out +0 bytes (NO PROGRESS)" in log_text
 
 
+def test_watch_log_emit_serializes_concurrent_writers(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    writer_count = 4
+    lines_per_writer = 20
+    barrier = threading.Barrier(writer_count)
+
+    def emit_lines(writer_id: int) -> None:
+        barrier.wait()
+        for line_id in range(lines_per_writer):
+            log.emit("BUSY", f"writer-{writer_id} line-{line_id}")
+
+    threads = [threading.Thread(target=emit_lines, args=(idx,)) for idx in range(writer_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1.0)
+        assert not thread.is_alive()
+
+    lines = log_path.read_text().splitlines()
+    assert len(lines) == writer_count * lines_per_writer
+    for writer_id in range(writer_count):
+        for line_id in range(lines_per_writer):
+            assert sum(line.endswith(f"writer-{writer_id} line-{line_id}") for line in lines) == 1
+
+
 def test_watch_long_phase_reporter_renders_subsecond_cpu_progress(tmp_path: Path) -> None:
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
@@ -6060,6 +6086,262 @@ def test_watch_cycle_phase_records_done_when_body_raises(tmp_path: Path, phase: 
     log_text = log_path.read_text()
     assert f"START     {phase} cycle" in log_text
     assert f"DONE      {phase} cycle elapsed 7s" in log_text
+
+
+def test_watch_cycle_phase_emits_in_process_busy_until_finished(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    clock_values = iter([100.0, 101.0, 102.0, 103.0])
+    last_clock = 103.0
+    cpu_seconds = 10.0
+
+    def clock() -> float:
+        nonlocal last_clock
+        try:
+            last_clock = next(clock_values)
+        except StopIteration:
+            pass
+        return last_clock
+
+    def cpu_sampler(_pid: int) -> float:
+        nonlocal cpu_seconds
+        cpu_seconds += 2.0
+        return cpu_seconds
+
+    reporter = _WatchLongPhaseReporter(
+        log=log,
+        threshold_seconds=0.01,
+        interval_seconds=0.01,
+        clock=clock,
+        cpu_sampler=cpu_sampler,
+    )
+    heartbeat = watch_module._start_watch_cycle_phase(reporter, "blind-parked-auto-rearm")
+
+    deadline = time.monotonic() + 1.0
+    busy_lines: list[str] = []
+    while time.monotonic() < deadline:
+        busy_lines = [line for line in log_path.read_text().splitlines() if "BUSY" in line]
+        if len(busy_lines) >= 2:
+            break
+        time.sleep(0.01)
+
+    heartbeat.finish()
+    ticker_thread = heartbeat._ticker_thread
+    assert ticker_thread is not None
+    assert not ticker_thread.is_alive()
+    count_after_finish = len([line for line in log_path.read_text().splitlines() if "BUSY" in line])
+    time.sleep(0.03)
+    assert len([line for line in log_path.read_text().splitlines() if "BUSY" in line]) == count_after_finish
+
+    assert len(busy_lines) >= 2
+    assert "blind-parked-auto-rearm cycle elapsed 1s cpu unavailable out unavailable" in busy_lines[0]
+    assert "blind-parked-auto-rearm cycle elapsed 2s cpu +2s out unavailable" in busy_lines[1]
+    assert "(NO PROGRESS)" not in "\n".join(busy_lines)
+
+
+def test_watch_cycle_phase_finish_waits_for_blocked_ticker_before_done(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    first_tick_sampled = threading.Event()
+    blocked_sampler_entered = threading.Event()
+    release_sampler = threading.Event()
+    finish_returned = threading.Event()
+    clock_values = iter([100.0, 101.0, 102.0])
+    last_clock = 102.0
+    sample_count = 0
+
+    def clock() -> float:
+        nonlocal last_clock
+        try:
+            last_clock = next(clock_values)
+        except StopIteration:
+            pass
+        return last_clock
+
+    def cpu_sampler(_pid: int) -> float:
+        nonlocal sample_count
+        sample_count += 1
+        if sample_count == 1:
+            first_tick_sampled.set()
+            return 10.0
+        blocked_sampler_entered.set()
+        assert release_sampler.wait(timeout=1.0)
+        return 12.0
+
+    reporter = _WatchLongPhaseReporter(
+        log=log,
+        threshold_seconds=0.001,
+        interval_seconds=0.001,
+        clock=clock,
+        cpu_sampler=cpu_sampler,
+    )
+    heartbeat = watch_module._start_watch_cycle_phase(reporter, "cycle-finalize")
+    assert first_tick_sampled.wait(timeout=1.0)
+    assert blocked_sampler_entered.wait(timeout=1.0)
+    ticker_thread = heartbeat._ticker_thread
+    ticker_stop = heartbeat._ticker_stop
+    assert ticker_thread is not None
+    assert ticker_stop is not None
+
+    def finish_heartbeat() -> None:
+        heartbeat.finish()
+        finish_returned.set()
+
+    finisher = threading.Thread(target=finish_heartbeat, daemon=True)
+    finisher.start()
+    assert ticker_stop.wait(timeout=1.0)
+    assert ticker_thread.is_alive()
+    lines_before_release = log_path.read_text().splitlines()
+    done_before_release = [line for line in lines_before_release if "DONE      cycle-finalize cycle" in line]
+
+    assert not finish_returned.is_set()
+    assert not done_before_release
+
+    release_sampler.set()
+    finisher.join(timeout=1.0)
+    assert not finisher.is_alive()
+    assert not ticker_thread.is_alive()
+    lines = log_path.read_text().splitlines()
+    phase_lines = [line for line in lines if "cycle-finalize cycle" in line]
+    assert "DONE      cycle-finalize cycle elapsed " in phase_lines[-1]
+    done_index = next(index for index, line in enumerate(lines) if "DONE      cycle-finalize cycle" in line)
+    assert not any("BUSY" in line and "cycle-finalize cycle" in line for line in lines[done_index + 1 :])
+
+
+def test_watch_cycle_phase_repeated_finish_leaves_no_live_ticker_threads(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    for index in range(5):
+        reporter = _WatchLongPhaseReporter(
+            log=log,
+            threshold_seconds=60,
+            interval_seconds=60,
+            clock=lambda: 100.0 + index,
+            cpu_sampler=lambda _pid: 10.0,
+        )
+        heartbeat = watch_module._start_watch_cycle_phase(reporter, f"cycle-finalize-{index}")
+        heartbeat.finish()
+
+    live_tickers = [
+        thread.name
+        for thread in threading.enumerate()
+        if thread.name.startswith("gza-watch-phase-heartbeat:") and thread.is_alive()
+    ]
+    assert live_tickers == []
+
+
+def test_watch_cycle_phase_busy_admission_cannot_write_after_done(tmp_path: Path) -> None:
+    class PausingWatchLog(_WatchLog):
+        def __init__(self, path: Path) -> None:
+            super().__init__(path, quiet=True)
+            self.busy_entered = threading.Event()
+            self.release_busy = threading.Event()
+
+        def emit(self, event: str, message: str, *, dedupe_key: str | None = None) -> None:
+            if event == "BUSY":
+                self.busy_entered.set()
+                assert self.release_busy.wait(timeout=1.0)
+            super().emit(event, message, dedupe_key=dedupe_key)
+
+    log = PausingWatchLog(tmp_path / ".gza" / "watch.log")
+    reporter = _WatchLongPhaseReporter(
+        log=log,
+        threshold_seconds=60,
+        interval_seconds=60,
+        clock=lambda: 100.0,
+        cpu_sampler=lambda _pid: 10.0,
+    )
+    heartbeat = reporter.start("cycle-finalize", "cycle")
+
+    busy_writer = threading.Thread(
+        target=lambda: heartbeat(
+            LongPhaseProgress(
+                elapsed_seconds=1.0,
+                cpu_delta_seconds=1.0,
+                output_bytes_delta=0,
+                output_lines_delta=0,
+                no_progress=False,
+            )
+        ),
+        daemon=True,
+    )
+    busy_writer.start()
+    assert log.busy_entered.wait(timeout=1.0)
+
+    finish_returned = threading.Event()
+    finisher = threading.Thread(target=lambda: (heartbeat.finish(), finish_returned.set()), daemon=True)
+    finisher.start()
+    assert not finish_returned.is_set()
+
+    log.release_busy.set()
+    busy_writer.join(timeout=1.0)
+    finisher.join(timeout=1.0)
+    assert not busy_writer.is_alive()
+    assert not finisher.is_alive()
+
+    lines = log.path.read_text().splitlines()
+    busy_index = next(index for index, line in enumerate(lines) if "BUSY" in line)
+    done_index = next(index for index, line in enumerate(lines) if "DONE" in line)
+    assert busy_index < done_index
+    assert not any("BUSY" in line for line in lines[done_index + 1 :])
+
+
+def test_watch_cycle_phase_cpu_regression_resets_before_no_progress(tmp_path: Path) -> None:
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+    clock_values = iter([100.0, 101.0, 102.0, 103.0])
+    last_clock = 103.0
+    cpu_values = iter([10.0, 8.0, 8.0])
+    last_cpu = 8.0
+
+    def clock() -> float:
+        nonlocal last_clock
+        try:
+            last_clock = next(clock_values)
+        except StopIteration:
+            pass
+        return last_clock
+
+    def cpu_sampler(_pid: int) -> float:
+        nonlocal last_cpu
+        try:
+            last_cpu = next(cpu_values)
+        except StopIteration:
+            pass
+        return last_cpu
+
+    reporter = _WatchLongPhaseReporter(
+        log=log,
+        threshold_seconds=0.001,
+        interval_seconds=0.001,
+        clock=clock,
+        cpu_sampler=cpu_sampler,
+    )
+    heartbeat = watch_module._start_watch_cycle_phase(reporter, "cycle-finalize")
+
+    deadline = time.monotonic() + 1.0
+    busy_lines: list[str] = []
+    while time.monotonic() < deadline:
+        busy_lines = [line for line in log_path.read_text().splitlines() if "BUSY" in line]
+        if len(busy_lines) >= 3:
+            break
+        time.sleep(0.01)
+
+    heartbeat.finish()
+    ticker_thread = heartbeat._ticker_thread
+    assert ticker_thread is not None
+    ticker_thread.join(timeout=1.0)
+    assert not ticker_thread.is_alive()
+
+    assert len(busy_lines) >= 3
+    assert "cycle-finalize cycle elapsed 1s cpu unavailable out unavailable" in busy_lines[0]
+    assert "cpu +0s" not in busy_lines[0]
+    assert "(NO PROGRESS)" not in busy_lines[0]
+    assert "cycle-finalize cycle elapsed 2s cpu unavailable out unavailable" in busy_lines[1]
+    assert "cpu +0s" not in busy_lines[1]
+    assert "(NO PROGRESS)" not in busy_lines[1]
+    assert "cycle-finalize cycle elapsed 3s cpu +0s out unavailable (NO PROGRESS)" in busy_lines[2]
 
 
 @pytest.mark.parametrize(
@@ -6686,6 +6968,44 @@ def test_watch_worker_heartbeat_renders_subsecond_cpu_progress(tmp_path: Path) -
     assert "cpu +0.5s log +0 bytes" in log_text
     assert "cpu +0.5s log +0 bytes (NO PROGRESS)" not in log_text
     assert "cpu +0s log +0 bytes (NO PROGRESS)" in log_text
+
+
+def test_watch_worker_heartbeat_cpu_regression_resets_before_no_progress(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+    task = store.add("Regressing worker cpu task", task_type="implement")
+    assert task.id is not None
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC) - timedelta(seconds=30)
+    task.running_pid = os.getpid()
+    store.update(task)
+    _register_watch_worker(config, worker_id="w-regression", task_id=str(task.id), started_at=task.started_at)
+    log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
+    now = 1000.0
+    cpu_samples = iter([10.0, 8.0, 8.0])
+    monitor = _WatchWorkerHeartbeatMonitor(
+        config=config,
+        store=store,
+        log=log,
+        threshold_seconds=60,
+        interval_seconds=60,
+        clock=lambda: now,
+        cpu_sampler=lambda _pid: next(cpu_samples),
+    )
+
+    monitor()
+    now = 1060.0
+    monitor()
+    now = 1120.0
+    monitor()
+
+    busy_lines = [line for line in log.path.read_text().splitlines() if "BUSY" in line]
+    assert len(busy_lines) == 2
+    assert "cpu unavailable log +0 bytes" in busy_lines[0]
+    assert "cpu +0s" not in busy_lines[0]
+    assert "(NO PROGRESS)" not in busy_lines[0]
+    assert "cpu +0s log +0 bytes (NO PROGRESS)" in busy_lines[1]
 
 
 def test_watch_worker_heartbeat_uses_fake_darwin_descendant_cpu_progress(tmp_path: Path) -> None:

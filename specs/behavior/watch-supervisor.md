@@ -719,11 +719,14 @@ state to win over already-mergeable fresh code.
   line before silence begins and then `BUSY` heartbeats every
   `watch.heartbeat_interval_seconds` while still in flight. Each heartbeat MUST identify
   the phase and task or merge-unit subject, report elapsed wall time, and include real
-  child-process liveness evidence such as CPU delta or captured output advancement. If
-  supported liveness evidence was sampled and has not advanced since the previous
-  heartbeat, the heartbeat MUST say `NO PROGRESS` explicitly. Unsupported evidence MUST
-  be rendered distinctly, such as `cpu unavailable`, and MUST NOT be treated as observed
-  flat progress. This heartbeat stream is separate from the restart-safe watch-progress
+  liveness evidence such as CPU delta or captured output advancement. Child-process
+  phases SHOULD report captured output deltas. In-process cycle-level phases have no
+  subprocess output stream and MUST render that field distinctly, such as `out
+  unavailable`, instead of reporting a misleading zero-byte output delta. If supported
+  liveness evidence was sampled and has not advanced since the previous heartbeat, the
+  heartbeat MUST say `NO PROGRESS` explicitly. Unsupported evidence MUST be rendered
+  distinctly, such as `cpu unavailable`, and MUST NOT be treated as observed flat
+  progress. This heartbeat stream is separate from the restart-safe watch-progress
   backstop state.
 - In-process cycle-level phases MUST use the non-task subject `cycle`. Each emitted
   `START <phase> cycle` line for a cycle phase MUST be paired with

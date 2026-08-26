@@ -4299,6 +4299,7 @@ def _read_darwin_process_tree_cpu_seconds(
     ps_runner: Callable[[], subprocess.CompletedProcess[str]] | None = None,
 ) -> float | None:
     """Return CPU seconds for a Darwin process and its live descendants."""
+    ps_timeout_seconds = 1.0
     if ps_runner is None:
         def _run_ps() -> subprocess.CompletedProcess[str]:
             process = _ORIGINAL_SUBPROCESS_POPEN(
@@ -4307,7 +4308,12 @@ def _read_darwin_process_tree_cpu_seconds(
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            stdout, stderr = process.communicate()
+            try:
+                stdout, stderr = process.communicate(timeout=ps_timeout_seconds)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate()
+                return subprocess.CompletedProcess(process.args, 124, stdout=stdout, stderr=stderr)
             return subprocess.CompletedProcess(process.args, process.returncode, stdout=stdout, stderr=stderr)
 
         ps_runner = _run_ps
@@ -4403,6 +4409,16 @@ def _long_phase_no_progress(
     )
 
 
+def _sample_long_phase_cpu_delta(current_cpu: float | None, last_cpu: float | None) -> float | None:
+    """Return a comparable CPU delta, or None when the sampled aggregate reset."""
+    if current_cpu is None or last_cpu is None:
+        return None
+    delta = current_cpu - last_cpu
+    if delta < 0.0:
+        return None
+    return delta
+
+
 class _LongPhaseHeartbeatState:
     def __init__(
         self,
@@ -4452,9 +4468,7 @@ class _LongPhaseHeartbeatState:
         if now < self.next_at:
             return
         current_cpu = self.cpu_sampler(self.process.pid)
-        cpu_delta: float | None = None
-        if current_cpu is not None and self.last_cpu is not None:
-            cpu_delta = max(0.0, current_cpu - self.last_cpu)
+        cpu_delta = _sample_long_phase_cpu_delta(current_cpu, self.last_cpu)
         no_progress = _long_phase_no_progress(
             output_bytes_delta=self.output_bytes_since_last,
             output_lines_delta=self.output_lines_since_last,
