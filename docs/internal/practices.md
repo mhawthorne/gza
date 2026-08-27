@@ -152,10 +152,9 @@ suite conftests call the shared `register_sigterm_faulthandler()` helper at
 import time, and `python -m gza.test_latency --summary` emits its current
 summary before re-raising termination.
 The wrapper reports the detected core count for operator telemetry while
-defaulting its xdist worker count to two under `--dist loadscope`, matching the
-CI-parity grouping expected by functional harness tests. Operators can still
-pin alternate grouping for local debugging by setting `PYTEST_XDIST_WORKERS`
-explicitly.
+defaulting its xdist worker count to two under `--dist loadscope`. Operators
+can still pin alternate grouping for local debugging by setting
+`PYTEST_XDIST_WORKERS` explicitly.
 
 The unit and functional lanes also use guarded serial-rerun bridges in
 `python -m gza.test_serial_rerun` and `python -m gza.test_functional_rerun`

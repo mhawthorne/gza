@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
@@ -433,6 +433,127 @@ class LandingPostRebaseReviewResult:
             raise ValueError("non-blocked review acquisition cannot carry a landing block")
         if self.status in {"pending", "in_progress", "created", "reused_completed"} and self.review_task is None:
             raise ValueError("review-bearing acquisition status requires a review task")
+
+
+@dataclass(frozen=True)
+class LandingPostRebaseReviewTransition:
+    """Result of landing's post-rebase review acquisition and policy transition."""
+
+    review_result: LandingPostRebaseReviewResult
+    decision: LandingPolicyDecision
+
+
+def run_landing_post_rebase_review_transition(
+    store: SqliteTaskStore,
+    request: LandingPostRebaseReviewRequest,
+    *,
+    policy: LandingPolicyName,
+    facts: LandingPolicyFacts,
+    config: Any | None = None,
+    judge: LandingJudge | None = None,
+    create_full_review: Callable[..., DbTask] = create_review_task,
+    create_resolution_review: Callable[..., DbTask] = create_resolution_review_task,
+) -> LandingPostRebaseReviewTransition:
+    """Acquire landing's one post-rebase review, then evaluate landing policy.
+
+    This is the production transition between post-rebase review acquisition and
+    guarded/strict landing policy. ``CHANGES_REQUESTED`` review evidence flows
+    directly to the landing policy decision; this path does not dispatch improve
+    work or start a second review after a completed exact review is available.
+    """
+
+    result = acquire_one_post_rebase_review(
+        store,
+        request,
+        config=config,
+        create_full_review=create_full_review,
+        create_resolution_review=create_resolution_review,
+    )
+    decision = _consume_landing_post_rebase_review_result(
+        result,
+        policy=policy,
+        facts=facts,
+        config=config,
+        judge=judge,
+    )
+    return LandingPostRebaseReviewTransition(result, decision)
+
+
+def _consume_landing_post_rebase_review_result(
+    result: LandingPostRebaseReviewResult,
+    *,
+    policy: LandingPolicyName,
+    facts: LandingPolicyFacts,
+    config: Any | None = None,
+    judge: LandingJudge | None = None,
+) -> LandingPolicyDecision:
+    """Consume landing's one-shot post-rebase review result.
+
+    This is the landing-specific transition seam between acquiring a
+    post-rebase review and evaluating the landing policy. In particular,
+    ``CHANGES_REQUESTED`` review evidence flows to the guarded/strict landing
+    decision rather than back into the generic improve or review loop.
+    """
+
+    if result.status == "blocked":
+        assert result.blocked is not None
+        return LandingPolicyDecision(False, blocked=result.blocked)
+    if result.status in {"created", "pending", "in_progress"}:
+        return LandingPolicyDecision(
+            False,
+            blocked=LandBlocked(
+                "required-review-unavailable",
+                "post-rebase review has not completed",
+                _evidence_refs(
+                    result.review_task.id if result.review_task is not None else None,
+                    facts.task_id,
+                    facts.source_head,
+                ),
+            ),
+        )
+
+    policy_facts = facts
+    if result.status == "reused_completed":
+        assert result.review_task is not None
+        project_dir = Path(getattr(config, "project_dir", Path.cwd()))
+        report = get_review_report(project_dir, result.review_task)
+        if report.verdict not in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED", "NEEDS_DISCUSSION"}:
+            return LandingPolicyDecision(
+                False,
+                blocked=LandBlocked(
+                    "required-review-unavailable",
+                    "post-rebase review evidence is malformed or not merge-decision bearing",
+                    _evidence_refs(result.review_task.id, facts.source_head),
+                ),
+            )
+        mode: LandingReviewMode = "resolution" if result.need == "resolution" else "plain_full"
+        if facts.review is not None:
+            review = replace(
+                facts.review,
+                status="completed",
+                mode=facts.review.mode if facts.review.mode != "unknown" else mode,
+                verdict=cast(LandingReviewVerdict, report.verdict),
+                current=True,
+                parseable=True,
+                identity_matched=True,
+                review_id=result.review_task.id,
+                reviewed_head=result.review_task.review_verify_head_sha or facts.source_head,
+            )
+        else:
+            review = LandingReviewEvidence(
+                required=True,
+                status="completed",
+                mode=mode,
+                verdict=cast(LandingReviewVerdict, report.verdict),
+                current=True,
+                parseable=True,
+                identity_matched=True,
+                review_id=result.review_task.id,
+                reviewed_head=result.review_task.review_verify_head_sha or facts.source_head,
+            )
+        policy_facts = replace(facts, review=review)
+
+    return evaluate_landing_policy(policy=policy, facts=policy_facts, judge=judge)
 
 
 class LandingCreateReviewResult(Protocol):

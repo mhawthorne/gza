@@ -160,7 +160,7 @@ def _full_verify_ruff_command(repo_root: Path) -> list[str]:
 
 
 @pytest.mark.timeout(30, method="signal")
-def test_full_verify_defaults_to_fixed_ci_parity_xdist_worker_count_on_high_core_machine(tmp_path: Path) -> None:
+def test_full_verify_defaults_to_two_xdist_workers_on_high_core_machine(tmp_path: Path) -> None:
     fixture_root = _setup_verify_script_fixture(tmp_path)
     tool_log = fixture_root / "venv-tools.log"
 

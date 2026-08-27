@@ -36,6 +36,7 @@ from gza.landing import (
     dry_run_steps_until_boundary,
     evaluate_landing_policy,
     inspect_current_landing_verify_evidence,
+    run_landing_post_rebase_review_transition,
 )
 from gza.review_scope import build_resolution_review_scope
 from gza.review_tasks import DuplicateReviewError
@@ -57,6 +58,82 @@ from gza.runner import (
 
 TREE_A = "a" * 64
 TREE_B = "b" * 64
+
+
+def _assert_no_improve_rows(store: SqliteTaskStore) -> None:
+    with store._connect() as conn:
+        rows = conn.execute("SELECT id FROM tasks WHERE task_type = 'improve'").fetchall()
+    assert rows == []
+
+
+def _assert_no_improve_action(result: Any) -> None:
+    action = getattr(result, "action", None)
+    assert not isinstance(action, dict) or action.get("type") not in {
+        "improve",
+        "create_improve",
+        "run_improve",
+        "wait_improve",
+        "resume",
+        "resume_improve",
+    }
+
+
+def _fail_improve_or_review_route(*_args: Any, **_kwargs: Any) -> Task:
+    raise AssertionError("no improve, second review, or fallback review route")
+
+
+def _assert_no_review_or_improve_rows_after_landing_review(store: SqliteTaskStore, review_ids: set[str]) -> None:
+    with store._connect() as conn:
+        review_rows = conn.execute("SELECT id FROM tasks WHERE task_type = 'review'").fetchall()
+        improve_rows = conn.execute("SELECT id FROM tasks WHERE task_type = 'improve'").fetchall()
+    assert {row[0] for row in review_rows} <= review_ids
+    assert improve_rows == []
+
+
+def _landing_policy_facts_for_review(impl: Task, review: Task) -> LandingPolicyFacts:
+    return _green_facts(
+        task_id=impl.id or "unknown",
+        source_head="head-a",
+        target_head="target-a",
+        parked_reason="review-max-cycles-reached",
+        review=_review(
+            verdict="APPROVED",
+            review_id=review.id,
+            reviewed_head=review.review_verify_head_sha,
+        ),
+        open_blockers=(_blocker("B1", deferrable=True, blocker_class="out_of_scope", source=f"review:{review.id}"),),
+    )
+
+
+def _run_landing_review_transition_with_poisoned_review_routes(
+    store: SqliteTaskStore,
+    impl: Task,
+    request: LandingPostRebaseReviewRequest,
+    review: Task,
+) -> Any:
+    transition = run_landing_post_rebase_review_transition(
+        store,
+        request,
+        policy="guarded",
+        facts=_landing_policy_facts_for_review(impl, review),
+        judge=_landing_judgment,
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=_fail_improve_or_review_route,
+    )
+
+    result = transition.review_result
+    _assert_no_improve_action(result)
+    assert result.status == "reused_completed"
+    assert result.review_task == review
+    decision = transition.decision
+    assert decision.allowed is True
+    assert decision.allowed_overrides == (
+        "defer-review-blockers",
+        "parked:review-max-cycles-reached",
+    )
+    assert decision.judgment_verdict == "LAND"
+    _assert_no_review_or_improve_rows_after_landing_review(store, {review.id or ""})
+    return transition
 
 
 def _review(**overrides: Any) -> LandingReviewEvidence:
@@ -3398,10 +3475,10 @@ def test_completed_changes_requested_post_rebase_review_returns_without_second_r
         "## Verdict\n\nCHANGES_REQUESTED\n"
     )
     store.update(review)
-    calls: list[str] = []
 
-    result = acquire_one_post_rebase_review(
+    transition = _run_landing_review_transition_with_poisoned_review_routes(
         store,
+        impl,
         LandingPostRebaseReviewRequest(
             impl_task=impl,
             source_head="head-a",
@@ -3409,13 +3486,13 @@ def test_completed_changes_requested_post_rebase_review_returns_without_second_r
             changed_diff=None,
             resolution_provenance_complete=False,
         ),
-        create_full_review=lambda *_args, **_kwargs: calls.append("created") or review,
+        review,
     )
 
+    result = transition.review_result
     assert result.status == "reused_completed"
     assert result.review_task == review
     assert result.review_budget_used is False
-    assert calls == []
 
 
 def test_malformed_completed_post_rebase_review_blocks(tmp_path) -> None:
@@ -3742,17 +3819,20 @@ def test_post_rebase_review_budget_sequence_never_allows_second_review_after_cha
             resolution_provenance_complete=False,
         ),
         create_full_review=create_first_review,
+        create_resolution_review=_fail_improve_or_review_route,
     )
     assert first.status == "created"
     assert first.review_task is not None
     assert first.review_budget_used is True
+    _assert_no_improve_action(first)
+    _assert_no_improve_rows(store)
 
     first.review_task.status = "completed"
     first.review_task.completed_at = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
     first.review_task.output_content = _review_report("CHANGES_REQUESTED")
     store.update(first.review_task)
 
-    completed = acquire_one_post_rebase_review(
+    completed = run_landing_post_rebase_review_transition(
         store,
         LandingPostRebaseReviewRequest(
             impl_task=impl,
@@ -3762,10 +3842,23 @@ def test_post_rebase_review_budget_sequence_never_allows_second_review_after_cha
             resolution_provenance_complete=False,
             review_budget_used=first.review_budget_used,
         ),
-        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no second review")),
+        policy="guarded",
+        facts=_landing_policy_facts_for_review(impl, first.review_task),
+        judge=_landing_judgment,
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=_fail_improve_or_review_route,
     )
-    assert completed.status == "reused_completed"
-    assert completed.review_budget_used is True
+    assert completed.review_result.status == "reused_completed"
+    assert completed.review_result.review_budget_used is True
+    assert completed.review_result.review_task == first.review_task
+    _assert_no_improve_action(completed.review_result)
+    assert completed.decision.allowed is True
+    assert completed.decision.allowed_overrides == (
+        "defer-review-blockers",
+        "parked:review-max-cycles-reached",
+    )
+    assert completed.decision.judgment_verdict == "LAND"
+    _assert_no_review_or_improve_rows_after_landing_review(store, {first.review_task.id or ""})
 
     first.review_task.status = "pending"
     first.review_task.completed_at = None
@@ -3779,12 +3872,15 @@ def test_post_rebase_review_budget_sequence_never_allows_second_review_after_cha
             target_head="target-a",
             changed_diff=True,
             resolution_provenance_complete=False,
-            review_budget_used=completed.review_budget_used,
+            review_budget_used=completed.review_result.review_budget_used,
         ),
-        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no second review")),
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=_fail_improve_or_review_route,
     )
     assert pending.status == "pending"
     assert pending.review_budget_used is True
+    _assert_no_improve_action(pending)
+    _assert_no_improve_rows(store)
 
     no_longer_required = acquire_one_post_rebase_review(
         store,
@@ -3798,10 +3894,13 @@ def test_post_rebase_review_budget_sequence_never_allows_second_review_after_cha
             changed_diff=False,
             review_budget_used=pending.review_budget_used,
         ),
-        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no second review")),
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=_fail_improve_or_review_route,
     )
     assert no_longer_required.status == "not_required"
     assert no_longer_required.review_budget_used is True
+    _assert_no_improve_action(no_longer_required)
+    _assert_no_improve_rows(store)
 
     first.review_task.status = "completed"
     first.review_task.completed_at = datetime(2026, 8, 26, 12, 1, tzinfo=UTC)
@@ -3817,10 +3916,13 @@ def test_post_rebase_review_budget_sequence_never_allows_second_review_after_cha
             resolution_provenance_complete=False,
             review_budget_used=no_longer_required.review_budget_used,
         ),
-        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no second review")),
+        create_full_review=_fail_improve_or_review_route,
+        create_resolution_review=_fail_improve_or_review_route,
     )
     assert changed_identity.status == "blocked"
     assert changed_identity.review_budget_used is True
     assert changed_identity.blocked is not None
     assert changed_identity.blocked.reason_code == "bounded-attempt-exhausted"
     assert created == ["created"]
+    _assert_no_improve_action(changed_identity)
+    _assert_no_improve_rows(store)
