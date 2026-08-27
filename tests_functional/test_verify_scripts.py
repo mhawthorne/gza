@@ -69,6 +69,7 @@ def _write_fake_passthrough_tool(path: Path, log_path: Path, name: str) -> None:
         f"printf '{name} %s\\n' \"$*\" >> {str(log_path)!r}\n",
     )
 
+
 def _write_fake_ruff_failure(path: Path, log_path: Path, *, exit_code: int = 1) -> None:
     _make_executable(
         path,
@@ -159,7 +160,7 @@ def _full_verify_ruff_command(repo_root: Path) -> list[str]:
 
 
 @pytest.mark.timeout(30, method="signal")
-def test_full_verify_defaults_to_ci_parity_xdist_worker_count_on_high_core_machine(tmp_path: Path) -> None:
+def test_full_verify_defaults_to_fixed_ci_parity_xdist_worker_count_on_high_core_machine(tmp_path: Path) -> None:
     fixture_root = _setup_verify_script_fixture(tmp_path)
     tool_log = fixture_root / "venv-tools.log"
 

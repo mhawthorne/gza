@@ -4273,6 +4273,7 @@ class _AdvanceEngineConfigAdapter:
     max_resume_attempts: int
     advance_create_plan_reviews: bool = True
     require_plan_review_before_implement: bool = True
+    on_max_cycles: str = "park"
     max_plan_review_cycles: int = 2
     max_failed_plan_review_retries: int = 3
     max_noop_improve_cycles: int = 1
@@ -4593,6 +4594,7 @@ def _build_iterate_engine_config(config: Config, *, max_resume_attempts: int) ->
         require_plan_review_before_implement=bool(
             getattr(config, "require_plan_review_before_implement", True)
         ),
+        on_max_cycles=str(getattr(config, "on_max_cycles", "park")),
         max_plan_review_cycles=_int_config(getattr(config, "max_plan_review_cycles", None), 2),
         max_failed_plan_review_retries=_int_config(
             getattr(config, "max_failed_plan_review_retries", None),
@@ -5451,7 +5453,7 @@ def _cmd_iterate_impl(
 
             try:
                 initial_action = _determine_selected_iterate_action_for_args(
-                    config,
+                    engine_config,
                     store,
                     preflight_context.git_runtime,
                     iterate_task,

@@ -26361,6 +26361,129 @@ class TestIterateCommand:
 
         assert action["type"] == "needs_rebase"
 
+    def test_iterate_adapter_honors_on_max_cycles_merge_and_defer_for_initial_action(
+        self, tmp_path: Path
+    ) -> None:
+        from unittest.mock import MagicMock
+
+        from gza.cli.advance_engine import determine_next_action
+        from gza.cli.execution import _build_iterate_engine_config
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        config = Config.load(tmp_path)
+        config.on_max_cycles = "merge_and_defer"
+        config.max_review_cycles = 0
+        config.verify_command = "./bin/tests"
+        impl = self._make_completed_impl(store)
+        impl.merge_status = "unmerged"
+        impl.has_commits = True
+        store.update(impl)
+        self._persist_current_green_verify(store, tmp_path, impl)
+        review = self._make_review_task(
+            store,
+            impl,
+            status="completed",
+            verdict="CHANGES_REQUESTED",
+            completed_at=datetime.now(UTC),
+        )
+        review.review_verify_head_sha = "same-head"
+        store.update(review)
+
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.ref_exists.return_value = False
+        mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
+        mock_git.can_merge.return_value = True
+        mock_git.is_merged.return_value = False
+        mock_git.rev_parse_if_exists.side_effect = (
+            lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
+        )
+
+        engine_config = _build_iterate_engine_config(config, max_resume_attempts=1)
+        action = determine_next_action(
+            engine_config,
+            store,
+            mock_git,
+            impl,
+            "main",
+            max_resume_attempts=1,
+            selected_for_merge=True,
+        )
+
+        assert engine_config.on_max_cycles == "merge_and_defer"
+        assert action["type"] == "merge"
+        assert action["max_cycles_merge_and_defer"] is True
+
+    def test_background_iterate_preflight_honors_on_max_cycles_merge_and_defer(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        config = Config.load(tmp_path)
+        config.on_max_cycles = "merge_and_defer"
+        config.max_review_cycles = 0
+        config.verify_command = "./bin/tests"
+        impl = self._make_completed_impl(store)
+        impl.merge_status = "unmerged"
+        impl.has_commits = True
+        store.update(impl)
+        self._persist_current_green_verify(store, tmp_path, impl)
+        review = self._make_review_task(
+            store,
+            impl,
+            status="completed",
+            verdict="CHANGES_REQUESTED",
+            completed_at=datetime.now(UTC),
+        )
+        review.review_verify_head_sha = "same-head"
+        store.update(review)
+
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.ref_exists.return_value = False
+        mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
+        mock_git.can_merge.return_value = True
+        mock_git.is_merged.return_value = False
+        mock_git.rev_parse_if_exists.side_effect = (
+            lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
+        )
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        spawn_background.assert_not_called()
+        assert "Next action: merge" in output
+        assert "ready to merge" in output
+        assert "max_cycles_reached" not in output
+
     def test_advance_engine_config_adapter_carries_max_failed_closing_review_retries(
         self, tmp_path: Path
     ) -> None:

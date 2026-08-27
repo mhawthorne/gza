@@ -46,6 +46,8 @@ from gza.cli._recovery_lane import collect_recovery_lane_entries
 from gza.cli.advance_engine import (
     PARK_REASON_IMPROVE_NO_OP,
     PARK_REASON_RETRY_LIMIT_REACHED,
+    PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_INVALID,
+    PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE,
     PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES,
     PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE,
     PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE,
@@ -133,10 +135,10 @@ from gza.cli.watch import (
     _task_snapshot,
     _warn_if_installed_gza_changed,
     _watch_iterate_impl_target,
+    _watch_log_path,
     _watch_needs_attention_message,
     _watch_no_progress_result_deferred_for_transient_backoff,
     _watch_reexec_argv,
-    _watch_log_path,
     _WatchCycleAnalysis,
     _WatchCyclePlan,
     _WatchLog,
@@ -40495,6 +40497,8 @@ def test_blind_parked_auto_rearm_ignores_verify_fix_failed_without_mutating_manu
         PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE,
         PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE,
         PARK_REASON_RETRY_LIMIT_REACHED,
+        PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE,
+        PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_INVALID,
     ],
 )
 def test_watch_parked_lineage_action_uses_shared_taxonomy(reason: str) -> None:
@@ -40524,6 +40528,8 @@ def test_watch_shared_parked_reason_taxonomy_covers_noop_and_recovery_parks() ->
     assert PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE in WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS
     assert PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE in WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS
     assert PARK_REASON_RETRY_LIMIT_REACHED in WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS
+    assert PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE in WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS
+    assert PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_INVALID in WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS
 
 
 def test_watch_cycle_surfaces_verify_noop_branch_tip_attention_once_without_respawning_iterate(

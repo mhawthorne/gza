@@ -59,7 +59,8 @@ Fail-closed cases include:
 ## Loop Bound
 
 - `max_review_cycles=3` is the current review/improve loop bound.
-- When the bound is reached, lifecycle escalates with `review-max-cycles-reached` and requires human intervention instead of continuing to churn.
+- When the bound is reached, `on_max_cycles=park` escalates with `review-max-cycles-reached` and requires human intervention instead of continuing to churn.
+- With `on_max_cycles=merge_and_defer`, an ordinary current-head capped review may merge only after local merge-source proof, readable deterministic review content, fresh green pre-merge verify evidence, and validated persisted `BLOCKER` metadata; unavailable or invalid content surfaces a dedicated attention reason before verify handling. The resulting action remains `type="merge"` and carries max-cycle deferral metadata for mandatory follow-up task creation.
 
 ## Operator Audit Policy
 

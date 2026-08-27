@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import py_compile
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,8 @@ from gza.advance_engine import (
     FAILED_RECOVERY_RETRY_OR_REIMPLEMENT_NEXT_STEP,
     NOOP_IMPROVE_KIND_REAL_BLOCKER,
     NOOP_IMPROVE_KIND_VERIFY_ONLY,
+    PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_INVALID,
+    PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE,
     REVIEW_CLEARANCE_ARTIFACT_KIND,
     VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND,
     VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_STATUS,
@@ -4983,12 +4986,45 @@ def _assert_malformed_capped_review_stays_on_attention_path(
     action: dict[str, object],
     store: SqliteTaskStore,
     impl: DbTask,
+    *,
+    reason: str = PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_INVALID,
 ) -> None:
-    assert action["type"] == "max_cycles_reached"
-    assert action["needs_attention_reason"] == "review-max-cycles-reached"
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == reason
     assert action.get("max_cycles_merge_and_defer") is not True
-    assert action["type"] not in {"reconcile_verify_gate_evidence", "verify_gate"}
+    assert action["type"] not in {"merge", "reconcile_verify_gate_evidence", "verify_gate"}
     assert not store.get_based_on_children(impl.id)
+
+
+def _persist_capped_review_verify_evidence(
+    store: SqliteTaskStore,
+    config: Config,
+    impl: DbTask,
+    *,
+    tmp_path: Path,
+    status: str,
+    reviewed_head_sha: str = "current-sha",
+) -> None:
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status=status,
+            exit_status="0" if status == "passed" else "1",
+            captured_at=datetime(2026, 5, 10, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha=reviewed_head_sha,
+            reviewed_base_sha="base-sha",
+            working_directory=str(tmp_path),
+            failure=None if status == "passed" else "verify failed",
+        ),
+        verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+        verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+        producer="test",
+    )
 
 
 def test_capped_review_candidate_with_zero_parsed_blockers_stays_on_attention_path(
@@ -5029,12 +5065,9 @@ def test_capped_review_candidate_with_zero_parsed_blockers_stays_on_attention_pa
     _assert_malformed_capped_review_stays_on_attention_path(action, store, impl)
 
 
-def test_capped_review_candidate_with_missing_persisted_output_stays_on_attention_path(
+def test_capped_review_candidate_with_missing_report_stays_on_unavailable_attention_path(
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
-    from gza import advance_engine as advance_engine_module
-
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
     config.on_max_cycles = "merge_and_defer"
@@ -5051,15 +5084,42 @@ def test_capped_review_candidate_with_missing_persisted_output_stays_on_attentio
     review.report_file = ".gza/missing-review-output.md"
     store.update(review)
 
-    monkeypatch.setattr(
-        advance_engine_module,
-        "get_review_report",
-        lambda _project_dir, _review: ParsedReviewReport(
-            verdict="CHANGES_REQUESTED",
-            findings=(_review_finding("B1", "BLOCKER"),),
-            format_version="v2",
-        ),
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        impl,
+        "main",
     )
+
+    _assert_malformed_capped_review_stays_on_attention_path(
+        action,
+        store,
+        impl,
+        reason=PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE,
+    )
+
+
+def test_capped_review_candidate_with_whitespace_report_stays_on_unavailable_attention_path(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/capped-review-blank-output",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "current-sha"
+    report_path = tmp_path / str(review.report_file)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("   \n\t")
+    review.output_content = None
+    store.update(review)
 
     action = evaluate_advance_rules(
         config,
@@ -5069,15 +5129,19 @@ def test_capped_review_candidate_with_missing_persisted_output_stays_on_attentio
         "main",
     )
 
-    _assert_malformed_capped_review_stays_on_attention_path(action, store, impl)
+    _assert_malformed_capped_review_stays_on_attention_path(
+        action,
+        store,
+        impl,
+        reason=PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE,
+    )
 
 
 def test_capped_review_candidate_with_malformed_blocker_id_stays_on_attention_path(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    from gza import advance_engine as advance_engine_module
-    from gza import review_tasks as review_tasks_module
+    from gza import advance_engine as advance_engine_module, review_tasks as review_tasks_module
 
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -5276,7 +5340,7 @@ def test_capped_review_candidate_with_stale_verify_runs_pre_merge_verify_before_
     assert action["verify_gate_state"] == "stale"
 
 
-def test_capped_review_candidate_with_green_verify_keeps_existing_cap_action_for_slice(
+def test_capped_review_candidate_with_green_verify_emits_annotated_merge_action(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -5332,9 +5396,323 @@ def test_capped_review_candidate_with_green_verify_keeps_existing_cap_action_for
         "main",
     )
 
+    parsed_blockers = tuple(
+        finding for finding in parse_review_report(review.output_content or "").findings if finding.severity == "BLOCKER"
+    )
+    assert action["type"] == "merge"
+    assert action["description"] == "Merge and defer blockers after max review cycles"
+    assert action["max_cycles_merge_and_defer"] is True
+    assert action["review_task"].id == review.id
+    assert action["latest_review_task_id"] == review.id
+    assert action["latest_review_head_sha"] == "current-sha"
+    assert action["current_review_head_sha"] == "current-sha"
+    assert action["deferred_blocker_ids"] == ("B1",)
+    assert action["deferred_blocker_findings"] == parsed_blockers
+    assert action["persisted_review_output"] == review.output_content
+    assert action["review_output"] == review.output_content
+    assert action["review_output_reference"] == review.report_file
+    assert action["max_cycles_audit"]["reason"] == "review-max-cycles"
+    assert action["max_cycles_audit"]["policy"] == "merge_and_defer"
+    assert action["max_cycles_audit"]["completed_review_cycles"] == 0
+    assert action["max_cycles_audit"]["max_review_cycles"] == 0
+    assert action["max_cycles_audit"]["verify_gate_state"] == "passed"
+    assert action["max_cycles_audit"]["verify_epoch"].reviewed_head_sha == "current-sha"
+    assert "needs_attention_reason" not in action
+
+
+@pytest.mark.parametrize("verify_evidence", ["missing", "stale", "failed"])
+def test_capped_review_missing_local_merge_source_needs_manual_resolution_before_verify_gate(
+    tmp_path: Path,
+    monkeypatch,
+    verify_evidence: str,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 0
+    config.verify_command = "./bin/tests"
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/capped-review-missing-local-source",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "current-sha"
+    review.output_content = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",))
+    store.update(review)
+    if verify_evidence == "stale":
+        _persist_capped_review_verify_evidence(
+            store,
+            config,
+            impl,
+            tmp_path=tmp_path,
+            status="passed",
+            reviewed_head_sha="old-sha",
+        )
+    elif verify_evidence == "failed":
+        _persist_capped_review_verify_evidence(
+            store,
+            config,
+            impl,
+            tmp_path=tmp_path,
+            status="failed",
+            reviewed_head_sha="current-sha",
+        )
+
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: parse_review_report(review.output_content or ""),
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "_resolve_branch_head_sha",
+        lambda _git, _branch: SimpleNamespace(head_sha="current-sha", warning=None),
+    )
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(
+            can_merge=True,
+            assume_local_branch_exists=False,
+            merge_source_result=(None, None),
+        ),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert action.get("max_cycles_merge_and_defer") is not True
+
+
+def test_review_max_cycles_action_uses_shared_candidate_before_annotated_merge(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 0
+    config.verify_command = "./bin/tests"
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/capped-review-shared-candidate",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "current-sha"
+    review.output_content = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",))
+    store.update(review)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 5, 10, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="current-sha",
+            reviewed_base_sha="base-sha",
+            working_directory=str(tmp_path),
+            failure=None,
+        ),
+        verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+        verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+        producer="test",
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "get_review_report",
+        lambda _project_dir, _review: parse_review_report(review.output_content or ""),
+    )
+
+    ctx = resolve_advance_context(
+        config,
+        store,
+        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        impl,
+        "main",
+    )
+    assert advance_engine_module.review_max_cycles_merge_candidate(ctx) is True
+
+    ineligible_ctx = replace(ctx, current_review_head_sha="different-sha")
+    assert advance_engine_module.review_max_cycles_merge_candidate(ineligible_ctx) is False
+    action = advance_engine_module._review_max_cycles_action(ineligible_ctx)
+
     assert action["type"] == "max_cycles_reached"
     assert action["needs_attention_reason"] == "review-max-cycles-reached"
     assert action.get("max_cycles_merge_and_defer") is not True
+
+
+def test_capped_review_report_read_error_needs_attention_before_verify_gate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 0
+    config.verify_command = "./bin/tests"
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/capped-review-read-error",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "current-sha"
+    review.output_content = None
+    review.report_file = "reviews/unreadable.md"
+    store.update(review)
+    report_path = tmp_path / str(review.report_file)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(_review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",)))
+
+    original_read_text = Path.read_text
+
+    def raise_for_report(path: Path, *args: object, **kwargs: object) -> str:
+        if path == report_path:
+            raise OSError("cannot read review report")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", raise_for_report)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE
+    assert "cannot read review report" in action["description"]
+    assert action.get("max_cycles_merge_and_defer") is not True
+    assert action["type"] not in {"merge", "verify_gate", "reconcile_verify_gate_evidence"}
+
+
+def test_capped_review_invalid_utf8_report_needs_unavailable_attention_before_verify_gate(
+    tmp_path: Path,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 0
+    config.verify_command = "./bin/tests"
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/capped-review-invalid-utf8",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "current-sha"
+    review.output_content = None
+    store.update(review)
+    report_path = tmp_path / str(review.report_file)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_bytes(b"\xff\xfe\xfa")
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        impl,
+        "main",
+    )
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE
+    assert "UnicodeDecodeError" in action["description"]
+    assert action.get("max_cycles_merge_and_defer") is not True
+    assert action["type"] not in {"merge", "verify_gate", "reconcile_verify_gate_evidence"}
+
+
+def test_capped_review_action_uses_single_content_snapshot_for_payload_and_findings(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 0
+    config.verify_command = "./bin/tests"
+    first_output = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",))
+    second_output = _review_output_with_findings("CHANGES_REQUESTED", blockers=("B2",))
+    reads = 0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/capped-review-single-snapshot",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "current-sha"
+    review.output_content = None
+    review.report_file = "reviews/changing.md"
+    store.update(review)
+    report_path = tmp_path / str(review.report_file)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(first_output)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 5, 10, 10, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="current-sha",
+            reviewed_base_sha="base-sha",
+            working_directory=str(tmp_path),
+            failure=None,
+        ),
+        verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+        verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+        producer="test",
+    )
+
+    original_read_text = Path.read_text
+
+    def get_changing_review_content(path: Path, *args: object, **kwargs: object) -> str:
+        nonlocal reads
+        if path == report_path:
+            reads += 1
+            return first_output if reads == 1 else second_output
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", get_changing_review_content)
+
+    action = evaluate_advance_rules(
+        config,
+        store,
+        _FakeGit(can_merge=True, existing_branches={impl.branch}, ref_shas={impl.branch: "current-sha"}),
+        impl,
+        "main",
+    )
+
+    assert reads == 1
+    assert action["type"] == "merge"
+    assert action["max_cycles_merge_and_defer"] is True
+    assert action["persisted_review_output"] == first_output
+    assert action["review_output"] == first_output
+    assert action["deferred_blocker_ids"] == ("B1",)
+    assert [finding.id for finding in action["deferred_blocker_findings"]] == ["B1"]
 
 
 def test_capped_review_candidate_with_unavailable_verify_blocks_merge_and_attention_path(
