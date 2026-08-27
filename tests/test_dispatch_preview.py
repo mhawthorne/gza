@@ -24,7 +24,7 @@ def _bulk_insert_completed_history(
 ) -> tuple[str, ...]:
     now = datetime(2026, 4, 4, 8, 0, tzinfo=UTC).isoformat()
     task_ids = tuple(f"gza-{start + idx}" for idx in range(count))
-    with store._connect() as conn:  # noqa: SLF001 - fast large-store fixture setup
+    with store._connect() as conn:  # noqa: SLF001
         conn.executemany(
             """
             INSERT INTO tasks (
@@ -59,7 +59,7 @@ def _bulk_insert_completed_implement_siblings_with_distinct_slices(
 ) -> tuple[str, ...]:
     now = datetime(2026, 4, 4, 8, 0, tzinfo=UTC).isoformat()
     task_ids = tuple(f"gza-{start + idx}" for idx in range(count))
-    with store._connect() as conn:  # noqa: SLF001 - fast large-store fixture setup
+    with store._connect() as conn:  # noqa: SLF001
         conn.executemany(
             """
             INSERT INTO tasks (
@@ -96,7 +96,7 @@ def _bulk_insert_failed_tombstoned_merge_unit_tasks(
     now = datetime(2026, 4, 5, 8, 0, tzinfo=UTC).isoformat()
     task_ids = tuple(f"gza-{start + idx}" for idx in range(count))
     unit_ids = tuple(f"mu-tombstone-{start + idx}" for idx in range(count))
-    with store._connect() as conn:  # noqa: SLF001 - fast large-store fixture setup
+    with store._connect() as conn:  # noqa: SLF001
         conn.executemany(
             """
             INSERT INTO tasks (

@@ -3,17 +3,22 @@
 # requires-python = ">=3.11"
 # dependencies = ["matplotlib"]
 # ///
-"""Graph gza ``watch`` queue depth over time from ``.gza/watch.log``.
+"""Graph gza ``watch`` queue depth over time from ``.gza/watch.log`` archives.
 
-Parses the watch log and plots four series — tasks **running**, **pending**
-(runnable), **blocked**, and **need attention** — against time, saving a PNG and
-printing a text table of the same numbers.
+Parses the selected watch log family and plots four series — tasks **running**,
+**pending** (runnable), **blocked**, and **need attention** — against time,
+saving a PNG and printing a text table of the same numbers. Live watch logs
+(``.gza/watch.log`` plus ``watch.<timestamp>.log`` archives) and dry-run watch
+logs (``.gza/watch.dry-run.log`` plus ``watch.dry-run.<timestamp>.log``
+archives) are read separately because they describe different runs.
 
 The watch log records only ``HH:MM:SS`` (no date), so dates are inferred: we walk
-the log in order and bump a day counter every time the clock jumps backwards
-(a midnight wrap), then anchor the *latest* line to ``--date`` (default today) so
-the log "ends now". If a future watch log grows a full date-bearing timestamp,
-that is used directly and the wrap inference is skipped.
+each log in order and bump a day counter every time the clock jumps backwards
+(a midnight wrap), then anchor the active log's newest line to ``--date``
+(default today) so it "ends now". Rotated archives are anchored to the timestamp
+in their filename, so the newest row is never placed after the archive end. If a
+future watch log grows a full date-bearing timestamp, that is used directly and
+the wrap inference is skipped.
 
 Run it with uv (deps are declared inline above)::
 
@@ -71,6 +76,21 @@ _ATTN_UNCHANGED_RE = re.compile(r"(\d+) tasks? still need attention")
 _ATTN_HEADER_RE = re.compile(r"Needs attention \((\d+) tasks?\)")
 # Real merge events: "MERGE     gza-7957 -> main" (dry-run variants excluded below).
 _MERGE_RE = re.compile(r"MERGE\s+(gza-\d+)\s*->")
+_ARCHIVE_TIMESTAMP_FORMAT = "%Y-%m-%dT%H-%M-%S"
+_LIVE_ARCHIVE_RE = re.compile(r"^watch\.(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})\.log$")
+_DRY_RUN_ARCHIVE_RE = re.compile(
+    r"^watch\.dry-run\.(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})\.log$"
+)
+
+
+class WatchLogFile:
+    """One active or archived watch log in a family."""
+
+    __slots__ = ("path", "archive_end")
+
+    def __init__(self, path, archive_end):
+        self.path = path
+        self.archive_end = archive_end
 
 
 class Point:
@@ -98,13 +118,26 @@ def _parse_clock(line):
     return None, None
 
 
-def parse_log(path, base_date):
+def _base_date(value):
+    """Return a date from either a date or datetime anchor."""
+    if isinstance(value, datetime):
+        return value.date()
+    return value
+
+
+def _combine_hms(day, hms):
+    h, m, s = hms
+    return datetime.combine(day, datetime.min.time()).replace(hour=h, minute=m, second=s)
+
+
+def parse_log(path, base_date, *, use_anchor_time=False):
     """Parse ``path`` into ``(points, merges)``.
 
     ``points`` is a chronological list of Point; ``merges`` is a list of
     ``(datetime, task_id)`` for each real ``MERGE gza-NNNN -> main`` event.
-    ``base_date`` anchors the newest line (HMS-only logs). Attention is carried
-    forward across cycles because the log only re-emits it when it changes.
+    ``base_date`` anchors the newest line's date (HMS-only logs). For archives,
+    callers should pass the archive filename timestamp so each rotated file is
+    dated independently. Attention is carried forward only within this file.
     """
     raw = []  # (full_dt | None, hms | None, kind, values...)
     attention = None  # carried forward as we scan
@@ -147,7 +180,7 @@ def parse_log(path, base_date):
     # Assign real datetimes. If any line carried a full timestamp we trust those and
     # forward-fill HMS-only lines from the last known date; otherwise infer via wraps.
     have_full = any(r[0] is not None for r in raw)
-    times = _assign_datetimes(raw, base_date, have_full)
+    times = _assign_datetimes(raw, base_date, have_full, use_anchor_time=use_anchor_time)
 
     # Second pass: build Points from WAKE rows, resolving each cycle's attention.
     #
@@ -189,20 +222,19 @@ def parse_log(path, base_date):
     return points, merges
 
 
-def _assign_datetimes(raw, base_date, have_full):
+def _assign_datetimes(raw, base_date, have_full, *, use_anchor_time=False):
     """Map each raw row to a datetime, inferring dates from midnight wraps."""
+    anchor_date = _base_date(base_date)
     if have_full:
         # Forward-fill: carry the most recent full date across HMS-only lines.
         out = []
-        last_date = base_date
+        last_date = anchor_date
         for full_dt, hms, *_ in raw:
             if full_dt is not None:
                 last_date = full_dt.date()
                 out.append(full_dt)
             else:
-                h, m, s = hms
-                out.append(datetime.combine(last_date, datetime.min.time())
-                           .replace(hour=h, minute=m, second=s))
+                out.append(_combine_hms(last_date, hms))
         return out
 
     # HMS-only: day counter increments on each backwards clock jump.
@@ -217,12 +249,19 @@ def _assign_datetimes(raw, base_date, have_full):
         prev = secs
     max_day = day_offsets[-1] if day_offsets else 0
     # Anchor so the last line lands on base_date; earlier days count backwards.
+    # Archive callers pass a full filename timestamp, so the newest HMS-only row
+    # must resolve to the latest matching wall-clock datetime at or before that
+    # timestamp. Date-only callers keep the historical "latest row is on this
+    # date" behavior.
+    last_date = anchor_date
+    if use_anchor_time and isinstance(base_date, datetime) and raw:
+        last_candidate = _combine_hms(anchor_date, raw[-1][1])
+        if last_candidate > base_date:
+            last_date = anchor_date - timedelta(days=1)
     out = []
     for (_, hms, *_), d in zip(raw, day_offsets):
-        h, m, s = hms
-        the_date = base_date - timedelta(days=(max_day - d))
-        out.append(datetime.combine(the_date, datetime.min.time())
-                   .replace(hour=h, minute=m, second=s))
+        the_date = last_date - timedelta(days=(max_day - d))
+        out.append(_combine_hms(the_date, hms))
     return out
 
 
@@ -625,6 +664,118 @@ def print_summary(points, out_path, unit="cycles", agg_label=""):
 # --- discovery / cli -------------------------------------------------------
 
 
+def _archive_timestamp(path, *, dry_run):
+    pattern = _DRY_RUN_ARCHIVE_RE if dry_run else _LIVE_ARCHIVE_RE
+    m = pattern.match(path.name)
+    if not m:
+        return None
+    return datetime.strptime(m.group(1), _ARCHIVE_TIMESTAMP_FORMAT)
+
+
+def _log_family(path):
+    """Return ``"live"``, ``"dry-run"``, or None for an unsupported log name."""
+    name = path.name
+    if name == "watch.dry-run.log" or _DRY_RUN_ARCHIVE_RE.match(name):
+        return "dry-run"
+    if name == "watch.log" or _LIVE_ARCHIVE_RE.match(name):
+        return "live"
+    return None
+
+
+def discover_watch_logs(log_path):
+    """Find the selected active watch log and same-family rotated archives."""
+    log_path = Path(log_path)
+    family = _log_family(log_path)
+    if family is None:
+        return [WatchLogFile(log_path, None)]
+
+    dry_run = family == "dry-run"
+    archive_glob = "watch.dry-run.*.log" if dry_run else "watch.*.log"
+    active_name = "watch.dry-run.log" if dry_run else "watch.log"
+
+    archives = []
+    for path in log_path.parent.glob(archive_glob):
+        archive_end = _archive_timestamp(path, dry_run=dry_run)
+        if archive_end is not None:
+            archives.append(WatchLogFile(path, archive_end))
+    archives.sort(key=lambda item: item.archive_end)
+
+    active = log_path.parent / active_name
+    if active.is_file():
+        archives.append(WatchLogFile(active, None))
+    return archives
+
+
+def requested_window_bounds(args):
+    """Return bounds known before parsing, for archive file selection."""
+    hi = getattr(args, "end", None)
+    if getattr(args, "all", False):
+        return None, hi
+    if args.start is not None:
+        return args.start, hi
+    if hi is not None:
+        return hi - timedelta(hours=args.hours), hi
+    return None, hi
+
+
+def select_watch_logs(files, lo, hi):
+    """Keep log files whose archive span can intersect ``[lo, hi]``."""
+    selected = []
+    previous_archive_end = None
+    for item in files:
+        span_start = previous_archive_end
+        span_end = item.archive_end
+        if item.archive_end is not None:
+            previous_archive_end = item.archive_end
+        if lo is not None and span_end is not None and span_end < lo:
+            continue
+        if hi is not None and span_start is not None and span_start > hi:
+            continue
+        selected.append(item)
+    return selected
+
+
+def _parse_log_file(item, base_date):
+    anchor = item.archive_end if item.archive_end is not None else base_date
+    return parse_log(item.path, anchor, use_anchor_time=item.archive_end is not None)
+
+
+def _newest_cycle_anchor(files, base_date, hi=None):
+    """Find the newest cycle by parsing only newest files until one has points."""
+    for item in reversed(files):
+        if hi is not None and item.archive_end is not None and item.archive_end < hi:
+            break
+        file_points, _file_merges = _parse_log_file(item, base_date)
+        candidates = [p.when for p in file_points if hi is None or p.when <= hi]
+        if candidates:
+            return max(candidates)
+    return hi
+
+
+def newest_watch_cycle(log_path, base_date):
+    """Return the newest WAKE cycle in the full selected log family."""
+    return _newest_cycle_anchor(discover_watch_logs(log_path), base_date)
+
+
+def parse_watch_logs(log_path, base_date, lo=None, hi=None, hours=None):
+    """Parse the requested watch-log family into chronological points and merges."""
+    files = discover_watch_logs(log_path)
+    if lo is None and hours is not None:
+        anchor = _newest_cycle_anchor(files, base_date, hi)
+        if anchor is not None:
+            lo = anchor - timedelta(hours=hours)
+
+    points = []
+    merges = []
+    for item in select_watch_logs(files, lo, hi):
+        file_points, file_merges = _parse_log_file(item, base_date)
+        points.extend(file_points)
+        merges.extend(file_merges)
+    points.sort(key=lambda p: p.when)
+    merges.sort(key=lambda event: event[0])
+    return points, merges
+
+
 def default_log():
     """Current project's .gza/watch.log, else newest watch.log under the supreme tree."""
     here = Path.cwd()
@@ -799,11 +950,14 @@ def rollup_config(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--log", type=Path, default=None,
-                    help="path to a .gza/watch.log (default: auto-discover)")
+                    help="path to a .gza/watch.log or watch.dry-run.log "
+                         "(default: auto-discover)")
     ap.add_argument("--out", type=Path, default=Path("tmp/watch_status.png"),
                     help="output PNG path (default: tmp/watch_status.png under the cwd)")
     ap.add_argument("--date", type=parse_date, default=None,
-                    help="base date to assume for the newest line (default: today)")
+                    help="date anchor for the newest HMS-only line in the active log; "
+                         "rotated archives use timestamps from their filenames "
+                         "(default: today)")
     ap.add_argument("--hours", type=float, default=24.0, metavar="H",
                     help="rolling window: show only the last H hours of activity "
                          "before the newest cycle, or before --end if set (default 24)")
@@ -848,7 +1002,9 @@ def main(argv=None):
 
     log_path = args.log or default_log()
     if not log_path or not Path(log_path).is_file():
-        ap.error(f"watch.log not found (looked for {log_path or '.gza/watch.log'}); pass --log")
+        ap.error(
+            f"watch log not found (looked for {log_path or '.gza/watch.log'}); pass --log"
+        )
     if args.aggregate is not None and args.resolution == "raw":
         ap.error("--aggregate requires --resolution hour|day")
     if args.start is not None and args.end is not None and args.start > args.end:
@@ -859,8 +1015,17 @@ def main(argv=None):
 
     agg, unit, agg_label = rollup_config(args)
     base_date = args.date or date_cls.today()
-    points, merges = parse_log(log_path, base_date)
+    file_lo, file_hi = requested_window_bounds(args)
+    parse_hours = (
+        args.hours
+        if file_lo is None and file_hi is None and not args.all and args.start is None
+        else None
+    )
+    points, merges = parse_watch_logs(log_path, base_date, file_lo, file_hi, parse_hours)
     if not points:
+        if file_lo is not None or file_hi is not None:
+            print("no cycles in the selected window", file=sys.stderr)
+            return 1
         print(f"no WAKE cycles parsed from {log_path}", file=sys.stderr)
         return 1
     lo, hi = compute_window(points, args)
@@ -895,12 +1060,26 @@ def _watch_loop(args, log_path):
     try:
         while True:
             try:
-                points, merges = parse_log(log_path, args.date or date_cls.today())
+                file_lo, file_hi = requested_window_bounds(args)
+                base_date = args.date or date_cls.today()
+                completion_latest = (
+                    newest_watch_cycle(log_path, base_date) if file_hi is not None else None
+                )
+                parse_hours = (
+                    args.hours
+                    if file_lo is None and file_hi is None and not args.all and args.start is None
+                    else None
+                )
+                points, merges = parse_watch_logs(
+                    log_path, base_date, file_lo, file_hi, parse_hours
+                )
             except OSError as exc:  # log momentarily unreadable — keep looping
                 print(f"read error: {exc}; retrying in {interval}s...", file=sys.stderr)
                 time.sleep(interval)
                 continue
-            latest = points[-1].when if points else None
+            latest = completion_latest if completion_latest is not None else (
+                points[-1].when if points else None
+            )
             lo, hi = compute_window(points, args)
             points = filter_window(points, lo, hi)
             points = rollup(points, args.resolution, agg)
