@@ -2645,8 +2645,45 @@ def _resolution_review(
     return review
 
 
-def test_post_rebase_review_not_required_for_mechanical_unchanged_diff_with_rewritten_live_head(tmp_path) -> None:
+def test_post_rebase_review_creates_full_review_for_mechanical_unchanged_diff_without_prior_review(tmp_path) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
+    calls: list[str] = []
+
+    def fake_full_review(*_args: Any, **_kwargs: Any):
+        calls.append("created")
+        review = store.add("Created full review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-b"
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-b",
+            target_head="target-a",
+            pre_rebase_source_head="head-a",
+            rebase_outcome_identity=_rebase_identity(
+                attempted_source_head="head-a",
+                live_source_head="head-b",
+            ),
+            rebase_outcome_kind="mechanical",
+            changed_diff=False,
+            conflict_resolved=False,
+        ),
+        create_full_review=fake_full_review,
+    )
+
+    assert result.status == "created"
+    assert result.need == "full"
+    assert result.review_budget_used is True
+    assert calls == ["created"]
+
+
+def test_post_rebase_review_not_required_for_mechanical_unchanged_diff_with_valid_prior_review(tmp_path) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    prior = _completed_full_review(store, impl, head="head-a")
 
     result = acquire_one_post_rebase_review(
         store,
@@ -2667,10 +2704,12 @@ def test_post_rebase_review_not_required_for_mechanical_unchanged_diff_with_rewr
 
     assert result.status == "not_required"
     assert result.review_budget_used is False
+    assert prior.status == "completed"
 
 
 def test_post_rebase_review_not_required_preserves_spent_budget(tmp_path) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
+    _completed_full_review(store, impl, head="head-a")
 
     result = acquire_one_post_rebase_review(
         store,
@@ -2731,6 +2770,7 @@ def test_post_rebase_review_not_required_for_supported_no_op_with_exact_proof(
     no_op_subtype: str,
 ) -> None:
     store, impl = _completed_impl_for_landing_review(tmp_path)
+    _completed_full_review(store, impl, head="head-a")
 
     result = acquire_one_post_rebase_review(
         store,
@@ -2746,6 +2786,56 @@ def test_post_rebase_review_not_required_for_supported_no_op_with_exact_proof(
 
     assert result.status == "not_required"
     assert result.review_budget_used is False
+
+
+@pytest.mark.parametrize(
+    ("prior_head", "prior_output"),
+    (
+        ("old-head", _review_report("APPROVED")),
+        ("head-a", "not a valid review verdict"),
+    ),
+)
+def test_post_rebase_review_refreshes_for_stale_or_malformed_prior_mechanical_review(
+    tmp_path,
+    prior_head: str,
+    prior_output: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    prior = _completed_full_review(store, impl, head=prior_head)
+    prior.output_content = prior_output
+    store.update(prior)
+    calls: list[str] = []
+
+    def fake_full_review(*_args: Any, **_kwargs: Any):
+        calls.append("created")
+        review = store.add("Created full review", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-b"
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-b",
+            target_head="target-a",
+            pre_rebase_source_head="head-a",
+            rebase_outcome_identity=_rebase_identity(
+                attempted_source_head="head-a",
+                live_source_head="head-b",
+            ),
+            rebase_outcome_kind="mechanical",
+            changed_diff=False,
+            conflict_resolved=False,
+        ),
+        create_full_review=fake_full_review,
+    )
+
+    assert result.status == "created"
+    assert result.need == "full"
+    assert result.review_budget_used is True
+    assert calls == ["created"]
 
 
 @pytest.mark.parametrize(
@@ -2917,6 +3007,117 @@ def test_recovered_and_resumed_rebases_require_one_review_even_when_diff_unchang
         assert result.review_task.review_scope is not None
     else:
         assert result.review_task.review_verify_head_sha == "head-a"
+
+
+@pytest.mark.parametrize("outcome_kind", ("provider_resolved", "recovered", "resumed", None))
+@pytest.mark.parametrize("rebase_identity", ("absent", "idless"))
+def test_unbindable_complete_resolution_provenance_falls_back_to_one_full_current_head_review(
+    tmp_path,
+    outcome_kind: str | None,
+    rebase_identity: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = None
+    if rebase_identity == "idless":
+        rebase = Task(id=None, prompt="ID-less rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+    created: list[str] = []
+
+    def fake_full(*_args: Any, **_kwargs: Any):
+        created.append("full")
+        review = store.add("Full fallback", task_type="review", depends_on=impl.id, based_on=impl.id)
+        review.status = "pending"
+        review.review_verify_head_sha = "head-a"
+        store.update(review)
+        return review
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind=outcome_kind,
+            changed_diff=None if outcome_kind is None else True,
+            conflict_resolved=outcome_kind == "provider_resolved",
+            resolution_provenance_complete=True,
+        ),
+        create_full_review=fake_full,
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no resolution")),
+    )
+
+    assert result.status == "created"
+    assert result.need == "full"
+    assert result.review_budget_used is True
+    assert result.review_task is not None
+    assert result.review_task.review_verify_head_sha == "head-a"
+    assert created == ["full"]
+
+
+@pytest.mark.parametrize("outcome_kind", ("provider_resolved", "recovered", "resumed", None))
+def test_unbindable_complete_resolution_provenance_reuses_exact_full_fallback_without_spending_again(
+    tmp_path,
+    outcome_kind: str | None,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    review = _completed_full_review(store, impl, head="head-a")
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind=outcome_kind,
+            changed_diff=None if outcome_kind is None else True,
+            conflict_resolved=outcome_kind == "provider_resolved",
+            resolution_provenance_complete=True,
+            review_budget_used=True,
+        ),
+        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no create")),
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no resolution")),
+    )
+
+    assert result.status == "reused_completed"
+    assert result.need == "full"
+    assert result.review_task == review
+    assert result.review_budget_used is True
+
+
+@pytest.mark.parametrize("outcome_kind", ("provider_resolved", "recovered", "resumed", None))
+@pytest.mark.parametrize("rebase_identity", ("absent", "idless"))
+def test_unbindable_complete_resolution_provenance_blocks_full_fallback_when_budget_spent(
+    tmp_path,
+    outcome_kind: str | None,
+    rebase_identity: str,
+) -> None:
+    store, impl = _completed_impl_for_landing_review(tmp_path)
+    rebase = None
+    if rebase_identity == "idless":
+        rebase = Task(id=None, prompt="ID-less rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+
+    result = acquire_one_post_rebase_review(
+        store,
+        LandingPostRebaseReviewRequest(
+            impl_task=impl,
+            rebase_task=rebase,
+            source_head="head-a",
+            target_head="target-a",
+            rebase_outcome_kind=outcome_kind,
+            changed_diff=None if outcome_kind is None else True,
+            conflict_resolved=outcome_kind == "provider_resolved",
+            resolution_provenance_complete=True,
+            review_budget_used=True,
+        ),
+        create_full_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("budget spent")),
+        create_resolution_review=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no resolution")),
+    )
+
+    assert result.status == "blocked"
+    assert result.need == "full"
+    assert result.review_budget_used is True
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "bounded-attempt-exhausted"
 
 
 @pytest.mark.parametrize("outcome_kind", (None, "unexpected"))
@@ -3465,6 +3666,7 @@ def test_post_rebase_review_result_budget_is_monotonic_after_spent_entry(
         review_budget_used=True,
     )
     if case == "not_required":
+        _completed_full_review(store, impl, head="head-a")
         request = LandingPostRebaseReviewRequest(
             impl_task=impl,
             source_head="head-a",
@@ -3683,6 +3885,10 @@ def test_post_rebase_review_budget_sequence_never_allows_second_review_after_cha
     )
     assert pending.status == "pending"
     assert pending.review_budget_used is True
+
+    first.review_task.status = "completed"
+    first.review_task.completed_at = datetime(2026, 8, 26, 12, 1, tzinfo=UTC)
+    store.update(first.review_task)
 
     no_longer_required = acquire_one_post_rebase_review(
         store,
