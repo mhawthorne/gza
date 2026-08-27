@@ -173,13 +173,14 @@ from ..unstick import (
     skip_reason_for_landed_or_moot,
 )
 from ..watch_leases import (
-    WATCH_SUPERVISOR_LEASE_NAME,
     WatchLeaseConflict,
     WatchLeaseHeld,
     WatchLeaseReleaseError,
     WatchLeaseSet,
     WatchLeaseTarget,
     acquire_watch_project_leases,
+    release_watch_held_leases,
+    watch_lease_target_identity,
 )
 from ..watch_progress import (
     WATCH_NO_PROGRESS_BACKSTOP_REASON,
@@ -7712,6 +7713,23 @@ class WatchSupervisorRuntimeConstruction:
         return {runtime.key: runtime for runtime in self.runtimes}
 
 
+@dataclass(frozen=True)
+class _WatchRuntimeActivationCandidate:
+    project: WatchSupervisorProjectSelector
+    resolved: ExecutionProjectResolved
+    lease_store: SqliteTaskStore
+
+
+@dataclass(frozen=True)
+class WatchSupervisorLeaseAcquisition:
+    """Owned watch leases for healthy selections plus disabled non-leaseable selections."""
+
+    lease_set: WatchLeaseSet | None
+    disabled: tuple[ExecutionProjectDisabled, ...] = ()
+    activation_candidates: tuple[_WatchRuntimeActivationCandidate, ...] = ()
+    retained_existing_keys: tuple[str, ...] = ()
+
+
 _WATCH_SELECTOR_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -8305,20 +8323,11 @@ def _fallback_watch_log(project_key: str, path: Path, exc: BaseException, *, qui
     return log
 
 
-def construct_watch_project_runtimes(
+def _watch_supervisor_activation_candidates(
     *,
     anchor_store: SqliteTaskStore,
     selection: WatchSupervisorSelection,
-    quiet: bool,
-) -> WatchSupervisorRuntimeConstruction:
-    """Construct ordered project-local watch runtimes from a resolved supervisor selection.
-
-    The execution resolver performs path/config/DB preflight without using
-    all-project query fan-out. This helper activates only validated projects,
-    builds project-owned Git/log/filter state, and keeps invalid projects as
-    disabled startup states for the future fleet supervisor.
-    """
-
+) -> tuple[tuple[_WatchRuntimeActivationCandidate, ...], tuple[ExecutionProjectDisabled, ...]]:
     project_by_key = {project.key: project for project in selection.projects}
     if len(project_by_key) != len(selection.projects):
         duplicate_keys = sorted(
@@ -8336,9 +8345,8 @@ def construct_watch_project_runtimes(
         if isinstance(resolved, ExecutionProjectDisabled):
             _reject_duplicate_watch_runtime_selection(resolved)
 
-    runtimes: list[WatchProjectRuntime] = []
     disabled_projects: list[ExecutionProjectDisabled] = []
-    activation_candidates: list[tuple[WatchSupervisorProjectSelector, ExecutionProjectResolved, SqliteTaskStore]] = []
+    activation_candidates: list[_WatchRuntimeActivationCandidate] = []
 
     for resolved in resolved_projects:
         if isinstance(resolved, ExecutionProjectDisabled):
@@ -8367,20 +8375,181 @@ def construct_watch_project_runtimes(
             )
             continue
 
-        activation_candidates.append((project, resolved, resolved.open_lease_store()))
+        try:
+            lease_store = resolved.open_lease_store()
+        except (
+            ManualMigrationRequired,
+            ExecutionProjectActivationError,
+            SchemaIntegrityError,
+            ConfigError,
+            OSError,
+            sqlite3.Error,
+            UnicodeError,
+        ) as exc:
+            disabled_projects.append(_disabled_watch_project_from_activation_error(project, resolved, exc))
+            continue
 
-    lease_set: WatchLeaseSet | None = None
-    if activation_candidates:
-        lease_set = acquire_watch_project_leases(
-            [
-                WatchLeaseTarget(project.key, lease_store)
-                for project, _resolved, lease_store in activation_candidates
-            ]
+        activation_candidates.append(
+            _WatchRuntimeActivationCandidate(
+                project=project,
+                resolved=resolved,
+                lease_store=lease_store,
+            )
         )
 
+    return tuple(activation_candidates), tuple(disabled_projects)
+
+
+def _disabled_watch_project_from_lease_conflict(
+    candidate: _WatchRuntimeActivationCandidate,
+    conflict: WatchLeaseConflict,
+) -> ExecutionProjectDisabled:
+    return ExecutionProjectDisabled(
+        selector_key=candidate.project.key,
+        reason="lease-conflict",
+        message=str(conflict),
+        project_id=candidate.resolved.project_id,
+        root_path=candidate.resolved.root_path,
+        config_path=candidate.resolved.config_path,
+        db_path=candidate.resolved.db_path,
+    )
+
+
+def acquire_watch_supervisor_selection_leases(
+    *,
+    anchor_store: SqliteTaskStore,
+    selection: WatchSupervisorSelection,
+    owner_token: str | None = None,
+    existing_lease_set: WatchLeaseSet | None = None,
+) -> WatchSupervisorLeaseAcquisition:
+    """Acquire leases for every currently healthy selected project in selector order."""
+
+    def retained_existing_key_order(retained_keys: set[str]) -> tuple[str, ...]:
+        if existing_lease_set is None:
+            return ()
+        return tuple(held.target.key for held in existing_lease_set.held if held.target.key in retained_keys)
+
+    if (
+        existing_lease_set is not None
+        and owner_token is not None
+        and owner_token != existing_lease_set.owner_token
+    ):
+        raise ValueError("owner_token must match existing_lease_set.owner_token")
+
+    activation_candidates, disabled_projects = _watch_supervisor_activation_candidates(
+        anchor_store=anchor_store,
+        selection=selection,
+    )
+
+    lease_set: WatchLeaseSet | None = None
+    retained_existing_key_tuple: tuple[str, ...] = ()
+    if activation_candidates:
+        if existing_lease_set is None:
+            lease_set = acquire_watch_project_leases(
+                [
+                    WatchLeaseTarget(candidate.project.key, candidate.lease_store)
+                    for candidate in activation_candidates
+                ],
+                owner_token=owner_token,
+            )
+        else:
+            remaining_candidates = list(activation_candidates)
+            disabled_list = list(disabled_projects)
+            retained_existing_key_set: set[str] = set()
+            while True:
+                targets = [
+                    WatchLeaseTarget(candidate.project.key, candidate.lease_store)
+                    for candidate in remaining_candidates
+                ]
+                try:
+                    lease_set = acquire_watch_project_leases(
+                        targets,
+                        owner_token=owner_token,
+                        existing_lease_set=existing_lease_set,
+                        retain_existing_target_keys=frozenset(retained_existing_key_set),
+                    )
+                    disabled_projects = tuple(disabled_list)
+                    activation_candidates = tuple(remaining_candidates)
+                    retained_existing_key_tuple = retained_existing_key_order(retained_existing_key_set)
+                    break
+                except WatchLeaseConflict as exc:
+                    conflicted = next(
+                        (
+                            candidate
+                            for candidate in remaining_candidates
+                            if candidate.project.key == exc.target_key
+                            and watch_lease_target_identity(WatchLeaseTarget(candidate.project.key, candidate.lease_store))
+                            == watch_lease_target_identity(exc.target)
+                        ),
+                        None,
+                    )
+                    if conflicted is None:
+                        raise
+                    disabled_list.append(_disabled_watch_project_from_lease_conflict(conflicted, exc))
+                    if any(held.target.key == conflicted.project.key for held in existing_lease_set.held):
+                        retained_existing_key_set.add(conflicted.project.key)
+                    remaining_candidates = [
+                        candidate
+                        for candidate in remaining_candidates
+                        if candidate is not conflicted
+                    ]
+                    if not remaining_candidates:
+                        lease_set = acquire_watch_project_leases(
+                            (),
+                            owner_token=owner_token,
+                            existing_lease_set=existing_lease_set,
+                            retain_existing_target_keys=frozenset(retained_existing_key_set),
+                        )
+                        disabled_projects = tuple(disabled_list)
+                        activation_candidates = ()
+                        retained_existing_key_tuple = retained_existing_key_order(retained_existing_key_set)
+                        break
+    elif existing_lease_set is not None:
+        lease_set = acquire_watch_project_leases(
+            (),
+            owner_token=owner_token,
+            existing_lease_set=existing_lease_set,
+        )
+    return WatchSupervisorLeaseAcquisition(
+        lease_set=lease_set,
+        disabled=disabled_projects,
+        activation_candidates=activation_candidates,
+        retained_existing_keys=retained_existing_key_tuple,
+    )
+
+
+def construct_watch_project_runtimes(
+    *,
+    anchor_store: SqliteTaskStore,
+    selection: WatchSupervisorSelection,
+    quiet: bool,
+    owner_token: str | None = None,
+    existing_lease_set: WatchLeaseSet | None = None,
+) -> WatchSupervisorRuntimeConstruction:
+    """Construct ordered project-local watch runtimes from a resolved supervisor selection.
+
+    The execution resolver performs path/config/DB preflight without using
+    all-project query fan-out. This helper activates only validated projects,
+    builds project-owned Git/log/filter state, and keeps invalid projects as
+    disabled startup states for the future fleet supervisor.
+    """
+
+    lease_acquisition = acquire_watch_supervisor_selection_leases(
+        anchor_store=anchor_store,
+        selection=selection,
+        owner_token=owner_token,
+        existing_lease_set=existing_lease_set,
+    )
+    lease_set = lease_acquisition.lease_set
+    disabled_projects = list(lease_acquisition.disabled)
+    runtimes: list[WatchProjectRuntime] = []
+
     retained_lease_keys: list[str] = []
+    retained_conflict_lease_keys = list(lease_acquisition.retained_existing_keys)
     try:
-        for project, resolved, _lease_store in activation_candidates:
+        for candidate in lease_acquisition.activation_candidates:
+            project = candidate.project
+            resolved = candidate.resolved
             try:
                 execution_runtime = resolved.open_runtime_store()
             except (
@@ -8443,29 +8612,43 @@ def construct_watch_project_runtimes(
                     worker_registry=worker_registry,
                 )
             )
-    except BaseException:
+    except BaseException as primary_error:
         if lease_set is not None:
-            lease_set.release()
+            try:
+                lease_set.release()
+            except WatchLeaseReleaseError as cleanup_error:
+                raise BaseExceptionGroup(
+                    "watch project runtime construction failed and watch-supervisor lease release also failed",
+                    [primary_error, cleanup_error],
+                ) from primary_error
         raise
 
     if lease_set is not None:
         held_by_key: dict[str, WatchLeaseHeld] = {held.target.key: held for held in lease_set.held}
-        retained_lease_key_set = set(retained_lease_keys)
-        released_disabled_keys = [held.target.key for held in reversed(lease_set.held) if held.target.key not in retained_lease_key_set]
+        retained_lease_key_set = {*retained_lease_keys, *retained_conflict_lease_keys}
+        released_disabled_keys = [held.target.key for held in lease_set.held if held.target.key not in retained_lease_key_set]
         try:
-            for key in released_disabled_keys:
-                held = held_by_key[key]
-                held.target.store.release_project_lease(
-                    lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-                    owner_token=lease_set.owner_token,
-                )
-        except BaseException:
-            lease_set.release()
+            release_watch_held_leases(
+                [held_by_key[key] for key in released_disabled_keys],
+                owner_token=lease_set.owner_token,
+            )
+        except WatchLeaseReleaseError as release_error:
+            try:
+                lease_set.release()
+            except WatchLeaseReleaseError as aggregate_cleanup_error:
+                raise BaseExceptionGroup(
+                    "watch disabled-project lease cleanup failed and aggregate cleanup also failed",
+                    [release_error, aggregate_cleanup_error],
+                ) from release_error
             raise
         lease_set = WatchLeaseSet(
             owner_pid=lease_set.owner_pid,
             owner_token=lease_set.owner_token,
-            held=tuple(held_by_key[key] for key in retained_lease_keys if key in held_by_key),
+            held=tuple(
+                held_by_key[key]
+                for key in [*retained_conflict_lease_keys, *retained_lease_keys]
+                if key in held_by_key
+            ),
         )
 
     return WatchSupervisorRuntimeConstruction(
@@ -8473,6 +8656,19 @@ def construct_watch_project_runtimes(
         disabled=tuple(disabled_projects),
         lease_set=lease_set,
     )
+
+
+def _format_disabled_watch_project(disabled: ExecutionProjectDisabled) -> str:
+    identity_parts = [f"selector={disabled.selector_key!r}", f"reason={disabled.reason}"]
+    if disabled.project_id is not None:
+        identity_parts.append(f"project_id={disabled.project_id!r}")
+    if disabled.root_path is not None:
+        identity_parts.append(f"root={disabled.root_path}")
+    if disabled.config_path is not None:
+        identity_parts.append(f"config={disabled.config_path}")
+    if disabled.db_path is not None:
+        identity_parts.append(f"db={disabled.db_path}")
+    return f"Disabled watch project ({', '.join(identity_parts)}): {disabled.message}"
 
 
 def _apply_watch_supervisor_selection_to_legacy_args(
@@ -16575,6 +16771,7 @@ def _clear_watch_session(
 
 def cmd_watch(args: argparse.Namespace) -> int:
     """Run continuous scheduler loop that maintains N concurrent workers."""
+    quiet = bool(getattr(args, "quiet", False))
     try:
         args.watch_reexec_invocation = _capture_watch_reexec_invocation(args)
         supervisor_selection = resolve_watch_supervisor_selection(args)
@@ -16586,7 +16783,81 @@ def cmd_watch(args: argparse.Namespace) -> int:
         print(f"Error: {exc}")
         return 1
     if supervisor_selection.multi_project:
-        print("Error: multi-project watch supervisor execution is not enabled yet")
+        supervisor_lease_set: WatchLeaseSet | None = None
+        multi_project_stop_signal: int | None = None
+        installed_signal_handlers = _InstalledWatchSignalHandlers()
+        multi_project_result_code: int | None = None
+        multi_project_primary_error: BaseException | None = None
+        multi_project_cleanup_errors: list[BaseException] = []
+
+        class _MultiProjectEarlyResult(Exception):
+            pass
+
+        def _handle_multi_project_shutdown(signum: int, _frame: object) -> None:
+            nonlocal multi_project_stop_signal
+            multi_project_stop_signal = signum
+
+        try:
+            try:
+                _install_watch_signal_handlers(_handle_multi_project_shutdown, installed=installed_signal_handlers)
+            except BaseException as exc:
+                print(f"Error: watch signal handler setup failed: {exc}", file=sys.stderr)
+                multi_project_result_code = 1
+                raise _MultiProjectEarlyResult
+            anchor_config = Config.load(args.project_dir)
+            anchor_store = get_store(anchor_config, open_mode="watch_lease_acquisition")
+            watch_lease_token = getattr(args, "watch_lease_token", None)
+            if not isinstance(watch_lease_token, str) or not watch_lease_token:
+                watch_lease_token = None
+            lease_acquisition = acquire_watch_supervisor_selection_leases(
+                anchor_store=anchor_store,
+                selection=supervisor_selection,
+                owner_token=watch_lease_token,
+            )
+            supervisor_lease_set = lease_acquisition.lease_set
+            if supervisor_lease_set is not None:
+                args.watch_lease_token = supervisor_lease_set.owner_token
+            if multi_project_stop_signal is not None:
+                multi_project_result_code = 128 + multi_project_stop_signal
+                raise _MultiProjectEarlyResult
+            for disabled in lease_acquisition.disabled:
+                print(_format_disabled_watch_project(disabled))
+        except WatchLeaseConflict as exc:
+            print(f"Error: {exc}")
+            multi_project_result_code = 1
+        except _MultiProjectEarlyResult:
+            pass
+        except BaseException as exc:
+            multi_project_primary_error = exc
+        finally:
+            if supervisor_lease_set is not None:
+                try:
+                    supervisor_lease_set.release()
+                except WatchLeaseReleaseError as exc:
+                    print(str(exc), file=sys.stderr)
+                    multi_project_cleanup_errors.append(exc)
+            restore_errors = _restore_installed_watch_signal_handlers(installed_signal_handlers)
+            if restore_errors:
+                for restore_exc in restore_errors:
+                    print(f"Error: watch signal handler restore failed: {restore_exc}", file=sys.stderr)
+                    multi_project_cleanup_errors.append(restore_exc)
+        if multi_project_primary_error is not None:
+            if multi_project_cleanup_errors:
+                raise BaseExceptionGroup(
+                    "multi-project watch failed and cleanup also failed",
+                    [multi_project_primary_error, *multi_project_cleanup_errors],
+                ) from multi_project_primary_error
+            raise multi_project_primary_error
+        if multi_project_cleanup_errors:
+            if multi_project_result_code is not None and multi_project_result_code != 1:
+                print(
+                    f"Error: multi-project watch primary exit status before cleanup failure: {multi_project_result_code}",
+                    file=sys.stderr,
+                )
+            return 1
+        if multi_project_result_code is not None:
+            return multi_project_result_code
+        print("Error: multi-project watch supervisor dispatch is not enabled yet")
         return 1
     try:
         _apply_watch_supervisor_selection_to_legacy_args(args, supervisor_selection)
@@ -16626,7 +16897,6 @@ def cmd_watch(args: argparse.Namespace) -> int:
     )
     dry_run = bool(getattr(args, "dry_run", False))
     show_skipped = bool(getattr(args, "show_skipped", False))
-    quiet = bool(getattr(args, "quiet", False))
     try:
         tag_filters, any_tag = parse_cli_tag_filters(args)
     except ValueError as exc:
@@ -16782,6 +17052,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
     watch_pid = os.getpid()
     watch_session_recorded = False
     signal_setup_failed = False
+    body_error: BaseException | None = None
     try:
         try:
             _install_watch_signal_handlers(_handle_shutdown, installed=installed_signal_handlers)
@@ -17308,9 +17579,11 @@ def cmd_watch(args: argparse.Namespace) -> int:
                     result_code = 1
         else:
             result_code = 0
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         _emit_shutdown_message_once()
-        raise
+        body_error = exc
+    except BaseException as exc:
+        body_error = exc
     finally:
         for restore_error in _restore_installed_watch_signal_handlers(installed_signal_handlers):
             cleanup_errors.append(restore_error)
@@ -17325,7 +17598,20 @@ def cmd_watch(args: argparse.Namespace) -> int:
             cleanup_errors.extend(_clear_watch_session(store=runtime.store, log=runtime.log, owner_pid=watch_pid))
         cleanup_errors.extend(_release_watch_lease_set_for_cleanup(watch_lease_set, log=runtime.log, quiet=quiet))
 
+    if body_error is not None:
+        if cleanup_errors:
+            raise BaseExceptionGroup(
+                "watch failed and cleanup also failed",
+                [body_error, *cleanup_errors],
+            ) from body_error
+        raise body_error
     if cleanup_errors:
+        if result_code is not None and result_code != 1:
+            _emit_watch_error_safely(
+                runtime.log,
+                quiet,
+                f"watch primary exit status before cleanup failure: {result_code}",
+            )
         return 1
     return result_code if result_code is not None else 0
 

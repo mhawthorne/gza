@@ -127,6 +127,7 @@ ExecutionProjectDisableReason = Literal[
     "runtime_filesystem_unavailable",
     "manual_migration_required",
     "schema_incompatible",
+    "lease-conflict",
 ]
 
 TASK_COMMENT_KIND_FEEDBACK = "feedback"

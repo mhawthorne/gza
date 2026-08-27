@@ -5,6 +5,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Protocol
 
 from gza.db import ProjectLease
@@ -13,6 +14,10 @@ WATCH_SUPERVISOR_LEASE_NAME = "watch-supervisor"
 
 
 class WatchLeaseStore(Protocol):
+    @property
+    def db_path(self) -> Path:
+        """Return the resolved task database path for ownership identity."""
+
     @property
     def project_id(self) -> str:
         """Return the project identity for diagnostics."""
@@ -45,6 +50,15 @@ class WatchLeaseTarget:
 
 
 @dataclass(frozen=True)
+class WatchLeaseIdentity:
+    """Concrete execution identity for one watch-supervisor lease."""
+
+    db_path: Path
+    project_id: str
+    lease_name: str
+
+
+@dataclass(frozen=True)
 class WatchLeaseHeld:
     """One acquired watch-supervisor lease."""
 
@@ -64,6 +78,7 @@ class WatchLeaseConflict(RuntimeError):
     """Raised when another live owner holds a selected watch-supervisor lease."""
 
     def __init__(self, target: WatchLeaseTarget) -> None:
+        self.target = target
         self.target_key = target.key
         self.project_id = target.store.project_id
         super().__init__(
@@ -72,12 +87,21 @@ class WatchLeaseConflict(RuntimeError):
         )
 
 
+def watch_lease_target_identity(target: WatchLeaseTarget) -> WatchLeaseIdentity:
+    """Return the concrete identity that determines whether a lease is already owned."""
+    return WatchLeaseIdentity(
+        db_path=target.store.db_path.resolve(),
+        project_id=target.store.project_id,
+        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+    )
+
+
 @dataclass(frozen=True)
 class WatchLeaseReleaseFailure:
     """Release failure for one acquired lease."""
 
     target_key: str
-    error: Exception
+    error: BaseException
 
 
 class WatchLeaseReleaseError(RuntimeError):
@@ -105,7 +129,7 @@ class WatchLeaseSet:
 
     def release(self) -> tuple[WatchLeaseRelease, ...]:
         """Release owned leases in reverse acquisition order."""
-        return _release_held_best_effort(self.held, owner_token=self.owner_token)
+        return release_watch_held_leases(self.held, owner_token=self.owner_token)
 
 
 def generate_watch_lease_owner_token() -> str:
@@ -126,7 +150,7 @@ def _release_held_best_effort(
                 lease_name=WATCH_SUPERVISOR_LEASE_NAME,
                 owner_token=owner_token,
             )
-        except Exception as exc:
+        except BaseException as exc:
             release_result = False
             failures.append(WatchLeaseReleaseFailure(target_key=acquired.target.key, error=exc))
         released.append(WatchLeaseRelease(target_key=acquired.target.key, released=release_result))
@@ -136,11 +160,30 @@ def _release_held_best_effort(
     return results
 
 
-def _raise_with_cleanup_context(primary: Exception, cleanup_error: WatchLeaseReleaseError) -> None:
-    raise ExceptionGroup(
+def release_watch_held_leases(
+    held: Sequence[WatchLeaseHeld],
+    *,
+    owner_token: str,
+) -> tuple[WatchLeaseRelease, ...]:
+    """Release held watch-supervisor leases in reverse acquisition order."""
+    return _release_held_best_effort(held, owner_token=owner_token)
+
+
+def _raise_with_cleanup_context(primary: BaseException, cleanup_error: WatchLeaseReleaseError) -> None:
+    raise BaseExceptionGroup(
         "watch-supervisor lease acquisition failed and rollback also failed",
         [primary, cleanup_error],
     )
+
+
+def _release_stale_existing_leases(
+    existing: Sequence[WatchLeaseHeld],
+    *,
+    owner_token: str,
+) -> None:
+    if not existing:
+        return
+    _release_held_best_effort(existing, owner_token=owner_token)
 
 
 def acquire_watch_project_leases(
@@ -149,12 +192,37 @@ def acquire_watch_project_leases(
     owner_token: str | None = None,
     owner_pid: int | None = None,
     acquired_at: datetime | None = None,
+    existing_lease_set: WatchLeaseSet | None = None,
+    retain_existing_target_keys: frozenset[str] = frozenset(),
 ) -> WatchLeaseSet:
-    """Acquire all selected project leases, rolling back earlier leases on conflict."""
-    resolved_owner_token = owner_token or generate_watch_lease_owner_token()
-    resolved_owner_pid = owner_pid if owner_pid is not None else os.getpid()
+    """Acquire selected project leases, adopting existing concrete ownership when supplied."""
+    if existing_lease_set is not None:
+        if owner_token is not None and owner_token != existing_lease_set.owner_token:
+            raise ValueError("owner_token must match existing_lease_set.owner_token")
+        if owner_pid is not None and owner_pid != existing_lease_set.owner_pid:
+            raise ValueError("owner_pid must match existing_lease_set.owner_pid")
+    resolved_owner_token = (
+        existing_lease_set.owner_token
+        if existing_lease_set is not None
+        else owner_token or generate_watch_lease_owner_token()
+    )
+    resolved_owner_pid = (
+        existing_lease_set.owner_pid
+        if existing_lease_set is not None
+        else owner_pid if owner_pid is not None else os.getpid()
+    )
     held: list[WatchLeaseHeld] = []
+    newly_acquired: list[WatchLeaseHeld] = []
+    existing_by_identity = (
+        {watch_lease_target_identity(held.target): held for held in existing_lease_set.held}
+        if existing_lease_set is not None
+        else {}
+    )
+    desired_identities: set[WatchLeaseIdentity] = set()
     for target in targets:
+        identity = watch_lease_target_identity(target)
+        desired_identities.add(identity)
+        already_owned = identity in existing_by_identity
         try:
             lease = target.store.try_acquire_project_lease(
                 lease_name=WATCH_SUPERVISOR_LEASE_NAME,
@@ -162,20 +230,48 @@ def acquire_watch_project_leases(
                 owner_token=resolved_owner_token,
                 acquired_at=acquired_at,
             )
-        except Exception as exc:
+        except BaseException as exc:
             try:
-                _release_held_best_effort(held, owner_token=resolved_owner_token)
+                _release_held_best_effort(newly_acquired, owner_token=resolved_owner_token)
             except WatchLeaseReleaseError as cleanup_error:
                 _raise_with_cleanup_context(exc, cleanup_error)
             raise
         if lease is None:
             conflict = WatchLeaseConflict(target)
             try:
-                _release_held_best_effort(held, owner_token=resolved_owner_token)
+                _release_held_best_effort(newly_acquired, owner_token=resolved_owner_token)
             except WatchLeaseReleaseError as cleanup_error:
                 _raise_with_cleanup_context(conflict, cleanup_error)
             raise conflict
-        held.append(WatchLeaseHeld(target=target, lease=lease))
+        acquired = WatchLeaseHeld(target=target, lease=lease)
+        held.append(acquired)
+        if not already_owned:
+            newly_acquired.append(acquired)
+    if existing_lease_set is not None:
+        retained_existing = [
+            held_lease
+            for held_lease in existing_lease_set.held
+            if watch_lease_target_identity(held_lease.target) not in desired_identities
+            and held_lease.target.key in retain_existing_target_keys
+        ]
+        stale_existing = [
+            held_lease
+            for held_lease in existing_lease_set.held
+            if watch_lease_target_identity(held_lease.target) not in desired_identities
+            and held_lease.target.key not in retain_existing_target_keys
+        ]
+        try:
+            _release_stale_existing_leases(stale_existing, owner_token=resolved_owner_token)
+        except WatchLeaseReleaseError as cleanup_error:
+            try:
+                _release_held_best_effort(newly_acquired, owner_token=resolved_owner_token)
+            except WatchLeaseReleaseError as rollback_error:
+                raise BaseExceptionGroup(
+                    "watch-supervisor lease refresh failed while releasing stale ownership",
+                    [cleanup_error, rollback_error],
+                ) from cleanup_error
+            raise
+        held.extend(retained_existing)
     return WatchLeaseSet(
         owner_pid=resolved_owner_pid,
         owner_token=resolved_owner_token,

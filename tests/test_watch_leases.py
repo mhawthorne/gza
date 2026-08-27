@@ -29,6 +29,10 @@ class RecordingStore:
         self.release_order = release_order
 
     @property
+    def db_path(self) -> Path:
+        return self.store.db_path
+
+    @property
     def project_id(self) -> str:
         return self.store.project_id
 
@@ -41,9 +45,13 @@ class RecordingStore:
 
 
 class RaisingAcquireStore:
-    def __init__(self, key: str, error: Exception) -> None:
+    def __init__(self, key: str, error: BaseException) -> None:
         self.key = key
         self.error = error
+
+    @property
+    def db_path(self) -> Path:
+        return Path(f"{self.key}.db")
 
     @property
     def project_id(self) -> str:
@@ -62,7 +70,7 @@ class RaisingReleaseStore(RecordingStore):
         key: str,
         store: SqliteTaskStore,
         release_order: list[str],
-        error: Exception,
+        error: BaseException,
     ) -> None:
         super().__init__(key, store, release_order)
         self.error = error
@@ -187,6 +195,34 @@ def test_watch_lease_acquisition_error_rolls_back_earlier_acquired_lease(tmp_pat
     )
 
 
+def test_watch_lease_acquisition_keyboard_interrupt_rolls_back_earlier_acquired_lease(
+    tmp_path: Path,
+) -> None:
+    first = _store(tmp_path, "first")
+    release_order: list[str] = []
+    first_recording: WatchLeaseStore = RecordingStore("first", first, release_order)
+    second_raising: WatchLeaseStore = RaisingAcquireStore("second", KeyboardInterrupt())
+
+    with pytest.raises(KeyboardInterrupt):
+        acquire_watch_project_leases(
+            [
+                WatchLeaseTarget("first", first_recording),
+                WatchLeaseTarget("second", second_raising),
+            ],
+            owner_token="run-token",
+        )
+
+    assert release_order == ["first"]
+    assert (
+        first.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-interrupt-rollback",
+        )
+        is not None
+    )
+
+
 def test_watch_lease_release_attempts_all_targets_and_surfaces_release_failure(tmp_path: Path) -> None:
     first = _store(tmp_path, "first")
     second = _store(tmp_path, "second")
@@ -218,6 +254,44 @@ def test_watch_lease_release_attempts_all_targets_and_surfaces_release_failure(t
             lease_name=WATCH_SUPERVISOR_LEASE_NAME,
             owner_pid=os.getpid(),
             owner_token="after-release",
+        )
+        is not None
+    )
+
+
+def test_watch_lease_release_keyboard_interrupt_attempts_all_targets_and_preserves_interrupt(
+    tmp_path: Path,
+) -> None:
+    first = _store(tmp_path, "first")
+    second = _store(tmp_path, "second")
+    third = _store(tmp_path, "third")
+    release_order: list[str] = []
+
+    leases = acquire_watch_project_leases(
+        [
+            WatchLeaseTarget("first", RecordingStore("first", first, release_order)),
+            WatchLeaseTarget(
+                "second",
+                RaisingReleaseStore("second", second, release_order, KeyboardInterrupt()),
+            ),
+            WatchLeaseTarget("third", RecordingStore("third", third, release_order)),
+        ],
+        owner_token="run-token",
+    )
+
+    with pytest.raises(WatchLeaseReleaseError) as exc:
+        leases.release()
+
+    assert release_order == ["third", "second", "first"]
+    assert [result.target_key for result in exc.value.results] == ["third", "second", "first"]
+    assert [result.released for result in exc.value.results] == [True, False, True]
+    assert [failure.target_key for failure in exc.value.failures] == ["second"]
+    assert isinstance(exc.value.failures[0].error, KeyboardInterrupt)
+    assert (
+        first.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-interrupted-release",
         )
         is not None
     )
@@ -327,3 +401,143 @@ def test_watch_lease_helper_adopts_already_owned_live_lease_with_same_run_token(
         is None
     )
     assert [result.released for result in adopted.release()] == [True]
+
+
+def test_watch_lease_incremental_conflict_preserves_existing_lease_and_rolls_back_new(
+    tmp_path: Path,
+) -> None:
+    first = _store(tmp_path, "first")
+    second = _store(tmp_path, "second")
+    third = _store(tmp_path, "third")
+    release_order: list[str] = []
+    existing = acquire_watch_project_leases(
+        [WatchLeaseTarget("first", RecordingStore("first", first, release_order))],
+        owner_token="run-token",
+    )
+    assert second.try_acquire_project_lease(
+        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+        owner_pid=os.getpid(),
+        owner_token="blocking-token",
+    )
+
+    with pytest.raises(WatchLeaseConflict) as exc:
+        acquire_watch_project_leases(
+            [
+                WatchLeaseTarget("first", RecordingStore("first", first, release_order)),
+                WatchLeaseTarget("third", RecordingStore("third", third, release_order)),
+                WatchLeaseTarget("second", RecordingStore("second", second, release_order)),
+            ],
+            existing_lease_set=existing,
+        )
+
+    assert exc.value.target_key == "second"
+    assert release_order == ["third"]
+    assert (
+        first.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="other-token",
+        )
+        is None
+    )
+    assert (
+        third.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-new-rollback",
+        )
+        is not None
+    )
+
+
+def test_watch_lease_refresh_replaces_same_key_identity_after_acquiring_new_before_releasing_old(
+    tmp_path: Path,
+) -> None:
+    old_store = _store(tmp_path, "old")
+    new_store = _store(tmp_path, "new")
+    release_order: list[str] = []
+    acquire_events: list[str] = []
+
+    class OrderedStore(RecordingStore):
+        def try_acquire_project_lease(self, **kwargs):
+            acquire_events.append(self.key)
+            if self.key == "new":
+                assert release_order == []
+            return super().try_acquire_project_lease(**kwargs)
+
+    existing = acquire_watch_project_leases(
+        [WatchLeaseTarget("core", RecordingStore("old", old_store, release_order))],
+        owner_token="run-token",
+    )
+
+    refreshed = acquire_watch_project_leases(
+        [WatchLeaseTarget("core", OrderedStore("new", new_store, release_order))],
+        existing_lease_set=existing,
+    )
+
+    assert acquire_events == ["new"]
+    assert release_order == ["old"]
+    assert [held.target.store.project_id for held in refreshed.held] == ["new"]
+    assert (
+        old_store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-old-release",
+        )
+        is not None
+    )
+    assert (
+        new_store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="while-new-held",
+        )
+        is None
+    )
+    refreshed.release()
+
+
+def test_watch_lease_refresh_conflict_after_replacement_rolls_back_new_and_preserves_old(
+    tmp_path: Path,
+) -> None:
+    old_store = _store(tmp_path, "old")
+    new_store = _store(tmp_path, "new")
+    blocker_store = _store(tmp_path, "blocker")
+    release_order: list[str] = []
+    existing = acquire_watch_project_leases(
+        [WatchLeaseTarget("core", RecordingStore("old", old_store, release_order))],
+        owner_token="run-token",
+    )
+    assert blocker_store.try_acquire_project_lease(
+        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+        owner_pid=os.getpid(),
+        owner_token="blocking-token",
+    )
+
+    with pytest.raises(WatchLeaseConflict) as exc_info:
+        acquire_watch_project_leases(
+            [
+                WatchLeaseTarget("core", RecordingStore("new", new_store, release_order)),
+                WatchLeaseTarget("other", RecordingStore("blocker", blocker_store, release_order)),
+            ],
+            existing_lease_set=existing,
+        )
+
+    assert exc_info.value.target_key == "other"
+    assert release_order == ["new"]
+    assert (
+        old_store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="old-still-held",
+        )
+        is None
+    )
+    assert (
+        new_store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="new-rolled-back",
+        )
+        is not None
+    )

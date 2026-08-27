@@ -1120,7 +1120,7 @@ def main() -> int:
         action="append",
         dest="watch_projects",
         metavar="NAME=PATH",
-        help="Select a named watch project path or registry project_id; one selected path can run now, multiple projects and registry IDs are validated but refused before execution",
+        help="Select a named watch project path or registry project_id; one selected path can run now, multiple projects acquire watch leases but are refused before dispatch",
     )
     watch_parser.add_argument(
         "--watch-tag",
@@ -1153,7 +1153,7 @@ def main() -> int:
         "--watch-config",
         metavar="PATH",
         dest="watch_config",
-        help="Load a version 1 watch supervisor manifest; one path-backed project can run now, multiple projects and registry-ID-only selectors are refused before execution",
+        help="Load a version 1 watch supervisor manifest; one path-backed project can run now, multiple projects acquire watch leases but are refused before dispatch",
     )
     watch_parser.add_argument(
         "--max-iterations",
