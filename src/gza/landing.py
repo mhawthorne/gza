@@ -18,6 +18,7 @@ from gza.db import SqliteTaskStore, Task as DbTask
 from gza.review_tasks import DuplicateReviewError, create_resolution_review_task, create_review_task
 from gza.review_verdict import get_review_report
 from gza.review_verify_state import VerifyGateDecision, resolve_verify_gate_decision
+from gza.runner import _compute_tree_fingerprint
 from gza.watch_progress import review_matches_create_review_action
 
 LandingPolicyName = Literal["guarded", "strict"]
@@ -701,6 +702,7 @@ class LandingJudgment:
 
 
 LandingJudge = Callable[[], LandingJudgment | LandingJudgeVerdict]
+LandingLiveTreeResolver = Callable[[], str | None]
 
 
 @dataclass(frozen=True)
@@ -752,6 +754,7 @@ def acquire_landing_verify_evidence(
     tree_fingerprint: str | None = None,
     context: AdvanceActionExecutionContext,
     execute_action: LandingAdvanceExecutor | None = None,
+    live_tree_fingerprint_resolver: LandingLiveTreeResolver | None = None,
     member_tasks: tuple[DbTask, ...] | None = None,
 ) -> LandingVerifyAcquisitionResult:
     """Acquire green lifecycle verify evidence with one shared direct action.
@@ -761,6 +764,14 @@ def acquire_landing_verify_evidence(
     helper never creates verify-fix or improve work.
     """
 
+    def resolve_live_tree_fingerprint() -> str | None:
+        if live_tree_fingerprint_resolver is not None:
+            return live_tree_fingerprint_resolver()
+        if git is not None and source_head is not None:
+            return _compute_tree_fingerprint(git, head_sha=source_head)
+        return tree_fingerprint
+
+    initial_tree_fingerprint = resolve_live_tree_fingerprint()
     initial = inspect_current_landing_verify_evidence(
         store,
         owner_task,
@@ -768,7 +779,7 @@ def acquire_landing_verify_evidence(
         git=git,
         source_head=source_head,
         gate_identity=gate_identity,
-        tree_fingerprint=tree_fingerprint,
+        tree_fingerprint=initial_tree_fingerprint,
     )
     if _landing_verify_evidence_is_current_green(initial):
         return LandingVerifyAcquisitionResult("current_green", initial)
@@ -812,6 +823,7 @@ def acquire_landing_verify_evidence(
         context=execution_context,
     ))
     execution = executor(owner_task, action, context)
+    refreshed_tree_fingerprint = resolve_live_tree_fingerprint()
     refreshed = inspect_current_landing_verify_evidence(
         store,
         owner_task,
@@ -819,7 +831,7 @@ def acquire_landing_verify_evidence(
         git=git,
         source_head=source_head,
         gate_identity=gate_identity,
-        tree_fingerprint=tree_fingerprint,
+        tree_fingerprint=refreshed_tree_fingerprint,
     )
     if _landing_verify_evidence_is_current_green(refreshed):
         return LandingVerifyAcquisitionResult(
@@ -1226,14 +1238,14 @@ def _landing_verify_evidence_from_decision(
     metadata = decision.lookup.artifact_metadata
     gate_identity = _verify_gate_identity(epoch)
     tree_fingerprint = _verify_tree_fingerprint(metadata)
+    expected_tree = _normalize_optional_nonblank_ref(expected_tree_fingerprint)
     current = decision.state == "passed"
     identity_matched = current
     if expected_source_head is not None:
         identity_matched = identity_matched and epoch is not None and epoch.reviewed_head_sha == expected_source_head
     if expected_gate_identity is not None:
         identity_matched = identity_matched and gate_identity == expected_gate_identity
-    if expected_tree_fingerprint is not None:
-        identity_matched = identity_matched and tree_fingerprint == expected_tree_fingerprint
+    identity_matched = identity_matched and expected_tree is not None and tree_fingerprint == expected_tree
     status = cast(LandingVerifyStatus, decision.state if decision.state in {"passed", "failed", "stale", "unavailable", "missing"} else "missing")
     if result is not None and result.status not in {"passed", "failed", "unavailable"}:
         status = "malformed"
@@ -1258,6 +1270,13 @@ def _landing_verify_evidence_is_current_green(evidence: LandingVerifyEvidence) -
         and bool(evidence.gate_identity)
         and bool(evidence.tree_fingerprint)
     )
+
+
+def _normalize_optional_nonblank_ref(ref: str | None) -> str | None:
+    if ref is None:
+        return None
+    stripped = ref.strip()
+    return stripped or None
 
 
 def _verify_epoch_identity(epoch: Any | None) -> str | None:
@@ -1296,17 +1315,20 @@ def _verify_tree_fingerprint(metadata: dict[str, Any] | None) -> str | None:
     aggregate = metadata.get("aggregate_details")
     if isinstance(aggregate, dict):
         value = aggregate.get("tree_fingerprint")
-        if _aggregate_tree_fingerprint_is_complete(aggregate) and isinstance(value, str) and value:
-            return value
+        normalized_value = _normalize_optional_nonblank_ref(value) if isinstance(value, str) else None
+        if _aggregate_tree_fingerprint_is_complete(aggregate) and normalized_value is not None:
+            return normalized_value
         return None
     value = metadata.get("tree_fingerprint")
-    if isinstance(value, str) and value:
-        return value
+    normalized_value = _normalize_optional_nonblank_ref(value) if isinstance(value, str) else None
+    if normalized_value is not None:
+        return normalized_value
     provenance = metadata.get("provenance")
     if isinstance(provenance, dict):
         value = provenance.get("tree_fingerprint")
-        if isinstance(value, str) and value:
-            return value
+        normalized_value = _normalize_optional_nonblank_ref(value) if isinstance(value, str) else None
+        if normalized_value is not None:
+            return normalized_value
     return None
 
 

@@ -2194,6 +2194,31 @@ def _decision(state: str, *, head: str = "head-a") -> VerifyGateDecision:
     )
 
 
+@pytest.mark.parametrize("expected_tree", (None, "   "))
+def test_inspect_current_landing_verify_blocks_omitted_or_blank_live_tree(tmp_path, expected_tree: str | None) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _verify_config(tmp_path)
+    impl = store.add("Implement landing verify", task_type="implement")
+    impl.status = "completed"
+    impl.branch = "feature/landing"
+    store.update(impl)
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+
+    evidence = inspect_current_landing_verify_evidence(
+        store,
+        impl,
+        config=config,
+        git=_FakeGit({"feature/landing": "head-a"}),
+        source_head="head-a",
+        tree_fingerprint=expected_tree,
+    )
+
+    assert evidence.status == "passed"
+    assert evidence.current is True
+    assert evidence.identity_matched is False
+    assert evidence.tree_fingerprint == TREE_A
+
+
 def test_inspect_current_landing_verify_requires_canonical_owner_artifact_not_rebase_verify(tmp_path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
     config = _verify_config(tmp_path)
@@ -2488,7 +2513,7 @@ def test_inspect_current_landing_verify_blocks_mismatched_or_absent_tree_proof(t
     assert evidence.identity_matched is False
 
 
-def test_acquire_landing_verify_runs_shared_direct_action_then_reevaluates(monkeypatch, tmp_path) -> None:
+def test_acquire_landing_verify_runs_shared_direct_action_then_reevaluates_stable_live_tree(monkeypatch, tmp_path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
     config = _verify_config(tmp_path)
     impl = store.add("Implement landing verify", task_type="implement")
@@ -2496,19 +2521,20 @@ def test_acquire_landing_verify_runs_shared_direct_action_then_reevaluates(monke
     impl.branch = "feature/landing"
     store.update(impl)
     calls: list[str] = []
-    decisions = [_decision("missing"), _decision("passed")]
-
-    def fake_resolve(*_args: Any, **_kwargs: Any) -> VerifyGateDecision:
-        return decisions.pop(0)
+    live_tree_calls: list[str] = []
 
     def fake_plan(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         return {"type": "verify_gate", "description": "Run verify gate before merge"}
 
     def fake_execute(_task: Any, action: dict[str, Any], _context: Any) -> Any:
         calls.append(str(action["type"]))
+        _persist_lifecycle_verify_for_landing(store, config, impl)
         return SimpleNamespace(action_type="verify_gate", status="success")
 
-    monkeypatch.setattr("gza.landing.resolve_verify_gate_decision", fake_resolve)
+    def live_tree() -> str:
+        live_tree_calls.append("resolved")
+        return TREE_A
+
     monkeypatch.setattr("gza.landing.plan_manual_verify_gate_action", fake_plan)
 
     result = acquire_landing_verify_evidence(
@@ -2520,11 +2546,86 @@ def test_acquire_landing_verify_runs_shared_direct_action_then_reevaluates(monke
         source_head="head-a",
         context=SimpleNamespace(),  # type: ignore[arg-type]
         execute_action=fake_execute,  # type: ignore[arg-type]
+        live_tree_fingerprint_resolver=live_tree,
     )
 
     assert result.status == "ran_verify"
     assert result.evidence.status == "passed"
     assert calls == ["verify_gate"]
+    assert live_tree_calls == ["resolved", "resolved"]
+
+
+@pytest.mark.parametrize("live_tree", (None, "   ", TREE_B))
+def test_acquire_landing_verify_blocks_without_exact_live_tree_before_work(live_tree: str | None, tmp_path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _verify_config(tmp_path)
+    impl = store.add("Implement landing verify", task_type="implement")
+    impl.status = "completed"
+    impl.branch = "feature/landing"
+    store.update(impl)
+    _persist_lifecycle_verify_for_landing(store, config, impl)
+
+    result = acquire_landing_verify_evidence(
+        store,
+        impl,
+        config=config,
+        git=_FakeGit({"feature/landing": "head-a"}),
+        target_branch="main",
+        source_head="head-a",
+        context=SimpleNamespace(),  # type: ignore[arg-type]
+        execute_action=lambda *_args: (_ for _ in ()).throw(AssertionError("must not execute")),  # type: ignore[arg-type]
+        live_tree_fingerprint_resolver=lambda: live_tree,
+    )
+
+    assert result.status == "blocked"
+    assert result.evidence.status == "passed"
+    assert result.evidence.identity_matched is False
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "verify-unavailable-or-red"
+
+
+def test_acquire_landing_verify_blocks_when_post_execution_live_tree_changed(monkeypatch, tmp_path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _verify_config(tmp_path)
+    impl = store.add("Implement landing verify", task_type="implement")
+    impl.status = "completed"
+    impl.branch = "feature/landing"
+    store.update(impl)
+    calls: list[str] = []
+    live_trees = [TREE_A, TREE_B]
+
+    def fake_plan(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"type": "verify_gate", "description": "Run verify gate before merge"}
+
+    def fake_execute(_task: Any, action: dict[str, Any], _context: Any) -> Any:
+        calls.append(str(action["type"]))
+        _persist_lifecycle_verify_for_landing(store, config, impl)
+        return SimpleNamespace(action_type="verify_gate", status="success")
+
+    def live_tree() -> str:
+        return live_trees.pop(0)
+
+    monkeypatch.setattr("gza.landing.plan_manual_verify_gate_action", fake_plan)
+
+    result = acquire_landing_verify_evidence(
+        store,
+        impl,
+        config=config,
+        git=_FakeGit({"feature/landing": "head-a"}),
+        target_branch="main",
+        source_head="head-a",
+        context=SimpleNamespace(),  # type: ignore[arg-type]
+        execute_action=fake_execute,  # type: ignore[arg-type]
+        live_tree_fingerprint_resolver=live_tree,
+    )
+
+    assert result.status == "blocked"
+    assert result.evidence.status == "passed"
+    assert result.evidence.identity_matched is False
+    assert result.blocked is not None
+    assert result.blocked.reason_code == "verify-unavailable-or-red"
+    assert calls == ["verify_gate"]
+    assert live_trees == []
 
 
 def test_acquire_landing_verify_blocks_red_without_verify_fix_or_improve(monkeypatch, tmp_path) -> None:
@@ -2545,6 +2646,7 @@ def test_acquire_landing_verify_blocks_red_without_verify_fix_or_improve(monkeyp
         source_head="head-a",
         context=SimpleNamespace(),  # type: ignore[arg-type]
         execute_action=lambda *_args: (_ for _ in ()).throw(AssertionError("must not execute")),  # type: ignore[arg-type]
+        live_tree_fingerprint_resolver=lambda: TREE_A,
     )
 
     assert result.status == "blocked"
