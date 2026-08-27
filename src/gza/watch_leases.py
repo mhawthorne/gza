@@ -211,18 +211,18 @@ def acquire_watch_project_leases(
         if existing_lease_set is not None
         else owner_pid if owner_pid is not None else os.getpid()
     )
-    held: list[WatchLeaseHeld] = []
     newly_acquired: list[WatchLeaseHeld] = []
     existing_by_identity = (
         {watch_lease_target_identity(held.target): held for held in existing_lease_set.held}
         if existing_lease_set is not None
         else {}
     )
+    adopted_by_identity: dict[WatchLeaseIdentity, WatchLeaseHeld] = {}
     desired_identities: set[WatchLeaseIdentity] = set()
     for target in targets:
         identity = watch_lease_target_identity(target)
         desired_identities.add(identity)
-        already_owned = identity in existing_by_identity
+        already_owned = existing_by_identity.get(identity)
         try:
             lease = target.store.try_acquire_project_lease(
                 lease_name=WATCH_SUPERVISOR_LEASE_NAME,
@@ -244,9 +244,10 @@ def acquire_watch_project_leases(
                 _raise_with_cleanup_context(conflict, cleanup_error)
             raise conflict
         acquired = WatchLeaseHeld(target=target, lease=lease)
-        held.append(acquired)
         if not already_owned:
             newly_acquired.append(acquired)
+        else:
+            adopted_by_identity[identity] = acquired
     if existing_lease_set is not None:
         retained_existing = [
             held_lease
@@ -271,7 +272,20 @@ def acquire_watch_project_leases(
                     [cleanup_error, rollback_error],
                 ) from cleanup_error
             raise
-        held.extend(retained_existing)
+        retained_by_identity = {
+            watch_lease_target_identity(held_lease.target): held_lease for held_lease in retained_existing
+        }
+        held = [
+            adopted_by_identity[identity]
+            if identity in adopted_by_identity
+            else retained_by_identity[identity]
+            for held_lease in existing_lease_set.held
+            for identity in (watch_lease_target_identity(held_lease.target),)
+            if identity in adopted_by_identity or identity in retained_by_identity
+        ]
+        held.extend(newly_acquired)
+    else:
+        held = newly_acquired
     return WatchLeaseSet(
         owner_pid=resolved_owner_pid,
         owner_token=resolved_owner_token,

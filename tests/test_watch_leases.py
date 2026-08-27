@@ -541,3 +541,104 @@ def test_watch_lease_refresh_conflict_after_replacement_rolls_back_new_and_prese
         )
         is not None
     )
+
+
+def test_watch_lease_refresh_appends_new_acquisitions_after_multiple_retained_existing_leases(
+    tmp_path: Path,
+) -> None:
+    retained_middle = _store(tmp_path, "retained-middle")
+    retained_last = _store(tmp_path, "retained-last")
+    released_old = _store(tmp_path, "released-old")
+    new_first = _store(tmp_path, "new-first")
+    new_after = _store(tmp_path, "new-after")
+    release_order: list[str] = []
+    existing = acquire_watch_project_leases(
+        [
+            WatchLeaseTarget("released", RecordingStore("released-old", released_old, release_order)),
+            WatchLeaseTarget("middle", RecordingStore("retained-middle", retained_middle, release_order)),
+            WatchLeaseTarget("last", RecordingStore("retained-last", retained_last, release_order)),
+        ],
+        owner_token="run-token",
+    )
+
+    refreshed = acquire_watch_project_leases(
+        [
+            WatchLeaseTarget("new-first", RecordingStore("new-first", new_first, release_order)),
+            WatchLeaseTarget("new-after", RecordingStore("new-after", new_after, release_order)),
+        ],
+        existing_lease_set=existing,
+        retain_existing_target_keys=frozenset({"middle", "last"}),
+    )
+
+    assert [held.target.key for held in refreshed.held] == ["middle", "last", "new-first", "new-after"]
+    assert release_order == ["released-old"]
+    assert [result.target_key for result in refreshed.release()] == ["new-after", "new-first", "last", "middle"]
+
+
+def test_watch_lease_refresh_replacement_is_ordered_after_older_retained_peer(
+    tmp_path: Path,
+) -> None:
+    old_core = _store(tmp_path, "old-core")
+    retained_peer = _store(tmp_path, "retained-peer")
+    new_core = _store(tmp_path, "new-core")
+    release_order: list[str] = []
+    existing = acquire_watch_project_leases(
+        [
+            WatchLeaseTarget("core", RecordingStore("old-core", old_core, release_order)),
+            WatchLeaseTarget("peer", RecordingStore("retained-peer", retained_peer, release_order)),
+        ],
+        owner_token="run-token",
+    )
+
+    refreshed = acquire_watch_project_leases(
+        [
+            WatchLeaseTarget("core", RecordingStore("new-core", new_core, release_order)),
+            WatchLeaseTarget("peer", RecordingStore("retained-peer", retained_peer, release_order)),
+        ],
+        existing_lease_set=existing,
+    )
+
+    assert [held.target.store.project_id for held in refreshed.held] == ["retained-peer", "new-core"]
+    assert release_order == ["old-core"]
+    assert [result.target_key for result in refreshed.release()] == ["core", "peer"]
+
+
+def test_watch_lease_incremental_rollback_releases_only_new_in_reverse_order_with_retained_existing(
+    tmp_path: Path,
+) -> None:
+    retained = _store(tmp_path, "retained")
+    new_first = _store(tmp_path, "new-first")
+    new_second = _store(tmp_path, "new-second")
+    blocker = _store(tmp_path, "blocker")
+    release_order: list[str] = []
+    existing = acquire_watch_project_leases(
+        [WatchLeaseTarget("retained", RecordingStore("retained", retained, release_order))],
+        owner_token="run-token",
+    )
+    assert blocker.try_acquire_project_lease(
+        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+        owner_pid=os.getpid(),
+        owner_token="blocking-token",
+    )
+
+    with pytest.raises(WatchLeaseConflict):
+        acquire_watch_project_leases(
+            [
+                WatchLeaseTarget("new-first", RecordingStore("new-first", new_first, release_order)),
+                WatchLeaseTarget("new-second", RecordingStore("new-second", new_second, release_order)),
+                WatchLeaseTarget("blocked", RecordingStore("blocker", blocker, release_order)),
+            ],
+            existing_lease_set=existing,
+            retain_existing_target_keys=frozenset({"retained"}),
+        )
+
+    assert release_order == ["new-second", "new-first"]
+    assert (
+        retained.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="retained-still-held",
+        )
+        is None
+    )
+    assert [result.target_key for result in existing.release()] == ["retained"]

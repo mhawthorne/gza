@@ -3105,7 +3105,7 @@ def test_construct_watch_project_runtimes_invalid_project_later_valid_acquires_b
     assert recovered.disabled == ()
     assert [runtime.key for runtime in recovered.runtimes] == ["bad", "good"]
     assert recovered.lease_set is not None
-    assert [held.target.key for held in recovered.lease_set.held] == ["bad", "good"]
+    assert [held.target.key for held in recovered.lease_set.held] == ["good", "bad"]
     assert (
         SqliteTaskStore(good_db, prefix="good", project_id="good").try_acquire_project_lease(
             lease_name=WATCH_SUPERVISOR_LEASE_NAME,
@@ -3554,6 +3554,134 @@ def test_construct_watch_project_runtimes_refresh_conflict_retains_old_same_key_
     )
     _assert_watch_supervisor_lease_can_be_acquired(old_core_store, "old-core-after-replacement")
     recovered.lease_set.release()
+
+
+@pytest.mark.parametrize(
+    ("initial_keys", "refresh_keys", "conflict_keys", "expected_held", "expected_rollbacks", "expected_release"),
+    [
+        (
+            ("first", "middle", "last"),
+            ("first", "middle", "new", "last"),
+            {"middle"},
+            ["first", "middle", "last", "new"],
+            [],
+            ["new", "last", "middle", "first"],
+        ),
+        (
+            ("first", "last"),
+            ("first", "new", "last"),
+            {"last"},
+            ["first", "last", "new"],
+            ["new"],
+            ["new", "last", "first"],
+        ),
+        (
+            ("first", "middle", "last"),
+            ("first", "newone", "middle", "newtwo", "last"),
+            {"first", "middle", "last"},
+            ["first", "middle", "last", "newone", "newtwo"],
+            ["newone", "newtwo", "newone"],
+            ["newtwo", "newone", "last", "middle", "first"],
+        ),
+    ],
+)
+def test_acquire_watch_supervisor_selection_leases_refresh_preserves_authoritative_release_order(
+    tmp_path: Path,
+    initial_keys: tuple[str, ...],
+    refresh_keys: tuple[str, ...],
+    conflict_keys: set[str],
+    expected_held: list[str],
+    expected_rollbacks: list[str],
+    expected_release: list[str],
+) -> None:
+    project_dirs = {key: tmp_path / key for key in {*initial_keys, *refresh_keys}}
+    old_dbs = {key: tmp_path / f"{key}-old.db" for key in initial_keys}
+    new_dbs = {key: tmp_path / f"{key}-new.db" for key in conflict_keys}
+    fresh_dbs = {key: tmp_path / f"{key}.db" for key in refresh_keys if key not in initial_keys}
+    for key in initial_keys:
+        _write_watch_runtime_project_config(
+            project_dirs[key],
+            project_name=key.title(),
+            project_id=key,
+            project_prefix=key.replace("-", ""),
+            db_path=old_dbs[key],
+        )
+    for key, db_path in fresh_dbs.items():
+        _write_watch_runtime_project_config(
+            project_dirs[key],
+            project_name=key.title(),
+            project_id=key,
+            project_prefix=key.replace("-", ""),
+            db_path=db_path,
+        )
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dirs[initial_keys[0]]))
+    initial_selection = _watch_runtime_selection(
+        tuple(
+            WatchSupervisorProjectSelector(key=key, ref=str(project_dirs[key]), path=project_dirs[key])
+            for key in initial_keys
+        )
+    )
+    initial = watch_module.acquire_watch_supervisor_selection_leases(
+        anchor_store=anchor_store,
+        selection=initial_selection,
+        owner_token="fleet-token",
+    )
+    assert initial.lease_set is not None
+
+    blocking_stores: list[SqliteTaskStore] = []
+    for key in conflict_keys:
+        _write_watch_runtime_project_config(
+            project_dirs[key],
+            project_name=key.title(),
+            project_id=key,
+            project_prefix=key.replace("-", ""),
+            db_path=new_dbs[key],
+        )
+        blocking_store = SqliteTaskStore(new_dbs[key], prefix=key.replace("-", ""), project_id=key)
+        assert blocking_store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token=f"blocking-{key}",
+        )
+        blocking_stores.append(blocking_store)
+
+    refresh_selection = _watch_runtime_selection(
+        tuple(
+            WatchSupervisorProjectSelector(key=key, ref=str(project_dirs[key]), path=project_dirs[key])
+            for key in refresh_keys
+        )
+    )
+    real_release = SqliteTaskStore.release_project_lease
+    release_calls: list[str] = []
+
+    def recording_release(self: SqliteTaskStore, *, lease_name: str, owner_token: str) -> bool:
+        release_calls.append(self.project_id)
+        return real_release(self, lease_name=lease_name, owner_token=owner_token)
+
+    with patch.object(SqliteTaskStore, "release_project_lease", autospec=True, side_effect=recording_release):
+        refreshed = watch_module.acquire_watch_supervisor_selection_leases(
+            anchor_store=anchor_store,
+            selection=refresh_selection,
+            owner_token="fleet-token",
+            existing_lease_set=initial.lease_set,
+        )
+
+    assert [disabled.selector_key for disabled in refreshed.disabled] == [
+        key for key in refresh_keys if key in conflict_keys
+    ]
+    assert refreshed.lease_set is not None
+    assert [held.target.key for held in refreshed.lease_set.held] == expected_held
+    assert release_calls == expected_rollbacks
+
+    release_calls.clear()
+    with patch.object(SqliteTaskStore, "release_project_lease", autospec=True, side_effect=recording_release):
+        assert [result.target_key for result in refreshed.lease_set.release()] == expected_release
+    assert release_calls == expected_release
+    for blocking_store in blocking_stores:
+        assert blocking_store.release_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_token=f"blocking-{blocking_store.project_id}",
+        )
 
 
 def test_construct_watch_project_runtimes_refresh_owner_token_mismatch_rejects_non_empty_before_mutation(

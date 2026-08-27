@@ -174,7 +174,6 @@ from ..unstick import (
 )
 from ..watch_leases import (
     WatchLeaseConflict,
-    WatchLeaseHeld,
     WatchLeaseReleaseError,
     WatchLeaseSet,
     WatchLeaseTarget,
@@ -8624,12 +8623,11 @@ def construct_watch_project_runtimes(
         raise
 
     if lease_set is not None:
-        held_by_key: dict[str, WatchLeaseHeld] = {held.target.key: held for held in lease_set.held}
         retained_lease_key_set = {*retained_lease_keys, *retained_conflict_lease_keys}
-        released_disabled_keys = [held.target.key for held in lease_set.held if held.target.key not in retained_lease_key_set]
+        released_disabled_held = [held for held in lease_set.held if held.target.key not in retained_lease_key_set]
         try:
             release_watch_held_leases(
-                [held_by_key[key] for key in released_disabled_keys],
+                released_disabled_held,
                 owner_token=lease_set.owner_token,
             )
         except WatchLeaseReleaseError as release_error:
@@ -8644,11 +8642,7 @@ def construct_watch_project_runtimes(
         lease_set = WatchLeaseSet(
             owner_pid=lease_set.owner_pid,
             owner_token=lease_set.owner_token,
-            held=tuple(
-                held_by_key[key]
-                for key in [*retained_conflict_lease_keys, *retained_lease_keys]
-                if key in held_by_key
-            ),
+            held=tuple(held for held in lease_set.held if held.target.key in retained_lease_key_set),
         )
 
     return WatchSupervisorRuntimeConstruction(
