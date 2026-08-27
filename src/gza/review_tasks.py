@@ -2565,6 +2565,7 @@ def validate_capped_review_blocker_action(
     review_task: Task,
     findings: tuple[ReviewFinding, ...],
     persisted_review_output: str,
+    authoritative_review_output: str | None = None,
 ) -> tuple[ReviewFinding, ...]:
     """Validate capped-review metadata against the persisted completed review row."""
     _validate_capped_review_persisted_output(persisted_review_output)
@@ -2581,7 +2582,9 @@ def validate_capped_review_blocker_action(
     if declares_spec_coherence_review_mode(persisted_review.review_scope):
         raise ValueError("Max-cycle merge-and-defer cannot defer spec-coherence review blockers.")
 
-    authoritative_output = persisted_review.output_content
+    authoritative_output = authoritative_review_output
+    if authoritative_output is None:
+        authoritative_output = persisted_review.output_content
     if not authoritative_output and config is not None:
         authoritative_output = get_review_content(config.project_dir, persisted_review)
     if not authoritative_output:

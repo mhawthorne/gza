@@ -288,7 +288,7 @@ def _guard_unit_subprocesses(request: pytest.FixtureRequest):
 
 
 @pytest.fixture(autouse=True)
-def _disable_git_signing(tmp_path, monkeypatch):
+def _disable_git_signing(tmp_path_factory, monkeypatch):
     """Disable git commit signing for all tests.
 
     The CI/development environment may have global git config that enables
@@ -296,8 +296,9 @@ def _disable_git_signing(tmp_path, monkeypatch):
     create temporary git repos. Setting GIT_CONFIG_GLOBAL to an empty file
     prevents the global config from being inherited.
     """
-    global_config = tmp_path / ".gitconfig-empty"
-    global_config.write_text("")
+    global_config = tmp_path_factory.getbasetemp() / ".gitconfig-empty"
+    if not global_config.exists():
+        global_config.write_text("")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
 
 

@@ -172,6 +172,8 @@ PARK_REASON_VERIFY_UNAVAILABLE_AFTER_FIX = "verify-unavailable-after-fix"
 PARK_REASON_REVIEW_BLOCKER_ADJUDICATION_NEEDED = "review-blocker-adjudication-needed"
 PARK_REASON_DUPLICATE_BLOCKER_NO_PROGRESS = "duplicate-blocker-no-progress"
 PARK_REASON_REVIEW_MAX_CYCLES_REACHED = "review-max-cycles-reached"
+PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE = "review-max-cycles-review-content-unavailable"
+PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_INVALID = "review-max-cycles-review-content-invalid"
 PARK_REASON_RETRY_LIMIT_REACHED = "retry-limit-reached"
 PARK_REASON_RETRYABLE_PROVIDER_ERROR = "retryable-provider-error"
 IMPROVE_ACTION_REASON_FRESH_COMMENTS = "fresh_comments"
@@ -204,6 +206,8 @@ WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS = frozenset(
         PARK_REASON_RETRY_LIMIT_REACHED,
         PARK_REASON_REVIEW_BLOCKER_ADJUDICATION_NEEDED,
         PARK_REASON_REVIEW_MAX_CYCLES_REACHED,
+        PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE,
+        PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_INVALID,
         "review-freshness-unverified",
         "review-needs-manual-creation",
         "review-verdict-needs-manual-attention",
@@ -360,6 +364,24 @@ class SiblingReviewAttentionCandidate:
 
 
 @dataclass(frozen=True)
+class CappedReviewMergePayload:
+    """Single review-content snapshot validated for capped merge deferral."""
+
+    review_task: DbTask
+    persisted_review_output: str
+    blocker_findings: tuple[ReviewFinding, ...]
+
+
+@dataclass(frozen=True)
+class ReviewContentSnapshot:
+    """Authoritative persisted content for one completed review."""
+
+    content: str | None
+    unavailable_reason: str | None = None
+    unavailable_detail: str | None = None
+
+
+@dataclass(frozen=True)
 class NeedsAttentionDisplayEntry:
     """Rendered needs-attention display text plus known field boundaries."""
 
@@ -446,10 +468,14 @@ class AdvanceContext:
     reused_investigation_task_ids: tuple[str, ...] = ()
     review_verdict: str | None = None
     review_report: ParsedReviewReport | None = None
+    latest_review_output_content: str | None = None
     latest_review_blocker_summary: ReviewBlockerSummary | None = None
     followup_findings: tuple[ReviewFinding, ...] = ()
     recent_verify_timeout_only_reviews: tuple[DbTask, ...] = ()
     off_topic_verify_clearance_candidate: OffTopicVerifyClearanceCandidate | None = None
+    capped_review_merge_payload: CappedReviewMergePayload | None = None
+    capped_review_content_error: str | None = None
+    capped_review_content_error_reason: str | None = None
 
     completed_review_cycles: int = 0
     review_cycle_boundary_task_id: str | None = None
@@ -2136,6 +2162,8 @@ def _count_duplicate_primary_blocker_streak(
     config: Any,
     reviews: list[DbTask],
     completed_rebases: list[DbTask],
+    *,
+    latest_report: ParsedReviewReport | None = None,
 ) -> DuplicateBlockerStreak | None:
     completed_reviews = sorted(
         (review for review in reviews if review.status == "completed"),
@@ -2146,7 +2174,8 @@ def _count_duplicate_primary_blocker_streak(
         return None
 
     latest_review = completed_reviews[0]
-    latest_report = get_review_report(Path(config.project_dir), latest_review)
+    if latest_report is None:
+        latest_report = get_review_report(Path(config.project_dir), latest_review)
     if latest_report.verdict != "CHANGES_REQUESTED":
         return None
 
@@ -2458,11 +2487,12 @@ def _find_sibling_review_attention_candidate(
     impl_task: DbTask,
     completed_reviews: list[DbTask],
     latest_completed_review: DbTask | None,
+    latest_review_output_content: str | None = None,
 ) -> SiblingReviewAttentionCandidate | None:
     if latest_completed_review is None or latest_completed_review.id is None or impl_task.id is None:
         return None
 
-    latest_summary = summarize_review_blockers(_get_review_output_content(config, latest_completed_review))
+    latest_summary = summarize_review_blockers(latest_review_output_content)
     if not latest_summary.is_verify_blocked_only:
         return None
 
@@ -4983,6 +5013,28 @@ def _get_review_output_content(config: Any, review_task: DbTask) -> str | None:
     return get_review_content(Path(config.project_dir), review_task)
 
 
+def _capped_review_content_error(exc: OSError | UnicodeError) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _resolve_review_content_snapshot(config: Any, review_task: DbTask) -> ReviewContentSnapshot:
+    try:
+        content = get_review_content(Path(config.project_dir), review_task)
+    except (OSError, UnicodeError) as exc:
+        return ReviewContentSnapshot(
+            content=None,
+            unavailable_reason=PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE,
+            unavailable_detail=_capped_review_content_error(exc),
+        )
+    if not isinstance(content, str) or not content.strip():
+        return ReviewContentSnapshot(
+            content=content,
+            unavailable_reason=PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE,
+            unavailable_detail="persisted review output is missing or blank",
+        )
+    return ReviewContentSnapshot(content=content)
+
+
 def _resolve_review_state(
     config: Any,
     store: SqliteTaskStore,
@@ -5001,6 +5053,7 @@ def _resolve_review_state(
     tuple[str, ...],
     str | None,
     ParsedReviewReport | None,
+    str | None,
     ReviewBlockerSummary | None,
     tuple[ReviewFinding, ...],
     tuple[DbTask, ...],
@@ -5025,6 +5078,8 @@ def _resolve_review_state(
     dict[str, Any] | None,
     OffTopicVerifyClearanceCandidate | None,
     SiblingReviewAttentionCandidate | None,
+    str | None,
+    str | None,
 ]:
     """Resolve review/improve lineage state for the implementation root task."""
     reviews = get_implementation_review_evidence(store, task)
@@ -5045,7 +5100,10 @@ def _resolve_review_state(
 
     review_verdict: str | None = None
     review_report: ParsedReviewReport | None = None
+    latest_review_output_content: str | None = None
     latest_review_blocker_summary: ReviewBlockerSummary | None = None
+    capped_review_content_error_reason: str | None = None
+    capped_review_content_error: str | None = None
     followup_findings: tuple[ReviewFinding, ...] = ()
     recent_verify_timeout_only_reviews: tuple[DbTask, ...] = ()
     completed_review_cycles = 0
@@ -5081,11 +5139,24 @@ def _resolve_review_state(
         latest_completed_code_change = task
 
     if latest_completed_review is not None:
-        review_report = get_review_report(Path(config.project_dir), latest_completed_review)
-        review_verdict = review_report.verdict
-        latest_review_blocker_summary = summarize_review_blockers(
-            _get_review_output_content(config, latest_completed_review)
-        )
+        latest_review_snapshot = _resolve_review_content_snapshot(config, latest_completed_review)
+        latest_review_output_content = latest_review_snapshot.content
+        capped_review_content_error_reason = latest_review_snapshot.unavailable_reason
+        capped_review_content_error = latest_review_snapshot.unavailable_detail
+        if latest_review_snapshot.unavailable_reason is None:
+            review_report = (
+                get_review_report(Path(config.project_dir), latest_completed_review)
+                if latest_completed_review.output_content is not None
+                else parse_review_report(latest_review_output_content or "")
+            )
+            review_verdict = review_report.verdict
+            latest_review_blocker_summary = summarize_review_blockers(latest_review_output_content)
+        else:
+            try:
+                review_report = get_review_report(Path(config.project_dir), latest_completed_review)
+            except (OSError, UnicodeError):
+                review_report = ParsedReviewReport(verdict=None, findings=(), format_version="unknown")
+            review_verdict = review_report.verdict
         followup_findings = tuple(
             finding for finding in review_report.findings if finding.severity == "FOLLOWUP"
         )
@@ -5219,7 +5290,11 @@ def _resolve_review_state(
 
         verify_timeout_only_reviews: list[DbTask] = []
         for review_task in completed_reviews:
-            review_content = _get_review_output_content(config, review_task)
+            review_content = (
+                latest_review_output_content
+                if review_task.id == latest_completed_review.id
+                else _get_review_output_content(config, review_task)
+            )
             if not is_verify_timeout_only_review(review_content):
                 break
             verify_timeout_only_reviews.append(review_task)
@@ -5233,6 +5308,7 @@ def _resolve_review_state(
             impl_task=task,
             completed_reviews=completed_reviews,
             latest_completed_review=latest_completed_review,
+            latest_review_output_content=latest_review_output_content,
         )
 
     max_failed_closing_review_retries = int(
@@ -5257,6 +5333,7 @@ def _resolve_review_state(
         reused_investigation_task_ids,
         review_verdict,
         review_report,
+        latest_review_output_content,
         latest_review_blocker_summary,
         followup_findings,
         recent_verify_timeout_only_reviews,
@@ -5281,6 +5358,8 @@ def _resolve_review_state(
         closing_review_action,
         off_topic_verify_clearance_candidate,
         sibling_review_attention_candidate,
+        capped_review_content_error_reason,
+        capped_review_content_error,
     )
 
 
@@ -5445,33 +5524,40 @@ def _review_blocker_summary_matches_parsed_blockers(
     )
 
 
-def _eligible_capped_review_blockers_for_merge(ctx: AdvanceContext) -> tuple[ReviewFinding, ...] | None:
+def _eligible_capped_review_blockers_for_merge(
+    ctx: AdvanceContext,
+    *,
+    persisted_review_output: str | None = None,
+) -> tuple[ReviewFinding, ...]:
     review_task = ctx.latest_completed_review
     if review_task is None:
-        return None
-    persisted_review_output = get_review_content(Path(ctx.config.project_dir), review_task)
+        raise ValueError("latest completed review is unavailable")
+    if persisted_review_output is None:
+        persisted_review_output = get_review_content(Path(ctx.config.project_dir), review_task)
     if not isinstance(persisted_review_output, str) or not persisted_review_output.strip():
-        return None
+        raise ValueError("persisted review output is missing or blank")
 
     parsed_report = parse_review_report(persisted_review_output)
     parsed_blockers = tuple(finding for finding in parsed_report.findings if finding.severity == "BLOCKER")
     if not _review_blocker_summary_matches_parsed_blockers(ctx.latest_review_blocker_summary, parsed_blockers):
-        return None
+        raise ValueError("parsed blocker findings do not match review blocker summary")
 
-    try:
-        return validate_capped_review_blocker_action(
-            ctx.store,
-            config=ctx.config,
-            review_task=review_task,
-            findings=parsed_blockers,
-            persisted_review_output=persisted_review_output,
-        )
-    except ValueError:
-        return None
+    return validate_capped_review_blocker_action(
+        ctx.store,
+        config=ctx.config,
+        review_task=review_task,
+        findings=parsed_blockers,
+        persisted_review_output=persisted_review_output,
+        authoritative_review_output=persisted_review_output,
+    )
 
 
-def review_max_cycles_merge_candidate(ctx: AdvanceContext) -> bool:
-    """Return whether a capped ordinary review may seek merge authority after verify."""
+def _review_max_cycles_base_merge_candidate(
+    ctx: AdvanceContext,
+    *,
+    require_changes_requested_verdict: bool = True,
+) -> bool:
+    """Return whether non-content capped-review authority checks pass."""
     if getattr(ctx.config, "on_max_cycles", "park") != "merge_and_defer":
         return False
     if not _is_implementation_owned_lineage(ctx):
@@ -5480,7 +5566,7 @@ def review_max_cycles_merge_candidate(ctx: AdvanceContext) -> bool:
         return False
     if ctx.review_cleared or ctx.review_blockers_revalidated:
         return False
-    if ctx.review_verdict != "CHANGES_REQUESTED":
+    if require_changes_requested_verdict and ctx.review_verdict != "CHANGES_REQUESTED":
         return False
     if ctx.completed_review_cycles < ctx.max_review_cycles:
         return False
@@ -5510,9 +5596,135 @@ def review_max_cycles_merge_candidate(ctx: AdvanceContext) -> bool:
         return False
     if ctx.duplicate_blocker_streak is not None:
         return False
-    if _eligible_capped_review_blockers_for_merge(ctx) is None:
-        return False
     return True
+
+
+def _resolve_capped_review_merge_payload(
+    ctx: AdvanceContext,
+) -> tuple[CappedReviewMergePayload | None, str | None, str | None]:
+    """Resolve the single persisted review snapshot used by capped merge planning."""
+    if not _review_max_cycles_base_merge_candidate(ctx):
+        return None, None, None
+
+    review_task = ctx.latest_completed_review
+    if review_task is None:
+        return None, None, None
+    if ctx.capped_review_content_error is not None:
+        reason = ctx.capped_review_content_error_reason or PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE
+        return None, reason, ctx.capped_review_content_error
+    persisted_review_output = ctx.latest_review_output_content
+    if not isinstance(persisted_review_output, str) or not persisted_review_output.strip():
+        return (
+            None,
+            PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE,
+            "persisted review output is missing or blank",
+        )
+
+    try:
+        blocker_findings = _eligible_capped_review_blockers_for_merge(
+            ctx,
+            persisted_review_output=persisted_review_output,
+        )
+    except ValueError as exc:
+        return None, PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_INVALID, str(exc)
+    return (
+        CappedReviewMergePayload(
+            review_task=review_task,
+            persisted_review_output=persisted_review_output,
+            blocker_findings=blocker_findings,
+        ),
+        None,
+        None,
+    )
+
+
+def _review_max_cycles_needs_attention_action(ctx: AdvanceContext) -> dict[str, Any]:
+    return with_needs_attention(
+        {
+            "type": "max_cycles_reached",
+            "description": (
+                f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"
+            ),
+        },
+        reason=PARK_REASON_REVIEW_MAX_CYCLES_REACHED,
+        subject_task_id=ctx.task.id,
+    )
+
+
+def _review_max_cycles_action(ctx: AdvanceContext) -> dict[str, Any]:
+    config = getattr(ctx, "config", None)
+    if getattr(config, "on_max_cycles", "park") != "merge_and_defer":
+        return _review_max_cycles_needs_attention_action(ctx)
+
+    if _merge_source_unavailable_requires_manual_resolution(ctx):
+        return _merge_source_unavailable_manual_resolution_action(ctx)
+
+    if ctx.capped_review_content_error is not None:
+        reason = ctx.capped_review_content_error_reason or PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE
+        return with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": (
+                    "SKIP: capped review content could not be resolved for max-cycle "
+                    f"merge deferral: {ctx.capped_review_content_error}"
+                ),
+            },
+            reason=reason,
+            subject_task_id=ctx.task.id,
+        )
+
+    verify_decision = getattr(ctx, "verify_gate_decision", None)
+    if verify_decision is None or verify_decision.state != "passed":
+        return _review_max_cycles_needs_attention_action(ctx)
+
+    if not review_max_cycles_merge_candidate(ctx):
+        return _review_max_cycles_needs_attention_action(ctx)
+
+    payload = ctx.capped_review_merge_payload
+    if payload is None:
+        return _review_max_cycles_needs_attention_action(ctx)
+    review_task = payload.review_task
+    if review_task.id is None:
+        return _review_max_cycles_needs_attention_action(ctx)
+    persisted_review_output = payload.persisted_review_output
+    blocker_findings = payload.blocker_findings
+
+    return {
+        "type": "merge",
+        "description": "Merge and defer blockers after max review cycles",
+        "max_cycles_merge_and_defer": True,
+        "review_task": review_task,
+        "latest_review_task_id": review_task.id,
+        "latest_review_completed_at": review_task.completed_at.isoformat() if review_task.completed_at else None,
+        "latest_review_head_sha": ctx.latest_reviewed_head_sha,
+        "current_review_head_sha": ctx.current_review_head_sha,
+        "deferred_blocker_findings": blocker_findings,
+        "deferred_blocker_ids": tuple(finding.id for finding in blocker_findings),
+        "persisted_review_output": persisted_review_output,
+        "review_output": persisted_review_output,
+        "review_output_reference": review_task.report_file,
+        "max_cycles_audit": {
+            "reason": "review-max-cycles",
+            "policy": "merge_and_defer",
+            "completed_review_cycles": ctx.completed_review_cycles,
+            "max_review_cycles": ctx.max_review_cycles,
+            "verify_gate_state": verify_decision.state,
+            "verify_epoch": verify_decision.current_epoch,
+        },
+    }
+
+
+def review_max_cycles_merge_candidate(ctx: AdvanceContext) -> bool:
+    """Return whether a capped ordinary review may seek merge authority after verify."""
+    return _review_max_cycles_base_merge_candidate(ctx) and ctx.capped_review_merge_payload is not None
+
+
+def _review_max_cycles_content_unavailable_candidate(ctx: AdvanceContext) -> bool:
+    """Return whether a capped lineage should surface missing review content explicitly."""
+    return (
+        ctx.capped_review_content_error_reason == PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE
+        and _review_max_cycles_base_merge_candidate(ctx, require_changes_requested_verdict=False)
+    )
 
 
 def has_current_passing_verify_for_merge(ctx: AdvanceContext) -> bool:
@@ -6758,7 +6970,11 @@ def _resolve_pre_closing_review_git_context(
                 ctx = replace(ctx, active_review=None)
 
     if (
-        ctx.review_verdict == "CHANGES_REQUESTED"
+        (
+            ctx.review_verdict == "CHANGES_REQUESTED"
+            or ctx.capped_review_content_error_reason
+            == PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE
+        )
         and review_root_task.id is not None
         and ctx.latest_completed_review is not None
     ):
@@ -6878,6 +7094,12 @@ def _resolve_post_closing_review_git_context(
                 for rebase in rebase_children
                 if rebase.status == "completed" and rebase.completed_at is not None
             ],
+            latest_report=(
+                ctx.review_report
+                if ctx.latest_completed_review is not None
+                and ctx.latest_completed_review.output_content is None
+                else None
+            ),
         )
         if review_blocker_adjudication_candidate is None:
             review_blocker_adjudication_candidate = _duplicate_blocker_adjudication_candidate_for_review(
@@ -7187,6 +7409,7 @@ def resolve_advance_context(
         reused_investigation_task_ids,
         review_verdict,
         review_report,
+        latest_review_output_content,
         latest_review_blocker_summary,
         followup_findings,
         recent_verify_timeout_only_reviews,
@@ -7211,6 +7434,8 @@ def resolve_advance_context(
         closing_review_action,
         off_topic_verify_clearance_candidate,
         sibling_review_attention_candidate,
+        capped_review_content_error_reason,
+        capped_review_content_error,
     ) = _resolve_review_state(
         config,
         store,
@@ -7255,6 +7480,7 @@ def resolve_advance_context(
         reused_investigation_task_ids=reused_investigation_task_ids,
         review_verdict=review_verdict,
         review_report=review_report,
+        latest_review_output_content=latest_review_output_content,
         latest_review_blocker_summary=latest_review_blocker_summary,
         followup_findings=followup_findings,
         recent_verify_timeout_only_reviews=recent_verify_timeout_only_reviews,
@@ -7278,6 +7504,8 @@ def resolve_advance_context(
         has_fresh_unresolved_comments_since_latest_review=has_fresh_unresolved_comments_since_latest_review,
         closing_review_action=closing_review_action,
         off_topic_verify_clearance_candidate=off_topic_verify_clearance_candidate,
+        capped_review_content_error=capped_review_content_error,
+        capped_review_content_error_reason=capped_review_content_error_reason,
     )
     ctx = _resolve_pre_closing_review_git_context(
         ctx,
@@ -7286,6 +7514,17 @@ def resolve_advance_context(
         git,
         target_branch,
         persist_post_merge_rebase_state=persist_post_merge_rebase_state,
+    )
+    capped_review_merge_payload, capped_review_content_error_reason, capped_review_content_error = (
+        _resolve_capped_review_merge_payload(ctx)
+    )
+    ctx = replace(
+        ctx,
+        capped_review_merge_payload=capped_review_merge_payload,
+        capped_review_content_error=capped_review_content_error or ctx.capped_review_content_error,
+        capped_review_content_error_reason=(
+            capped_review_content_error_reason or ctx.capped_review_content_error_reason
+        ),
     )
     verify_owner_task = _verify_gate_owner_task(ctx)
     if verify_owner_task is not None:
@@ -8431,19 +8670,13 @@ ADVANCE_RULES: list[AdvanceRule] = [
     AdvanceRule(
         name="review_max_cycles",
         matches=lambda ctx: (not ctx.review_cleared)
-        and ctx.review_verdict == "CHANGES_REQUESTED"
+        and (
+            ctx.review_verdict == "CHANGES_REQUESTED"
+            or _review_max_cycles_content_unavailable_candidate(ctx)
+        )
         and ctx.completed_review_cycles >= ctx.max_review_cycles
         and not ctx.review_blockers_revalidated,
-        action=lambda ctx: with_needs_attention(
-            {
-                "type": "max_cycles_reached",
-                "description": (
-                    f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"
-                ),
-            },
-            reason=PARK_REASON_REVIEW_MAX_CYCLES_REACHED,
-            subject_task_id=ctx.task.id,
-        ),
+        action=_review_max_cycles_action,
     ),
     AdvanceRule(
         name="review_create_improve",
