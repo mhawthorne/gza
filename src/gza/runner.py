@@ -3425,6 +3425,16 @@ def _extract_review_verify_phase_results(output: str | None) -> list[dict[str, A
     return phases
 
 
+def _review_verify_tree_fingerprint(result: ReviewVerifyResult | None) -> str | None:
+    if result is None:
+        return None
+    for phase in reversed(_extract_review_verify_phase_results(result.output)):
+        value = phase.get("tree_fingerprint")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 def _store_review_verify_artifact_records(
     task: Task,
     config: Config,
@@ -3578,7 +3588,7 @@ def _build_verify_gate_provenance(
     timeout_grace_seconds: float | None,
     project_results: tuple[ProjectVerificationResult, ...],
 ) -> dict[str, Any]:
-    return {
+    provenance = {
         "command_identity": normalized_verify_command(result.command),
         "reviewed_branch": result.reviewed_branch,
         "reviewed_head_sha": result.reviewed_head_sha,
@@ -3591,6 +3601,10 @@ def _build_verify_gate_provenance(
             "cross_project": bool(project_results),
         },
     }
+    tree_fingerprint = _review_verify_tree_fingerprint(result)
+    if tree_fingerprint is not None:
+        provenance["tree_fingerprint"] = tree_fingerprint
+    return provenance
 
 
 def _build_cross_project_verify_aggregate_details(
@@ -3624,6 +3638,37 @@ def _build_cross_project_verify_aggregate_details(
         if failed_origins and all(origin == "timeout" for origin in failed_origins)
         else ("test_failure" if failed_origins else None)
     )
+    phase_results: list[dict[str, Any]] = []
+    for entry in project_results:
+        if entry.result is None:
+            continue
+        tree_fingerprint = _review_verify_tree_fingerprint(entry.result)
+        phase_results.append(
+            {
+                "scope": entry.scope,
+                "tree_fingerprint": tree_fingerprint,
+            }
+        )
+    fingerprints = [
+        phase["tree_fingerprint"]
+        for phase in phase_results
+        if isinstance(phase.get("tree_fingerprint"), str) and phase["tree_fingerprint"]
+    ]
+    missing_fingerprint_count = runnable_count - len(fingerprints)
+    supplied_fingerprints_agree = bool(fingerprints) and all(
+        fingerprint == fingerprints[-1] for fingerprint in fingerprints
+    )
+    tree_fingerprint_complete = (
+        runnable_count > 0
+        and len(phase_results) == runnable_count
+        and missing_fingerprint_count == 0
+        and supplied_fingerprints_agree
+    )
+    tree_fingerprint = (
+        phase_results[-1]["tree_fingerprint"]
+        if tree_fingerprint_complete
+        else None
+    )
     return {
         "affected_scope_count": len(project_results),
         "runnable_count": runnable_count,
@@ -3632,6 +3677,12 @@ def _build_cross_project_verify_aggregate_details(
         "unavailable_count": unavailable_count,
         "skipped_count": skipped_count,
         "failure_origin": aggregate_failure_origin,
+        "tree_fingerprint": tree_fingerprint,
+        "tree_fingerprint_complete": tree_fingerprint_complete,
+        "tree_fingerprint_present_count": len(fingerprints),
+        "tree_fingerprint_missing_count": missing_fingerprint_count,
+        "tree_fingerprint_contradictory": bool(fingerprints) and not supplied_fingerprints_agree,
+        "phase_results": phase_results,
         "scopes": [
             {
                 "scope": entry.scope,

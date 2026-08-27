@@ -237,6 +237,51 @@ def _coerce_failure_origin(result_payload: dict[str, Any]) -> str | None:
     return INVALID_STRUCTURED_FAILURE_ORIGIN
 
 
+def _first_present_str(*values: object) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _verify_gate_tree_fingerprint(
+    *,
+    provenance: dict[str, Any] | None,
+    aggregate_details: dict[str, Any] | None,
+) -> str | None:
+    """Return the exact tree fingerprint carried by canonical verify metadata."""
+    if isinstance(aggregate_details, dict):
+        value = aggregate_details.get("tree_fingerprint")
+        if _aggregate_tree_fingerprint_is_complete(aggregate_details) and isinstance(value, str) and value:
+            return value
+        return None
+    if isinstance(provenance, dict):
+        value = provenance.get("tree_fingerprint")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _aggregate_tree_fingerprint_is_complete(aggregate_details: dict[str, Any]) -> bool:
+    if aggregate_details.get("tree_fingerprint_complete") is True:
+        return True
+    phase_results = aggregate_details.get("phase_results")
+    runnable_count = aggregate_details.get("runnable_count")
+    if not isinstance(phase_results, list) or not isinstance(runnable_count, int) or isinstance(runnable_count, bool):
+        return False
+    if runnable_count <= 0 or len(phase_results) != runnable_count:
+        return False
+    fingerprints: list[str] = []
+    for phase in phase_results:
+        if not isinstance(phase, dict):
+            return False
+        value = phase.get("tree_fingerprint")
+        if not isinstance(value, str) or not value:
+            return False
+        fingerprints.append(value)
+    return bool(fingerprints) and all(fingerprint == fingerprints[-1] for fingerprint in fingerprints)
+
+
 def _artifact_verify_result(metadata: dict[str, Any]) -> VerifyGateResult | None:
     result_payload = metadata.get("result")
     if not isinstance(result_payload, dict):
@@ -785,6 +830,12 @@ def build_verify_gate_artifact_payload(
         "output_artifact_task_id": output_artifact_task_id,
         "output_artifact_path": output_artifact_path,
     }
+    tree_fingerprint = _verify_gate_tree_fingerprint(
+        provenance=provenance,
+        aggregate_details=aggregate_details,
+    )
+    if tree_fingerprint is not None:
+        payload["tree_fingerprint"] = tree_fingerprint
     if provenance is not None:
         payload["provenance"] = provenance
     if aggregate_details is not None:

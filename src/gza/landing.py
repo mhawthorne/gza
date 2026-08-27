@@ -5,7 +5,20 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, cast
+from pathlib import Path
+from typing import Any, Literal, Protocol, cast
+
+from gza.advance_engine import plan_manual_verify_gate_action
+from gza.cli.advance_executor import (
+    AdvanceActionExecutionContext,
+    AdvanceActionExecutionResult,
+    execute_advance_action,
+)
+from gza.db import SqliteTaskStore, Task as DbTask
+from gza.review_tasks import DuplicateReviewError, create_resolution_review_task, create_review_task
+from gza.review_verdict import get_review_report
+from gza.review_verify_state import VerifyGateDecision, resolve_verify_gate_decision
+from gza.watch_progress import review_matches_create_review_action
 
 LandingPolicyName = Literal["guarded", "strict"]
 LandingPhaseName = Literal[
@@ -75,6 +88,23 @@ LandingPolicyReasonCode = Literal[
     "required-review-unavailable",
     "nondeferrable-blocker",
     "policy-or-judge-refused",
+]
+LandingVerifyAcquisitionStatus = Literal["current_green", "ran_verify", "blocked"]
+LandingPostRebaseReviewStatus = Literal[
+    "not_required",
+    "reused_completed",
+    "pending",
+    "in_progress",
+    "created",
+    "blocked",
+]
+LandingPostRebaseReviewNeed = Literal["none", "resolution", "full"]
+LandingRebaseOutcomeKind = Literal[
+    "mechanical",
+    "no_op",
+    "provider_resolved",
+    "recovered",
+    "resumed",
 ]
 
 LANDING_PHASES: tuple[LandingPhaseName, ...] = (
@@ -327,6 +357,27 @@ class LandingVerifyEvidence:
 
 
 @dataclass(frozen=True)
+class LandingVerifyAcquisitionResult:
+    """Landing-specific lifecycle verify acquisition outcome."""
+
+    status: LandingVerifyAcquisitionStatus
+    evidence: LandingVerifyEvidence
+    action: dict[str, Any] | None = None
+    execution: AdvanceActionExecutionResult | None = None
+    blocked: LandBlocked | None = None
+
+    def __post_init__(self) -> None:
+        if self.status == "blocked" and self.blocked is None:
+            raise ValueError("blocked verify acquisition requires a landing block")
+        if self.status != "blocked" and self.blocked is not None:
+            raise ValueError("non-blocked verify acquisition cannot carry a landing block")
+        if self.status == "current_green" and self.action is not None:
+            raise ValueError("current-green verify acquisition should not carry an executed action")
+        if self.status == "ran_verify" and self.execution is None:
+            raise ValueError("ran verify acquisition requires execution evidence")
+
+
+@dataclass(frozen=True)
 class LandingOpenBlocker:
     """A current review blocker and its deterministic deferral classification."""
 
@@ -343,6 +394,95 @@ class LandingOpenBlocker:
         object.__setattr__(self, "finding_id", finding_id)
         object.__setattr__(self, "source", source)
         object.__setattr__(self, "fingerprint", fingerprint)
+
+
+@dataclass(frozen=True)
+class LandingPostRebaseReviewRequest:
+    """Inputs for landing's one-shot post-rebase review acquisition."""
+
+    impl_task: DbTask
+    source_head: str
+    target_head: str
+    pre_rebase_source_head: str | None = None
+    rebase_task: DbTask | None = None
+    rebase_outcome_identity: LandingRebaseOutcomeIdentity | None = None
+    rebase_outcome_kind: LandingRebaseOutcomeKind | str | None = None
+    changed_diff: bool | None = None
+    conflict_resolved: bool = False
+    resolution_provenance_complete: bool = True
+    review_budget_used: bool = False
+    trigger_source: str = "manual_land"
+
+
+@dataclass(frozen=True)
+class LandingPostRebaseReviewResult:
+    """Landing-specific post-rebase review acquisition outcome."""
+
+    status: LandingPostRebaseReviewStatus
+    need: LandingPostRebaseReviewNeed
+    review_task: DbTask | None = None
+    action: dict[str, Any] | None = None
+    review_budget_used: bool = False
+    blocked: LandBlocked | None = None
+
+    def __post_init__(self) -> None:
+        if self.status == "blocked" and self.blocked is None:
+            raise ValueError("blocked review acquisition requires a landing block")
+        if self.status != "blocked" and self.blocked is not None:
+            raise ValueError("non-blocked review acquisition cannot carry a landing block")
+        if self.status in {"pending", "in_progress", "created", "reused_completed"} and self.review_task is None:
+            raise ValueError("review-bearing acquisition status requires a review task")
+
+
+class LandingCreateReviewResult(Protocol):
+    status: str
+    review_task: DbTask | None
+    message: str
+
+
+@dataclass(frozen=True)
+class LandingRebaseOutcomeIdentity:
+    """Structured durable rebase outcome proof used before review carry-forward."""
+
+    outcome_id: str
+    outcome_kind: LandingRebaseOutcomeKind | str
+    attempted_source_head: str
+    attempted_target_head: str
+    live_source_head: str
+    live_target_head: str
+    target_contained: bool
+    provider_resolution_proof: bool
+    changed_diff: bool | None
+    no_op_subtype: LandingRebaseNoOpSubtype | str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "outcome_id", _normalize_required_ref(self.outcome_id, "rebase outcome ID"))
+        object.__setattr__(
+            self,
+            "attempted_source_head",
+            _normalize_required_ref(self.attempted_source_head, "rebase attempted source head"),
+        )
+        object.__setattr__(
+            self,
+            "attempted_target_head",
+            _normalize_required_ref(self.attempted_target_head, "rebase attempted target head"),
+        )
+        object.__setattr__(
+            self,
+            "live_source_head",
+            _normalize_required_ref(self.live_source_head, "rebase live source head"),
+        )
+        object.__setattr__(
+            self,
+            "live_target_head",
+            _normalize_required_ref(self.live_target_head, "rebase live target head"),
+        )
+
+
+LandingAdvanceExecutor = Callable[
+    [DbTask, dict[str, Any], AdvanceActionExecutionContext],
+    AdvanceActionExecutionResult,
+]
 
 
 @dataclass(frozen=True)
@@ -575,6 +715,355 @@ class _LandingParkClassification:
         return self.blocked is None
 
 
+def inspect_current_landing_verify_evidence(
+    store: SqliteTaskStore,
+    owner_task: DbTask,
+    *,
+    config: Any | None,
+    git: Any | None,
+    source_head: str | None = None,
+    gate_identity: str | None = None,
+    tree_fingerprint: str | None = None,
+) -> LandingVerifyEvidence:
+    """Return current canonical lifecycle verify evidence for landing.
+
+    This reads only the lifecycle verify-gate store. Rebase/provider-side verify
+    proof is intentionally not considered.
+    """
+
+    decision = resolve_verify_gate_decision(store, owner_task, config=config, git=git)
+    return _landing_verify_evidence_from_decision(
+        decision,
+        expected_source_head=source_head,
+        expected_gate_identity=gate_identity,
+        expected_tree_fingerprint=tree_fingerprint,
+    )
+
+
+def acquire_landing_verify_evidence(
+    store: SqliteTaskStore,
+    owner_task: DbTask,
+    *,
+    config: Any,
+    git: Any,
+    target_branch: str,
+    source_head: str | None = None,
+    gate_identity: str | None = None,
+    tree_fingerprint: str | None = None,
+    context: AdvanceActionExecutionContext,
+    execute_action: LandingAdvanceExecutor | None = None,
+    member_tasks: tuple[DbTask, ...] | None = None,
+) -> LandingVerifyAcquisitionResult:
+    """Acquire green lifecycle verify evidence with one shared direct action.
+
+    Missing or stale evidence is refreshed through the same direct verify action
+    used by advance. Red/unavailable evidence is returned as a typed block; this
+    helper never creates verify-fix or improve work.
+    """
+
+    initial = inspect_current_landing_verify_evidence(
+        store,
+        owner_task,
+        config=config,
+        git=git,
+        source_head=source_head,
+        gate_identity=gate_identity,
+        tree_fingerprint=tree_fingerprint,
+    )
+    if _landing_verify_evidence_is_current_green(initial):
+        return LandingVerifyAcquisitionResult("current_green", initial)
+    if initial.status not in {"missing", "stale"}:
+        return LandingVerifyAcquisitionResult(
+            "blocked",
+            initial,
+            blocked=LandBlocked(
+                "verify-unavailable-or-red",
+                "current green source verify evidence is unavailable",
+                _evidence_refs(owner_task.id, initial.epoch, initial.gate_identity, initial.tree_fingerprint, source_head),
+            ),
+        )
+
+    action = plan_manual_verify_gate_action(
+        config,
+        store,
+        git,
+        owner_task,
+        target_branch,
+        verify_owner_task=owner_task,
+        member_tasks=member_tasks,
+        selected_for_merge=True,
+    )
+    action_type = str(action.get("type") or "")
+    if action_type not in {"verify_gate", "reconcile_verify_gate_evidence"}:
+        return LandingVerifyAcquisitionResult(
+            "blocked",
+            initial,
+            action=action,
+            blocked=LandBlocked(
+                "verify-unavailable-or-red",
+                "shared lifecycle verify prerequisite is unavailable",
+                _evidence_refs(owner_task.id, action_type or None, source_head),
+            ),
+        )
+
+    executor = execute_action or (lambda task, planned_action, execution_context: execute_advance_action(
+        task=task,
+        action=planned_action,
+        context=execution_context,
+    ))
+    execution = executor(owner_task, action, context)
+    refreshed = inspect_current_landing_verify_evidence(
+        store,
+        owner_task,
+        config=config,
+        git=git,
+        source_head=source_head,
+        gate_identity=gate_identity,
+        tree_fingerprint=tree_fingerprint,
+    )
+    if _landing_verify_evidence_is_current_green(refreshed):
+        return LandingVerifyAcquisitionResult(
+            "ran_verify",
+            refreshed,
+            action=action,
+            execution=execution,
+        )
+    return LandingVerifyAcquisitionResult(
+        "blocked",
+        refreshed,
+        action=action,
+        execution=execution,
+        blocked=LandBlocked(
+            "verify-unavailable-or-red",
+            "current green source verify evidence is unavailable after shared verify",
+            _evidence_refs(owner_task.id, refreshed.epoch, refreshed.gate_identity, refreshed.tree_fingerprint, source_head),
+        ),
+    )
+
+
+def acquire_one_post_rebase_review(
+    store: SqliteTaskStore,
+    request: LandingPostRebaseReviewRequest,
+    *,
+    config: Any | None = None,
+    create_full_review: Callable[..., DbTask] = create_review_task,
+    create_resolution_review: Callable[..., DbTask] = create_resolution_review_task,
+) -> LandingPostRebaseReviewResult:
+    """Select or create landing's one allowed post-rebase review.
+
+    Conflict resolution forces resolution mode even when the diff is proven
+    unchanged. Changed or unknown diffs use resolution mode when provenance is
+    complete, otherwise a full current-head fallback. Matching pending or
+    in-progress reviews are reused only when mode and reviewed-head identity are
+    exact.
+    """
+
+    review_budget_used = request.review_budget_used
+    try:
+        source_head = _normalize_required_ref(request.source_head, "landing post-rebase source head")
+        target_head = _normalize_required_ref(request.target_head, "landing post-rebase target head")
+    except ValueError as exc:
+        return LandingPostRebaseReviewResult(
+            status="blocked",
+            need="full",
+            review_budget_used=review_budget_used,
+            blocked=LandBlocked(
+                "required-review-unavailable",
+                str(exc),
+                _evidence_refs(request.impl_task.id),
+            ),
+        )
+    need = _post_rebase_review_need(request, source_head=source_head, target_head=target_head)
+    if need == "none":
+        return LandingPostRebaseReviewResult(
+            status="not_required",
+            need="none",
+            review_budget_used=review_budget_used,
+        )
+    action = _post_rebase_review_action(request, need)
+    if action is None:
+        return LandingPostRebaseReviewResult(
+            status="blocked",
+            need=need,
+            review_budget_used=review_budget_used,
+            blocked=LandBlocked(
+                "required-review-unavailable",
+                "post-rebase review identity is unavailable",
+                _evidence_refs(request.impl_task.id, source_head, target_head),
+            ),
+        )
+
+    exact_active, incompatible_active = _select_active_landing_review(store, request.impl_task, action=action)
+    if incompatible_active is not None:
+        return LandingPostRebaseReviewResult(
+            status="blocked",
+            need=need,
+            action=action,
+            review_budget_used=review_budget_used,
+            blocked=LandBlocked(
+                "required-review-unavailable",
+                "active review does not match the required post-rebase review identity",
+                _evidence_refs(incompatible_active.id, request.impl_task.id, source_head),
+            ),
+        )
+    if exact_active is not None:
+        if _landing_review_matches_required_identity(
+            exact_active,
+            subject_task_id=request.impl_task.id or "",
+            action=action,
+            completed=False,
+        ):
+            status = "in_progress" if exact_active.status == "in_progress" else "pending"
+            return LandingPostRebaseReviewResult(
+                cast(LandingPostRebaseReviewStatus, status),
+                need,
+                review_task=exact_active,
+                action=action,
+                review_budget_used=True,
+            )
+
+    exact = _find_exact_landing_review(store, request.impl_task, action=action)
+    if exact is not None:
+        if exact.status == "completed":
+            verdict = _landing_review_verdict_from_task(config, exact)
+            if verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS", "CHANGES_REQUESTED"}:
+                return LandingPostRebaseReviewResult(
+                    status="reused_completed",
+                    need=need,
+                    review_task=exact,
+                    action=action,
+                    review_budget_used=review_budget_used,
+                )
+            return LandingPostRebaseReviewResult(
+                status="blocked",
+                need=need,
+                review_task=exact,
+                action=action,
+                review_budget_used=review_budget_used,
+                blocked=LandBlocked(
+                    "required-review-unavailable",
+                    "post-rebase review evidence is malformed or not merge-decision bearing",
+                    _evidence_refs(exact.id, source_head),
+                ),
+            )
+        if exact.status in {"failed", "stopped"}:
+            return LandingPostRebaseReviewResult(
+                status="blocked",
+                need=need,
+                review_task=exact,
+                action=action,
+                review_budget_used=review_budget_used,
+                blocked=LandBlocked(
+                    "required-review-unavailable",
+                    f"latest exact post-rebase review ended with terminal status {exact.status}",
+                    _evidence_refs(exact.id, source_head),
+                ),
+            )
+
+    if review_budget_used:
+        return LandingPostRebaseReviewResult(
+            status="blocked",
+            need=need,
+            action=action,
+            review_budget_used=review_budget_used,
+            blocked=LandBlocked(
+                "bounded-attempt-exhausted",
+                "landing post-rebase review budget is exhausted",
+                _evidence_refs(request.impl_task.id, source_head, target_head),
+            ),
+        )
+
+    try:
+        if need == "resolution":
+            if request.rebase_task is None:
+                raise ValueError("resolution review requires a rebase task")
+            review = create_resolution_review(
+                store,
+                request.impl_task,
+                config=config,
+                rebase_task=request.rebase_task,
+                resolved_head_sha=source_head,
+                resolved_target_sha=target_head,
+                trigger_source=request.trigger_source,
+            )
+        else:
+            review = create_full_review(
+                store,
+                request.impl_task,
+                config=config,
+                trigger_source=request.trigger_source,
+            )
+            review.review_verify_head_sha = source_head
+            store.update(review)
+    except DuplicateReviewError as exc:
+        active = exc.active_review
+        if _landing_review_matches_required_identity(
+            active,
+            subject_task_id=request.impl_task.id or "",
+            action=action,
+            completed=False,
+        ):
+            status = "in_progress" if active.status == "in_progress" else "pending"
+            return LandingPostRebaseReviewResult(
+                status=cast(LandingPostRebaseReviewStatus, status),
+                need=need,
+                review_task=active,
+                action=action,
+                review_budget_used=True,
+            )
+        return LandingPostRebaseReviewResult(
+            status="blocked",
+            need=need,
+            action=action,
+            review_budget_used=review_budget_used,
+            blocked=LandBlocked(
+                "required-review-unavailable",
+                "active review does not match the required post-rebase review identity",
+                _evidence_refs(active.id, request.impl_task.id, source_head),
+            ),
+        )
+    except ValueError as exc:
+        if need == "resolution":
+            fallback_request = LandingPostRebaseReviewRequest(
+                impl_task=request.impl_task,
+                source_head=source_head,
+                target_head=target_head,
+                pre_rebase_source_head=request.pre_rebase_source_head,
+                rebase_task=request.rebase_task,
+                changed_diff=request.changed_diff,
+                conflict_resolved=request.conflict_resolved,
+                resolution_provenance_complete=False,
+                review_budget_used=review_budget_used,
+                trigger_source=request.trigger_source,
+            )
+            return acquire_one_post_rebase_review(
+                store,
+                fallback_request,
+                config=config,
+                create_full_review=create_full_review,
+                create_resolution_review=create_resolution_review,
+            )
+        return LandingPostRebaseReviewResult(
+            status="blocked",
+            need=need,
+            action=action,
+            review_budget_used=review_budget_used,
+            blocked=LandBlocked(
+                "required-review-unavailable",
+                f"post-rebase review could not be created: {exc}",
+                _evidence_refs(request.impl_task.id, source_head, target_head),
+            ),
+        )
+
+    return LandingPostRebaseReviewResult(
+        status="created",
+        need=need,
+        review_task=review,
+        action=action,
+        review_budget_used=True,
+    )
+
+
 def dry_run_steps_until_boundary(
     *,
     resolved: bool,
@@ -723,6 +1212,321 @@ def _normalize_required_ref(ref: str | None, label: str) -> str:
     if not refs:
         raise ValueError(f"{label} is required")
     return refs[0]
+
+
+def _landing_verify_evidence_from_decision(
+    decision: VerifyGateDecision,
+    *,
+    expected_source_head: str | None,
+    expected_gate_identity: str | None,
+    expected_tree_fingerprint: str | None,
+) -> LandingVerifyEvidence:
+    epoch = decision.current_epoch
+    result = decision.lookup.result
+    metadata = decision.lookup.artifact_metadata
+    gate_identity = _verify_gate_identity(epoch)
+    tree_fingerprint = _verify_tree_fingerprint(metadata)
+    current = decision.state == "passed"
+    identity_matched = current
+    if expected_source_head is not None:
+        identity_matched = identity_matched and epoch is not None and epoch.reviewed_head_sha == expected_source_head
+    if expected_gate_identity is not None:
+        identity_matched = identity_matched and gate_identity == expected_gate_identity
+    if expected_tree_fingerprint is not None:
+        identity_matched = identity_matched and tree_fingerprint == expected_tree_fingerprint
+    status = cast(LandingVerifyStatus, decision.state if decision.state in {"passed", "failed", "stale", "unavailable", "missing"} else "missing")
+    if result is not None and result.status not in {"passed", "failed", "unavailable"}:
+        status = "malformed"
+        current = False
+        identity_matched = False
+    return LandingVerifyEvidence(
+        status=status,
+        current=current,
+        identity_matched=identity_matched,
+        epoch=_verify_epoch_identity(epoch),
+        gate_identity=gate_identity,
+        tree_fingerprint=tree_fingerprint,
+    )
+
+
+def _landing_verify_evidence_is_current_green(evidence: LandingVerifyEvidence) -> bool:
+    return (
+        evidence.status == "passed"
+        and evidence.current
+        and evidence.identity_matched
+        and bool(evidence.epoch)
+        and bool(evidence.gate_identity)
+        and bool(evidence.tree_fingerprint)
+    )
+
+
+def _verify_epoch_identity(epoch: Any | None) -> str | None:
+    if epoch is None:
+        return None
+    return json.dumps(
+        {
+            "branch": getattr(epoch, "reviewed_branch", None),
+            "head": getattr(epoch, "reviewed_head_sha", None),
+            "command": getattr(epoch, "verify_command", None),
+            "timeout": getattr(epoch, "verify_timeout_seconds", None),
+            "grace": getattr(epoch, "verify_timeout_grace_seconds", None),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _verify_gate_identity(epoch: Any | None) -> str | None:
+    if epoch is None:
+        return None
+    return json.dumps(
+        {
+            "command": getattr(epoch, "verify_command", None),
+            "timeout": getattr(epoch, "verify_timeout_seconds", None),
+            "grace": getattr(epoch, "verify_timeout_grace_seconds", None),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _verify_tree_fingerprint(metadata: dict[str, Any] | None) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    aggregate = metadata.get("aggregate_details")
+    if isinstance(aggregate, dict):
+        value = aggregate.get("tree_fingerprint")
+        if _aggregate_tree_fingerprint_is_complete(aggregate) and isinstance(value, str) and value:
+            return value
+        return None
+    value = metadata.get("tree_fingerprint")
+    if isinstance(value, str) and value:
+        return value
+    provenance = metadata.get("provenance")
+    if isinstance(provenance, dict):
+        value = provenance.get("tree_fingerprint")
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _aggregate_tree_fingerprint_is_complete(aggregate: dict[str, Any]) -> bool:
+    if aggregate.get("tree_fingerprint_complete") is True:
+        return True
+    phase_results = aggregate.get("phase_results")
+    runnable_count = aggregate.get("runnable_count")
+    if not isinstance(phase_results, list) or not isinstance(runnable_count, int) or isinstance(runnable_count, bool):
+        return False
+    if runnable_count <= 0 or len(phase_results) != runnable_count:
+        return False
+    fingerprints = []
+    for phase in phase_results:
+        if not isinstance(phase, dict):
+            return False
+        value = phase.get("tree_fingerprint")
+        if not isinstance(value, str) or not value:
+            return False
+        fingerprints.append(value)
+    return bool(fingerprints) and all(fingerprint == fingerprints[-1] for fingerprint in fingerprints)
+
+
+def _post_rebase_review_need(
+    request: LandingPostRebaseReviewRequest,
+    *,
+    source_head: str | None = None,
+    target_head: str | None = None,
+) -> LandingPostRebaseReviewNeed:
+    outcome_kind = request.rebase_outcome_kind
+    if outcome_kind == "provider_resolved" or request.conflict_resolved:
+        return "resolution" if request.resolution_provenance_complete else "full"
+    if outcome_kind in {"recovered", "resumed"}:
+        return "resolution" if request.resolution_provenance_complete else "full"
+    if outcome_kind not in {"mechanical", "no_op"}:
+        if request.changed_diff is False:
+            return "full"
+        return "resolution" if request.resolution_provenance_complete else "full"
+    if (
+        request.changed_diff is False
+        and source_head is not None
+        and target_head is not None
+        and _valid_post_rebase_carry_forward_identity(request, source_head=source_head, target_head=target_head)
+    ):
+        return "none"
+    return "full"
+
+
+def _valid_post_rebase_carry_forward_identity(
+    request: LandingPostRebaseReviewRequest,
+    *,
+    source_head: str,
+    target_head: str,
+) -> bool:
+    identity = request.rebase_outcome_identity
+    if identity is None:
+        return False
+    if identity.live_source_head != source_head or identity.live_target_head != target_head:
+        return False
+    if identity.attempted_target_head != target_head:
+        return False
+    if identity.target_contained is not True:
+        return False
+    if identity.provider_resolution_proof is not False:
+        return False
+    if identity.changed_diff is not False or request.changed_diff is not False:
+        return False
+    if identity.outcome_kind == "mechanical":
+        try:
+            pre_rebase_source_head = _normalize_required_ref(
+                request.pre_rebase_source_head,
+                "landing pre-rebase source head",
+            )
+        except ValueError:
+            return False
+        return (
+            request.rebase_outcome_kind == "mechanical"
+            and identity.no_op_subtype is None
+            and identity.attempted_source_head == pre_rebase_source_head
+        )
+    if identity.outcome_kind != "no_op" or request.rebase_outcome_kind != "no_op":
+        return False
+    if identity.no_op_subtype not in {
+        "already_contained",
+        "superseded_contained",
+        "unchanged_target",
+        "moot",
+    }:
+        return False
+    return identity.attempted_source_head == source_head
+
+
+def _post_rebase_review_action(
+    request: LandingPostRebaseReviewRequest,
+    need: LandingPostRebaseReviewNeed,
+) -> dict[str, Any] | None:
+    if need == "none":
+        return None
+    try:
+        source_head = _normalize_required_ref(request.source_head, "landing post-rebase source head")
+        target_head = _normalize_required_ref(request.target_head, "landing post-rebase target head")
+    except ValueError:
+        return None
+    if need == "full":
+        return {
+            "type": "create_review",
+            "review_head_sha": source_head,
+        }
+    if request.rebase_task is None or not request.rebase_task.id:
+        return None
+    return {
+        "type": "create_review",
+        "review_mode": "resolution",
+        "resolution_rebase_task_id": request.rebase_task.id,
+        "resolution_head_sha": source_head,
+        "resolution_target_sha": target_head,
+    }
+
+
+def _find_exact_landing_review(
+    store: SqliteTaskStore,
+    impl_task: DbTask,
+    *,
+    action: dict[str, Any],
+) -> DbTask | None:
+    if impl_task.id is None:
+        return None
+    candidates = [
+        review
+        for review in store.get_reviews_for_task(impl_task.id)
+        if review.status in {"completed", "failed", "stopped"}
+        and _landing_review_matches_required_identity(
+            review,
+            subject_task_id=impl_task.id,
+            action=action,
+            completed=review.status == "completed",
+        )
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda review: (review.completed_at or review.started_at or review.created_at, review.id or ""))
+
+
+def _select_active_landing_review(
+    store: SqliteTaskStore,
+    impl_task: DbTask,
+    *,
+    action: dict[str, Any],
+) -> tuple[DbTask | None, DbTask | None]:
+    if impl_task.id is None:
+        return None, None
+    candidates = [
+        review
+        for review in store.get_reviews_for_task(impl_task.id)
+        if review.status in {"pending", "in_progress"}
+    ]
+    if not candidates:
+        return None, None
+    exact: list[DbTask] = []
+    incompatible: list[DbTask] = []
+    for review in candidates:
+        if _landing_review_matches_required_identity(
+            review,
+            subject_task_id=impl_task.id,
+            action=action,
+            completed=False,
+        ):
+            exact.append(review)
+        else:
+            incompatible.append(review)
+    def latest(review: DbTask) -> tuple[Any, str]:
+        return review.started_at or review.created_at, review.id or ""
+
+    if incompatible:
+        return None, max(incompatible, key=latest)
+    if exact:
+        return max(exact, key=latest), None
+    return None, None
+
+
+def _landing_review_matches_required_identity(
+    review: DbTask,
+    *,
+    subject_task_id: str,
+    action: dict[str, Any],
+    completed: bool,
+) -> bool:
+    if not subject_task_id:
+        return False
+    if not review_matches_create_review_action(review, subject_task_id=subject_task_id, action=action):
+        return False
+    review_mode = action.get("review_mode")
+    if review_mode == "resolution":
+        expected_head = action.get("resolution_head_sha")
+        if not isinstance(expected_head, str) or not expected_head.strip():
+            return False
+        actual_head = review.review_verify_head_sha
+        if actual_head is not None and actual_head != expected_head.strip():
+            return False
+        if completed and actual_head != expected_head.strip():
+            return False
+    else:
+        expected_head = action.get("review_head_sha")
+        if not isinstance(expected_head, str) or not expected_head.strip():
+            return False
+        if review.review_verify_head_sha != expected_head.strip():
+            return False
+    return True
+
+
+def _landing_review_verdict_from_task(config: Any | None, review: DbTask) -> str | None:
+    if review.output_content:
+        try:
+            return get_review_report(Path(getattr(config, "project_dir", ".")), review).verdict
+        except Exception:
+            return None
+    try:
+        return get_review_report(Path(getattr(config, "project_dir", ".")), review).verdict
+    except Exception:
+        return None
 
 
 def _blocker_fingerprint(blocker: LandingOpenBlocker) -> str:
