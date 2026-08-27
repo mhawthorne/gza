@@ -293,7 +293,10 @@ and dispatch stops only when aggregate capacity or eligible heads are exhausted.
   healthy selected project in deterministic selector order before the first mutation or
   preview that assumes exclusivity. A startup lease conflict for any otherwise valid
   selected project MUST abort the requested healthy set and release leases already
-  acquired; the supervisor MUST NOT silently run a surprising subset.
+  acquired; the supervisor MUST NOT silently run a surprising subset. When the same
+  startup selection also contains preflight-disabled projects, the supervisor MUST surface
+  each disabled project's typed diagnostic together with the lease-conflict error instead
+  of suppressing either class of startup failure.
 - Invalid or unhealthy projects are represented explicitly as runtime states with
   explicit capabilities:
   - `enabled`: config is valid and the lease is owned. The runtime MAY perform normal

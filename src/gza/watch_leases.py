@@ -81,6 +81,7 @@ class WatchLeaseConflict(RuntimeError):
         self.target = target
         self.target_key = target.key
         self.project_id = target.store.project_id
+        self.watch_disabled_projects: tuple[object, ...] = ()
         super().__init__(
             f"watch-supervisor lease for project {self.project_id!r} "
             f"({self.target_key}) is held by another live owner"

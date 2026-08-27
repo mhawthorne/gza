@@ -2700,6 +2700,96 @@ def test_cmd_watch_multi_project_lease_conflict_rolls_back_prior_selector(
     ) is None
 
 
+@pytest.mark.parametrize("invalid_position", ["before_conflict", "after_conflict"])
+def test_cmd_watch_multi_project_lease_conflict_prints_preflight_disabled_project(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    invalid_position: str,
+) -> None:
+    anchor_dir = tmp_path / "anchor"
+    bad_dir = tmp_path / "bad"
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_db = tmp_path / "first.db"
+    second_db = tmp_path / "second.db"
+    _write_watch_runtime_project_config(
+        anchor_dir,
+        project_name="Anchor",
+        project_id="anchor",
+        project_prefix="anchor",
+        db_path=tmp_path / "anchor.db",
+    )
+    bad_dir.mkdir()
+    _write_watch_runtime_project_config(
+        first_dir,
+        project_name="First",
+        project_id="first",
+        project_prefix="first",
+        db_path=first_db,
+    )
+    _write_watch_runtime_project_config(
+        second_dir,
+        project_name="Second",
+        project_id="second",
+        project_prefix="second",
+        db_path=second_db,
+    )
+    first_store = SqliteTaskStore(first_db, prefix="first", project_id="first")
+    second_store = SqliteTaskStore(second_db, prefix="second", project_id="second")
+    assert second_store.try_acquire_project_lease(
+        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+        owner_pid=os.getpid(),
+        owner_token="blocking-watch",
+    ) is not None
+    if invalid_position == "before_conflict":
+        watch_projects = [f"bad={bad_dir}", f"first={first_dir}", f"second={second_dir}"]
+    else:
+        watch_projects = [f"first={first_dir}", f"second={second_dir}", f"bad={bad_dir}"]
+    args = _watch_args(
+        anchor_dir,
+        [],
+        watch_projects=watch_projects,
+        watch_lease_token="fleet-token",
+    )
+
+    with (
+        patch(
+            "gza.cli.watch.ExecutionProjectResolved.open_runtime_store",
+            side_effect=AssertionError("conflicted startup must not activate runtimes"),
+        ) as open_runtime_store,
+        patch("gza.cli.watch.Git", side_effect=AssertionError("conflicted startup must not open Git")),
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "Disabled watch project" in captured.out
+    assert "selector='bad'" in captured.out
+    assert "reason=missing_config" in captured.out
+    assert f"root={bad_dir}" in captured.out
+    assert f"config={bad_dir / 'gza.yaml'}" in captured.out
+    assert "watch-supervisor lease" in captured.out
+    assert "(second)" in captured.out
+    open_runtime_store.assert_not_called()
+    assert not (anchor_dir / ".gza" / "watch.log").exists()
+    assert not (bad_dir / ".gza" / "watch.log").exists()
+    assert not (first_dir / ".gza" / "watch.log").exists()
+    assert not (second_dir / ".gza" / "watch.log").exists()
+    _assert_watch_supervisor_lease_can_be_acquired(first_store, f"after-first-rollback-{invalid_position}")
+    assert (
+        second_store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token=f"after-second-conflict-{invalid_position}",
+        )
+        is None
+    )
+    assert second_store.release_project_lease(
+        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+        owner_token="blocking-watch",
+    )
+
+
 def test_cmd_watch_multi_project_path_resolution_conflict_does_not_mutate_anchor_store(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

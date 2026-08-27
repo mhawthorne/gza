@@ -8414,6 +8414,22 @@ def _disabled_watch_project_from_lease_conflict(
     )
 
 
+def _attach_disabled_watch_projects_to_lease_conflict(
+    exc: WatchLeaseConflict,
+    disabled_projects: tuple[ExecutionProjectDisabled, ...],
+) -> WatchLeaseConflict:
+    exc.watch_disabled_projects = disabled_projects
+    return exc
+
+
+def _watch_lease_conflict_disabled_projects(exc: WatchLeaseConflict) -> tuple[ExecutionProjectDisabled, ...]:
+    return tuple(
+        disabled
+        for disabled in exc.watch_disabled_projects
+        if isinstance(disabled, ExecutionProjectDisabled)
+    )
+
+
 def acquire_watch_supervisor_selection_leases(
     *,
     anchor_store: SqliteTaskStore,
@@ -8444,13 +8460,16 @@ def acquire_watch_supervisor_selection_leases(
     retained_existing_key_tuple: tuple[str, ...] = ()
     if activation_candidates:
         if existing_lease_set is None:
-            lease_set = acquire_watch_project_leases(
-                [
-                    WatchLeaseTarget(candidate.project.key, candidate.lease_store)
-                    for candidate in activation_candidates
-                ],
-                owner_token=owner_token,
-            )
+            try:
+                lease_set = acquire_watch_project_leases(
+                    [
+                        WatchLeaseTarget(candidate.project.key, candidate.lease_store)
+                        for candidate in activation_candidates
+                    ],
+                    owner_token=owner_token,
+                )
+            except WatchLeaseConflict as exc:
+                raise _attach_disabled_watch_projects_to_lease_conflict(exc, disabled_projects) from exc
         else:
             remaining_candidates = list(activation_candidates)
             disabled_list = list(disabled_projects)
@@ -16817,6 +16836,8 @@ def cmd_watch(args: argparse.Namespace) -> int:
             for disabled in lease_acquisition.disabled:
                 print(_format_disabled_watch_project(disabled))
         except WatchLeaseConflict as exc:
+            for disabled in _watch_lease_conflict_disabled_projects(exc):
+                print(_format_disabled_watch_project(disabled))
             print(f"Error: {exc}")
             multi_project_result_code = 1
         except _MultiProjectEarlyResult:
