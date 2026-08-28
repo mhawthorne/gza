@@ -16,7 +16,6 @@ import pytest
 
 import gza.concurrency as concurrency_module
 import gza.workers as workers_module
-from checks.unit_suite_boundary import DEFAULT_PATHS, find_unit_suite_boundary_violations
 from gza.pytest_timeout_diagnostics import positive_int_env, register_sigterm_faulthandler
 from tests.helpers.env import COLOR_FORCING_ENV_VARS
 
@@ -196,20 +195,11 @@ def install_unit_runtime_subprocess_guard(
     return stack
 
 
-def pytest_sessionstart(session: pytest.Session) -> None:
-    """Fail fast if shell-backed CLI coverage drifts into the unit suite."""
-    del session
-    tests_root = DEFAULT_PATHS[0]
-    violations = find_unit_suite_boundary_violations(tests_root)
-    if not violations:
-        return
-
-    formatted = "\n".join(f"  - {violation.format()}" for violation in violations)
-    raise pytest.UsageError(
-        "Unit-suite boundary violation(s) detected. Use invoke_gza for in-process CLI coverage and "
-        "move any subprocess-backed test to tests_functional/.\n"
-        f"{formatted}"
-    )
+# The unit-suite boundary rule is NOT enforced here. `checks/unit_suite_boundary.py`
+# exports `check_file`, so `checks/__main__.py` auto-registers it and the `checks`
+# verify phase already runs the identical rule over the same `tests/` tree. Running
+# it again from pytest_sessionstart re-parsed every unit test file with `ast` once
+# per xdist worker on every unit run, for no additional coverage.
 
 
 def pytest_collection_modifyitems(items):
