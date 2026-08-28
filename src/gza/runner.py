@@ -15,9 +15,9 @@ import sys
 import tempfile
 import time
 import tomllib
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, cast
@@ -2849,6 +2849,77 @@ def resolve_backup_dir(db_path: Path, project_dir: Path) -> Path:
     return db_path.parent / "backups"
 
 
+BACKUP_NAME_RE = re.compile(r"^gza-(\d{10})\.db$")
+
+
+def parse_backup_stamp(name: str) -> datetime | None:
+    """Parse ``gza-YYYYMMDDHH.db`` into a datetime, or None if unrecognized."""
+    match = BACKUP_NAME_RE.match(name)
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%Y%m%d%H")
+    except ValueError:
+        return None
+
+
+def select_backups_to_prune(
+    names: Iterable[str],
+    now: datetime,
+    *,
+    hourly_hours: int,
+    intraday_days: int,
+    intraday_per_day: int,
+) -> list[str]:
+    """Return the snapshot names a tiered retention policy would drop.
+
+    Three tiers, youngest first:
+
+    - within ``hourly_hours``: keep every snapshot
+    - within ``intraday_days``: keep ``intraday_per_day`` evenly spaced per day
+    - older: keep one per day
+
+    Selection is keyed on the filename stamp rather than mtime, because mtime is
+    mutable and can drift from the hour the snapshot actually represents. Names
+    that do not parse are never pruned, so an unrecognized file is kept rather
+    than silently deleted.
+    """
+    # Fail closed: this drives deletion, so an unusable dial prunes nothing
+    # rather than pruning against a garbage window.
+    try:
+        hourly_hours = int(hourly_hours)
+        intraday_days = int(intraday_days)
+        intraday_per_day = int(intraday_per_day)
+    except (TypeError, ValueError):
+        return []
+
+    dated: list[tuple[datetime, str]] = []
+    for name in names:
+        stamp = parse_backup_stamp(name)
+        if stamp is not None:
+            dated.append((stamp, name))
+    dated.sort(reverse=True)
+
+    per_day = max(1, intraday_per_day)
+    bucket_hours = max(1, 24 // per_day)
+    hourly_cutoff = now - timedelta(hours=hourly_hours)
+    intraday_cutoff = now - timedelta(days=intraday_days)
+
+    kept_buckets: set[tuple[str, int]] = set()
+    prune: list[str] = []
+    for stamp, name in dated:
+        if stamp >= hourly_cutoff:
+            continue
+        day = stamp.strftime("%Y%m%d")
+        bucket = stamp.hour // bucket_hours if stamp >= intraday_cutoff else 0
+        key = (day, bucket)
+        if key in kept_buckets:
+            prune.append(name)
+        else:
+            kept_buckets.add(key)
+    return prune
+
+
 def backup_dir_size_bytes(backup_dir: Path) -> int:
     """Total bytes of the snapshot files in ``backup_dir`` (non-recursive)."""
     total = 0
@@ -2887,7 +2958,42 @@ def check_backup_dir_size(backup_dir: Path, warn_gb: int) -> str | None:
     )
 
 
-def backup_database(db_path: Path, project_dir: Path, warn_gb: int = 0) -> None:
+def prune_backup_dir(
+    backup_dir: Path,
+    *,
+    hourly_hours: int,
+    intraday_days: int,
+    intraday_per_day: int,
+    now: datetime | None = None,
+) -> list[str]:
+    """Apply tiered retention to ``backup_dir``, returning the names removed."""
+    try:
+        names = [e.name for e in os.scandir(backup_dir) if e.is_file(follow_symlinks=False)]
+    except OSError:
+        return []
+    doomed = select_backups_to_prune(
+        names,
+        now or datetime.now(),
+        hourly_hours=hourly_hours,
+        intraday_days=intraday_days,
+        intraday_per_day=intraday_per_day,
+    )
+    removed: list[str] = []
+    for name in doomed:
+        try:
+            (backup_dir / name).unlink()
+            removed.append(name)
+        except OSError as exc:
+            logger.warning("could not prune backup %s: %s", name, exc)
+    return removed
+
+
+def backup_database(
+    db_path: Path,
+    project_dir: Path,
+    warn_gb: int = 0,
+    retention: dict[str, int] | None = None,
+) -> None:
     """Create an hourly backup of the SQLite database if one doesn't exist yet.
 
     Checks if a backup for the current hour already exists. If not, creates
@@ -2914,7 +3020,17 @@ def backup_database(db_path: Path, project_dir: Path, warn_gb: int = 0) -> None:
     _backup_sqlite_file(db_path, backup_path)
 
     # Only reached when a new snapshot was written, so this runs at most once
-    # per hour rather than on every task launch.
+    # per hour rather than on every task launch. Pruning is automatic because a
+    # policy that only runs when an operator remembers to invoke it is how this
+    # directory reached hundreds of GB in the first place.
+    if retention is not None:
+        prune_backup_dir(
+            backup_dir,
+            hourly_hours=retention["hourly_hours"],
+            intraday_days=retention["intraday_days"],
+            intraday_per_day=retention["intraday_per_day"],
+        )
+
     warning = check_backup_dir_size(backup_dir, warn_gb)
     if warning:
         logger.warning(warning)
@@ -8659,7 +8775,16 @@ def run(
         runtime_context: Optional captured runtime cwd/env/identity bundle.
     """
     # Create hourly backup before running
-    backup_database(config.db_path, config.project_dir, config.backup_size_warn_gb)
+    backup_database(
+        config.db_path,
+        config.project_dir,
+        config.backup_size_warn_gb,
+        {
+            "hourly_hours": config.backup_retention_hourly_hours,
+            "intraday_days": config.backup_retention_intraday_days,
+            "intraday_per_day": config.backup_retention_intraday_per_day,
+        },
+    )
 
     # Load tasks from SQLite
     store = SqliteTaskStore.from_config(config)

@@ -462,6 +462,18 @@ provider: codex
 
 # --- Other ---
 
+# Keep every database backup newer than this many hours.
+# Default: 24
+# backup_retention_hourly_hours: 24
+
+# Thin backups to `backup_retention_intraday_per_day` within this many days.
+# Default: 7
+# backup_retention_intraday_days: 7
+
+# Backups kept per day inside the intraday window; one per day beyond it.
+# Default: 4
+# backup_retention_intraday_per_day: 4
+
 # Warn when database backups exceed this many GB (0 disables).
 # Default: 100
 # backup_size_warn_gb: 100

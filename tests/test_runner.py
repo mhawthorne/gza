@@ -26171,3 +26171,78 @@ def test_resolve_backup_dir_external_db(tmp_path):
     db.parent.mkdir(parents=True)
     db.write_bytes(b"")
     assert runner.resolve_backup_dir(db, tmp_path / "proj") == db.parent / "backups"
+
+
+def _names(*stamps):
+    return [f"gza-{s}.db" for s in stamps]
+
+
+def test_select_backups_keeps_everything_inside_hourly_window():
+    now = datetime(2026, 8, 28, 12)
+    names = _names("2026082810", "2026082811", "2026082812")
+    assert runner.select_backups_to_prune(
+        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
+    ) == []
+
+
+def test_select_backups_thins_intraday_window_to_per_day_quota():
+    now = datetime(2026, 8, 28, 12)
+    # Three snapshots inside one 6h bucket, 3 days back: only the newest survives.
+    names = _names("2026082500", "2026082501", "2026082502")
+    prune = runner.select_backups_to_prune(
+        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
+    )
+    assert sorted(prune) == sorted(_names("2026082500", "2026082501"))
+
+
+def test_select_backups_keeps_one_per_day_beyond_intraday_window():
+    now = datetime(2026, 8, 28, 12)
+    names = _names("2026080100", "2026080106", "2026080112", "2026080218")
+    prune = runner.select_backups_to_prune(
+        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
+    )
+    # One survivor per day; Aug 1 loses two of its three.
+    assert len(prune) == 2
+    assert "gza-2026080218.db" not in prune
+
+
+def test_select_backups_never_prunes_unparseable_names():
+    now = datetime(2026, 8, 28, 12)
+    names = ["notes.txt", "gza-backup.db", "gza-2026010100.db", "gza-2026010101.db"]
+    prune = runner.select_backups_to_prune(
+        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
+    )
+    assert "notes.txt" not in prune
+    assert "gza-backup.db" not in prune
+    assert len(prune) == 1
+
+
+def test_prune_backup_dir_removes_only_selected(tmp_path):
+    for stamp in ("2026010100", "2026010101", "2026010102"):
+        (tmp_path / f"gza-{stamp}.db").write_bytes(b"x")
+    keep = tmp_path / "keep.txt"
+    keep.write_bytes(b"x")
+    removed = runner.prune_backup_dir(
+        tmp_path,
+        hourly_hours=24,
+        intraday_days=7,
+        intraday_per_day=4,
+        now=datetime(2026, 8, 28, 12),
+    )
+    assert len(removed) == 2
+    assert keep.exists()
+    assert len(list(tmp_path.glob("gza-*.db"))) == 1
+
+
+def test_parse_backup_stamp_rejects_bad_names():
+    assert runner.parse_backup_stamp("gza-2026010100.db") == datetime(2026, 1, 1, 0)
+    assert runner.parse_backup_stamp("gza-2026013299.db") is None
+    assert runner.parse_backup_stamp("gza-20260101.db") is None
+
+
+def test_select_backups_prunes_nothing_for_non_numeric_dials():
+    now = datetime(2026, 8, 28, 12)
+    names = _names("2026010100", "2026010101")
+    assert runner.select_backups_to_prune(
+        names, now, hourly_hours=object(), intraday_days=7, intraday_per_day=4
+    ) == []

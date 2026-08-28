@@ -125,6 +125,9 @@ DEFAULT_MERGE_SQUASH_THRESHOLD = 0
 DEFAULT_MAIN_CHECKOUT_ISOLATE = False
 DEFAULT_CLEANUP_DAYS = 30
 DEFAULT_BACKUP_SIZE_WARN_GB = 100
+DEFAULT_BACKUP_RETENTION_HOURLY_HOURS = 24
+DEFAULT_BACKUP_RETENTION_INTRADAY_DAYS = 7
+DEFAULT_BACKUP_RETENTION_INTRADAY_PER_DAY = 4
 DEFAULT_QUIET_PERIOD_SECONDS = 300
 DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD = 500
 DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
@@ -167,7 +170,8 @@ VALID_CONFIG_FIELDS = {
     "advance_off_topic_verify_unblock",
     "plan_slice_target_timeout_minutes", "max_failed_closing_review_retries", "max_concurrent",
     "iterate_max_iterations", "watch", "interactive_worktree_dir",
-    "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "backup_size_warn_gb",
+    "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "backup_size_warn_gb", "backup_retention_hourly_hours",
+    "backup_retention_intraday_days", "backup_retention_intraday_per_day",
     "quiet_period_seconds",
     "review_diff_small_threshold",
     "review_diff_medium_threshold", "review_context_file_limit", "autonomous_verify_timeout_seconds",
@@ -291,6 +295,9 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "main_checkout_isolate": None,
     "cleanup_days": None,
     "backup_size_warn_gb": None,
+    "backup_retention_hourly_hours": None,
+    "backup_retention_intraday_days": None,
+    "backup_retention_intraday_per_day": None,
     "quiet_period_seconds": None,
     "review_diff_small_threshold": None,
     "review_diff_medium_threshold": None,
@@ -426,6 +433,9 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "main_checkout_isolate": None,
     "cleanup_days": None,
     "backup_size_warn_gb": None,
+    "backup_retention_hourly_hours": None,
+    "backup_retention_intraday_days": None,
+    "backup_retention_intraday_per_day": None,
     "quiet_period_seconds": None,
     "review_diff_small_threshold": None,
     "review_diff_medium_threshold": None,
@@ -1621,6 +1631,9 @@ class Config:
     iterate_max_iterations: int = DEFAULT_ITERATE_MAX_ITERATIONS
     cleanup_days: int = DEFAULT_CLEANUP_DAYS
     backup_size_warn_gb: int = DEFAULT_BACKUP_SIZE_WARN_GB
+    backup_retention_hourly_hours: int = DEFAULT_BACKUP_RETENTION_HOURLY_HOURS
+    backup_retention_intraday_days: int = DEFAULT_BACKUP_RETENTION_INTRADAY_DAYS
+    backup_retention_intraday_per_day: int = DEFAULT_BACKUP_RETENTION_INTRADAY_PER_DAY
     quiet_period_seconds: int = DEFAULT_QUIET_PERIOD_SECONDS
     review_diff_small_threshold: int = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
@@ -2967,6 +2980,30 @@ class Config:
             )
             or 0
         )
+        backup_retention_hourly_hours = (
+            _validate_non_negative_int_field(
+                data.get("backup_retention_hourly_hours", DEFAULT_BACKUP_RETENTION_HOURLY_HOURS),
+                "backup_retention_hourly_hours",
+            )
+            or 0
+        )
+        backup_retention_intraday_days = (
+            _validate_non_negative_int_field(
+                data.get("backup_retention_intraday_days", DEFAULT_BACKUP_RETENTION_INTRADAY_DAYS),
+                "backup_retention_intraday_days",
+            )
+            or 0
+        )
+        backup_retention_intraday_per_day = (
+            _validate_non_negative_int_field(
+                data.get(
+                    "backup_retention_intraday_per_day",
+                    DEFAULT_BACKUP_RETENTION_INTRADAY_PER_DAY,
+                ),
+                "backup_retention_intraday_per_day",
+            )
+            or 0
+        )
         quiet_period_seconds = _validate_non_negative_int_field(
             data.get("quiet_period_seconds", DEFAULT_QUIET_PERIOD_SECONDS),
             "quiet_period_seconds",
@@ -3297,6 +3334,9 @@ class Config:
             main_checkout_isolate=main_checkout_isolate,
             cleanup_days=cleanup_days,
             backup_size_warn_gb=backup_size_warn_gb,
+            backup_retention_hourly_hours=backup_retention_hourly_hours,
+            backup_retention_intraday_days=backup_retention_intraday_days,
+            backup_retention_intraday_per_day=backup_retention_intraday_per_day,
             quiet_period_seconds=quiet_period_seconds,
             review_diff_small_threshold=review_diff_small_threshold,
             review_diff_medium_threshold=review_diff_medium_threshold,
