@@ -5575,13 +5575,17 @@ def _review_max_cycles_base_merge_candidate(
     ctx: AdvanceContext,
     *,
     require_changes_requested_verdict: bool = True,
+    require_live_merge_source: bool = True,
 ) -> bool:
     """Return whether non-content capped-review authority checks pass."""
     if getattr(ctx.config, "on_max_cycles", "park") != "merge_and_defer":
         return False
     if not _is_implementation_owned_lineage(ctx):
         return False
-    if not _can_emit_live_merge_action(ctx):
+    if require_live_merge_source:
+        if not _can_emit_live_merge_action(ctx):
+            return False
+    elif not execution_status_allows_merge(ctx):
         return False
     if ctx.review_cleared or ctx.review_blockers_revalidated:
         return False
@@ -5772,7 +5776,11 @@ def _review_max_cycles_content_unavailable_candidate(ctx: AdvanceContext) -> boo
     """Return whether a capped lineage should surface missing review content explicitly."""
     return (
         ctx.capped_review_content_error_reason == PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE
-        and _review_max_cycles_base_merge_candidate(ctx, require_changes_requested_verdict=False)
+        and _review_max_cycles_base_merge_candidate(
+            ctx,
+            require_changes_requested_verdict=False,
+            require_live_merge_source=False,
+        )
     )
 
 

@@ -385,9 +385,11 @@ closed and be treated as changed.
   MUST still be current for the live implementation head and outside the plan
   cap, verify exhaustion, no-op improve, adjudication, duplicate-blocker, and
   spec-coherence lanes. Missing merge source or unavailable/invalid review
-  content MUST surface its own attention reason before verify handling. Missing
-  or stale verify evidence MUST run the normal pre-merge verify path; red or
-  unavailable evidence MUST remain on the existing verify-fix or attention path.
+  content MUST surface its own attention reason before verify handling; when
+  both source proof and review content are unavailable, missing merge source
+  MUST win with `merge-source-needs-manual-resolution`. Missing or stale verify
+  evidence MUST run the normal pre-merge verify path; red or unavailable
+  evidence MUST remain on the existing verify-fix or attention path.
 - `max_review_cycles` MUST count only completed review/improve cycles inside the current
   durable-progress epoch. The epoch resets only when persisted evidence shows a new
   reviewed head or other durable branch progress boundary; historical pre-boundary churn
@@ -572,7 +574,7 @@ When a current review exists for the implementation lineage:
   only when fresh green verify evidence and validated persisted `BLOCKER` metadata
   are available. Missing merge source or unavailable/invalid review content
   surfaces its own attention reason instead of falling through to the generic cap
-  park.
+  park; if both are present, missing merge source wins.
 - **A. Ordinary no-op improves do not bypass the two-gate model.** A no-op improve does
   not, by itself, authorize merge. If code changed, both the review gate and verify gate
   become stale and MUST be re-run in the normal order: verify first, then review.

@@ -5642,6 +5642,88 @@ def test_capped_review_invalid_utf8_report_needs_unavailable_attention_before_ve
     assert action["type"] not in {"merge", "verify_gate", "reconcile_verify_gate_evidence"}
 
 
+@pytest.mark.parametrize(
+    ("case", "expected_diagnostic"),
+    [
+        ("missing", "persisted review output is missing or blank"),
+        ("blank", "persisted review output is missing or blank"),
+        ("oserror", "OSError: cannot read review report"),
+        ("unicode", "UnicodeDecodeError"),
+    ],
+)
+def test_capped_review_unavailable_content_with_missing_merge_source_uses_source_attention(
+    tmp_path: Path,
+    monkeypatch,
+    case: str,
+    expected_diagnostic: str,
+) -> None:
+    from gza import advance_engine as advance_engine_module
+
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 0
+    config.verify_command = "./bin/tests"
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/capped-review-missing-source-{case}",
+        when=datetime(2026, 5, 10, 9, 0, tzinfo=UTC),
+    )
+    review = _add_completed_review(store, impl, when=datetime(2026, 5, 10, 10, 0, tzinfo=UTC))
+    review.review_verify_head_sha = "current-sha"
+    review.output_content = None
+    store.update(review)
+    report_path = tmp_path / str(review.report_file)
+
+    if case == "missing":
+        review.report_file = ".gza/missing-capped-review-output.md"
+        store.update(review)
+        report_path = tmp_path / str(review.report_file)
+    elif case == "blank":
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("   \n\t")
+    elif case == "oserror":
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(_review_output_with_findings("CHANGES_REQUESTED", blockers=("B1",)))
+        original_read_text = Path.read_text
+
+        def raise_for_report(path: Path, *args: object, **kwargs: object) -> str:
+            if path == report_path:
+                raise OSError("cannot read review report")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", raise_for_report)
+    elif case == "unicode":
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_bytes(b"\xff\xfe\xfa")
+
+    git = _FakeGit(
+        can_merge=True,
+        assume_local_branch_exists=False,
+        merge_source_result=(None, None),
+    )
+    monkeypatch.setattr(
+        advance_engine_module,
+        "_resolve_branch_head_sha",
+        lambda _git, _branch: SimpleNamespace(head_sha="current-sha", warning=None),
+    )
+    ctx = resolve_advance_context(config, store, git, impl, "main")
+    assert ctx.capped_review_content_error_reason == PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE
+    assert ctx.capped_review_content_error is not None
+    assert expected_diagnostic in ctx.capped_review_content_error
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == "merge-source-needs-manual-resolution"
+    assert action["needs_attention_reason"] != "review-verdict-needs-manual-attention"
+    assert action["subject_task_id"] == impl.id
+    assert action.get("max_cycles_merge_and_defer") is not True
+    assert action["type"] not in {"merge", "verify_gate", "reconcile_verify_gate_evidence"}
+    assert not store.get_based_on_children(impl.id)
+
+
 def test_capped_review_action_uses_single_content_snapshot_for_payload_and_findings(
     tmp_path: Path,
     monkeypatch,
