@@ -2829,7 +2829,9 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     # 4. Clean up old backup files
     if args.backups or no_scope:
-        backups_dir = config.project_dir / ".gza" / "backups"
+        from gza.runner import resolve_backup_dir
+
+        backups_dir = resolve_backup_dir(config.db_path, config.project_dir)
         if backups_dir.exists():
             for backup_file in backups_dir.iterdir():
                 if backup_file.is_file():
@@ -3112,7 +3114,9 @@ def _clean_archive(config: Config, args: argparse.Namespace) -> int:
 
     # Delete old backups
     if args.backups or no_scope:
-        backups_dir = config.project_dir / ".gza" / "backups"
+        from gza.runner import resolve_backup_dir
+
+        backups_dir = resolve_backup_dir(config.db_path, config.project_dir)
         if backups_dir.exists():
             for backup_file in backups_dir.iterdir():
                 if backup_file.is_file():

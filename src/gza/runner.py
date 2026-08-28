@@ -2831,6 +2831,24 @@ def _backup_sqlite_file(source_path: Path, destination_path: Path) -> None:
         source.close()
 
 
+def resolve_backup_dir(db_path: Path, project_dir: Path) -> Path:
+    """Return the directory holding hourly snapshots of ``db_path``.
+
+    Single source of truth shared by backup creation and ``gza clean`` so the
+    two can never disagree about where snapshots live. A project-local DB backs
+    up under the project's ``.gza/backups``; any other DB backs up alongside
+    itself so snapshots stay with the database they came from.
+    """
+    local_db = project_dir / f".{APP_NAME}/{APP_NAME}.db"
+    try:
+        is_local = db_path.resolve() == local_db.resolve()
+    except OSError:
+        is_local = False
+    if is_local:
+        return project_dir / BACKUP_DIR
+    return db_path.parent / "backups"
+
+
 def backup_database(db_path: Path, project_dir: Path) -> None:
     """Create an hourly backup of the SQLite database if one doesn't exist yet.
 
@@ -2846,11 +2864,7 @@ def backup_database(db_path: Path, project_dir: Path) -> None:
     if not db_path.exists():
         return
 
-    local_db = project_dir / f".{APP_NAME}/{APP_NAME}.db"
-    if db_path.resolve() == local_db.resolve():
-        backup_dir = project_dir / BACKUP_DIR
-    else:
-        backup_dir = db_path.parent / "backups"
+    backup_dir = resolve_backup_dir(db_path, project_dir)
     hour_stamp = datetime.now().strftime("%Y%m%d%H")
     backup_path = backup_dir / f"gza-{hour_stamp}.db"
 
