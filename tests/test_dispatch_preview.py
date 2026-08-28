@@ -13,6 +13,15 @@ from gza.dispatch_preview import build_dispatch_preview, plan_watch_dispatch_ent
 from gza.pickup import get_runnable_pending_tasks
 from tests.cli.conftest import make_store, setup_config
 
+# Row count for the scale-guard fixtures below. These tests prove the scoped
+# recovery preview never falls back to `get_all()` and never hydrates unrelated
+# rows. Every one of them asserts that via a raising `get_all`, an `isdisjoint`
+# check against the bulk ids, or a fixed hydration bound (the largest is 75) --
+# all of which are independent of how many rows exist, so long as the count
+# exceeds the bound. 400 clears the largest bound by more than 5x while keeping
+# fixture setup cheap; the previous 3000/9000 only inflated insert time.
+_SCALE_GUARD_ROWS = 400
+
 
 def _bulk_insert_completed_history(
     store,
@@ -460,7 +469,7 @@ def test_recovery_preview_zero_seed_scope_stays_empty_without_get_all(
     store = make_store(tmp_path)
     store._default_merge_target_cache = "main"  # noqa: SLF001 - avoid real git in unit test
     store._project_root = None  # noqa: SLF001 - avoid real git fallback in unit test
-    _bulk_insert_completed_history(store, count=3000, start=100000)
+    _bulk_insert_completed_history(store, count=_SCALE_GUARD_ROWS, start=100000)
 
     with patch(
         "gza.recovery_engine._load_merge_context",
@@ -587,7 +596,7 @@ def test_recovery_preview_terminal_no_work_seed_bounds_hydration_with_large_desc
         state="empty",
     )
     store.attach_task_to_merge_unit(failed.id, unit.id, "owner")
-    _bulk_insert_completed_history(store, count=3000, start=300000, based_on=failed.id, task_type="internal")
+    _bulk_insert_completed_history(store, count=_SCALE_GUARD_ROWS, start=300000, based_on=failed.id, task_type="internal")
 
     full_preview = _build_forced_full_recovery_preview(store)
 
@@ -637,7 +646,7 @@ def test_recovery_preview_scoped_seed_ignores_large_non_recovery_descendant_hist
     store.attach_task_to_merge_unit(failed.id, failed_unit.id, "owner")
     non_recovery_descendant_ids = _bulk_insert_completed_history(
         store,
-        count=3000,
+        count=_SCALE_GUARD_ROWS,
         start=200000,
         based_on=failed.id,
         task_type="internal",
@@ -700,7 +709,7 @@ def test_recovery_children_query_rejects_unrelated_same_type_completed_descendan
     store.update(failed)
     descendant_ids = _bulk_insert_completed_history(
         store,
-        count=3000,
+        count=_SCALE_GUARD_ROWS,
         start=210000,
         based_on=failed.id,
     )
@@ -1126,7 +1135,7 @@ def test_recovery_preview_scoped_same_parent_evidence_bounds_hydration_with_larg
     unrelated_ids = _bulk_insert_completed_implement_siblings_with_distinct_slices(
         store,
         parent_id=parent.id,
-        count=9000,
+        count=_SCALE_GUARD_ROWS,
         start=340000,
     )
 
@@ -1164,7 +1173,7 @@ def test_recovery_preview_scoped_legacy_seed_excludes_large_inactive_tombstoned_
     store = make_store(tmp_path)
     store._default_merge_target_cache = "main"  # noqa: SLF001 - avoid real git in unit test
     store._project_root = None  # noqa: SLF001 - avoid real git fallback in unit test
-    tombstoned_ids = _bulk_insert_failed_tombstoned_merge_unit_tasks(store, count=3000, start=360000)
+    tombstoned_ids = _bulk_insert_failed_tombstoned_merge_unit_tasks(store, count=_SCALE_GUARD_ROWS, start=360000)
 
     def fail_get_all():
         raise AssertionError("scoped recovery preview must not fall back to get_all()")

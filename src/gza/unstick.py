@@ -122,11 +122,18 @@ def discover_parked_tasks(
                 pending_ids.extend((task.based_on, task.depends_on))
         return False
 
+    merge_unit_owner_cache: dict[str, str | None] = {}
+
+    def _merge_unit_owner_id(task_id: str) -> str | None:
+        if task_id not in merge_unit_owner_cache:
+            merge_unit = store.resolve_merge_unit_for_task(task_id)
+            merge_unit_owner_cache[task_id] = merge_unit.owner_task_id if merge_unit is not None else None
+        return merge_unit_owner_cache[task_id]
+
     def _task_is_in_canonical_owner_scope(task_id: str, owner_id: str) -> bool:
         if task_id == owner_id or _task_is_descendant_of(task_id, owner_id):
             return True
-        merge_unit = store.resolve_merge_unit_for_task(task_id)
-        return merge_unit is not None and merge_unit.owner_task_id == owner_id
+        return _merge_unit_owner_id(task_id) == owner_id
 
     query_task_ids: tuple[str, ...] | None
     if not scoped_task_ids:
@@ -135,14 +142,19 @@ def discover_parked_tasks(
         query_task_ids = scoped_task_ids
     else:
         expanded: list[str] = []
+        all_candidate_ids: tuple[str, ...] | None = None
         for task_id, kind in selector_kind_by_task_id.items():
             if kind == "effective_leaf":
                 expanded.append(task_id)
                 continue
+            if all_candidate_ids is None:
+                all_candidate_ids = tuple(
+                    candidate.id for candidate in store.get_all() if candidate.id is not None
+                )
             expanded.extend(
-                candidate.id
-                for candidate in store.get_all()
-                if candidate.id is not None and _task_is_in_canonical_owner_scope(candidate.id, task_id)
+                candidate_id
+                for candidate_id in all_candidate_ids
+                if _task_is_in_canonical_owner_scope(candidate_id, task_id)
             )
         query_task_ids = tuple(dict.fromkeys(expanded))
 

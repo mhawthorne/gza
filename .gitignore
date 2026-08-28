@@ -6,7 +6,8 @@ src/gza/_version.py
 .docker-build-marker
 .mypy_cache/
 .pytest_cache/
-tmp/
+.sessions/
+
 gza.local.yaml
 
 # Gza runtime data
@@ -23,3 +24,5 @@ CHANGES.md
 
 # Test artifacts from WorkerRegistry using MagicMock paths
 MagicMock/
+
+tmp/

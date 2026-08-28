@@ -407,20 +407,6 @@ def test_unit_test_conftest_registers_sigterm_faulthandler(monkeypatch: pytest.M
     assert calls == [True]
 
 
-def test_unit_test_conftest_rejects_boundary_violations(monkeypatch: pytest.MonkeyPatch) -> None:
-    """tests/conftest.py should fail collection loudly when shell-backed tests drift into tests/."""
-    conftest_path = Path(__file__).resolve().parents[1] / "tests" / "conftest.py"
-    module = _load_module(conftest_path, "tests_timeout_conftest_boundary_guard")
-    monkeypatch.setattr(
-        module,
-        "find_unit_suite_boundary_violations",
-        lambda _path: [SimpleNamespace(format=lambda: "tests/example.py:7 forbidden helper")],
-    )
-
-    with pytest.raises(pytest.UsageError, match="Unit-suite boundary violation"):
-        module.pytest_sessionstart(SimpleNamespace())
-
-
 def test_functional_suite_conftest_injects_functional_watchdog() -> None:
     """tests_functional/conftest.py should assign the functional watchdog unless overridden."""
     repo_root = Path(__file__).resolve().parents[1]

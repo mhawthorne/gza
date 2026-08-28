@@ -1731,6 +1731,7 @@ def _is_resolved_by_landed_lineage(
                     target_branch=target_branch,
                     merge_context=merge_context,
                     read_context=read_context,
+                    classification_cache=merge_context.branch_resolution,
                 )
                 == "visible"
             ):
