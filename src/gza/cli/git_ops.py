@@ -8,7 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -58,6 +58,7 @@ from ..db import (
     SqliteTaskStore,
     Task as DbTask,
     TaskStats,
+    merge_unit_is_active,
     task_id_numeric_key,
 )
 from ..dependency_preconditions import task_is_merged
@@ -308,7 +309,10 @@ def _build_advance_recovery_merge_context(git: Git, target_branch: str | None) -
         )
         return _MergeContext(git=git, default_branch=target_branch)
 
-    preview_branch_names = local_branch_names()
+    try:
+        preview_branch_names = local_branch_names()
+    except (GitError, OSError, ValueError):
+        return build_merge_context_from_git(git, target_branch)
     if not isinstance(preview_branch_names, Iterable):
         console.print(
             "[yellow]Warning: advance recovery preview is using a degraded git context; "
@@ -6534,6 +6538,46 @@ def _run_advance_owner_row_read_session(
     return result
 
 
+def _build_advance_recovery_read_context(
+    store: SqliteTaskStore,
+    *,
+    allow_reconcile_mutation: bool,
+) -> RecoveryReadContext:
+    tasks = tuple(store.get_all())
+    task_by_id = {task.id: task for task in tasks if task.id is not None}
+    based_on_children: dict[str, list[DbTask]] = {}
+    depends_on_children: dict[str, list[DbTask]] = {}
+    for task in tasks:
+        if task.id is None:
+            continue
+        if task.based_on is not None:
+            based_on_children.setdefault(task.based_on, []).append(task)
+        if task.depends_on is not None:
+            depends_on_children.setdefault(task.depends_on, []).append(task)
+
+    merge_units_by_task_id = {}
+    historical_merge_units_by_task_id = {}
+    if store.supports_merge_units():
+        task_ids = [task.id for task in tasks if task.id is not None]
+        for task_id, units in store.list_merge_units_for_tasks(task_ids).items():
+            if not units:
+                continue
+            historical_merge_units_by_task_id[task_id] = units
+            active_unit = next((unit for unit in units if merge_unit_is_active(unit)), None)
+            if active_unit is not None:
+                merge_units_by_task_id[task_id] = active_unit
+
+    return RecoveryReadContext(
+        tasks=tasks,
+        task_by_id=task_by_id,
+        based_on_children=based_on_children,
+        depends_on_children=depends_on_children,
+        merge_units_by_task_id=merge_units_by_task_id,
+        historical_merge_units_by_task_id=historical_merge_units_by_task_id,
+        allow_reconcile_mutation=allow_reconcile_mutation,
+    )
+
+
 def cmd_advance(args: argparse.Namespace) -> int:
     """Intelligently progress unmerged tasks through their lifecycle."""
     try:
@@ -6678,13 +6722,27 @@ def cmd_advance(args: argparse.Namespace) -> int:
             return None
         if not any(item_action["type"] in {"merge", "merge_with_followups"} for _, _, item_action in plan):
             return None
-        main_verify = _check_main_integration_verify_with_git_env(
-            config,
-            store,
-            git,
-            reason="advance-pre-merge",
-        )
-        if not main_verify.merges_halted or main_verify.state.task.id is None:
+        if dry_run:
+            rev_parse_if_exists = getattr(git, "rev_parse_if_exists", None)
+            resolved_head_sha = rev_parse_if_exists("HEAD") if callable(rev_parse_if_exists) else None
+            main_verify = inspect_main_integration_verify_checkpoint(
+                config,
+                store,
+                git,
+                resolved_head_sha=resolved_head_sha,
+            )
+        else:
+            main_verify = _check_main_integration_verify_with_git_env(
+                config,
+                store,
+                git,
+                reason="advance-pre-merge",
+            )
+        if (
+            not main_verify.merges_halted
+            or main_verify.state is None
+            or main_verify.state.task.id is None
+        ):
             return None
         return (
             main_verify.state.task,
@@ -6701,6 +6759,70 @@ def cmd_advance(args: argparse.Namespace) -> int:
     preview_gated_rows: list[tuple[LineageOwnerRow, DbTask, dict[str, Any], str]] = []
     new_pending_tasks: list = []
     recovery_preview_task_ids: set[str] = set()
+    persist_planning_state = not dry_run
+    recovery_planning_read_contexts_by_task_id: dict[str, RecoveryReadContext] = {}
+
+    def _remember_recovery_planning_read_context(
+        read_context: RecoveryReadContext,
+        *tasks: DbTask | None,
+    ) -> None:
+        for candidate in tasks:
+            if candidate is not None and candidate.id is not None:
+                recovery_planning_read_contexts_by_task_id[candidate.id] = read_context
+
+    def _remember_recovery_planning_read_context_for_rows(
+        read_context: RecoveryReadContext,
+        rows: Sequence[LineageOwnerRow],
+    ) -> None:
+        for row in rows:
+            _remember_recovery_planning_read_context(
+                read_context,
+                row.recovery_leaf_task,
+                row.recovery_action_task,
+                row.lifecycle_action_task,
+                row.owner_task,
+                *row.unresolved_tasks,
+                *row.members,
+            )
+
+    def _build_recovery_planning_read_context_for_rows(
+        rows: Sequence[LineageOwnerRow],
+        *,
+        allow_reconcile_mutation: bool,
+    ) -> RecoveryReadContext | None:
+        if not any(
+            candidate is not None and candidate.status == "failed"
+            for row in rows
+            for candidate in (
+                row.recovery_leaf_task,
+                row.recovery_action_task,
+                row.owner_task,
+                *row.unresolved_tasks,
+            )
+        ):
+            return None
+        read_context = _build_advance_recovery_read_context(
+            store,
+            allow_reconcile_mutation=allow_reconcile_mutation,
+        )
+        if git is not None:
+            read_context.merge_context = _build_advance_recovery_merge_context(
+                git,
+                target_branch,
+            )
+        _remember_recovery_planning_read_context_for_rows(read_context, rows)
+        return read_context
+
+    def _recovery_planning_read_context_for_row(
+        row: LineageOwnerRow,
+        action_task: DbTask,
+    ) -> RecoveryReadContext | None:
+        for candidate in (row.recovery_leaf_task, row.recovery_action_task, action_task):
+            if candidate is not None and candidate.id is not None:
+                read_context = recovery_planning_read_contexts_by_task_id.get(candidate.id)
+                if read_context is not None:
+                    return read_context
+        return None
 
     def _advance_scope_mismatch_message(explicit_task_id: str) -> str:
         scoped_filters: list[str] = []
@@ -6775,8 +6897,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         config=config,
                         git=git,
                         target_branch=target_branch,
-                        persist_post_merge_rebase_state=not (repeat_mode and dry_run),
-                        persist_review_clearance=not (repeat_mode and dry_run),
+                        persist_post_merge_rebase_state=persist_planning_state,
+                        persist_review_clearance=persist_planning_state,
                         reuse_recovery_merge_context=True,
                     )
                 )
@@ -6798,8 +6920,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                             config=config,
                             git=git,
                             target_branch=target_branch,
-                            persist_post_merge_rebase_state=not (repeat_mode and dry_run),
-                            persist_review_clearance=not (repeat_mode and dry_run),
+                            persist_post_merge_rebase_state=persist_planning_state,
+                            persist_review_clearance=persist_planning_state,
                             reuse_recovery_merge_context=True,
                         )
                         if row.owner_task.status == "dropped"
@@ -6811,12 +6933,41 @@ def cmd_advance(args: argparse.Namespace) -> int:
             owner_rows, dropped_owner_lineage = _run_advance_owner_row_read_session(
                 store,
                 _load_explicit_owner_rows,
-                apply_deferred_reconciliations=not (repeat_mode and dry_run),
+                apply_deferred_reconciliations=persist_planning_state,
+            )
+            _build_recovery_planning_read_context_for_rows(
+                owner_rows,
+                allow_reconcile_mutation=persist_planning_state,
             )
             if not owner_rows and task.status != "dropped" and not dropped_owner_lineage:
                 if advance_type is not None or tag_filters is not None:
                     return phase1_error(args, _advance_scope_mismatch_message(task_id))
-                planning_task = resolve_recovery_planning_task(store, task) if task.status == "failed" else task
+                recovery_fallback_read_context = _build_advance_recovery_read_context(
+                    store,
+                    allow_reconcile_mutation=persist_planning_state,
+                )
+                recovery_fallback_merge_context = None
+                if git is not None:
+                    recovery_fallback_merge_context = _build_advance_recovery_merge_context(
+                        git,
+                        target_branch,
+                    )
+                    recovery_fallback_read_context.merge_context = recovery_fallback_merge_context
+                planning_task = (
+                    resolve_recovery_planning_task(
+                        store,
+                        task,
+                        merge_context=recovery_fallback_merge_context,
+                        read_context=recovery_fallback_read_context,
+                    )
+                    if task.status == "failed"
+                    else task
+                )
+                _remember_recovery_planning_read_context(
+                    recovery_fallback_read_context,
+                    task,
+                    planning_task,
+                )
                 owner_rows = [
                     LineageOwnerRow(
                         owner_task=task,
@@ -6862,15 +7013,41 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         config=config,
                         git=git,
                         target_branch=target_branch,
+                        persist_post_merge_rebase_state=persist_planning_state,
+                        persist_review_clearance=persist_planning_state,
                         reuse_recovery_merge_context=True,
                     )
                 )
                 return owner_rows
 
-            owner_rows = _run_advance_owner_row_read_session(store, _load_all_owner_rows)
+            owner_rows = _run_advance_owner_row_read_session(
+                store,
+                _load_all_owner_rows,
+                apply_deferred_reconciliations=persist_planning_state,
+            )
             if not no_resume_failed:
-                list_failed_tasks_for_recovery(
-                    store, warnings=failed_task_recovery_warnings, git=git, target_branch=target_branch
+                failed_inventory_read_context = _build_advance_recovery_read_context(
+                    store,
+                    allow_reconcile_mutation=persist_planning_state,
+                )
+                failed_inventory_read_context.merge_context = _build_advance_recovery_merge_context(
+                    git,
+                    target_branch,
+                )
+                failed_inventory_tasks = list_failed_tasks_for_recovery(
+                    store,
+                    warnings=failed_task_recovery_warnings,
+                    read_context=failed_inventory_read_context,
+                    git=git,
+                    target_branch=target_branch,
+                )
+                _remember_recovery_planning_read_context(
+                    failed_inventory_read_context,
+                    *failed_inventory_tasks,
+                )
+                _remember_recovery_planning_read_context_for_rows(
+                    failed_inventory_read_context,
+                    owner_rows,
                 )
             if no_resume_failed:
                 owner_rows = [
@@ -6888,7 +7065,17 @@ def cmd_advance(args: argparse.Namespace) -> int:
             owner_rows = owner_rows[:max_tasks]
 
         if owner_rows:
-            recovery_read_context = RecoveryReadContext()
+            recovery_read_context = next(
+                (
+                    context
+                    for row in owner_rows
+                    for candidate in (row.recovery_leaf_task, row.recovery_action_task)
+                    if candidate is not None
+                    and candidate.id is not None
+                    and (context := recovery_planning_read_contexts_by_task_id.get(candidate.id)) is not None
+                ),
+                None,
+            ) or RecoveryReadContext(allow_reconcile_mutation=persist_planning_state)
             if git is not None:
                 recovery_read_context.merge_context = _build_advance_recovery_merge_context(
                     git,
@@ -7354,6 +7541,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 _load_rows,
                 apply_deferred_reconciliations=not dry_run,
             )
+            _build_recovery_planning_read_context_for_rows(
+                rows,
+                allow_reconcile_mutation=not dry_run,
+            )
             if not rows and target_branch is not None:
                 if (
                     resolved_merge_state == "merged"
@@ -7398,6 +7589,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     max_resume_attempts=max_resume_attempts,
                     persist_post_merge_rebase_state=not dry_run,
                     persist_review_clearance=not dry_run,
+                    read_context=_recovery_planning_read_context_for_row(row, action_task),
                 )
             )
             decision = plan_lifecycle_execution(
@@ -7418,6 +7610,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     max_resume_attempts=max_resume_attempts,
                     persist_post_merge_rebase_state=not dry_run,
                     persist_review_clearance=not dry_run,
+                    read_context=_recovery_planning_read_context_for_row(item[0], item[1]),
                     selected_for_merge=True,
                 ),
             )[0]
@@ -7844,6 +8037,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     action_task,
                     target_branch,
                     max_resume_attempts=max_resume_attempts,
+                    persist_post_merge_rebase_state=persist_planning_state,
+                    persist_review_clearance=persist_planning_state,
+                    read_context=_recovery_planning_read_context_for_row(row, action_task),
                 )
             )
             plan.append((row, action_task, action))
@@ -7888,6 +8084,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     item[1],
                     target_branch,
                     max_resume_attempts=max_resume_attempts,
+                    persist_post_merge_rebase_state=persist_planning_state,
+                    persist_review_clearance=persist_planning_state,
+                    read_context=_recovery_planning_read_context_for_row(item[0], item[1]),
                     selected_for_merge=True,
                 ),
             )

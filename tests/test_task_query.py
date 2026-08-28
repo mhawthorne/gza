@@ -202,6 +202,40 @@ def test_incomplete_preset_projects_next_action_fields(tmp_path: Path) -> None:
     assert "missing config/git context" in str(row.values["next_action_reason"])
 
 
+def test_incomplete_projection_labels_annotated_max_cycle_merge(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    impl = store.add("capped impl", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    store.update(impl)
+
+    service = TaskQueryService(store)
+    row = task_query.LineageRow(
+        owner_task=impl,
+        members=(impl,),
+        tree=None,
+        unresolved_tasks=(impl,),
+        lifecycle_action_task=impl,
+        next_action_data={
+            "type": "merge",
+            "description": "Merge and defer blockers after max review cycles",
+            "max_cycles_merge_and_defer": True,
+        },
+    )
+
+    projected = service._project_lineage_row(  # noqa: SLF001
+        row,
+        TaskQueryPresets.incomplete(limit=None),
+        config=None,
+        git=None,
+        target_branch="main",
+    )
+
+    assert projected.values["next_action"] == "merge_and_defer_blockers"
+    assert projected.values["next_action_reason"] == "Merge and defer blockers after max review cycles"
+
+
 def test_incomplete_preset_untagged_only_filters_tagged_owner_rows(tmp_path: Path) -> None:
     store = _store(tmp_path)
     untagged = store.add("untagged failed impl", task_type="implement")

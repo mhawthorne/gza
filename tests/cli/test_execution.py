@@ -26497,10 +26497,18 @@ class TestIterateCommand:
         store = make_store(tmp_path)
         config = Config.load(tmp_path)
         impl = self._make_completed_impl(store)
+        review = self._make_review_task(
+            store,
+            impl,
+            status="completed",
+            verdict="CHANGES_REQUESTED",
+            completed_at=datetime.now(UTC),
+        )
         action = {
             "type": "merge",
             "description": "Merge and defer blockers after max review cycles",
             "max_cycles_merge_and_defer": True,
+            "review_task": review,
         }
         mock_git = MagicMock()
         mock_git.current_branch.return_value = "main"
@@ -26528,7 +26536,10 @@ class TestIterateCommand:
 
         assert result == 0
         assert "Next action: merge" in output
-        assert "Merge and defer blockers" in output
+        assert "merge_and_defer_blockers" in output
+        assert f"Iterate complete: implementation {impl.id} is ready to merge and defer blockers." in output
+        assert "Needs attention:" not in output
+        assert "manual review" not in output.lower()
         assert store.get_based_on_children(impl.id) == []
 
     def test_advance_engine_config_adapter_carries_max_failed_closing_review_retries(

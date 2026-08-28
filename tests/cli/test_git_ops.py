@@ -3,7 +3,7 @@
 import argparse
 import sqlite3
 import sys
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -76,6 +76,7 @@ from gza.merge_services import (
 )
 from gza.rebase_checkout import StaleRebaseImportError
 from gza.rebase_diff import RebaseDiffBaseline, RebaseDiffResult, parse_rebase_diff_provenance
+from gza.recovery_engine import _MergeContext
 from gza.review_scope import build_spec_coherence_review_scope, declares_resolution_review_mode
 from gza.review_tasks import (
     CappedReviewBlockerMaterializationError,
@@ -577,6 +578,46 @@ def _advance_args(tmp_path: Path, task_id: str) -> argparse.Namespace:
     )
 
 
+def _durable_preview_snapshot(store: Any) -> dict[str, tuple[tuple[Any, ...], ...]]:
+    def _quote_identifier(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
+
+    tables = (
+        "tasks",
+        "task_tags",
+        "merge_units",
+        "merge_unit_tasks",
+        "task_artifacts",
+    )
+    with store._connect() as conn:  # type: ignore[attr-defined]
+        snapshot: dict[str, tuple[tuple[Any, ...], ...]] = {}
+        for table in tables:
+            columns = [str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")]
+            quoted_columns = [_quote_identifier(column) for column in columns]
+            column_sql = ", ".join(quoted_columns)
+            order_sql = ", ".join(quoted_columns)
+            snapshot[table] = tuple(tuple(row) for row in conn.execute(f"SELECT {column_sql} FROM {table} ORDER BY {order_sql}"))
+    return snapshot
+
+
+def _add_capped_merge_ready_impl(
+    store: Any,
+    config: Config,
+    tmp_path: Path,
+    *,
+    branch: str,
+) -> tuple[Any, Any]:
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 1
+    config.verify_command = "./bin/tests"
+    task = _completed_merge_task(store, "Capped merge dry-run", branch)
+    review_output = _capped_review_output("B1")
+    review = _completed_review(store, task, review_output)
+    _persist_capped_authorization_verify(store, config, task, tmp_path=tmp_path)
+    assert store.get_or_create_merge_unit_for_task(task) is not None
+    return task, review
+
+
 def _add_mergeable_impl_with_failed_rebase(store, branch: str):
     task = store.add("Implement feature", task_type="implement")
     assert task.id is not None
@@ -600,6 +641,76 @@ def _add_mergeable_impl_with_failed_rebase(store, branch: str):
     review.report_file = "reviews/fake.md"
     store.update(review)
     return task
+
+
+@pytest.mark.parametrize(
+    ("scope", "max_tasks", "batch"),
+    [
+        ("explicit", None, None),
+        ("unscoped", None, None),
+        ("batch", 1, 1),
+    ],
+)
+def test_cmd_advance_dry_run_renders_capped_merge_and_defer_without_writes(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    scope: str,
+    max_tasks: int | None,
+    batch: int | None,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    task, _review = _add_capped_merge_ready_impl(
+        store,
+        config,
+        tmp_path,
+        branch=f"feature/capped-dry-run-{scope}",
+    )
+    before = _durable_preview_snapshot(store)
+
+    fake_git = _make_read_session_reconciliation_git(tmp_path, task.branch)
+
+    args = _advance_args(tmp_path, task.id)
+    if scope != "explicit":
+        args.task_id = None
+    args.dry_run = True
+    args.max = max_tasks
+    args.batch = batch
+
+    with (
+        patch("gza.cli.git_ops.Config.load", return_value=config),
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch(
+            "gza.git.Git._run",
+            return_value=SimpleNamespace(returncode=0, stdout="refs/remotes/origin/main\n", stderr=""),
+        ),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.check_main_integration_verify", side_effect=AssertionError("dry-run must inspect only")),
+        patch("gza.cli.git_ops._execute_merge_action", side_effect=AssertionError("dry-run must not merge")),
+    ):
+        rc = cmd_advance(args)
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "Would advance 1 task(s):" in output
+    assert "Merge and defer blockers after max review cycles" in output
+    assert "review-max-cycles-reached" not in output
+    assert _durable_preview_snapshot(store) == before
+    blocker_children = [
+        child
+        for child in store.get_based_on_children(task.id)
+        if child.task_type == "implement" and "deferred-review-blocker" in child.tags
+    ]
+    assert blocker_children == []
+    refreshed = store.get(task.id)
+    assert refreshed is not None
+    assert refreshed.merge_status == "unmerged"
 
 
 def _add_completed_impl_with_approved_review(store, branch: str, *, when: datetime) -> tuple[Any, Any]:
@@ -827,7 +938,21 @@ def _make_read_session_reconciliation_git(tmp_path: Path, branch: str) -> MagicM
     fake_git.has_changes.return_value = False
     fake_git.can_merge.return_value = True
     fake_git.count_commits_ahead.return_value = 1
+    fake_git.rev_parse_if_exists.side_effect = (
+        lambda ref: "same-sha" if ref in {branch, "HEAD"} else "base-head" if ref == "main" else None
+    )
+    fake_git._run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
     return fake_git
+
+
+@contextmanager
+def _mock_git_default_branch_run():
+    result = SimpleNamespace(returncode=0, stdout="refs/remotes/origin/main\n", stderr="")
+    with ExitStack() as stack:
+        stack.enter_context(patch("gza.git.Git._run", return_value=result))
+        stack.enter_context(patch("gza.recovery_engine.Git._run", return_value=result))
+        stack.enter_context(patch("gza.lineage_query.Git._run", return_value=result))
+        yield
 
 
 def _add_prerequisite_unmerged_failed_child(
@@ -866,6 +991,31 @@ def _add_prerequisite_unmerged_failed_child(
     failed.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
     store.update(failed)
     return dependency, owner, failed
+
+
+def _failed_recovery_owner_row(task: Any) -> LineageOwnerRow:
+    return LineageOwnerRow(
+        owner_task=task,
+        members=(task,),
+        tree=None,
+        lineage_status="skipped",
+        next_action={"type": "unknown", "description": "pending command evaluation"},
+        next_action_reason="pending command evaluation",
+        unresolved_tasks=(task,),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=None,
+        recovery_action_task=task,
+        recovery_leaf_task=task,
+    )
+
+
+def _mark_dependency_merge_unit_merged(store: Any, dependency: Any) -> None:
+    dependency.branch = dependency.branch or f"feature/{dependency.id}-dependency"
+    dependency.has_commits = True
+    store.update(dependency)
+    unit = store.get_or_create_merge_unit_for_task(dependency)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "merged")
 
 
 @pytest.mark.parametrize("subject_type", ["improve", "rebase", "fix"])
@@ -13828,7 +13978,7 @@ def test_cmd_advance_explicit_dropped_owner_fallback_uses_one_read_session_conne
     assert len([conn for close_on_exit, conn in opened_connections if close_on_exit is False]) == 1
 
 
-def test_cmd_advance_explicit_failed_leaf_persists_deferred_prerequisite_reconciliation(
+def test_cmd_advance_explicit_failed_leaf_dry_run_skips_deferred_prerequisite_reconciliation(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -13839,6 +13989,8 @@ def test_cmd_advance_explicit_failed_leaf_persists_deferred_prerequisite_reconci
     )
 
     fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
+    assert store.get_or_create_merge_unit_for_task(failed) is not None
+    before = _durable_preview_snapshot(store)
 
     with (
         patch("gza.cli.git_ops.get_store", return_value=store),
@@ -13847,6 +13999,10 @@ def test_cmd_advance_explicit_failed_leaf_persists_deferred_prerequisite_reconci
         patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
         patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[]),
+        patch("gza.recovery_engine.is_resolved_by_merged_target", return_value=False),
+        patch("gza.recovery_engine._is_resolved_by_landed_lineage", return_value=False),
+        patch("gza.recovery_engine.get_completed_same_slice_sibling_attempt", return_value=None),
         patch(
             "gza.cli.advance_engine.determine_next_action",
             return_value={"type": "skip", "description": "nothing to do"},
@@ -13856,12 +14012,10 @@ def test_cmd_advance_explicit_failed_leaf_persists_deferred_prerequisite_reconci
         rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, failed.id)), "dry_run": True}))
 
     assert rc == 0
-    merge_unit = store.resolve_merge_unit_for_task(failed.id)
-    assert merge_unit is not None
-    assert merge_unit.state == "empty"
+    assert _durable_preview_snapshot(store) == before
 
 
-def test_cmd_advance_explicit_dropped_owner_fallback_persists_deferred_prerequisite_reconciliation(
+def test_cmd_advance_explicit_dropped_owner_fallback_dry_run_skips_deferred_prerequisite_reconciliation(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
@@ -13873,6 +14027,8 @@ def test_cmd_advance_explicit_dropped_owner_fallback_persists_deferred_prerequis
     )
 
     fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
+    assert store.get_or_create_merge_unit_for_task(failed) is not None
+    before = _durable_preview_snapshot(store)
 
     with (
         patch("gza.cli.git_ops.get_store", return_value=store),
@@ -13890,9 +14046,7 @@ def test_cmd_advance_explicit_dropped_owner_fallback_persists_deferred_prerequis
         rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, failed.id)), "dry_run": True}))
 
     assert rc == 0
-    merge_unit = store.resolve_merge_unit_for_task(failed.id)
-    assert merge_unit is not None
-    assert merge_unit.state == "redundant"
+    assert _durable_preview_snapshot(store) == before
 
 
 def test_cmd_advance_explicit_task_plans_only_requested_lineage_refs(
@@ -14072,6 +14226,10 @@ def test_cmd_advance_explicit_failed_leaf_preloads_only_owner_lineage_refs(
         patch("gza.cli.git_ops.Git", return_value=fake_git),
         patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
         patch("gza.git.Git", return_value=fake_git),
+        patch(
+            "gza.git.Git._run",
+            return_value=SimpleNamespace(returncode=0, stdout="refs/remotes/origin/main\n", stderr=""),
+        ),
         patch("gza.git.Git.default_branch", return_value="main"),
         patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=iter([row])),
@@ -14227,6 +14385,10 @@ def test_cmd_advance_explicit_dropped_owner_fallback_preloads_only_requested_lin
         patch("gza.cli.git_ops.Git", return_value=fake_git),
         patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
         patch("gza.git.Git", return_value=fake_git),
+        patch(
+            "gza.git.Git._run",
+            return_value=SimpleNamespace(returncode=0, stdout="refs/remotes/origin/main\n", stderr=""),
+        ),
         patch("gza.git.Git.default_branch", return_value="main"),
         patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=iter([row])),
@@ -14404,6 +14566,10 @@ def test_cmd_advance_execution_fails_closed_when_only_origin_branch_exists(
     with (
         patch("gza.cli.git_ops.Git", return_value=fake_git),
         patch("gza.git.Git", return_value=fake_git),
+        patch(
+            "gza.git.Git._run",
+            return_value=SimpleNamespace(returncode=0, stdout="refs/remotes/origin/main\n", stderr=""),
+        ),
         patch("gza.git.Git.default_branch", return_value="main"),
         patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
@@ -14469,6 +14635,10 @@ def test_cmd_advance_execution_uses_local_branch_when_origin_ref_is_reported(
     with (
         patch("gza.cli.git_ops.Git", return_value=fake_git),
         patch("gza.git.Git", return_value=fake_git),
+        patch(
+            "gza.git.Git._run",
+            return_value=SimpleNamespace(returncode=0, stdout="refs/remotes/origin/main\n", stderr=""),
+        ),
         patch("gza.git.Git.default_branch", return_value="main"),
         patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
@@ -15513,6 +15683,7 @@ def test_cmd_advance_all_tasks_query_uses_one_read_session_connection(
 
     with (
         patch("gza.cli.git_ops.get_store", return_value=store),
+        _mock_git_default_branch_run(),
         patch("gza.cli.git_ops.Git", return_value=fake_git),
         patch("gza.git.Git", return_value=fake_git),
         patch("gza.git.Git.default_branch", return_value="main"),
@@ -15571,6 +15742,7 @@ def test_cmd_advance_reports_isolated_promotion_failure_phase(
 
     with (
         patch("gza.cli.git_ops.get_store", return_value=store),
+        _mock_git_default_branch_run(),
         patch("gza.cli.git_ops.Git", return_value=fake_git),
         patch("gza.git.Git", return_value=fake_git),
         patch("gza.git.Git.default_branch", return_value="main"),
@@ -15589,43 +15761,455 @@ def test_cmd_advance_reports_isolated_promotion_failure_phase(
     assert "Merge failed" not in output
 
 
-def test_cmd_advance_all_tasks_persists_deferred_prerequisite_reconciliation(
+def test_cmd_advance_all_tasks_default_dry_run_skips_deferred_prerequisite_reconciliation(
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
-    _dependency, _owner, failed = _add_prerequisite_unmerged_failed_child(
+    dependency, _owner, failed = _add_prerequisite_unmerged_failed_child(
         store,
         owner_branch="feature/all-tasks-prereq-reconcile",
     )
+    _mark_dependency_merge_unit_merged(store, dependency)
 
     args = _advance_args(tmp_path, failed.id)
     args.task_id = None
     args.dry_run = True
-    args.no_resume_failed = True
+    args.no_resume_failed = False
 
     fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
+    before = _durable_preview_snapshot(store)
+    row = _failed_recovery_owner_row(failed)
 
     with (
         patch("gza.cli.git_ops.get_store", return_value=store),
+        _mock_git_default_branch_run(),
         patch("gza.cli.git_ops.Git", return_value=fake_git),
         patch("gza.git.Git", return_value=fake_git),
         patch("gza.git.Git.default_branch", return_value="main"),
         patch("gza.git.Git.local_branch_names", return_value=()),
         patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
         patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[]),
+        patch("gza.recovery_engine.is_resolved_by_merged_target", return_value=False),
+        patch("gza.recovery_engine._is_resolved_by_landed_lineage", return_value=False),
+        patch("gza.recovery_engine.get_completed_same_slice_sibling_attempt", return_value=None),
         patch(
             "gza.cli.advance_engine.determine_next_action",
             return_value={"type": "skip", "description": "nothing to do"},
+        ),
+        patch(
+            "gza.recovery_engine._load_merge_context",
+            return_value=_MergeContext(git=fake_git, default_branch="main"),
         ),
         patch("gza.recovery_engine.resolve_task_merge_state_for_target", return_value="redundant"),
     ):
         rc = cmd_advance(args)
 
     assert rc == 0
-    merge_unit = store.resolve_merge_unit_for_task(failed.id)
-    assert merge_unit is not None
-    assert merge_unit.state == "redundant"
+    assert _durable_preview_snapshot(store) == before
+
+
+def test_cmd_advance_all_tasks_default_run_persists_prerequisite_reconciliation(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    dependency, _owner, failed = _add_prerequisite_unmerged_failed_child(
+        store,
+        owner_branch="feature/all-tasks-prereq-reconcile-run",
+    )
+    _mark_dependency_merge_unit_merged(store, dependency)
+
+    args = _advance_args(tmp_path, failed.id)
+    args.task_id = None
+    args.dry_run = False
+    args.no_resume_failed = False
+
+    fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        _mock_git_default_branch_run(),
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[]),
+        patch("gza.recovery_engine.is_resolved_by_merged_target", return_value=False),
+        patch("gza.recovery_engine._is_resolved_by_landed_lineage", return_value=False),
+        patch("gza.recovery_engine.get_completed_same_slice_sibling_attempt", return_value=None),
+        patch(
+            "gza.recovery_engine._load_merge_context",
+            return_value=_MergeContext(git=fake_git, default_branch="main"),
+        ),
+        patch("gza.recovery_engine.resolve_task_merge_state_for_target", return_value="redundant"),
+    ):
+        rc = cmd_advance(args)
+
+    assert rc == 0
+    reconciled_unit = store.resolve_merge_unit_for_task(failed.id)
+    assert reconciled_unit is not None
+    assert reconciled_unit.state == "redundant"
+
+
+def test_cmd_advance_all_tasks_dry_run_preserves_prerequisite_reconciliation_for_owner_row(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    dependency, _owner, failed = _add_prerequisite_unmerged_failed_child(
+        store,
+        owner_branch="feature/all-tasks-owner-prereq-reconcile",
+    )
+    _mark_dependency_merge_unit_merged(store, dependency)
+
+    args = _advance_args(tmp_path, failed.id)
+    args.task_id = None
+    args.dry_run = True
+    args.no_resume_failed = False
+
+    fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
+    before = _durable_preview_snapshot(store)
+    row = _failed_recovery_owner_row(failed)
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        _mock_git_default_branch_run(),
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.advance_engine.resolve_task_merge_state_for_target", return_value="redundant"),
+        patch("gza.merge_state.resolve_task_merge_state_for_target", return_value="redundant"),
+        patch("gza.recovery_engine.resolve_task_merge_state_for_target", return_value="redundant"),
+    ):
+        rc = cmd_advance(args)
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "No eligible tasks to advance" in output
+    assert _durable_preview_snapshot(store) == before
+
+
+def test_cmd_advance_all_tasks_run_persists_prerequisite_reconciliation_for_owner_row(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    dependency, _owner, failed = _add_prerequisite_unmerged_failed_child(
+        store,
+        owner_branch="feature/all-tasks-owner-prereq-reconcile-run",
+    )
+    _mark_dependency_merge_unit_merged(store, dependency)
+
+    args = _advance_args(tmp_path, failed.id)
+    args.task_id = None
+    args.dry_run = False
+    args.no_resume_failed = False
+
+    fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
+    row = _failed_recovery_owner_row(failed)
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        _mock_git_default_branch_run(),
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.advance_engine.resolve_task_merge_state_for_target", return_value="redundant"),
+        patch("gza.merge_state.resolve_task_merge_state_for_target", return_value="redundant"),
+        patch("gza.recovery_engine.resolve_task_merge_state_for_target", return_value="redundant"),
+    ):
+        rc = cmd_advance(args)
+
+    assert rc == 0
+    reconciled_unit = store.resolve_merge_unit_for_task(failed.id)
+    assert reconciled_unit is not None
+    assert reconciled_unit.state == "redundant"
+
+
+def test_cmd_advance_explicit_owner_row_dry_run_preserves_prerequisite_reconciliation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    dependency, _owner, failed = _add_prerequisite_unmerged_failed_child(
+        store,
+        owner_branch="feature/explicit-owner-prereq-reconcile",
+    )
+    _mark_dependency_merge_unit_merged(store, dependency)
+
+    fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
+    before = _durable_preview_snapshot(store)
+    row = _failed_recovery_owner_row(failed)
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        _mock_git_default_branch_run(),
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.advance_engine.resolve_task_merge_state_for_target", return_value="empty"),
+        patch("gza.merge_state.resolve_task_merge_state_for_target", return_value="empty"),
+        patch("gza.recovery_engine.resolve_task_merge_state_for_target", return_value="empty"),
+    ):
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, failed.id)), "dry_run": True}))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "No eligible tasks to advance" in output
+    assert _durable_preview_snapshot(store) == before
+
+
+def test_cmd_advance_explicit_owner_row_run_persists_prerequisite_reconciliation(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    dependency, _owner, failed = _add_prerequisite_unmerged_failed_child(
+        store,
+        owner_branch="feature/explicit-owner-prereq-reconcile-run",
+    )
+    _mark_dependency_merge_unit_merged(store, dependency)
+
+    fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
+    row = _failed_recovery_owner_row(failed)
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        _mock_git_default_branch_run(),
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.advance_engine.resolve_task_merge_state_for_target", return_value="empty"),
+        patch("gza.merge_state.resolve_task_merge_state_for_target", return_value="empty"),
+        patch("gza.recovery_engine.resolve_task_merge_state_for_target", return_value="empty"),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, failed.id))
+
+    assert rc == 0
+    reconciled_unit = store.resolve_merge_unit_for_task(failed.id)
+    assert reconciled_unit is not None
+    assert reconciled_unit.state == "empty"
+
+
+def test_cmd_advance_repeat_dry_run_preserves_prerequisite_reconciliation_for_owner_row(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    dependency, _owner, failed = _add_prerequisite_unmerged_failed_child(
+        store,
+        owner_branch="feature/repeat-owner-prereq-reconcile",
+    )
+    _mark_dependency_merge_unit_merged(store, dependency)
+
+    args = _advance_args(tmp_path, failed.id)
+    args.dry_run = True
+    args.repeat = True
+    args.max_iterations = 1
+
+    fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
+    before = _durable_preview_snapshot(store)
+    row = _failed_recovery_owner_row(failed)
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        _mock_git_default_branch_run(),
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.advance_engine.resolve_task_merge_state_for_target", return_value="empty"),
+        patch("gza.merge_state.resolve_task_merge_state_for_target", return_value="empty"),
+        patch("gza.recovery_engine.resolve_task_merge_state_for_target", return_value="empty"),
+    ):
+        rc = cmd_advance(args)
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert "Advance repeat stopped on skip" in output
+    assert _durable_preview_snapshot(store) == before
+
+
+def _add_legacy_pr_required_failed_task(store: Any, *, branch: str) -> Any:
+    task = store.add("Legacy publication failure", task_type="implement", create_pr=True)
+    assert task.id is not None
+    task.status = "failed"
+    task.failure_reason = "PR_REQUIRED"
+    task.branch = branch
+    task.has_commits = True
+    task.completed_at = datetime(2026, 5, 16, 9, 0, tzinfo=UTC)
+    store.update(task)
+    return task
+
+
+def test_cmd_advance_explicit_owner_row_dry_run_preserves_legacy_pr_required_reconciliation(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    failed = _add_legacy_pr_required_failed_task(store, branch="feature/explicit-owner-pr-required")
+    row = _failed_recovery_owner_row(failed)
+
+    fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
+    before = _durable_preview_snapshot(store)
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        _mock_git_default_branch_run(),
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.advance_engine.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.merge_state.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.recovery_engine.resolve_task_merge_state_for_target", return_value="unmerged"),
+    ):
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, failed.id)), "dry_run": True}))
+
+    output = capsys.readouterr().out
+    assert rc == 0
+    assert failed.id in output
+    assert "Reconcile branch publication (BRANCH_UNPUSHABLE)" in output
+    assert store.get(failed.id).failure_reason == "PR_REQUIRED"
+    assert _durable_preview_snapshot(store) == before
+
+
+def test_cmd_advance_explicit_owner_row_run_persists_legacy_pr_required_reconciliation(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    failed = _add_legacy_pr_required_failed_task(store, branch="feature/explicit-owner-pr-required-run")
+    row = _failed_recovery_owner_row(failed)
+
+    fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
+    result = AdvanceActionExecutionResult(
+        action_type="reconcile_branch_divergence",
+        status="skip",
+        message="reconcile execution skipped in test",
+    )
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        _mock_git_default_branch_run(),
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[row]),
+        patch("gza.cli.git_ops.execute_advance_action", return_value=result),
+        patch("gza.advance_engine.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.merge_state.resolve_task_merge_state_for_target", return_value="unmerged"),
+        patch("gza.recovery_engine.resolve_task_merge_state_for_target", return_value="unmerged"),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, failed.id))
+
+    assert rc == 0
+    assert store.get(failed.id).failure_reason == "BRANCH_UNPUSHABLE"
+
+
+def test_cmd_advance_explicit_no_owner_fallback_dry_run_skips_prerequisite_reconciliation(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    dependency, _owner, failed = _add_prerequisite_unmerged_failed_child(
+        store,
+        owner_branch="feature/explicit-no-owner-prereq-reconcile",
+    )
+    _mark_dependency_merge_unit_merged(store, dependency)
+
+    fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
+    before = _durable_preview_snapshot(store)
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[]),
+        patch("gza.recovery_engine.is_resolved_by_merged_target", return_value=False),
+        patch("gza.recovery_engine._is_resolved_by_landed_lineage", return_value=False),
+        patch("gza.recovery_engine.get_completed_same_slice_sibling_attempt", return_value=None),
+        patch("gza.recovery_engine.resolve_task_merge_state_for_target", return_value="empty"),
+    ):
+        rc = cmd_advance(argparse.Namespace(**{**vars(_advance_args(tmp_path, failed.id)), "dry_run": True}))
+
+    assert rc == 0
+    assert _durable_preview_snapshot(store) == before
+
+
+def test_cmd_advance_explicit_no_owner_fallback_run_persists_prerequisite_reconciliation(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    dependency, _owner, failed = _add_prerequisite_unmerged_failed_child(
+        store,
+        owner_branch="feature/explicit-no-owner-prereq-reconcile-run",
+    )
+    _mark_dependency_merge_unit_merged(store, dependency)
+
+    fake_git = _make_read_session_reconciliation_git(tmp_path, failed.branch)
+
+    with (
+        patch("gza.cli.git_ops.get_store", return_value=store),
+        patch("gza.cli.git_ops.Git", return_value=fake_git),
+        patch("gza.git.Git.default_branch", return_value="main"),
+        patch("gza.git.Git.local_branch_names", return_value=()),
+        patch("gza.cli.git_ops._resolve_advance_target_branch", return_value="main"),
+        patch("gza.cli.git_ops.prime_advance_planning_refs"),
+        patch("gza.cli.git_ops.query_lineage_owner_rows", return_value=[]),
+        patch("gza.recovery_engine.is_resolved_by_merged_target", return_value=False),
+        patch("gza.recovery_engine._is_resolved_by_landed_lineage", return_value=False),
+        patch("gza.recovery_engine.get_completed_same_slice_sibling_attempt", return_value=None),
+        patch("gza.recovery_engine.resolve_task_merge_state_for_target", return_value="empty"),
+    ):
+        rc = cmd_advance(_advance_args(tmp_path, failed.id))
+
+    assert rc == 0
+    reconciled_unit = store.resolve_merge_unit_for_task(failed.id)
+    assert reconciled_unit is not None
+    assert reconciled_unit.state == "empty"
 
 
 def test_advance_retryable_provider_attention_recommends_retry_or_reimplement_for_failed_impl(

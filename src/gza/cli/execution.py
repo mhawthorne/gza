@@ -6622,12 +6622,9 @@ def _cmd_iterate_impl(
             print(f"\nNext action: {action_type}")
 
         if action_type in {"merge", "merge_with_followups"}:
+            is_max_cycle_merge_and_defer = action_type == "merge" and action.get("max_cycles_merge_and_defer") is True
             final_status = "merge_ready"
-            final_stop_reason = (
-                "merge_and_defer_blockers"
-                if action_type == "merge" and action.get("max_cycles_merge_and_defer") is True
-                else "merge_ready"
-            )
+            final_stop_reason = "merge_and_defer_blockers" if is_max_cycle_merge_and_defer else "merge_ready"
             maybe_review_verdict: str | None = None
             maybe_review = action.get("review_task")
             if action_type == "merge_with_followups" and isinstance(maybe_review, DbTask):
@@ -6661,7 +6658,7 @@ def _cmd_iterate_impl(
             if maybe_review_verdict in {"APPROVED", "APPROVED_WITH_FOLLOWUPS"}:
                 final_status = "approved"
                 final_stop_reason = "approved" if maybe_review_verdict == "APPROVED" else "approved_with_followups"
-            else:
+            elif not is_max_cycle_merge_and_defer:
                 merge_desc = action.get("description")
                 if isinstance(merge_desc, str) and merge_desc:
                     final_stop_reason = merge_desc

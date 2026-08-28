@@ -91,6 +91,29 @@ def test_format_cycle_lifecycle_action_summary_includes_plan_slice_repair_action
     assert summary == f"Lifecycle actions (1): {plan.id}→repair_plan_slice_materialization"
 
 
+def test_format_cycle_lifecycle_action_summary_labels_capped_merge_and_defer(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Capped implementation ready for direct merge", task_type="implement")
+    assert impl.id is not None
+
+    summary = lifecycle_actions_cli.format_cycle_lifecycle_action_summary(
+        [
+            (
+                impl,
+                {
+                    "type": "merge",
+                    "description": "Merge and defer blockers after max review cycles",
+                    "max_cycles_merge_and_defer": True,
+                },
+            )
+        ]
+    )
+
+    assert summary == f"Lifecycle actions (1): {impl.id}→merge_and_defer_blockers"
+
+
 def _mock_unmerged_git() -> Git:
     class _MockUnmergedGit(Git):
         def __init__(self) -> None:
@@ -9317,6 +9340,47 @@ class TestShowCommand:
         output = capsys.readouterr().out
         assert exit_code == 0
         assert "Lifecycle: review pending" in output
+
+    def test_show_lifecycle_labels_capped_merge_and_defer(self, tmp_path: Path) -> None:
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        config = Config.load(tmp_path)
+
+        impl = store.add("Capped implementation", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.completed_at = datetime.now(UTC)
+        impl.branch = "feature/capped-show"
+        impl.has_commits = True
+        impl.merge_status = "unmerged"
+        store.update(impl)
+
+        review = store.add("Capped review", task_type="review", based_on=impl.id, depends_on=impl.id)
+        assert review.id is not None
+
+        fake_git = MagicMock()
+        fake_git.default_branch.return_value = "main"
+
+        with (
+            patch("gza.cli.query.Git", return_value=fake_git),
+            patch(
+                "gza.cli.query.determine_next_action",
+                return_value={
+                    "type": "merge",
+                    "description": "Merge and defer blockers after max review cycles",
+                    "max_cycles_merge_and_defer": True,
+                },
+            ),
+        ):
+            summary = query_cli._summarize_lifecycle(  # noqa: SLF001
+                impl,
+                config=config,
+                store=store,
+            )
+
+        assert summary is not None
+        assert summary.text == "completed, ready to merge and defer blockers"
+        assert summary.severity == "completed"
 
     def test_show_lineage_statuses_reuse_top_level_show_status_colors(self, tmp_path: Path) -> None:
         """Show lineage status labels should use the same status palette as the top-level Status field."""
@@ -20539,6 +20603,83 @@ class TestIncompleteCommand:
 
         assert result == 0
         assert "merges blocked: main checkout has uncommitted changes - commit or stash them first" in captured.out
+
+    @pytest.mark.parametrize(
+        ("action", "main_checkout_isolate", "has_changes", "expected_warning"),
+        [
+            (
+                {"type": "merge", "description": "Merge", "max_cycles_merge_and_defer": True},
+                False,
+                True,
+                True,
+            ),
+            (
+                {"type": "merge", "description": "Merge", "max_cycles_merge_and_defer": True},
+                False,
+                False,
+                False,
+            ),
+            (
+                {"type": "merge", "description": "Merge", "max_cycles_merge_and_defer": True},
+                True,
+                True,
+                False,
+            ),
+            (
+                {"type": "merge", "description": "Merge"},
+                False,
+                True,
+                True,
+            ),
+        ],
+    )
+    def test_incomplete_dirty_checkout_warning_uses_raw_merge_action_semantics(
+        self,
+        tmp_path: Path,
+        action: dict[str, object],
+        main_checkout_isolate: bool,
+        has_changes: bool,
+        expected_warning: bool,
+    ) -> None:
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        config.main_checkout_isolate = main_checkout_isolate
+        store = make_store(tmp_path)
+        impl = store.add("Projected merge row", task_type="implement")
+        assert impl.id is not None
+
+        row = query_cli._LineageRow(
+            owner_task=impl,
+            members=(impl,),
+            tree=None,
+            unresolved_tasks=(impl,),
+            lifecycle_action_task=impl,
+            lineage_status="actionable",
+            next_action_data=action,
+            values={
+                "next_action": "merge_and_defer_blockers"
+                if action.get("max_cycles_merge_and_defer") is True
+                else action["type"],
+            },
+        )
+        result = query_cli._TaskQueryResult(
+            query=query_cli._TaskQueryPresets.incomplete(limit=None),
+            rows=(row,),
+            total_count=1,
+        )
+        git = _mock_unmerged_git()
+        git.has_changes.return_value = has_changes
+
+        warning = query_cli._incomplete_dirty_checkout_warning(  # noqa: SLF001
+            result,
+            config=config,
+            git=git,
+        )
+
+        if expected_warning:
+            assert warning == "merges blocked: main checkout has uncommitted changes - commit or stash them first"
+        else:
+            assert warning is None
 
     def test_incomplete_failed_empty_prereq_still_shows_release_valve_guidance(
         self,

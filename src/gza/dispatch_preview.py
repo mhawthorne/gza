@@ -294,6 +294,7 @@ def _build_recovery_preview_entries(
     failed_rows.sort(key=_recovery_owner_row_sort_key)
 
     entries: list[DispatchPreviewEntry] = []
+    persist_projection_state = read_context.allow_reconcile_mutation
     for row in failed_rows:
         task = row.recovery_leaf_task
         if task is None or task.id is None:
@@ -329,6 +330,8 @@ def _build_recovery_preview_entries(
                 target_branch,
                 max_resume_attempts=max_recovery_attempts,
                 read_context=read_context,
+                persist_post_merge_rebase_state=persist_projection_state,
+                persist_review_clearance=persist_projection_state,
             )
             if config is not None and git is not None and target_branch
             else None

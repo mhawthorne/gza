@@ -13,7 +13,7 @@ from ..console import prompt_available_width, shorten_prompt
 from ..db import SqliteTaskStore, Task as DbTask
 from ..git import Git
 from ..lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows_in_read_session
-from ..pickup import is_worker_consuming_advance_action
+from ..pickup import is_worker_consuming_advance_action, projected_advance_action_type
 from ..recovery_read_context import RecoveryReadContext
 from ..task_query import normalize_tag_filters
 from .advance_engine import classify_advance_action, determine_next_action, prime_lifecycle_git_facts
@@ -150,7 +150,7 @@ def format_cycle_lifecycle_action_summary(
 ) -> str | None:
     """Build the one-line per-pass watch lifecycle summary."""
     parts = [
-        f"{task.id}→{str(action.get('type', 'unknown'))}"
+        f"{task.id}→{projected_advance_action_type(action)}"
         for task, action in items
         if classify_advance_action(action) == "actionable" and task.id is not None
     ]

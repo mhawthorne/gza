@@ -72,6 +72,7 @@ from ..operator_state import (
     effective_no_work_merge_state,
     moot_empty_lifecycle_detail,
 )
+from ..pickup import is_merge_routing_advance_action
 from ..pr_ops import lookup_task_pr
 from ..query import (
     _LINEAGE_REL_LABELS as _QUERY_LINEAGE_REL_LABELS,
@@ -616,6 +617,8 @@ def _summarize_lifecycle(
     if action_type in {"merge", "merge_with_followups"}:
         if planning_task.merge_status == "merged":
             detail = "completed and merged"
+        elif action_type == "merge" and action.get("max_cycles_merge_and_defer") is True:
+            detail = "completed, ready to merge and defer blockers"
         else:
             detail = "completed, ready to merge"
         return _with_recovered_lifecycle_prefix(detail, recovered=recovered, severity="completed")
@@ -1935,7 +1938,9 @@ def _incomplete_dirty_checkout_warning(
     if config.main_checkout_isolate or git is None:
         return None
     has_mergeable_rows = any(
-        isinstance(row, _LineageRow) and row.values.get("next_action") in {"merge", "merge_with_followups"}
+        isinstance(row, _LineageRow)
+        and isinstance(row.next_action_data, Mapping)
+        and is_merge_routing_advance_action(row.next_action_data)
         for row in result.rows
     )
     if not has_mergeable_rows:

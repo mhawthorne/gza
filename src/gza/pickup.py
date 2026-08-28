@@ -1,5 +1,6 @@
 """Shared queue pickup and worker-slot semantics."""
 
+from collections.abc import Mapping
 from datetime import datetime
 
 from .db import SqliteTaskStore, Task
@@ -30,6 +31,25 @@ QUIET_EXEMPT_RECOVERY_ORIGINS: frozenset[str] = frozenset({"retry", "resume"})
 def is_worker_consuming_advance_action(action_type: str) -> bool:
     """Return True when an advance action consumes a worker slot."""
     return action_type in WORKER_CONSUMING_ADVANCE_ACTION_TYPES
+
+
+def projected_advance_action_type(action: Mapping[str, object] | object) -> str:
+    """Return the operator-facing action type without changing executor routing."""
+    get = getattr(action, "get", None)
+    if not callable(get):
+        return "unknown"
+    action_type = str(get("type", "unknown"))
+    if action_type == "merge" and get("max_cycles_merge_and_defer") is True:
+        return "merge_and_defer_blockers"
+    return action_type
+
+
+def is_merge_routing_advance_action(action: Mapping[str, object] | object) -> bool:
+    """Return True when an action routes through the direct merge executor."""
+    get = getattr(action, "get", None)
+    if not callable(get):
+        return False
+    return str(get("type", "")) in {"merge", "merge_with_followups"}
 
 
 def count_worker_consuming_actions(actions: list[dict]) -> int:

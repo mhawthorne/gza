@@ -842,8 +842,10 @@ The batch limit means "maintain at most N concurrent detached worker processes,"
   still depend on the presence of any actionable recovery, including direct reconcile
   actions that do not consume worker slots.
 - Only worker-consuming actions spend a slot. Direct actions such as merge,
-  merge-with-followups, scope evaluation, re-exec decisions, and attention emission MUST
-  NOT consume slots.
+  merge-with-followups, annotated max-cycle merge-and-defer, scope evaluation, re-exec
+  decisions, and attention emission MUST NOT consume slots. Annotated max-cycle
+  merge-and-defer remains an executable `merge` action and MUST NOT route through an
+  iterate worker.
 - One detached iterate chain occupies one slot for as long as its worker process remains
   live, even though that worker may drive several engine steps internally.
 

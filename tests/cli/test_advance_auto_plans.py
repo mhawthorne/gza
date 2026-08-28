@@ -591,19 +591,12 @@ def test_advance_dry_run_warns_once_when_failed_task_branch_reachability_is_unav
     failed.completed_at = datetime.now(UTC)
     store.update(failed)
 
-    class _BrokenMergeGit:
-        def branch_exists(self, branch: str) -> bool:
-            return bool(branch)
-
-        def is_merged(self, branch: str, into: str) -> bool:
-            raise GitError("simulated reachability failure")
+    git = _mock_git()
+    git.local_branch_names.side_effect = GitError("simulated reachability failure")
 
     with (
-        patch("gza.cli.git_ops.Git", return_value=_mock_git()),
-        patch(
-            "gza.recovery_engine._load_merge_context",
-            lambda _project_dir=None: _MergeContext(git=_BrokenMergeGit(), default_branch="main"),
-        ),
+        patch("gza.cli.git_ops.Git", return_value=git),
+        patch("gza.git.Git._run", return_value=SimpleNamespace(returncode=0, stdout="main-sha\n", stderr="")),
     ):
         rc = cmd_advance(_advance_args(tmp_path, dry_run=True))
 

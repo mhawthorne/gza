@@ -53351,6 +53351,102 @@ def test_watch_cycle_executes_direct_lifecycle_actions_before_worker_consuming_a
     assert stdout.index("MERGE") < stdout.index("(new) review for")
 
 
+def test_watch_cycle_treats_capped_merge_and_defer_as_direct_merge_action(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    merge_owner = store.add("Capped merge and defer", task_type="implement")
+    assert merge_owner.id is not None
+    merge_owner.status = "completed"
+    merge_owner.completed_at = datetime.now(UTC)
+    merge_owner.branch = "feature/watch-capped-merge"
+    merge_owner.has_commits = True
+    merge_owner.merge_status = "unmerged"
+    store.update(merge_owner)
+
+    review_owner = store.add("Needs review before merge", task_type="implement")
+    assert review_owner.id is not None
+    review_owner.status = "completed"
+    review_owner.completed_at = datetime.now(UTC)
+    review_owner.branch = "feature/watch-create-review-after-capped"
+    review_owner.has_commits = True
+    review_owner.merge_status = "unmerged"
+    store.update(review_owner)
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=False)
+    capped_action = {
+        "type": "merge",
+        "description": "Merge and defer blockers after max review cycles",
+        "max_cycles_merge_and_defer": True,
+    }
+    review_action = {"type": "create_review", "description": "Create review before merge"}
+    executed_worker_actions: list[str] = []
+
+    def _row(task: Task) -> LineageOwnerRow:
+        return LineageOwnerRow(
+            owner_task=task,
+            members=(task,),
+            tree=None,
+            lineage_status="actionable",
+            next_action=None,
+            next_action_reason="",
+            unresolved_tasks=(task,),
+            unresolved_leaf_summary=(),
+            lifecycle_action_task=task,
+            recovery_action_task=None,
+            recovery_leaf_task=None,
+        )
+
+    def _fake_determine(_config, _store, _git, task, _target_branch, **_kwargs):
+        return capped_action if task.id == merge_owner.id else review_action
+
+    def _fake_execute_advance_action(*, task, action, context):
+        del task, context
+        executed_worker_actions.append(str(action["type"]))
+        assert action["type"] != "merge"
+        return AdvanceActionExecutionResult(
+            action_type=str(action["type"]),
+            status="dry_run",
+            message=f"Would {action['type']}",
+            worker_label="worker",
+            worker_consuming=True,
+        )
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.collect_scoped_tag_scope_gaps", return_value=[]),
+        patch("gza.cli.watch.collect_recovery_lane_entries", return_value=[]),
+        patch(
+            "gza.cli.watch._query_owner_rows_with_context",
+            return_value=([_row(merge_owner), _row(review_owner)], RecoveryReadContext()),
+        ),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch.determine_next_action", side_effect=_fake_determine),
+        patch("gza.cli.watch.execute_advance_action", side_effect=_fake_execute_advance_action),
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=True,
+            log=log,
+        )
+
+    stdout = capsys.readouterr().out
+    log_text = log_path.read_text()
+    assert executed_worker_actions == ["create_review"]
+    assert f"{merge_owner.id}→merge_and_defer_blockers" in stdout
+    assert f"{merge_owner.id}→merge_and_defer_blockers" in log_text
+    assert "iterate" not in " ".join(executed_worker_actions)
+
+
 def test_watch_cycle_reuses_lifecycle_slot_when_non_consuming_result_leaves_capacity(
     tmp_path: Path,
 ) -> None:

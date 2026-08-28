@@ -19,7 +19,7 @@ from .db import (
 from .lifecycle_completion import task_is_complete_for_lifecycle
 from .lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_owner_rows_in_read_session
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
-from .pickup import effective_edit_time, is_in_quiet_period
+from .pickup import effective_edit_time, is_in_quiet_period, projected_advance_action_type
 from .recovery_read_context import RecoveryReadContext
 from .review_verify_state import (
     owner_task_verify_epoch,
@@ -1082,7 +1082,7 @@ class TaskQueryService:
                     target_branch=target_branch,
                 )
             )
-            action_type_value = action.get("type") if action else None
+            action_type_value = projected_advance_action_type(action) if action else None
             action_reason_value = action.get("description") if action else None
             if next_action_reason is None:
                 next_action_type = str(action_type_value) if action_type_value is not None else None

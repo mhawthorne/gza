@@ -1740,12 +1740,23 @@ def _is_resolved_by_landed_lineage(
     return False
 
 
-def resolve_recovery_planning_task(store: SqliteTaskStore, task: DbTask) -> DbTask:
+def resolve_recovery_planning_task(
+    store: SqliteTaskStore,
+    task: DbTask,
+    *,
+    merge_context: _MergeContext | None = None,
+    read_context: RecoveryReadContext | None = None,
+) -> DbTask:
     """Return the task that should own normal lifecycle planning for this lineage."""
     if task.status != "failed":
         return task
-    _reconcile_historical_prerequisite_unmerged_failure(store, task)
-    snapshot = _build_recovery_chain_snapshot(store, task)
+    _reconcile_historical_prerequisite_unmerged_failure(
+        store,
+        task,
+        merge_context=merge_context,
+        read_context=read_context,
+    )
+    snapshot = _build_recovery_chain_snapshot(store, task, read_context=read_context)
     return snapshot.latest_completed_terminal_descendant or task
 
 
@@ -1779,7 +1790,11 @@ def list_failed_tasks_for_recovery(
         merge_context = _load_merge_context(_project_dir_for_store(store))
     if read_context is not None and read_context.merge_context is None:
         read_context.merge_context = merge_context
-    failed = list(read_context.failed_tasks()) if read_context is not None else [task for task in store.get_all() if task.status == "failed"]
+    failed = (
+        list(read_context.failed_tasks())
+        if read_context is not None and read_context.tasks is not None
+        else [task for task in store.get_all() if task.status == "failed"]
+    )
     if read_context is not None and read_context.recovery_scope_task_ids is not None:
         failed = [
             task
