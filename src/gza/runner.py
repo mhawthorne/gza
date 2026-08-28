@@ -2849,7 +2849,45 @@ def resolve_backup_dir(db_path: Path, project_dir: Path) -> Path:
     return db_path.parent / "backups"
 
 
-def backup_database(db_path: Path, project_dir: Path) -> None:
+def backup_dir_size_bytes(backup_dir: Path) -> int:
+    """Total bytes of the snapshot files in ``backup_dir`` (non-recursive)."""
+    total = 0
+    try:
+        for entry in os.scandir(backup_dir):
+            try:
+                if entry.is_file(follow_symlinks=False):
+                    total += entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return total
+
+
+def check_backup_dir_size(backup_dir: Path, warn_gb: int) -> str | None:
+    """Return a warning message when ``backup_dir`` exceeds ``warn_gb``.
+
+    ``warn_gb`` of 0 disables the check. The message names the remedy so the
+    warning is actionable wherever it surfaces.
+    """
+    try:
+        limit_gb = int(warn_gb)
+    except (TypeError, ValueError):
+        return None
+    if limit_gb <= 0:
+        return None
+    limit = limit_gb * 1024**3
+    size = backup_dir_size_bytes(backup_dir)
+    if size <= limit:
+        return None
+    return (
+        f"database backups in {backup_dir} total {size / 1024**3:.1f} GB, "
+        f"over the {limit_gb} GB backup_size_warn_gb threshold; "
+        f"run 'gza clean --backups' to prune old snapshots"
+    )
+
+
+def backup_database(db_path: Path, project_dir: Path, warn_gb: int = 0) -> None:
     """Create an hourly backup of the SQLite database if one doesn't exist yet.
 
     Checks if a backup for the current hour already exists. If not, creates
@@ -2874,6 +2912,13 @@ def backup_database(db_path: Path, project_dir: Path) -> None:
     backup_dir.mkdir(parents=True, exist_ok=True)
 
     _backup_sqlite_file(db_path, backup_path)
+
+    # Only reached when a new snapshot was written, so this runs at most once
+    # per hour rather than on every task launch.
+    warning = check_backup_dir_size(backup_dir, warn_gb)
+    if warning:
+        logger.warning(warning)
+        print(f"warning: {warning}", file=sys.stderr)
 
 
 def load_dotenv(project_dir: Path) -> None:
@@ -8614,7 +8659,7 @@ def run(
         runtime_context: Optional captured runtime cwd/env/identity bundle.
     """
     # Create hourly backup before running
-    backup_database(config.db_path, config.project_dir)
+    backup_database(config.db_path, config.project_dir, config.backup_size_warn_gb)
 
     # Load tasks from SQLite
     store = SqliteTaskStore.from_config(config)

@@ -84,6 +84,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("claude_args", "list[str]", None, "Deprecated legacy alias for `claude.args`."),
     ConfigKeySpec("cleanup_days", "int", 30, "Default retention window for `gza clean`."),
     ConfigKeySpec(
+        "backup_size_warn_gb",
+        "int",
+        100,
+        "Warn when database backups exceed this many GB (0 disables).",
+    ),
+    ConfigKeySpec(
         "quiet_period_seconds",
         "int",
         300,

@@ -45,6 +45,7 @@ from gza.review_verify_state import (
     latest_verify_result_for_epoch,
     persist_verify_gate_artifact,
 )
+from gza import runner
 from gza.runner import (
     BACKUP_DIR,
     BRANCH_UNPUSHABLE_FAILURE_REASON,
@@ -26130,3 +26131,43 @@ def test_completion_guard_fails_closed_when_verify_fix_worktree_is_unresolved(
     assert can_complete is False
     assert "Cannot resolve managed verify_fix worktree" in capsys.readouterr().out
     run_verify.assert_not_called()
+
+
+def test_check_backup_dir_size_under_threshold(tmp_path):
+    (tmp_path / "gza-2026010100.db").write_bytes(b"x" * 1024)
+    assert runner.check_backup_dir_size(tmp_path, 1) is None
+
+
+def test_check_backup_dir_size_ignores_non_numeric_threshold(tmp_path):
+    assert runner.check_backup_dir_size(tmp_path, object()) is None
+
+
+def test_check_backup_dir_size_over_threshold(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "backup_dir_size_bytes", lambda _p: 2 * 1024**3)
+    warning = runner.check_backup_dir_size(tmp_path, 1)
+    assert warning is not None
+    assert "backup_size_warn_gb" in warning
+    assert str(tmp_path) in warning
+
+
+def test_check_backup_dir_size_disabled_by_zero(tmp_path):
+    (tmp_path / "gza-2026010100.db").write_bytes(b"x" * 4096)
+    assert runner.check_backup_dir_size(tmp_path, 0) is None
+
+
+def test_check_backup_dir_size_missing_dir(tmp_path):
+    assert runner.check_backup_dir_size(tmp_path / "nope", 1) is None
+
+
+def test_resolve_backup_dir_local_db(tmp_path):
+    db = tmp_path / ".gza" / "gza.db"
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b"")
+    assert runner.resolve_backup_dir(db, tmp_path) == tmp_path / ".gza/backups"
+
+
+def test_resolve_backup_dir_external_db(tmp_path):
+    db = tmp_path / "shared" / "gza.db"
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b"")
+    assert runner.resolve_backup_dir(db, tmp_path / "proj") == db.parent / "backups"

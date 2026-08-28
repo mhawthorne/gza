@@ -521,6 +521,10 @@ provider: codex
 
 # --- Other ---
 
+# Warn when database backups exceed this many GB (0 disables).
+# Default: 100
+# backup_size_warn_gb: 100
+
 # Treat every task in this project as if tagged `cross-project`: scope gates allow discovered
 # project roots and lifecycle verify fans out across affected projects. This is not the same as
 # `enforce_project_scope: false`, which disables scope parking without enabling cross-project

@@ -124,6 +124,7 @@ DEFAULT_INTERACTIVE_WORKTREE_DIR = ""
 DEFAULT_MERGE_SQUASH_THRESHOLD = 0
 DEFAULT_MAIN_CHECKOUT_ISOLATE = False
 DEFAULT_CLEANUP_DAYS = 30
+DEFAULT_BACKUP_SIZE_WARN_GB = 100
 DEFAULT_QUIET_PERIOD_SECONDS = 300
 DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD = 500
 DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD = 2000
@@ -166,7 +167,8 @@ VALID_CONFIG_FIELDS = {
     "advance_off_topic_verify_unblock",
     "plan_slice_target_timeout_minutes", "max_failed_closing_review_retries", "max_concurrent",
     "iterate_max_iterations", "watch", "interactive_worktree_dir",
-    "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "quiet_period_seconds",
+    "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "backup_size_warn_gb",
+    "quiet_period_seconds",
     "review_diff_small_threshold",
     "review_diff_medium_threshold", "review_context_file_limit", "autonomous_verify_timeout_seconds",
     "review_verify_timeout_grace_seconds", "main_integration_verify_red_ttl_minutes",
@@ -288,6 +290,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "merge_squash_threshold": None,
     "main_checkout_isolate": None,
     "cleanup_days": None,
+    "backup_size_warn_gb": None,
     "quiet_period_seconds": None,
     "review_diff_small_threshold": None,
     "review_diff_medium_threshold": None,
@@ -422,6 +425,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "merge_squash_threshold": None,
     "main_checkout_isolate": None,
     "cleanup_days": None,
+    "backup_size_warn_gb": None,
     "quiet_period_seconds": None,
     "review_diff_small_threshold": None,
     "review_diff_medium_threshold": None,
@@ -1616,6 +1620,7 @@ class Config:
     spec_coherence: SpecCoherenceConfig = field(default_factory=SpecCoherenceConfig)
     iterate_max_iterations: int = DEFAULT_ITERATE_MAX_ITERATIONS
     cleanup_days: int = DEFAULT_CLEANUP_DAYS
+    backup_size_warn_gb: int = DEFAULT_BACKUP_SIZE_WARN_GB
     quiet_period_seconds: int = DEFAULT_QUIET_PERIOD_SECONDS
     review_diff_small_threshold: int = DEFAULT_REVIEW_DIFF_SMALL_THRESHOLD
     review_diff_medium_threshold: int = DEFAULT_REVIEW_DIFF_MEDIUM_THRESHOLD
@@ -2955,6 +2960,13 @@ class Config:
             raise ConfigError("cleanup_days must be a positive integer")
         if cleanup_days < 1:
             raise ConfigError("cleanup_days must be a positive integer")
+        backup_size_warn_gb = (
+            _validate_non_negative_int_field(
+                data.get("backup_size_warn_gb", DEFAULT_BACKUP_SIZE_WARN_GB),
+                "backup_size_warn_gb",
+            )
+            or 0
+        )
         quiet_period_seconds = _validate_non_negative_int_field(
             data.get("quiet_period_seconds", DEFAULT_QUIET_PERIOD_SECONDS),
             "quiet_period_seconds",
@@ -3284,6 +3296,7 @@ class Config:
             merge_squash_threshold=merge_squash_threshold,
             main_checkout_isolate=main_checkout_isolate,
             cleanup_days=cleanup_days,
+            backup_size_warn_gb=backup_size_warn_gb,
             quiet_period_seconds=quiet_period_seconds,
             review_diff_small_threshold=review_diff_small_threshold,
             review_diff_medium_threshold=review_diff_medium_threshold,

@@ -2885,6 +2885,11 @@ def cmd_clean(args: argparse.Namespace) -> int:
             print(f"Backups cleaned: {len(deleted_backups)}")
         else:
             print("Backups: nothing to clean")
+        from gza.runner import check_backup_dir_size
+
+        size_warning = check_backup_dir_size(backups_dir, config.backup_size_warn_gb)
+        if size_warning:
+            print(f"  warning: {size_warning}")
         print()
 
     # Report errors
