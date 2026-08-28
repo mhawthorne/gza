@@ -181,6 +181,7 @@ from ..review_verify_state import (
 from ..runner import (
     WIP_INTERRUPTED_COMMIT_SUBJECT,
     LongPhaseHeartbeat,
+    LongPhaseProgress,
     TaskExecutionLogger,
     _call_provider_run,
     _complete_failed_code_task_after_pr_publication,
@@ -351,7 +352,7 @@ def _print_mixed_recovery_preview_entries(
     for entry in mixed_entries:
         task = entry.task
         prompt_display = shorten_prompt(task.prompt, 100)
-        console.print(f"  {task.id} {prompt_display}")
+        console.print(f"{task.id} {prompt_display}")
         if entry.runnable:
             action = failed_recovery_decision_to_action(
                 task,
@@ -359,7 +360,7 @@ def _print_mixed_recovery_preview_entries(
                 subject_task_id=task.id,
             )
             action_color = _advance_action_color(str(action["type"]))
-            console.print(f"      [{action_color}]→ {action['description']}[/{action_color}]")
+            console.print(f"[{action_color}]→ {action['description']}[/{action_color}]")
         else:
             attention_action = failed_recovery_decision_to_attention_action(
                 store,
@@ -370,9 +371,9 @@ def _print_mixed_recovery_preview_entries(
             )
             if attention_action is not None:
                 detail = format_needs_attention_entry_for_display(task, action=attention_action)
-                console.print(f"      {detail}")
+                console.print(f"{detail}")
             else:
-                console.print(f"      SKIP: {entry.decision.reason_text}")
+                console.print(f"SKIP: {entry.decision.reason_text}")
         console.print()
 
 
@@ -4599,7 +4600,7 @@ def _print_advance_deferred_blocker_lines(
     console: Console,
     merge_result: object,
     *,
-    indent: str = "      ",
+    indent: str = "",
 ) -> None:
     ac = _colors.WORK_COLORS
     created_ids = _format_task_ids(getattr(merge_result, "created_deferred_blockers", ()))
@@ -5552,6 +5553,32 @@ def _stage_isolated_merge_action(
     )
 
 
+CLI_VERIFY_HEARTBEAT_THRESHOLD_SECONDS = 15
+CLI_VERIFY_HEARTBEAT_INTERVAL_SECONDS = 30
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = int(max(0.0, seconds))
+    minutes, secs = divmod(total, 60)
+    return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
+
+
+class _CliVerifyProgressHeartbeat:
+    """Print periodic pre-merge verify progress to stdout for interactive CLI runs."""
+
+    def __init__(self, console: Console, label: str) -> None:
+        self._console = console
+        self._label = label
+
+    def __call__(self, progress: LongPhaseProgress) -> None:
+        elapsed = _format_elapsed(progress.elapsed_seconds)
+        if progress.no_progress:
+            detail = "no output yet"
+        else:
+            detail = f"+{progress.output_lines_delta} line(s)"
+        self._console.print(f"{self._label} running - {elapsed} elapsed, {detail}")
+
+
 def _execute_merge_action(
     config: Config,
     store: SqliteTaskStore,
@@ -6135,13 +6162,42 @@ def _execute_merge_action(
     verified_head_sha: str | None = None
     verified_tree_fingerprint: str | None = None
     if rc == 0 and candidate_verify_required:
+        _verify_console = Console()
+        _verify_command_label = getattr(config, "verify_command", None) or "verify"
+        if not quiet_mechanics:
+            _verify_console.print(f"Running pre-merge verify ({_verify_command_label}) on the merge candidate...")
+        _cli_heartbeat = (
+            None if quiet_mechanics else _CliVerifyProgressHeartbeat(_verify_console, "Pre-merge verify")
+        )
+        _verify_heartbeat = on_heartbeat or _cli_heartbeat
+
+        def _announce_red_rerun(attempt: int, total: int, _evidence: object) -> None:
+            if quiet_mechanics:
+                return
+            _verify_console.print(f"Pre-merge verify came back red; re-running to confirm (attempt {attempt} of {total})")
+
         candidate_verify = check_candidate_integration_verify(
             config,
             execution_git,
             reason="merge-executor-pre-promotion",
             red_reruns=2,
             env=_owned_git_env(execution_git),
+            on_red_rerun_start=_announce_red_rerun,
+            heartbeat_threshold_seconds=(
+                heartbeat_threshold_seconds
+                if heartbeat_threshold_seconds is not None
+                else CLI_VERIFY_HEARTBEAT_THRESHOLD_SECONDS
+            ),
+            heartbeat_interval_seconds=(
+                heartbeat_interval_seconds
+                if heartbeat_interval_seconds is not None
+                else CLI_VERIFY_HEARTBEAT_INTERVAL_SECONDS
+            ),
+            heartbeat_for_attempt=(lambda _attempt: _verify_heartbeat) if _verify_heartbeat is not None else None,
         )
+        if not quiet_mechanics:
+            _verify_status = getattr(getattr(candidate_verify, "evidence", None), "verify_status", None)
+            _verify_console.print(f"Pre-merge verify {_verify_status or 'finished'}")
         proof = _candidate_verify_promotion_proof(execution_git, candidate_verify)
         if not proof.exact_match:
             print(f"Error: {proof.block_reason}")
@@ -6600,10 +6656,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
         )
         for atask, aaction in items:
             _color = _advance_action_color(aaction["type"])
-            console.print(f"  [{_color}]{_format_needs_attention_line(atask, aaction)}[/{_color}]")
+            console.print(f"[{_color}]{_format_needs_attention_line(atask, aaction)}[/{_color}]")
             next_step = needs_attention_recommended_next_step(store, atask, aaction)
             if next_step is not None:
-                console.print(f"  [{_color}]{next_step}[/{_color}]")
+                console.print(f"[{_color}]{next_step}[/{_color}]")
 
     def _append_attention_once(
         items: list[tuple[DbTask, dict[str, Any]]],
@@ -7578,7 +7634,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     outcome, message, merge_attention_action, merge_result = _execute_repeat_merge(action_task, action)
                     print(f"cycle {cycle}: {action_type} -> {outcome}: {message}")
                     if merge_result is not None:
-                        _print_advance_deferred_blocker_lines(console, merge_result, indent="  ")
+                        _print_advance_deferred_blocker_lines(console, merge_result)
                     if merge_attention_action is not None:
                         print(f"Advance repeat parked: {merge_attention_action['description']}")
                         return 0
@@ -7888,14 +7944,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
                             continue
                         display_task = row.owner_task
                         prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
-                        console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                        console.print(f"[{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                         _color = _advance_action_color(action["type"])
-                        console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
+                        console.print(f"[{_color}]→ {action['description']}[/{_color}]")
                     for row, _task, _action, description in preview_gated_rows:
                         display_task = row.owner_task
                         prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
-                        console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                        console.print(f"      [{_c_warn}]— {description}[/{_c_warn}]")
+                        console.print(f"[{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                        console.print(f"[{_c_warn}]— {description}[/{_c_warn}]")
                     print()
                 return 0
             if preview_attention_plan:
@@ -7907,14 +7963,14 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         continue
                     display_task = row.owner_task
                     prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
-                    console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    console.print(f"[{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     _color = _advance_action_color(action["type"])
-                    console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
+                    console.print(f"[{_color}]→ {action['description']}[/{_color}]")
                 for row, _task, _action, description in preview_gated_rows:
                     display_task = row.owner_task
                     prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
-                    console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                    console.print(f"      [{_c_warn}]— {description}[/{_c_warn}]")
+                    console.print(f"[{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    console.print(f"[{_c_warn}]— {description}[/{_c_warn}]")
                 print()
 
         if dry_run:
@@ -7953,9 +8009,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         skip_rows_printed = True
                     display_task = row.owner_task
                     prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
-                    console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    console.print(f"[{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
                     _color = _advance_action_color(action["type"])
-                    console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
+                    console.print(f"[{_color}]→ {action['description']}[/{_color}]")
                     print()
                 for row, _task, _action, description in preview_gated_rows:
                     if not skip_rows_printed:
@@ -7963,8 +8019,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         skip_rows_printed = True
                     display_task = row.owner_task
                     prompt_display = shorten_prompt(display_task.prompt, _prompt_avail(display_task.id))
-                    console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                    console.print(f"      [{_c_warn}]— {description}[/{_c_warn}]")
+                    console.print(f"[{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                    console.print(f"[{_c_warn}]— {description}[/{_c_warn}]")
                     print()
             if new_mode and batch_limit is not None:
                 planned_workers = count_worker_consuming_actions(
@@ -7983,8 +8039,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         print(f"Would start {len(pending_tasks)} new pending task(s):\n")
                         for pt in pending_tasks:
                             prompt_display = shorten_prompt(pt.prompt, _prompt_avail(pt.id))
-                            console.print(f"  [{_c_tid}]{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                            console.print(f"      [{_c_default}]→ Start new worker[/{_c_default}]")
+                            console.print(f"[{_c_tid}]{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                            console.print(f"[{_c_default}]→ Start new worker[/{_c_default}]")
                             print()
                     else:
                         print("No pending tasks available to fill batch\n")
@@ -8026,8 +8082,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     print(f"Will start {len(new_pending_tasks)} new pending task(s):\n")
                     for pt in new_pending_tasks:
                         prompt_display = shorten_prompt(pt.prompt, _prompt_avail(pt.id))
-                        console.print(f"  [{_c_tid}]{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
-                        console.print(f"      [{_c_default}]→ Start new worker[/{_c_default}]")
+                        console.print(f"[{_c_tid}]{pt.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+                        console.print(f"[{_c_default}]→ Start new worker[/{_c_default}]")
                         print()
 
         if not auto and (preview_actionable_rows or new_mode):
@@ -8074,7 +8130,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             workers_started += 1
 
         if exec_result.status == "skip":
-            console.print(f"      [{_c_warn}]{exec_result.message}[/{_c_warn}]")
+            console.print(f"[{_c_warn}]{exec_result.message}[/{_c_warn}]")
             skip_count += 1
             attention = resolve_execution_needs_attention(action_task, exec_result)
             if attention is not None:
@@ -8087,15 +8143,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
         if exec_result.status == "error":
             if exec_result.success_message:
-                console.print(f"      [{_c_ok}]✓ {exec_result.success_message}[/{_c_ok}]")
+                console.print(f"[{_c_ok}]✓ {exec_result.success_message}[/{_c_ok}]")
             err_message = exec_result.error_message or exec_result.message or f"Failed to execute {action_type}"
-            console.print(f"      [{_c_err}]✗ {err_message}[/{_c_err}]")
+            console.print(f"[{_c_err}]✗ {err_message}[/{_c_err}]")
             error_count += 1
             return
 
         success_message = exec_result.success_message or exec_result.message
         if success_message:
-            console.print(f"      [{_c_ok}]✓ {success_message}[/{_c_ok}]")
+            console.print(f"[{_c_ok}]✓ {success_message}[/{_c_ok}]")
 
         if exec_result.worker_started or (exec_result.work_done and not exec_result.worker_consuming):
             success_count += 1
@@ -8111,9 +8167,9 @@ def cmd_advance(args: argparse.Namespace) -> int:
         action_type = action["type"]
 
         if classify_advance_action(action) != "actionable":
-            console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+            console.print(f"[{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             _color = _advance_action_color(action_type)
-            console.print(f"      [{_color}]{action['description']}[/{_color}]")
+            console.print(f"[{_color}]{action['description']}[/{_color}]")
             skip_count += 1
             if classify_advance_action(action) == "needs_attention":
                 _append_attention_once(
@@ -8124,20 +8180,20 @@ def cmd_advance(args: argparse.Namespace) -> int:
             continue
 
         if not decision.selected:
-            console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+            console.print(f"[{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
             message = _gated_lifecycle_skip_message(free_worker_slots=decision.free_worker_slots)
-            console.print(f"      [{_c_warn}]— {message}[/{_c_warn}]")
+            console.print(f"[{_c_warn}]— {message}[/{_c_warn}]")
             print()
             skip_count += 1
             continue
 
-        console.print(f"  [{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
+        console.print(f"[{_c_tid}]{display_task.id}[/{_c_tid}] [{pink}]{prompt_display}[/{pink}]")
         _color = _advance_action_color(action_type)
-        console.print(f"      [{_color}]→ {action['description']}[/{_color}]")
+        console.print(f"[{_color}]→ {action['description']}[/{_color}]")
 
         if action_type in {"merge", "merge_with_followups"}:
             if merge_halt_attention is not None:
-                console.print(f"      [{_c_warn}]SKIP: {merge_halt_attention['description'][6:]}[/{_c_warn}]")
+                console.print(f"[{_c_warn}]SKIP: {merge_halt_attention['description'][6:]}[/{_c_warn}]")
                 skip_count += 1
                 print()
                 continue
@@ -8165,24 +8221,24 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 )
             if merge_result.created_followups:
                 created_ids = ", ".join(str(t.id) for t in merge_result.created_followups if t.id is not None)
-                console.print(f"      [{_c_ok}]✓ Created follow-up task(s): {created_ids}[/{_c_ok}]")
+                console.print(f"[{_c_ok}]✓ Created follow-up task(s): {created_ids}[/{_c_ok}]")
             if merge_result.reused_followups:
                 reused_ids = ", ".join(str(t.id) for t in merge_result.reused_followups if t.id is not None)
-                console.print(f"      [{_c_warn}]↺ Reused follow-up task(s): {reused_ids}[/{_c_warn}]")
+                console.print(f"[{_c_warn}]↺ Reused follow-up task(s): {reused_ids}[/{_c_warn}]")
             _print_advance_deferred_blocker_lines(console, merge_result)
             created_investigation_task_ids = getattr(merge_result, "created_investigation_task_ids", ())
             reused_investigation_task_ids = getattr(merge_result, "reused_investigation_task_ids", ())
             if created_investigation_task_ids:
                 created_ids = ", ".join(created_investigation_task_ids)
-                console.print(f"      [{_c_ok}]✓ Created investigation task(s): {created_ids}[/{_c_ok}]")
+                console.print(f"[{_c_ok}]✓ Created investigation task(s): {created_ids}[/{_c_ok}]")
             if reused_investigation_task_ids:
                 reused_ids = ", ".join(reused_investigation_task_ids)
-                console.print(f"      [{_c_warn}]↺ Reused investigation task(s): {reused_ids}[/{_c_warn}]")
+                console.print(f"[{_c_warn}]↺ Reused investigation task(s): {reused_ids}[/{_c_warn}]")
             for warning in getattr(merge_result, "promotion_warnings", ()):
-                console.print(f"      [{_c_warn}]WARN: {warning}[/{_c_warn}]")
+                console.print(f"[{_c_warn}]WARN: {warning}[/{_c_warn}]")
             rc = merge_result.rc
             if rc == 0:
-                console.print(f"      [{_c_ok}]✓ Merged[/{_c_ok}]")
+                console.print(f"[{_c_ok}]✓ Merged[/{_c_ok}]")
                 success_count += 1
                 main_verify = _check_main_integration_verify_with_git_env(
                     config,
@@ -8204,7 +8260,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     "blocked_candidate_verify_unavailable",
                 }:
                     candidate_message = format_blocked_candidate_verify_message(str(display_task.id), merge_result)
-                    console.print(f"      [{_c_warn}]! {candidate_message}[/{_c_warn}]")
+                    console.print(f"[{_c_warn}]! {candidate_message}[/{_c_warn}]")
                     _append_attention_once(
                         attention_tasks,
                         display_task,
@@ -8243,7 +8299,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     continue
                 if is_pre_promotion_merge_refusal_status(getattr(merge_result, "status", None)):
                     block_reason = getattr(merge_result, "block_reason", None) or "merge refused before target promotion"
-                    console.print(f"      [{_c_err}]✗ {block_reason}[/{_c_err}]")
+                    console.print(f"[{_c_err}]✗ {block_reason}[/{_c_err}]")
                     error_count += 1
                     continue
                 if is_pending_merge_finalization_refusal_status(getattr(merge_result, "status", None)):
@@ -8251,7 +8307,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         getattr(merge_result, "block_reason", None)
                         or "pending merge finalization refused before state finalization"
                     )
-                    console.print(f"      [{_c_err}]✗ {block_reason}[/{_c_err}]")
+                    console.print(f"[{_c_err}]✗ {block_reason}[/{_c_err}]")
                     error_count += 1
                     continue
                 resolved_subject = (
@@ -8262,13 +8318,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 conflict_ref = resolved_subject.merge_source_ref if resolved_subject is not None else task.branch
                 conflict_detected = conflict_ref is not None and not git.can_merge(conflict_ref, target_branch)
                 if conflict_detected:
-                    console.print(f"      [{_c_warn}]! Merge had conflicts against '{target_branch}'[/{_c_warn}]")
+                    console.print(f"[{_c_warn}]! Merge had conflicts against '{target_branch}'[/{_c_warn}]")
                     try:
                         # _merge_single_task already attempts merge --abort.
                         # For failed squash merges, MERGE_HEAD may be absent, so
                         # force cleanup as a final fallback.
                         git.reset_hard_head()
-                        console.print(f"      [{_c_ok}]✓ Restored clean git state[/{_c_ok}]")
+                        console.print(f"[{_c_ok}]✓ Restored clean git state[/{_c_ok}]")
                     except GitError as cleanup_error:
                         console.print(
                             f"      [{_c_err}]✗ Cleanup failed after merge conflict: {cleanup_error}. "
@@ -8285,7 +8341,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         exec_result.success_message = f"{exec_result.success_message} (target: {target_branch})"
                     _render_worker_action_result(task, display_task, action_type, exec_result)
                 else:
-                    console.print(f"      [{_c_err}]✗ Merge failed[/{_c_err}]")
+                    console.print(f"[{_c_err}]✗ Merge failed[/{_c_err}]")
                     error_count += 1
 
         else:
