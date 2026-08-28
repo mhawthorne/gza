@@ -411,7 +411,45 @@ def _resolve_owner_task_for_selection(
     for candidate in candidates:
         if any(member_id == task_id for member_id in _candidate_member_ids(candidate, store=store)):
             return candidate.owner_task
+    owner_task = _resolve_owner_task_via_merge_unit(store, candidates=candidates, task_id=task_id)
+    if owner_task is not None:
+        return owner_task
     return task
+
+
+def _resolve_owner_task_for_selection_merge_unit_owner_id(
+    store: SqliteTaskStore,
+    task_id: str,
+) -> str | None:
+    merge_unit = store.resolve_merge_unit_for_task(task_id)
+    return merge_unit.owner_task_id if merge_unit is not None else None
+
+
+def _resolve_owner_task_via_merge_unit(
+    store: SqliteTaskStore,
+    *,
+    candidates: Sequence[ParkedTaskCandidate],
+    task_id: str,
+) -> DbTask | None:
+    """Resolve a selector id to a parked owner that shares its merge unit.
+
+    Operators (and `advance`'s own next-step line) commonly name the implementation
+    task, while the park is keyed to the merge-unit owner. Match through the shared
+    merge unit before declaring the selector unparked.
+    """
+    requested_owner_id = _resolve_owner_task_for_selection_merge_unit_owner_id(store, task_id)
+    if requested_owner_id is None:
+        return None
+    for candidate in candidates:
+        for candidate_task in (candidate.owner_task, candidate.subject_task):
+            candidate_task_id = candidate_task.id
+            if candidate_task_id is None:
+                continue
+            if candidate_task_id == requested_owner_id:
+                return candidate.owner_task
+            if _resolve_owner_task_for_selection_merge_unit_owner_id(store, candidate_task_id) == requested_owner_id:
+                return candidate.owner_task
+    return None
 
 
 def _candidate_member_ids(candidate: ParkedTaskCandidate, *, store: SqliteTaskStore) -> tuple[str, ...]:

@@ -1043,3 +1043,81 @@ def test_select_and_clear_parked_tasks_rearms_remote_only_branch_when_remote_wou
     observations = store.list_watch_progress_observations(subject_kind="merge_unit", subject_id=str(merge_unit.id))
     assert observations == []
     git.is_merged.assert_not_called()
+
+
+def _stub_task(task_id: str):
+    """Minimal task stand-in for selector-resolution tests."""
+    task = Mock()
+    task.id = task_id
+    task.branch = None
+    task.tags = ()
+    return task
+
+
+def test_resolve_owner_task_for_selection_matches_via_merge_unit() -> None:
+    """An implementation id resolves to the parked owner that shares its merge unit.
+
+    `advance`'s next-step line names the implementation, while the park is keyed to the
+    merge-unit owner. Without the merge-unit fallback the selector reports the owner as
+    "not currently parked".
+    """
+    from gza.unstick import ParkedTaskCandidate, _resolve_owner_task_for_selection
+
+    impl = _stub_task("gza-impl")
+    owner = _stub_task("gza-owner")
+    subject = _stub_task("gza-subject")
+
+    store = Mock()
+    store.get.return_value = impl
+
+    def _resolve_merge_unit_for_task(task_id: str):
+        # Both the implementation and the parked owner belong to the same merge unit.
+        if task_id in {"gza-impl", "gza-owner", "gza-subject"}:
+            return Mock(owner_task_id="gza-owner")
+        return None
+
+    store.resolve_merge_unit_for_task.side_effect = _resolve_merge_unit_for_task
+    store.get_tasks_for_branch.return_value = []
+
+    candidate = ParkedTaskCandidate(
+        owner_task=owner,
+        subject_task=subject,
+        reason_class="retry-limit",
+        attention_reason=RETRY_LIMIT_REACHED_ATTENTION_REASON,
+        source="test",
+    )
+
+    resolved = _resolve_owner_task_for_selection(store, candidates=[candidate], task_id="gza-impl")
+
+    assert resolved is owner
+
+
+def test_resolve_owner_task_for_selection_unrelated_id_is_not_adopted() -> None:
+    """A task in a different merge unit must not be adopted by an unrelated park."""
+    from gza.unstick import ParkedTaskCandidate, _resolve_owner_task_for_selection
+
+    stranger = _stub_task("gza-stranger")
+    owner = _stub_task("gza-owner")
+
+    store = Mock()
+    store.get.return_value = stranger
+
+    def _resolve_merge_unit_for_task(task_id: str):
+        if task_id == "gza-stranger":
+            return Mock(owner_task_id="gza-other-owner")
+        return Mock(owner_task_id="gza-owner")
+
+    store.resolve_merge_unit_for_task.side_effect = _resolve_merge_unit_for_task
+    store.get_tasks_for_branch.return_value = []
+
+    candidate = ParkedTaskCandidate(
+        owner_task=owner,
+        subject_task=owner,
+        reason_class="retry-limit",
+        attention_reason=RETRY_LIMIT_REACHED_ATTENTION_REASON,
+        source="test",
+    )
+
+    resolved = _resolve_owner_task_for_selection(store, candidates=[candidate], task_id="gza-stranger")
+
+    assert resolved is stranger
