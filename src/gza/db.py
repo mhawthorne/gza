@@ -2563,6 +2563,8 @@ CREATE TABLE IF NOT EXISTS merge_unit_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_merge_unit_tasks_project_task
     ON merge_unit_tasks(project_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_merge_unit_tasks_project_task_unit
+    ON merge_unit_tasks(project_id, task_id, merge_unit_id);
 CREATE INDEX IF NOT EXISTS idx_merge_unit_tasks_project_unit_role
     ON merge_unit_tasks(project_id, merge_unit_id, role);
 
@@ -4488,6 +4490,20 @@ def _ensure_required_auto_migration_artifacts(
                     "Schema integrity check failed while repairing required index "
                     "idx_merge_units_project_state_source: use a writable database."
                 ) from exc
+    if target_version >= 42 and _table_exists(conn, "merge_unit_tasks"):
+        if not _index_exists(conn, "idx_merge_unit_tasks_project_task_unit"):
+            try:
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_merge_unit_tasks_project_task_unit
+                        ON merge_unit_tasks(project_id, task_id, merge_unit_id)
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                raise SchemaIntegrityError(
+                    "Schema integrity check failed while repairing required index "
+                    "idx_merge_unit_tasks_project_task_unit: use a writable database."
+                ) from exc
     if target_version >= 50:
         if not _table_exists(conn, "task_artifacts"):
             try:
@@ -5185,6 +5201,8 @@ CREATE TABLE IF NOT EXISTS merge_unit_tasks (
 );
 CREATE INDEX IF NOT EXISTS idx_merge_unit_tasks_project_task
     ON merge_unit_tasks(project_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_merge_unit_tasks_project_task_unit
+    ON merge_unit_tasks(project_id, task_id, merge_unit_id);
 CREATE INDEX IF NOT EXISTS idx_merge_unit_tasks_project_unit_role
     ON merge_unit_tasks(project_id, merge_unit_id, role);
 

@@ -26481,8 +26481,55 @@ class TestIterateCommand:
         assert result == 0
         spawn_background.assert_not_called()
         assert "Next action: merge" in output
-        assert "ready to merge" in output
+        assert "ready to merge and defer blockers" in output
         assert "max_cycles_reached" not in output
+        assert store.get_based_on_children(impl.id) == []
+
+    def test_foreground_iterate_terminal_merge_and_defer_reports_blocker_deferral_without_children(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        config = Config.load(tmp_path)
+        impl = self._make_completed_impl(store)
+        action = {
+            "type": "merge",
+            "description": "Merge and defer blockers after max review cycles",
+            "max_cycles_merge_and_defer": True,
+        }
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=False,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.cli.execution.determine_next_action", return_value=action),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert "Next action: merge" in output
+        assert "Merge and defer blockers" in output
+        assert store.get_based_on_children(impl.id) == []
 
     def test_advance_engine_config_adapter_carries_max_failed_closing_review_retries(
         self, tmp_path: Path

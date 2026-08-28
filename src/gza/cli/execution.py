@@ -5173,7 +5173,13 @@ def _cmd_iterate_impl(
 
         print(f"Next action: {action_type}")
         if action_type == "merge":
-            print(f"No remaining iterate action: implementation {iterate_task.id} is ready to merge.")
+            if initial_action.get("max_cycles_merge_and_defer") is True:
+                print(
+                    f"No remaining iterate action: implementation {iterate_task.id} "
+                    "is ready to merge and defer blockers."
+                )
+            else:
+                print(f"No remaining iterate action: implementation {iterate_task.id} is ready to merge.")
             return 0
         if action_type == "wait_review":
             print("Iterate waiting: review_in_progress. Existing task is already in progress.")
@@ -6617,7 +6623,11 @@ def _cmd_iterate_impl(
 
         if action_type in {"merge", "merge_with_followups"}:
             final_status = "merge_ready"
-            final_stop_reason = "merge_ready"
+            final_stop_reason = (
+                "merge_and_defer_blockers"
+                if action_type == "merge" and action.get("max_cycles_merge_and_defer") is True
+                else "merge_ready"
+            )
             maybe_review_verdict: str | None = None
             maybe_review = action.get("review_task")
             if action_type == "merge_with_followups" and isinstance(maybe_review, DbTask):
@@ -7554,6 +7564,9 @@ def _cmd_iterate_impl(
         iterate_wall_seconds=iterate_wall_seconds,
     )
 
+    if final_status == "merge_ready" and final_stop_reason == "merge_and_defer_blockers":
+        print(f"Iterate complete: implementation {impl_task.id} is ready to merge and defer blockers.")
+        return 0
     if final_status in {"approved", "merge_ready"}:
         return 0
     if final_status == "maxed_out":

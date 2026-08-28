@@ -268,6 +268,7 @@ from .advance_executor import (
 )
 from .execution import _spawn_background_iterate
 from .git_ops import (
+    _authorize_staged_merge_finalization_before_materialization,
     _blocked_candidate_verify_attention_key,
     _candidate_verify_promotion_proof,
     _classify_isolated_promotion_rollback_failed,
@@ -283,6 +284,7 @@ from .git_ops import (
     _promote_isolated_merge_to_target_branch,
     _reconcile_diverged_branch_with_origin,
     _require_default_branch,
+    _require_staged_authorized_source_ref_unchanged_after_materialization,
     _stage_isolated_merge_action,
     _StagedIsolatedMergeAction,
     _unimplemented_implement_prompt,
@@ -5295,55 +5297,22 @@ def _run_isolated_merge_batch(
         for staged_entry in staged_batch:
             partial_staged = staged_entry.staged
             try:
+                authorized_staged = _authorize_staged_merge_finalization_before_materialization(
+                    store,
+                    config=config,
+                    live_git=git,
+                    staged_git=merge_git,
+                    staged=staged_entry.staged,
+                    target_branch=target_branch,
+                )
                 materialized_staged = _materialize_max_cycle_deferred_blockers_for_staged_action(
                     store,
                     config=config,
-                    staged=staged_entry.staged,
+                    staged=authorized_staged,
                     active_scope_tags=tags,
                     trigger_source=MERGE_SOURCE_WATCH,
                 )
                 partial_staged = materialized_staged
-                action_metadata = materialized_staged.merge_action_metadata
-                if action_metadata.get("pending_merge_finalization") is not True and (
-                    action_metadata.get("type") == "merge_with_followups"
-                    or (
-                        action_metadata.get("type") == "merge"
-                        and action_metadata.get("max_cycles_merge_and_defer") is True
-                    )
-                ):
-                    source_ref = materialized_staged.source_ref or materialized_staged.merge_branch
-                    source_ref_sha = _watch_ref_sha_if_available(merge_git, source_ref) or _watch_ref_sha_if_available(
-                        git,
-                        source_ref,
-                    )
-                    previous_target_sha = _watch_ref_sha_if_available(
-                        git, target_branch
-                    ) or _watch_ref_sha_if_available(
-                        merge_git,
-                        target_branch,
-                    )
-                    if not source_ref or not source_ref_sha or not previous_target_sha:
-                        raise GitError("could not prove isolated merge finalization source or previous target")
-                    _persist_merge_finalization_prepared_attempt_for_action(
-                        store,
-                        merge_subject=materialized_staged.merge_subject,
-                        action=materialized_staged.merge_action_metadata,
-                        target_branch=materialized_staged.target_branch,
-                        previous_target_sha=previous_target_sha,
-                        source_ref=source_ref,
-                        source_ref_sha=source_ref_sha,
-                        merge_unit_id=materialized_staged.merge_unit_id,
-                        created_followups=materialized_staged.created_followups,
-                        reused_followups=materialized_staged.reused_followups,
-                        created_deferred_blockers=materialized_staged.created_deferred_blockers,
-                        reused_deferred_blockers=materialized_staged.reused_deferred_blockers,
-                    )
-                    materialized_staged = replace(
-                        materialized_staged,
-                        source_ref=source_ref,
-                        source_ref_sha=source_ref_sha,
-                        previous_target_sha=previous_target_sha,
-                    )
             except Exception as exc:
                 partial_created = tuple(getattr(exc, "created", ()))
                 partial_reused = tuple(getattr(exc, "reused", ()))
@@ -5395,11 +5364,107 @@ def _run_isolated_merge_batch(
                 )
                 return reconciled_work_done, False, None
             materialized_batch.append(replace(staged_entry, staged=materialized_staged))
+        prepared_batch: list[_WatchBatchStagedMerge] = []
+        for staged_entry in materialized_batch:
+            materialized_staged = staged_entry.staged
+            try:
+                action_metadata = materialized_staged.merge_action_metadata
+                if action_metadata.get("pending_merge_finalization") is not True and (
+                    action_metadata.get("type") == "merge_with_followups"
+                    or (
+                        action_metadata.get("type") == "merge"
+                        and action_metadata.get("max_cycles_merge_and_defer") is True
+                    )
+                ):
+                    materialized_staged = _require_staged_authorized_source_ref_unchanged_after_materialization(
+                        store,
+                        config=config,
+                        git=git,
+                        staged=materialized_staged,
+                    )
+                    source_ref = materialized_staged.source_ref or materialized_staged.merge_branch
+                    source_ref_sha = materialized_staged.source_ref_sha
+                    previous_target_sha = _watch_ref_sha_if_available(
+                        git, target_branch
+                    ) or _watch_ref_sha_if_available(
+                        merge_git,
+                        target_branch,
+                    )
+                    previous_target_sha = materialized_staged.previous_target_sha or previous_target_sha
+                    if not source_ref or not source_ref_sha or not previous_target_sha:
+                        raise GitError("could not prove isolated merge finalization source or previous target")
+                    _persist_merge_finalization_prepared_attempt_for_action(
+                        store,
+                        merge_subject=materialized_staged.merge_subject,
+                        action=materialized_staged.merge_action_metadata,
+                        target_branch=materialized_staged.target_branch,
+                        previous_target_sha=previous_target_sha,
+                        source_ref=source_ref,
+                        source_ref_sha=source_ref_sha,
+                        merge_unit_id=materialized_staged.merge_unit_id,
+                        created_followups=materialized_staged.created_followups,
+                        reused_followups=materialized_staged.reused_followups,
+                        created_deferred_blockers=materialized_staged.created_deferred_blockers,
+                        reused_deferred_blockers=materialized_staged.reused_deferred_blockers,
+                    )
+                    materialized_staged = replace(
+                        materialized_staged,
+                        source_ref=source_ref,
+                        source_ref_sha=source_ref_sha,
+                        previous_target_sha=previous_target_sha,
+                    )
+            except Exception as exc:
+                failed_entry = replace(staged_entry, staged=materialized_staged)
+                for prior_entry in materialized_batch:
+                    if _emit_staged_deferred_blocker_follow_lines(
+                        log, prior_entry, emitted_task_ids=emitted_follow_task_ids
+                    ):
+                        reconciled_work_done = True
+                if _emit_staged_deferred_blocker_follow_lines(
+                    log, failed_entry, emitted_task_ids=emitted_follow_task_ids
+                ):
+                    reconciled_work_done = True
+                log.emit(
+                    "ERROR",
+                    (
+                        f"{staged_entry.display_task.id}: merge finalization prepared-attempt persistence failed: "
+                        f"{exc}; stopping isolated merge batch"
+                    ),
+                )
+                return reconciled_work_done, False, None
+            prepared_batch.append(replace(staged_entry, staged=materialized_staged))
+        materialized_batch = prepared_batch
         staged_batch = materialized_batch
+        expected_previous_target_sha = next(
+            (entry.staged.previous_target_sha for entry in staged_batch if entry.staged.previous_target_sha),
+            None,
+        )
+        if expected_previous_target_sha is not None:
+            for staged_entry in staged_batch:
+                staged_previous_target_sha = staged_entry.staged.previous_target_sha
+                if staged_previous_target_sha and staged_previous_target_sha != expected_previous_target_sha:
+                    if _emit_staged_batch_deferred_blocker_follow_lines(
+                        log, staged_batch, emitted_task_ids=emitted_follow_task_ids
+                    ):
+                        reconciled_work_done = True
+                    log.emit(
+                        "ERROR",
+                        (
+                            f"{staged_entry.display_task.id}: isolated merge batch target proof mismatch: "
+                            f"expected {expected_previous_target_sha}, got {staged_previous_target_sha}; "
+                            "stopping isolated merge batch"
+                        ),
+                    )
+                    return reconciled_work_done, False, None
         try:
             warnings = _run_with_optional_stdout_suppressed(
                 quiet,
-                lambda: _promote_isolated_merge_to_target_branch(git, merge_git, target_branch),
+                lambda: _promote_isolated_merge_to_target_branch(
+                    git,
+                    merge_git,
+                    target_branch,
+                    expected_previous_target_sha=expected_previous_target_sha,
+                ),
             )
         except _IsolatedPromotionRollbackFailed as exc:
             if _emit_staged_batch_deferred_blocker_follow_lines(

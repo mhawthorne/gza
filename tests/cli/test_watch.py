@@ -163,8 +163,8 @@ from gza.config import Config, ConfigError
 from gza.db import (
     MERGE_SOURCE_MAX_CYCLES_DEFERRED,
     MERGE_SOURCE_WATCH,
-    DuplicateActiveChildError,
     SCHEMA_VERSION,
+    DuplicateActiveChildError,
     SchemaIntegrityError,
     SqliteTaskStore,
     Task,
@@ -179,7 +179,7 @@ from gza.dispatch_preview import (
     build_dispatch_preview,
     plan_watch_dispatch_entries,
 )
-from gza.git import Git, GitError
+from gza.git import Git, GitError, ResolvedMergeSourceRef
 from gza.git_health import (
     GIT_HEALTH_PROMPT,
     check_git_health as real_check_git_health,
@@ -383,8 +383,8 @@ def _watch_blocker_finding(finding_id: str) -> ReviewFinding:
     )
 
 
-def _watch_capped_review_output(*finding_ids: str) -> str:
-    sections = ["## Review", "", "Verdict: CHANGES_REQUESTED", "", "## Blockers", ""]
+def _watch_capped_review_output(*finding_ids: str, verdict: str = "CHANGES_REQUESTED") -> str:
+    sections = ["## Review", "", f"Verdict: {verdict}", "", "## Blockers", ""]
     for finding_id in finding_ids or ("B1",):
         sections.extend(
             [
@@ -478,14 +478,106 @@ def _persist_watch_merge_finalization_prepared_attempt(
 def _watch_max_cycle_merge_action(
     review: DbTask, findings: tuple[ReviewFinding, ...], output: str
 ) -> dict[str, object]:
+    from gza.review_verify_state import VerifyEpoch
+
+    reviewed_branch = getattr(review, "review_verify_branch", None)
+    reviewed_head_sha = getattr(review, "review_verify_head_sha", None) or "same-sha"
     return {
         "type": "merge",
         "description": "Merge and defer blockers",
         "max_cycles_merge_and_defer": True,
         "review_task": review,
+        "latest_review_task_id": review.id,
+        "latest_review_completed_at": review.completed_at.isoformat() if review.completed_at else None,
+        "latest_review_mode": "plain_full",
+        "latest_review_head_sha": reviewed_head_sha,
+        "current_review_head_sha": reviewed_head_sha,
         "blocker_findings": findings,
+        "deferred_blocker_ids": tuple(finding.id for finding in findings),
         "persisted_review_output": output,
+        "max_cycles_audit": {
+            "reason": "review-max-cycles",
+            "policy": "merge_and_defer",
+            "completed_review_cycles": 3,
+            "max_review_cycles": 3,
+            "verify_gate_state": "passed",
+            "verify_epoch": VerifyEpoch(
+                reviewed_branch=reviewed_branch,
+                reviewed_head_sha=reviewed_head_sha,
+                verify_command="./bin/tests",
+                verify_timeout_seconds=None,
+                verify_timeout_grace_seconds=None,
+            ),
+        },
     }
+
+
+def _persist_watch_capped_verify(
+    store: SqliteTaskStore,
+    config: Config,
+    task: DbTask,
+    *,
+    status: str,
+    head_sha: str = "source-sha",
+    captured_at: datetime,
+) -> None:
+    assert task.branch is not None
+    config.verify_command = "./bin/tests"
+    config.max_review_cycles = 1
+    if task.id is not None and not any(
+        improve.status == "completed" for improve in store.get_improve_tasks_by_root(task.id)
+    ):
+        completed_review_times = [
+            review.completed_at
+            for review in store.get_reviews_for_task(task.id)
+            if review.status == "completed" and review.completed_at is not None
+        ]
+        cycle_anchor = min(completed_review_times) if completed_review_times else captured_at
+        previous_review = store.add(
+            f"Previous capped review {task.id}",
+            task_type="review",
+            depends_on=task.id,
+            based_on=task.id,
+        )
+        assert previous_review.id is not None
+        previous_review.status = "completed"
+        previous_review.completed_at = cycle_anchor - timedelta(minutes=2)
+        previous_review.output_content = _watch_capped_review_output("B0")
+        previous_review.review_verify_branch = task.branch
+        previous_review.review_verify_head_sha = head_sha
+        store.update(previous_review)
+        completed_improve = store.add(
+            "Completed improve for prior capped cycle",
+            task_type="improve",
+            based_on=task.id,
+            depends_on=previous_review.id,
+        )
+        completed_improve.status = "completed"
+        completed_improve.completed_at = cycle_anchor - timedelta(minutes=1)
+        completed_improve.branch = task.branch
+        completed_improve.has_commits = True
+        completed_improve.changed_diff = True
+        store.update(completed_improve)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=task,
+        source_task=task,
+        result=_make_review_verify_result(
+            "./bin/tests",
+            status=status,
+            exit_status="0" if status == "passed" else status,
+            captured_at=captured_at,
+            reviewed_branch=task.branch,
+            reviewed_head_sha=head_sha,
+            reviewed_base_sha="base-sha",
+            working_directory=str(config.project_dir),
+            failure=None if status == "passed" else f"verify {status}",
+        ),
+        verify_timeout_seconds=config.autonomous_verify_timeout_seconds,
+        verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
+        producer="test",
+    )
 
 
 def _main_verify_red_check(
@@ -1689,6 +1781,7 @@ def test_cmd_watch_single_manifest_only_tags_apply_manifest_tag_mode(
     expected_any_tag: bool,
 ) -> None:
     setup_config(tmp_path)
+    config = Config.load(tmp_path)
     store = make_store(tmp_path)
     manifest_path = tmp_path / "watch.yaml"
     manifest_path.write_text(
@@ -1726,6 +1819,7 @@ def test_cmd_watch_single_manifest_recovery_slots_project_to_legacy_runtime(
     manifest_recovery_slots: int,
 ) -> None:
     setup_config(tmp_path)
+    config = Config.load(tmp_path)
     store = make_store(tmp_path)
     manifest_path = tmp_path / "watch.yaml"
     manifest_path.write_text(
@@ -19030,7 +19124,7 @@ def test_execute_merge_action_surfaces_isolated_promotion_warnings(tmp_path: Pat
 
     assert result.rc == 0
     assert result.promotion_warnings == ("stash warning",)
-    promote.assert_called_once_with(repo_git, merge_git, "main")
+    promote.assert_called_once_with(repo_git, merge_git, "main", expected_previous_target_sha=None)
 
 
 def test_execute_merge_action_reconciles_pending_squash_only_after_isolated_promotion(
@@ -19115,7 +19209,7 @@ def test_execute_merge_action_reconciles_pending_squash_only_after_isolated_prom
         )
 
     assert result.rc == 0
-    promote.assert_called_once_with(repo_git, merge_git, "main")
+    promote.assert_called_once_with(repo_git, merge_git, "main", expected_previous_target_sha=None)
     reconcile.assert_called_once()
     print_reconcile.assert_called_once_with(reconcile_result, suppress_success=False)
     refreshed_task = store.get(task.id)
@@ -19189,7 +19283,7 @@ def test_execute_merge_action_skips_pending_squash_reconcile_when_isolated_promo
         )
 
     assert result.rc == 1
-    promote.assert_called_once_with(repo_git, merge_git, "main")
+    promote.assert_called_once_with(repo_git, merge_git, "main", expected_previous_target_sha=None)
     reconcile.assert_not_called()
     print_reconcile.assert_not_called()
     assert "Error: isolated merge failed: promotion failed" in capsys.readouterr().out
@@ -20826,6 +20920,7 @@ def test_watch_cycle_quiet_logs_deferred_blocker_materialization_failure_and_lea
     tmp_path: Path,
 ) -> None:
     setup_config(tmp_path)
+    config = Config.load(tmp_path)
     store = make_store(tmp_path)
     task = _make_completed_watch_merge_task(
         store,
@@ -20840,9 +20935,18 @@ def test_watch_cycle_quiet_logs_deferred_blocker_materialization_failure_and_lea
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
     review.output_content = review_output
+    review.review_verify_branch = task.branch
+    review.review_verify_head_sha = "watchtestsourcesha"
     store.update(review)
+    _persist_watch_capped_verify(
+        store,
+        config,
+        task,
+        status="passed",
+        head_sha="watchtestsourcesha",
+        captured_at=datetime.now(UTC),
+    )
     action = _watch_max_cycle_merge_action(review, (_watch_blocker_finding("B1"),), review_output)
-    config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
 
@@ -24063,6 +24167,9 @@ def test_watch_cycle_isolated_batch_max_cycle_materializes_all_debt_before_one_p
         "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
     )
     store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 1
     tasks = [
         _make_completed_watch_merge_task(
             store,
@@ -24084,17 +24191,23 @@ def test_watch_cycle_isolated_batch_max_cycle_materializes_all_debt_before_one_p
         review.status = "completed"
         review.completed_at = datetime.now(UTC)
         review.output_content = review_output
+        review.review_verify_branch = task.branch
+        review.review_verify_head_sha = "watchtestsourcesha"
         store.update(review)
-        actions[str(task.id)] = {
-            "type": "merge",
-            "description": "Merge and defer blockers",
-            "max_cycles_merge_and_defer": True,
-            "review_task": review,
-            "blocker_findings": (_watch_blocker_finding(f"B{index}"),),
-            "persisted_review_output": review_output,
-        }
+        _persist_watch_capped_verify(
+            store,
+            config,
+            task,
+            status="passed",
+            head_sha="watchtestsourcesha",
+            captured_at=datetime(2026, 8, 27, 10, index, tzinfo=UTC),
+        )
+        actions[str(task.id)] = _watch_max_cycle_merge_action(
+            review,
+            (_watch_blocker_finding(f"B{index}"),),
+            review_output,
+        )
 
-    config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
@@ -24115,6 +24228,7 @@ def test_watch_cycle_isolated_batch_max_cycle_materializes_all_debt_before_one_p
             created_investigation_task_ids=(),
             reused_investigation_task_ids=(),
             merge_action_metadata=actions[str(task.id)],
+            source_ref_sha="watchtestsourcesha",
         )
         for task, unit in zip(tasks, units, strict=True)
     }
@@ -24203,6 +24317,871 @@ def test_watch_cycle_isolated_batch_max_cycle_materializes_all_debt_before_one_p
         assert f"FOLLOW    {children[0].id} queued (created, from {task.id})" in log_path.read_text()
 
 
+@pytest.mark.parametrize("candidate_status", ["failed", "passed"])
+def test_watch_cycle_isolated_batch_candidate_only_containment_waits_for_candidate_gate(
+    tmp_path: Path,
+    candidate_status: str,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 1
+    tasks = [
+        _make_completed_watch_merge_task(
+            store,
+            f"Candidate containment {index}",
+            branch=f"feature/watch-candidate-contained-{index}",
+        )
+        for index in range(1, 3)
+    ]
+    units = [store.get_or_create_merge_unit_for_task(task) for task in tasks]
+    assert all(unit is not None for unit in units)
+    actions: dict[str, dict[str, object]] = {}
+    for index, task in enumerate(tasks, start=1):
+        review_output = _watch_capped_review_output(f"B{index}")
+        review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 8, 27, 10, index, tzinfo=UTC)
+        review.output_content = review_output
+        review.review_verify_branch = task.branch
+        review.review_verify_head_sha = "source-sha"
+        store.update(review)
+        _persist_watch_capped_verify(
+            store,
+            config,
+            task,
+            status="passed",
+            head_sha="source-sha",
+            captured_at=datetime(2026, 8, 27, 11, index, tzinfo=UTC),
+        )
+        actions[str(task.id)] = _watch_max_cycle_merge_action(
+            review,
+            (parse_review_report(review_output).findings[0],),
+            review_output,
+        )
+
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    git.branch_exists = MagicMock(side_effect=lambda branch: branch in {task.branch for task in tasks})  # type: ignore[method-assign]
+    git.is_merged = MagicMock(return_value=False)  # type: ignore[method-assign]
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "source-sha" if ref in {task.branch for task in tasks} else "target-before" if ref == "main" else None
+    )
+    merge_git = MagicMock(name="candidate_containment_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.branch_exists.side_effect = lambda branch: branch in {task.branch for task in tasks}
+    merge_git.resolve_fresh_merge_source.side_effect = lambda source_ref, **_kwargs: ResolvedMergeSourceRef(source_ref)
+    merge_git.is_ancestor.return_value = True
+    merge_git.rev_parse.return_value = "candidate-head"
+    merge_git.rev_parse_if_exists.side_effect = lambda ref: (
+        "source-sha" if ref in {task.branch for task in tasks} else "candidate-head" if ref == "main" else None
+    )
+    merge_git.is_merged.side_effect = (
+        lambda source_ref, _target_ref=None, **_kwargs: str(source_ref).endswith(str(tasks[1].branch))
+    )
+
+    merge_single_task_ids: list[str] = []
+
+    def merge_single_side_effect(*args: object, **_kwargs: object) -> _MergeSingleTaskResult:
+        task_id = args[0]
+        assert task_id in {task.id for task in tasks}
+        merge_single_task_ids.append(str(task_id))
+        return _MergeSingleTaskResult(rc=0, authorized_source_ref_sha="source-sha")
+
+    candidate_check = _candidate_verify_check(
+        tmp_path,
+        status=candidate_status,
+        classification="pass" if candidate_status == "passed" else "deterministic_red",
+        tree_fingerprint="fp-candidate",
+        head_sha="candidate-head",
+        failure=None if candidate_status == "passed" else "verify failed",
+        failing_phase=None if candidate_status == "passed" else "unit",
+    )
+    decisions = [
+        SimpleNamespace(
+            item=(SimpleNamespace(owner_task=task), task, actions[str(task.id)]),
+            action=actions[str(task.id)],
+        )
+        for task in tasks
+    ]
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli.watch.ensure_watch_main_checkout", return_value=merge_git),
+        patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
+        patch("gza.cli.git_ops._merge_single_task", side_effect=merge_single_side_effect),
+        patch("gza.cli.watch.check_candidate_integration_verify", return_value=candidate_check),
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch", return_value=()) as promote,
+        patch("gza.cli.watch.promote_candidate_integration_verify_evidence", return_value=SimpleNamespace()),
+        patch(
+            "gza.cli.watch.check_main_integration_verify",
+            return_value=SimpleNamespace(merges_halted=False, needs_attention=False, state=None, remediation=None),
+        ),
+    ):
+        work_done, halted, remediation = watch_module._run_isolated_merge_batch(
+            config=config,
+            store=store,
+            git=git,
+            merge_git=merge_git,
+            current_branch="main",
+            target_branch="main",
+            env={},
+            decisions=decisions,
+            quiet=True,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            tags=None,
+            any_tag=False,
+            reserve_rebase_launch=lambda _task_id: None,
+            create_rebase_task=lambda _task: (_ for _ in ()).throw(AssertionError("unused")),
+            prepare_rebase_task=lambda _task, _permit: None,
+            free_worker_start_slots=lambda: 0,
+            spawn_rebase_worker=lambda _task: 1,
+            release_reserved_task=lambda _task_id: None,
+            observe_dispatch=lambda *_args: None,
+            note_handled_child_task_id=lambda _task_id: None,
+            defer_lifecycle_start=lambda _start: None,
+        )
+
+    assert halted is False
+    assert remediation is None
+    log_text = log_path.read_text()
+    if candidate_status == "failed":
+        assert work_done is False
+        assert str(tasks[1].id) not in merge_single_task_ids
+        promote.assert_not_called()
+        assert "MERGE     " not in log_text
+        assert "max_cycles_deferred" not in log_text
+        for task, unit in zip(tasks, units, strict=True):
+            assert unit is not None
+            refreshed = store.get_merge_unit(unit.id)
+            assert refreshed is not None
+            assert refreshed.state == "unmerged"
+            assert refreshed.merge_source is None
+            assert [child for child in store.get_based_on_children(task.id) if child.task_type == "implement"] == []
+        return
+
+    assert work_done is True
+    assert str(tasks[1].id) not in merge_single_task_ids
+    promote.assert_called_once()
+    for task, unit in zip(tasks, units, strict=True):
+        assert unit is not None
+        refreshed = store.get_merge_unit(unit.id)
+        assert refreshed is not None
+        assert refreshed.state == "merged"
+        assert refreshed.merge_source == MERGE_SOURCE_MAX_CYCLES_DEFERRED
+        children = [child for child in store.get_based_on_children(task.id) if child.task_type == "implement"]
+        assert len(children) == 1
+        assert log_text.count(f"FOLLOW    {children[0].id} queued (created, from {task.id})") == 1
+        assert log_text.count(f"MERGE     {task.id} -> main") == 1
+
+
+@pytest.mark.parametrize(
+    "race",
+    [
+        "review-content",
+        "newer-review",
+        "spec-coherence-review",
+        "spec-coherence-needs-discussion",
+        "spec-coherence-unknown",
+        "red-verify",
+    ],
+)
+def test_watch_cycle_isolated_batch_post_materialization_authority_race_preserves_debt_without_promotion(
+    tmp_path: Path,
+    race: str,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    task = _make_completed_watch_merge_task(
+        store,
+        f"Batch post-materialization stale {race}",
+        branch=f"feature/watch-post-materialization-stale-{race}",
+    )
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    review_output = _watch_capped_review_output("B1")
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 8, 27, 10, 0, tzinfo=UTC)
+    review.output_content = review_output
+    review.review_verify_branch = task.branch
+    review.review_verify_head_sha = "source-sha"
+    store.update(review)
+    _persist_watch_capped_verify(
+        store,
+        config,
+        task,
+        status="passed",
+        head_sha="source-sha",
+        captured_at=datetime(2026, 8, 27, 10, 1, tzinfo=UTC),
+    )
+    action = _watch_max_cycle_merge_action(review, (parse_review_report(review_output).findings[0],), review_output)
+    staged = _StagedIsolatedMergeAction(
+        merge_subject=task,
+        merge_unit_id=unit.id,
+        merge_branch=task.branch,
+        source_ref=task.branch,
+        source_ref_sha="source-sha",
+        target_branch="main",
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+        merge_action_metadata=action,
+    )
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "source-sha" if ref == task.branch else "target-before" if ref == "main" else None
+    )
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "candidate-head"
+    merge_git.rev_parse_if_exists.side_effect = lambda ref: (
+        "source-sha" if ref == task.branch else "candidate-head" if ref == "main" else None
+    )
+
+    from gza.cli import git_ops as git_ops_module
+
+    real_materialize = git_ops_module._materialize_max_cycle_deferred_blockers_for_staged_action
+
+    def materialize_then_stale(*args: object, **kwargs: object) -> _StagedIsolatedMergeAction:
+        materialized = real_materialize(*args, **kwargs)
+        if race == "review-content":
+            review.output_content = _watch_capped_review_output("B2")
+            store.update(review)
+        elif race == "newer-review":
+            newer_output = _watch_capped_review_output("B2")
+            newer = store.add(f"Newer review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+            assert newer.id is not None
+            newer.status = "completed"
+            newer.completed_at = datetime(2026, 8, 27, 10, 5, tzinfo=UTC)
+            newer.output_content = newer_output
+            newer.review_verify_branch = task.branch
+            newer.review_verify_head_sha = "source-sha"
+            store.update(newer)
+        elif race.startswith("spec-coherence"):
+            newer_output = _watch_capped_review_output("B2")
+            if race == "spec-coherence-needs-discussion":
+                newer_output = _watch_capped_review_output("B2", verdict="NEEDS_DISCUSSION")
+            elif race == "spec-coherence-unknown":
+                newer_output = "## Review\n\nVerdict: BANANA\n\n## Notes\n\nUnparseable for lifecycle authority.\n"
+            newer = store.add(f"Spec coherence review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+            assert newer.id is not None
+            assert task.id is not None
+            newer.status = "completed"
+            newer.completed_at = datetime(2026, 8, 27, 10, 5, tzinfo=UTC)
+            newer.output_content = newer_output
+            newer.review_scope = build_spec_coherence_review_scope(
+                implementation_task_id=task.id,
+                reviewed_head_sha="source-sha",
+                changed_paths=("specs/behavior/lifecycle-engine.md",),
+            )
+            newer.review_verify_branch = task.branch
+            newer.review_verify_head_sha = "source-sha"
+            store.update(newer)
+        else:
+            _persist_watch_capped_verify(
+                store,
+                config,
+                task,
+                status="failed",
+                head_sha="source-sha",
+                captured_at=datetime(2026, 8, 27, 10, 5, tzinfo=UTC),
+            )
+        return materialized
+
+    decision = SimpleNamespace(item=(SimpleNamespace(owner_task=task), task, action), action=action)
+    log_path = tmp_path / ".gza" / "watch.log"
+    with (
+        patch("gza.cli.watch._stage_isolated_merge_action", return_value=staged),
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
+        ),
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch(
+            "gza.cli.watch._materialize_max_cycle_deferred_blockers_for_staged_action",
+            side_effect=materialize_then_stale,
+        ),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch") as promote,
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action") as finalize,
+    ):
+        work_done, halted, remediation = watch_module._run_isolated_merge_batch(
+            config=config,
+            store=store,
+            git=git,
+            merge_git=merge_git,
+            current_branch="main",
+            target_branch="main",
+            env={},
+            decisions=[decision],
+            quiet=True,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            tags=None,
+            any_tag=False,
+            reserve_rebase_launch=lambda _task_id: None,
+            create_rebase_task=lambda _task: (_ for _ in ()).throw(AssertionError("unused")),
+            prepare_rebase_task=lambda _task, _permit: None,
+            free_worker_start_slots=lambda: 0,
+            spawn_rebase_worker=lambda _task: 1,
+            release_reserved_task=lambda _task_id: None,
+            observe_dispatch=lambda *_args: None,
+            note_handled_child_task_id=lambda _task_id: None,
+            defer_lifecycle_start=lambda _start: None,
+        )
+
+    assert work_done is True
+    assert halted is False
+    assert remediation is None
+    promote.assert_not_called()
+    finalize.assert_not_called()
+    children = [child for child in store.get_based_on_children(task.id) if child.task_type == "implement"]
+    assert len(children) == 1
+    assert f"FOLLOW    {children[0].id} queued (created, from {task.id})" in log_path.read_text()
+    assert "merge finalization prepared-attempt persistence failed" in log_path.read_text()
+    assert not store.list_artifacts(task.id, kind="merge_finalization_prepared_attempt")
+    refreshed = store.get_merge_unit(unit.id)
+    assert refreshed is not None
+    assert refreshed.state == "unmerged"
+    assert refreshed.merge_source is None
+
+
+def test_watch_cycle_isolated_batch_max_cycle_refuses_when_target_advances_before_promotion(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    task = _make_completed_watch_merge_task(
+        store,
+        "Batch capped target race",
+        branch="feature/watch-batch-capped-target-race",
+    )
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    review_output = _watch_capped_review_output("B1")
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime(2026, 8, 27, 10, 0, tzinfo=UTC)
+    review.output_content = review_output
+    review.review_verify_branch = task.branch
+    review.review_verify_head_sha = "source-sha"
+    store.update(review)
+    _persist_watch_capped_verify(
+        store,
+        config,
+        task,
+        status="passed",
+        head_sha="source-sha",
+        captured_at=datetime(2026, 8, 27, 10, 1, tzinfo=UTC),
+    )
+    action = _watch_max_cycle_merge_action(review, (parse_review_report(review_output).findings[0],), review_output)
+    staged = _StagedIsolatedMergeAction(
+        merge_subject=task,
+        merge_unit_id=unit.id,
+        merge_branch=task.branch,
+        source_ref=task.branch,
+        source_ref_sha="source-sha",
+        target_branch="main",
+        pending_squash_reconcile=None,
+        review_task=None,
+        followup_findings=(),
+        created_investigation_task_ids=(),
+        reused_investigation_task_ids=(),
+        merge_action_metadata=action,
+    )
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "source-sha" if ref == task.branch else "target-before" if ref == "main" else None
+    )
+    git.rev_parse = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: "target-after" if ref == "refs/heads/main" else "source-sha"
+    )
+    git.update_ref = MagicMock(side_effect=AssertionError("target ref must not update after target advances"))  # type: ignore[method-assign]
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "candidate-head"
+    merge_git.rev_parse_if_exists.side_effect = lambda ref: (
+        "source-sha" if ref == task.branch else "candidate-head" if ref == "main" else None
+    )
+    decision = SimpleNamespace(item=(SimpleNamespace(owner_task=task), task, action), action=action)
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli.watch._stage_isolated_merge_action", return_value=staged),
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
+        ),
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch("gza.cli.git_ops.active_worktree_path_for_branch", return_value=None),
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action") as finalize,
+    ):
+        work_done, halted, remediation = watch_module._run_isolated_merge_batch(
+            config=config,
+            store=store,
+            git=git,
+            merge_git=merge_git,
+            current_branch="main",
+            target_branch="main",
+            env={},
+            decisions=[decision],
+            quiet=True,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            tags=None,
+            any_tag=False,
+            reserve_rebase_launch=lambda _task_id: None,
+            create_rebase_task=lambda _task: (_ for _ in ()).throw(AssertionError("unused")),
+            prepare_rebase_task=lambda _task, _permit: None,
+            free_worker_start_slots=lambda: 0,
+            spawn_rebase_worker=lambda _task: 1,
+            release_reserved_task=lambda _task_id: None,
+            observe_dispatch=lambda *_args: None,
+            note_handled_child_task_id=lambda _task_id: None,
+            defer_lifecycle_start=lambda _start: None,
+        )
+
+    assert work_done is True
+    assert halted is False
+    assert remediation is None
+    git.update_ref.assert_not_called()
+    finalize.assert_not_called()
+    children = [child for child in store.get_based_on_children(task.id) if child.task_type == "implement"]
+    assert len(children) == 1
+    log_text = log_path.read_text()
+    assert f"FOLLOW    {children[0].id} queued (created, from {task.id})" in log_text
+    assert "changed after authorization" in log_text
+    assert not store.list_artifacts(task.id, kind="merge_finalization_attempt_proof")
+    refreshed = store.get_merge_unit(unit.id)
+    assert refreshed is not None
+    assert refreshed.state == "unmerged"
+    assert refreshed.merge_source is None
+
+
+@pytest.mark.parametrize("race", ["source-moved", "spec-coherence-review", "verify-failed", "verify-unavailable"])
+def test_watch_cycle_isolated_batch_max_cycle_final_authorization_blocks_before_debt_or_promotion(
+    tmp_path: Path,
+    race: str,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    task = _make_completed_watch_merge_task(
+        store,
+        f"Batch capped final authorization {race}",
+        branch=f"feature/watch-batch-final-auth-{race}",
+    )
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    review_output = _watch_capped_review_output("B1")
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = review_output
+    review.review_verify_branch = task.branch
+    review.review_verify_head_sha = "source-sha"
+    store.update(review)
+    action = _watch_max_cycle_merge_action(review, (parse_review_report(review_output).findings[0],), review_output)
+    config = Config.load(tmp_path)
+    _persist_watch_capped_verify(
+        store,
+        config,
+        task,
+        status="passed",
+        head_sha="source-sha",
+        captured_at=datetime(2026, 8, 27, 10, 0, tzinfo=UTC),
+    )
+    if race in {"verify-failed", "verify-unavailable"}:
+        _persist_watch_capped_verify(
+            store,
+            config,
+            task,
+            status="failed" if race == "verify-failed" else "unavailable",
+            head_sha="source-sha",
+            captured_at=datetime(2026, 8, 27, 10, 5, tzinfo=UTC),
+        )
+    elif race == "spec-coherence-review":
+        newer_output = _watch_capped_review_output("B2")
+        newer = store.add(f"Spec coherence review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+        assert newer.id is not None
+        assert task.id is not None
+        newer.status = "completed"
+        newer.completed_at = datetime(2026, 8, 27, 10, 5, tzinfo=UTC)
+        newer.output_content = newer_output
+        newer.review_scope = build_spec_coherence_review_scope(
+            implementation_task_id=task.id,
+            reviewed_head_sha="source-sha",
+            changed_paths=("specs/behavior/lifecycle-engine.md",),
+        )
+        newer.review_verify_branch = task.branch
+        newer.review_verify_head_sha = "source-sha"
+        store.update(newer)
+
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: (
+            "source-after"
+            if race == "source-moved" and ref == task.branch
+            else "source-sha"
+            if ref == task.branch
+            else "target-before"
+            if ref == "main"
+            else None
+        )
+    )
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "candidate-head"
+    merge_git.rev_parse_if_exists.side_effect = lambda ref: (
+        "source-sha" if ref == task.branch else "candidate-head" if ref == "main" else None
+    )
+    merge_git.is_merged.return_value = False
+    decision = SimpleNamespace(item=(SimpleNamespace(owner_task=task), task, action), action=action)
+
+    with (
+        patch(
+            "gza.cli.git_ops._merge_single_task",
+            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="source-sha"),
+        ),
+        patch(
+            "gza.cli.git_ops._create_or_reuse_capped_review_blocker_tasks",
+            side_effect=AssertionError("deferred blockers must not materialize after final authorization failure"),
+        ),
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
+        ),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch") as promote,
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action") as finalize,
+    ):
+        work_done, halted, remediation = watch_module._run_isolated_merge_batch(
+            config=config,
+            store=store,
+            git=git,
+            merge_git=merge_git,
+            current_branch="main",
+            target_branch="main",
+            env={},
+            decisions=[decision],
+            quiet=True,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            tags=None,
+            any_tag=False,
+            reserve_rebase_launch=lambda _task_id: None,
+            create_rebase_task=lambda _task: (_ for _ in ()).throw(AssertionError("unused")),
+            prepare_rebase_task=lambda _task, _permit: None,
+            free_worker_start_slots=lambda: 0,
+            spawn_rebase_worker=lambda _task: 1,
+            release_reserved_task=lambda _task_id: None,
+            observe_dispatch=lambda *_args: None,
+            note_handled_child_task_id=lambda _task_id: None,
+            defer_lifecycle_start=lambda _start: None,
+        )
+
+    assert work_done is False
+    assert halted is False
+    assert remediation is None
+    promote.assert_not_called()
+    finalize.assert_not_called()
+    assert not store.list_artifacts(task.id, kind="merge_finalization_prepared_attempt")
+    assert [child for child in store.get_based_on_children(task.id) if child.task_type == "implement"] == []
+    refreshed = store.get_merge_unit(unit.id)
+    assert refreshed is not None
+    assert refreshed.state == "unmerged"
+    assert refreshed.merge_source is None
+
+
+@pytest.mark.parametrize("race", ["blank-verify-no-current-evidence", "blank-verify-source-moved"])
+def test_watch_cycle_isolated_batch_blank_verify_refuses_capped_action_before_debt_or_promotion(
+    tmp_path: Path,
+    race: str,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\n"
+    )
+    config = Config.load(tmp_path)
+    config.verify_command = ""
+    store = make_store(tmp_path)
+    task = _make_completed_watch_merge_task(
+        store,
+        f"Watch blank verify capped {race}",
+        branch=f"feature/watch-blank-verify-capped-{race}",
+    )
+    unit = store.get_or_create_merge_unit_for_task(task)
+    assert unit is not None
+    review_output = _watch_capped_review_output("B1")
+    review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+    assert review.id is not None
+    review.status = "completed"
+    review.completed_at = datetime.now(UTC)
+    review.output_content = review_output
+    review.review_verify_branch = task.branch
+    review.review_verify_head_sha = "source-sha"
+    store.update(review)
+    action = _watch_max_cycle_merge_action(review, (parse_review_report(review_output).findings[0],), review_output)
+
+    live_source_sha = "source-after" if race == "blank-verify-source-moved" else "source-sha"
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
+        side_effect=lambda ref: live_source_sha if ref == task.branch else "target-before" if ref == "main" else None
+    )
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "candidate-head"
+    merge_git.rev_parse_if_exists.side_effect = lambda ref: (
+        "source-sha" if ref == task.branch else "candidate-head" if ref == "main" else None
+    )
+    decision = SimpleNamespace(item=(SimpleNamespace(owner_task=task), task, action), action=action)
+
+    with (
+        patch(
+            "gza.cli.git_ops._merge_single_task",
+            return_value=_MergeSingleTaskResult(rc=0, authorized_source_ref_sha="source-sha"),
+        ),
+        patch(
+            "gza.cli.git_ops._create_or_reuse_capped_review_blocker_tasks",
+            side_effect=AssertionError("blank verify capped action must not create deferred blockers"),
+        ),
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
+        ),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch") as promote,
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action") as finalize,
+    ):
+        work_done, halted, remediation = watch_module._run_isolated_merge_batch(
+            config=config,
+            store=store,
+            git=git,
+            merge_git=merge_git,
+            current_branch="main",
+            target_branch="main",
+            env={},
+            decisions=[decision],
+            quiet=True,
+            dry_run=False,
+            log=_WatchLog(tmp_path / ".gza" / "watch.log", quiet=True),
+            tags=None,
+            any_tag=False,
+            reserve_rebase_launch=lambda _task_id: None,
+            create_rebase_task=lambda _task: (_ for _ in ()).throw(AssertionError("unused")),
+            prepare_rebase_task=lambda _task, _permit: None,
+            free_worker_start_slots=lambda: 0,
+            spawn_rebase_worker=lambda _task: 1,
+            release_reserved_task=lambda _task_id: None,
+            observe_dispatch=lambda *_args: None,
+            note_handled_child_task_id=lambda _task_id: None,
+            defer_lifecycle_start=lambda _start: None,
+        )
+
+    assert work_done is False
+    assert halted is False
+    assert remediation is None
+    promote.assert_not_called()
+    finalize.assert_not_called()
+    assert [child for child in store.get_based_on_children(task.id) if child.task_type == "implement"] == []
+    assert not store.list_artifacts(task.id, kind="merge_finalization_prepared_attempt")
+    assert not store.list_artifacts(task.id, kind="merge_finalization_attempt_proof")
+    refreshed = store.get_merge_unit(unit.id)
+    assert refreshed is not None
+    assert refreshed.state == "unmerged"
+    assert refreshed.merge_source is None
+
+
+def test_watch_cycle_isolated_batch_source_move_during_second_materialization_preserves_debt_without_promotion(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n"
+        "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
+    )
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 1
+    tasks = [
+        _make_completed_watch_merge_task(
+            store,
+            f"Watch batch source race {index}",
+            branch=f"feature/watch-batch-source-race-{index}",
+        )
+        for index in range(1, 3)
+    ]
+    units = [store.get_or_create_merge_unit_for_task(task) for task in tasks]
+    assert all(unit is not None for unit in units)
+    actions: dict[str, dict[str, object]] = {}
+    for index, task in enumerate(tasks, start=1):
+        review_output = _watch_capped_review_output(f"B{index}")
+        review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+        assert review.id is not None
+        review.status = "completed"
+        review.completed_at = datetime(2026, 8, 27, 10, index, tzinfo=UTC)
+        review.output_content = review_output
+        review.review_verify_branch = task.branch
+        review.review_verify_head_sha = "source-sha"
+        store.update(review)
+        _persist_watch_capped_verify(
+            store,
+            config,
+            task,
+            status="passed",
+            head_sha="source-sha",
+            captured_at=datetime(2026, 8, 27, 11, index, tzinfo=UTC),
+        )
+        actions[str(task.id)] = _watch_max_cycle_merge_action(
+            review,
+            (parse_review_report(review_output).findings[0],),
+            review_output,
+        )
+
+    git = _make_watch_git()
+    git.repo_dir = tmp_path
+    source_moved = False
+
+    def live_rev_parse(ref: str) -> str | None:
+        if ref == tasks[0].branch:
+            return "source-after" if source_moved else "source-sha"
+        if ref == tasks[1].branch:
+            return "source-sha"
+        if ref == "main":
+            return "target-before"
+        return None
+
+    git.rev_parse_if_exists = MagicMock(side_effect=live_rev_parse)  # type: ignore[method-assign]
+    merge_git = MagicMock(name="isolated_batch_git")
+    merge_git.repo_dir = config.main_checkout_integration_path
+    merge_git.rev_parse.return_value = "candidate-head"
+    merge_git.rev_parse_if_exists.side_effect = lambda ref: (
+        "source-sha" if ref in {tasks[0].branch, tasks[1].branch} else "candidate-head" if ref == "main" else None
+    )
+
+    staged_entries = {
+        task.id: _StagedIsolatedMergeAction(
+            merge_subject=task,
+            merge_unit_id=unit.id if unit is not None else None,
+            merge_branch=task.branch,
+            source_ref=task.branch,
+            source_ref_sha="source-sha",
+            target_branch="main",
+            pending_squash_reconcile=None,
+            review_task=None,
+            followup_findings=(),
+            created_investigation_task_ids=(),
+            reused_investigation_task_ids=(),
+            merge_action_metadata=actions[str(task.id)],
+        )
+        for task, unit in zip(tasks, units, strict=True)
+    }
+
+    from gza.cli import git_ops as git_ops_module
+
+    real_materialize = git_ops_module._materialize_max_cycle_deferred_blockers_for_staged_action
+    materialized_ids: list[str] = []
+
+    def materialize_side_effect(*args: object, **kwargs: object) -> _StagedIsolatedMergeAction:
+        nonlocal source_moved
+        staged = kwargs["staged"]
+        result = real_materialize(*args, **kwargs)
+        materialized_ids.append(str(staged.merge_subject.id))
+        if staged.merge_subject.id == tasks[1].id:
+            source_moved = True
+        return result
+
+    decisions = [
+        SimpleNamespace(
+            item=(SimpleNamespace(owner_task=task), task, actions[str(task.id)]), action=actions[str(task.id)]
+        )
+        for task in tasks
+    ]
+    log_path = tmp_path / ".gza" / "watch.log"
+
+    with (
+        patch("gza.cli.watch._stage_isolated_merge_action", side_effect=lambda *args, **_kwargs: staged_entries[args[3].id]),
+        patch(
+            "gza.cli.watch.check_candidate_integration_verify",
+            return_value=_candidate_verify_check(tmp_path, tree_fingerprint="fp-candidate", head_sha="candidate-head"),
+        ),
+        patch("gza.cli.git_ops._compute_tree_fingerprint", return_value="fp-candidate"),
+        patch(
+            "gza.cli.watch._materialize_max_cycle_deferred_blockers_for_staged_action",
+            side_effect=materialize_side_effect,
+        ),
+        patch("gza.cli.watch._promote_isolated_merge_to_target_branch") as promote,
+        patch("gza.cli.watch._finalize_staged_isolated_merge_action") as finalize,
+    ):
+        work_done, halted, remediation = watch_module._run_isolated_merge_batch(
+            config=config,
+            store=store,
+            git=git,
+            merge_git=merge_git,
+            current_branch="main",
+            target_branch="main",
+            env={},
+            decisions=decisions,
+            quiet=True,
+            dry_run=False,
+            log=_WatchLog(log_path, quiet=True),
+            tags=None,
+            any_tag=False,
+            reserve_rebase_launch=lambda _task_id: None,
+            create_rebase_task=lambda _task: (_ for _ in ()).throw(AssertionError("unused")),
+            prepare_rebase_task=lambda _task, _permit: None,
+            free_worker_start_slots=lambda: 0,
+            spawn_rebase_worker=lambda _task: 1,
+            release_reserved_task=lambda _task_id: None,
+            observe_dispatch=lambda *_args: None,
+            note_handled_child_task_id=lambda _task_id: None,
+            defer_lifecycle_start=lambda _start: None,
+        )
+
+    assert work_done is True
+    assert halted is False
+    assert remediation is None
+    assert materialized_ids == [str(task.id) for task in tasks]
+    promote.assert_not_called()
+    finalize.assert_not_called()
+    for task, unit in zip(tasks, units, strict=True):
+        assert unit is not None
+        children = [child for child in store.get_based_on_children(task.id) if child.task_type == "implement"]
+        assert len(children) == 1
+        refreshed = store.get_merge_unit(unit.id)
+        assert refreshed is not None
+        assert refreshed.state == "unmerged"
+        assert refreshed.merge_source is None
+        assert not store.list_artifacts(task.id, kind="merge_finalization_prepared_attempt")
+        assert not store.list_artifacts(task.id, kind="merge_finalization_attempt_proof")
+        assert f"FOLLOW    {children[0].id} queued (created, from {task.id})" in log_path.read_text()
+    assert "max-cycle merge-and-defer lifecycle authority changed before promotion" in log_path.read_text()
+
+
 @pytest.mark.parametrize("family", ["ordinary_followup", "max_cycles_deferred"])
 def test_watch_cycle_isolated_batch_persists_prepared_attempt_before_promotion(
     tmp_path: Path,
@@ -24235,13 +25214,25 @@ def test_watch_cycle_isolated_batch_persists_prepared_attempt_before_promotion(
         review_output = _watch_capped_review_output("B1")
         finding = parse_review_report(review_output).findings[0]
         review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
-        action = _watch_max_cycle_merge_action(review, (finding,), review_output)
         review_based_on = task.id
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
     review.output_content = review_output
+    if family == "max_cycles_deferred":
+        review.review_verify_branch = task.branch
+        review.review_verify_head_sha = "watchtestsourcesha"
     store.update(review)
+    if family == "max_cycles_deferred":
+        action = _watch_max_cycle_merge_action(review, (finding,), review_output)
+        _persist_watch_capped_verify(
+            store,
+            Config.load(tmp_path),
+            task,
+            status="passed",
+            head_sha="watchtestsourcesha",
+            captured_at=datetime(2026, 8, 27, 11, 0, tzinfo=UTC),
+        )
     staged = _StagedIsolatedMergeAction(
         merge_subject=task,
         merge_unit_id=unit.id,
@@ -24253,6 +25244,9 @@ def test_watch_cycle_isolated_batch_persists_prepared_attempt_before_promotion(
         merge_action_metadata=action,
     )
     config = Config.load(tmp_path)
+    if family == "max_cycles_deferred":
+        config.on_max_cycles = "merge_and_defer"
+        config.max_review_cycles = 1
     log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
     git = _make_watch_git()
     merge_git = MagicMock(name="isolated_batch_git")
@@ -24351,13 +25345,25 @@ def test_watch_cycle_isolated_batch_prepared_attempt_failure_aborts_before_promo
         review_output = _watch_capped_review_output("B1")
         finding = parse_review_report(review_output).findings[0]
         review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
-        action = _watch_max_cycle_merge_action(review, (finding,), review_output)
         child_parent_id = task.id
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
     review.output_content = review_output
+    if family == "max_cycles_deferred":
+        review.review_verify_branch = task.branch
+        review.review_verify_head_sha = "watchtestsourcesha"
     store.update(review)
+    if family == "max_cycles_deferred":
+        action = _watch_max_cycle_merge_action(review, (finding,), review_output)
+        _persist_watch_capped_verify(
+            store,
+            Config.load(tmp_path),
+            task,
+            status="passed",
+            head_sha="watchtestsourcesha",
+            captured_at=datetime(2026, 8, 27, 11, 5, tzinfo=UTC),
+        )
     staged = _StagedIsolatedMergeAction(
         merge_subject=task,
         merge_unit_id=unit.id,
@@ -24369,6 +25375,9 @@ def test_watch_cycle_isolated_batch_prepared_attempt_failure_aborts_before_promo
         merge_action_metadata=action,
     )
     config = Config.load(tmp_path)
+    if family == "max_cycles_deferred":
+        config.on_max_cycles = "merge_and_defer"
+        config.max_review_cycles = 1
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
@@ -24476,13 +25485,29 @@ def test_watch_cycle_isolated_batch_checkpoint_failure_recovers_as_missing_proof
         review_output = _watch_capped_review_output("B1")
         finding = parse_review_report(review_output).findings[0]
         review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
-        action = _watch_max_cycle_merge_action(review, (finding,), review_output)
         expected_reason = "pending-merge-finalization-capped-blocker-missing-proof"
     assert review.id is not None
     review.status = "completed"
     review.completed_at = datetime.now(UTC)
     review.output_content = review_output
+    if family == "max_cycles_deferred":
+        review.review_verify_branch = task.branch
+        review.review_verify_head_sha = "watchtestsourcesha"
     store.update(review)
+    config = Config.load(tmp_path)
+    if family == "max_cycles_deferred":
+        config.on_max_cycles = "merge_and_defer"
+        config.max_review_cycles = 1
+    if family == "max_cycles_deferred":
+        action = _watch_max_cycle_merge_action(review, (finding,), review_output)
+        _persist_watch_capped_verify(
+            store,
+            config,
+            task,
+            status="passed",
+            head_sha="watchtestsourcesha",
+            captured_at=datetime.now(UTC),
+        )
     staged = _StagedIsolatedMergeAction(
         merge_subject=task,
         merge_unit_id=unit.id,
@@ -24491,14 +25516,16 @@ def test_watch_cycle_isolated_batch_checkpoint_failure_recovers_as_missing_proof
         pending_squash_reconcile=None,
         review_task=review if family == "ordinary_followup" else None,
         followup_findings=(finding,) if family == "ordinary_followup" else (),
+        source_ref_sha="watchtestsourcesha",
         merge_action_metadata=action,
     )
-    config = Config.load(tmp_path)
     log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
     git = _make_watch_git()
     target_reads = ["target-before", "target-after"]
     git.rev_parse_if_exists = MagicMock(  # type: ignore[method-assign]
-        side_effect=lambda ref: target_reads.pop(0) if ref == "main" else "watchtestsourcesha"
+        side_effect=lambda ref: (
+            target_reads.pop(0) if ref == "main" and target_reads else "target-after" if ref == "main" else "watchtestsourcesha"
+        )
     )
     merge_git = MagicMock(name="isolated_batch_git")
     merge_git.repo_dir = config.main_checkout_integration_path
@@ -24557,7 +25584,7 @@ def test_watch_cycle_isolated_batch_checkpoint_failure_recovers_as_missing_proof
         target_branch="main",
         require_already_merged=True,
         resolved_merge_state="merged",
-        live_target_sha="target-after",
+        live_target_sha="candidate-head",
     )
     assert attention is not None
     assert attention["type"] == "needs_attention"
@@ -24586,26 +25613,32 @@ def test_watch_cycle_isolated_batch_max_cycle_materialization_failure_aborts_who
     ]
     units = [store.get_or_create_merge_unit_for_task(task) for task in tasks]
     assert all(unit is not None for unit in units)
-    actions = {
-        str(task.id): {
-            "type": "merge",
-            "description": "Merge and defer blockers",
-            "max_cycles_merge_and_defer": True,
-            "review_task": store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id),
-            "blocker_findings": (_watch_blocker_finding(f"B{index}"),),
-            "persisted_review_output": "## Review\n\nVerdict: CHANGES_REQUESTED\n",
-        }
-        for index, task in enumerate(tasks, start=1)
-    }
-    for action in actions.values():
-        review = action["review_task"]
-        assert isinstance(review, DbTask)
+    config = Config.load(tmp_path)
+    actions: dict[str, dict[str, object]] = {}
+    for index, task in enumerate(tasks, start=1):
+        review_output = _watch_capped_review_output(f"B{index}")
+        review = store.add(f"Review {task.id}", task_type="review", depends_on=task.id, based_on=task.id)
+        assert review.id is not None
         review.status = "completed"
         review.completed_at = datetime.now(UTC)
-        review.output_content = str(action["persisted_review_output"])
+        review.output_content = review_output
+        review.review_verify_branch = task.branch
+        review.review_verify_head_sha = "watchtestsourcesha"
         store.update(review)
+        _persist_watch_capped_verify(
+            store,
+            config,
+            task,
+            status="passed",
+            head_sha="watchtestsourcesha",
+            captured_at=datetime.now(UTC),
+        )
+        actions[str(task.id)] = _watch_max_cycle_merge_action(
+            review,
+            (_watch_blocker_finding(f"B{index}"),),
+            review_output,
+        )
 
-    config = Config.load(tmp_path)
     log_path = tmp_path / ".gza" / "watch.log"
     log = _WatchLog(log_path, quiet=True)
     git = _make_watch_git()
@@ -24619,6 +25652,7 @@ def test_watch_cycle_isolated_batch_max_cycle_materialization_failure_aborts_who
             merge_unit_id=unit.id if unit is not None else None,
             merge_branch=task.branch,
             pending_squash_reconcile=None,
+            source_ref_sha="watchtestsourcesha",
             review_task=None,
             followup_findings=(),
             created_investigation_task_ids=(),
@@ -25317,7 +26351,17 @@ def test_watch_cycle_isolated_batch_post_promotion_failure_replay_records_action
         review.status = "completed"
         review.completed_at = datetime.now(UTC)
         review.output_content = review_output
+        review.review_verify_branch = task.branch
+        review.review_verify_head_sha = "watchtestsourcesha"
         store.update(review)
+        _persist_watch_capped_verify(
+            store,
+            Config.load(tmp_path),
+            task,
+            status="passed",
+            head_sha="watchtestsourcesha",
+            captured_at=datetime.now(UTC),
+        )
         actions[str(task.id)] = _watch_max_cycle_merge_action(
             review,
             (_watch_blocker_finding(f"B{index}"),),
@@ -25331,6 +26375,8 @@ def test_watch_cycle_isolated_batch_post_promotion_failure_replay_records_action
         )
 
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 1
     log = _WatchLog(tmp_path / ".gza" / "watch.log", quiet=True)
     git = _make_watch_git()
     merge_git = MagicMock(name="isolated_batch_git")
@@ -25344,6 +26390,7 @@ def test_watch_cycle_isolated_batch_post_promotion_failure_replay_records_action
             merge_unit_id=unit.id if unit is not None else None,
             merge_branch=task.branch,
             pending_squash_reconcile=None,
+            source_ref_sha="watchtestsourcesha",
             review_task=None,
             followup_findings=(),
             created_investigation_task_ids=(),

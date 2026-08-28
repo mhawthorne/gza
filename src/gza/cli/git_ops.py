@@ -13,12 +13,15 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal, NoReturn, TypeVar, cast
 
 from rich.console import Console
 
 import gza.colors as _colors
-from gza.query import get_base_task_slug as _get_base_task_slug
+from gza.query import (
+    get_base_task_slug as _get_base_task_slug,
+    get_implementation_review_evidence,
+)
 
 from ..advance_engine import (
     IMPROVE_ACTION_REASON_REVIEW_CHANGES_REQUESTED,
@@ -166,9 +169,15 @@ from ..review_verdict import (
     ReviewFinding,
     get_review_content,
     get_review_report,
+    parse_review_report,
     summarize_review_blockers,
 )
-from ..review_verify_state import refresh_preserved_rebase_review_verify_heads
+from ..review_verify_state import (
+    VerifyEpoch,
+    refresh_preserved_rebase_review_verify_heads,
+    resolve_verify_gate_decision,
+    verify_epoch_matches,
+)
 from ..runner import (
     WIP_INTERRUPTED_COMMIT_SUBJECT,
     LongPhaseHeartbeat,
@@ -894,6 +903,24 @@ class _MergeSingleTaskResult:
     created_deferred_blockers: tuple[DbTask, ...] = ()
     reused_deferred_blockers: tuple[DbTask, ...] = ()
     authorized_merge_action: dict[str, Any] | None = None
+    authorized_source_ref_sha: str | None = None
+
+
+class _CappedReviewLifecycleAuthorityChanged(GitError):
+    """Raised when live lifecycle planning no longer authorizes a capped merge."""
+
+
+class _AlreadyMergedLifecycleProofGit:
+    """Proxy used to prove capped lifecycle state for mark-only reconciliation."""
+
+    def __init__(self, wrapped: Git) -> None:
+        self._wrapped = wrapped
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._wrapped, name)
+
+    def is_merged(self, *_args: object, **_kwargs: object) -> bool:
+        return False
 
 
 def _coerce_merge_single_task_result(result: int | _MergeSingleTaskResult) -> _MergeSingleTaskResult:
@@ -1069,6 +1096,8 @@ def _promote_isolated_merge_to_target_branch(
     repo_git: Git,
     merge_git: Git,
     target_branch: str,
+    *,
+    expected_previous_target_sha: str | None = None,
 ) -> tuple[str, ...]:
     """Advance the real target-branch ref to the detached isolated merge result.
 
@@ -1078,7 +1107,13 @@ def _promote_isolated_merge_to_target_branch(
     attached, it is hard-reset to the new tip so that checkout stays clean.
     """
     target_ref = f"refs/heads/{target_branch}"
-    previous_target_oid = repo_git.rev_parse(target_ref)
+    observed_previous_target_oid = repo_git.rev_parse(target_ref)
+    if expected_previous_target_sha is not None and observed_previous_target_oid != expected_previous_target_sha:
+        raise GitError(
+            f"isolated merge promotion refused because target '{target_branch}' changed after authorization; "
+            f"expected {expected_previous_target_sha}, got {observed_previous_target_oid}"
+        )
+    previous_target_oid = expected_previous_target_sha or observed_previous_target_oid
     merged_head_oid = merge_git.rev_parse("HEAD")
     attached_target_checkout = active_worktree_path_for_branch(repo_git, target_branch)
     parent_env = _owned_git_env(repo_git)
@@ -1930,6 +1965,26 @@ def _merge_single_task(
                 status="merge_source_ref_unavailable",
                 block_reason=block_reason,
             )
+    merge_preflight_target = merge_preflight_ref or current_branch
+    expected_preflight_target_sha: str | None = None
+    if authorized_merge_action is not None and _merge_finalization_family_for_action(authorized_merge_action) is not None:
+        try:
+            expected_preflight_target_sha = _require_ref_sha_for_merge_finalization_proof(
+                git,
+                merge_preflight_target,
+                label="preflight target",
+            )
+        except Exception as exc:
+            block_reason = _pre_promotion_merge_refusal_reason(
+                phase="pre-merge target proof",
+                exc=exc,
+            )
+            print(f"Error: {block_reason}")
+            return _MergeSingleTaskResult(
+                rc=1,
+                status="merge_target_ref_unavailable",
+                block_reason=block_reason,
+            )
 
     def _build_commit_message(subject: DbTask) -> str:
         assert subject.id is not None, "Task ID must be set before squash merge commit"
@@ -1985,13 +2040,14 @@ def _merge_single_task(
             merge_source_ref=merge_source_ref,
             current_branch=current_branch,
             merge_source=effective_merge_source,
-            merge_preflight_target=merge_preflight_ref or current_branch,
+            merge_preflight_target=merge_preflight_target,
             squash=getattr(args, "squash", False),
             delete_branch=getattr(args, "delete", False),
             no_followups=getattr(args, "no_followups", False),
             quiet_mechanics=quiet_mechanics,
             materialize_side_effects=materialize_side_effects,
             authorized_source_ref_sha=authorized_source_ref_sha,
+            expected_preflight_target_sha=expected_preflight_target_sha,
             pre_materialized_deferred_blockers=pregate_deferred_blockers,
             pre_materialized_deferred_blockers_printed=pregate_deferred_blockers_printed,
             process_monitor_factory=process_monitor_factory,
@@ -2021,7 +2077,11 @@ def _merge_single_task(
         ),
     )
     coerced = _coerce_manual_merge_execution_result(result)
-    return replace(coerced, authorized_merge_action=authorized_merge_action)
+    return replace(
+        coerced,
+        authorized_merge_action=authorized_merge_action,
+        authorized_source_ref_sha=authorized_source_ref_sha,
+    )
 
 
 def cmd_merge(args: argparse.Namespace) -> int:
@@ -3894,10 +3954,68 @@ def _validated_capped_review_action_metadata(
     if not isinstance(review_task, DbTask):
         raise ValueError("max-cycle merge-and-defer action requires a review_task")
     persisted_review_output = action.get("persisted_review_output")
+    review_output_alias = action.get("review_output")
     if not isinstance(persisted_review_output, str):
-        persisted_review_output = action.get("review_output")
-    if not isinstance(persisted_review_output, str):
-        raise ValueError("max-cycle merge-and-defer action requires persisted review output")
+        raise ValueError("max-cycle merge-and-defer action requires persisted_review_output")
+    if review_output_alias is not None and review_output_alias != persisted_review_output:
+        raise ValueError("max-cycle merge-and-defer action has conflicting review output aliases")
+    audit = action.get("max_cycles_audit")
+    if not isinstance(audit, Mapping):
+        raise ValueError("max-cycle merge-and-defer action requires max_cycles_audit")
+    if audit.get("reason") != "review-max-cycles":
+        raise ValueError("max-cycle merge-and-defer action requires review-max-cycles audit reason")
+    if audit.get("policy") != "merge_and_defer":
+        raise ValueError("max-cycle merge-and-defer action requires merge_and_defer audit policy")
+    completed_review_cycles = audit.get("completed_review_cycles")
+    max_review_cycles = audit.get("max_review_cycles")
+    if (
+        isinstance(completed_review_cycles, bool)
+        or not isinstance(completed_review_cycles, int)
+        or isinstance(max_review_cycles, bool)
+        or not isinstance(max_review_cycles, int)
+    ):
+        raise ValueError("max-cycle merge-and-defer action requires integer review cycle audit fields")
+    if completed_review_cycles < max_review_cycles:
+        raise ValueError("max-cycle merge-and-defer action completed cycles are below the configured cap")
+    if action.get("pending_merge_finalization") is not True:
+        latest_review_task_id = action.get("latest_review_task_id")
+        if not isinstance(latest_review_task_id, str) or not latest_review_task_id:
+            raise ValueError("max-cycle merge-and-defer action requires latest_review_task_id")
+        if review_task.id != latest_review_task_id:
+            raise ValueError("max-cycle merge-and-defer review_task does not match latest_review_task_id")
+        current_review_task = store.get(latest_review_task_id)
+        if current_review_task is None:
+            raise ValueError(f"max-cycle merge-and-defer review {latest_review_task_id} is missing")
+        latest_review_completed_at = action.get("latest_review_completed_at")
+        if not isinstance(latest_review_completed_at, str) or not latest_review_completed_at:
+            raise ValueError("max-cycle merge-and-defer action requires latest_review_completed_at")
+        try:
+            annotated_completed_at = _normalize_action_completed_at(latest_review_completed_at)
+        except ValueError as exc:
+            raise ValueError("max-cycle merge-and-defer action has invalid latest_review_completed_at") from exc
+        if current_review_task.completed_at != annotated_completed_at:
+            raise ValueError("max-cycle merge-and-defer latest_review_completed_at does not match review row")
+        latest_review_mode = action.get("latest_review_mode")
+        if latest_review_mode not in {"plain_full", "resolution"}:
+            raise ValueError("max-cycle merge-and-defer action requires latest_review_mode")
+        if _capped_review_authority_mode(current_review_task) != latest_review_mode:
+            raise ValueError("max-cycle merge-and-defer latest_review_mode does not match review row")
+        latest_review_head_sha = action.get("latest_review_head_sha")
+        current_review_head_sha = action.get("current_review_head_sha")
+        if not isinstance(latest_review_head_sha, str) or not latest_review_head_sha:
+            raise ValueError("max-cycle merge-and-defer action requires latest_review_head_sha")
+        if not isinstance(current_review_head_sha, str) or not current_review_head_sha:
+            raise ValueError("max-cycle merge-and-defer action requires current_review_head_sha")
+        if current_review_head_sha != latest_review_head_sha:
+            raise ValueError("max-cycle merge-and-defer action reviewed head does not match current review head")
+        if current_review_task.review_verify_head_sha != latest_review_head_sha:
+            raise ValueError("max-cycle merge-and-defer latest_review_head_sha does not match review row")
+        verify_gate_state = audit.get("verify_gate_state") if isinstance(audit, Mapping) else None
+        verify_epoch = audit.get("verify_epoch") if isinstance(audit, Mapping) else None
+        if verify_gate_state != "passed" or not isinstance(verify_epoch, VerifyEpoch):
+            raise ValueError("max-cycle merge-and-defer action requires passing verify epoch metadata")
+        if verify_epoch.reviewed_head_sha != current_review_head_sha:
+            raise ValueError("max-cycle merge-and-defer verify epoch does not match reviewed head")
     blocker_findings = _capped_review_blocker_findings_for_action(action)
     if not blocker_findings:
         raise ValueError("max-cycle merge-and-defer action requires blocker findings")
@@ -3908,7 +4026,389 @@ def _validated_capped_review_action_metadata(
         findings=blocker_findings,
         persisted_review_output=persisted_review_output,
     )
+    expected_blocker_ids = tuple(finding.id for finding in parsed_blockers)
+    declared_blocker_ids = action.get("deferred_blocker_ids")
+    if not isinstance(declared_blocker_ids, (list, tuple)) or not all(
+        isinstance(finding_id, str) for finding_id in declared_blocker_ids
+    ):
+        raise ValueError("max-cycle merge-and-defer action requires deferred_blocker_ids")
+    if tuple(declared_blocker_ids) != expected_blocker_ids:
+        raise ValueError(
+            "max-cycle merge-and-defer deferred_blocker_ids do not match parsed blocker findings; "
+            f"expected {expected_blocker_ids!r}, got {tuple(declared_blocker_ids)!r}"
+        )
     return review_task, parsed_blockers, persisted_review_output
+
+
+def _capped_review_authority_mode(review_task: DbTask) -> str:
+    if declares_resolution_review_mode(review_task.review_scope):
+        return "resolution"
+    if declares_spec_coherence_review_mode(review_task.review_scope):
+        return "spec_coherence"
+    return "plain_full"
+
+
+def _normalize_action_completed_at(value: str) -> datetime:
+    completed_at = datetime.fromisoformat(value)
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=UTC)
+    return completed_at
+
+
+def _latest_applicable_capped_review(
+    reviews: Iterable[DbTask],
+    *,
+    config: Config,
+    reviewed_head_sha: str,
+) -> DbTask | None:
+    candidates: list[DbTask] = []
+    seen_review_ids: set[str] = set()
+    for review in reviews:
+        if review.id is None or review.id in seen_review_ids:
+            continue
+        seen_review_ids.add(review.id)
+        if review.status != "completed" or review.task_type != "review":
+            continue
+        if review.review_verify_head_sha != reviewed_head_sha:
+            continue
+        review_mode = _capped_review_authority_mode(review)
+        if review_mode in {"plain_full", "resolution"}:
+            candidates.append(review)
+            continue
+        if review_mode == "spec_coherence":
+            authoritative_output = review.output_content
+            if not authoritative_output:
+                try:
+                    authoritative_output = get_review_content(config.project_dir, review)
+                except Exception:
+                    authoritative_output = None
+            if authoritative_output is None or parse_review_report(authoritative_output).verdict != "APPROVED":
+                candidates.append(review)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda review: (review.completed_at or review.created_at, review.created_at))
+
+
+def _latest_canonical_capped_authority_review(
+    reviews: Iterable[DbTask],
+    *,
+    config: Config,
+) -> DbTask | None:
+    candidates: list[DbTask] = []
+    seen_review_ids: set[str] = set()
+    for review in reviews:
+        if review.id is None or review.id in seen_review_ids:
+            continue
+        seen_review_ids.add(review.id)
+        if review.status != "completed" or review.task_type != "review":
+            continue
+        review_mode = _capped_review_authority_mode(review)
+        if review_mode in {"plain_full", "resolution"}:
+            candidates.append(review)
+            continue
+        if review_mode == "spec_coherence":
+            authoritative_output = review.output_content
+            if not authoritative_output:
+                try:
+                    authoritative_output = get_review_content(config.project_dir, review)
+                except Exception:
+                    authoritative_output = None
+            if authoritative_output is None or parse_review_report(authoritative_output).verdict != "APPROVED":
+                candidates.append(review)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda review: (review.completed_at or review.created_at, review.created_at))
+
+
+def _require_latest_capped_review_action_authority(
+    store: SqliteTaskStore,
+    *,
+    config: Config,
+    merge_subject: DbTask,
+    action: Mapping[str, Any],
+) -> tuple[DbTask, tuple[ReviewFinding, ...], str]:
+    validated = _validated_capped_review_action_metadata(
+        store,
+        config=config,
+        action=action,
+    )
+    if validated is None:
+        raise ValueError("max-cycle merge-and-defer action requires capped review authority")
+    review_task, blocker_findings, persisted_review_output = validated
+    reviewed_head_sha = action.get("current_review_head_sha")
+    if not isinstance(reviewed_head_sha, str) or not reviewed_head_sha:
+        raise ValueError("max-cycle merge-and-defer action requires current_review_head_sha")
+    canonical_reviews = tuple(get_implementation_review_evidence(store, merge_subject))
+    canonical_review_ids = {review.id for review in canonical_reviews if review.id is not None}
+    if review_task.id not in canonical_review_ids:
+        raise ValueError("max-cycle merge-and-defer review is not canonical evidence for the merge subject")
+    latest = _latest_canonical_capped_authority_review(
+        canonical_reviews,
+        config=config,
+    )
+    if latest is None:
+        raise ValueError(
+            "max-cycle merge-and-defer latest applicable completed review is no longer backed by "
+            "canonical completed review evidence"
+        )
+    latest_mode = _capped_review_authority_mode(latest)
+    if latest_mode == "spec_coherence":
+        _raise_spec_coherence_capped_review_preemption(config, latest)
+    if latest.review_verify_head_sha != reviewed_head_sha:
+        observed = latest.review_verify_head_sha or "unavailable"
+        raise ValueError(
+            "max-cycle merge-and-defer latest canonical completed review has ambiguous reviewed head; "
+            f"expected {reviewed_head_sha}, got {observed}"
+        )
+    if latest.id != action.get("latest_review_task_id"):
+        raise ValueError(
+            "max-cycle merge-and-defer review is no longer the latest applicable completed review "
+            "from canonical evidence"
+        )
+    if latest.id != review_task.id:
+        raise ValueError(
+            "max-cycle merge-and-defer review_task no longer matches latest applicable completed review "
+            "from canonical evidence"
+        )
+    latest_completed_at = latest.completed_at
+    if latest_completed_at is None:
+        raise ValueError("max-cycle merge-and-defer latest review has no completion time")
+    action_completed_at = _normalize_action_completed_at(str(action["latest_review_completed_at"]))
+    if latest_completed_at != action_completed_at:
+        raise ValueError("max-cycle merge-and-defer latest review completion identity changed")
+    if latest_mode != action.get("latest_review_mode"):
+        raise ValueError("max-cycle merge-and-defer latest review mode changed")
+    if latest.review_verify_head_sha != reviewed_head_sha:
+        raise ValueError("max-cycle merge-and-defer latest review head changed")
+    authoritative_output = latest.output_content
+    if not authoritative_output:
+        authoritative_output = get_review_content(config.project_dir, latest)
+    if authoritative_output != persisted_review_output:
+        raise ValueError("max-cycle merge-and-defer latest review content changed")
+    validate_capped_review_blocker_action(
+        store,
+        config=config,
+        review_task=latest,
+        findings=blocker_findings,
+        persisted_review_output=persisted_review_output,
+        authoritative_review_output=authoritative_output,
+    )
+    return latest, blocker_findings, persisted_review_output
+
+
+def _require_fresh_capped_review_lifecycle_authority(
+    store: SqliteTaskStore,
+    *,
+    config: Config,
+    git: Git,
+    merge_subject: DbTask,
+    action: Mapping[str, Any],
+    target_branch: str,
+    allow_already_merged_reconciliation: bool = False,
+) -> None:
+    """Require the live lifecycle planner to still emit the same capped merge action."""
+    proof_git: Any = _AlreadyMergedLifecycleProofGit(git) if allow_already_merged_reconciliation else git
+    live_action = determine_next_action(
+        config,
+        store,
+        proof_git,
+        merge_subject,
+        target_branch,
+        selected_for_merge=True,
+    )
+    if not (live_action.get("type") == "merge" and live_action.get("max_cycles_merge_and_defer") is True):
+        action_type = live_action.get("type") or "unknown"
+        description = live_action.get("description") or "capped merge is no longer lifecycle-eligible"
+        raise _CappedReviewLifecycleAuthorityChanged(
+            "max-cycle merge-and-defer lifecycle authority changed before promotion; "
+            f"live action is {action_type}: {description}"
+        )
+
+    live_review_task, live_blockers, live_review_output = _validated_capped_review_action_metadata(
+        store,
+        config=config,
+        action=live_action,
+    ) or (None, (), None)
+    action_review_task, action_blockers, action_review_output = _validated_capped_review_action_metadata(
+        store,
+        config=config,
+        action=action,
+    ) or (None, (), None)
+    if (
+        live_review_task is None
+        or action_review_task is None
+        or live_review_task.id != action_review_task.id
+        or live_review_output != action_review_output
+        or tuple(finding.id for finding in live_blockers) != tuple(finding.id for finding in action_blockers)
+        or live_action.get("current_review_head_sha") != action.get("current_review_head_sha")
+        or live_action.get("latest_review_completed_at") != action.get("latest_review_completed_at")
+        or live_action.get("latest_review_mode") != action.get("latest_review_mode")
+    ):
+        raise _CappedReviewLifecycleAuthorityChanged(
+            "max-cycle merge-and-defer lifecycle authority no longer matches the planned action"
+        )
+
+
+def _raise_spec_coherence_capped_review_preemption(config: Config, review: DbTask) -> NoReturn:
+    authoritative_output = review.output_content
+    if not authoritative_output:
+        try:
+            authoritative_output = get_review_content(config.project_dir, review)
+        except Exception as exc:
+            raise ValueError(
+                "max-cycle merge-and-defer latest applicable completed review is preempted by "
+                "a newer unreadable spec-coherence review"
+            ) from exc
+    verdict = parse_review_report(authoritative_output).verdict
+    if verdict == "CHANGES_REQUESTED":
+        raise ValueError(
+            "max-cycle merge-and-defer latest applicable completed review is preempted by "
+            "a newer CHANGES_REQUESTED spec-coherence review"
+        )
+    if verdict == "NEEDS_DISCUSSION":
+        raise ValueError(
+            "max-cycle merge-and-defer latest applicable completed review is preempted by "
+            "a newer NEEDS_DISCUSSION spec-coherence review"
+        )
+    raise ValueError(
+        "max-cycle merge-and-defer latest applicable completed review is preempted by "
+        "a newer unknown or malformed spec-coherence review verdict"
+    )
+
+
+def _require_live_capped_review_merge_authorization(
+    store: SqliteTaskStore,
+    *,
+    config: Config,
+    git: Git,
+    merge_subject: DbTask,
+    action: Mapping[str, Any],
+    source_ref: str | None,
+    target_branch: str,
+    source_ref_sha: str | None = None,
+    allow_already_merged_reconciliation: bool = False,
+) -> str | None:
+    """Revalidate non-replay max-cycle merge authority against the live source."""
+    if not (action.get("type") == "merge" and action.get("max_cycles_merge_and_defer") is True):
+        return source_ref_sha
+    if action.get("pending_merge_finalization") is True:
+        return source_ref_sha
+
+    _require_fresh_capped_review_lifecycle_authority(
+        store,
+        config=config,
+        git=git,
+        merge_subject=merge_subject,
+        action=action,
+        target_branch=target_branch,
+        allow_already_merged_reconciliation=allow_already_merged_reconciliation,
+    )
+    _require_latest_capped_review_action_authority(
+        store,
+        config=config,
+        merge_subject=merge_subject,
+        action=action,
+    )
+    if not source_ref:
+        raise GitError("max-cycle merge-and-defer action cannot prove live source ref")
+    resolved_source_sha = _require_ref_sha_for_merge_finalization_proof(
+        git,
+        source_ref,
+        label="authorized source",
+    )
+    if source_ref_sha is not None and resolved_source_sha != source_ref_sha:
+        raise GitError(
+            "max-cycle merge-and-defer source changed after staging; "
+            f"expected {source_ref_sha}, got {resolved_source_sha}"
+        )
+    reviewed_head_sha = action.get("current_review_head_sha")
+    if resolved_source_sha != reviewed_head_sha:
+        raise GitError(
+            "max-cycle merge-and-defer source no longer matches reviewed head; "
+            f"expected {reviewed_head_sha}, got {resolved_source_sha}"
+        )
+    if not isinstance(getattr(config, "verify_command", None), str) or not config.verify_command.strip():
+        raise GitError("max-cycle merge-and-defer verify_command is not configured")
+
+    audit = action.get("max_cycles_audit")
+    annotated_epoch = audit.get("verify_epoch") if isinstance(audit, Mapping) else None
+    if not isinstance(annotated_epoch, VerifyEpoch):
+        raise GitError("max-cycle merge-and-defer action is missing verify epoch proof")
+    decision = resolve_verify_gate_decision(store, merge_subject, config=config, git=git)
+    if decision.state != "passed" or decision.current_epoch is None:
+        raise GitError(
+            "max-cycle merge-and-defer verify evidence is no longer current and passing "
+            f"(state={decision.state})"
+        )
+    if not verify_epoch_matches(expected=annotated_epoch, candidate=decision.current_epoch):
+        raise GitError("max-cycle merge-and-defer verify epoch no longer matches current source head")
+    result = decision.lookup.result
+    if result is None or result.reviewed_head_sha != resolved_source_sha or result.status != "passed":
+        raise GitError("max-cycle merge-and-defer verify result does not authorize the live source head")
+    return resolved_source_sha
+
+
+def _require_post_materialization_capped_review_merge_authorization(
+    store: SqliteTaskStore,
+    *,
+    config: Config,
+    git: Git,
+    merge_subject: DbTask,
+    action: Mapping[str, Any],
+    source_ref: str | None,
+    source_ref_sha: str | None,
+    target_branch: str,
+    allow_already_merged_reconciliation: bool = False,
+) -> str | None:
+    """Revalidate capped authority at the final side-effect boundary after child materialization."""
+    if not (action.get("type") == "merge" and action.get("max_cycles_merge_and_defer") is True):
+        if _merge_finalization_family_for_action(action) is not None:
+            if not source_ref:
+                raise GitError("could not prove merge finalization source ref after materialization")
+            if not source_ref_sha:
+                raise GitError("could not prove merge finalization source after materialization")
+            return _require_authorized_source_ref_unchanged(git, source_ref, source_ref_sha)
+        return source_ref_sha
+    return _require_live_capped_review_merge_authorization(
+        store,
+        config=config,
+        git=git,
+        merge_subject=merge_subject,
+        action=action,
+        source_ref=source_ref,
+        target_branch=target_branch,
+        source_ref_sha=source_ref_sha,
+        allow_already_merged_reconciliation=allow_already_merged_reconciliation,
+    )
+
+
+def _require_staged_authorized_source_ref_unchanged_after_materialization(
+    store: SqliteTaskStore,
+    *,
+    config: Config,
+    git: Git,
+    staged: "_StagedIsolatedMergeAction",
+) -> _StagedIsolatedMergeAction:
+    """Recheck proof-bound staged source immediately before prepared-attempt writes."""
+    action = staged.merge_action_metadata
+    if action.get("pending_merge_finalization") is True or _merge_finalization_family_for_action(action) is None:
+        return staged
+    source_ref = staged.source_ref or staged.merge_branch
+    if not source_ref:
+        raise GitError("could not prove isolated merge finalization source ref before promotion")
+    if not staged.source_ref_sha:
+        raise GitError("could not prove isolated merge finalization source before promotion")
+    source_ref_sha = _require_post_materialization_capped_review_merge_authorization(
+        store,
+        config=config,
+        git=git,
+        merge_subject=staged.merge_subject,
+        action=action,
+        source_ref=source_ref,
+        source_ref_sha=staged.source_ref_sha,
+        target_branch=staged.target_branch,
+    )
+    return replace(staged, source_ref=source_ref, source_ref_sha=source_ref_sha)
 
 
 def _materialize_max_cycle_deferred_blockers_for_action(
@@ -4140,6 +4640,57 @@ def _materialize_mandatory_merge_side_effects_for_staged_action(
         reused_followups=tuple(reused_followups),
         created_deferred_blockers=tuple(created_blockers),
         reused_deferred_blockers=tuple(reused_blockers),
+    )
+
+
+def _authorize_staged_merge_finalization_before_materialization(
+    store: SqliteTaskStore,
+    *,
+    config: Config,
+    live_git: Git,
+    staged_git: Git,
+    staged: _StagedIsolatedMergeAction,
+    target_branch: str,
+    allow_already_merged_reconciliation: bool = False,
+) -> _StagedIsolatedMergeAction:
+    """Prove live source and target identity for staged mandatory side effects."""
+    action = staged.merge_action_metadata
+    if action.get("pending_merge_finalization") is True or _merge_finalization_family_for_action(action) is None:
+        return staged
+    source_ref = staged.source_ref or staged.merge_branch
+    if not source_ref:
+        raise GitError("could not prove isolated merge finalization source ref before promotion")
+    staged_source_sha = staged.source_ref_sha or _ref_sha_for_merge_finalization_proof(staged_git, source_ref)
+    source_ref_sha = _require_live_capped_review_merge_authorization(
+        store,
+        config=config,
+        git=live_git,
+        merge_subject=staged.merge_subject,
+        action=action,
+        source_ref=source_ref,
+        source_ref_sha=staged_source_sha,
+        target_branch=staged.target_branch,
+        allow_already_merged_reconciliation=allow_already_merged_reconciliation,
+    )
+    if source_ref_sha is None:
+        source_ref_sha = _require_ref_sha_for_merge_finalization_proof(
+            live_git,
+            source_ref,
+            label="authorized source",
+        )
+    previous_target_sha = _ref_sha_for_merge_finalization_proof(
+        live_git,
+        target_branch,
+    ) or _require_ref_sha_for_merge_finalization_proof(
+        staged_git,
+        target_branch,
+        label="previous target",
+    )
+    return replace(
+        staged,
+        source_ref=source_ref,
+        source_ref_sha=source_ref_sha,
+        previous_target_sha=previous_target_sha,
     )
 
 
@@ -4697,18 +5248,28 @@ def _stage_isolated_merge_action(
             created_investigation_task_ids=list(created_investigation_task_ids),
             reused_investigation_task_ids=list(reused_investigation_task_ids),
         )
-    if (
+    candidate_source_ref = resolved_subject.merge_source_ref if resolved_subject is not None else None
+    candidate_contains_source = (
         already_merged_behavior == "mark_merged"
-        and resolved_subject is not None
-        and resolved_subject.merge_source_ref
-        and merge_git.is_merged(resolved_subject.merge_source_ref, merge_current_branch)
-    ):
-        proof_source_ref = resolved_subject.merge_source_ref
+        and candidate_source_ref is not None
+        and merge_git.is_merged(candidate_source_ref, merge_current_branch)
+    )
+    live_is_merged = getattr(git, "is_merged", None)
+    live_target_contains_source = (
+        candidate_contains_source
+        and candidate_source_ref is not None
+        and callable(live_is_merged)
+        and live_is_merged(candidate_source_ref, current_branch)
+    )
+    if live_target_contains_source:
+        if resolved_subject is None or candidate_source_ref is None:
+            raise GitError("could not prove already-merged finalization source ref")
+        proof_source_ref = candidate_source_ref
         proof_source_ref_sha: str | None = None
         if _merge_finalization_family_for_action(action) is not None:
             try:
                 proof_source_ref_sha = _require_ref_sha_for_merge_finalization_proof(
-                    merge_git,
+                    git,
                     proof_source_ref,
                     label="authorized source",
                 )
@@ -4725,6 +5286,30 @@ def _stage_isolated_merge_action(
         created_deferred_blockers: list[DbTask] = []
         reused_deferred_blockers: list[DbTask] = []
         try:
+            authorized_already_merged = _authorize_staged_merge_finalization_before_materialization(
+                store,
+                config=config,
+                live_git=git,
+                staged_git=merge_git,
+                staged=_StagedIsolatedMergeAction(
+                    merge_subject=merge_subject,
+                    merge_unit_id=resolved_subject.merge_unit_id,
+                    merge_branch=resolved_subject.merge_branch,
+                    pending_squash_reconcile=None,
+                    review_task=review_task,
+                    followup_findings=followup_findings,
+                    merge_action_metadata=action,
+                    source_ref=proof_source_ref,
+                    source_ref_sha=proof_source_ref_sha,
+                    target_branch=target_branch,
+                ),
+                target_branch=target_branch,
+                allow_already_merged_reconciliation=True,
+            )
+            if authorized_already_merged.source_ref is None:
+                raise GitError("could not prove already-merged finalization source ref")
+            proof_source_ref = authorized_already_merged.source_ref
+            proof_source_ref_sha = authorized_already_merged.source_ref_sha
             created_followups, reused_followups = _materialize_merge_followup_side_effects(
                 store,
                 config=config,
@@ -4744,14 +5329,26 @@ def _stage_isolated_merge_action(
             if _merge_finalization_family_for_action(action) is not None:
                 if not proof_source_ref or not proof_source_ref_sha:
                     raise GitError("could not prove already-merged finalization source ref")
-                _require_authorized_source_ref_unchanged(merge_git, proof_source_ref, proof_source_ref_sha)
+                proof_source_ref_sha = _require_post_materialization_capped_review_merge_authorization(
+                    store,
+                    config=config,
+                    git=git,
+                    merge_subject=merge_subject,
+                    action=action,
+                    source_ref=proof_source_ref,
+                    source_ref_sha=proof_source_ref_sha,
+                    target_branch=target_branch,
+                    allow_already_merged_reconciliation=True,
+                )
+                if proof_source_ref_sha is None:
+                    raise GitError("could not prove already-merged finalization source ref")
                 target_sha = _require_ref_sha_for_merge_finalization_proof(
-                    merge_git,
+                    git,
                     target_branch,
                     label="target",
                 )
                 _require_authorized_source_contained_in_target(
-                    merge_git,
+                    git,
                     source_sha=proof_source_ref_sha,
                     target_sha=target_sha,
                     target_branch=target_branch,
@@ -4781,7 +5378,7 @@ def _stage_isolated_merge_action(
             try:
                 _validate_pending_merge_finalization_proof_for_state(
                     store,
-                    merge_git,
+                    git,
                     merge_subject=merge_subject,
                     action=action,
                     target_branch=target_branch,
@@ -4794,6 +5391,30 @@ def _stage_isolated_merge_action(
             except Exception as exc:
                 return _pending_merge_finalization_refusal_result(
                     exc=exc,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_investigation_task_ids=created_investigation_task_ids,
+                    reused_investigation_task_ids=reused_investigation_task_ids,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            try:
+                proof_source_ref_sha = _require_post_materialization_capped_review_merge_authorization(
+                    store,
+                    config=config,
+                    git=git,
+                    merge_subject=merge_subject,
+                    action=action,
+                    source_ref=proof_source_ref,
+                    source_ref_sha=proof_source_ref_sha,
+                    target_branch=target_branch,
+                    allow_already_merged_reconciliation=True,
+                )
+            except Exception as exc:
+                return _post_merge_state_persistence_failed_result(
+                    exc=exc,
+                    status="already_merged_state_persistence_failed",
+                    phase="already-merged state finalization",
                     created_followups=created_followups,
                     reused_followups=reused_followups,
                     created_investigation_task_ids=created_investigation_task_ids,
@@ -4829,6 +5450,39 @@ def _stage_isolated_merge_action(
             reused_deferred_blockers=reused_deferred_blockers,
             status="already_merged",
         )
+    if candidate_contains_source and not live_target_contains_source:
+        if resolved_subject is None or candidate_source_ref is None:
+            raise GitError("could not prove candidate-only finalization source ref")
+        staged = _StagedIsolatedMergeAction(
+            merge_subject=merge_subject,
+            merge_unit_id=resolved_subject.merge_unit_id,
+            merge_branch=resolved_subject.merge_branch,
+            pending_squash_reconcile=None,
+            review_task=review_task,
+            followup_findings=followup_findings,
+            created_investigation_task_ids=created_investigation_task_ids,
+            reused_investigation_task_ids=reused_investigation_task_ids,
+            merge_action_metadata=dict(action),
+            source_ref=candidate_source_ref,
+            target_branch=target_branch,
+        )
+        try:
+            return _authorize_staged_merge_finalization_before_materialization(
+                store,
+                config=config,
+                live_git=git,
+                staged_git=merge_git,
+                staged=staged,
+                target_branch=target_branch,
+            )
+        except Exception as exc:
+            return _pre_promotion_merge_refusal_result(
+                exc=exc,
+                status="pre_merge_proof_persistence_failed",
+                phase="candidate-only merge finalization proof",
+                created_investigation_task_ids=created_investigation_task_ids,
+                reused_investigation_task_ids=reused_investigation_task_ids,
+            )
     merge_args = _build_auto_merge_args(
         config,
         merge_git,
@@ -4893,6 +5547,7 @@ def _stage_isolated_merge_action(
         reused_investigation_task_ids=reused_investigation_task_ids,
         merge_action_metadata=dict(authorized_action),
         source_ref=resolved_subject.merge_source_ref if resolved_subject is not None else task.branch,
+        source_ref_sha=merge_result.authorized_source_ref_sha,
         promotion_kind="squash" if getattr(merge_args, "squash", False) else "normal",
     )
 
@@ -4930,6 +5585,11 @@ def _execute_merge_action(
     execution_git = merge_git or git
     execution_branch = merge_current_branch or current_branch
     isolated_promotion = merge_git is not None and merge_git.repo_dir != git.repo_dir
+    canonical_live_proof_available = all(
+        callable(getattr(git, method_name, None))
+        for method_name in ("is_merged", "is_ancestor", "rev_parse_if_exists")
+    )
+    live_proof_git = git if canonical_live_proof_available else execution_git
     resolved_subject = (
         _resolve_merge_subject(store, execution_git, task.id or "", target_branch=target_branch) if task.id else None
     )
@@ -4997,11 +5657,16 @@ def _execute_merge_action(
 
     assert task.id is not None
     effective_merge_source = merge_source_for_action(action, merge_source)
+    allow_already_merged_reconciliation = already_merged_behavior == "mark_merged"
     mandatory_side_effects_materialized = False
-    proof_source_ref = resolved_subject.merge_source_ref if resolved_subject is not None else task.branch
+    proof_source_ref = (resolved_subject.merge_source_ref if resolved_subject is not None else None) or task.branch
     proof_source_ref_sha: str | None = None
     promotion_kind: MergeFinalizationPromotionKind = "normal"
-    if _merge_finalization_family_for_action(action) is not None and not isolated_promotion:
+    if (
+        action.get("type") == "merge"
+        and action.get("max_cycles_merge_and_defer") is True
+        and action.get("pending_merge_finalization") is not True
+    ):
         if not proof_source_ref:
             return _pre_promotion_merge_refusal_result(
                 exc=GitError("could not prove merge finalization source ref before materialization"),
@@ -5016,9 +5681,20 @@ def _execute_merge_action(
             )
         try:
             proof_source_ref_sha = _require_ref_sha_for_merge_finalization_proof(
-                execution_git,
+                live_proof_git,
                 proof_source_ref,
                 label="authorized source",
+            )
+            proof_source_ref_sha = _require_live_capped_review_merge_authorization(
+                store,
+                config=config,
+                git=live_proof_git,
+                merge_subject=merge_subject,
+                action=action,
+                source_ref=proof_source_ref,
+                source_ref_sha=proof_source_ref_sha,
+                target_branch=target_branch,
+                allow_already_merged_reconciliation=allow_already_merged_reconciliation,
             )
         except Exception as exc:
             return _pre_promotion_merge_refusal_result(
@@ -5054,14 +5730,39 @@ def _execute_merge_action(
                 effective_action,
             )
             if (
+                effective_action.get("type") == "merge"
+                and effective_action.get("max_cycles_merge_and_defer") is True
+                and effective_action.get("pending_merge_finalization") is not True
+            ):
+                _require_fresh_capped_review_lifecycle_authority(
+                    store,
+                    config=config,
+                    git=live_proof_git,
+                    merge_subject=merge_subject,
+                    action=effective_action,
+                    target_branch=target_branch,
+                    allow_already_merged_reconciliation=allow_already_merged_reconciliation,
+                )
+            if (
                 _merge_finalization_family_for_action(effective_action) is not None
                 and proof_source_ref_sha is None
                 and proof_source_ref
             ):
                 proof_source_ref_sha = _require_ref_sha_for_merge_finalization_proof(
-                    execution_git,
+                    live_proof_git,
                     proof_source_ref,
                     label="authorized source",
+                )
+                proof_source_ref_sha = _require_live_capped_review_merge_authorization(
+                    store,
+                    config=config,
+                    git=live_proof_git,
+                    merge_subject=merge_subject,
+                    action=effective_action,
+                    source_ref=proof_source_ref,
+                    source_ref_sha=proof_source_ref_sha,
+                    target_branch=target_branch,
+                    allow_already_merged_reconciliation=allow_already_merged_reconciliation,
                 )
             created_followups, reused_followups = _materialize_merge_followup_side_effects(
                 store,
@@ -5081,6 +5782,18 @@ def _execute_merge_action(
             )
         except Exception as exc:
             if effective_action.get("max_cycles_merge_and_defer") is True:
+                if isinstance(exc, _CappedReviewLifecycleAuthorityChanged):
+                    return _pre_promotion_merge_refusal_result(
+                        exc=exc,
+                        status="max_cycle_lifecycle_authority_changed",
+                        phase="pre-materialization lifecycle authority proof",
+                        created_followups=created_followups,
+                        reused_followups=reused_followups,
+                        created_investigation_task_ids=created_investigation_task_ids,
+                        reused_investigation_task_ids=reused_investigation_task_ids,
+                        created_deferred_blockers=created_deferred_blockers,
+                        reused_deferred_blockers=reused_deferred_blockers,
+                    )
                 return _deferred_blocker_materialization_failed_result(
                     exc=exc,
                     created_followups=created_followups,
@@ -5102,15 +5815,24 @@ def _execute_merge_action(
         if (
             _merge_finalization_family_for_action(effective_action) is not None
             and effective_action.get("pending_merge_finalization") is not True
+            and not isolated_promotion
         ):
             try:
                 if not proof_source_ref or not proof_source_ref_sha:
                     raise GitError("could not prove merge finalization source ref before promotion")
-                _require_authorized_source_ref_unchanged(
-                    execution_git,
-                    proof_source_ref,
-                    proof_source_ref_sha,
+                proof_source_ref_sha = _require_post_materialization_capped_review_merge_authorization(
+                    store,
+                    config=config,
+                    git=live_proof_git,
+                    merge_subject=merge_subject,
+                    action=effective_action,
+                    source_ref=proof_source_ref,
+                    source_ref_sha=proof_source_ref_sha,
+                    target_branch=target_branch,
+                    allow_already_merged_reconciliation=allow_already_merged_reconciliation,
                 )
+                if proof_source_ref_sha is None:
+                    raise GitError("could not prove merge finalization source ref before promotion")
             except Exception as exc:
                 return _pre_promotion_merge_refusal_result(
                     exc=exc,
@@ -5125,7 +5847,7 @@ def _execute_merge_action(
                 )
             try:
                 previous_target_sha = _require_ref_sha_for_merge_finalization_proof(
-                    execution_git,
+                    live_proof_git,
                     target_branch,
                     label="previous target",
                 )
@@ -5159,12 +5881,22 @@ def _execute_merge_action(
         mandatory_side_effects_materialized = True
         return None
 
-    if (
+    already_merged_source_ref: str | None = (
+        resolved_subject.merge_source_ref if resolved_subject is not None else None
+    )
+    execution_contains_source = (
         already_merged_behavior == "mark_merged"
-        and resolved_subject is not None
-        and resolved_subject.merge_source_ref
-        and execution_git.is_merged(resolved_subject.merge_source_ref, execution_branch)
-    ):
+        and already_merged_source_ref is not None
+        and execution_git.is_merged(already_merged_source_ref, execution_branch)
+    )
+    live_contains_source = (
+        execution_contains_source
+        and already_merged_source_ref is not None
+        and live_proof_git.is_merged(already_merged_source_ref, current_branch)
+    )
+    if execution_contains_source and (not isolated_promotion or live_contains_source):
+        if resolved_subject is None or already_merged_source_ref is None:
+            raise GitError("could not prove already-merged finalization source ref")
         materialization_error = _materialize_mandatory_side_effects_before_state(action)
         if materialization_error is not None:
             return materialization_error
@@ -5175,18 +5907,26 @@ def _execute_merge_action(
             try:
                 if not proof_source_ref or not proof_source_ref_sha:
                     raise GitError("could not prove already-merged finalization source ref")
-                _require_authorized_source_ref_unchanged(
-                    execution_git,
-                    proof_source_ref,
-                    proof_source_ref_sha,
+                proof_source_ref_sha = _require_post_materialization_capped_review_merge_authorization(
+                    store,
+                    config=config,
+                    git=live_proof_git,
+                    merge_subject=merge_subject,
+                    action=action,
+                    source_ref=proof_source_ref,
+                    source_ref_sha=proof_source_ref_sha,
+                    target_branch=target_branch,
+                    allow_already_merged_reconciliation=allow_already_merged_reconciliation,
                 )
+                if proof_source_ref_sha is None:
+                    raise GitError("could not prove already-merged finalization source ref")
                 target_sha = _require_ref_sha_for_merge_finalization_proof(
-                    execution_git,
+                    live_proof_git,
                     target_branch,
                     label="target",
                 )
                 _require_authorized_source_contained_in_target(
-                    execution_git,
+                    live_proof_git,
                     source_sha=proof_source_ref_sha,
                     target_sha=target_sha,
                     target_branch=target_branch,
@@ -5197,7 +5937,7 @@ def _execute_merge_action(
                     action=action,
                     target_branch=target_branch,
                     previous_target_sha=target_sha,
-                    source_ref=resolved_subject.merge_source_ref,
+                    source_ref=already_merged_source_ref,
                     source_ref_sha=proof_source_ref_sha,
                     merge_unit_id=resolved_subject.merge_unit_id,
                     promotion_observed=True,
@@ -5208,13 +5948,13 @@ def _execute_merge_action(
                 )
                 _persist_merge_finalization_attempt_proof_for_action(
                     store,
-                    execution_git,
+                    live_proof_git,
                     merge_subject=merge_subject,
                     action=action,
                     target_branch=target_branch,
                     previous_target_sha=target_sha,
                     promoted_target_sha=target_sha,
-                    source_ref=resolved_subject.merge_source_ref,
+                    source_ref=already_merged_source_ref,
                     source_ref_sha=proof_source_ref_sha,
                     merge_unit_id=resolved_subject.merge_unit_id,
                     created_followups=created_followups,
@@ -5238,7 +5978,7 @@ def _execute_merge_action(
             try:
                 _validate_pending_merge_finalization_proof_for_state(
                     store,
-                    execution_git,
+                    live_proof_git,
                     merge_subject=merge_subject,
                     action=action,
                     target_branch=target_branch,
@@ -5251,6 +5991,30 @@ def _execute_merge_action(
             except Exception as exc:
                 return _pending_merge_finalization_refusal_result(
                     exc=exc,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_investigation_task_ids=created_investigation_task_ids,
+                    reused_investigation_task_ids=reused_investigation_task_ids,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
+            try:
+                proof_source_ref_sha = _require_post_materialization_capped_review_merge_authorization(
+                    store,
+                    config=config,
+                    git=live_proof_git,
+                    merge_subject=merge_subject,
+                    action=action,
+                    source_ref=proof_source_ref,
+                    source_ref_sha=proof_source_ref_sha,
+                    target_branch=target_branch,
+                    allow_already_merged_reconciliation=allow_already_merged_reconciliation,
+                )
+            except Exception as exc:
+                return _post_merge_state_persistence_failed_result(
+                    exc=exc,
+                    status="already_merged_state_persistence_failed",
+                    phase="already-merged state finalization",
                     created_followups=created_followups,
                     reused_followups=reused_followups,
                     created_investigation_task_ids=created_investigation_task_ids,
@@ -5396,6 +6160,21 @@ def _execute_merge_action(
     if rc == 0 and merge_git is not None and merge_git.repo_dir != git.repo_dir:
         assert staged_isolated is not None
         try:
+            if (
+                staged_isolated.merge_action_metadata.get("pending_merge_finalization") is not True
+                and _merge_finalization_family_for_action(staged_isolated.merge_action_metadata) is not None
+            ):
+                staged_isolated = _authorize_staged_merge_finalization_before_materialization(
+                    store,
+                    config=config,
+                    live_git=git,
+                    staged_git=execution_git,
+                    staged=staged_isolated,
+                    target_branch=target_branch,
+                )
+                source_ref = staged_isolated.source_ref
+                source_ref_sha = staged_isolated.source_ref_sha
+                assert staged_isolated.previous_target_sha is not None
             staged_isolated = _materialize_mandatory_merge_side_effects_for_staged_action(
                 store,
                 config=config,
@@ -5411,32 +6190,20 @@ def _execute_merge_action(
                 staged_isolated.merge_action_metadata.get("pending_merge_finalization") is not True
                 and _merge_finalization_family_for_action(staged_isolated.merge_action_metadata) is not None
             ):
-                source_ref = staged_isolated.source_ref or staged_isolated.merge_branch
-                if not source_ref:
-                    raise GitError("could not prove isolated merge finalization source ref before promotion")
-                source_ref_sha = _ref_sha_for_merge_finalization_proof(
-                    execution_git,
-                    source_ref,
-                ) or _ref_sha_for_merge_finalization_proof(git, source_ref)
-                if not source_ref_sha:
-                    raise GitError(f"could not prove source ref {source_ref!r} before promotion")
-                staged_isolated = replace(
-                    staged_isolated,
-                    source_ref=source_ref,
-                    source_ref_sha=source_ref_sha,
-                    previous_target_sha=_require_ref_sha_for_merge_finalization_proof(
-                        git,
-                        target_branch,
-                        label="previous target",
-                    )
-                    if _ref_sha_for_merge_finalization_proof(git, target_branch) is not None
-                    else _require_ref_sha_for_merge_finalization_proof(
-                        execution_git,
-                        target_branch,
-                        label="previous target",
-                    ),
+                staged_isolated = _require_staged_authorized_source_ref_unchanged_after_materialization(
+                    store,
+                    config=config,
+                    git=git,
+                    staged=staged_isolated,
                 )
-                assert staged_isolated.previous_target_sha is not None
+                source_ref = staged_isolated.source_ref or staged_isolated.merge_branch
+                source_ref_sha = staged_isolated.source_ref_sha
+                if staged_isolated.previous_target_sha is None:
+                    raise GitError("could not prove isolated merge finalization target before promotion")
+                if source_ref is None:
+                    raise GitError("could not prove isolated merge finalization source ref before promotion")
+                if source_ref_sha is None:
+                    raise GitError("could not prove isolated merge finalization source before promotion")
                 _persist_merge_finalization_prepared_attempt_for_action(
                     store,
                     merge_subject=staged_isolated.merge_subject,
@@ -5477,6 +6244,7 @@ def _execute_merge_action(
                 git,
                 execution_git,
                 target_branch,
+                expected_previous_target_sha=staged_isolated.previous_target_sha,
             )
         except _IsolatedPromotionRollbackFailed as exc:
             classification = _classify_isolated_promotion_rollback_failed(git, exc)

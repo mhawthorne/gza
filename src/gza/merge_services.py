@@ -75,6 +75,7 @@ class ManualMergeExecutionRequest:
     quiet_mechanics: bool = False
     materialize_side_effects: bool = True
     authorized_source_ref_sha: str | None = None
+    expected_preflight_target_sha: str | None = None
     pre_materialized_deferred_blockers: tuple[list[DbTask], list[DbTask]] | None = None
     pre_materialized_deferred_blockers_printed: bool = False
     pending_squash_reconcile: Any = None
@@ -597,6 +598,27 @@ def execute_manual_merge(
                     created_deferred_blockers=created_deferred_blockers,
                     reused_deferred_blockers=reused_deferred_blockers,
                 )
+        if request.expected_preflight_target_sha is not None:
+            rev_parse_if_exists = getattr(request.git, "rev_parse_if_exists", None)
+            current_target_sha = (
+                rev_parse_if_exists(request.merge_preflight_target) if callable(rev_parse_if_exists) else None
+            )
+            if current_target_sha != request.expected_preflight_target_sha:
+                block_reason = (
+                    "merge target changed after preflight authorization; "
+                    f"expected {request.expected_preflight_target_sha}, got {current_target_sha or 'unavailable'}; "
+                    "target is unchanged; retry after refreshing merge authorization"
+                )
+                hooks.emit(f"Error: {block_reason}")
+                return ManualMergeExecutionResult(
+                    rc=1,
+                    status="merge_target_ref_changed",
+                    block_reason=block_reason,
+                    created_followups=created_followups,
+                    reused_followups=reused_followups,
+                    created_deferred_blockers=created_deferred_blockers,
+                    reused_deferred_blockers=reused_deferred_blockers,
+                )
         if not request.quiet_mechanics:
             hooks.emit(f"Merging '{request.merge_source_ref}' into '{request.current_branch}'...")
 
@@ -615,12 +637,12 @@ def execute_manual_merge(
         if request.process_monitor_factory is not None:
             merge_kwargs["process_monitor_factory"] = request.process_monitor_factory
         try:
-            request.git.merge(request.merge_source_ref, **merge_kwargs)
+            request.git.merge(request.authorized_source_ref_sha or request.merge_source_ref, **merge_kwargs)
         except TypeError as exc:
             if request.process_monitor_factory is None or "process_monitor_factory" not in str(exc):
                 raise
             request.git.merge(
-                request.merge_source_ref,
+                request.authorized_source_ref_sha or request.merge_source_ref,
                 squash=request.squash,
                 commit_message=commit_message,
             )

@@ -748,8 +748,14 @@ failure *and* actionable merge/review work remains eligible for the latter.
   MUST NOT invoke conflict assessment or create a rebase child.
 - Manual `gza merge` retains a narrower human-override path than automation. Automated
   lifecycle actions (`advance`/`watch`) MUST still merge only review-cleared work under
-  the rules above; they MUST NOT auto-merge `CHANGES_REQUESTED` reviews by deferring
-  blockers, and they MUST NOT bypass parked lifecycle `needs_attention` /
+  the rules above, except for the narrow `on_max_cycles=merge_and_defer` capped-review
+  path defined in §6: an eligible ordinary plain-full or resolution review may defer
+  persisted deterministic `BLOCKER` findings only when the review content is unchanged,
+  the live source ref still equals the reviewed head, and current lifecycle-owned verify
+  evidence is fresh and passing for that same head. Spec-coherence reviews, red or
+  unavailable verify gates, no-op/adjudication lanes, and other parked gates remain
+  non-deferable. Automation MUST NOT otherwise auto-merge `CHANGES_REQUESTED` reviews by
+  deferring blockers, and it MUST NOT bypass parked lifecycle `needs_attention` /
   `needs_discussion` merge gates. Manual `gza merge --force` MAY override those parked
   lifecycle gates for the local merge path only, but it MUST still refuse any real git
   conflict and MUST leave the unit's persisted provenance distinguishable from an
@@ -821,7 +827,9 @@ failure *and* actionable merge/review work remains eligible for the latter.
   unavailable, and MUST block promotion when the candidate result is red or exact-tree
   freshness cannot be proven. The canonical checkpoint MAY be copied forward from that
   candidate evidence only when the exact verified candidate tree is the one promoted onto
-  the canonical target. Before any later merge attempt in the same command cycle, the
+  the canonical target. Already-merged reconciliation may mutate merge state immediately
+  only when the source is contained in the live pre-batch target; containment introduced
+  only by earlier staged candidate entries MUST wait for verified promotion. Before any later merge attempt in the same command cycle, the
   caller MUST refresh or rebuild that isolated checkout back to the canonical target, or
   stop the merge lane for the cycle; later candidates MUST NOT run on top of a blocked
   candidate tree. Watch's caller surface MUST preserve that blocked-candidate outcome

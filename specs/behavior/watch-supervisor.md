@@ -597,8 +597,11 @@ Each watch cycle MUST execute these phases in order:
    Only an explicitly classified merge conflict may use that per-member skip path;
    non-conflict staging failures MUST remain visible failures and MUST NOT promote the
    remaining batch under conflict semantics. A branch that is already merged into the
-   target during staging MUST be reconciled as successful merge-state work, not reported
-   as a conflict.
+   pre-batch live target during staging MUST be reconciled as successful merge-state
+   work, not reported as a conflict. A branch that is contained only by the accumulated
+   detached candidate MUST remain a staged batch member: its mandatory debt, merge
+   provenance, and merge-state finalization MUST wait until the combined candidate passes
+   verification and the live target is promoted.
    Pre-promotion source-proof refusals, including unavailable authorized source refs,
    pre-merge proof failures, and source refs that change after mandatory child
    materialization, MUST report that the target is unchanged and MUST NOT route through

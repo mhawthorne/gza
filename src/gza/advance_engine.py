@@ -105,6 +105,7 @@ from gza.review_tasks import (
     extract_capped_review_blocker_persisted_output,
     extract_capped_review_blocker_prompt_parts,
     extract_followup_prompt_parts,
+    extract_review_blocker_adjudication_prompt_parts,
     find_existing_review_blocker_adjudication_task,
     find_existing_verify_fix_task,
     persist_off_topic_verify_clearance,
@@ -1158,6 +1159,7 @@ def _pending_followup_finalization_action(
 
 
 def _pending_capped_blocker_finalization_action(
+    config: Any | None,
     store: SqliteTaskStore,
     task: DbTask,
     *,
@@ -1243,6 +1245,15 @@ def _pending_capped_blocker_finalization_action(
         if not blockers:
             invalid_traces.append(f"review {review_task_id} has no parsed blockers")
             continue
+        blocker_ids = tuple(finding.id for finding in blockers if isinstance(finding.id, str) and finding.id)
+        if len(blocker_ids) != len(blockers):
+            invalid_traces.append(f"review {review_task_id} has malformed blocker IDs")
+            continue
+        max_review_cycles = getattr(config, "max_review_cycles", None)
+        if isinstance(max_review_cycles, bool) or not isinstance(max_review_cycles, int):
+            invalid_traces.append(f"review {review_task_id} cannot prove max review cycle policy")
+            continue
+        completed_review_cycles = max_review_cycles
         children_by_finding: dict[str, list[DbTask]] = {}
         for child in children:
             parts = extract_capped_review_blocker_prompt_parts(child.prompt)
@@ -1250,8 +1261,8 @@ def _pending_capped_blocker_finalization_action(
                 continue
             finding_id, _review_task_id, _impl_task_id = parts
             children_by_finding.setdefault(finding_id, []).append(child)
-        blocker_ids = {finding.id for finding in blockers}
-        if set(children_by_finding) != blocker_ids:
+        blocker_id_set = set(blocker_ids)
+        if set(children_by_finding) != blocker_id_set:
             invalid_traces.append(f"review {review_task_id} blocker task set does not match parsed blockers")
             continue
         proven_children: list[DbTask] = []
@@ -1299,12 +1310,19 @@ def _pending_capped_blocker_finalization_action(
                 "review_task": review_task,
                 "max_cycles_merge_and_defer": True,
                 "deferred_blocker_findings": blockers,
+                "deferred_blocker_ids": blocker_ids,
                 "persisted_review_output": persisted_output,
                 "review_output": persisted_output,
                 "pending_merge_finalization": True,
                 "proven_deferred_blocker_tasks": tuple(proven_children),
                 "merge_finalization_proof_id": proofs[0].artifact.id,
                 "merge_finalization_proof_sha": proofs[0].artifact.sha256,
+                "max_cycles_audit": {
+                    "reason": "review-max-cycles",
+                    "policy": "merge_and_defer",
+                    "completed_review_cycles": completed_review_cycles,
+                    "max_review_cycles": max_review_cycles,
+                },
             }
         )
     if len(proven_actions) == 1 and not invalid_traces:
@@ -1359,6 +1377,7 @@ def pending_merge_finalization_action(
         merge_unit_id=merge_unit.id,
     )
     capped_action = _pending_capped_blocker_finalization_action(
+        config,
         store,
         task,
         target_branch=target_branch,
@@ -5592,11 +5611,30 @@ def _review_max_cycles_base_merge_candidate(
         return False
     if ctx.active_review_blocker_adjudication is not None:
         return False
+    if _active_review_blocker_adjudication_child(ctx) is not None:
+        return False
     if ctx.review_blocker_adjudication_candidate is not None:
         return False
     if ctx.duplicate_blocker_streak is not None:
         return False
     return True
+
+
+def _active_review_blocker_adjudication_child(ctx: AdvanceContext) -> DbTask | None:
+    review_task = ctx.latest_completed_review
+    impl_task = getattr(ctx, "review_root_task", None) or ctx.task
+    if review_task is None or review_task.id is None or impl_task.id is None:
+        return None
+    for child in ctx.store.get_based_on_children(review_task.id):
+        if child.task_type != "internal" or child.status not in {"pending", "in_progress"}:
+            continue
+        parts = extract_review_blocker_adjudication_prompt_parts(child.prompt)
+        if parts is None:
+            continue
+        _finding_id, review_task_id, impl_task_id = parts
+        if review_task_id == review_task.id and impl_task_id == impl_task.id:
+            return child
+    return None
 
 
 def _resolve_capped_review_merge_payload(
@@ -5684,10 +5722,21 @@ def _review_max_cycles_action(ctx: AdvanceContext) -> dict[str, Any]:
     if payload is None:
         return _review_max_cycles_needs_attention_action(ctx)
     review_task = payload.review_task
-    if review_task.id is None:
+    if (
+        review_task.id is None
+        or review_task.completed_at is None
+        or not ctx.latest_reviewed_head_sha
+        or not ctx.current_review_head_sha
+    ):
         return _review_max_cycles_needs_attention_action(ctx)
     persisted_review_output = payload.persisted_review_output
     blocker_findings = payload.blocker_findings
+    blocker_ids = tuple(finding.id for finding in blocker_findings if isinstance(finding.id, str) and finding.id)
+    if len(blocker_ids) != len(blocker_findings):
+        return _review_max_cycles_needs_attention_action(ctx)
+    latest_review_mode = (
+        "resolution" if declares_resolution_review_mode(review_task.review_scope) else "plain_full"
+    )
 
     return {
         "type": "merge",
@@ -5695,13 +5744,13 @@ def _review_max_cycles_action(ctx: AdvanceContext) -> dict[str, Any]:
         "max_cycles_merge_and_defer": True,
         "review_task": review_task,
         "latest_review_task_id": review_task.id,
-        "latest_review_completed_at": review_task.completed_at.isoformat() if review_task.completed_at else None,
+        "latest_review_completed_at": review_task.completed_at.isoformat(),
+        "latest_review_mode": latest_review_mode,
         "latest_review_head_sha": ctx.latest_reviewed_head_sha,
         "current_review_head_sha": ctx.current_review_head_sha,
         "deferred_blocker_findings": blocker_findings,
-        "deferred_blocker_ids": tuple(finding.id for finding in blocker_findings),
+        "deferred_blocker_ids": blocker_ids,
         "persisted_review_output": persisted_review_output,
-        "review_output": persisted_review_output,
         "review_output_reference": review_task.report_file,
         "max_cycles_audit": {
             "reason": "review-max-cycles",

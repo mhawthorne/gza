@@ -3547,6 +3547,7 @@ def test_head_advanced_stale_review_refresh_preempts_max_cycles(tmp_path: Path, 
 
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "park"
     config.max_review_cycles = 0
 
     impl = _make_completed_unmerged_impl(
@@ -4894,6 +4895,7 @@ def test_current_head_review_still_parks_at_max_cycles_when_head_unchanged(
 
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "park"
     config.max_review_cycles = 1
     config.max_noop_improve_cycles = 2
     config.max_noop_improve_cycles = 2
@@ -5340,7 +5342,7 @@ def test_capped_review_candidate_with_stale_verify_runs_pre_merge_verify_before_
     assert action["verify_gate_state"] == "stale"
 
 
-def test_capped_review_candidate_with_green_verify_emits_annotated_merge_action(
+def test_default_on_max_cycles_with_green_verify_emits_annotated_merge_action(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -5348,7 +5350,6 @@ def test_capped_review_candidate_with_green_verify_emits_annotated_merge_action(
 
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
-    config.on_max_cycles = "merge_and_defer"
     config.max_review_cycles = 0
     config.verify_command = "./bin/tests"
 
@@ -5404,12 +5405,13 @@ def test_capped_review_candidate_with_green_verify_emits_annotated_merge_action(
     assert action["max_cycles_merge_and_defer"] is True
     assert action["review_task"].id == review.id
     assert action["latest_review_task_id"] == review.id
+    assert action["latest_review_mode"] == "plain_full"
     assert action["latest_review_head_sha"] == "current-sha"
     assert action["current_review_head_sha"] == "current-sha"
     assert action["deferred_blocker_ids"] == ("B1",)
     assert action["deferred_blocker_findings"] == parsed_blockers
     assert action["persisted_review_output"] == review.output_content
-    assert action["review_output"] == review.output_content
+    assert "review_output" not in action
     assert action["review_output_reference"] == review.report_file
     assert action["max_cycles_audit"]["reason"] == "review-max-cycles"
     assert action["max_cycles_audit"]["policy"] == "merge_and_defer"
@@ -5710,7 +5712,7 @@ def test_capped_review_action_uses_single_content_snapshot_for_payload_and_findi
     assert action["type"] == "merge"
     assert action["max_cycles_merge_and_defer"] is True
     assert action["persisted_review_output"] == first_output
-    assert action["review_output"] == first_output
+    assert "review_output" not in action
     assert action["deferred_blocker_ids"] == ("B1",)
     assert [finding.id for finding in action["deferred_blocker_findings"]] == ["B1"]
 
@@ -5950,6 +5952,7 @@ def test_current_head_epoch_resets_review_cycle_cap(tmp_path: Path, monkeypatch)
 
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "park"
     config.max_review_cycles = 1
 
     impl = _make_completed_unmerged_impl(
@@ -6007,6 +6010,7 @@ def test_refresh_review_at_current_head_returns_to_normal_max_cycle_behavior(
 
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "park"
     config.max_review_cycles = 1
 
     impl = _make_completed_unmerged_impl(

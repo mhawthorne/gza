@@ -150,8 +150,8 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec(
         "on_max_cycles",
         "str",
-        "park",
-        "Policy for completed review/improve loops at max_review_cycles: `park` preserves the current manual-attention stop; `merge_and_defer` is accepted for opt-in staged rollout once the merge-and-defer executor path is enabled.",
+        "merge_and_defer",
+        "Policy for completed review/improve loops at max_review_cycles: `merge_and_defer` merges current green capped reviews and creates mandatory blocker follow-ups; `park` is the rollback switch for manual-attention stop.",
     ),
     ConfigKeySpec("max_plan_review_cycles", "int", 2, "Cap for plan_review/plan_improve loops in lifecycle automation."),
     ConfigKeySpec(

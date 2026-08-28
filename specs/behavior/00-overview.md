@@ -206,7 +206,9 @@ target branch, and either finishes idempotently when authoritative merge state i
 Running `gza land` is the operator's explicit authorization for that selected unit only.
 It does not change the normal two-gate merge invariant for `advance` or `watch`: unattended
 automation remains strict, never creates landing judgments, never defers new blockers, and
-never bypasses parked lifecycle gates merely because guarded landing exists.
+never bypasses parked lifecycle gates merely because guarded landing exists. The narrow
+`on_max_cycles=merge_and_defer` exception is governed by the capped-review proof rules in
+[lifecycle-engine.md](lifecycle-engine.md#6--review-and-improve-loop).
 
 Successful guarded escalation is auditable as distinct merge provenance. A strict or
 non-escalated landing records `manual_land`; a guarded landing that defers blockers or

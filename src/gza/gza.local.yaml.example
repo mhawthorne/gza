@@ -476,8 +476,8 @@ provider: codex
 # Default: effective watch batch or 5
 # max_concurrent: 5
 
-# Policy for completed review/improve loops at max_review_cycles: `park` preserves the current
-# manual-attention stop; `merge_and_defer` is accepted for opt-in staged rollout once the merge-
-# and-defer executor path is enabled.
-# Default: park
-# on_max_cycles: park
+# Policy for completed review/improve loops at max_review_cycles: `merge_and_defer` merges current
+# green capped reviews and creates mandatory blocker follow-ups; `park` is the rollback switch for
+# manual-attention stop.
+# Default: merge_and_defer
+# on_max_cycles: merge_and_defer
