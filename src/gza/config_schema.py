@@ -90,6 +90,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
         "Warn when database backups exceed this many GB (0 disables).",
     ),
     ConfigKeySpec(
+        "backup_compression",
+        "bool",
+        True,
+        "Compress database backups with zstd (~8x smaller).",
+    ),
+    ConfigKeySpec(
         "backup_retention_hourly_hours",
         "int",
         24,

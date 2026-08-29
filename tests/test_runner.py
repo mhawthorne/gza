@@ -9403,7 +9403,7 @@ class TestBackupDatabase:
 
         from datetime import datetime
         hour_stamp = datetime.now().strftime("%Y%m%d%H")
-        backup_file = backup_dir / f"gza-{hour_stamp}.db"
+        backup_file = backup_dir / f"gza-{hour_stamp}.db.zst"
         assert backup_file.exists()
         assert backup_file.stat().st_size > 0
 
@@ -9458,8 +9458,11 @@ class TestBackupDatabase:
         backup_database(db_path, tmp_path)
 
         hour_stamp = datetime.now().strftime("%Y%m%d%H")
-        backup_path = tmp_path / BACKUP_DIR / f"gza-{hour_stamp}.db"
-        assert backup_path.exists()
+        packed_path = tmp_path / BACKUP_DIR / f"gza-{hour_stamp}.db.zst"
+        assert packed_path.exists()
+
+        backup_path = tmp_path / "restored.db"
+        runner.decompress_backup(packed_path, backup_path)
 
         backup_conn = sqlite3.connect(str(backup_path))
         rows = backup_conn.execute("SELECT id, name FROM items").fetchall()
@@ -9484,7 +9487,7 @@ class TestBackupDatabase:
         backup_database(shared_db, project_dir)
 
         hour_stamp = datetime.now().strftime("%Y%m%d%H")
-        shared_backup = shared_db.parent / "backups" / f"gza-{hour_stamp}.db"
+        shared_backup = shared_db.parent / "backups" / f"gza-{hour_stamp}.db.zst"
         project_backup_dir = project_dir / BACKUP_DIR
 
         assert shared_backup.exists()
@@ -26246,3 +26249,67 @@ def test_select_backups_prunes_nothing_for_non_numeric_dials():
     assert runner.select_backups_to_prune(
         names, now, hourly_hours=object(), intraday_days=7, intraday_per_day=4
     ) == []
+
+
+def _sqlite_with_rows(path):
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE t (v TEXT)")
+    conn.executemany("INSERT INTO t VALUES (?)", [("row" * 50,) for _ in range(500)])
+    conn.commit()
+    conn.close()
+
+
+def test_backup_database_writes_compressed_snapshot(tmp_path):
+    db = tmp_path / ".gza" / "gza.db"
+    db.parent.mkdir(parents=True)
+    _sqlite_with_rows(db)
+    runner.backup_database(db, tmp_path)
+    made = list((tmp_path / ".gza" / "backups").glob("gza-*.db.zst"))
+    assert len(made) == 1
+    # No staging file left behind.
+    assert not list((tmp_path / ".gza" / "backups").glob(".*tmp"))
+
+
+def test_backup_database_roundtrips_through_decompress(tmp_path):
+    db = tmp_path / ".gza" / "gza.db"
+    db.parent.mkdir(parents=True)
+    _sqlite_with_rows(db)
+    runner.backup_database(db, tmp_path)
+    packed = next((tmp_path / ".gza" / "backups").glob("gza-*.db.zst"))
+    restored = tmp_path / "restored.db"
+    runner.decompress_backup(packed, restored)
+    conn = sqlite3.connect(str(restored))
+    assert conn.execute("SELECT count(*) FROM t").fetchone()[0] == 500
+    conn.close()
+
+
+def test_backup_database_skips_hour_already_stored_uncompressed(tmp_path):
+    db = tmp_path / ".gza" / "gza.db"
+    db.parent.mkdir(parents=True)
+    _sqlite_with_rows(db)
+    backups = tmp_path / ".gza" / "backups"
+    backups.mkdir(parents=True)
+    stamp = datetime.now().strftime("%Y%m%d%H")
+    (backups / f"gza-{stamp}.db").write_bytes(b"existing")
+    runner.backup_database(db, tmp_path)
+    assert list(backups.glob("gza-*.db.zst")) == []
+
+
+def test_backup_database_uncompressed_when_disabled(tmp_path):
+    db = tmp_path / ".gza" / "gza.db"
+    db.parent.mkdir(parents=True)
+    _sqlite_with_rows(db)
+    runner.backup_database(db, tmp_path, compress=False)
+    backups = tmp_path / ".gza" / "backups"
+    assert len(list(backups.glob("gza-*.db"))) == 1
+    assert list(backups.glob("*.zst")) == []
+
+
+def test_select_backups_handles_compressed_names():
+    now = datetime(2026, 8, 28, 12)
+    names = ["gza-2026010100.db.zst", "gza-2026010101.db.zst"]
+    prune = runner.select_backups_to_prune(
+        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
+    )
+    assert len(prune) == 1
+    assert prune[0].endswith(".db.zst")

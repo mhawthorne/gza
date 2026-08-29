@@ -462,6 +462,10 @@ provider: codex
 
 # --- Other ---
 
+# Compress database backups with zstd (~8x smaller).
+# Default: true
+# backup_compression: true
+
 # Keep every database backup newer than this many hours.
 # Default: 24
 # backup_retention_hourly_hours: 24

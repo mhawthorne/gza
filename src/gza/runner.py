@@ -2831,6 +2831,28 @@ def _backup_sqlite_file(source_path: Path, destination_path: Path) -> None:
         source.close()
 
 
+BACKUP_COMPRESSED_SUFFIX = ".zst"
+BACKUP_COMPRESSION_LEVEL = 3
+
+
+def _compress_file(source_path: Path, destination_path: Path) -> None:
+    """Stream-compress ``source_path`` to ``destination_path`` with zstd."""
+    import zstandard
+
+    compressor = zstandard.ZstdCompressor(level=BACKUP_COMPRESSION_LEVEL)
+    with open(source_path, "rb") as raw, open(destination_path, "wb") as packed:
+        compressor.copy_stream(raw, packed)
+
+
+def decompress_backup(source_path: Path, destination_path: Path) -> None:
+    """Expand a ``.zst`` snapshot back into a usable SQLite file."""
+    import zstandard
+
+    decompressor = zstandard.ZstdDecompressor()
+    with open(source_path, "rb") as packed, open(destination_path, "wb") as raw:
+        decompressor.copy_stream(packed, raw)
+
+
 def resolve_backup_dir(db_path: Path, project_dir: Path) -> Path:
     """Return the directory holding hourly snapshots of ``db_path``.
 
@@ -2849,7 +2871,7 @@ def resolve_backup_dir(db_path: Path, project_dir: Path) -> Path:
     return db_path.parent / "backups"
 
 
-BACKUP_NAME_RE = re.compile(r"^gza-(\d{10})\.db$")
+BACKUP_NAME_RE = re.compile(r"^gza-(\d{10})\.db(?:\.zst)?$")
 
 
 def parse_backup_stamp(name: str) -> datetime | None:
@@ -2993,31 +3015,54 @@ def backup_database(
     project_dir: Path,
     warn_gb: int = 0,
     retention: dict[str, int] | None = None,
+    compress: bool = True,
 ) -> None:
     """Create an hourly backup of the SQLite database if one doesn't exist yet.
 
     Checks if a backup for the current hour already exists. If not, creates
-    a timestamped backup using SQLite's backup API (safe for concurrent access).
+    a timestamped backup using SQLite's backup API (safe for concurrent access)
+    and compresses it with zstd, which shrinks a snapshot roughly 8x.
 
-    Backup filename format: gza-YYYYMMDDHH.db (e.g., gza-2026021414.db)
+    Backup filename format: gza-YYYYMMDDHH.db.zst (e.g., gza-2026021414.db.zst).
+    Uncompressed snapshots written by older versions are still recognized.
 
     Args:
         db_path: Path to the source SQLite database
         project_dir: Project directory (used for project-local DB backup location)
+        warn_gb: Warn when the backup directory exceeds this many GB
+        retention: Tiered retention dials, or None to skip pruning
+        compress: Whether to zstd-compress the snapshot
     """
     if not db_path.exists():
         return
 
     backup_dir = resolve_backup_dir(db_path, project_dir)
     hour_stamp = datetime.now().strftime("%Y%m%d%H")
-    backup_path = backup_dir / f"gza-{hour_stamp}.db"
+    plain_path = backup_dir / f"gza-{hour_stamp}.db"
+    backup_path = plain_path.with_name(plain_path.name + BACKUP_COMPRESSED_SUFFIX) if compress else plain_path
 
-    if backup_path.exists():
+    # Either form counts as this hour's snapshot, so flipping the compression
+    # setting never causes a duplicate copy of the same hour.
+    if plain_path.exists() or plain_path.with_name(plain_path.name + BACKUP_COMPRESSED_SUFFIX).exists():
         return
 
     backup_dir.mkdir(parents=True, exist_ok=True)
 
-    _backup_sqlite_file(db_path, backup_path)
+    if compress:
+        # SQLite's backup API needs a real file, so stage uncompressed and
+        # compress on the way out. The staging file is removed even on failure
+        # so a partial snapshot never lingers as this hour's backup.
+        staging = backup_dir / f".gza-{hour_stamp}.db.tmp"
+        try:
+            _backup_sqlite_file(db_path, staging)
+            _compress_file(staging, backup_path)
+        except BaseException:
+            backup_path.unlink(missing_ok=True)
+            raise
+        finally:
+            staging.unlink(missing_ok=True)
+    else:
+        _backup_sqlite_file(db_path, backup_path)
 
     # Only reached when a new snapshot was written, so this runs at most once
     # per hour rather than on every task launch. Pruning is automatic because a
@@ -8784,6 +8829,7 @@ def run(
             "intraday_days": config.backup_retention_intraday_days,
             "intraday_per_day": config.backup_retention_intraday_per_day,
         },
+        config.backup_compression,
     )
 
     # Load tasks from SQLite

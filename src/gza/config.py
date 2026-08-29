@@ -125,6 +125,7 @@ DEFAULT_MERGE_SQUASH_THRESHOLD = 0
 DEFAULT_MAIN_CHECKOUT_ISOLATE = False
 DEFAULT_CLEANUP_DAYS = 30
 DEFAULT_BACKUP_SIZE_WARN_GB = 100
+DEFAULT_BACKUP_COMPRESSION = True
 DEFAULT_BACKUP_RETENTION_HOURLY_HOURS = 24
 DEFAULT_BACKUP_RETENTION_INTRADAY_DAYS = 7
 DEFAULT_BACKUP_RETENTION_INTRADAY_PER_DAY = 4
@@ -170,7 +171,7 @@ VALID_CONFIG_FIELDS = {
     "advance_off_topic_verify_unblock",
     "plan_slice_target_timeout_minutes", "max_failed_closing_review_retries", "max_concurrent",
     "iterate_max_iterations", "watch", "interactive_worktree_dir",
-    "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "backup_size_warn_gb", "backup_retention_hourly_hours",
+    "merge_squash_threshold", "main_checkout_isolate", "cleanup_days", "backup_size_warn_gb", "backup_compression", "backup_retention_hourly_hours",
     "backup_retention_intraday_days", "backup_retention_intraday_per_day",
     "quiet_period_seconds",
     "review_diff_small_threshold",
@@ -295,6 +296,7 @@ LOCAL_OVERRIDE_ALLOWED_SCHEMA: dict[str, object] = {
     "main_checkout_isolate": None,
     "cleanup_days": None,
     "backup_size_warn_gb": None,
+    "backup_compression": None,
     "backup_retention_hourly_hours": None,
     "backup_retention_intraday_days": None,
     "backup_retention_intraday_per_day": None,
@@ -433,6 +435,7 @@ USER_CONFIG_ALLOWED_SCHEMA: dict[str, object] = {
     "main_checkout_isolate": None,
     "cleanup_days": None,
     "backup_size_warn_gb": None,
+    "backup_compression": None,
     "backup_retention_hourly_hours": None,
     "backup_retention_intraday_days": None,
     "backup_retention_intraday_per_day": None,
@@ -1631,6 +1634,7 @@ class Config:
     iterate_max_iterations: int = DEFAULT_ITERATE_MAX_ITERATIONS
     cleanup_days: int = DEFAULT_CLEANUP_DAYS
     backup_size_warn_gb: int = DEFAULT_BACKUP_SIZE_WARN_GB
+    backup_compression: bool = DEFAULT_BACKUP_COMPRESSION
     backup_retention_hourly_hours: int = DEFAULT_BACKUP_RETENTION_HOURLY_HOURS
     backup_retention_intraday_days: int = DEFAULT_BACKUP_RETENTION_INTRADAY_DAYS
     backup_retention_intraday_per_day: int = DEFAULT_BACKUP_RETENTION_INTRADAY_PER_DAY
@@ -2980,6 +2984,9 @@ class Config:
             )
             or 0
         )
+        backup_compression = data.get("backup_compression", DEFAULT_BACKUP_COMPRESSION)
+        if not isinstance(backup_compression, bool):
+            raise ConfigError("'backup_compression' must be a boolean (true/false)")
         backup_retention_hourly_hours = (
             _validate_non_negative_int_field(
                 data.get("backup_retention_hourly_hours", DEFAULT_BACKUP_RETENTION_HOURLY_HOURS),
@@ -3334,6 +3341,7 @@ class Config:
             main_checkout_isolate=main_checkout_isolate,
             cleanup_days=cleanup_days,
             backup_size_warn_gb=backup_size_warn_gb,
+            backup_compression=backup_compression,
             backup_retention_hourly_hours=backup_retention_hourly_hours,
             backup_retention_intraday_days=backup_retention_intraday_days,
             backup_retention_intraday_per_day=backup_retention_intraday_per_day,
