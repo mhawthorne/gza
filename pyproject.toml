@@ -24,6 +24,7 @@ classifiers = [
 dependencies = [
     "pyyaml>=6.0",
     "rich>=13.0",
+    "zstandard>=0.22",
 ]
 
 [project.urls]

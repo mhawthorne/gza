@@ -45,6 +45,7 @@ from gza.review_verify_state import (
     latest_verify_result_for_epoch,
     persist_verify_gate_artifact,
 )
+from gza import runner
 from gza.runner import (
     BACKUP_DIR,
     BRANCH_UNPUSHABLE_FAILURE_REASON,
@@ -9402,7 +9403,7 @@ class TestBackupDatabase:
 
         from datetime import datetime
         hour_stamp = datetime.now().strftime("%Y%m%d%H")
-        backup_file = backup_dir / f"gza-{hour_stamp}.db"
+        backup_file = backup_dir / f"gza-{hour_stamp}.db.zst"
         assert backup_file.exists()
         assert backup_file.stat().st_size > 0
 
@@ -9457,8 +9458,11 @@ class TestBackupDatabase:
         backup_database(db_path, tmp_path)
 
         hour_stamp = datetime.now().strftime("%Y%m%d%H")
-        backup_path = tmp_path / BACKUP_DIR / f"gza-{hour_stamp}.db"
-        assert backup_path.exists()
+        packed_path = tmp_path / BACKUP_DIR / f"gza-{hour_stamp}.db.zst"
+        assert packed_path.exists()
+
+        backup_path = tmp_path / "restored.db"
+        runner.decompress_backup(packed_path, backup_path)
 
         backup_conn = sqlite3.connect(str(backup_path))
         rows = backup_conn.execute("SELECT id, name FROM items").fetchall()
@@ -9483,7 +9487,7 @@ class TestBackupDatabase:
         backup_database(shared_db, project_dir)
 
         hour_stamp = datetime.now().strftime("%Y%m%d%H")
-        shared_backup = shared_db.parent / "backups" / f"gza-{hour_stamp}.db"
+        shared_backup = shared_db.parent / "backups" / f"gza-{hour_stamp}.db.zst"
         project_backup_dir = project_dir / BACKUP_DIR
 
         assert shared_backup.exists()
@@ -26130,3 +26134,182 @@ def test_completion_guard_fails_closed_when_verify_fix_worktree_is_unresolved(
     assert can_complete is False
     assert "Cannot resolve managed verify_fix worktree" in capsys.readouterr().out
     run_verify.assert_not_called()
+
+
+def test_check_backup_dir_size_under_threshold(tmp_path):
+    (tmp_path / "gza-2026010100.db").write_bytes(b"x" * 1024)
+    assert runner.check_backup_dir_size(tmp_path, 1) is None
+
+
+def test_check_backup_dir_size_ignores_non_numeric_threshold(tmp_path):
+    assert runner.check_backup_dir_size(tmp_path, object()) is None
+
+
+def test_check_backup_dir_size_over_threshold(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "backup_dir_size_bytes", lambda _p: 2 * 1024**3)
+    warning = runner.check_backup_dir_size(tmp_path, 1)
+    assert warning is not None
+    assert "backup_size_warn_gb" in warning
+    assert str(tmp_path) in warning
+
+
+def test_check_backup_dir_size_disabled_by_zero(tmp_path):
+    (tmp_path / "gza-2026010100.db").write_bytes(b"x" * 4096)
+    assert runner.check_backup_dir_size(tmp_path, 0) is None
+
+
+def test_check_backup_dir_size_missing_dir(tmp_path):
+    assert runner.check_backup_dir_size(tmp_path / "nope", 1) is None
+
+
+def test_resolve_backup_dir_local_db(tmp_path):
+    db = tmp_path / ".gza" / "gza.db"
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b"")
+    assert runner.resolve_backup_dir(db, tmp_path) == tmp_path / ".gza/backups"
+
+
+def test_resolve_backup_dir_external_db(tmp_path):
+    db = tmp_path / "shared" / "gza.db"
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b"")
+    assert runner.resolve_backup_dir(db, tmp_path / "proj") == db.parent / "backups"
+
+
+def _names(*stamps):
+    return [f"gza-{s}.db" for s in stamps]
+
+
+def test_select_backups_keeps_everything_inside_hourly_window():
+    now = datetime(2026, 8, 28, 12)
+    names = _names("2026082810", "2026082811", "2026082812")
+    assert runner.select_backups_to_prune(
+        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
+    ) == []
+
+
+def test_select_backups_thins_intraday_window_to_per_day_quota():
+    now = datetime(2026, 8, 28, 12)
+    # Three snapshots inside one 6h bucket, 3 days back: only the newest survives.
+    names = _names("2026082500", "2026082501", "2026082502")
+    prune = runner.select_backups_to_prune(
+        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
+    )
+    assert sorted(prune) == sorted(_names("2026082500", "2026082501"))
+
+
+def test_select_backups_keeps_one_per_day_beyond_intraday_window():
+    now = datetime(2026, 8, 28, 12)
+    names = _names("2026080100", "2026080106", "2026080112", "2026080218")
+    prune = runner.select_backups_to_prune(
+        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
+    )
+    # One survivor per day; Aug 1 loses two of its three.
+    assert len(prune) == 2
+    assert "gza-2026080218.db" not in prune
+
+
+def test_select_backups_never_prunes_unparseable_names():
+    now = datetime(2026, 8, 28, 12)
+    names = ["notes.txt", "gza-backup.db", "gza-2026010100.db", "gza-2026010101.db"]
+    prune = runner.select_backups_to_prune(
+        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
+    )
+    assert "notes.txt" not in prune
+    assert "gza-backup.db" not in prune
+    assert len(prune) == 1
+
+
+def test_prune_backup_dir_removes_only_selected(tmp_path):
+    for stamp in ("2026010100", "2026010101", "2026010102"):
+        (tmp_path / f"gza-{stamp}.db").write_bytes(b"x")
+    keep = tmp_path / "keep.txt"
+    keep.write_bytes(b"x")
+    removed = runner.prune_backup_dir(
+        tmp_path,
+        hourly_hours=24,
+        intraday_days=7,
+        intraday_per_day=4,
+        now=datetime(2026, 8, 28, 12),
+    )
+    assert len(removed) == 2
+    assert keep.exists()
+    assert len(list(tmp_path.glob("gza-*.db"))) == 1
+
+
+def test_parse_backup_stamp_rejects_bad_names():
+    assert runner.parse_backup_stamp("gza-2026010100.db") == datetime(2026, 1, 1, 0)
+    assert runner.parse_backup_stamp("gza-2026013299.db") is None
+    assert runner.parse_backup_stamp("gza-20260101.db") is None
+
+
+def test_select_backups_prunes_nothing_for_non_numeric_dials():
+    now = datetime(2026, 8, 28, 12)
+    names = _names("2026010100", "2026010101")
+    assert runner.select_backups_to_prune(
+        names, now, hourly_hours=object(), intraday_days=7, intraday_per_day=4
+    ) == []
+
+
+def _sqlite_with_rows(path):
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE t (v TEXT)")
+    conn.executemany("INSERT INTO t VALUES (?)", [("row" * 50,) for _ in range(500)])
+    conn.commit()
+    conn.close()
+
+
+def test_backup_database_writes_compressed_snapshot(tmp_path):
+    db = tmp_path / ".gza" / "gza.db"
+    db.parent.mkdir(parents=True)
+    _sqlite_with_rows(db)
+    runner.backup_database(db, tmp_path)
+    made = list((tmp_path / ".gza" / "backups").glob("gza-*.db.zst"))
+    assert len(made) == 1
+    # No staging file left behind.
+    assert not list((tmp_path / ".gza" / "backups").glob(".*tmp"))
+
+
+def test_backup_database_roundtrips_through_decompress(tmp_path):
+    db = tmp_path / ".gza" / "gza.db"
+    db.parent.mkdir(parents=True)
+    _sqlite_with_rows(db)
+    runner.backup_database(db, tmp_path)
+    packed = next((tmp_path / ".gza" / "backups").glob("gza-*.db.zst"))
+    restored = tmp_path / "restored.db"
+    runner.decompress_backup(packed, restored)
+    conn = sqlite3.connect(str(restored))
+    assert conn.execute("SELECT count(*) FROM t").fetchone()[0] == 500
+    conn.close()
+
+
+def test_backup_database_skips_hour_already_stored_uncompressed(tmp_path):
+    db = tmp_path / ".gza" / "gza.db"
+    db.parent.mkdir(parents=True)
+    _sqlite_with_rows(db)
+    backups = tmp_path / ".gza" / "backups"
+    backups.mkdir(parents=True)
+    stamp = datetime.now().strftime("%Y%m%d%H")
+    (backups / f"gza-{stamp}.db").write_bytes(b"existing")
+    runner.backup_database(db, tmp_path)
+    assert list(backups.glob("gza-*.db.zst")) == []
+
+
+def test_backup_database_uncompressed_when_disabled(tmp_path):
+    db = tmp_path / ".gza" / "gza.db"
+    db.parent.mkdir(parents=True)
+    _sqlite_with_rows(db)
+    runner.backup_database(db, tmp_path, compress=False)
+    backups = tmp_path / ".gza" / "backups"
+    assert len(list(backups.glob("gza-*.db"))) == 1
+    assert list(backups.glob("*.zst")) == []
+
+
+def test_select_backups_handles_compressed_names():
+    now = datetime(2026, 8, 28, 12)
+    names = ["gza-2026010100.db.zst", "gza-2026010101.db.zst"]
+    prune = runner.select_backups_to_prune(
+        names, now, hourly_hours=24, intraday_days=7, intraday_per_day=4
+    )
+    assert len(prune) == 1
+    assert prune[0].endswith(".db.zst")

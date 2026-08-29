@@ -2829,8 +2829,33 @@ def cmd_clean(args: argparse.Namespace) -> int:
 
     # 4. Clean up old backup files
     if args.backups or no_scope:
-        backups_dir = config.project_dir / ".gza" / "backups"
-        if backups_dir.exists():
+        from gza.runner import resolve_backup_dir, select_backups_to_prune
+
+        backups_dir = resolve_backup_dir(config.db_path, config.project_dir)
+        if getattr(args, "roll", False) and backups_dir.exists():
+            # Tiered layout: keep recent hours, thin the last week, one per day
+            # beyond that. Keyed on the filename stamp, not mtime.
+            doomed = set(
+                select_backups_to_prune(
+                    [f.name for f in backups_dir.iterdir() if f.is_file()],
+                    datetime.now(),
+                    hourly_hours=config.backup_retention_hourly_hours,
+                    intraday_days=config.backup_retention_intraday_days,
+                    intraday_per_day=config.backup_retention_intraday_per_day,
+                )
+            )
+            for backup_file in backups_dir.iterdir():
+                if backup_file.name not in doomed:
+                    continue
+                if args.dry_run:
+                    deleted_backups.append(backup_file.name)
+                else:
+                    try:
+                        backup_file.unlink()
+                        deleted_backups.append(backup_file.name)
+                    except OSError as e:
+                        errors.append((backup_file.name, e))
+        elif backups_dir.exists():
             for backup_file in backups_dir.iterdir():
                 if backup_file.is_file():
                     if backup_file.stat().st_mtime < cutoff_timestamp:
@@ -2883,6 +2908,11 @@ def cmd_clean(args: argparse.Namespace) -> int:
             print(f"Backups cleaned: {len(deleted_backups)}")
         else:
             print("Backups: nothing to clean")
+        from gza.runner import check_backup_dir_size
+
+        size_warning = check_backup_dir_size(backups_dir, config.backup_size_warn_gb)
+        if size_warning:
+            print(f"  warning: {size_warning}")
         print()
 
     # Report errors
@@ -3112,7 +3142,9 @@ def _clean_archive(config: Config, args: argparse.Namespace) -> int:
 
     # Delete old backups
     if args.backups or no_scope:
-        backups_dir = config.project_dir / ".gza" / "backups"
+        from gza.runner import resolve_backup_dir
+
+        backups_dir = resolve_backup_dir(config.db_path, config.project_dir)
         if backups_dir.exists():
             for backup_file in backups_dir.iterdir():
                 if backup_file.is_file():

@@ -84,6 +84,36 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("claude_args", "list[str]", None, "Deprecated legacy alias for `claude.args`."),
     ConfigKeySpec("cleanup_days", "int", 30, "Default retention window for `gza clean`."),
     ConfigKeySpec(
+        "backup_size_warn_gb",
+        "int",
+        100,
+        "Warn when database backups exceed this many GB (0 disables).",
+    ),
+    ConfigKeySpec(
+        "backup_compression",
+        "bool",
+        True,
+        "Compress database backups with zstd (~8x smaller).",
+    ),
+    ConfigKeySpec(
+        "backup_retention_hourly_hours",
+        "int",
+        24,
+        "Keep every database backup newer than this many hours.",
+    ),
+    ConfigKeySpec(
+        "backup_retention_intraday_days",
+        "int",
+        7,
+        "Thin backups to `backup_retention_intraday_per_day` within this many days.",
+    ),
+    ConfigKeySpec(
+        "backup_retention_intraday_per_day",
+        "int",
+        4,
+        "Backups kept per day inside the intraday window; one per day beyond it.",
+    ),
+    ConfigKeySpec(
         "quiet_period_seconds",
         "int",
         300,
