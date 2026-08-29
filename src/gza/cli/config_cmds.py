@@ -2832,9 +2832,10 @@ def cmd_clean(args: argparse.Namespace) -> int:
         from gza.runner import resolve_backup_dir, select_backups_to_prune
 
         backups_dir = resolve_backup_dir(config.db_path, config.project_dir)
-        if getattr(args, "roll", False) and backups_dir.exists():
-            # Tiered layout: keep recent hours, thin the last week, one per day
-            # beyond that. Keyed on the filename stamp, not mtime.
+        if not getattr(args, "flat", False) and backups_dir.exists():
+            # Tiered layout is the default: keep recent hours, thin the last
+            # week, one per day beyond that. Keyed on the filename stamp, not
+            # mtime. --flat restores the old age-only cutoff.
             doomed = set(
                 select_backups_to_prune(
                     [f.name for f in backups_dir.iterdir() if f.is_file()],

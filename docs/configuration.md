@@ -1607,7 +1607,7 @@ gza clean [options]
 | `--workers` | Only clean up stale worker metadata and startup logs |
 | `--logs` | Only clean up old log files (conversation `.log` and paired `.ops.jsonl` siblings together) and live task artifact files; archived artifacts are left for `--purge` |
 | `--backups` | Only clean up old backup files |
-| `--roll` | Roll backups to the tiered retention layout instead of a flat age cutoff |
+| `--flat` | Prune backups by a flat `--days` age cutoff instead of the default tiered retention layout |
 | `--days N` | Remove items older than N days (default: from config cleanup_days, or 30) |
 | `--keep-unmerged` | Keep logs and task artifacts for tasks that are still unmerged |
 | `--archive` | Archive old log, live task artifact, and worker files instead of deleting; already archived artifacts are skipped |
