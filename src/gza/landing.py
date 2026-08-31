@@ -1439,7 +1439,8 @@ def _verify_tree_fingerprint(metadata: dict[str, Any] | None) -> str | None:
         normalized_value = _normalize_optional_nonblank_ref(value) if isinstance(value, str) else None
         if _aggregate_tree_fingerprint_is_complete(aggregate) and normalized_value is not None:
             return normalized_value
-        return None
+        if _aggregate_details_is_cross_project(aggregate):
+            return None
     value = metadata.get("tree_fingerprint")
     normalized_value = _normalize_optional_nonblank_ref(value) if isinstance(value, str) else None
     if normalized_value is not None:
@@ -1451,6 +1452,15 @@ def _verify_tree_fingerprint(metadata: dict[str, Any] | None) -> str | None:
         if normalized_value is not None:
             return normalized_value
     return None
+
+
+def _aggregate_details_is_cross_project(aggregate: dict[str, Any]) -> bool:
+    return (
+        isinstance(aggregate.get("scopes"), list)
+        or "runnable_count" in aggregate
+        or "tree_fingerprint_complete" in aggregate
+        or "tree_fingerprint_contradictory" in aggregate
+    )
 
 
 def _aggregate_tree_fingerprint_is_complete(aggregate: dict[str, Any]) -> bool:

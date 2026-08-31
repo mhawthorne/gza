@@ -10466,6 +10466,25 @@ class SqliteTaskStore:
                 ).fetchall()
         return [artifact for row in rows if (artifact := self._row_to_task_artifact(row)) is not None]
 
+    def list_recent_artifacts(self, *, kind: str, limit: int = 25) -> list[TaskArtifact]:
+        """Return recent artifacts of one kind across this project, newest first."""
+        if not self.supports_task_artifacts():
+            return []
+        if limit < 1:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM task_artifacts
+                WHERE project_id = ? AND kind = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (self._project_id, kind, limit),
+            ).fetchall()
+        return [artifact for row in rows if (artifact := self._row_to_task_artifact(row)) is not None]
+
     def get_artifact(self, artifact_id: int, *, task_id: str | None = None) -> TaskArtifact | None:
         """Return one artifact by id, optionally scoped to a task."""
         if not self.supports_task_artifacts():

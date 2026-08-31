@@ -66,12 +66,12 @@ from ..runner import (
     _persist_review_verify_result,
     _project_boundary,
     _resolve_review_verify_base_sha,
-    _resolve_review_verify_timeout_settings,
     _run_lifecycle_verify,
     _run_review_verify_command,
     _run_review_verify_commands_for_projects,
     _verify_fix_completion_worktree_path,
     _worktree_execution_dir,
+    resolve_lifecycle_verify_timeout_settings,
 )
 from ..runtime_context import RuntimeExecutionContext, normalize_subprocess_env
 from ..verify_fix_outcome import (
@@ -1339,12 +1339,16 @@ def _execute_verify_gate(
         )
 
     try:
-        timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(context.config)
+        timeout_seconds, timeout_grace_seconds = resolve_lifecycle_verify_timeout_settings(
+            context.config,
+            context.store,
+        )
         provider_cwd = _worktree_execution_dir(worktree_git.repo_dir, _project_boundary(context.config))
         reviewed_base_sha = _resolve_review_verify_base_sha(worktree_git, worktree_git.default_branch())
         heartbeat_for_phase = context.heartbeat_for_lifecycle_phase
         execution = _run_lifecycle_verify(
             config=context.config,
+            store=context.store,
             task=subject_task,
             worktree_git=worktree_git,
             worktree_path=worktree_git.repo_dir,
@@ -2027,7 +2031,10 @@ def _execute_recover_verify_only_noop_review(
         return _persist_attention(message, outcome_kind="setup_failure")
 
     try:
-        timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(context.config)
+        timeout_seconds, timeout_grace_seconds = resolve_lifecycle_verify_timeout_settings(
+            context.config,
+            context.store,
+        )
         provider_cwd = _worktree_execution_dir(worktree_git.repo_dir, _project_boundary(context.config))
         verify_command = (
             str(context.config.verify_command).strip()
@@ -2062,6 +2069,7 @@ def _execute_recover_verify_only_noop_review(
             elif task_is_cross_project(noop_improve_task, context.config):
                 cross_project_verify = _run_review_verify_commands_for_projects(
                     config=context.config,
+                    store=context.store,
                     task=noop_improve_task,
                     worktree_git=worktree_git,
                     worktree_path=worktree_git.repo_dir,

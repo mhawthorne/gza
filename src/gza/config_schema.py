@@ -241,7 +241,12 @@ CONFIG_KEY_REGISTRY: tuple[ConfigKeySpec, ...] = (
     ConfigKeySpec("code_task_diff_timeout_large_minutes", "int", 45, "Scaled timeout applied to code tasks at or above the large diff threshold."),
     ConfigKeySpec("code_task_diff_timeout_cap_minutes", "int", 45, "Hard maximum runtime budget for code tasks after base timeout resolution and diff-size scaling."),
     ConfigKeySpec("review_context_file_limit", "int", 12, "Max changed files included in large review context excerpts."),
-    ConfigKeySpec("autonomous_verify_timeout_seconds", "int", 120, "Timeout in seconds for lifecycle/automation-initiated verify_command runs."),
+    ConfigKeySpec(
+        "autonomous_verify_timeout_seconds",
+        "int",
+        120,
+        "Configured timeout floor in seconds for lifecycle/automation-initiated verify_command runs. Recent full-suite observations may derive a larger effective timeout for lifecycle gates.",
+    ),
     ConfigKeySpec(
         "review_verify_timeout_grace_seconds",
         "float",

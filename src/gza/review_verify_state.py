@@ -254,12 +254,22 @@ def _verify_gate_tree_fingerprint(
         value = aggregate_details.get("tree_fingerprint")
         if _aggregate_tree_fingerprint_is_complete(aggregate_details) and isinstance(value, str) and value:
             return value
-        return None
+        if _aggregate_details_is_cross_project(aggregate_details):
+            return None
     if isinstance(provenance, dict):
         value = provenance.get("tree_fingerprint")
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def _aggregate_details_is_cross_project(aggregate_details: dict[str, Any]) -> bool:
+    return (
+        isinstance(aggregate_details.get("scopes"), list)
+        or "runnable_count" in aggregate_details
+        or "tree_fingerprint_complete" in aggregate_details
+        or "tree_fingerprint_contradictory" in aggregate_details
+    )
 
 
 def _aggregate_tree_fingerprint_is_complete(aggregate_details: dict[str, Any]) -> bool:

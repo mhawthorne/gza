@@ -18,6 +18,7 @@ from .db import SqliteTaskStore, Task
 from .git import Git, GitError
 from .off_topic_verify import extract_pytest_failing_nodeids
 from .runner import (
+    LifecycleVerifyBudgetError,
     LongPhaseHeartbeat,
     _capture_review_verify_result,
     _compute_tree_fingerprint,
@@ -26,6 +27,7 @@ from .runner import (
     _make_review_verify_result,
     _resolve_review_verify_timeout_settings,
     _run_review_verify_command,
+    resolve_lifecycle_verify_timeout_settings,
 )
 
 MAIN_INTEGRATION_VERIFY_PROMPT = "System alert: local main integration verify"
@@ -864,6 +866,7 @@ def _current_verify_environment_identity(
 
 def _current_gate_identity(
     config: Config,
+    store: SqliteTaskStore | None = None,
     *,
     runner_class: Literal["host", "container"],
 ) -> MainIntegrationVerifyGateIdentity:
@@ -878,7 +881,14 @@ def _current_gate_identity(
             environment_identity=None,
         )
 
-    timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(config)
+    if store is None:
+        timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(config)
+    else:
+        timeout_seconds, timeout_grace_seconds = resolve_lifecycle_verify_timeout_settings(
+            config,
+            store,
+            verify_command=verify_command,
+        )
     return MainIntegrationVerifyGateIdentity(
         gate_enabled=True,
         verify_command=verify_command,
@@ -1221,7 +1231,19 @@ def run_main_integration_verify(
     if resolved_head_sha is _HEAD_SHA_UNSET:
         resolved_head_sha = git.rev_parse_if_exists("HEAD")
     head_sha = _coerce_optional_str(resolved_head_sha)
-    gate = _current_gate_identity(config, runner_class=runner_class)
+    try:
+        gate = _current_gate_identity(config, store, runner_class=runner_class)
+        budget_resolution_failure: LifecycleVerifyBudgetError | None = None
+    except LifecycleVerifyBudgetError as exc:
+        timeout_grace_seconds = _resolve_review_verify_timeout_settings(config)[1]
+        gate = MainIntegrationVerifyGateIdentity(
+            gate_enabled=True,
+            verify_command=normalized_verify_command(config),
+            verify_timeout_seconds=None,
+            verify_timeout_grace_seconds=timeout_grace_seconds,
+            environment_identity=_current_verify_environment_identity(runner_class=runner_class),
+        )
+        budget_resolution_failure = exc
     verify_command = gate.verify_command or ""
     gate_enabled = gate.gate_enabled
 
@@ -1235,6 +1257,17 @@ def run_main_integration_verify(
             reviewed_head_sha=head_sha,
             working_directory=str(git.repo_dir),
             failure="verify_command is not configured",
+        )
+    elif budget_resolution_failure is not None:
+        result = _make_review_verify_result(
+            verify_command,
+            status="unavailable",
+            exit_status="budget unavailable",
+            captured_at=captured_at,
+            reviewed_branch=git.current_branch(),
+            reviewed_head_sha=head_sha,
+            working_directory=str(git.repo_dir),
+            failure=f"could not resolve lifecycle verify budget for local main integration verify: {budget_resolution_failure}",
         )
     else:
         assert gate.verify_timeout_seconds is not None
@@ -1470,9 +1503,12 @@ def _run_main_integration_verify_with_red_reruns(
     heartbeat_interval_seconds: int | None = None,
     heartbeat_for_attempt: Callable[[int], LongPhaseHeartbeat | None] | None = None,
 ) -> tuple[MainIntegrationVerifyState, MainIntegrationVerifyRemediation | None, int]:
-    current_gate = _current_gate_identity(config, runner_class=runner_class)
-    gated_initial_run_start = on_initial_run_start if current_gate.gate_enabled else None
-    gated_heartbeat_for_attempt = heartbeat_for_attempt if current_gate.gate_enabled else None
+    try:
+        gate_enabled = _current_gate_identity(config, store, runner_class=runner_class).gate_enabled
+    except LifecycleVerifyBudgetError:
+        gate_enabled = verify_gate_enabled(config)
+    gated_initial_run_start = on_initial_run_start if gate_enabled else None
+    gated_heartbeat_for_attempt = heartbeat_for_attempt if gate_enabled else None
     state, remediation, remediation_source_state, verify_runs = _run_integration_verify_with_red_reruns(
         lambda run_reason, attempt: run_main_integration_verify(
             config,
@@ -1534,7 +1570,44 @@ def check_main_integration_verify(
         resolved_head_sha = git.rev_parse_if_exists("HEAD")
     current_head_sha = _coerce_optional_str(resolved_head_sha)
     current_tree_fingerprint = _compute_tree_fingerprint(git, head_sha=current_head_sha)
-    current_gate = _current_gate_identity(config, runner_class=runner_class)
+    try:
+        current_gate = _current_gate_identity(config, store, runner_class=runner_class)
+    except LifecycleVerifyBudgetError:
+        refreshed, remediation, verify_runs = _run_main_integration_verify_with_red_reruns(
+            config,
+            store,
+            git,
+            reason=reason,
+            red_reruns=red_reruns,
+            runner_class=runner_class,
+            resolved_head_sha=resolved_head_sha,
+            env=env,
+            on_initial_run_start=on_initial_run_start,
+            on_red_rerun_start=on_red_rerun_start,
+            heartbeat_threshold_seconds=heartbeat_threshold_seconds,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            heartbeat_for_attempt=heartbeat_for_attempt,
+        )
+        return MainIntegrationVerifyCheck(
+            state=refreshed,
+            performed_verify=True,
+            current_tree_fingerprint=current_tree_fingerprint,
+            is_current=True,
+            merges_halted=_verify_result_halts_merges(
+                status=refreshed.verify_status,
+                gate_enabled=refreshed.gate_enabled,
+                exit_status=refreshed.verify_exit_status,
+            ),
+            needs_attention=_verify_result_needs_attention(
+                status=refreshed.verify_status,
+                gate_enabled=refreshed.gate_enabled,
+                exit_status=refreshed.verify_exit_status,
+                alert_message=refreshed.alert_message,
+            ),
+            remediation=remediation,
+            verify_runs=verify_runs,
+            resolved_signature=refreshed.failure_signature,
+        )
     state = load_main_integration_verify_state(store)
     prior_red_signature = (
         _verify_failure_signature(
@@ -1661,7 +1734,7 @@ def inspect_main_integration_verify_checkpoint(
         resolved_head_sha = git.rev_parse_if_exists("HEAD")
     current_head_sha = _coerce_optional_str(resolved_head_sha)
     current_tree_fingerprint = _compute_tree_fingerprint(git, head_sha=current_head_sha)
-    current_gate = _current_gate_identity(config, runner_class=runner_class)
+    current_gate = _current_gate_identity(config, store, runner_class=runner_class)
     state = load_main_integration_verify_state(store)
     checkpoint_is_current = state is not None and _checkpoint_is_current(
         state,
@@ -1881,7 +1954,7 @@ def current_main_integration_verify_alert_with_target_proof(
     needs_non_red_attention = main_verify_state_needs_non_red_attention(state)
     if not halts_merges and not needs_non_red_attention:
         return None
-    if not _gate_identity_matches(state, _current_gate_identity(config, runner_class=runner_class)):
+    if not _gate_identity_matches(state, _current_gate_identity(config, store, runner_class=runner_class)):
         return None
     default_branch = git.default_branch()
     target_proof = resolve_main_integration_verify_target_proof(state, git, target_branch=default_branch)

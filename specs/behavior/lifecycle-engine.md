@@ -414,10 +414,20 @@ epoch.
 - Missing or stale verify evidence for the current owner epoch MUST select `verify_gate`
   first. Lifecycle MUST rerun verify before it creates a review for that head.
 - Current red verify evidence before review MUST route into the `verify_fix` lane, not the
-  review/improve lane. Lifecycle MUST create, reuse, run, or wait on one same-branch
-  `verify_fix` task keyed by the exact current verify epoch and implementation owner.
-- If a same-epoch `verify_fix` is already `pending`, lifecycle MUST `run_verify_fix`. If
-  it is already `in_progress`, lifecycle MUST `wait_verify_fix`.
+  review/improve lane, unless it is a budget-only timeout. Lifecycle MUST create, reuse,
+  run, or wait on one same-branch `verify_fix` task keyed by the exact current verify
+  epoch and implementation owner.
+- If the current verify evidence has `failure_origin == "timeout"` and persisted phase
+  diagnostics show no failed phase, lifecycle MUST park with
+  `verify-budget-exceeded` instead of creating a `verify_fix`. The gate remains
+  blocking; this only classifies the condition as wall-clock budget exhaustion rather
+  than a code defect. The attention payload SHOULD include completed phase names and
+  known not-started phase names when available. This classification MUST happen before
+  looking up or acting on any existing same-epoch `verify_fix`; existing task rows are
+  left untouched.
+- If a same-epoch `verify_fix` is already `pending` and the current evidence is not a
+  budget-only timeout, lifecycle MUST `run_verify_fix`. If it is already `in_progress`,
+  lifecycle MUST `wait_verify_fix`.
 - If one same-epoch `verify_fix` attempt completed without source changes and the current
   red verify evidence is structurally classified as timeout-origin, lifecycle MUST rerun
   verification for the exact same head once before treating that `verify_fix` as
@@ -1302,6 +1312,7 @@ is a spec change. The accompanying human message is free text.
 | `review-freshness-unverified` | needs_discussion | §5 live branch-head probe failed while checking whether a code-changing event made the latest completed review stale |
 | `resolution-review-metadata-invalid` | needs_discussion | §5 required resolution-review metadata is still missing, malformed, or inconsistent after live SHA re-derivation |
 | `closing-review-needs-manual-refresh` † | needs_discussion | §6/§8 closing-review requirement, manual refresh |
+| `verify-budget-exceeded` | needs_discussion | §5a verify gate timed out with no failed phase in persisted phase diagnostics |
 | `verify-failed-needs-fix` | needs_discussion | §5a verify gate is red before review can proceed, but lifecycle cannot safely create/continue the current `verify_fix` lane |
 | `verify-fix-failed` | needs_discussion | §5a current verify gate is still red after one completed same-epoch `verify_fix` |
 | `verify-unavailable` | needs_discussion | §5a verify gate is unavailable and lifecycle cannot safely route through `verify_fix` |

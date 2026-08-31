@@ -41,7 +41,7 @@ from gza.main_integration_verify import (
     resolve_main_integration_verify_target_proof,
     run_main_integration_verify,
 )
-from gza.runner import _compute_tree_fingerprint, _make_review_verify_result
+from gza.runner import VERIFY_GATE_ARTIFACT_KIND, _compute_tree_fingerprint, _make_review_verify_result
 from tests.cli.conftest import make_store, setup_config
 
 
@@ -90,6 +90,49 @@ def _current_identity(
         python_implementation=platform.python_implementation(),
         python_version=f"{sys.version_info.major}.{sys.version_info.minor}",
         python_executable_family=python_executable_family,
+    )
+
+
+def _store_full_suite_verify_observation(
+    store: SqliteTaskStore,
+    config: Config,
+    *,
+    duration_seconds: float,
+    command: str = "./bin/tests",
+    created_at: datetime = datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+) -> None:
+    owner = store.add("completed verify observation", task_type="implement")
+    assert owner.id is not None
+    store.add_artifact(
+        owner.id,
+        kind=VERIFY_GATE_ARTIFACT_KIND,
+        path=f".gza/artifacts/{owner.id}-verify-gate.json",
+        byte_size=2,
+        sha256="0" * 64,
+        created_at=created_at,
+        command=command,
+        status="passed",
+        exit_status="0",
+        metadata={
+            "schema_version": 1,
+            "result": {"command": command, "status": "passed"},
+            "verify_epoch": {"verify_command": command, "verify_timeout_seconds": 120},
+            "aggregate_details": {
+                "phase_results": [
+                    {"name": "ruff", "status": "passed", "duration_seconds": 1.0},
+                    {"name": "ty", "status": "passed", "duration_seconds": 1.0},
+                    {"name": "mypy", "status": "passed", "duration_seconds": 8.0},
+                    {"name": "checks", "status": "passed", "duration_seconds": 5.0},
+                    {"name": "unit", "status": "passed", "duration_seconds": duration_seconds - 25.0},
+                    {"name": "functional", "status": "passed", "duration_seconds": 10.0},
+                ],
+                "started_phase_names": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                "completed_phase_names": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                "failed_phase_names": [],
+                "expected_phase_names": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                "not_started_phase_names": [],
+            },
+        },
     )
 
 
@@ -1723,6 +1766,128 @@ def test_check_main_integration_verify_does_not_emit_initial_start_for_cached_ch
     run_verify.assert_not_called()
     assert check.performed_verify is False
     assert starts == []
+
+
+def test_run_main_integration_verify_uses_derived_lifecycle_timeout_in_identity_and_execution(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    _store_full_suite_verify_observation(store, config, duration_seconds=160.0)
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+    captured: dict[str, object] = {}
+
+    def fake_run_verify(command: str, **kwargs: object):
+        captured["timeout_seconds"] = kwargs["timeout_seconds"]
+        captured["timeout_grace_seconds"] = kwargs["timeout_grace_seconds"]
+        return _make_review_verify_result(
+            command,
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch=str(kwargs["reviewed_branch"]),
+            reviewed_head_sha=str(kwargs["reviewed_head_sha"]),
+            working_directory=str(kwargs["cwd"]),
+            output="passed\nTree fingerprint: fp-derived\n",
+        )
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-derived"),
+        patch("gza.main_integration_verify._run_review_verify_command", side_effect=fake_run_verify) as run_verify,
+    ):
+        state = run_main_integration_verify(config, store, git, reason="unit-test-derived-budget")
+
+    run_verify.assert_called_once()
+    assert captured["timeout_seconds"] == 230
+    assert captured["timeout_grace_seconds"] == 5.0
+    assert state.verify_timeout_seconds == 230
+    assert state.verify_timeout_grace_seconds == 5.0
+    artifact = store.list_artifacts(state.task.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+    assert artifact.metadata["verify_epoch"]["verify_timeout_seconds"] == 230
+
+
+def test_check_main_integration_verify_blocks_when_lifecycle_budget_store_read_fails(tmp_path, monkeypatch) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+
+    def fail_list_recent_artifacts(*_args: object, **_kwargs: object):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(store, "list_recent_artifacts", fail_list_recent_artifacts)
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-budget-unavailable"),
+        patch("gza.main_integration_verify._run_review_verify_command") as run_verify,
+    ):
+        check = check_main_integration_verify(config, store, git, reason="unit-test-budget-unavailable")
+
+    run_verify.assert_not_called()
+    assert check.performed_verify is True
+    assert check.merges_halted is True
+    assert check.needs_attention is True
+    assert check.state.verify_status == "unavailable"
+    assert check.state.verify_exit_status == "budget unavailable"
+    assert check.state.verify_timeout_seconds is None
+    assert "could not resolve lifecycle verify budget" in (check.state.failure or "")
+    assert "database is locked" in (check.state.failure or "")
+
+
+def test_check_main_integration_verify_treats_changed_derived_budget_as_stale_identity(tmp_path) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    _seed_main_verify_task(
+        store,
+        verify_status="passed",
+        verify_exit_status="0",
+        failure="",
+        alert_message="",
+    )
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+    config.main_integration_verify_red_ttl_minutes = 30
+    _store_full_suite_verify_observation(store, config, duration_seconds=160.0)
+
+    git = MagicMock()
+    git.repo_dir = tmp_path
+    git.current_branch.return_value = "main"
+    git.rev_parse_if_exists.return_value = "abc123"
+    verify_result = _make_review_verify_result(
+        "./bin/tests",
+        status="passed",
+        exit_status="0",
+        captured_at=datetime(2026, 8, 29, 12, 10, tzinfo=UTC),
+        reviewed_branch="main",
+        reviewed_head_sha="abc123",
+        working_directory=str(tmp_path),
+        output="passed\nTree fingerprint: fp-verified\n",
+    )
+
+    with (
+        patch("gza.main_integration_verify._compute_tree_fingerprint", return_value="fp-verified"),
+        patch("gza.main_integration_verify._run_review_verify_command", return_value=verify_result) as run_verify,
+    ):
+        check = check_main_integration_verify(config, store, git, reason="unit-test-derived-budget-drift")
+
+    run_verify.assert_called_once()
+    assert check.performed_verify is True
+    assert check.state.verify_timeout_seconds == 230
 
 
 def test_compute_tree_fingerprint_explicit_missing_head_is_not_reusable_for_clean_target(tmp_path) -> None:

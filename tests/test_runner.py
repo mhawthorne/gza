@@ -59,7 +59,10 @@ from gza.runner import (
     CompletedCodeTaskPrPublicationOutcome,
     CrossProjectReviewVerifyResult,
     ExtractionSeedResult,
+    LifecycleVerifyBudgetError,
+    LifecycleVerifyExecution,
     LongPhaseProgress,
+    PHASE_EVIDENCE_INDETERMINATE,
     ProjectBoundary,
     ProjectReviewVerifyResult,
     ResolvedTimeoutBudget,
@@ -88,6 +91,7 @@ from gza.runner import (
     _get_task_output,
     _LongPhaseHeartbeatState,
     _monitored_review_verify_process_pipe_drain,
+    _persist_lifecycle_verify_execution,
     _persist_review_blocker_adjudication_for_completed_task,
     _post_complete_code_task,
     _prepare_docker_worktree_git_metadata,
@@ -117,7 +121,9 @@ from gza.runner import (
     open_task_startup_log,
     post_review_to_pr,
     rename_startup_log_to_slug,
+    resolve_lifecycle_verify_timeout_settings,
     run,
+    validate_verify_phase_evidence_from_metadata,
     write_execution_provenance_event,
     write_log_entry,
     write_ops_entry,
@@ -1910,6 +1916,985 @@ class TestReviewContextFromChain:
         assert lookup.result is not None
         assert lookup.result.failure_origin == expected_origin
 
+    def test_single_project_verify_artifact_records_completed_and_not_started_phases(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/verify"
+        store.update(impl)
+        output = "\n".join(
+            [
+                "gza-verify phase=start name=ruff",
+                "gza-verify phase=passed name=ruff duration_seconds=1.4",
+                "gza-verify phase=start name=ty",
+                "gza-verify phase=passed name=ty duration_seconds=1.4",
+                "gza-verify phase=start name=mypy",
+                "gza-verify phase=passed name=mypy duration_seconds=25.6",
+                "gza-verify phase=start name=checks",
+                "gza-verify phase=passed name=checks duration_seconds=4.9",
+                "gza-verify phase=start name=unit",
+                "gza-verify phase=passed name=unit duration_seconds=558.9",
+                "verify_command timed out after 120s",
+            ]
+        )
+        result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+            failure="verify_command timed out after 120s",
+            output=output,
+            failure_origin="timeout",
+        )
+
+        _persist_lifecycle_verify_execution(
+            config,
+            store,
+            impl,
+            LifecycleVerifyExecution(markdown="verify markdown", aggregate_result=result),
+            producer="test",
+            timeout_seconds=120,
+            timeout_grace_seconds=5.0,
+            artifact_task=impl,
+        )
+
+        artifact = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert artifact.metadata is not None
+        aggregate_details = artifact.metadata["aggregate_details"]
+        assert aggregate_details["completed_phase_names"] == ["ruff", "ty", "mypy", "checks", "unit"]
+        assert aggregate_details["failed_phase_names"] == []
+        assert aggregate_details["not_started_phase_names"] == ["functional"]
+
+    def test_lifecycle_verify_timeout_derives_from_recent_green_full_suite_phases(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+            reviewed_branch="feature/verify",
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+            output="\n".join(
+                [
+                    "gza-verify phase=start name=ruff",
+                    "gza-verify phase=passed name=ruff duration_seconds=2.0",
+                    "gza-verify phase=start name=ty",
+                    "gza-verify phase=passed name=ty duration_seconds=2.0",
+                    "gza-verify phase=start name=mypy",
+                    "gza-verify phase=passed name=mypy duration_seconds=30.0",
+                    "gza-verify phase=start name=checks",
+                    "gza-verify phase=passed name=checks duration_seconds=6.0",
+                    "gza-verify phase=start name=unit",
+                    "gza-verify phase=passed name=unit duration_seconds=500.0",
+                    "gza-verify phase=start name=functional",
+                    "gza-verify phase=passed name=functional duration_seconds=100.0",
+                ]
+            ),
+        )
+        _persist_lifecycle_verify_execution(
+            config,
+            store,
+            impl,
+            LifecycleVerifyExecution(markdown="verify markdown", aggregate_result=result),
+            producer="test",
+            timeout_seconds=120,
+            timeout_grace_seconds=5.0,
+            artifact_task=impl,
+        )
+
+        timeout_seconds, grace_seconds = resolve_lifecycle_verify_timeout_settings(config, store)
+
+        assert timeout_seconds == 830
+        assert grace_seconds == 5.0
+
+    def test_cross_project_verify_artifact_preserves_per_scope_phase_diagnostics(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="(per-project verify_command)",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/cross-verify"
+        store.update(impl)
+        project_results = [
+            ProjectReviewVerifyResult(
+                project=None,
+                scope="services/foo",
+                working_directory="services/foo",
+                result=ReviewVerifyResult(
+                    command="./bin/foo-verify",
+                    status="failed",
+                    exit_status="timed out",
+                    captured_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="head-1",
+                    reviewed_base_sha="base-1",
+                    failure="verify_command timed out after 120s",
+                    failure_origin="timeout",
+                    output="\n".join(
+                        [
+                            "gza-verify phase=start name=ruff",
+                            "gza-verify phase=passed name=ruff duration_seconds=1.0",
+                            "gza-verify phase=start name=unit",
+                            "gza-verify phase=failed name=unit duration_seconds=3.0",
+                        ]
+                    ),
+                ),
+            ),
+            ProjectReviewVerifyResult(
+                project=None,
+                scope="libs/bar",
+                working_directory="libs/bar",
+                result=ReviewVerifyResult(
+                    command="./bin/bar-verify",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 8, 29, 12, 1, tzinfo=UTC),
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="head-1",
+                    reviewed_base_sha="base-1",
+                    output="\n".join(
+                        [
+                            "gza-verify phase=start name=ruff",
+                            "gza-verify phase=passed name=ruff duration_seconds=1.5",
+                        ]
+                    ),
+                ),
+            ),
+        ]
+        aggregate = _aggregate_cross_project_verify_result(
+            command="(per-project verify_command)",
+            captured_at=datetime(2026, 8, 29, 12, 2, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            project_results=project_results,
+        )
+
+        _persist_lifecycle_verify_execution(
+            config,
+            store,
+            impl,
+            LifecycleVerifyExecution(
+                markdown="verify markdown",
+                aggregate_result=aggregate,
+                project_results=tuple(project_results),
+            ),
+            producer="test",
+            timeout_seconds=120,
+            timeout_grace_seconds=5.0,
+            artifact_task=impl,
+        )
+
+        artifact = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert artifact.metadata is not None
+        aggregate_details = artifact.metadata["aggregate_details"]
+        assert aggregate_details["failed_phase_names"] == ["services/foo:unit"]
+        assert aggregate_details["completed_phase_names"] == [
+            "services/foo:ruff",
+            "services/foo:unit",
+            "libs/bar:ruff",
+        ]
+        assert aggregate_details["phase_results"][1] == {
+            "scope": "services/foo",
+            "name": "unit",
+            "status": "failed",
+            "duration_seconds": 3.0,
+        }
+        assert aggregate_details["scopes"][0]["phase_diagnostics"]["failed_phase_names"] == ["unit"]
+        assert aggregate_details["scopes"][1]["phase_diagnostics"]["completed_phase_names"] == ["ruff"]
+
+    def test_cross_project_verify_aggregate_uses_scope_fingerprint_when_last_phase_omits_it(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="(per-project verify_command)",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.branch = "feature/cross-verify"
+        store.update(impl)
+        fingerprint = "a" * 64
+        project_results = tuple(
+            ProjectReviewVerifyResult(
+                project=None,
+                scope=scope,
+                working_directory=scope,
+                result=ReviewVerifyResult(
+                    command="./bin/tests",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 8, 29, 12, index, tzinfo=UTC),
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="head-1",
+                    reviewed_base_sha="base-1",
+                    output="\n".join(
+                        [
+                            "gza-verify phase=start name=unit",
+                            (
+                                "gza-verify phase=passed name=unit duration_seconds=1.0 "
+                                f"tree_fingerprint={fingerprint}"
+                            ),
+                            "gza-verify phase=start name=functional",
+                            "gza-verify phase=passed name=functional duration_seconds=2.0",
+                        ]
+                    ),
+                ),
+                timeout_seconds=120,
+                timeout_grace_seconds=5.0,
+            )
+            for index, scope in enumerate(("services/foo", "libs/bar"))
+        )
+        aggregate = _aggregate_cross_project_verify_result(
+            command="(per-project verify_command)",
+            captured_at=datetime(2026, 8, 29, 12, 2, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            project_results=project_results,
+        )
+
+        _persist_lifecycle_verify_execution(
+            config,
+            store,
+            impl,
+            LifecycleVerifyExecution(
+                markdown="verify markdown",
+                aggregate_result=aggregate,
+                project_results=project_results,
+            ),
+            producer="test",
+            timeout_seconds=120,
+            timeout_grace_seconds=5.0,
+            artifact_task=impl,
+        )
+
+        artifact = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)[0]
+        assert artifact.metadata is not None
+        aggregate_details = artifact.metadata["aggregate_details"]
+        assert aggregate_details["tree_fingerprint_complete"] is True
+        assert aggregate_details["tree_fingerprint"] == fingerprint
+        assert "tree_fingerprint" not in aggregate_details["phase_results"][-1]
+
+    def test_lifecycle_verify_timeout_derives_from_timeout_completed_phase_lower_bound(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+            reviewed_branch="feature/verify",
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+            failure="verify_command timed out after 120s",
+            failure_origin="timeout",
+            output="\n".join(
+                [
+                    "gza-verify phase=start name=ruff",
+                    "gza-verify phase=passed name=ruff duration_seconds=2.0",
+                    "gza-verify phase=start name=unit",
+                    "gza-verify phase=passed name=unit duration_seconds=116.0",
+                ]
+            ),
+        )
+        _persist_lifecycle_verify_execution(
+            config,
+            store,
+            impl,
+            LifecycleVerifyExecution(markdown="verify markdown", aggregate_result=result),
+            producer="test",
+            timeout_seconds=120,
+            timeout_grace_seconds=5.0,
+            artifact_task=impl,
+        )
+
+        timeout_seconds, grace_seconds = resolve_lifecycle_verify_timeout_settings(config, store)
+
+        assert timeout_seconds == 180
+        assert timeout_seconds > config.autonomous_verify_timeout_seconds
+        assert grace_seconds == 5.0
+
+    def test_lifecycle_verify_timeout_uses_persisted_timeout_cap_lower_bound(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        result = ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+            reviewed_branch="feature/verify",
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(tmp_path),
+            failure="verify_command timed out after 600s",
+            failure_origin="timeout",
+            output="\n".join(
+                [
+                    "gza-verify phase=start name=ruff",
+                    "gza-verify phase=passed name=ruff duration_seconds=1.0",
+                ]
+            ),
+        )
+        _persist_lifecycle_verify_execution(
+            config,
+            store,
+            impl,
+            LifecycleVerifyExecution(markdown="verify markdown", aggregate_result=result),
+            producer="test",
+            timeout_seconds=600,
+            timeout_grace_seconds=5.0,
+            artifact_task=impl,
+        )
+
+        timeout_seconds, _grace_seconds = resolve_lifecycle_verify_timeout_settings(config, store)
+
+        assert timeout_seconds > 600
+
+    def test_lifecycle_verify_timeout_requires_timeout_provenance_for_timeout_observation(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        store.add_artifact(
+            impl.id,
+            kind=VERIFY_GATE_ARTIFACT_KIND,
+            path=".gza/artifacts/timeout-missing-provenance.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+            metadata={
+                "schema_version": 1,
+                "result": {"status": "failed", "failure_origin": "timeout"},
+                "verify_epoch": {"verify_command": "./bin/tests"},
+                "aggregate_details": {
+                    "phase_results": [{"name": "ruff", "status": "passed", "duration_seconds": 1.0}],
+                    "started_phase_names": ["ruff"],
+                    "completed_phase_names": ["ruff"],
+                    "failed_phase_names": [],
+                    "expected_phase_names": ["ruff", "ty"],
+                    "not_started_phase_names": ["ty"],
+                },
+            },
+            status="failed",
+        )
+
+        with pytest.raises(LifecycleVerifyBudgetError, match="missing persisted verify_timeout_seconds"):
+            resolve_lifecycle_verify_timeout_settings(config, store)
+
+    def test_lifecycle_verify_timeout_derives_from_completed_phases_before_in_flight_phase(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        metadata = {
+            "schema_version": 1,
+            "result": {"status": "failed", "failure_origin": "timeout"},
+            "verify_epoch": {"verify_command": "./bin/tests", "verify_timeout_seconds": 600},
+            "aggregate_details": {
+                "phase_results": [{"name": "ruff", "status": "passed", "duration_seconds": 1.0}],
+                "started_phase_names": ["ruff", "unit"],
+                "completed_phase_names": ["ruff"],
+                "failed_phase_names": [],
+                "expected_phase_names": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                "not_started_phase_names": ["ty", "mypy", "checks", "functional"],
+            },
+        }
+        store.add_artifact(
+            impl.id,
+            kind=VERIFY_GATE_ARTIFACT_KIND,
+            path=".gza/artifacts/timeout-in-flight.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+            metadata=metadata,
+            status="failed",
+        )
+
+        routing_validation = validate_verify_phase_evidence_from_metadata(metadata)
+        timeout_seconds, _grace_seconds = resolve_lifecycle_verify_timeout_settings(config, store)
+
+        assert routing_validation.state == PHASE_EVIDENCE_INDETERMINATE
+        assert routing_validation.completed_phase_names == ()
+        assert timeout_seconds > config.autonomous_verify_timeout_seconds
+
+    def test_lifecycle_verify_timeout_derives_scoped_observation_before_in_flight_phase(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="foo",
+            verify_command="./bin/foo-verify",
+            autonomous_verify_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        scoped_diagnostics = {
+            "phase_results": [{"name": "unit", "status": "passed", "duration_seconds": 1.0}],
+            "started_phase_names": ["unit", "functional"],
+            "completed_phase_names": ["unit"],
+            "failed_phase_names": [],
+            "expected_phase_names": ["unit", "functional"],
+            "not_started_phase_names": [],
+        }
+        metadata = {
+            "schema_version": 1,
+            "result": {"command": "(per-project verify_command)", "status": "failed", "failure_origin": "timeout"},
+            "verify_epoch": {"verify_command": "(per-project verify_command)"},
+            "aggregate_details": {
+                "phase_results": [{"scope": "services/foo", "name": "unit", "status": "passed", "duration_seconds": 1.0}],
+                "started_phase_names": ["services/foo:unit", "services/foo:functional"],
+                "completed_phase_names": ["services/foo:unit"],
+                "failed_phase_names": [],
+                "expected_phase_names": ["services/foo:unit", "services/foo:functional"],
+                "not_started_phase_names": [],
+                "scopes": [
+                    {
+                        "scope": "services/foo",
+                        "status": "failed",
+                        "failure_origin": "timeout",
+                        "command_identity": "./bin/foo-verify",
+                        "verify_timeout_seconds": 600,
+                        "phase_diagnostics": scoped_diagnostics,
+                    }
+                ],
+            },
+        }
+        store.add_artifact(
+            impl.id,
+            kind=VERIFY_GATE_ARTIFACT_KIND,
+            path=".gza/artifacts/scoped-timeout-in-flight.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+            metadata=metadata,
+            status="failed",
+        )
+
+        routing_validation = validate_verify_phase_evidence_from_metadata(metadata)
+        timeout_seconds, _grace_seconds = resolve_lifecycle_verify_timeout_settings(
+            config,
+            store,
+            scope="services/foo",
+            verify_command="./bin/foo-verify",
+        )
+
+        assert routing_validation.state == PHASE_EVIDENCE_INDETERMINATE
+        assert routing_validation.completed_phase_names == ()
+        assert timeout_seconds > config.autonomous_verify_timeout_seconds
+
+    @pytest.mark.parametrize(
+        "aggregate_details",
+        [
+            {
+                "phase_results": [{"name": "ruff", "status": "passed", "duration_seconds": 700.0}],
+                "started_phase_names": [],
+                "completed_phase_names": ["ruff"],
+                "failed_phase_names": [],
+                "expected_phase_names": ["ruff"],
+                "not_started_phase_names": [],
+            },
+            {
+                "phase_results": [
+                    {"name": "ruff", "status": "passed", "duration_seconds": 350.0},
+                    {"name": "ruff", "status": "passed", "duration_seconds": 350.0},
+                ],
+                "started_phase_names": ["ruff", "ruff"],
+                "completed_phase_names": ["ruff", "ruff"],
+                "failed_phase_names": [],
+                "expected_phase_names": ["ruff", "ruff"],
+                "not_started_phase_names": [],
+            },
+        ],
+    )
+    def test_lifecycle_verify_timeout_rejects_malformed_phase_identities_for_routing_and_budget(
+        self,
+        tmp_path: Path,
+        aggregate_details: dict[str, Any],
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        metadata = {
+            "schema_version": 1,
+            "result": {"status": "failed", "failure_origin": "timeout"},
+            "verify_epoch": {"verify_command": "./bin/tests", "verify_timeout_seconds": 600},
+            "aggregate_details": aggregate_details,
+        }
+        store.add_artifact(
+            impl.id,
+            kind=VERIFY_GATE_ARTIFACT_KIND,
+            path=".gza/artifacts/malformed-timeout.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+            metadata=metadata,
+            status="failed",
+        )
+
+        routing_validation = validate_verify_phase_evidence_from_metadata(metadata)
+        timeout_seconds, _grace_seconds = resolve_lifecycle_verify_timeout_settings(config, store)
+
+        assert routing_validation.state == PHASE_EVIDENCE_INDETERMINATE
+        assert timeout_seconds == config.autonomous_verify_timeout_seconds
+
+    def test_lifecycle_verify_timeout_rejects_malformed_scoped_phase_identities_for_routing_and_budget(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="foo",
+            verify_command="./bin/foo-verify",
+            autonomous_verify_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        metadata = {
+            "schema_version": 1,
+            "result": {"command": "(per-project verify_command)", "status": "failed", "failure_origin": "timeout"},
+            "verify_epoch": {"verify_command": "(per-project verify_command)"},
+            "aggregate_details": {
+                "phase_results": [
+                    {"scope": "services/foo", "name": "unit", "status": "passed", "duration_seconds": 700.0}
+                ],
+                "started_phase_names": ["services/foo:unit"],
+                "completed_phase_names": ["services/foo:unit"],
+                "failed_phase_names": [],
+                "expected_phase_names": ["services/foo:unit"],
+                "not_started_phase_names": [],
+                "scopes": [
+                    {
+                        "scope": "services/foo",
+                        "status": "failed",
+                        "failure_origin": "timeout",
+                        "command_identity": "./bin/foo-verify",
+                        "verify_timeout_seconds": 600,
+                        "phase_diagnostics": {
+                            "phase_results": [{"name": "unit", "status": "passed", "duration_seconds": 700.0}],
+                            "started_phase_names": [],
+                            "completed_phase_names": ["unit"],
+                            "failed_phase_names": [],
+                            "expected_phase_names": ["unit"],
+                            "not_started_phase_names": [],
+                        },
+                    }
+                ],
+            },
+        }
+        store.add_artifact(
+            impl.id,
+            kind=VERIFY_GATE_ARTIFACT_KIND,
+            path=".gza/artifacts/malformed-scoped-timeout.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+            metadata=metadata,
+            status="failed",
+        )
+
+        routing_validation = validate_verify_phase_evidence_from_metadata(metadata)
+        timeout_seconds, _grace_seconds = resolve_lifecycle_verify_timeout_settings(
+            config,
+            store,
+            scope="services/foo",
+            verify_command="./bin/foo-verify",
+        )
+
+        assert routing_validation.state == PHASE_EVIDENCE_INDETERMINATE
+        assert timeout_seconds == config.autonomous_verify_timeout_seconds
+
+    @pytest.mark.parametrize(
+        "aggregate_details",
+        [
+            {},
+            {
+                "phase_results": [],
+                "started_phase_names": [],
+                "completed_phase_names": [],
+                "failed_phase_names": [],
+                "expected_phase_names": ["ruff"],
+                "not_started_phase_names": ["ruff"],
+            },
+            {
+                "phase_results": [],
+                "started_phase_names": ["ruff"],
+                "completed_phase_names": [],
+                "failed_phase_names": [],
+                "expected_phase_names": ["ruff"],
+                "not_started_phase_names": [],
+            },
+            {
+                "phase_results": [{"name": "ruff", "status": "unknown", "duration_seconds": 1.0}],
+                "started_phase_names": ["ruff"],
+                "completed_phase_names": ["ruff"],
+                "failed_phase_names": [],
+                "expected_phase_names": ["ruff"],
+                "not_started_phase_names": [],
+            },
+            {
+                "phase_results": [{"name": "ruff", "status": "failed", "duration_seconds": 1.0}],
+                "started_phase_names": ["ruff"],
+                "completed_phase_names": ["ruff"],
+                "failed_phase_names": [],
+                "expected_phase_names": ["ruff"],
+                "not_started_phase_names": [],
+            },
+            {
+                "phase_results": [{"name": "ruff", "status": "failed", "duration_seconds": 1.0}],
+                "started_phase_names": ["ruff"],
+                "completed_phase_names": ["ruff"],
+                "failed_phase_names": ["ruff"],
+                "expected_phase_names": ["ruff"],
+                "not_started_phase_names": [],
+            },
+        ],
+    )
+    def test_lifecycle_verify_timeout_ignores_indeterminate_phase_evidence(
+        self,
+        tmp_path: Path,
+        aggregate_details: dict[str, Any],
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=600,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        store.add_artifact(
+            impl.id,
+            kind=VERIFY_GATE_ARTIFACT_KIND,
+            path=".gza/artifacts/invalid-timeout.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+            metadata={
+                "schema_version": 1,
+                "result": {"status": "failed", "failure_origin": "timeout"},
+                "verify_epoch": {"verify_command": "./bin/tests", "verify_timeout_seconds": 600},
+                "aggregate_details": aggregate_details,
+            },
+            status="failed",
+        )
+
+        timeout_seconds, _grace_seconds = resolve_lifecycle_verify_timeout_settings(config, store)
+
+        assert timeout_seconds == 600
+
+    def test_lifecycle_verify_timeout_finds_green_observation_behind_many_timeouts(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        green_metadata = {
+            "schema_version": 1,
+            "result": {"command": "./bin/tests", "status": "passed"},
+            "verify_epoch": {"verify_command": "./bin/tests"},
+            "aggregate_details": {
+                "phase_results": [
+                    {"name": "ruff", "status": "passed", "duration_seconds": 2.0},
+                    {"name": "ty", "status": "passed", "duration_seconds": 2.0},
+                    {"name": "mypy", "status": "passed", "duration_seconds": 30.0},
+                    {"name": "checks", "status": "passed", "duration_seconds": 6.0},
+                    {"name": "unit", "status": "passed", "duration_seconds": 500.0},
+                    {"name": "functional", "status": "passed", "duration_seconds": 100.0},
+                ],
+                "expected_phase_names": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                "started_phase_names": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                "completed_phase_names": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                "failed_phase_names": [],
+                "not_started_phase_names": [],
+            },
+        }
+        store.add_artifact(
+            impl.id,
+            kind=VERIFY_GATE_ARTIFACT_KIND,
+            path=".gza/artifacts/old-green.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 29, 11, 0, tzinfo=UTC),
+            metadata=green_metadata,
+            status="passed",
+        )
+        for index in range(30):
+            store.add_artifact(
+                impl.id,
+                kind=VERIFY_GATE_ARTIFACT_KIND,
+                path=f".gza/artifacts/new-timeout-{index}.json",
+                byte_size=2,
+                sha256="1" * 64,
+                created_at=datetime(2026, 8, 29, 12, index, tzinfo=UTC),
+                metadata={"schema_version": 1, "result": {"status": "failed", "failure_origin": "timeout"}},
+                status="failed",
+            )
+
+        timeout_seconds, _grace_seconds = resolve_lifecycle_verify_timeout_settings(config, store)
+
+        assert timeout_seconds == 830
+        assert timeout_seconds > config.autonomous_verify_timeout_seconds
+
+    def test_lifecycle_verify_timeout_uses_only_matching_scope_and_command_evidence(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="foo",
+            verify_command="./bin/foo-verify",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        store.add_artifact(
+            impl.id,
+            kind=VERIFY_GATE_ARTIFACT_KIND,
+            path=".gza/artifacts/cross-green.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+            metadata={
+                "schema_version": 1,
+                "result": {"command": "./bin/tests", "status": "passed"},
+                "verify_epoch": {"verify_command": "./bin/tests"},
+                "aggregate_details": {
+                    "scopes": [
+                        {
+                            "scope": "services/foo",
+                            "status": "passed",
+                            "command_identity": "./bin/foo-verify",
+                            "phase_diagnostics": {
+                                "phase_results": [
+                                    {"name": "unit", "status": "passed", "duration_seconds": 300.0}
+                                ],
+                                "started_phase_names": ["unit"],
+                                "completed_phase_names": ["unit"],
+                                "failed_phase_names": [],
+                                "expected_phase_names": ["unit"],
+                                "not_started_phase_names": [],
+                            },
+                        },
+                        {
+                            "scope": "libs/bar",
+                            "status": "passed",
+                            "command_identity": "./bin/bar-verify",
+                            "phase_diagnostics": {
+                                "phase_results": [
+                                    {"name": "unit", "status": "passed", "duration_seconds": 700.0}
+                                ],
+                                "started_phase_names": ["unit"],
+                                "completed_phase_names": ["unit"],
+                                "failed_phase_names": [],
+                                "expected_phase_names": ["unit"],
+                                "not_started_phase_names": [],
+                            },
+                        },
+                        {
+                            "scope": "services/foo",
+                            "status": "passed",
+                            "command_identity": "./bin/other-verify",
+                            "phase_diagnostics": {
+                                "phase_results": [
+                                    {"name": "unit", "status": "passed", "duration_seconds": 900.0}
+                                ],
+                                "started_phase_names": ["unit"],
+                                "completed_phase_names": ["unit"],
+                                "failed_phase_names": [],
+                                "expected_phase_names": ["unit"],
+                                "not_started_phase_names": [],
+                            },
+                        },
+                    ]
+                },
+            },
+            status="passed",
+        )
+
+        timeout_seconds, _grace_seconds = resolve_lifecycle_verify_timeout_settings(
+            config,
+            store,
+            scope="services/foo",
+            verify_command="./bin/foo-verify",
+        )
+
+        assert timeout_seconds == 405
+
+    def test_cross_project_verify_surfaces_scoped_budget_read_failure(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        project_dir = tmp_path / "services" / "foo"
+        worktree_path = tmp_path / "worktree"
+        worktree_project_dir = worktree_path / "services" / "foo"
+        project_dir.mkdir(parents=True)
+        worktree_project_dir.mkdir(parents=True)
+        for target in (project_dir, worktree_project_dir):
+            (target / "gza.yaml").write_text(
+                "project_name: foo\n"
+                "provider: codex\n"
+                "model: gpt-5.5\n"
+                "verify_command: ./bin/foo-verify\n"
+            )
+        config = Config(
+            project_dir=project_dir,
+            project_name="foo",
+            verify_command="./bin/foo-verify",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+        config._project_boundary_cache = ProjectBoundary(
+            repo_root=tmp_path,
+            scope_root=Path("services/foo"),
+            local_dependencies=(),
+        )
+        task = Task(id="gza-1", prompt="Review cross-project", status="pending", task_type="review")
+        task.tags = ("cross-project",)
+        store = Mock(spec=SqliteTaskStore)
+        store.list_recent_artifacts.side_effect = RuntimeError("database is locked")
+        worktree_git = Mock()
+        worktree_git.default_branch.return_value = "main"
+        worktree_git.get_diff_name_status.return_value = "M\tservices/foo/app.py\n"
+
+        with patch("gza.runner._run_review_verify_command") as run_verify:
+            outcome = _run_review_verify_commands_for_projects(
+                config=config,
+                store=store,
+                task=task,
+                worktree_git=worktree_git,
+                worktree_path=worktree_path,
+                timeout_seconds=120,
+                timeout_grace_seconds=5.0,
+            )
+
+        assert outcome is not None
+        assert outcome.project_results[0].result is not None
+        assert outcome.project_results[0].result.status == "unavailable"
+        assert "scope services/foo" in (outcome.project_results[0].result.failure or "")
+        assert "database is locked" in (outcome.project_results[0].result.failure or "")
+        run_verify.assert_not_called()
+
+    def test_lifecycle_verify_timeout_surfaces_artifact_store_read_errors(self, tmp_path: Path) -> None:
+        store = Mock(spec=SqliteTaskStore)
+        store.list_recent_artifacts.side_effect = RuntimeError("database is locked")
+        config = Config(
+            project_dir=tmp_path,
+            project_name="test-project",
+            verify_command="./bin/tests",
+            autonomous_verify_timeout_seconds=120,
+            review_verify_timeout_grace_seconds=5.0,
+        )
+
+        with pytest.raises(LifecycleVerifyBudgetError, match="database is locked"):
+            resolve_lifecycle_verify_timeout_settings(config, store)
+
     def test_run_review_verify_command_reports_custom_timeout(self, tmp_path: Path):
         """Timeout wording should reflect the configured autonomous review timeout."""
         timed_out = Mock(
@@ -2565,7 +3550,7 @@ class TestReviewContextFromChain:
             "provider: codex\n"
             "model: gpt-5.5\n"
             "verify_command: ./bin/foo-verify\n"
-            "autonomous_verify_timeout_seconds: 101\n"
+            "autonomous_verify_timeout_seconds: 600\n"
             "review_verify_timeout_grace_seconds: 11\n"
         )
         (sibling_dir / "gza.yaml").write_text(
@@ -2582,7 +3567,7 @@ class TestReviewContextFromChain:
             "provider: codex\n"
             "model: gpt-5.5\n"
             "verify_command: ./bin/foo-verify\n"
-            "autonomous_verify_timeout_seconds: 101\n"
+            "autonomous_verify_timeout_seconds: 600\n"
             "review_verify_timeout_grace_seconds: 11\n"
         )
         (worktree_sibling_dir / "gza.yaml").write_text(
@@ -2599,7 +3584,7 @@ class TestReviewContextFromChain:
             project_dir=project_dir,
             project_name="foo",
             verify_command="./bin/foo-verify",
-            autonomous_verify_timeout_seconds=303,
+            autonomous_verify_timeout_seconds=120,
             review_verify_timeout_grace_seconds=33.0,
         )
         config._project_boundary_cache = ProjectBoundary(
@@ -2609,6 +3594,7 @@ class TestReviewContextFromChain:
         )
         task = Task(id="gza-1", prompt="Review cross-project", status="pending", task_type="review")
         task.tags = ("cross-project",)
+        store = SqliteTaskStore(tmp_path / "test.db")
 
         worktree_git = Mock()
         worktree_git.default_branch.return_value = "main"
@@ -2639,10 +3625,11 @@ class TestReviewContextFromChain:
         ) as mock_verify:
             outcome = _run_review_verify_commands_for_projects(
                 config=config,
+                store=store,
                 task=task,
                 worktree_git=worktree_git,
                 worktree_path=worktree_path,
-                timeout_seconds=303,
+                timeout_seconds=120,
                 timeout_grace_seconds=33.0,
                 reviewed_branch="feature/cross-project",
                 reviewed_head_sha="deadbeef",
@@ -2664,7 +3651,7 @@ class TestReviewContextFromChain:
         assert len(verify_calls) == 2
         assert verify_calls[0].kwargs["cwd"] == worktree_path / "services" / "foo"
         assert verify_calls[1].kwargs["cwd"] == worktree_path / "libs" / "bar"
-        assert verify_calls[0].kwargs["timeout_seconds"] == 101
+        assert verify_calls[0].kwargs["timeout_seconds"] == 600
         assert verify_calls[0].kwargs["timeout_grace_seconds"] == 11.0
         assert verify_calls[1].kwargs["timeout_seconds"] == 202
         assert verify_calls[1].kwargs["timeout_grace_seconds"] == 22.0
@@ -24222,6 +25209,35 @@ class TestProviderPromptSanitization:
         verify_fix.changed_diff = False
         verify_fix.tags = ("cross-project",)
         store.update(verify_fix)
+        store.add_artifact(
+            impl.id,
+            kind=VERIFY_GATE_ARTIFACT_KIND,
+            path=".gza/artifacts/old-green.json",
+            byte_size=2,
+            sha256="0" * 64,
+            created_at=datetime(2026, 8, 17, 9, 0, tzinfo=UTC),
+            status="passed",
+            metadata={
+                "schema_version": 1,
+                "result": {"command": "./bin/tests", "status": "passed"},
+                "verify_epoch": {"verify_command": "./bin/tests"},
+                "aggregate_details": {
+                    "phase_results": [
+                        {"name": "ruff", "status": "passed", "duration_seconds": 2.0},
+                        {"name": "ty", "status": "passed", "duration_seconds": 2.0},
+                        {"name": "mypy", "status": "passed", "duration_seconds": 30.0},
+                        {"name": "checks", "status": "passed", "duration_seconds": 6.0},
+                        {"name": "unit", "status": "passed", "duration_seconds": 500.0},
+                        {"name": "functional", "status": "passed", "duration_seconds": 100.0},
+                    ],
+                    "expected_phase_names": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                    "started_phase_names": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                    "completed_phase_names": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+                    "failed_phase_names": [],
+                    "not_started_phase_names": [],
+                },
+            },
+        )
 
         green = ReviewVerifyResult(
             command="(per-project verify_command)",
@@ -24252,6 +25268,8 @@ class TestProviderPromptSanitization:
             )
 
         run_verify.assert_called_once()
+        assert run_verify.call_args.kwargs["timeout_seconds"] == 830
+        assert run_verify.call_args.kwargs["timeout_grace_seconds"] == 5.0
 
     def test_capture_noop_verify_fix_does_not_rerun_mixed_cross_project_aggregate_and_parks(
         self,

@@ -56,7 +56,23 @@ gza-verify phase=failed name=functional duration_seconds=12.500000
 
 ## Consumer behavior
 
-- `src/gza/runner.py` parses only `phase=passed` and `phase=failed` result lines.
+- `src/gza/runner.py` parses `phase=start`, `phase=passed`, and `phase=failed`
+  lines. Lifecycle verify artifacts persist started, completed, failed, and known
+  not-started phase names when structured phase output is available.
+- Cross-project lifecycle verify aggregates preserve the same diagnostics per scope
+  and prefix aggregate phase-name lists with the scope, so a failed child phase remains
+  visible to routing and operator summaries.
+- A verify timeout with `failure_origin == "timeout"` and no parsed failed phase is
+  classified as a wall-clock budget condition, not as a code-fixing `verify_fix`
+  candidate, only when the structured phase records affirmatively validate as
+  complete zero-red evidence. Missing, empty, malformed, incomplete, or
+  contradictory phase summaries remain indeterminate and fail closed under the normal
+  non-budget verify-blocking path. It still blocks review and merge.
+- Adaptive lifecycle verify budgets use only valid phase summaries matching the
+  current verify command and project scope. Timeout-origin observations use the
+  persisted effective timeout as the known wall-clock lower bound; if that provenance
+  is missing, budget resolution surfaces an operator-visible diagnostic instead of
+  falling back to the configured cap.
 - When a phase wrapper cannot spawn its command, `verify_phase` keeps the stdout result
   line parseable and emits a stderr diagnostic of the form
   `verify_phase: failed to launch command [...]`.

@@ -139,6 +139,8 @@ from gza.review_verify_state import (
     verify_result_is_timeout_origin,
 )
 from gza.runner import (
+    PHASE_EVIDENCE_RED,
+    PHASE_EVIDENCE_VALID_ZERO_RED,
     PROJECT_SCOPE_VIOLATION_FAILURE_REASON,
     REVIEW_BLOCKER_RESOLUTION_ARTIFACT_KIND,
     ReviewVerifyResult,
@@ -148,6 +150,7 @@ from gza.runner import (
     _make_review_verify_result,
     _project_boundary,
     _task_has_current_passing_review_verify_evidence,
+    validate_verify_phase_evidence_from_metadata,
 )
 from gza.source_followup import (
     collect_non_dropped_implement_source_ids,
@@ -165,6 +168,7 @@ PARK_REASON_IMPROVE_NO_OP = "improve-no-op"
 PARK_REASON_VERIFY_NOOP_BRANCH_TIP_UNAVAILABLE = "verify-noop-improve-branch-tip-unavailable"
 PARK_REASON_VERIFY_NOOP_DIFF_PROBE_UNAVAILABLE = "verify-noop-improve-diff-probe-unavailable"
 PARK_REASON_VERIFY_BLOCKED_NO_CODE_ISSUES = "verify-blocked-no-code-issues"
+PARK_REASON_VERIFY_BUDGET_EXCEEDED = "verify-budget-exceeded"
 PARK_REASON_VERIFY_FAILED_NEEDS_FIX = "verify-failed-needs-fix"
 PARK_REASON_VERIFY_FIX_FAILED = "verify-fix-failed"
 PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE = "verify-fix-proof-unavailable"
@@ -213,6 +217,7 @@ WATCH_SURFACE_ONCE_NEEDS_ATTENTION_REASONS = frozenset(
         "review-needs-manual-creation",
         "review-verdict-needs-manual-attention",
         "stale-review-needs-manual-refresh",
+        PARK_REASON_VERIFY_BUDGET_EXCEEDED,
         PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
         PARK_REASON_VERIFY_FIX_FAILED,
         PARK_REASON_VERIFY_FIX_PROOF_UNAVAILABLE,
@@ -5950,6 +5955,122 @@ def _verify_fix_failed_manual_rearm_requires_fresh_verify(
     return decision.lookup.result.captured_at < rearm.manual_rearmed_at
 
 
+def _verify_gate_failed_phase_names(decision: VerifyGateDecision) -> tuple[str, ...] | None:
+    validation = validate_verify_phase_evidence_from_metadata(decision.lookup.artifact_metadata)
+    if validation.state not in {PHASE_EVIDENCE_RED, PHASE_EVIDENCE_VALID_ZERO_RED}:
+        return None
+    return validation.failed_phase_names
+
+
+def _verify_gate_phase_budget_summary(decision: VerifyGateDecision) -> dict[str, Any]:
+    metadata = decision.lookup.artifact_metadata
+    aggregate_details = metadata.get("aggregate_details") if isinstance(metadata, dict) else None
+    if not isinstance(aggregate_details, dict):
+        return {}
+    summary: dict[str, Any] = {}
+    for key in (
+        "completed_phase_names",
+        "failed_phase_names",
+        "expected_phase_names",
+        "not_started_phase_names",
+        "started_phase_names",
+    ):
+        value = aggregate_details.get(key)
+        if isinstance(value, list):
+            summary[key] = tuple(item for item in value if isinstance(item, str) and item)
+    scopes = aggregate_details.get("scopes")
+    if isinstance(scopes, list):
+        scoped_summary: list[dict[str, Any]] = []
+        for scope in scopes:
+            if not isinstance(scope, dict):
+                continue
+            diagnostics = scope.get("phase_diagnostics")
+            if not isinstance(diagnostics, dict):
+                continue
+            scoped_summary.append(
+                {
+                    "scope": scope.get("scope"),
+                    "status": scope.get("status"),
+                    "started_phase_names": tuple(
+                        item
+                        for item in diagnostics.get("started_phase_names", ())
+                        if isinstance(item, str) and item
+                    ),
+                    "completed_phase_names": tuple(
+                        item
+                        for item in diagnostics.get("completed_phase_names", ())
+                        if isinstance(item, str) and item
+                    ),
+                    "failed_phase_names": tuple(
+                        item
+                        for item in diagnostics.get("failed_phase_names", ())
+                        if isinstance(item, str) and item
+                    ),
+                    "not_started_phase_names": tuple(
+                        item
+                        for item in diagnostics.get("not_started_phase_names", ())
+                        if isinstance(item, str) and item
+                    ),
+                }
+            )
+        if scoped_summary:
+            summary["scopes"] = tuple(scoped_summary)
+    return summary
+
+
+def _verify_gate_is_budget_only_timeout(decision: VerifyGateDecision) -> bool:
+    validation = validate_verify_phase_evidence_from_metadata(decision.lookup.artifact_metadata)
+    return (
+        decision.state == "failed"
+        and verify_result_is_timeout_origin(decision.lookup.result)
+        and validation.state == PHASE_EVIDENCE_VALID_ZERO_RED
+    )
+
+
+def _verify_budget_exceeded_action(ctx: AdvanceContext, *, phase: str, owner_task: DbTask) -> dict[str, Any]:
+    decision = ctx.verify_gate_decision
+    summary = _verify_gate_phase_budget_summary(decision) if decision is not None else {}
+    completed_names = summary.get("completed_phase_names", ())
+    not_started_names = summary.get("not_started_phase_names", ())
+    completed_text = ", ".join(completed_names) if completed_names else "none recorded"
+    not_started_text = ", ".join(not_started_names) if not_started_names else "unknown"
+    scopes = summary.get("scopes", ())
+    scope_text = ""
+    if scopes:
+        entries = []
+        for scope in scopes:
+            if not isinstance(scope, dict):
+                continue
+            scope_name = scope.get("scope") if isinstance(scope.get("scope"), str) else "unknown scope"
+            scope_completed = scope.get("completed_phase_names", ())
+            scope_not_started = scope.get("not_started_phase_names", ())
+            completed = ", ".join(scope_completed) if scope_completed else "none recorded"
+            not_started = ", ".join(scope_not_started) if scope_not_started else "unknown"
+            entries.append(f"{scope_name} completed [{completed}], not-started [{not_started}]")
+        if entries:
+            scope_text = f" Scope details: {'; '.join(entries)}."
+    description_suffix = "review" if phase == "pre_review" else "merge"
+    return _with_red_verify_gate_metadata(
+        ctx,
+        with_needs_attention(
+            {
+                "type": "needs_discussion",
+                "description": (
+                    f"SKIP: verify gate exceeded its wall-clock budget before {description_suffix}; "
+                    f"completed phases: {completed_text}; phases not started: {not_started_text}. "
+                    "No executed phase reported a failure, so no verify_fix task was created."
+                    f"{scope_text}"
+                ),
+                "verify_epoch": None if decision is None else decision.current_epoch,
+                "verify_phase_summary": summary,
+            },
+            reason=PARK_REASON_VERIFY_BUDGET_EXCEEDED,
+            subject_task_id=owner_task.id,
+        ),
+        phase=phase,
+    )
+
+
 def _pre_review_verify_fix_action(ctx: AdvanceContext, *, phase: str = "pre_review") -> dict[str, Any]:
     decision = getattr(ctx, "verify_gate_decision", None)
     owner_task = _verify_gate_owner_task(ctx)
@@ -5985,6 +6106,9 @@ def _pre_review_verify_fix_action(ctx: AdvanceContext, *, phase: str = "pre_revi
             ),
             phase=phase,
         )
+
+    if _verify_gate_is_budget_only_timeout(decision):
+        return _verify_budget_exceeded_action(ctx, phase=phase, owner_task=owner_task)
 
     existing = find_existing_verify_fix_task(
         ctx.store,

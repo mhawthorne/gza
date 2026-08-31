@@ -172,6 +172,7 @@ from .review_verdict import (
     validate_review_report_contract,
 )
 from .review_verify_state import (
+    VERIFY_GATE_ARTIFACT_KIND,
     VerifyEpoch,
     latest_verify_result_for_epoch,
     normalized_verify_command,
@@ -3483,6 +3484,8 @@ class ProjectReviewVerifyResult:
     working_directory: str
     result: ReviewVerifyResult | None = None
     skip_reason: str | None = None
+    timeout_seconds: int | None = None
+    timeout_grace_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -3506,6 +3509,28 @@ class LifecycleVerifyExecution:
     markdown: str
     aggregate_result: VerificationResult
     project_results: tuple[ProjectVerificationResult, ...] = ()
+
+
+class LifecycleVerifyBudgetError(RuntimeError):
+    """Raised when lifecycle verify cannot safely resolve an effective budget."""
+
+
+@dataclass(frozen=True)
+class PhaseEvidenceValidation:
+    """Strict validation result for persisted verify phase summaries."""
+
+    state: str
+    failed_phase_names: tuple[str, ...] = ()
+    completed_phase_names: tuple[str, ...] = ()
+    not_started_phase_names: tuple[str, ...] = ()
+    started_phase_names: tuple[str, ...] = ()
+    phase_results: tuple[dict[str, Any], ...] = ()
+    reason: str | None = None
+
+
+PHASE_EVIDENCE_RED = "red"
+PHASE_EVIDENCE_VALID_ZERO_RED = "valid_zero_red"
+PHASE_EVIDENCE_INDETERMINATE = "indeterminate"
 
 
 def _combine_verify_output(*parts: str | bytes | None) -> str:
@@ -3643,6 +3668,83 @@ def _extract_review_verify_phase_results(output: str | None) -> list[dict[str, A
             phase["tree_fingerprint"] = tree_fingerprint
         phases.append(phase)
     return phases
+
+
+def _extract_review_verify_phase_starts(output: str | None) -> list[str]:
+    """Parse structured phase-start markers from captured command output."""
+    if not output:
+        return []
+    return [
+        match.group("name")
+        for match in re.finditer(
+            r"^gza-verify phase=start name=(?P<name>[A-Za-z0-9_.-]+)$",
+            output,
+            re.MULTILINE,
+        )
+    ]
+
+
+def _expected_verify_phase_names(command: str | None) -> tuple[str, ...]:
+    normalized = normalized_verify_command(command)
+    if normalized in {"./bin/tests", "bin/tests"}:
+        return ("ruff", "ty", "mypy", "checks", "unit", "functional")
+    return ()
+
+
+def _build_single_project_verify_aggregate_details(result: VerificationResult) -> dict[str, Any] | None:
+    """Build operator-facing phase diagnostics for one verify_command run."""
+    phase_results = _extract_review_verify_phase_results(result.output)
+    started_phase_names = _extract_review_verify_phase_starts(result.output)
+    if not phase_results and not started_phase_names:
+        return None
+
+    completed_phase_names = [
+        str(phase["name"])
+        for phase in phase_results
+        if isinstance(phase.get("name"), str)
+    ]
+    failed_phase_names = [
+        str(phase["name"])
+        for phase in phase_results
+        if phase.get("status") == "failed" and isinstance(phase.get("name"), str)
+    ]
+    expected_phase_names = _expected_verify_phase_names(result.command)
+    not_started_phase_names = tuple(
+        name
+        for name in expected_phase_names
+        if name not in set(started_phase_names) and name not in set(completed_phase_names)
+    )
+    return {
+        "schema_version": 1,
+        "phase_results": phase_results,
+        "started_phase_names": started_phase_names,
+        "completed_phase_names": completed_phase_names,
+        "failed_phase_names": failed_phase_names,
+        "expected_phase_names": list(expected_phase_names),
+        "not_started_phase_names": list(not_started_phase_names),
+        "completed_count": len(completed_phase_names),
+        "failed_count": len(failed_phase_names),
+    }
+
+
+def _build_project_phase_diagnostics(result: VerificationResult | None) -> dict[str, Any]:
+    if result is None:
+        return {
+            "phase_results": [],
+            "started_phase_names": [],
+            "completed_phase_names": [],
+            "failed_phase_names": [],
+            "expected_phase_names": [],
+            "not_started_phase_names": [],
+        }
+    return _build_single_project_verify_aggregate_details(result) or {
+        "phase_results": [],
+        "started_phase_names": [],
+        "completed_phase_names": [],
+        "failed_phase_names": [],
+        "expected_phase_names": list(_expected_verify_phase_names(result.command)),
+        "not_started_phase_names": [],
+    }
 
 
 def _review_verify_tree_fingerprint(result: ReviewVerifyResult | None) -> str | None:
@@ -3808,7 +3910,7 @@ def _build_verify_gate_provenance(
     timeout_grace_seconds: float | None,
     project_results: tuple[ProjectVerificationResult, ...],
 ) -> dict[str, Any]:
-    provenance = {
+    provenance: dict[str, Any] = {
         "command_identity": normalized_verify_command(result.command),
         "reviewed_branch": result.reviewed_branch,
         "reviewed_head_sha": result.reviewed_head_sha,
@@ -3824,6 +3926,18 @@ def _build_verify_gate_provenance(
     tree_fingerprint = _review_verify_tree_fingerprint(result)
     if tree_fingerprint is not None:
         provenance["tree_fingerprint"] = tree_fingerprint
+    if project_results:
+        provenance["scopes"] = [
+            {
+                "scope": entry.scope,
+                "command_identity": (
+                    normalized_verify_command(entry.result.command) if entry.result is not None else None
+                ),
+                "verify_timeout_seconds": entry.timeout_seconds,
+                "verify_timeout_grace_seconds": entry.timeout_grace_seconds,
+            }
+            for entry in project_results
+        ]
     return provenance
 
 
@@ -3859,20 +3973,56 @@ def _build_cross_project_verify_aggregate_details(
         else ("test_failure" if failed_origins else None)
     )
     phase_results: list[dict[str, Any]] = []
+    completed_phase_names: list[str] = []
+    failed_phase_names: list[str] = []
+    started_phase_names: list[str] = []
+    not_started_phase_names: list[str] = []
+    expected_phase_names: list[str] = []
+    scope_entries: list[dict[str, Any]] = []
     for entry in project_results:
-        if entry.result is None:
-            continue
+        diagnostics = _build_project_phase_diagnostics(entry.result)
         tree_fingerprint = _review_verify_tree_fingerprint(entry.result)
-        phase_results.append(
+        scope_entries.append(
             {
                 "scope": entry.scope,
+                "working_directory": entry.working_directory,
+                "status": _entry_status(entry),
+                "exit_status": entry.result.exit_status if entry.result is not None else None,
+                "failure_origin": _failure_origin(entry.result),
+                "command_identity": (
+                    normalized_verify_command(entry.result.command) if entry.result is not None else None
+                ),
+                "verify_timeout_seconds": entry.timeout_seconds,
+                "verify_timeout_grace_seconds": entry.timeout_grace_seconds,
+                "reviewed_branch": entry.result.reviewed_branch if entry.result is not None else None,
+                "reviewed_head_sha": entry.result.reviewed_head_sha if entry.result is not None else None,
+                "reviewed_base_sha": entry.result.reviewed_base_sha if entry.result is not None else None,
+                "skip_reason": entry.skip_reason,
                 "tree_fingerprint": tree_fingerprint,
+                "phase_diagnostics": diagnostics,
             }
         )
+        for key, target in (
+            ("started_phase_names", started_phase_names),
+            ("completed_phase_names", completed_phase_names),
+            ("failed_phase_names", failed_phase_names),
+            ("not_started_phase_names", not_started_phase_names),
+            ("expected_phase_names", expected_phase_names),
+        ):
+            values = diagnostics.get(key)
+            if isinstance(values, list):
+                target.extend(f"{entry.scope}:{name}" for name in values if isinstance(name, str) and name)
+        child_phase_results = diagnostics.get("phase_results")
+        if isinstance(child_phase_results, list) and child_phase_results:
+            for child_phase in child_phase_results:
+                if isinstance(child_phase, dict):
+                    phase_results.append({"scope": entry.scope, **child_phase})
+        elif entry.result is not None:
+            phase_results.append({"scope": entry.scope, "tree_fingerprint": tree_fingerprint})
     fingerprints = [
-        phase["tree_fingerprint"]
-        for phase in phase_results
-        if isinstance(phase.get("tree_fingerprint"), str) and phase["tree_fingerprint"]
+        scope["tree_fingerprint"]
+        for scope in scope_entries
+        if isinstance(scope.get("tree_fingerprint"), str) and scope["tree_fingerprint"]
     ]
     missing_fingerprint_count = runnable_count - len(fingerprints)
     supplied_fingerprints_agree = bool(fingerprints) and all(
@@ -3880,12 +4030,12 @@ def _build_cross_project_verify_aggregate_details(
     )
     tree_fingerprint_complete = (
         runnable_count > 0
-        and len(phase_results) == runnable_count
+        and len(scope_entries) == len(project_results)
         and missing_fingerprint_count == 0
         and supplied_fingerprints_agree
     )
     tree_fingerprint = (
-        phase_results[-1]["tree_fingerprint"]
+        fingerprints[-1]
         if tree_fingerprint_complete
         else None
     )
@@ -3903,24 +4053,192 @@ def _build_cross_project_verify_aggregate_details(
         "tree_fingerprint_missing_count": missing_fingerprint_count,
         "tree_fingerprint_contradictory": bool(fingerprints) and not supplied_fingerprints_agree,
         "phase_results": phase_results,
-        "scopes": [
-            {
-                "scope": entry.scope,
-                "working_directory": entry.working_directory,
-                "status": _entry_status(entry),
-                "exit_status": entry.result.exit_status if entry.result is not None else None,
-                "failure_origin": _failure_origin(entry.result),
-                "command_identity": (
-                    normalized_verify_command(entry.result.command) if entry.result is not None else None
-                ),
-                "reviewed_branch": entry.result.reviewed_branch if entry.result is not None else None,
-                "reviewed_head_sha": entry.result.reviewed_head_sha if entry.result is not None else None,
-                "reviewed_base_sha": entry.result.reviewed_base_sha if entry.result is not None else None,
-                "skip_reason": entry.skip_reason,
-            }
-            for entry in project_results
-        ],
+        "started_phase_names": started_phase_names,
+        "completed_phase_names": completed_phase_names,
+        "failed_phase_names": failed_phase_names,
+        "expected_phase_names": expected_phase_names,
+        "not_started_phase_names": not_started_phase_names,
+        "scopes": scope_entries,
     }
+
+
+def _coerce_phase_name_list(value: object) -> tuple[str, ...] | None:
+    if not isinstance(value, list):
+        return None
+    names: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            return None
+        names.append(item)
+    return tuple(names)
+
+
+def _has_duplicate_items(values: tuple[str, ...]) -> bool:
+    return len(set(values)) != len(values)
+
+
+def _validate_phase_summary_details(
+    aggregate_details: object,
+    *,
+    result_status: str | None = None,
+    failure_origin: str | None = None,
+    allow_timeout_budget_in_flight: bool = False,
+) -> PhaseEvidenceValidation:
+    if not isinstance(aggregate_details, dict):
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="missing aggregate_details")
+    phase_results_raw = aggregate_details.get("phase_results")
+    if not isinstance(phase_results_raw, list) or not phase_results_raw:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="missing phase results")
+
+    started_names = _coerce_phase_name_list(aggregate_details.get("started_phase_names"))
+    completed_names = _coerce_phase_name_list(aggregate_details.get("completed_phase_names"))
+    failed_names = _coerce_phase_name_list(aggregate_details.get("failed_phase_names"))
+    expected_names = _coerce_phase_name_list(aggregate_details.get("expected_phase_names"))
+    not_started_names = _coerce_phase_name_list(aggregate_details.get("not_started_phase_names"))
+    if (
+        started_names is None
+        or completed_names is None
+        or failed_names is None
+        or expected_names is None
+        or not_started_names is None
+    ):
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase name summary")
+    for values, label in (
+        (started_names, "started"),
+        (completed_names, "completed"),
+        (failed_names, "failed"),
+        (expected_names, "expected"),
+        (not_started_names, "not-started"),
+    ):
+        if _has_duplicate_items(values):
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason=f"duplicate {label} phase identity")
+
+    phase_results: list[dict[str, Any]] = []
+    result_names: list[str] = []
+    result_failed_names: list[str] = []
+    for phase in phase_results_raw:
+        if not isinstance(phase, dict):
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase result")
+        name = phase.get("name")
+        status = phase.get("status")
+        duration = phase.get("duration_seconds")
+        if not isinstance(name, str) or not name:
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase name")
+        if status not in {"passed", "failed"}:
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase status")
+        if isinstance(duration, bool) or not isinstance(duration, int | float):
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase duration")
+        duration_value = float(duration)
+        if not math.isfinite(duration_value) or duration_value < 0:
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed phase duration")
+        phase_result = cast(dict[str, Any], phase)
+        phase_results.append(phase_result)
+        scope = phase.get("scope")
+        result_name = f"{scope}:{name}" if isinstance(scope, str) and scope else name
+        result_names.append(result_name)
+        if status == "failed":
+            result_failed_names.append(result_name)
+
+    if _has_duplicate_items(tuple(result_names)):
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="duplicate terminal phase identity")
+    if tuple(result_names) != completed_names:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="completed phases contradict results")
+    if tuple(result_failed_names) != failed_names:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="failed phases contradict results")
+    result_name_set = set(result_names)
+    started_without_result = tuple(name for name in started_names if name not in result_name_set)
+    allow_final_in_flight = (
+        allow_timeout_budget_in_flight
+        and result_status == "failed"
+        and failure_origin == "timeout"
+        and not result_failed_names
+        and bool(result_names)
+        and len(started_without_result) == 1
+        and started_names[:-1] == tuple(result_names)
+        and started_names[-1] == started_without_result[0]
+    )
+    if started_without_result and not allow_final_in_flight:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="started phase lacks terminal result")
+    if any(name not in started_names for name in result_names):
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="terminal phase lacks start")
+    if expected_names:
+        expected_set = set(expected_names)
+        if any(name not in expected_set for name in (*started_names, *result_names, *not_started_names)):
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="result phase outside expected set")
+        expected_not_started = tuple(
+            name for name in expected_names if name not in set(started_names) and name not in result_name_set
+        )
+        if expected_not_started != not_started_names:
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="not-started phases contradict results")
+    elif not_started_names:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="not-started phases without expected phases")
+
+    scopes = aggregate_details.get("scopes")
+    if isinstance(scopes, list):
+        scoped_completed: list[str] = []
+        scoped_failed: list[str] = []
+        scoped_started: list[str] = []
+        scoped_not_started: list[str] = []
+        for scope in scopes:
+            if not isinstance(scope, dict):
+                return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed scope entry")
+            scope_name = scope.get("scope")
+            if not isinstance(scope_name, str) or not scope_name:
+                return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="malformed scope name")
+            scope_status = scope.get("status")
+            if scope_status in {"skipped", "unavailable"}:
+                continue
+            diagnostics = scope.get("phase_diagnostics")
+            scope_failure_origin = scope.get("failure_origin")
+            scope_validation = _validate_phase_summary_details(
+                diagnostics,
+                result_status=scope_status if isinstance(scope_status, str) else None,
+                failure_origin=scope_failure_origin if isinstance(scope_failure_origin, str) else None,
+                allow_timeout_budget_in_flight=allow_timeout_budget_in_flight,
+            )
+            if scope_validation.state == PHASE_EVIDENCE_INDETERMINATE:
+                return PhaseEvidenceValidation(
+                    PHASE_EVIDENCE_INDETERMINATE,
+                    reason=f"{scope_name}: {scope_validation.reason or 'indeterminate phase evidence'}",
+                )
+            scoped_completed.extend(f"{scope_name}:{name}" for name in scope_validation.completed_phase_names)
+            scoped_failed.extend(f"{scope_name}:{name}" for name in scope_validation.failed_phase_names)
+            scoped_started.extend(f"{scope_name}:{name}" for name in scope_validation.started_phase_names)
+            scoped_not_started.extend(f"{scope_name}:{name}" for name in scope_validation.not_started_phase_names)
+        if tuple(scoped_completed) != completed_names or tuple(scoped_failed) != failed_names:
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="scoped phase summary contradicts aggregate")
+        if tuple(scoped_started) != started_names or tuple(scoped_not_started) != not_started_names:
+            return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="scoped phase lifecycle contradicts aggregate")
+
+    if result_status == "passed" and failed_names:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="passed aggregate contains failed phase")
+    if result_status == "failed" and failure_origin != "timeout" and not failed_names:
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="failed aggregate lacks failed phase evidence")
+
+    state = PHASE_EVIDENCE_RED if failed_names else PHASE_EVIDENCE_VALID_ZERO_RED
+    return PhaseEvidenceValidation(
+        state,
+        failed_phase_names=failed_names,
+        completed_phase_names=completed_names,
+        not_started_phase_names=not_started_names,
+        started_phase_names=started_names,
+        phase_results=tuple(phase_results),
+    )
+
+
+def validate_verify_phase_evidence_from_metadata(metadata: object) -> PhaseEvidenceValidation:
+    if not isinstance(metadata, dict):
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="missing metadata")
+    result = metadata.get("result")
+    if not isinstance(result, dict):
+        return PhaseEvidenceValidation(PHASE_EVIDENCE_INDETERMINATE, reason="missing result")
+    result_status = result.get("status")
+    failure_origin = result.get("failure_origin")
+    return _validate_phase_summary_details(
+        metadata.get("aggregate_details"),
+        result_status=result_status if isinstance(result_status, str) else None,
+        failure_origin=failure_origin if isinstance(failure_origin, str) else None,
+    )
 
 
 def _persist_lifecycle_verify_execution(
@@ -3967,7 +4285,11 @@ def _persist_lifecycle_verify_execution(
             timeout_grace_seconds=timeout_grace_seconds,
             project_results=execution.project_results,
         )
-        aggregate_details = _build_cross_project_verify_aggregate_details(execution.project_results)
+        aggregate_details = (
+            _build_cross_project_verify_aggregate_details(execution.project_results)
+            if execution.project_results
+            else _build_single_project_verify_aggregate_details(persisted_result)
+        )
         if consumed_verify_fix_task is not None and consumed_verify_fix_no_source_changes is not None:
             apply_verify_fix_completion_outcome(
                 consumed_verify_fix_task,
@@ -5177,6 +5499,199 @@ def _resolve_review_verify_timeout_settings(config: object) -> tuple[int, float]
     )
 
 
+def _timeout_seconds_from_metadata(metadata: dict[str, Any], *, scope_entry: dict[str, Any] | None = None) -> float | None:
+    candidates: list[object] = []
+    if scope_entry is not None:
+        candidates.extend((scope_entry.get("verify_timeout_seconds"), scope_entry.get("timeout_seconds")))
+    verify_epoch = metadata.get("verify_epoch")
+    if isinstance(verify_epoch, dict):
+        candidates.append(verify_epoch.get("verify_timeout_seconds"))
+    candidates.append(metadata.get("timeout_seconds"))
+    for candidate in candidates:
+        if isinstance(candidate, bool) or not isinstance(candidate, int | float):
+            continue
+        value = float(candidate)
+        if math.isfinite(value) and value >= 0:
+            return value
+    return None
+
+
+def _artifact_command_identity(metadata: dict[str, Any]) -> str | None:
+    provenance = metadata.get("provenance")
+    if isinstance(provenance, dict):
+        command_identity = provenance.get("command_identity")
+        if isinstance(command_identity, str) and command_identity:
+            return command_identity
+    verify_epoch = metadata.get("verify_epoch")
+    if isinstance(verify_epoch, dict):
+        return normalized_verify_command(
+            verify_epoch.get("verify_command") if isinstance(verify_epoch.get("verify_command"), str) else None
+        )
+    result = metadata.get("result")
+    if isinstance(result, dict):
+        return normalized_verify_command(result.get("command") if isinstance(result.get("command"), str) else None)
+    return None
+
+
+def _scoped_phase_metadata(
+    metadata: dict[str, Any],
+    *,
+    scope: str | None,
+    command_identity: str | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+    aggregate_details = metadata.get("aggregate_details")
+    if not isinstance(aggregate_details, dict):
+        return None
+    scopes = aggregate_details.get("scopes")
+    if scope is None:
+        if isinstance(scopes, list):
+            return None
+        if command_identity is not None and _artifact_command_identity(metadata) != command_identity:
+            return None
+        return metadata, None
+    if not isinstance(scopes, list):
+        return None
+    for scope_entry in scopes:
+        if not isinstance(scope_entry, dict) or scope_entry.get("scope") != scope:
+            continue
+        if command_identity is not None and scope_entry.get("command_identity") != command_identity:
+            return None
+        diagnostics = scope_entry.get("phase_diagnostics")
+        if not isinstance(diagnostics, dict):
+            return None
+        result_payload = {
+            "status": scope_entry.get("status"),
+            "failure_origin": scope_entry.get("failure_origin"),
+        }
+        return {"result": result_payload, "aggregate_details": diagnostics, "verify_epoch": metadata.get("verify_epoch")}, scope_entry
+    return None
+
+
+def _phase_duration_observation_from_artifact(
+    artifact: TaskArtifact,
+    *,
+    scope: str | None = None,
+    command_identity: str | None = None,
+) -> tuple[float, str] | None:
+    metadata = artifact.metadata if isinstance(artifact.metadata, dict) else None
+    if metadata is None:
+        return None
+    scoped = _scoped_phase_metadata(metadata, scope=scope, command_identity=command_identity)
+    if scoped is None:
+        return None
+    scoped_metadata, scope_entry = scoped
+    aggregate_details = scoped_metadata.get("aggregate_details")
+    result = scoped_metadata.get("result")
+    if not isinstance(aggregate_details, dict):
+        return None
+    if not isinstance(result, dict):
+        return None
+    result_status = result.get("status")
+    failure_origin = result.get("failure_origin")
+    validation = _validate_phase_summary_details(
+        aggregate_details,
+        result_status=result_status if isinstance(result_status, str) else None,
+        failure_origin=failure_origin if isinstance(failure_origin, str) else None,
+        allow_timeout_budget_in_flight=True,
+    )
+    if validation.state == PHASE_EVIDENCE_INDETERMINATE:
+        return None
+    expected_names = _coerce_phase_name_list(aggregate_details.get("expected_phase_names"))
+    if not expected_names:
+        return None
+    durations: list[float] = []
+    for phase in validation.phase_results:
+        duration = phase["duration_seconds"]
+        durations.append(float(duration))
+    if result_status == "passed":
+        if validation.state != PHASE_EVIDENCE_VALID_ZERO_RED or validation.completed_phase_names != expected_names:
+            return None
+        return sum(durations), "green_full_suite"
+    if (
+        result_status == "failed"
+        and failure_origin == "timeout"
+        and validation.state == PHASE_EVIDENCE_VALID_ZERO_RED
+        and validation.completed_phase_names
+    ):
+        timeout_seconds = _timeout_seconds_from_metadata(metadata, scope_entry=scope_entry)
+        if timeout_seconds is None:
+            raise LifecycleVerifyBudgetError(
+                "valid timeout phase evidence is missing persisted verify_timeout_seconds provenance"
+            )
+        return max(sum(durations), timeout_seconds), "timeout_wall_clock_lower_bound"
+    return None
+
+
+def _phase_duration_total_from_artifact(artifact: TaskArtifact) -> float | None:
+    observation = _phase_duration_observation_from_artifact(artifact)
+    return None if observation is None else observation[0]
+
+
+def _derived_lifecycle_verify_timeout_seconds(
+    store: SqliteTaskStore,
+    *,
+    scope: str | None = None,
+    command_identity: str | None = None,
+) -> int | None:
+    """Return a timeout derived from persisted full-suite phase observations."""
+    observations: list[tuple[float, str]] = []
+    try:
+        artifacts = store.list_recent_artifacts(kind=VERIFY_GATE_ARTIFACT_KIND, limit=250)
+    except Exception as exc:
+        raise LifecycleVerifyBudgetError(
+            f"could not inspect recent verify artifacts for lifecycle budget headroom: {exc}"
+        ) from exc
+    for artifact in artifacts:
+        try:
+            observation = _phase_duration_observation_from_artifact(
+                artifact,
+                scope=scope,
+                command_identity=command_identity,
+            )
+        except LifecycleVerifyBudgetError as exc:
+            scope_text = f" for scope {scope}" if scope is not None else ""
+            raise LifecycleVerifyBudgetError(f"{exc}{scope_text}") from exc
+        if observation is not None:
+            observations.append(observation)
+    if not observations:
+        return None
+    observed, reason = max(observations, key=lambda item: item[0])
+    logger.debug(
+        "derived lifecycle verify budget from %s observation: completed phase total %.1fs",
+        reason,
+        observed,
+    )
+    return max(1, math.ceil(observed * 1.25 + 30))
+
+
+def resolve_lifecycle_verify_timeout_settings(
+    config: object,
+    store: SqliteTaskStore,
+    *,
+    scope: str | None = None,
+    verify_command: str | None = None,
+) -> tuple[int, float]:
+    """Resolve lifecycle verify timeout, deriving headroom from recent green full-suite runs."""
+    configured_timeout, grace = _resolve_review_verify_timeout_settings(config)
+    command_identity = normalized_verify_command(
+        verify_command if verify_command is not None else getattr(config, "verify_command", None)
+    )
+    derived_timeout = _derived_lifecycle_verify_timeout_seconds(
+        store,
+        scope=scope,
+        command_identity=command_identity,
+    )
+    if derived_timeout is None or derived_timeout <= configured_timeout:
+        return configured_timeout, grace
+    logger.warning(
+        "autonomous_verify_timeout_seconds=%ss is below recent green verify runtime plus headroom; "
+        "using derived lifecycle verify budget %ss",
+        configured_timeout,
+        derived_timeout,
+    )
+    return derived_timeout, grace
+
+
 def _run_verify_command(
     verify_command: str,
     *,
@@ -5594,6 +6109,7 @@ def _aggregate_cross_project_review_verify_result(
 def _run_verify_commands_for_projects(
     *,
     config: Config,
+    store: SqliteTaskStore | None = None,
     task: Task,
     worktree_git: Git,
     worktree_path: Path,
@@ -5633,7 +6149,6 @@ def _run_verify_commands_for_projects(
     for project in affected.projects:
         scope = _format_repo_project_scope(project.scope_root)
         project_cwd = worktree_path if project.scope_root == Path(".") else worktree_path / project.scope_root
-        project_timeout_seconds, project_timeout_grace_seconds = _resolve_review_verify_timeout_settings(project.config)
         if not project.verify_command:
             project_results.append(
                 ProjectReviewVerifyResult(
@@ -5654,6 +6169,39 @@ def _run_verify_commands_for_projects(
                 ]
             )
             continue
+
+        project_timeout_seconds = timeout_seconds
+        project_timeout_grace_seconds = timeout_grace_seconds
+        if store is not None:
+            try:
+                project_timeout_seconds, project_timeout_grace_seconds = resolve_lifecycle_verify_timeout_settings(
+                    project.config,
+                    store,
+                    scope=scope,
+                    verify_command=project.verify_command,
+                )
+            except LifecycleVerifyBudgetError as exc:
+                result = _make_review_verify_result(
+                    project.verify_command,
+                    status="unavailable",
+                    exit_status="budget unavailable",
+                    captured_at=datetime.now(UTC),
+                    reviewed_branch=reviewed_branch,
+                    reviewed_head_sha=reviewed_head_sha,
+                    reviewed_base_sha=reviewed_base_sha,
+                    working_directory=str(project_cwd),
+                    failure=f"could not resolve lifecycle verify budget for scope {scope}: {exc}",
+                )
+                project_results.append(
+                    ProjectReviewVerifyResult(
+                        project=project,
+                        scope=scope,
+                        working_directory=str(project_cwd),
+                        result=result,
+                    )
+                )
+                section_entries.extend([f"### {scope}", "", *_strip_review_verify_heading(_format_review_verify_result(result)), ""])
+                continue
 
         result = _run_review_verify_command(
             project.verify_command,
@@ -5683,6 +6231,8 @@ def _run_verify_commands_for_projects(
                 scope=scope,
                 working_directory=str(project_cwd),
                 result=result,
+                timeout_seconds=project_timeout_seconds,
+                timeout_grace_seconds=project_timeout_grace_seconds,
             )
         )
         result_lines = _strip_review_verify_heading(_format_review_verify_result(result))
@@ -5729,6 +6279,7 @@ def _run_verify_commands_for_projects(
 def _run_review_verify_commands_for_projects(
     *,
     config: Config,
+    store: SqliteTaskStore | None = None,
     task: Task,
     worktree_git: Git,
     worktree_path: Path,
@@ -5745,6 +6296,7 @@ def _run_review_verify_commands_for_projects(
     """Compatibility wrapper for review-specific cross-project execution."""
     return _run_verify_commands_for_projects(
         config=config,
+        store=store,
         task=task,
         worktree_git=worktree_git,
         worktree_path=worktree_path,
@@ -5763,6 +6315,7 @@ def _run_review_verify_commands_for_projects(
 def _run_lifecycle_verify(
     *,
     config: Config,
+    store: SqliteTaskStore | None = None,
     task: Task,
     worktree_git: Git,
     worktree_path: Path,
@@ -5781,6 +6334,7 @@ def _run_lifecycle_verify(
     if _task_is_cross_project(task, config):
         execution = _run_review_verify_commands_for_projects(
             config=config,
+            store=store,
             task=task,
             worktree_git=worktree_git,
             worktree_path=worktree_path,
@@ -5889,13 +6443,20 @@ def _capture_noop_verify_fix_timeout_rerun(
         current_head_sha=proven_head,
     ):
         return False
-    timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(config)
+    try:
+        timeout_seconds, timeout_grace_seconds = resolve_lifecycle_verify_timeout_settings(config, store)
+    except LifecycleVerifyBudgetError as exc:
+        _warn_verify_fix_timeout_rerun_prerequisite(
+            f"Cannot resolve lifecycle verify budget for verify_fix task {task.id}; manual attention is required. {exc}"
+        )
+        return False
     rerun_cwd = _worktree_execution_dir(worktree_path, boundary)
     worktree_git_env = getattr(worktree_git, "env", None)
     if worktree_git_env is None:
         worktree_git_env = RuntimeExecutionContext.from_config(config).env
     execution = _run_lifecycle_verify(
         config=config,
+        store=store,
         task=task,
         worktree_git=worktree_git,
         worktree_path=worktree_path,

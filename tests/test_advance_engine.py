@@ -20,6 +20,7 @@ from gza.advance_engine import (
     NOOP_IMPROVE_KIND_VERIFY_ONLY,
     PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_INVALID,
     PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE,
+    PARK_REASON_VERIFY_BUDGET_EXCEEDED,
     REVIEW_CLEARANCE_ARTIFACT_KIND,
     VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_ARTIFACT_KIND,
     VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_STATUS,
@@ -79,7 +80,13 @@ from gza.review_verify_state import (
     persist_verify_gate_artifact,
     refresh_preserved_rebase_review_verify_heads,
 )
-from gza.runner import CROSS_PROJECT_TAG, ReviewVerifyResult
+from gza.runner import (
+    CROSS_PROJECT_TAG,
+    PHASE_EVIDENCE_RED,
+    VERIFY_GATE_ARTIFACT_KIND,
+    ReviewVerifyResult,
+    validate_verify_phase_evidence_from_metadata,
+)
 from gza.task_query import collect_scoped_tag_scope_gaps
 
 
@@ -22735,6 +22742,526 @@ def test_pre_review_failed_verify_creates_verify_fix(tmp_path: Path) -> None:
 
     assert action["type"] == "create_verify_fix"
     assert action["verify_epoch"].reviewed_head_sha == "verify-head"
+
+
+@pytest.mark.parametrize(
+    ("exit_status", "failure_origin"),
+    [
+        ("1", "test_failure"),
+        ("timed out", "timeout"),
+    ],
+)
+def test_pre_review_red_phase_verify_routes_to_verify_fix(
+    tmp_path: Path,
+    exit_status: str,
+    failure_origin: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-red-phase",
+        when=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status=exit_status,
+            captured_at=datetime(2026, 8, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="unit phase failed",
+            failure_origin=failure_origin,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+        aggregate_details={
+            "schema_version": 1,
+            "phase_results": [
+                {"name": "unit", "status": "failed", "duration_seconds": 3.25},
+            ],
+            "started_phase_names": ["unit"],
+            "completed_phase_names": ["unit"],
+            "failed_phase_names": ["unit"],
+            "expected_phase_names": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+            "not_started_phase_names": ["ruff", "ty", "mypy", "checks", "functional"],
+        },
+    )
+    artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    assert artifacts
+    validation = validate_verify_phase_evidence_from_metadata(artifacts[0].metadata)
+    assert validation.state == PHASE_EVIDENCE_RED
+    assert validation.failed_phase_names == ("unit",)
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_verify_fix"
+    assert action["verify_epoch"].reviewed_head_sha == "verify-head"
+    assert store.get_verify_fix_tasks_by_root(impl.id) == []
+
+
+def test_pre_review_budget_timeout_routes_to_attention_without_verify_fix(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-budget-timeout",
+        when=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="verify_command timed out after 120s",
+            failure_origin="timeout",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+        aggregate_details={
+            "schema_version": 1,
+            "phase_results": [
+                {"name": "ruff", "status": "passed", "duration_seconds": 1.4},
+                {"name": "ty", "status": "passed", "duration_seconds": 1.4},
+                {"name": "mypy", "status": "passed", "duration_seconds": 25.6},
+                {"name": "checks", "status": "passed", "duration_seconds": 4.9},
+                {"name": "unit", "status": "passed", "duration_seconds": 558.9},
+            ],
+            "started_phase_names": ["ruff", "ty", "mypy", "checks", "unit"],
+            "completed_phase_names": ["ruff", "ty", "mypy", "checks", "unit"],
+            "failed_phase_names": [],
+            "expected_phase_names": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+            "not_started_phase_names": ["functional"],
+        },
+    )
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == PARK_REASON_VERIFY_BUDGET_EXCEEDED
+    assert action["verify_gate_phase"] == "pre_merge"
+    assert action["verify_phase_summary"]["completed_phase_names"] == ("ruff", "ty", "mypy", "checks", "unit")
+    assert action["verify_phase_summary"]["not_started_phase_names"] == ("functional",)
+    assert store.get_verify_fix_tasks_by_root(impl.id) == []
+
+
+@pytest.mark.parametrize(
+    "aggregate_details",
+    [
+        None,
+        {
+            "schema_version": 1,
+            "phase_results": [],
+            "started_phase_names": [],
+            "completed_phase_names": [],
+            "failed_phase_names": [],
+            "expected_phase_names": ["ruff"],
+            "not_started_phase_names": ["ruff"],
+        },
+        {
+            "schema_version": 1,
+            "phase_results": [],
+            "started_phase_names": ["ruff"],
+            "completed_phase_names": [],
+            "failed_phase_names": [],
+            "expected_phase_names": ["ruff"],
+            "not_started_phase_names": [],
+        },
+        {
+            "schema_version": 1,
+            "phase_results": [{"name": "ruff", "status": "unknown", "duration_seconds": 1.0}],
+            "started_phase_names": ["ruff"],
+            "completed_phase_names": ["ruff"],
+            "failed_phase_names": [],
+            "expected_phase_names": ["ruff"],
+            "not_started_phase_names": [],
+        },
+        {
+            "schema_version": 1,
+            "phase_results": [{"name": "ruff", "status": "failed", "duration_seconds": 1.0}],
+            "started_phase_names": ["ruff"],
+            "completed_phase_names": ["ruff"],
+            "failed_phase_names": [],
+            "expected_phase_names": ["ruff"],
+            "not_started_phase_names": [],
+        },
+        {
+            "schema_version": 1,
+            "phase_results": [{"scope": "services/foo"}],
+            "started_phase_names": [],
+            "completed_phase_names": [],
+            "failed_phase_names": [],
+            "expected_phase_names": [],
+            "not_started_phase_names": [],
+            "scopes": [
+                {
+                    "scope": "services/foo",
+                    "status": "failed",
+                    "failure_origin": "timeout",
+                    "phase_diagnostics": {
+                        "phase_results": [],
+                        "started_phase_names": [],
+                        "completed_phase_names": [],
+                        "failed_phase_names": [],
+                        "expected_phase_names": ["unit"],
+                        "not_started_phase_names": ["unit"],
+                    },
+                }
+            ],
+        },
+    ],
+)
+def test_pre_review_timeout_with_indeterminate_phase_evidence_does_not_use_budget_route(
+    tmp_path: Path,
+    aggregate_details: dict[str, object] | None,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/pre-review-indeterminate-timeout",
+        when=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="verify_command timed out after 120s",
+            failure_origin="timeout",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+        aggregate_details=aggregate_details,
+    )
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action.get("needs_attention_reason") != PARK_REASON_VERIFY_BUDGET_EXCEEDED
+    assert "No executed phase reported a failure" not in action.get("description", "")
+
+
+@pytest.mark.parametrize("existing_status", ["pending", "in_progress", "completed", "failed"])
+def test_pre_review_budget_timeout_parks_even_with_existing_verify_fix(
+    tmp_path: Path,
+    existing_status: str,
+) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch=f"feature/pre-review-budget-timeout-{existing_status}",
+        when=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+    )
+    epoch = VerifyEpoch(
+        reviewed_branch=impl.branch,
+        reviewed_head_sha="verify-head",
+        verify_command="./bin/tests",
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="failed",
+            exit_status="timed out",
+            captured_at=datetime(2026, 8, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory=str(tmp_path),
+            failure="verify_command timed out after 120s",
+            failure_origin="timeout",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+        aggregate_details={
+            "schema_version": 1,
+            "phase_results": [
+                {"name": "ruff", "status": "passed", "duration_seconds": 1.4},
+                {"name": "unit", "status": "passed", "duration_seconds": 110.0},
+            ],
+            "started_phase_names": ["ruff", "unit"],
+            "completed_phase_names": ["ruff", "unit"],
+            "failed_phase_names": [],
+            "expected_phase_names": ["ruff", "ty", "mypy", "checks", "unit", "functional"],
+            "not_started_phase_names": ["ty", "mypy", "checks", "functional"],
+        },
+    )
+    verify_fix = store.add(
+        build_verify_fix_prompt(impl.id, epoch),
+        task_type="verify_fix",
+        based_on=impl.id,
+        same_branch=True,
+    )
+    assert verify_fix.id is not None
+    verify_fix.branch = impl.branch
+    verify_fix.status = existing_status
+    if existing_status == "completed":
+        verify_fix.completed_at = datetime(2026, 8, 29, 12, 10, tzinfo=UTC)
+    store.update(verify_fix)
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == PARK_REASON_VERIFY_BUDGET_EXCEEDED
+    assert action["verify_phase_summary"]["completed_phase_names"] == ("ruff", "unit")
+    assert action["verify_phase_summary"]["not_started_phase_names"] == (
+        "ty",
+        "mypy",
+        "checks",
+        "functional",
+    )
+    assert action["type"] not in {
+        "create_verify_fix",
+        "run_verify_fix",
+        "wait_verify_fix",
+        "rerun_completed_verify_fix",
+    }
+    refreshed = store.get(verify_fix.id)
+    assert refreshed is not None
+    assert refreshed.status == existing_status
+
+
+def test_pre_review_cross_project_budget_timeout_routes_to_attention_with_scope_summary(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "(per-project verify_command)"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/cross-project-budget-timeout",
+        when=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="(per-project verify_command)",
+            status="failed",
+            exit_status="1 passed, 1 failed, 0 unavailable",
+            captured_at=datetime(2026, 8, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory="(per-project; see artifact)",
+            failure="one or more affected projects failed review verification",
+            failure_origin="timeout",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+        aggregate_details={
+            "schema_version": 1,
+            "phase_results": [
+                {"scope": "services/foo", "name": "unit", "status": "passed", "duration_seconds": 110.0},
+                {"scope": "libs/bar", "name": "ruff", "status": "passed", "duration_seconds": 1.0},
+            ],
+            "started_phase_names": ["services/foo:unit", "libs/bar:ruff"],
+            "completed_phase_names": ["services/foo:unit", "libs/bar:ruff"],
+            "failed_phase_names": [],
+            "expected_phase_names": [
+                "services/foo:unit",
+                "services/foo:functional",
+                "libs/bar:ruff",
+                "libs/bar:unit",
+            ],
+            "not_started_phase_names": ["services/foo:functional", "libs/bar:unit"],
+            "scopes": [
+                {
+                    "scope": "services/foo",
+                    "status": "failed",
+                    "failure_origin": "timeout",
+                    "phase_diagnostics": {
+                        "phase_results": [
+                            {"name": "unit", "status": "passed", "duration_seconds": 110.0},
+                        ],
+                        "started_phase_names": ["unit"],
+                        "completed_phase_names": ["unit"],
+                        "failed_phase_names": [],
+                        "expected_phase_names": ["unit", "functional"],
+                        "not_started_phase_names": ["functional"],
+                    },
+                },
+                {
+                    "scope": "libs/bar",
+                    "status": "passed",
+                    "phase_diagnostics": {
+                        "phase_results": [
+                            {"name": "ruff", "status": "passed", "duration_seconds": 1.0},
+                        ],
+                        "started_phase_names": ["ruff"],
+                        "completed_phase_names": ["ruff"],
+                        "failed_phase_names": [],
+                        "expected_phase_names": ["ruff", "unit"],
+                        "not_started_phase_names": ["unit"],
+                    },
+                },
+            ],
+        },
+    )
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "needs_discussion"
+    assert action["needs_attention_reason"] == PARK_REASON_VERIFY_BUDGET_EXCEEDED
+    assert action["verify_phase_summary"]["scopes"][0]["completed_phase_names"] == ("unit",)
+    assert "services/foo completed [unit], not-started [functional]" in action["description"]
+    assert store.get_verify_fix_tasks_by_root(impl.id) == []
+
+
+def test_pre_review_cross_project_timeout_with_failed_child_phase_routes_to_verify_fix(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.require_review_before_merge = False
+    config.verify_command = "(per-project verify_command)"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = _make_completed_unmerged_impl(
+        store,
+        branch="feature/cross-project-timeout-red-phase",
+        when=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+    )
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="(per-project verify_command)",
+            status="failed",
+            exit_status="1 passed, 1 failed, 0 unavailable",
+            captured_at=datetime(2026, 8, 29, 12, 5, tzinfo=UTC),
+            reviewed_branch=impl.branch,
+            reviewed_head_sha="verify-head",
+            reviewed_base_sha="base-head",
+            working_directory="(per-project; see artifact)",
+            failure="one or more affected projects failed review verification",
+            failure_origin="timeout",
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+        aggregate_details={
+            "schema_version": 1,
+            "phase_results": [
+                {"scope": "services/foo", "name": "unit", "status": "failed", "duration_seconds": 3.0},
+                {"scope": "libs/bar", "name": "ruff", "status": "passed", "duration_seconds": 1.0},
+            ],
+            "started_phase_names": ["services/foo:unit", "libs/bar:ruff"],
+            "completed_phase_names": ["services/foo:unit", "libs/bar:ruff"],
+            "failed_phase_names": ["services/foo:unit"],
+            "expected_phase_names": ["services/foo:unit", "libs/bar:ruff"],
+            "not_started_phase_names": [],
+            "scopes": [
+                {
+                    "scope": "services/foo",
+                    "status": "failed",
+                    "failure_origin": "timeout",
+                    "phase_diagnostics": {
+                        "phase_results": [
+                            {"name": "unit", "status": "failed", "duration_seconds": 3.0},
+                        ],
+                        "started_phase_names": ["unit"],
+                        "completed_phase_names": ["unit"],
+                        "failed_phase_names": ["unit"],
+                        "expected_phase_names": ["unit"],
+                        "not_started_phase_names": [],
+                    },
+                },
+                {
+                    "scope": "libs/bar",
+                    "status": "passed",
+                    "phase_diagnostics": {
+                        "phase_results": [
+                            {"name": "ruff", "status": "passed", "duration_seconds": 1.0},
+                        ],
+                        "started_phase_names": ["ruff"],
+                        "completed_phase_names": ["ruff"],
+                        "failed_phase_names": [],
+                        "expected_phase_names": ["ruff"],
+                        "not_started_phase_names": [],
+                    },
+                },
+            ],
+        },
+    )
+    artifacts = store.list_artifacts(impl.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    assert artifacts
+    validation = validate_verify_phase_evidence_from_metadata(artifacts[0].metadata)
+    assert validation.state == PHASE_EVIDENCE_RED
+    assert validation.failed_phase_names == ("services/foo:unit",)
+    git = _FakeGit(can_merge=True, ref_shas={impl.branch: "verify-head"})
+
+    action = evaluate_advance_rules(config, store, git, impl, "main")
+
+    assert action["type"] == "create_verify_fix"
+    assert action["verify_epoch"].reviewed_head_sha == "verify-head"
+    assert store.get_verify_fix_tasks_by_root(impl.id) == []
 
 
 def test_pre_review_cross_project_placeholder_verify_pass_creates_closing_review(tmp_path: Path) -> None:

@@ -75,7 +75,7 @@ Task-scoped `advance <task-id> --repeat` runs the same lifecycle engine in a for
 | `max_review_cycles` | `3` | Max review→improve cycles within one durable-progress epoch before flagging for manual intervention |
 | `max_noop_improve_cycles` | `1` | Max consecutive no-op improves before lifecycle automation stops for discussion |
 | `advance_off_topic_verify_unblock` | `false` | Whether the narrow legacy compatibility lane for verify-only blocked reviews MAY clear through the audited off-topic verify-failure path instead of parking |
-| `autonomous_verify_timeout_seconds` | `120` | Timeout for lifecycle/automation-initiated `verify_command` runs |
+| `autonomous_verify_timeout_seconds` | `120` | Configured floor for lifecycle/automation-initiated `verify_command` runs; recent full-suite observations can derive a larger effective timeout |
 | `review_verify_timeout_grace_seconds` | `5` | Grace period after SIGTERM before autonomous lifecycle verification escalates to SIGKILL; accepts float values >= 1 second |
 | `recommend_rebase_behind_commits` | `1` | Deprecated compatibility key; accepted but ignored by lifecycle planning |
 | `merge_squash_threshold` | `0` | Auto-squash branches with >= N commits (0 = disabled) |

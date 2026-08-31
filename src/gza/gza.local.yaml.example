@@ -414,7 +414,8 @@ provider: codex
 # Default: false
 # advance_off_topic_verify_unblock: false
 
-# Timeout in seconds for lifecycle/automation-initiated verify_command runs.
+# Configured timeout floor in seconds for lifecycle/automation-initiated verify_command runs.
+# Recent full-suite observations may derive a larger effective timeout for lifecycle gates.
 # Default: 120
 # autonomous_verify_timeout_seconds: 120
 

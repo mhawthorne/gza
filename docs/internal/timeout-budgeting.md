@@ -49,7 +49,15 @@ before a final provider summary is emitted.
 Autonomous lifecycle verification has a second timeout layer aimed at
 diagnostics, not longer budgets:
 
-- the runner enforces `autonomous_verify_timeout_seconds`;
+- `autonomous_verify_timeout_seconds` is the configured floor for lifecycle verify;
+- lifecycle verify may raise the effective budget above that floor when recent
+  persisted full-suite `./bin/tests` phase observations show the suite needs more
+  wall-clock headroom. Complete green runs count as full observations. Timeout runs
+  with completed phase results and no failed phase count conservatively as lower-bound
+  observations. The derived budget is the observed max plus 25% and 30 seconds, and
+  the effective value is recorded as verify provenance;
+- if recent verify-artifact inspection fails, lifecycle surfaces a budget diagnostic
+  instead of silently falling back to the configured floor;
 - on timeout it sends SIGTERM to the verify process group;
 - it waits `review_verify_timeout_grace_seconds` for the harness to flush
   diagnostics such as slow-test summaries or faulthandler dumps;
@@ -66,6 +74,10 @@ diagnostics, not longer budgets:
   timeout context, but they must not advertise reusable verify phases.
 - Verification wrappers should omit `tree_fingerprint=` entirely when exact
   fingerprinting is unavailable, rather than emitting placeholder values.
+- If a timeout records completed phase results and no failed phase result, lifecycle
+  parks the owner as `verify-budget-exceeded` and does not spawn a `verify_fix`.
+  The timeout remains a blocking verify gate; the route changes only the operator
+  diagnosis.
 
 ## Pytest parallel-only rerun bridges
 

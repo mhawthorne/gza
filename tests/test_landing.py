@@ -11,22 +11,22 @@ from gza.config import Config
 from gza.db import SqliteTaskStore, Task
 from gza.landing import (
     LANDING_PHASES,
-    LandingPostRebaseReviewRequest,
+    LandBlocked,
     LandingFollowupFinding,
     LandingFollowupMaterializationIdentity,
-    LandingOpenBlocker,
-    LandingJudgment,
     LandingJudgeVerdict,
+    LandingJudgment,
+    LandingOpenBlocker,
     LandingPolicyDecision,
     LandingPolicyFacts,
-    LandingRebaseOutcomeIdentity,
+    LandingPostRebaseReviewRequest,
     LandingRebaseFingerprint,
+    LandingRebaseOutcomeIdentity,
     LandingReviewEvidence,
     LandingSpecCoherenceEvidence,
     LandingSpecCoherenceFingerprint,
     LandingStateFingerprint,
     LandingVerifyEvidence,
-    LandBlocked,
     LandPostMergeVerifyFailure,
     LandRequest,
     LandResult,
@@ -45,8 +45,8 @@ from gza.review_verify_state import (
     VerifyGateLookup,
     VerifyGateResult,
     make_verify_epoch,
-    persist_verify_gate_artifact,
     persist_recredited_verify_gate_artifact,
+    persist_verify_gate_artifact,
 )
 from gza.runner import (
     LifecycleVerifyExecution,
@@ -54,7 +54,6 @@ from gza.runner import (
     ReviewVerifyResult,
     _persist_lifecycle_verify_execution,
 )
-
 
 TREE_A = "a" * 64
 TREE_B = "b" * 64
@@ -2493,6 +2492,61 @@ def test_inspect_current_landing_verify_blocks_inconsistent_cross_project_tree_p
     impl.branch = "feature/landing"
     store.update(impl)
     _persist_lifecycle_verify_for_landing(store, config, impl, aggregate_tree=None, project_trees=(TREE_A, TREE_B))
+
+    evidence = inspect_current_landing_verify_evidence(
+        store,
+        impl,
+        config=config,
+        git=_FakeGit({"feature/landing": "head-a"}),
+        source_head="head-a",
+        tree_fingerprint=TREE_A,
+    )
+
+    assert evidence.status == "passed"
+    assert evidence.current is True
+    assert evidence.identity_matched is False
+    assert evidence.tree_fingerprint is None
+
+
+def test_inspect_current_landing_verify_rejects_cross_project_tree_fallback(tmp_path) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    config = _verify_config(tmp_path)
+    impl = store.add("Implement landing verify", task_type="implement")
+    impl.status = "completed"
+    impl.branch = "feature/landing"
+    store.update(impl)
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=impl,
+        source_task=impl,
+        result=ReviewVerifyResult(
+            command="./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 26, 12, 0, tzinfo=UTC),
+            reviewed_branch="feature/landing",
+            reviewed_head_sha="head-a",
+            reviewed_base_sha="base-a",
+            working_directory="/tmp/worktree",
+            failure=None,
+            output=(
+                "verify output\n"
+                f"gza-verify phase=passed name=unit duration_seconds=1.0 tree_fingerprint={TREE_A}\n"
+            ),
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="advance_verify_gate",
+        provenance={"tree_fingerprint": TREE_A},
+        aggregate_details={
+            "runnable_count": 2,
+            "tree_fingerprint": None,
+            "tree_fingerprint_complete": False,
+            "tree_fingerprint_missing_count": 1,
+            "scopes": [],
+        },
+    )
 
     evidence = inspect_current_landing_verify_evidence(
         store,

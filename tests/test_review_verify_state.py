@@ -248,6 +248,66 @@ def test_persist_verify_gate_artifact_stores_provenance_and_cross_project_aggreg
     assert lookup.source == "owner_artifact"
 
 
+@pytest.mark.parametrize(
+    "aggregate_details",
+    [
+        {
+            "runnable_count": 2,
+            "tree_fingerprint": None,
+            "tree_fingerprint_complete": False,
+            "tree_fingerprint_missing_count": 1,
+            "scopes": [],
+        },
+        {
+            "runnable_count": 2,
+            "tree_fingerprint": None,
+            "tree_fingerprint_complete": False,
+            "tree_fingerprint_contradictory": True,
+            "scopes": [],
+        },
+    ],
+)
+def test_build_verify_gate_artifact_payload_rejects_cross_project_fingerprint_fallback(
+    tmp_path: Path,
+    aggregate_details: dict[str, object],
+) -> None:
+    impl = SimpleNamespace(id="gza-1", task_type="implement")
+
+    payload = build_verify_gate_artifact_payload(
+        result=_result(captured_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC)),
+        source_task=impl,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        provenance={"tree_fingerprint": "f" * 64},
+        aggregate_details=aggregate_details,
+    )
+
+    assert "tree_fingerprint" not in payload
+
+
+def test_build_verify_gate_artifact_payload_allows_single_project_fingerprint_fallback(tmp_path: Path) -> None:
+    impl = SimpleNamespace(id="gza-1", task_type="implement")
+
+    payload = build_verify_gate_artifact_payload(
+        result=_result(captured_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC)),
+        source_task=impl,
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        provenance={"tree_fingerprint": "f" * 64},
+        aggregate_details={
+            "schema_version": 1,
+            "phase_results": [{"name": "unit", "status": "passed", "duration_seconds": 1.0}],
+            "started_phase_names": ["unit"],
+            "completed_phase_names": ["unit"],
+            "failed_phase_names": [],
+            "expected_phase_names": ["unit"],
+            "not_started_phase_names": [],
+        },
+    )
+
+    assert payload["tree_fingerprint"] == "f" * 64
+
+
 def test_latest_verify_result_for_epoch_marks_canonical_owner_artifact_stale(tmp_path: Path) -> None:
     store = SqliteTaskStore(tmp_path / "test.db")
     impl = store.add("Implement stale canonical verify", task_type="implement")

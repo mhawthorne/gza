@@ -1401,6 +1401,169 @@ def test_recover_verify_only_noop_review_passes_runtime_context_to_cross_project
     assert os.environ["PROJECT_ONLY_TOKEN"] == "ambient-cross-token"
 
 
+def test_recover_verify_only_noop_review_uses_child_project_verify_budgets(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "gza.yaml").write_text(
+        "project_name: root\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
+        "verify_command: ./bin/root-verify\n"
+        "autonomous_verify_timeout_seconds: 120\n"
+        "review_verify_timeout_grace_seconds: 3\n"
+    )
+    service_dir = tmp_path / "services" / "foo"
+    lib_dir = tmp_path / "libs" / "bar"
+    service_dir.mkdir(parents=True)
+    lib_dir.mkdir(parents=True)
+    (service_dir / "gza.yaml").write_text(
+        "project_name: foo\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
+        "verify_command: ./bin/foo-verify\n"
+        "autonomous_verify_timeout_seconds: 300\n"
+        "review_verify_timeout_grace_seconds: 11\n"
+    )
+    (lib_dir / "gza.yaml").write_text(
+        "project_name: bar\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
+        "verify_command: ./bin/bar-verify\n"
+        "autonomous_verify_timeout_seconds: 222\n"
+        "review_verify_timeout_grace_seconds: 22\n"
+    )
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement feature", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/verify-only-noop-cross-budget")
+    store.update(impl)
+    review = store.add("Review feature", task_type="review", depends_on=impl.id)
+    assert review.id is not None
+    _mark_completed(review)
+    review.review_verify_status = "failed"
+    review.review_verify_branch = impl.branch
+    review.review_verify_head_sha = "same-head"
+    store.update(review)
+    improve = store.add("Improve attempt", task_type="improve", depends_on=review.id, based_on=impl.id, same_branch=True)
+    assert improve.id is not None
+    improve.status = "completed"
+    improve.completed_at = datetime.now(UTC)
+    improve.branch = impl.branch
+    improve.changed_diff = False
+    improve.tags = (CROSS_PROJECT_TAG,)
+    store.update(improve)
+    store.add_artifact(
+        impl.id,
+        kind=VERIFY_GATE_ARTIFACT_KIND,
+        path=".gza/artifacts/scoped-timeout-budget.json",
+        byte_size=2,
+        sha256="0" * 64,
+        created_at=datetime(2026, 8, 29, 12, 0, tzinfo=UTC),
+        metadata={
+            "schema_version": 1,
+            "result": {"command": "(per-project verify_command)", "status": "failed", "failure_origin": "timeout"},
+            "verify_epoch": {"verify_command": "(per-project verify_command)"},
+            "aggregate_details": {
+                "scopes": [
+                    {
+                        "scope": "services/foo",
+                        "status": "failed",
+                        "failure_origin": "timeout",
+                        "command_identity": "./bin/foo-verify",
+                        "verify_timeout_seconds": 600,
+                        "verify_timeout_grace_seconds": 11,
+                        "phase_diagnostics": {
+                            "phase_results": [{"name": "unit", "status": "passed", "duration_seconds": 1.0}],
+                            "started_phase_names": ["unit"],
+                            "completed_phase_names": ["unit"],
+                            "failed_phase_names": [],
+                            "expected_phase_names": ["unit"],
+                            "not_started_phase_names": [],
+                        },
+                    }
+                ]
+            },
+        },
+        status="failed",
+    )
+
+    class CrossProjectBudgetGit(_VerifyOnlyNoopGit):
+        def worktree_add_existing(self, path: Path, ref: str, *, detach: bool = False) -> Path:
+            super().worktree_add_existing(path, ref, detach=detach)
+            worktree_service_dir = path / "services" / "foo"
+            worktree_lib_dir = path / "libs" / "bar"
+            worktree_service_dir.mkdir(parents=True)
+            worktree_lib_dir.mkdir(parents=True)
+            (worktree_service_dir / "gza.yaml").write_text((service_dir / "gza.yaml").read_text())
+            (worktree_lib_dir / "gza.yaml").write_text((lib_dir / "gza.yaml").read_text())
+            return path
+
+    git = CrossProjectBudgetGit(impl.branch or "", "same-head")
+    context = _base_executor_context(
+        store=store,
+        config=config,
+        trigger_source="advance",
+        git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
+    )
+
+    def make_worktree_git(path: Path, **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            repo_dir=Path(path),
+            default_branch=lambda: "main",
+            rev_parse_if_exists=lambda ref: "same-head",
+            get_diff_name_status=lambda *_args, **_kwargs: "M\tservices/foo/app.py\nM\tlibs/bar/lib.py\n",
+        )
+
+    with (
+        patch("gza.cli.advance_executor.Git", side_effect=make_worktree_git),
+        patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-sha"),
+        patch(
+            "gza.runner._run_review_verify_command",
+            side_effect=lambda command, **_kwargs: {
+                "./bin/foo-verify": _make_review_verify_result(
+                    "./bin/foo-verify",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 8, 29, 12, 1, tzinfo=UTC),
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="same-head",
+                    reviewed_base_sha="base-sha",
+                ),
+                "./bin/bar-verify": _make_review_verify_result(
+                    "./bin/bar-verify",
+                    status="passed",
+                    exit_status="0",
+                    captured_at=datetime(2026, 8, 29, 12, 2, tzinfo=UTC),
+                    reviewed_branch=impl.branch,
+                    reviewed_head_sha="same-head",
+                    reviewed_base_sha="base-sha",
+                ),
+            }[command],
+        ) as verify_command,
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "recover_verify_only_noop_review",
+                "review_task": review,
+                "latest_noop_improve_task": improve,
+                "current_branch_head_sha": "same-head",
+            },
+            context=context,
+        )
+
+    assert result.status == "success"
+    calls_by_command = {verify_call.args[0]: verify_call.kwargs for verify_call in verify_command.call_args_list}
+    assert set(calls_by_command) == {"./bin/foo-verify", "./bin/bar-verify"}
+    assert calls_by_command["./bin/foo-verify"]["timeout_seconds"] == 780
+    assert calls_by_command["./bin/foo-verify"]["timeout_grace_seconds"] == 11.0
+    assert calls_by_command["./bin/bar-verify"]["timeout_seconds"] == 222
+    assert calls_by_command["./bin/bar-verify"]["timeout_grace_seconds"] == 22.0
+
+
 def test_recover_verify_only_noop_review_failed_verify_returns_attention(tmp_path: Path) -> None:
     setup_config(tmp_path)
     store = make_store(tmp_path)
