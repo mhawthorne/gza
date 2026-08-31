@@ -1782,6 +1782,7 @@ def test_cmd_watch_single_manifest_only_tags_apply_manifest_tag_mode(
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     manifest_path = tmp_path / "watch.yaml"
     manifest_path.write_text(
@@ -20921,6 +20922,7 @@ def test_watch_cycle_quiet_logs_deferred_blocker_materialization_failure_and_lea
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _make_completed_watch_merge_task(
         store,
@@ -24164,7 +24166,7 @@ def test_watch_cycle_isolated_batch_max_cycle_materializes_all_debt_before_one_p
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n"
-        "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
+        "main_checkout_isolate: true\nverify_command: ./bin/tests\non_max_cycles: merge_and_defer\n"
     )
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -24324,7 +24326,7 @@ def test_watch_cycle_isolated_batch_candidate_only_containment_waits_for_candida
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n"
-        "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
+        "main_checkout_isolate: true\nverify_command: ./bin/tests\non_max_cycles: merge_and_defer\n"
     )
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -24499,7 +24501,7 @@ def test_watch_cycle_isolated_batch_post_materialization_authority_race_preserve
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n"
-        "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
+        "main_checkout_isolate: true\nverify_command: ./bin/tests\non_max_cycles: merge_and_defer\n"
     )
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -24666,7 +24668,7 @@ def test_watch_cycle_isolated_batch_max_cycle_refuses_when_target_advances_befor
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n"
-        "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
+        "main_checkout_isolate: true\nverify_command: ./bin/tests\non_max_cycles: merge_and_defer\n"
     )
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -24786,7 +24788,7 @@ def test_watch_cycle_isolated_batch_max_cycle_final_authorization_blocks_before_
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n"
-        "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
+        "main_checkout_isolate: true\nverify_command: ./bin/tests\non_max_cycles: merge_and_defer\n"
     )
     store = make_store(tmp_path)
     task = _make_completed_watch_merge_task(
@@ -25021,7 +25023,7 @@ def test_watch_cycle_isolated_batch_source_move_during_second_materialization_pr
 ) -> None:
     (tmp_path / "gza.yaml").write_text(
         "project_name: test-project\nprovider: codex\nmodel: gpt-5.5\ndb_path: .gza/gza.db\n"
-        "main_checkout_isolate: true\nverify_command: ./bin/tests\n"
+        "main_checkout_isolate: true\nverify_command: ./bin/tests\non_max_cycles: merge_and_defer\n"
     )
     store = make_store(tmp_path)
     config = Config.load(tmp_path)
@@ -25614,6 +25616,7 @@ def test_watch_cycle_isolated_batch_max_cycle_materialization_failure_aborts_who
     units = [store.get_or_create_merge_unit_for_task(task) for task in tasks]
     assert all(unit is not None for unit in units)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     actions: dict[str, dict[str, object]] = {}
     for index, task in enumerate(tasks, start=1):
         review_output = _watch_capped_review_output(f"B{index}")

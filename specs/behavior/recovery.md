@@ -235,8 +235,16 @@ its stored action.
   cases, not content-rescue cases: they MUST recommend the parked-task rearm path (`uv run
   gza unstick <owner-id> --reason retry-limit`, optionally `--run`), not `uv run gza fix`.
   `gza fix` remains reserved for genuine content/review churn such as
-  `review-max-cycles-reached` and completed-implementation failed recovery whose terminal
-  failure category is not retryable.
+  `review-max-cycles-reached` under the current default `on_max_cycles=park` and for
+  completed-implementation failed recovery whose terminal failure category is not
+  retryable. Under opt-in `on_max_cycles=merge_and_defer`, an eligible capped review is
+  no longer a recovery handoff: it remains a direct annotated merge action only after the
+  lifecycle engine proves fresh green current-head verify evidence plus deterministic
+  persisted blocker payload. The merge executor then durably creates or reuses every
+  deferred-blocker task before promotion, already-merged mutation, or merge-unit
+  finalization. Missing or stale verify evidence MUST run the normal pre-merge verify
+  path before eligibility is reconsidered; red or unavailable evidence remains on the
+  existing verify-fix or attention path and cannot merge-and-defer.
 - `iterate` MUST check the shared recovery predicate before printing an `empty` /
   `redundant` terminal message, and MUST NOT print that terminal for a pending resume row
   with a continuable session (see §4).

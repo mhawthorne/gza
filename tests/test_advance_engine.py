@@ -5349,7 +5349,7 @@ def test_capped_review_candidate_with_stale_verify_runs_pre_merge_verify_before_
     assert action["verify_gate_state"] == "stale"
 
 
-def test_default_on_max_cycles_with_green_verify_emits_annotated_merge_action(
+def test_opt_in_on_max_cycles_with_green_verify_emits_annotated_merge_action(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -5357,6 +5357,7 @@ def test_default_on_max_cycles_with_green_verify_emits_annotated_merge_action(
 
     store = _make_store(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     config.max_review_cycles = 0
     config.verify_command = "./bin/tests"
 

@@ -100,7 +100,8 @@ stateDiagram-v2
     Reviewing --> Mergeable: APPROVED (review still valid)
     Reviewing --> MergeableWithFollowups: APPROVED_WITH_FOLLOWUPS
     Reviewing --> Improving: CHANGES_REQUESTED\n(cycles < limit)
-    Reviewing --> HumanParked: unknown / inconsistent verdict,\ncurrent-head max cycles, duplicate blocker,\nverify-blocked
+    Reviewing --> MergeableWithDeferred: CHANGES_REQUESTED max cycles\non_max_cycles=merge_and_defer,\ngreen verify + persisted blocker payload
+    Reviewing --> HumanParked: unknown / inconsistent verdict,\ncurrent-head max cycles under park,\nduplicate blocker, verify-blocked
 
     Improving --> Verifying: improve changed code\n(re-run verify, then fresh review)
     Improving --> Recovering: improve fails
@@ -112,6 +113,7 @@ stateDiagram-v2
     Rebasing --> Mergeable: rebased, implementation patch preserved\n(prior approval carried)
     Rebasing --> HumanParked: rebase failed / circuit breaker /\ndid not unblock merge
     MergeableWithFollowups --> Merged: file follow-ups, then merge
+    MergeableWithDeferred --> Merged: file deferred blockers, then merge
     Mergeable --> Merged: merge succeeds
 
     Recovering --> Implementing: resume / retry (within bounds)
@@ -168,7 +170,17 @@ These hold across the whole machine; the detailed rules in
    obtains a current green verify gate, any mandatory spec-coherence gate, and a durable
    `LAND` judgment for that exact source/target/review/verify/blocker identity. This
    exception is operator-scoped only; `advance` and `watch` remain strict and MUST NOT use
-   guarded landing authority.
+   guarded landing authority. The current default `on_max_cycles=park` preserves the
+   ordinary review gate at `max_review_cycles`; the narrow unattended opt-in
+   `on_max_cycles=merge_and_defer` MAY bypass review approval only for ordinary
+   current-head capped `CHANGES_REQUESTED` reviews after the capped-review contract in
+   [lifecycle-engine.md](lifecycle-engine.md#6--review-state) proves fresh green
+   lifecycle-owned verify evidence for the exact current head and a deterministic
+   persisted blocker payload, then emits an annotated `merge` action. The merge executor
+   MUST create or reuse every required deferred-blocker task before promotion,
+   already-merged mutation, or merge-unit finalization records merge success. Missing or
+   stale verify evidence is not yet eligible and MUST run the normal pre-merge verify
+   path; red or unavailable verify evidence is not deferable.
    `APPROVED_WITH_FOLLOWUPS` permits merge only when the follow-up tasks are durably
    recorded *before* the merge completes, so nothing is lost. Historical compatibility
    handling for older review-coupled verify blockers MUST NOT be read as widening this
@@ -205,10 +217,11 @@ target branch, and either finishes idempotently when authoritative merge state i
 
 Running `gza land` is the operator's explicit authorization for that selected unit only.
 It does not change the normal two-gate merge invariant for `advance` or `watch`: unattended
-automation remains strict, never creates landing judgments, never defers new blockers, and
-never bypasses parked lifecycle gates merely because guarded landing exists. The narrow
-`on_max_cycles=merge_and_defer` exception is governed by the capped-review proof rules in
-[lifecycle-engine.md](lifecycle-engine.md#6--review-and-improve-loop).
+automation remains strict, never creates landing judgments, and never bypasses parked
+lifecycle gates merely because guarded landing exists. The only unattended blocker
+deferral allowed by this contract is the narrow `on_max_cycles=merge_and_defer`
+exception governed by the capped-review proof rules in
+[lifecycle-engine.md](lifecycle-engine.md#6--review-state).
 
 Successful guarded escalation is auditable as distinct merge provenance. A strict or
 non-escalated landing records `manual_land`; a guarded landing that defers blockers or
@@ -249,7 +262,7 @@ time, so each row names what would let us remove it.
 | `needs_discussion` — verify failed needs fix | The lifecycle-owned verify gate is red before review can proceed, but automation cannot safely create or continue the current `verify_fix` lane. | Inspect the failing verify evidence, repair the branch or environment, then re-advance. | Keep verify failures on a dedicated remediation lane instead of treating them as review blockers. |
 | `needs_discussion` — verify fix failed | One completed same-epoch `verify_fix` already ran, and the current verify gate is still red for that same implementation head / verify identity. | Inspect the failing verify evidence and the completed `verify_fix`, then take over manually. | Better targeted remediation quality and better verify diagnostics. |
 | `needs_discussion` — verify unavailable | The lifecycle-owned verify gate could not be run safely for the current implementation head, or remained unavailable after one same-epoch `verify_fix`. | Fix the environment or configuration problem, then re-advance. | More reliable verify setup and environment diagnostics. |
-| `max_cycles_reached` — review churn | Review→improve cycles within the current durable-progress epoch hit the bound (`max_review_cycles`) and no stale-review refresh path is available. Historical churn from older reviewed heads does not count once fresh durable progress has produced a new epoch. | Take over: review and fix inline, or redirect the work. | Better improve quality; raise/redesign the bound. |
+| `max_cycles_reached` — review churn | Review→improve cycles within the current durable-progress epoch hit the bound (`max_review_cycles`) and no stale-review refresh path is available. Under the current default `on_max_cycles=park`, this remains a manual-attention stop. Under opt-in `on_max_cycles=merge_and_defer`, eligible ordinary current-head code/resolution reviews instead follow the audited merge-and-defer path after fresh green verify and deterministic persisted blocker payload proof; the executor must durably create or reuse the blocker tasks before promotion, already-merged mutation, or merge-unit finalization. Missing or stale verify evidence goes through the normal pre-merge verify path first, while red or unavailable verify evidence remains non-deferred. | Take over: review and fix inline, or redirect the work. | Better improve quality; raise/redesign the bound. |
 | `needs_discussion` — blocker adjudication needed | A disputed non-verify CODE blocker reached independent adjudication, but the adjudicator returned `NEEDS_HUMAN`, failed, or produced an unsafe/unparseable result. | Review the blocker, the dispute evidence, and the adjudication output; then fix, override, or restate the blocker explicitly. | Reliable adjudication worker plus durable blocker-resolution state. |
 | `needs_discussion` — duplicate blocker | The same primary blocker repeats across cycles (default bound) with no progress. | Resolve the underlying issue the agent keeps missing. | Detect and break the repeat earlier. |
 | `needs_discussion` — no-op improves | Improve completed without changing code, repeatedly (`max_noop_improve_cycles`). Disputed non-verify CODE blockers route to adjudication first; remaining no-op cases still park. Legacy compatibility handling for verify-only blocked reviews does not make repeated no-op improves a normal merge path. | Decide whether the feedback is actionable; fix or drop. | Detect un-actionable feedback up front. |

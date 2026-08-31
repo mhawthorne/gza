@@ -4388,6 +4388,7 @@ def test_pending_capped_finalization_reconciles_current_scope_tags_before_state(
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Replay capped proof", "feature/replay-capped-proof")
     review_output = (
@@ -4445,6 +4446,7 @@ def test_pending_capped_finalization_reserved_tag_drift_blocks_state(
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Replay capped tag write failure", "feature/replay-capped-tag-fail")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -4493,6 +4495,7 @@ def test_pending_capped_finalization_tag_write_failure_blocks_state(
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(
         store,
@@ -4828,6 +4831,7 @@ def test_execute_merge_action_pending_replay_revalidates_proof_before_state(
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, f"Replay proof race {family} {race_case}", f"feature/{family}-{race_case}")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -5430,6 +5434,7 @@ def test_execute_merge_action_max_cycle_rejects_malformed_replay_child_before_st
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Malformed capped replay", "feature/capped-replay-shape")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -5477,6 +5482,7 @@ def test_execute_merge_action_max_cycle_rejects_duplicate_replay_children_before
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Duplicate capped replay", "feature/capped-replay-duplicate")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -5615,6 +5621,7 @@ def test_execute_merge_action_max_cycle_materializes_blockers_before_non_isolate
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Completed capped implementation", "feature/capped-order")
     review_output = _capped_review_output("B1")
@@ -5683,6 +5690,7 @@ def test_execute_merge_action_materializes_fresh_inner_replan_identity_before_me
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, f"Fresh replan {race_case}", f"feature/fresh-replan-{race_case}")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -6291,6 +6299,7 @@ def test_max_cycle_newer_ordinary_review_with_ambiguous_head_blocks_stale_action
     if executor_path == "isolated-single":
         config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     config.verify_command = "./bin/tests"
     store = make_store(tmp_path)
     task = _completed_merge_task(
@@ -6396,6 +6405,7 @@ def test_max_cycle_post_materialization_authority_race_preserves_debt_without_me
     if executor_path == "isolated-single":
         config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     config.verify_command = "./bin/tests"
     store = make_store(tmp_path)
     task = _completed_merge_task(
@@ -6669,6 +6679,7 @@ def test_execute_merge_action_max_cycle_materializes_blockers_before_already_mer
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Already merged capped implementation", "feature/capped-already")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -6725,6 +6736,7 @@ def test_stage_isolated_merge_action_max_cycle_already_merged_materializes_befor
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Staged already merged capped", "feature/staged-capped-already")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -6879,6 +6891,7 @@ def test_stage_isolated_merge_action_max_cycle_already_merged_materialization_fa
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Staged already merged capped failure", "feature/staged-capped-failure")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -6930,6 +6943,7 @@ def test_execute_merge_action_max_cycle_task_creation_failure_aborts_before_merg
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Creation failure capped implementation", "feature/capped-fail")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -6987,6 +7001,7 @@ def test_execute_merge_action_max_cycle_partial_creation_failure_returns_created
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Partial capped implementation", "feature/capped-partial-fail")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -7055,6 +7070,7 @@ def test_execute_merge_action_max_cycle_conflict_preflight_creates_no_deferred_b
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Conflict capped implementation", "feature/capped-conflict")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -7722,6 +7738,7 @@ def test_execute_merge_action_max_cycle_replay_reuses_existing_blockers_and_fill
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Replay capped implementation", "feature/capped-replay")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -7791,6 +7808,7 @@ def test_execute_merge_action_max_cycle_passes_active_scope_tags_to_blocker_crea
 ) -> None:
     setup_config(tmp_path)
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(
         store,
@@ -9586,6 +9604,7 @@ def test_execute_merge_action_isolated_checkpoint_failure_replays_action_provena
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\nverify_command: ./bin/tests\n")
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Isolated checkpoint capped", "feature/isolated-checkpoint-capped")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -9697,6 +9716,7 @@ def test_execute_merge_action_isolated_finalization_state_failure_preserves_debt
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\nverify_command: ./bin/tests\n")
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Isolated finalization state failure", "feature/isolated-final-state")
     unit = store.get_or_create_merge_unit_for_task(task)
@@ -9923,6 +9943,7 @@ def test_execute_merge_action_fail_closed_when_isolated_candidate_gate_checkout_
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     config.verify_command = "./bin/tests"
     store = make_store(tmp_path)
 
@@ -9963,6 +9984,7 @@ def test_execute_merge_action_isolated_candidate_verify_red_blocks_promotion(
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     config.verify_command = "./bin/tests"
     store = make_store(tmp_path)
 
@@ -10037,6 +10059,7 @@ def test_execute_merge_action_isolated_max_cycle_red_candidate_creates_no_debt(
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     config.verify_command = "./bin/tests"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Isolated capped red", "feature/isolated-capped-red")
@@ -10108,6 +10131,7 @@ def test_execute_merge_action_isolated_max_cycle_refuses_when_target_advances_be
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     config.verify_command = "./bin/tests"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Isolated capped target race", "feature/isolated-capped-target-race")
@@ -10457,6 +10481,7 @@ def test_max_cycle_blank_verify_refuses_before_debt_or_state(
     if executor_path == "isolated-single":
         config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     config.verify_command = ""
     store = make_store(tmp_path)
     task = _completed_merge_task(
@@ -10536,6 +10561,7 @@ def test_execute_merge_action_isolated_max_cycle_source_move_during_materializat
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     config.verify_command = "./bin/tests"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Isolated capped materialization race", "feature/isolated-capped-materialize-race")
@@ -10608,6 +10634,7 @@ def test_execute_merge_action_isolated_followup_source_move_during_materializati
     config_path = tmp_path / "gza.yaml"
     config_path.write_text(config_path.read_text() + "main_checkout_isolate: true\n")
     config = Config.load(tmp_path)
+    config.on_max_cycles = "merge_and_defer"
     config.verify_command = "./bin/tests"
     store = make_store(tmp_path)
     task = _completed_merge_task(store, "Isolated follow-up materialization race", "feature/isolated-followup-materialize-race")

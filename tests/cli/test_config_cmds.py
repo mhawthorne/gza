@@ -4950,15 +4950,15 @@ class TestOnMaxCyclesConfigValidation:
         config_path = tmp_path / "gza.yaml"
         config_path.write_text(f"project_name: test\nprovider: codex\nmodel: gpt-5.5\n{extra}")
 
-    def test_config_on_max_cycles_default_merges_and_defers(self, tmp_path: Path) -> None:
-        """Config.load ships merge-and-defer as the max-cycle default."""
+    def test_config_on_max_cycles_default_parks(self, tmp_path: Path) -> None:
+        """Config.load keeps park as the max-cycle default during opt-in rollout."""
         from gza.config import Config
 
         self._write_config(tmp_path, "")
 
         config = Config.load(tmp_path)
 
-        assert config.on_max_cycles == "merge_and_defer"
+        assert config.on_max_cycles == "park"
 
     @pytest.mark.parametrize("value", ["park", "merge_and_defer"])
     def test_config_on_max_cycles_allowed_values_load(self, tmp_path: Path, value: str) -> None:

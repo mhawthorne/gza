@@ -606,6 +606,18 @@ Each watch cycle MUST execute these phases in order:
    pre-merge proof failures, and source refs that change after mandatory child
    materialization, MUST report that the target is unchanged and MUST NOT route through
    conflict/rebase handling.
+   With current default `on_max_cycles=park`, a `review-max-cycles-reached` action remains
+   a human-attention signal. With opt-in `on_max_cycles=merge_and_defer`, the shared
+   lifecycle engine projects an eligible capped review as an annotated direct `merge`
+   action. Watch MUST execute that action in this direct phase, render lifecycle summaries
+   using merge-and-defer wording, create or reuse all mandatory deferred-blocker tasks
+   before promotion, already-merged mutation, or merge-unit finalization, persist
+   `max_cycles_deferred` merge provenance on success, and MUST NOT spawn an iterate
+   worker for that capped review. Missing or stale source verify evidence MUST run the
+   normal pre-merge verify path before eligibility is reconsidered; red or unavailable
+   source verify evidence, spec-coherence blockers, no-op/adjudication lanes,
+   duplicate-blocker stops, and plan-review caps stay on their existing non-deferred
+   paths and cannot merge-and-defer.
    If the isolated checkout is unavailable, or combined candidate verify is red or
    freshness is unproven, watch MUST leave the canonical target untouched. A red staged
    batch MUST trigger bounded replay from the canonical target until the first
@@ -624,7 +636,8 @@ Each watch cycle MUST execute these phases in order:
    parked-owner auto-rearm pass before any worker dispatch. This phase MUST stay
    supervisor-owned and MUST reuse the shared parked clear service; it MUST NOT invoke
    operator-triggered guarded landing, create a landing judge task, inspect per-merge
-   relevance, defer blockers, or fork a second lifecycle policy. For each
+   relevance, defer blockers outside the shared capped-review merge action, or fork a
+   second lifecycle policy. For each
    currently parked subject/reason candidate, watch MUST first exclude
    `verify-fix-failed`, which remains a manual-only fresh-verify escape hatch, and then
    apply these gates in order: feature enabled, budget remaining, cooldown elapsed, and
@@ -1128,8 +1141,10 @@ These are exclusions in the contract, not omissions in the current implementatio
 - Watch MUST NOT kill, reset, or discard code work solely to make the loop progress.
 - Watch MUST NOT widen scope past explicit tag filters.
 - Watch MUST NOT invoke `gza land` semantics, create or reuse landing judgments, defer
-  review blockers, or bypass parked lifecycle gates. Guarded landing is an explicit
-  operator command for one selected merge unit; ordinary watch remains strict.
+  review blockers outside the shared capped-review merge action, or bypass parked
+  lifecycle gates. Guarded landing is an explicit operator command for one selected merge
+  unit; ordinary watch remains strict except for executing the annotated
+  `on_max_cycles=merge_and_defer` action selected by the shared lifecycle engine.
 
 ## Policy knobs this layer owns
 
