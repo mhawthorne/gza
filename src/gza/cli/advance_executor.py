@@ -1346,6 +1346,9 @@ def _execute_verify_gate(
         provider_cwd = _worktree_execution_dir(worktree_git.repo_dir, _project_boundary(context.config))
         reviewed_base_sha = _resolve_review_verify_base_sha(worktree_git, worktree_git.default_branch())
         heartbeat_for_phase = context.heartbeat_for_lifecycle_phase
+        if heartbeat_for_phase is not None:
+            _verify_command_label = str(getattr(context.config, "verify_command", "")).strip() or "verify"
+            print(f"Running verify gate ({_verify_command_label}) before {phase_label}...", flush=True)
         execution = _run_lifecycle_verify(
             config=context.config,
             store=context.store,

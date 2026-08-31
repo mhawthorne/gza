@@ -5583,6 +5583,27 @@ class _CliVerifyProgressHeartbeat:
         self._console.print(f"{self._label} running - {elapsed} elapsed, {detail}")
 
 
+_advance_progress_console = Console()
+
+
+def _drain_pending_stdin() -> None:
+    """Discard buffered typeahead so a stray keystroke cannot answer a prompt.
+
+    Long silent phases (verify gates, post-merge side effects) tempt the operator
+    into pressing keys to check for life. Without this drain those keystrokes sit
+    in the tty buffer and are consumed by the next confirm prompt, auto-approving
+    an action nobody read.
+    """
+    try:
+        if not sys.stdin.isatty():
+            return
+        import termios
+
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except (OSError, ImportError, ValueError):
+        return
+
+
 def _execute_merge_action(
     config: Config,
     store: SqliteTaskStore,
@@ -6219,6 +6240,8 @@ def _execute_merge_action(
         verified_tree_fingerprint = proof.verified_tree_fingerprint
     if rc == 0 and merge_git is not None and merge_git.repo_dir != git.repo_dir:
         assert staged_isolated is not None
+        if not quiet_mechanics:
+            _advance_progress_console.print("Finalizing merge (materializing follow-ups and promoting)...")
         try:
             if (
                 staged_isolated.merge_action_metadata.get("pending_merge_finalization") is not True
@@ -7301,6 +7324,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     t,
                     target_branch=target_branch,
                 ),
+                heartbeat_for_lifecycle_phase=(
+                    None
+                    if dry_run_mode
+                    else (
+                        lambda phase, _task: _CliVerifyProgressHeartbeat(
+                            _advance_progress_console,
+                            "Verify gate" if phase == "verify" else f"Verify gate ({phase})",
+                        )
+                    )
+                ),
                 runtime_context=runtime_context,
             )
 
@@ -7761,6 +7794,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             print(f"Repeating advance for {task_id} (max {repeat_max_iterations} cycles)...")
             if not auto and not dry_run:
                 try:
+                    _drain_pending_stdin()
                     answer = input("Proceed? [Y/n] ").strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     print()
@@ -8287,6 +8321,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
         if not auto and (preview_actionable_rows or new_mode):
             try:
+                _drain_pending_stdin()
                 answer = input("Proceed? [Y/n] ").strip().lower()
             except (EOFError, KeyboardInterrupt):
                 print()
