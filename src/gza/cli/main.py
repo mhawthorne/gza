@@ -1979,9 +1979,9 @@ def main() -> int:
         help="Only clean up old backup files",
     )
     clean_parser.add_argument(
-        "--roll",
+        "--flat",
         action="store_true",
-        help="Roll backups to the tiered retention layout (hourly/intraday/daily) instead of a flat age cutoff",
+        help="Prune backups by a flat --days age cutoff instead of the default tiered retention layout",
     )
     clean_parser.add_argument(
         "--days",
