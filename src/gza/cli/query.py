@@ -3075,7 +3075,12 @@ def cmd_unmerged(args: argparse.Namespace, git: _UnmergedGit | None = None) -> i
                     f"[/{TASK_COLORS['task_id']}]",
                     to_stderr=use_json,
                 )
-            refresh_cohorts = build_unmerged_branch_cohorts(store)
+            refresh_cohorts = _build_tag_scoped_unmerged_cohorts(
+                store,
+                tag_filters=normalized_tag_filters,
+                any_tag=any_tag,
+                untagged_only=untagged_only,
+            )
             _reconcile_results, refresh_error = _refresh_canonical_default_branch_merge_truth(
                 store,
                 cast(Git, git_client),
@@ -3273,6 +3278,43 @@ def cmd_stale_unmerged(args: argparse.Namespace) -> int:
         f"Dropped {dropped_task_count} task(s) across {len(candidates)} stale unmerged merge unit(s)"
     )
     return 0
+
+
+def _build_tag_scoped_unmerged_cohorts(
+    store: SqliteTaskStore,
+    *,
+    tag_filters: tuple[str, ...] | None,
+    any_tag: bool,
+    untagged_only: bool,
+) -> list[BranchCohort]:
+    """Build unmerged refresh cohorts narrowed to the requested tag scope.
+
+    Tag matching mirrors the post-refresh display filter: it tests the lineage
+    owner's tags, not the candidate row's own tags. Narrowing here means a tagged
+    query only pays per-branch git proof cost for branches it can actually show.
+    """
+    if tag_filters is None and not untagged_only:
+        return build_unmerged_branch_cohorts(store)
+
+    owner_tags_by_task_id: dict[str, tuple[str, ...]] = {}
+    scoped_candidates: list[DbTask] = []
+    for task in store.get_canonical_unmerged_candidates():
+        if task.id is None:
+            continue
+        owner_tags = owner_tags_by_task_id.get(task.id)
+        if owner_tags is None:
+            owner_tags = tuple(_resolve_lineage_owner_task(store, task).tags or ())
+            owner_tags_by_task_id[task.id] = owner_tags
+        if untagged_only and owner_tags:
+            continue
+        if not task_matches_tag_filters(
+            task_tags=owner_tags,
+            tag_filters=tag_filters,
+            any_tag=any_tag,
+        ):
+            continue
+        scoped_candidates.append(task)
+    return build_branch_cohorts_for_tasks(store, scoped_candidates)
 
 
 def _refresh_canonical_default_branch_merge_truth(

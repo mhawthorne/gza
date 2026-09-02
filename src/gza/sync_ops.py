@@ -55,6 +55,7 @@ class BranchCohort:
     merge_unit_state: str | None = None
     merge_unit_target_branch: str | None = None
     merge_unit_head_sha: str | None = None
+    merge_unit_base_sha: str | None = None
 
     @property
     def code_tasks(self) -> tuple[Task, ...]:
@@ -239,6 +240,7 @@ def build_branch_cohorts_for_task_ids(
                     merge_unit_state=unit.state,
                     merge_unit_target_branch=unit.target_branch,
                     merge_unit_head_sha=unit.head_sha,
+                    merge_unit_base_sha=unit.base_sha,
                 )
             )
             continue
@@ -279,6 +281,7 @@ def build_branch_cohorts_for_tasks(
                     merge_unit_state=unit.state,
                     merge_unit_target_branch=unit.target_branch,
                     merge_unit_head_sha=unit.head_sha,
+                    merge_unit_base_sha=unit.base_sha,
                 )
             )
             continue
@@ -325,6 +328,53 @@ def build_unmerged_branch_cohorts(store: SqliteTaskStore) -> list[BranchCohort]:
         store,
         store.get_canonical_unmerged_candidates(),
     )
+def _branches_with_unchanged_ref_proof(
+    git: Git,
+    cohorts: list[BranchCohort],
+    *,
+    target_branch: str,
+) -> frozenset[str]:
+    """Return branches whose recorded merge proof is still bit-for-bit current.
+
+    A merge proof is a pure function of (branch head SHA, target head SHA), so a
+    unit whose stored head_sha/base_sha both still resolve to the live refs cannot
+    change its answer. Resolving every ref costs one batched ref lookup, far less
+    than the per-branch ``is_merged``/diff work it lets us skip.
+
+    Fails open: anything missing, unresolvable, or recorded against a different
+    target branch is excluded so it gets fully re-proven.
+    """
+    candidates = [
+        cohort
+        for cohort in cohorts
+        if cohort.merge_unit_id is not None
+        and cohort.merge_unit_state is not None
+        and cohort.merge_unit_target_branch == target_branch
+        and cohort.merge_unit_head_sha
+        and cohort.merge_unit_base_sha
+    ]
+    if not candidates:
+        return frozenset()
+
+    refs = {target_branch}
+    refs.update(cohort.branch for cohort in candidates)
+    try:
+        resolved = git.resolve_refs(sorted(refs))
+    except GitError:
+        return frozenset()
+
+    target_sha = resolved.get(target_branch)
+    if not target_sha:
+        return frozenset()
+
+    return frozenset(
+        cohort.branch
+        for cohort in candidates
+        if cohort.merge_unit_base_sha == target_sha
+        and resolved.get(cohort.branch) == cohort.merge_unit_head_sha
+    )
+
+
 def reconcile_branch_merge_truth(
     git: Git,
     cohorts: list[BranchCohort],
@@ -333,6 +383,7 @@ def reconcile_branch_merge_truth(
     include_diff_stats: bool,
     remote_target_ref: str | None = None,
     preserve_recorded_merged: bool = True,
+    reuse_unchanged_ref_proof: bool = False,
 ) -> list[BranchSyncResult]:
     """Compute branch-scoped merge truth and optional diff stats without persistence.
 
@@ -342,6 +393,11 @@ def reconcile_branch_merge_truth(
     merge truth must be proven against the canonical local target branch only.
     """
     results: list[BranchSyncResult] = []
+    unchanged_proof_branches = (
+        _branches_with_unchanged_ref_proof(git, cohorts, target_branch=target_branch)
+        if reuse_unchanged_ref_proof
+        else frozenset()
+    )
 
     for cohort in cohorts:
         result = BranchSyncResult(
@@ -365,6 +421,16 @@ def reconcile_branch_merge_truth(
             and cohort.merge_unit_target_branch == target_branch
         ):
             result.merge_status = cohort.merge_unit_state
+            continue
+        if cohort.branch in unchanged_proof_branches:
+            # Both the branch head and the target head are byte-identical to the
+            # SHAs recorded when this unit was last proven, so re-running the git
+            # proof cannot produce a different answer. Reuse the stored state
+            # (and stored diff stats) instead of re-shelling out per branch.
+            result.merge_status = cohort.merge_unit_state
+            result.head_sha = cohort.merge_unit_head_sha
+            result.base_sha = cohort.merge_unit_base_sha
+            result.actions.append("reused unchanged-ref merge proof")
             continue
         try:
             local_branch_exists = git.branch_exists(cohort.branch)
@@ -1072,6 +1138,7 @@ def sync_branch_cohorts(
             eligible_cohorts,
             target_branch=default_branch,
             include_diff_stats=include_diff_stats,
+            reuse_unchanged_ref_proof=True,
         )
     else:
         results = [

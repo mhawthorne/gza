@@ -21478,3 +21478,81 @@ def test_cmd_next_enters_git_cache_for_recovery_lifecycle_and_queue_query(
         "run",
         "cache-exit",
     ]
+
+
+class TestTagScopedUnmergedCohorts:
+    """`gza unmerged --tag` must not pay git proof cost for out-of-scope branches."""
+
+    @staticmethod
+    def _task(task_id: str, branch: str, tags: list[str]) -> Task:
+        return Task(
+            id=task_id,
+            prompt=f"Task {task_id}",
+            status="completed",
+            task_type="implement",
+            branch=branch,
+            tags=tags,
+            created_at=datetime(2026, 2, 12, 10, 0, tzinfo=UTC),
+        )
+
+    def test_tag_filter_narrows_refresh_candidates_to_matching_lineage_owners(self) -> None:
+        in_scope = self._task("gza-1", "feature/in-scope", ["v0.5.1"])
+        out_of_scope = self._task("gza-2", "feature/out-of-scope", ["other"])
+        store = MagicMock()
+        store.get_canonical_unmerged_candidates.return_value = [in_scope, out_of_scope]
+
+        from gza.cli import query as query_module
+
+        with (
+            patch.object(query_module, "_resolve_lineage_owner_task", side_effect=lambda _store, task: task),
+            patch.object(query_module, "build_branch_cohorts_for_tasks") as build_cohorts,
+        ):
+            query_module._build_tag_scoped_unmerged_cohorts(
+                store,
+                tag_filters=("v0.5.1",),
+                any_tag=True,
+                untagged_only=False,
+            )
+
+        assert build_cohorts.call_args.args[1] == [in_scope]
+
+    def test_no_tag_filter_uses_the_full_canonical_candidate_set(self) -> None:
+        store = MagicMock()
+
+        from gza.cli import query as query_module
+
+        with (
+            patch.object(query_module, "build_unmerged_branch_cohorts") as build_all,
+            patch.object(query_module, "build_branch_cohorts_for_tasks") as build_scoped,
+        ):
+            result = query_module._build_tag_scoped_unmerged_cohorts(
+                store,
+                tag_filters=None,
+                any_tag=True,
+                untagged_only=False,
+            )
+
+        build_all.assert_called_once_with(store)
+        build_scoped.assert_not_called()
+        assert result is build_all.return_value
+
+    def test_untagged_only_selects_candidates_whose_owner_has_no_tags(self) -> None:
+        untagged = self._task("gza-1", "feature/untagged", [])
+        tagged = self._task("gza-2", "feature/tagged", ["v0.5.1"])
+        store = MagicMock()
+        store.get_canonical_unmerged_candidates.return_value = [untagged, tagged]
+
+        from gza.cli import query as query_module
+
+        with (
+            patch.object(query_module, "_resolve_lineage_owner_task", side_effect=lambda _store, task: task),
+            patch.object(query_module, "build_branch_cohorts_for_tasks") as build_cohorts,
+        ):
+            query_module._build_tag_scoped_unmerged_cohorts(
+                store,
+                tag_filters=None,
+                any_tag=True,
+                untagged_only=True,
+            )
+
+        assert build_cohorts.call_args.args[1] == [untagged]

@@ -2705,3 +2705,97 @@ def test_reconcile_branch_merge_truth_warns_and_fails_closed_when_commit_count_u
     # Fail-closed: preserves "unmerged" (from task.merge_status) rather than guessing "empty".
     assert results[0].merge_status == "unmerged"
     assert any("could not determine unique commit count" in w for w in results[0].warnings)
+
+
+def test_reconcile_reuses_proof_when_branch_and_target_shas_are_unchanged(tmp_path):
+    """An unchanged (head_sha, base_sha) pair skips the per-branch git proof."""
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/unchanged")
+    cohort = BranchCohort(
+        branch=task.branch,
+        tasks=(task,),
+        merge_unit_id="unit-1",
+        merge_unit_state="unmerged",
+        merge_unit_target_branch="main",
+        merge_unit_head_sha="head-sha",
+        merge_unit_base_sha="base-sha",
+    )
+
+    git = Mock()
+    git.resolve_refs.return_value = {"feature/unchanged": "head-sha", "main": "base-sha"}
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=True,
+        reuse_unchanged_ref_proof=True,
+    )
+
+    assert results[0].merge_status == "unmerged"
+    assert "reused unchanged-ref merge proof" in results[0].actions
+    assert results[0].head_sha == "head-sha"
+    assert results[0].base_sha == "base-sha"
+    git.is_merged.assert_not_called()
+    git.get_diff_numstat.assert_not_called()
+
+
+def test_reconcile_reproves_branch_when_target_sha_moved(tmp_path):
+    """A moved target head invalidates the recorded proof and forces a re-prove."""
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/target-moved")
+    cohort = BranchCohort(
+        branch=task.branch,
+        tasks=(task,),
+        merge_unit_id="unit-1",
+        merge_unit_state="unmerged",
+        merge_unit_target_branch="main",
+        merge_unit_head_sha="head-sha",
+        merge_unit_base_sha="old-base-sha",
+    )
+
+    git = Mock()
+    git.resolve_refs.return_value = {"feature/target-moved": "head-sha", "main": "new-base-sha"}
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = True
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=True,
+        reuse_unchanged_ref_proof=True,
+    )
+
+    assert "reused unchanged-ref merge proof" not in results[0].actions
+    git.is_merged.assert_called()
+
+
+def test_reconcile_does_not_reuse_proof_when_fast_path_disabled(tmp_path):
+    """The reuse fast path stays off for callers that demand a fresh proof."""
+    store = SqliteTaskStore(tmp_path / "test.db")
+    task = _completed_branch_task(store, "Task", "feature/fresh")
+    cohort = BranchCohort(
+        branch=task.branch,
+        tasks=(task,),
+        merge_unit_id="unit-1",
+        merge_unit_state="unmerged",
+        merge_unit_target_branch="main",
+        merge_unit_head_sha="head-sha",
+        merge_unit_base_sha="base-sha",
+    )
+
+    git = Mock()
+    git.resolve_refs.return_value = {"feature/fresh": "head-sha", "main": "base-sha"}
+    git.branch_exists.return_value = True
+    git.is_merged.return_value = True
+
+    results = reconcile_branch_merge_truth(
+        git,
+        [cohort],
+        target_branch="main",
+        include_diff_stats=True,
+    )
+
+    assert "reused unchanged-ref merge proof" not in results[0].actions
+    git.is_merged.assert_called()
