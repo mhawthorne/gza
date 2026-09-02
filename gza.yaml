@@ -20,7 +20,8 @@ learnings_interval: 10
 
 merge_squash_threshold: 1
 
-max_review_cycles: 10
+max_review_cycles: 2
+on_max_cycles: merge_and_defer
 
 advance_mode: iterate
 
