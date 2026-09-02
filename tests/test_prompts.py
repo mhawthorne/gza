@@ -20,13 +20,13 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "Severity shorthand: `BLOCKER` means merge-blocking; `FOLLOWUP` means non-gating but task-worthy; `NIT` is omitted from canonical output.",
     "Open-state citation:",
     "Class-of-issue enumeration:",
-    "Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.",
-    "Treat unexplained deviations from the provided review scope, plan, or request as BLOCKER.",
+    "A finding is a BLOCKER only if at least one of these is true:",
+    "Treat unexplained deviations from the provided review scope, plan, or request as BLOCKER under (1).",
     "If `## Review scope:` is present, grade ask-adherence against that section only.",
     "Do not raise blockers solely because deferred sibling slices from the original plan are not implemented;",
-    "Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.",
-    "Treat misleading output (UI/prompt/context contradictions) as BLOCKER when it can cause incorrect operator or agent decisions.",
-    "If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are BLOCKER when they can mislead operators.",
+    "Silent broad-exception fallbacks introduced by this diff are BLOCKER under (3) when they can alter user/agent-visible state without clear warning/error surfacing.",
+    "Misleading output (UI/prompt/context contradictions) introduced by this diff is BLOCKER under (3) when it can cause incorrect operator or agent decisions.",
+    "If this diff changed config/CLI/operator-facing behavior, missing or incorrect docs/help/release-note updates for THAT change are BLOCKER under (1).",
     "Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.",
     "For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.",
     "Every BLOCKER must be falsifiable: `Evidence:` and `Open-state citation:` must show the current still-open state, and `Required fix:` must describe the concrete change needed to close it.",
@@ -41,7 +41,7 @@ REVIEW_CONTRACT_PARITY_CLAUSES = [
     "Derive the final verdict from the findings:",
     "cannot classify safely -> `NEEDS_DISCUSSION`",
     "Borderline cases must include a one-sentence rubric justification in `Impact:`, `Required fix:`, or `Recommended follow-up:`",
-    "A broad exception that can mask visible state or swallow a user/agent-visible failure is a `BLOCKER`.",
+    "A broad exception introduced by this diff that can mask visible state or swallow a user/agent-visible failure is a `BLOCKER`",
     "An adjacent-path coverage sweep that would strengthen confidence without proving the current slice unsafe is a `FOLLOWUP`.",
 ]
 
@@ -69,14 +69,13 @@ IMPROVE_ATOMIC_CLOSURE_CONTRACT_CLAUSES = [
     "anti-regression statement",
 ]
 
-REVIEW_SUMMARY_CHECKLIST_COUNT = 6
+REVIEW_SUMMARY_CHECKLIST_COUNT = 5
 REVIEW_SUMMARY_CHECKLIST_ITEMS = [
-    "Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?",
-    "Did I check for silent broad-exception fallbacks that mask errors while changing user/agent-visible state?",
-    "Did I check for misleading output (contradictory UI/prompt/context signals)?",
-    "Was a `## Review scope:` section provided, and if so did I grade ask-adherence against that scope while treating sibling slices as non-blocking unless they break an explicit contract? Otherwise, was an `## Original plan:` or `## Original request:` section provided, and did I verify ask-adherence against it while calling out intentional deviations? If neither was provided, did I state \"No plan or request provided.\"?",
-    "Did I require targeted regression tests that match each failure mode (not generic \"add tests\")?",
-    "If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?",
+    'What was this task asked to do, and does the diff do it? Grade against `## Review scope:` if present; otherwise against `## Original plan:` or `## Original request:`. Treat sibling slices as non-blocking unless they break an explicit contract, and call out intentional deviations. If none of those sections was provided, state "No stated intent provided." and say what goal you inferred from the diff.',
+    'Does the diff regress behavior that worked before it? Cite the specific prior behavior.',
+    'Does the diff introduce a correctness defect in the code it changed (including silent broad-exception fallbacks that alter user/agent-visible state, or misleading output that could cause a wrong operator/agent decision)?',
+    'Does the diff violate AGENTS.md or `.gza/learnings.md`?',
+    'For the failure modes I am blocking on, did I require targeted regression tests that match them (not generic "add tests")? If I am blocking on nothing, answer "No - no blockers."',
 ]
 
 
@@ -978,15 +977,15 @@ class TestPromptBuilderBuild:
         assert "silent broad-exception fallbacks" in result
         assert "misleading output" in result
         assert "targeted regression tests" in result
-        assert "config, CLI, or operator-facing behavior changed" in result
+        assert "config/CLI/operator-facing behavior" in result
         assert "## Review scope:" in result
         assert "## Original plan:" in result
         assert "## Original request:" in result
         assert "provided diff is authoritative" in result
         assert "read unchanged source files" in result
-        assert "No plan or request provided." in result
+        assert "you have no stated intent to grade against" in result
         assert "unexplained deviations from the provided review scope, plan, or request" in result
-        assert "Reserve BLOCKER for:" in result
+        assert "A finding is a BLOCKER only if at least one of these is true:" in result
         assert "lookup table" in result
         assert "classifier" in result
         assert "dispatcher" in result
@@ -997,8 +996,7 @@ class TestPromptBuilderBuild:
             in result
         )
         _assert_summary_checklist_contract(result)
-        checklist_lines = re.findall(r"^\s*-\s.+\?$", result, flags=re.MULTILINE)
-        assert len(checklist_lines) == REVIEW_SUMMARY_CHECKLIST_COUNT
+        assert len(REVIEW_SUMMARY_CHECKLIST_ITEMS) == REVIEW_SUMMARY_CHECKLIST_COUNT
         assert "Yes/No - ..." in result
 
     def test_build_review_prompt_omits_supplied_verify_result_context(self, tmp_path: Path):
@@ -1053,19 +1051,19 @@ class TestPromptBuilderBuild:
         assert "<1-2 sentence overview of the changes>" not in content
         _assert_summary_checklist_contract(content)
         assert (
-            "<Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>"
+            "<A finding is a BLOCKER only if at least one of these is true:>"
             in content
         )
         assert (
-            "<Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.>"
+            "<Silent broad-exception fallbacks introduced by this diff are BLOCKER under (3) when they can alter user/agent-visible state without clear warning/error surfacing.>"
             in content
         )
         assert (
-            "<Treat unexplained deviations from the provided review scope, plan, or request as BLOCKER.>"
+            "<Treat unexplained deviations from the provided review scope, plan, or request as BLOCKER under (1).>"
             in content
         )
         assert (
-            "<Treat misleading output (UI/prompt/context contradictions) as BLOCKER when it can cause incorrect operator or agent decisions.>"
+            "<Misleading output (UI/prompt/context contradictions) introduced by this diff is BLOCKER under (3) when it can cause incorrect operator or agent decisions.>"
             in content
         )
         assert "<Do not run or evaluate `verify_command`; verification is handled elsewhere.>" in content
@@ -1167,7 +1165,7 @@ class TestPromptBuilderBuild:
             in content
         )
         assert (
-            "A broad exception that can mask visible state or swallow a user/agent-visible failure is a `BLOCKER`."
+            "A broad exception introduced by this diff that can mask visible state or swallow a user/agent-visible failure is a `BLOCKER`"
             in content
         )
         assert (
@@ -1220,7 +1218,7 @@ class TestPromptBuilderBuild:
             in content
         )
         assert (
-            "If no retrievable plan or request exists for this task, pass no ask section and let the reviewer state: `No plan or request provided.`"
+            "If no retrievable plan or request exists for this task, pass no ask section and let the reviewer state: `No stated intent provided.`"
             in content
         )
 

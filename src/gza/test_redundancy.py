@@ -141,9 +141,9 @@ def greedy_cover(
     return chosen, curve
 
 
-def load_durations(durations_path: Path | None) -> collections.Counter[str]:
+def load_durations(durations_path: Path | None) -> dict[str, float]:
     """Parse per-test seconds out of a pytest --durations=0 transcript."""
-    totals: collections.Counter[str] = collections.Counter()
+    totals: dict[str, float] = collections.defaultdict(float)
     if durations_path is None:
         return totals
     for line in durations_path.read_text(errors="replace").splitlines():
@@ -155,7 +155,7 @@ def load_durations(durations_path: Path | None) -> collections.Counter[str]:
 
 def build_report(
     arcs_by_context: dict[str, set[tuple[str, tuple[int, int]]]],
-    durations: collections.Counter[str],
+    durations: dict[str, float],
     curve_marks: tuple[int, ...],
 ) -> RedundancyReport:
     sets = list(arcs_by_context.values())
@@ -247,7 +247,7 @@ def run_suite(pytest_args: list[str], coverage_path: Path, durations_path: Path 
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     parser.add_argument(
         "--coverage-file",
         help="Analyse an existing coverage data file instead of running the suite.",

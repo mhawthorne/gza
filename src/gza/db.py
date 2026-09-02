@@ -3053,11 +3053,6 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return cur.fetchone() is not None
 
 
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    """Return the set of column names for an existing table."""
-    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})")}
-
-
 def _split_sql_statements(script: str) -> list[str]:
     """Split a SQL script into complete sqlite statements without breaking string literals."""
     statements: list[str] = []

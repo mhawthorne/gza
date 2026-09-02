@@ -78,13 +78,13 @@ Keep this review stack-agnostic. If project verification instructions are missin
 ## Summary
 
 <Provide 3-5 bullets summarizing the review>
-<Then answer this checklist with exactly 6 bullets in `Yes/No - ...` form and one short evidence clause each:>
-<- Did I check the diff against AGENTS.md and `.gza/learnings.md` and flag any violations/regressions?>
-<- Did I check for silent broad-exception fallbacks that mask errors while changing user/agent-visible state?>
-<- Did I check for misleading output (contradictory UI/prompt/context signals)?>
-<- Was a `## Review scope:` section provided, and if so did I grade ask-adherence against that scope while treating sibling slices as non-blocking unless they break an explicit contract? Otherwise, was an `## Original plan:` or `## Original request:` section provided, and did I verify ask-adherence against it while calling out intentional deviations? If neither was provided, did I state "No plan or request provided."?>
-<- Did I require targeted regression tests that match each failure mode (not generic "add tests")?>
-<- If config, CLI, or operator-facing behavior changed, did I verify docs/help/release-note impact?>
+<Then answer this checklist with exactly 5 bullets in `Yes/No - ...` form and one short evidence clause each. The first bullet is the primary question this review exists to answer:>
+<- What was this task asked to do, and does the diff do it? Grade against `## Review scope:` if present; otherwise against `## Original plan:` or `## Original request:`. Treat sibling slices as non-blocking unless they break an explicit contract, and call out intentional deviations. If none of those sections was provided, state "No stated intent provided." and say what goal you inferred from the diff.>
+<- Does the diff regress behavior that worked before it? Cite the specific prior behavior.>
+<- Does the diff introduce a correctness defect in the code it changed (including silent broad-exception fallbacks that alter user/agent-visible state, or misleading output that could cause a wrong operator/agent decision)?>
+<- Does the diff violate AGENTS.md or `.gza/learnings.md`?>
+<- For the failure modes I am blocking on, did I require targeted regression tests that match them (not generic "add tests")? If I am blocking on nothing, answer "No - no blockers.">
+<Answering "No" to these is a normal and expected outcome. Do not manufacture a finding to fill a bullet.>
 
 ## Blockers
 
@@ -94,13 +94,20 @@ Keep this review stack-agnostic. If project verification instructions are missin
 <Report all still-open gaps for that same class in one blocker, with every affected `path:line` or `path:start-end` citation included in `Open-state citation:` regardless of file, and a `Required fix:` that closes the whole class.>
 <Do not create one blocker per field, branch, case, table row, or file unless the required fixes are materially different.>
 <Do not expand the audit beyond the same module, and do not expand isolated one-off defects - this rule applies only after you have found a repeated-pattern blocker shape.>
-<Reserve BLOCKER for: correctness defects, behavior regressions, repository/rules violations, missing observability for user/agent-visible fallbacks, and misleading output/contradictory signals.>
-<Treat unexplained deviations from the provided review scope, plan, or request as BLOCKER.>
+<A finding is a BLOCKER only if at least one of these is true:>
+<  1. The task's stated goal is not met, or is met incorrectly.>
+<  2. The diff regresses behavior that worked before it.>
+<  3. The diff introduces a correctness defect in the code it changed.>
+<  4. The diff violates AGENTS.md, `.gza/learnings.md`, or another explicit repository rule.>
+<If a finding satisfies none of the four, it is a FOLLOWUP, however real it is. This explicitly includes: pre-existing defects the diff did not introduce, hardening the task's goal does not require, quality debt in untouched code, and improvements to adjacent code paths.>
+<Treat unexplained deviations from the provided review scope, plan, or request as BLOCKER under (1).>
 <If `## Review scope:` is present, grade ask-adherence against that section only. Use any original plan context section only to understand boundaries and integration contracts.>
 <Do not raise blockers solely because deferred sibling slices from the original plan are not implemented; only raise blockers when in-scope work is missing/broken or the diff violates an explicit integration contract described in the review scope or plan context.>
-<Treat silent broad-exception fallbacks as BLOCKER when they can alter user/agent-visible state without clear warning/error surfacing.>
-<Treat misleading output (UI/prompt/context contradictions) as BLOCKER when it can cause incorrect operator or agent decisions.>
-<If config/CLI/operator-facing behavior changed, missing or incorrect docs/help/release-note updates are BLOCKER when they can mislead operators.>
+<Silent broad-exception fallbacks introduced by this diff are BLOCKER under (3) when they can alter user/agent-visible state without clear warning/error surfacing.>
+<A pre-existing one the diff merely touches is a FOLLOWUP.>
+<Misleading output (UI/prompt/context contradictions) introduced by this diff is BLOCKER under (3) when it can cause incorrect operator or agent decisions.>
+<If this diff changed config/CLI/operator-facing behavior, missing or incorrect docs/help/release-note updates for THAT change are BLOCKER under (1).>
+<Pre-existing documentation gaps are FOLLOWUP.>
 <Use FOLLOWUP for actionable low-risk debt that should be tracked but should not block merge.>
 <For each blocker, give a clear closure condition so an improve task can resolve all blockers in one pass.>
 <For class-of-issue blockers, the closure condition must cover every enumerated instance across all cited paths, not just the first example.>
@@ -117,7 +124,7 @@ Keep this review stack-agnostic. If project verification instructions are missin
 <Derive the final verdict from the findings:>
 <cannot classify safely -> `NEEDS_DISCUSSION`>
 <Borderline cases must include a one-sentence rubric justification in `Impact:`, `Required fix:`, or `Recommended follow-up:`>
-<A broad exception that can mask visible state or swallow a user/agent-visible failure is a `BLOCKER`.>
+<A broad exception introduced by this diff that can mask visible state or swallow a user/agent-visible failure is a `BLOCKER` (criterion 3).>
 <An adjacent-path coverage sweep that would strengthen confidence without proving the current slice unsafe is a `FOLLOWUP`.>
 <Open-state citation must contain one or more current-source references in `path:line` or `path:start-end` form; backticked citations and comma-separated multiple citations are allowed.>
 
