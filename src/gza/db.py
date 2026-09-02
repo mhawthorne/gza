@@ -5302,6 +5302,17 @@ CREATE TABLE IF NOT EXISTS provider_usage_failures (
     last_error_at TEXT NOT NULL
 );
 """
+# These four migrations create current-schema tables that the SCHEMA literal above
+# never defined, so a freshly created database only acquired them because
+# _ensure_required_auto_migration_artifacts recreated them on open. Composing them
+# in makes SCHEMA the whole current schema. Every statement is IF NOT EXISTS, so
+# appending them is idempotent for databases that already have the objects.
+SCHEMA += (
+    MIGRATION_V50_TO_V51  # watch_progress_observations
+    + MIGRATION_V55_TO_V56  # watch_recovery_backoffs
+    + MIGRATION_V57_TO_V58  # parked_task_rearms
+    + MIGRATION_V61_TO_V62  # project_leases
+)
 
 # Migration from v1 to v2
 MIGRATION_V1_TO_V2 = """
@@ -5763,6 +5774,9 @@ class SqliteTaskStore:
         self._query_only_table_exists: dict[str, bool] = {}
         self._query_only_columns: dict[str, set[str]] = {}
         self._write_pragmas_applied = False
+        # Set by _ensure_db when it creates the database from scratch. Such a database
+        # has no rows, so the row-level repair passes below cannot find anything to fix.
+        self._created_empty_db = False
         self._supports_merge_units_cache: bool | None = None
         self._default_merge_target_cache: str | None = None
         self._read_session_conn: sqlite3.Connection | None = None
@@ -5783,8 +5797,9 @@ class SqliteTaskStore:
             self._ensure_project_row()
         else:
             self._ensure_db()
-            self.repair_inconsistent_unmerged_merge_units()
-            self.repair_stale_unmerged_merge_unit_owners()
+            if not self._created_empty_db:
+                self.repair_inconsistent_unmerged_merge_units()
+                self.repair_stale_unmerged_merge_unit_owners()
             self._ensure_project_row()
 
     @classmethod
@@ -6317,6 +6332,7 @@ class SqliteTaskStore:
                 raise SchemaIntegrityError(f"Registry DB disappeared before mutation: {self.db_path}")
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
             with self._connect() as conn:
+                artifacts_verified_at_current_schema = False
                 cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
                 if cur.fetchone() is None:
                     existing_objects = conn.execute(
@@ -6333,6 +6349,11 @@ class SqliteTaskStore:
                     # Fresh database - create full current schema directly.
                     conn.executescript(SCHEMA)
                     conn.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
+                    # SCHEMA defines the current schema in full, so the artifact repair
+                    # below -- which exists to recreate objects lost to external damage --
+                    # has nothing to find in a database created microseconds ago.
+                    artifacts_verified_at_current_schema = True
+                    self._created_empty_db = True
                 else:
                     cur = conn.execute("SELECT version FROM schema_version LIMIT 1")
                     row = cur.fetchone()
@@ -6349,6 +6370,9 @@ class SqliteTaskStore:
                             f"Database schema v{current_version} is newer than supported v{SCHEMA_VERSION}."
                         )
                     _ensure_required_auto_migration_artifacts(conn, target_version=current_version)
+                    # Remember whether that call already covered the current schema so the
+                    # closing repair below can be skipped when no migration ran afterwards.
+                    artifacts_verified_at_current_schema = current_version == SCHEMA_VERSION
 
                     pending_manual: list[int] = []
                     for target_version, migration_sql in _MIGRATIONS:
@@ -6382,6 +6406,7 @@ class SqliteTaskStore:
                             _validate_auto_migration_target(conn, target_version)
                             conn.execute("UPDATE schema_version SET version = ?", (target_version,))
                             current_version = target_version
+                            artifacts_verified_at_current_schema = False
 
                     if pending_manual:
                         raise ManualMigrationRequired(pending_manual)
@@ -6420,8 +6445,12 @@ class SqliteTaskStore:
                     )
 
                 # Repair required artifacts for current schemas when external damage
-                # or partial migrations removed them.
-                _ensure_required_auto_migration_artifacts(conn, target_version=SCHEMA_VERSION)
+                # or partial migrations removed them. Skipped when the pre-migration
+                # check above already verified them at SCHEMA_VERSION and no migration
+                # ran since; that call is a byte-for-byte repeat of this one and costs
+                # ~175 PRAGMA probes per store open.
+                if not artifacts_verified_at_current_schema:
+                    _ensure_required_auto_migration_artifacts(conn, target_version=SCHEMA_VERSION)
 
     def _db_file_identity(self) -> _DbFileIdentity:
         stat_result = self.db_path.stat()
