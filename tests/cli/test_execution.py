@@ -26417,6 +26417,335 @@ class TestIterateCommand:
         assert action["type"] == "merge"
         assert action["max_cycles_merge_and_defer"] is True
 
+    def test_iterate_adapter_forwards_planner_config_surface(self, tmp_path: Path) -> None:
+        from gza.cli.execution import _build_iterate_engine_config
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        config = Config.load(tmp_path)
+        config.enforce_project_scope = True
+        config.default_cross_project = True
+        config.spec_coherence.enabled = True
+        config.spec_coherence.paths = ("custom/specs/**",)
+
+        engine_config = _build_iterate_engine_config(config, max_resume_attempts=1)
+
+        assert engine_config.max_resume_attempts == 1
+        assert engine_config.enforce_project_scope is True
+        assert engine_config.default_cross_project is True
+        assert engine_config.spec_coherence is config.spec_coherence
+
+    def test_foreground_iterate_preserves_spec_coherence_gate_before_capped_merge(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        config = Config.load(tmp_path)
+        config.on_max_cycles = "merge_and_defer"
+        config.max_review_cycles = 0
+        config.verify_command = "./bin/tests"
+        config.spec_coherence.enabled = True
+        config.spec_coherence.paths = ("specs/behavior/**",)
+        impl = self._make_completed_impl(store)
+        impl.merge_status = "unmerged"
+        impl.has_commits = True
+        store.update(impl)
+        self._persist_current_green_verify(store, tmp_path, impl)
+        review = self._make_review_task(
+            store,
+            impl,
+            status="completed",
+            verdict="CHANGES_REQUESTED",
+            completed_at=datetime.now(UTC),
+        )
+        review.review_verify_head_sha = "same-head"
+        store.update(review)
+
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.ref_exists.return_value = False
+        mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
+        mock_git.can_merge.return_value = True
+        mock_git.is_merged.return_value = False
+        mock_git.rev_parse_if_exists.side_effect = (
+            lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
+        )
+        mock_git.get_diff_name_status.return_value = "M\tspecs/behavior/lifecycle-engine.md\n"
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert "[dry-run] First iteration 1/1 action: create_review" in output
+        assert "behavior-spec coherence review" in output
+        assert "merge" not in output
+        assert "ready to merge" not in output
+
+    def test_background_iterate_preserves_spec_coherence_gate_before_capped_merge(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        config = Config.load(tmp_path)
+        config.on_max_cycles = "merge_and_defer"
+        config.max_review_cycles = 0
+        config.verify_command = "./bin/tests"
+        config.spec_coherence.enabled = True
+        config.spec_coherence.paths = ("specs/behavior/**",)
+        impl = self._make_completed_impl(store)
+        impl.merge_status = "unmerged"
+        impl.has_commits = True
+        store.update(impl)
+        self._persist_current_green_verify(store, tmp_path, impl)
+        review = self._make_review_task(
+            store,
+            impl,
+            status="completed",
+            verdict="CHANGES_REQUESTED",
+            completed_at=datetime.now(UTC),
+        )
+        review.review_verify_head_sha = "same-head"
+        store.update(review)
+
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.ref_exists.return_value = False
+        mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
+        mock_git.can_merge.return_value = True
+        mock_git.is_merged.return_value = False
+        mock_git.rev_parse_if_exists.side_effect = (
+            lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
+        )
+        mock_git.get_diff_name_status.return_value = "M\tspecs/behavior/lifecycle-engine.md\n"
+        spawned: list[SimpleNamespace] = []
+
+        def fake_spawn(_args, _config, task, **_kwargs):
+            spawned.append(SimpleNamespace(task=task, kwargs=_kwargs))
+            return 0
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch("gza.cli.execution._spawn_background_iterate", side_effect=fake_spawn),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert spawned
+        assert spawned[0].task.id == impl.id
+        prepared_task_id = spawned[0].kwargs["prepared_task_id"]
+        assert isinstance(prepared_task_id, str)
+        prepared_review = store.get(prepared_task_id)
+        assert prepared_review is not None
+        assert prepared_review.task_type == "review"
+        assert parse_spec_coherence_review_scope(prepared_review.review_scope) is not None
+        assert "merge" not in output
+        assert "ready to merge" not in output
+
+    def test_foreground_iterate_preserves_project_scope_before_capped_merge(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+        from gza.runner import ProjectBoundary
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        config = Config.load(tmp_path)
+        config.project_dir = tmp_path / "services" / "foo"
+        config.enforce_project_scope = True
+        config.default_cross_project = False
+        config.on_max_cycles = "merge_and_defer"
+        config.max_review_cycles = 0
+        config.verify_command = "./bin/tests"
+        setattr(
+            config,
+            "_project_boundary_cache",
+            ProjectBoundary(repo_root=tmp_path, scope_root=Path("services/foo"), local_dependencies=()),
+        )
+        impl = self._make_completed_impl(store)
+        impl.merge_status = "unmerged"
+        impl.has_commits = True
+        store.update(impl)
+        self._persist_current_green_verify(store, tmp_path, impl)
+        review = self._make_review_task(
+            store,
+            impl,
+            status="completed",
+            verdict="CHANGES_REQUESTED",
+            completed_at=datetime.now(UTC),
+        )
+        review.review_verify_head_sha = "same-head"
+        store.update(review)
+
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.ref_exists.return_value = False
+        mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
+        mock_git.can_merge.return_value = True
+        mock_git.is_merged.return_value = False
+        mock_git.rev_parse_if_exists.side_effect = (
+            lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
+        )
+        mock_git.get_diff_name_status.return_value = "M\tother-project/file.py\n"
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=True,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=False,
+            force=False,
+            worker_id=None,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 0
+        assert "[dry-run] First next action: needs_discussion" in output
+        assert "strict project scope" in output
+        assert "other-project/file.py" in output
+        assert "merge" not in output
+        assert "ready to merge" not in output
+
+    def test_background_iterate_preserves_project_scope_before_capped_merge(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from gza.cli.execution import cmd_iterate
+        from gza.config import Config
+        from gza.runner import ProjectBoundary
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        config = Config.load(tmp_path)
+        config.project_dir = tmp_path / "services" / "foo"
+        config.enforce_project_scope = True
+        config.default_cross_project = False
+        config.on_max_cycles = "merge_and_defer"
+        config.max_review_cycles = 0
+        config.verify_command = "./bin/tests"
+        setattr(
+            config,
+            "_project_boundary_cache",
+            ProjectBoundary(repo_root=tmp_path, scope_root=Path("services/foo"), local_dependencies=()),
+        )
+        impl = self._make_completed_impl(store)
+        impl.merge_status = "unmerged"
+        impl.has_commits = True
+        store.update(impl)
+        self._persist_current_green_verify(store, tmp_path, impl)
+        review = self._make_review_task(
+            store,
+            impl,
+            status="completed",
+            verdict="CHANGES_REQUESTED",
+            completed_at=datetime.now(UTC),
+        )
+        review.review_verify_head_sha = "same-head"
+        store.update(review)
+
+        mock_git = MagicMock()
+        mock_git.current_branch.return_value = "main"
+        mock_git.branch_exists.return_value = True
+        mock_git.ref_exists.return_value = False
+        mock_git.resolve_fresh_merge_source.return_value = SimpleNamespace(ref=impl.branch, warning=None)
+        mock_git.can_merge.return_value = True
+        mock_git.is_merged.return_value = False
+        mock_git.rev_parse_if_exists.side_effect = (
+            lambda ref: "same-head" if ref == impl.branch else "base-head" if ref == "main" else None
+        )
+        mock_git.get_diff_name_status.return_value = "M\tother-project/file.py\n"
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            auto_iterate=False,
+            background=True,
+            force=False,
+        )
+
+        with (
+            patch("gza.cli.execution.Config.load", return_value=config),
+            patch("gza.cli.execution.get_store", return_value=store),
+            patch("gza.cli.execution.Git", return_value=mock_git),
+            patch(
+                "gza.cli.execution._spawn_background_iterate",
+                side_effect=AssertionError("background iterate worker should not spawn"),
+            ),
+        ):
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        assert "Next action: needs_discussion" in output
+        assert "strict project scope" in output
+        assert "other-project/file.py" in output
+        assert "merge" not in output
+        assert "ready to merge" not in output
+
     def test_background_iterate_preflight_honors_on_max_cycles_merge_and_defer(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

@@ -4262,9 +4262,15 @@ def _spawn_background_iterate(
     )
 
 
-@dataclass(frozen=True)
+@dataclass
 class _AdvanceEngineConfigAdapter:
-    """Minimal config surface required by determine_next_action()."""
+    """Iterate config wrapper for determine_next_action().
+
+    Iterate overrides a few loop-specific values while forwarding the rest of
+    the planner's config surface to the real project Config. This prevents
+    lifecycle gates from silently falling back when new planner-relevant config
+    is added.
+    """
 
     project_dir: Any
     require_review_before_merge: bool
@@ -4281,6 +4287,13 @@ class _AdvanceEngineConfigAdapter:
     verify_command: str | None = None
     autonomous_verify_timeout_seconds: int | None = None
     review_verify_timeout_grace_seconds: float | None = None
+    _base_config: Any | None = None
+
+    def __getattr__(self, name: str) -> Any:
+        base_config = object.__getattribute__(self, "_base_config")
+        if base_config is None:
+            raise AttributeError(name)
+        return getattr(base_config, name)
 
 
 def _determine_selected_iterate_action(
@@ -4614,6 +4627,7 @@ def _build_iterate_engine_config(config: Config, *, max_resume_attempts: int) ->
             if isinstance(timeout_grace_raw, (int, float)) and not isinstance(timeout_grace_raw, bool)
             else None
         ),
+        _base_config=config,
     )
 
 

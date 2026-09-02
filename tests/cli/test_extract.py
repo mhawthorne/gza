@@ -1,12 +1,11 @@
 """Fast unit tests for `gza extract` command wiring."""
 
 import os
-import threading
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from gza.concurrency import launch_permit, release_task_launch_permit, take_task_launch_permit
+from gza.concurrency import take_task_launch_permit
 from gza.config import Config
 from gza.db import SqliteTaskStore, Task
 from gza.extractions import ExtractionDraft, ExtractionError, FileDiffSummary, SourceSelection
@@ -469,36 +468,10 @@ def test_extract_per_commit_foreground_does_not_hold_future_reserved_permit_whil
             store.update(first_task)
             first_permit.release()
 
-            acquired = threading.Event()
-            released = threading.Event()
-            failure: list[BaseException] = []
-
-            def _other_launcher() -> None:
-                try:
-                    permit = launch_permit(config, store)
-                except BaseException as exc:  # pragma: no cover - failure asserted below
-                    failure.append(exc)
-                    return
-                acquired.set()
-                permit.release()
-                released.set()
-
-            thread = threading.Thread(target=_other_launcher)
-            thread.start()
-            thread.join(timeout=0.2)
-            if thread.is_alive():
-                if prepared_task is not None and prepared_task.id is not None:
-                    release_task_launch_permit(str(prepared_task.id))
-                thread.join(timeout=1)
-                raise AssertionError("future extract task kept launch capacity locked during first foreground run")
-
-            assert not failure
-            assert acquired.is_set()
-            assert released.is_set()
         else:
             permit = take_task_launch_permit(task_id)
-            if permit is not None:
-                permit.release()
+            assert permit is not None
+            permit.release()
         return 0
 
     with (

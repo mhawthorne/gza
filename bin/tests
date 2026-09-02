@@ -6,13 +6,8 @@ CORES="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
 if [[ ! "$CORES" =~ ^[1-9][0-9]*$ ]]; then
     CORES=1
 fi
-if [[ -z "${PYTEST_XDIST_WORKERS:-}" ]]; then
-    if [[ "$CORES" -ge 2 ]]; then
-        PYTEST_XDIST_WORKERS=2
-    else
-        PYTEST_XDIST_WORKERS="$CORES"
-    fi
-fi
+DEFAULT_XDIST_WORKERS=2
+PYTEST_XDIST_WORKERS="${PYTEST_XDIST_WORKERS:-$DEFAULT_XDIST_WORKERS}"
 RUN_INTEGRATION=0
 QUICK_MODE=0
 TARGET_ARGS=()
