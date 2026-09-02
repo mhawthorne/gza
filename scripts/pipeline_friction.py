@@ -3,7 +3,8 @@
 
 Where merge_unit_metrics.py answers "what did landing cost" (runtime, tokens,
 USD), this answers "how much friction did it hit" -- review iteration counts,
-how often improve/verify_fix/fix/rebase were needed, and calendar time to land.
+how often improve/verify_fix/fix/rebase were needed, and active vs elapsed
+time to land (the gap between them is queue/idle time).
 
 Intended as a baseline snapshot: run it, change something, run it again and
 compare. Filter by tag to scope to one release.
@@ -96,7 +97,8 @@ def load_units(
                t.task_type       AS task_type,
                t.status          AS task_status,
                t.created_at      AS created_at,
-               t.started_at      AS started_at
+               t.started_at      AS started_at,
+               t.duration_seconds AS duration_seconds
           FROM merge_units mu
           JOIN merge_unit_tasks mut
             ON mut.merge_unit_id = mu.id
@@ -124,19 +126,31 @@ def load_units(
                 "lines_removed": row["lines_removed"] or 0,
                 "counts": Counter(),
                 "first_start": None,
+                "active_seconds": 0.0,
             },
         )
         unit["counts"][row["task_type"]] += 1
-        started = parse_ts(row["started_at"]) or parse_ts(row["created_at"])
+        # Elapsed is anchored on real starts only; a task that never started
+        # contributes no clock, so queue time before first execution is excluded.
+        started = parse_ts(row["started_at"])
         if started and (unit["first_start"] is None or started < unit["first_start"]):
             unit["first_start"] = started
+        if row["duration_seconds"]:
+            unit["active_seconds"] += float(row["duration_seconds"])
 
     for unit in units.values():
         merged = parse_ts(unit["merged_at"])
+        unit["hours_active"] = unit["active_seconds"] / 3600
         if merged and unit["first_start"]:
-            unit["hours_to_land"] = (merged - unit["first_start"]).total_seconds() / 3600
+            unit["hours_elapsed"] = (merged - unit["first_start"]).total_seconds() / 3600
         else:
-            unit["hours_to_land"] = None
+            unit["hours_elapsed"] = None
+        if unit["hours_elapsed"] and unit["hours_elapsed"] > 0:
+            # Share of calendar time with no agent running on this unit.
+            idle = max(0.0, unit["hours_elapsed"] - unit["hours_active"])
+            unit["pct_idle"] = 100.0 * idle / unit["hours_elapsed"]
+        else:
+            unit["pct_idle"] = None
 
     return sorted(units.values(), key=lambda u: u["merged_at"] or "")
 
@@ -148,7 +162,9 @@ def summarize(units: list[dict]) -> dict:
 
     reviews = [u["counts"]["review"] for u in units]
     improves = [u["counts"]["improve"] for u in units]
-    hours = [u["hours_to_land"] for u in units if u["hours_to_land"] is not None]
+    elapsed = [u["hours_elapsed"] for u in units if u["hours_elapsed"] is not None]
+    active = [u["hours_active"] for u in units]
+    idle_pcts = [u["pct_idle"] for u in units if u["pct_idle"] is not None]
 
     summary: dict = {
         "total_units": total,
@@ -173,11 +189,23 @@ def summarize(units: list[dict]) -> dict:
         "pct_clean_first_pass": 100.0
         * sum(1 for u in units if u["counts"]["review"] <= 1 and not u["counts"]["improve"])
         / total,
-        "hours_to_land": {
-            "median": percentile(hours, 0.5),
-            "p90": percentile(hours, 0.9),
-            "max": max(hours) if hours else None,
+        "hours_active": {
+            "median": percentile(active, 0.5),
+            "p90": percentile(active, 0.9),
+            "max": max(active) if active else None,
+            "total": sum(active),
         },
+        "hours_elapsed": {
+            "median": percentile(elapsed, 0.5),
+            "p90": percentile(elapsed, 0.9),
+            "max": max(elapsed) if elapsed else None,
+            "total": sum(elapsed),
+        },
+        "pct_idle": {
+            "median": percentile(idle_pcts, 0.5),
+            "p90": percentile(idle_pcts, 0.9),
+        },
+        "units_missing_elapsed": total - len(elapsed),
         "merge_source": dict(Counter(u["merge_source"] or "(blank)" for u in units)),
     }
     return summary
@@ -210,20 +238,26 @@ def print_report(units: list[dict], summary: dict, tag: str | None, verbose: boo
         print(f"  {task_type:<12} {summary['pct_needing'][task_type]:>5.1f}%")
     print(f"\nClean first pass (<=1 review, no improve): {summary['pct_clean_first_pass']:.1f}%")
 
-    h = summary["hours_to_land"]
-    print(f"\nHours from first task start to merge: median {fmt(h['median'])}   p90 {fmt(h['p90'])}   max {fmt(h['max'])}")
+    ha, he, pi = summary["hours_active"], summary["hours_elapsed"], summary["pct_idle"]
+    print("\nHours per unit (active = summed task runtime, elapsed = first start -> merged)")
+    print(f"  active   median {fmt(ha['median'])}   p90 {fmt(ha['p90'])}   max {fmt(ha['max'])}   total {fmt(ha['total'])}")
+    print(f"  elapsed  median {fmt(he['median'])}   p90 {fmt(he['p90'])}   max {fmt(he['max'])}   total {fmt(he['total'])}")
+    print(f"  idle     median {fmt(pi['median'], '%')}   p90 {fmt(pi['p90'], '%')}  (share of elapsed with nothing running)")
+    if summary["units_missing_elapsed"]:
+        print(f"  note: {summary['units_missing_elapsed']} unit(s) had no started task; excluded from elapsed")
 
     print(f"\nMerge source: {summary['merge_source']}")
 
     if verbose:
         print("\nPer-unit detail (worst review counts first):")
-        print(f"  {'unit':<14} {'rev':>3} {'imp':>3} {'vfix':>4} {'fix':>3} {'reb':>3} {'hrs':>7}  branch")
+        print(f"  {'unit':<14} {'rev':>3} {'imp':>3} {'vfix':>4} {'fix':>3} {'reb':>3} {'act':>6} {'elap':>7} {'idle':>6}  branch")
         for unit in sorted(units, key=lambda u: -u["counts"]["review"]):
             c = unit["counts"]
             print(
                 f"  {unit['unit_id']:<14} {c['review']:>3} {c['improve']:>3} "
                 f"{c['verify_fix']:>4} {c['fix']:>3} {c['rebase']:>3} "
-                f"{fmt(unit['hours_to_land']):>7}  {unit['source_branch']}"
+                f"{fmt(unit['hours_active']):>6} {fmt(unit['hours_elapsed']):>7} "
+                f"{fmt(unit['pct_idle'], '%'):>6}  {unit['source_branch']}"
             )
 
 
