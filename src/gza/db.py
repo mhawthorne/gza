@@ -3911,9 +3911,24 @@ _TASK_ARTIFACTS_REQUIRED_COLUMNS: tuple[str, ...] = (
 )
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Return the column names of a table, empty when the table does not exist."""
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {str(row["name"]) if isinstance(row, sqlite3.Row) else str(row[1]) for row in rows}
+
+
 def _missing_required_columns(conn: sqlite3.Connection, table: str, required_columns: tuple[str, ...]) -> list[str]:
-    """Return required columns missing from a table."""
-    return [column for column in required_columns if not _table_has_column(conn, table, column)]
+    """Return required columns missing from a table.
+
+    Reads the table shape once rather than issuing one PRAGMA table_info per
+    required column; the per-column form ran the identical query up to twenty
+    times per call, on every store open.
+    """
+    present = _table_columns(conn, table)
+    return [column for column in required_columns if column not in present]
 
 
 _REGISTRY_MUTATION_REQUIRED_PROJECT_COLUMNS = (
@@ -4417,14 +4432,25 @@ def _ensure_required_auto_migration_artifacts(
             "ALTER TABLE tasks ADD COLUMN verify_fix_completion_outcome_json TEXT",
         ),
     )
+    # Read each table's shape once instead of once per required column. This loop
+    # checks ~49 columns spread over a handful of tables, and the per-column form
+    # issued a full PRAGMA table_info for every one of them on every store open.
+    # Entries are refreshed after an ALTER so later columns see the new shape.
+    columns_by_table: dict[str, set[str]] = {}
+
+    def _columns_for(table: str) -> set[str]:
+        if table not in columns_by_table:
+            columns_by_table[table] = _table_columns(conn, table)
+        return columns_by_table[table]
+
     for min_version, table, column, alter_sql in required_columns:
         if target_version < min_version:
             continue
-        if min_version >= 36 and not _table_exists(conn, table):
+        if min_version >= 36 and not _columns_for(table):
             # Older synthetic schemas used in tests may not have all optional
             # child tables; do not fail v36 repair for those shapes.
             continue
-        if _table_has_column(conn, table, column):
+        if column in _columns_for(table):
             continue
         try:
             conn.execute(alter_sql)
@@ -4433,6 +4459,7 @@ def _ensure_required_auto_migration_artifacts(
                 f"Schema integrity check failed while repairing required column "
                 f"{table}.{column}: use a writable database."
             ) from exc
+        columns_by_table.pop(table, None)
 
     if target_version >= 35 and not _table_exists(conn, "task_tags"):
         try:
