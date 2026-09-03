@@ -16452,7 +16452,10 @@ def test_watch_cycle_plain_mode_starts_manually_queued_pending_recovery_child(tm
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch(
+            "gza.cli.watch._spawn_background_worker",
+            side_effect=lambda _args, _config, task_id, **_kwargs: _mark_watch_task_running(store, str(task_id)),
+        ) as spawn_worker,
     ):
         result = _run_cycle(
             config=config,
@@ -16502,7 +16505,10 @@ def test_watch_cycle_restart_failed_starts_manually_queued_child_after_recovery_
     with (
         patch("gza.cli._common.reconcile_in_progress_tasks"),
         patch("gza.cli._common.prune_terminal_dead_workers"),
-        patch("gza.cli.watch._spawn_background_worker", return_value=0) as spawn_worker,
+        patch(
+            "gza.cli.watch._spawn_background_worker",
+            side_effect=lambda _args, _config, task_id, **_kwargs: _mark_watch_task_running(store, str(task_id)),
+        ) as spawn_worker,
     ):
         first_result = _run_cycle(
             config=config,
@@ -16549,6 +16555,9 @@ def test_watch_cycle_restart_failed_starts_manually_queued_child_after_recovery_
     assert first_result.work_done is True
     assert second_result.work_done is True
     assert third_result.work_done is True
+    assert first_result.confirmed_start_count == 1
+    assert second_result.confirmed_start_count == 1
+    assert third_result.confirmed_start_count == 1
     assert spawn_worker.call_count == 3
     assert spawn_worker.call_args_list[-1].kwargs["task_id"] == manual_child.id
 
