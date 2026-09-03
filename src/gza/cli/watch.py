@@ -851,6 +851,7 @@ def _retire_duplicate_main_verify_remediation_tasks(
         fresh.urgent = False
         fresh.queue_position = None
         store.update(fresh)
+        store.drop_active_merge_units_owned_by(duplicate_id)
         retired_ids.append(duplicate_id)
     return _MainVerifyRemediationDuplicateRetireResult(
         merged_tags=merged_tags,
@@ -925,6 +926,7 @@ def _drop_main_verify_remediation_task(
     fresh.urgent = False
     fresh.queue_position = None
     store.update(fresh)
+    store.drop_active_merge_units_owned_by(task_id)
     return True
 
 

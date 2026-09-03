@@ -284,6 +284,12 @@ It is the object L1/L2 ultimately resolve against.
 - `dropped` and `superseded` are **inactive manual tombstones**. They preserve history for
   an abandoned losing unit, but they are not dependency-satisfying, not actionable, and
   not eligible for shared active-unit resolution by task id or unit listing.
+- **Owner drop propagates to the unit.** When a task transitions to `dropped`, any
+  actionable (`unmerged`/`blocked`/`stale`) merge unit it owns MUST be tombstoned to
+  `dropped` at the same time, so `merge_units.state` stays consistent with
+  `tasks.status` and actionable unit listings need no owner-status filter. Units the
+  dropped task belongs to but does not own, and units already in a landed/no-work state
+  (`merged`/`empty`/`redundant`), MUST be left untouched — those record merge truth.
 - A unit MAY also be inactive via `superseded_by_unit_id != NULL` even if its literal
   `state` is not itself `superseded`. Shared active-unit readers MUST treat both
   mechanisms the same way: only units with `superseded_by_unit_id == NULL` and

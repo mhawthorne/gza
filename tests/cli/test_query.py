@@ -821,7 +821,10 @@ def test_stale_unmerged_execute_drops_only_selected_tasks_and_keeps_branch_histo
     assert updated_stale_review.status == "dropped"
     assert updated_live_owner.status == "completed"
     assert updated_stale_owner.branch == "feature/stale"
-    assert store.resolve_merge_unit_for_task(stale_owner.id) is not None
+    assert store.resolve_merge_unit_for_task(stale_owner.id) is None
+    tombstoned = store.get_merge_unit(stale_unit.id)
+    assert tombstoned is not None
+    assert tombstoned.state == "dropped"
 
 
 def test_stale_unmerged_execute_json_applies_drops_and_reports_them(tmp_path: Path) -> None:
