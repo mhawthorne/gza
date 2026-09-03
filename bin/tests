@@ -7,6 +7,12 @@ if [[ ! "$CORES" =~ ^[1-9][0-9]*$ ]]; then
     CORES=1
 fi
 DEFAULT_XDIST_WORKERS=2
+# The worker count is deliberately fixed rather than scaled to the machine, so a
+# local run reproduces CI ordering. Clamp downward only: on a single-core host
+# two workers buy no parallelism and still pay fork and coordination overhead.
+if [[ "$CORES" -lt "$DEFAULT_XDIST_WORKERS" ]]; then
+    DEFAULT_XDIST_WORKERS="$CORES"
+fi
 PYTEST_XDIST_WORKERS="${PYTEST_XDIST_WORKERS:-$DEFAULT_XDIST_WORKERS}"
 RUN_INTEGRATION=0
 QUICK_MODE=0

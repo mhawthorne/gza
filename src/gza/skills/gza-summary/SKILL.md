@@ -3,7 +3,7 @@ name: gza-summary
 description: Synthesize operator triage guidance from failed-task history, unimplemented plan and explore work, unmerged branches, and queue state
 allowed-tools: Bash(uv run gza history:*), Bash(uv run gza unmerged:*), Bash(uv run gza next:*), Bash(uv run gza advance:*), Bash(uv run gza watch:*)
 version: 2.0.0
-public: true
+public: false
 ---
 
 # Gza Summary

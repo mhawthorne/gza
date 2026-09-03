@@ -11,8 +11,10 @@ Parses the selected watch log family and plots six disjoint series — tasks
 (classification residual; should stay at zero) — against time, saving a PNG and
 printing a text table of the same numbers. Newer logs carry a per-cycle
 ``cycle accounting:`` line with the full breakdown; older logs only have the
-WAKE counts plus attention lines, which are mapped onto parked (recovery and
-other are unknown there). Live watch logs
+WAKE counts plus attention lines. By default parked is left unknown on those
+older cycles, since the old attention lines count a broader, differently-scoped
+set of conditions than the modern parked bucket; pass --legacy-attention to map
+them onto parked anyway (recovery and other are unknown either way). Live watch logs
 (``.gza/watch.log`` plus ``watch.<timestamp>.log`` archives) and dry-run watch
 logs (``.gza/watch.dry-run.log`` plus ``watch.dry-run.<timestamp>.log``
 archives) are read separately because they describe different runs.
@@ -146,7 +148,7 @@ def _combine_hms(day, hms):
     return datetime.combine(day, datetime.min.time()).replace(hour=h, minute=m, second=s)
 
 
-def parse_log(path, base_date, *, use_anchor_time=False):
+def parse_log(path, base_date, *, use_anchor_time=False, legacy_attention=False):
     """Parse ``path`` into ``(points, merges)``.
 
     ``points`` is a chronological list of Point; ``merges`` is a list of
@@ -154,6 +156,13 @@ def parse_log(path, base_date, *, use_anchor_time=False):
     ``base_date`` anchors the newest line's date (HMS-only logs). For archives,
     callers should pass the archive filename timestamp so each rotated file is
     dated independently. Attention is carried forward only within this file.
+
+    By default only the ``cycle accounting:`` line is trusted for ``parked``;
+    cycles that predate it are left as ``parked=None`` (unknown), since the old
+    "Needs attention" lines count a much broader set of conditions than the
+    modern ``parked`` bucket and conflating the two under one series produces a
+    misleading count. Pass ``legacy_attention=True`` to fall back to those old
+    lines for logs from before the accounting line existed.
     """
     raw = []  # (full_dt | None, hms | None, kind, values...)
     attention = None  # carried forward as we scan
@@ -245,11 +254,14 @@ def parse_log(path, base_date, *, use_anchor_time=False):
                                 acct_parked, acct_recovery, acct_other))
             attention = acct_parked
             continue
-        if cycle_attn is not None:
-            attention = cycle_attn
-        elif first_attn_idx is not None and i > first_attn_idx:
-            attention = 0  # attention reporting is active but this cycle is silent
-        # else: before any attention reporting -> leave as None (unknown)
+        if legacy_attention:
+            if cycle_attn is not None:
+                attention = cycle_attn
+            elif first_attn_idx is not None and i > first_attn_idx:
+                attention = 0  # attention reporting is active but this cycle is silent
+            # else: before any attention reporting -> leave as None (unknown)
+        else:
+            attention = None  # no accounting line on this cycle -> parked unknown
         _, _, _, running, pending, blocked = row
         points.append(Point(when, running, pending, blocked, attention))
     return points, merges
@@ -774,9 +786,10 @@ def select_watch_logs(files, lo, hi):
     return selected
 
 
-def _parse_log_file(item, base_date):
+def _parse_log_file(item, base_date, *, legacy_attention=False):
     anchor = item.archive_end if item.archive_end is not None else base_date
-    return parse_log(item.path, anchor, use_anchor_time=item.archive_end is not None)
+    return parse_log(item.path, anchor, use_anchor_time=item.archive_end is not None,
+                      legacy_attention=legacy_attention)
 
 
 def _newest_cycle_anchor(files, base_date, hi=None):
@@ -796,7 +809,7 @@ def newest_watch_cycle(log_path, base_date):
     return _newest_cycle_anchor(discover_watch_logs(log_path), base_date)
 
 
-def parse_watch_logs(log_path, base_date, lo=None, hi=None, hours=None):
+def parse_watch_logs(log_path, base_date, lo=None, hi=None, hours=None, *, legacy_attention=False):
     """Parse the requested watch-log family into chronological points and merges."""
     files = discover_watch_logs(log_path)
     if lo is None and hours is not None:
@@ -807,7 +820,7 @@ def parse_watch_logs(log_path, base_date, lo=None, hi=None, hours=None):
     points = []
     merges = []
     for item in select_watch_logs(files, lo, hi):
-        file_points, file_merges = _parse_log_file(item, base_date)
+        file_points, file_merges = _parse_log_file(item, base_date, legacy_attention=legacy_attention)
         points.extend(file_points)
         merges.extend(file_merges)
     points.sort(key=lambda p: p.when)
@@ -1036,6 +1049,11 @@ def main(argv=None):
                     help="max share of vertical space the merge id band may use, so the data "
                          f"lines stay readable (default {MERGE_BAND_DEFAULT}; clamped to "
                          f"0.05–{MERGE_BAND_MAX})")
+    ap.add_argument("--legacy-attention", action="store_true",
+                     help="for cycles that predate the 'cycle accounting:' line, fall back to "
+                          "the old 'Needs attention' lines for the parked series (a broader, "
+                          "differently-scoped count than the modern parked bucket; off by "
+                          "default so parked is unknown, not misleading, on old logs)")
     ap.add_argument("--watch", nargs="?", type=int, const=60, default=None, metavar="N",
                     help="live mode: refresh table + PNG every N seconds (default 60). "
                          "Table shows the most recent --table-rows cycles.")
@@ -1062,7 +1080,8 @@ def main(argv=None):
         if file_lo is None and file_hi is None and not args.all and args.start is None
         else None
     )
-    points, merges = parse_watch_logs(log_path, base_date, file_lo, file_hi, parse_hours)
+    points, merges = parse_watch_logs(log_path, base_date, file_lo, file_hi, parse_hours,
+                                       legacy_attention=args.legacy_attention)
     if not points:
         if file_lo is not None or file_hi is not None:
             print("no cycles in the selected window", file=sys.stderr)
@@ -1112,7 +1131,8 @@ def _watch_loop(args, log_path):
                     else None
                 )
                 points, merges = parse_watch_logs(
-                    log_path, base_date, file_lo, file_hi, parse_hours
+                    log_path, base_date, file_lo, file_hi, parse_hours,
+                    legacy_attention=args.legacy_attention,
                 )
             except OSError as exc:  # log momentarily unreadable — keep looping
                 print(f"read error: {exc}; retrying in {interval}s...", file=sys.stderr)
