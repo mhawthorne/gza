@@ -1938,3 +1938,29 @@ def test_verify_dry_run_reports_current_epoch_without_mutation(tmp_path, capsys)
     output = capsys.readouterr().out
     assert "[dry-run] Verify gate: failed" in output
     assert "head=head-current" in output
+
+
+def test_verify_context_reports_progress_like_advance(tmp_path, capsys):
+    """The manual verify gate must narrate progress the way `advance` does."""
+    from gza.cli.verify import _make_verify_context
+    from gza.runner import LongPhaseProgress
+
+    config = _setup_verify_config(tmp_path)
+    store = make_store(tmp_path)
+    task = _completed_unmerged_task(store)
+    context = _make_verify_context(config=config, store=store, git=_fake_git(tmp_path))
+
+    assert context.heartbeat_for_lifecycle_phase is not None
+    heartbeat = context.heartbeat_for_lifecycle_phase("verify", task)
+    assert heartbeat is not None
+    heartbeat(LongPhaseProgress(
+            elapsed_seconds=90.0,
+            cpu_delta_seconds=None,
+            output_bytes_delta=0,
+            output_lines_delta=0,
+            no_progress=True,
+        ))
+
+    output = capsys.readouterr().out
+    assert "Verify gate running" in output
+    assert "elapsed" in output
