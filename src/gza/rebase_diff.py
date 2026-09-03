@@ -27,6 +27,17 @@ class RebaseDiffResult:
     changed_diff: bool
     detail: str
     warning: str | None = None
+    changed_diff_boundary_proven: bool = False
+    compared_head_sha: str | None = None
+    compared_target_sha: str | None = None
+
+
+@dataclass(frozen=True)
+class RebaseBoundaryProof:
+    """Durable proof that a changed-diff rebase consumed its captured target."""
+
+    proven: bool
+    warning: str | None = None
 
 
 @dataclass(frozen=True)
@@ -39,6 +50,7 @@ class RebaseDiffProvenance:
     resolved_head_sha: str | None
     resolved_target_sha: str | None
     recovered: bool = False
+    changed_diff_boundary_proven: bool = False
 
 
 @dataclass(frozen=True)
@@ -79,16 +91,104 @@ def resolution_delta_provenance_is_complete(provenance: RebaseDiffProvenance) ->
     )
 
 
-def rebase_diff_provenance_quality(provenance: RebaseDiffProvenance | None) -> tuple[int, int, int]:
+def rebase_changed_diff_boundary_proof_is_valid(provenance: RebaseDiffProvenance | None) -> bool:
+    """Return whether persisted provenance can reset review-cycle accounting."""
+    if provenance is None or provenance.recovered or not provenance.changed_diff_boundary_proven:
+        return False
+    return (
+        resolution_delta_provenance_is_complete(provenance)
+        and bool(provenance.resolved_head_sha)
+        and bool(provenance.resolved_target_sha)
+        and provenance.resolved_target_sha == provenance.target_at_start
+    )
+
+
+def _normalize_changed_diff_boundary_proof(
+    *,
+    baseline: RebaseDiffBaseline,
+    resolved_head_sha: str | None,
+    resolved_target_sha: str | None,
+    changed_diff_boundary_proven: bool,
+) -> bool:
+    """Accept an affirmative boundary flag only when its provenance is internally valid."""
+    if not changed_diff_boundary_proven:
+        return False
+    return rebase_changed_diff_boundary_proof_is_valid(
+        RebaseDiffProvenance(
+            old_tip=baseline.old_tip,
+            target_at_start=baseline.target_at_start,
+            merge_base_at_start=baseline.merge_base_at_start,
+            resolved_head_sha=resolved_head_sha,
+            resolved_target_sha=resolved_target_sha,
+            recovered=baseline.recovered,
+            changed_diff_boundary_proven=True,
+        )
+    )
+
+
+def prove_rebase_changed_diff_boundary(
+    git: Git,
+    *,
+    baseline: RebaseDiffBaseline,
+    resolved_head_sha: str | None,
+    resolved_target_sha: str | None,
+) -> RebaseBoundaryProof:
+    """Prove a changed-diff rebase boundary against the exact compared head.
+
+    Target stability is not enough: the resulting head must contain the
+    immutable target SHA captured before the rebase started.
+    """
+    if not _normalize_changed_diff_boundary_proof(
+        baseline=baseline,
+        resolved_head_sha=resolved_head_sha,
+        resolved_target_sha=resolved_target_sha,
+        changed_diff_boundary_proven=True,
+    ):
+        return RebaseBoundaryProof(proven=False)
+
+    assert baseline.target_at_start is not None
+    assert resolved_head_sha is not None
+    try:
+        contains_target = git.is_ancestor(baseline.target_at_start, resolved_head_sha)
+    except (GitError, RuntimeError) as exc:
+        return RebaseBoundaryProof(
+            proven=False,
+            warning=(
+                "rebase changed-diff boundary proof failed: could not prove "
+                f"whether {resolved_head_sha} contains captured target {baseline.target_at_start}: {exc}"
+            ),
+        )
+    except Exception as exc:
+        return RebaseBoundaryProof(
+            proven=False,
+            warning=(
+                "rebase changed-diff boundary proof failed: could not prove "
+                f"whether {resolved_head_sha} contains captured target {baseline.target_at_start}: {exc}"
+            ),
+        )
+
+    if contains_target is True:
+        return RebaseBoundaryProof(proven=True)
+    return RebaseBoundaryProof(
+        proven=False,
+        warning=(
+            "rebase changed-diff boundary proof unavailable: rebased head "
+            f"{resolved_head_sha} does not contain captured target {baseline.target_at_start}"
+        ),
+    )
+
+
+def rebase_diff_provenance_quality(provenance: RebaseDiffProvenance | None) -> tuple[int, int, int, int]:
     """Rank persisted rebase provenance so stale writes cannot replace better proof."""
     if provenance is None:
-        return (0, 0, 0)
+        return (0, 0, 0, 0)
     full_resolution_proof = int(
         resolution_delta_provenance_is_complete(provenance)
         and bool(provenance.resolved_head_sha)
         and bool(provenance.resolved_target_sha)
     )
     irrecoverable_pre_rebase_proof = int(resolution_delta_provenance_is_complete(provenance))
+    changed_diff_boundary_proof = int(rebase_changed_diff_boundary_proof_is_valid(provenance))
     populated_fields = sum(
         1
         for value in (
@@ -100,7 +200,7 @@ def rebase_diff_provenance_quality(provenance: RebaseDiffProvenance | None) -> t
         )
         if value
     )
-    return (full_resolution_proof, irrecoverable_pre_rebase_proof, populated_fields)
+    return (changed_diff_boundary_proof, full_resolution_proof, irrecoverable_pre_rebase_proof, populated_fields)
 
 
 def capture_rebase_diff_baseline(
@@ -164,33 +264,59 @@ def compute_rebase_changed_diff(
             warning="rebase diff comparison missing pre-rebase refs; treating as changed",
         )
 
-    new_tip = git.rev_parse_if_exists(branch)
-    target_at_completion = git.rev_parse_if_exists(target)
-    if not new_tip or not target_at_completion:
+    compared_head_sha = git.rev_parse_if_exists(branch)
+    compared_target_sha = git.rev_parse_if_exists(target)
+    if not compared_head_sha or not compared_target_sha:
         return RebaseDiffResult(
             changed_diff=True,
             detail="yes (review must be refreshed)",
             warning="rebase diff comparison missing post-rebase refs; treating as changed",
+            compared_head_sha=compared_head_sha,
+            compared_target_sha=compared_target_sha,
         )
 
     try:
         pre_patch_id = _aggregate_patch_id(git, baseline.merge_base_at_start, baseline.old_tip)
-        post_patch_id = _aggregate_patch_id(git, target_at_completion, new_tip)
+        post_patch_id = _aggregate_patch_id(git, compared_target_sha, compared_head_sha)
     except (GitError, RuntimeError) as exc:
         return RebaseDiffResult(
             changed_diff=True,
             detail="yes (review must be refreshed)",
             warning=f"rebase diff comparison failed: {exc}; treating as changed",
+            compared_head_sha=compared_head_sha,
+            compared_target_sha=compared_target_sha,
         )
 
     if pre_patch_id == post_patch_id:
         return RebaseDiffResult(
             changed_diff=False,
             detail="no (review can be preserved)",
+            compared_head_sha=compared_head_sha,
+            compared_target_sha=compared_target_sha,
         )
+    target_stable = compared_target_sha == baseline.target_at_start
+    boundary_proof = (
+        prove_rebase_changed_diff_boundary(
+            git,
+            baseline=baseline,
+            resolved_head_sha=compared_head_sha,
+            resolved_target_sha=compared_target_sha,
+        )
+        if target_stable
+        else RebaseBoundaryProof(proven=False)
+    )
     return RebaseDiffResult(
         changed_diff=True,
         detail="yes (review must be refreshed)",
+        warning=(
+            "rebase diff comparison target moved after baseline capture; "
+            "changed-diff boundary proof unavailable"
+            if not target_stable
+            else boundary_proof.warning
+        ),
+        changed_diff_boundary_proven=boundary_proof.proven,
+        compared_head_sha=compared_head_sha,
+        compared_target_sha=compared_target_sha,
     )
 
 
@@ -199,8 +325,15 @@ def build_rebase_diff_provenance(
     baseline: RebaseDiffBaseline,
     resolved_head_sha: str | None,
     resolved_target_sha: str | None,
+    changed_diff_boundary_proven: bool = False,
 ) -> str:
     """Serialize the refs needed for later resolution-delta review context."""
+    changed_diff_boundary_proven = _normalize_changed_diff_boundary_proof(
+        baseline=baseline,
+        resolved_head_sha=resolved_head_sha,
+        resolved_target_sha=resolved_target_sha,
+        changed_diff_boundary_proven=changed_diff_boundary_proven,
+    )
     return "\n".join(
         (
             "Rebase diff provenance: yes",
@@ -210,7 +343,51 @@ def build_rebase_diff_provenance(
             f"Resolved head SHA: {resolved_head_sha or ''}",
             f"Resolved target SHA: {resolved_target_sha or ''}",
             f"Recovered baseline: {'yes' if baseline.recovered else 'no'}",
+            f"Changed-diff boundary proven: {'yes' if changed_diff_boundary_proven else 'no'}",
         )
+    )
+
+
+def serialize_rebase_diff_provenance(provenance: RebaseDiffProvenance) -> str:
+    """Serialize an already-parsed provenance block without changing its fields."""
+    return build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip=provenance.old_tip,
+            target_at_start=provenance.target_at_start,
+            merge_base_at_start=provenance.merge_base_at_start,
+            recovered=provenance.recovered,
+        ),
+        resolved_head_sha=provenance.resolved_head_sha,
+        resolved_target_sha=provenance.resolved_target_sha,
+        changed_diff_boundary_proven=provenance.changed_diff_boundary_proven,
+    )
+
+
+def combine_rebase_diff_provenance_preserving_boundary(
+    *,
+    persisted: RebaseDiffProvenance,
+    candidate: RebaseDiffProvenance,
+) -> RebaseDiffProvenance:
+    """Fill missing provenance fields without inventing boundary proof."""
+    persisted_boundary_valid = rebase_changed_diff_boundary_proof_is_valid(persisted)
+    combined = RebaseDiffProvenance(
+        old_tip=persisted.old_tip or candidate.old_tip,
+        target_at_start=persisted.target_at_start or candidate.target_at_start,
+        merge_base_at_start=persisted.merge_base_at_start or candidate.merge_base_at_start,
+        resolved_head_sha=persisted.resolved_head_sha or candidate.resolved_head_sha,
+        resolved_target_sha=persisted.resolved_target_sha or candidate.resolved_target_sha,
+        recovered=persisted.recovered,
+        changed_diff_boundary_proven=persisted_boundary_valid,
+    )
+    return RebaseDiffProvenance(
+        old_tip=combined.old_tip,
+        target_at_start=combined.target_at_start,
+        merge_base_at_start=combined.merge_base_at_start,
+        resolved_head_sha=combined.resolved_head_sha,
+        resolved_target_sha=combined.resolved_target_sha,
+        recovered=combined.recovered,
+        changed_diff_boundary_proven=persisted_boundary_valid
+        and rebase_changed_diff_boundary_proof_is_valid(combined),
     )
 
 
@@ -231,6 +408,7 @@ def parse_rebase_diff_provenance(text: str | None) -> RebaseDiffProvenance | Non
         resolved_head_sha=fields.get("resolved head sha") or None,
         resolved_target_sha=fields.get("resolved target sha") or None,
         recovered=(fields.get("recovered baseline") or "").lower() == "yes",
+        changed_diff_boundary_proven=(fields.get("changed-diff boundary proven") or "").lower() == "yes",
     )
 
 
@@ -286,13 +464,23 @@ def recover_rebase_diff_provenance(
     if not any((old_tip, target_at_start, merge_base_at_start, resolved_head_sha, resolved_target_sha)):
         return existing
 
-    return RebaseDiffProvenance(
+    recovered_provenance = RebaseDiffProvenance(
         old_tip=old_tip,
         target_at_start=target_at_start,
         merge_base_at_start=merge_base_at_start,
         resolved_head_sha=resolved_head_sha,
         resolved_target_sha=resolved_target_sha,
         recovered=recovered,
+        changed_diff_boundary_proven=rebase_changed_diff_boundary_proof_is_valid(existing),
+    )
+    return RebaseDiffProvenance(
+        old_tip=recovered_provenance.old_tip,
+        target_at_start=recovered_provenance.target_at_start,
+        merge_base_at_start=recovered_provenance.merge_base_at_start,
+        resolved_head_sha=recovered_provenance.resolved_head_sha,
+        resolved_target_sha=recovered_provenance.resolved_target_sha,
+        recovered=recovered_provenance.recovered,
+        changed_diff_boundary_proven=rebase_changed_diff_boundary_proof_is_valid(recovered_provenance),
     )
 
 

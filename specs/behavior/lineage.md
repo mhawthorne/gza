@@ -182,6 +182,12 @@ only the direct `based_on` children of one task.
   branchless nodes attached via the merge unit — MUST be considered candidates.
 - "Latest" MUST order completed nodes ahead of incomplete ones, then by most-recent
   completion time. The current/applicable node is the first under that order.
+- Legacy unlinked review fallback MUST only use completed review rows with neither
+  `based_on` nor `depends_on`. Dated slug matches and prompt-only matches MUST be bounded
+  to one implementation epoch, including numeric slug revisions such as `foo` and `foo-2`,
+  so one review row cannot count as evidence for more than one implementation identity.
+  If duplicate implementation rows share the exact same full dated slug, exact dated
+  legacy reviews MUST resolve to a single containing implementation epoch or fail closed.
 
 *Implementation note: `query.get_reviews_for_root` (gathers direct + same-merge-unit +
 slug-fallback) and `task_query._latest_review_verdict`. Consumed by lifecycle §6

@@ -2113,9 +2113,17 @@ If that manual resume completes successfully, operator-facing lifecycle readouts
 Detached `gza iterate --background` runs follow the same observability rule: if the background worker stops during startup or another no-run preflight path, the task log path and `gza log <impl-task-id>` now retain the refusal reason rather than silently exiting.
 
 When iterate stops with `max_cycles_reached`, it now prints review-iteration accounting with:
-- task `completed` review-iteration count
+- `completed_since_boundary`, the review-iteration count compared with `max_review_cycles`
 - configured `max_review_cycles`
-- `consumed_this_invocation` cycles
+- `boundary`, either `none` or the changed-diff rebase boundary that scoped the count
+- separately labeled lifetime and invocation counts for diagnostics
+
+These accounting counts include strict exact legacy unlinked review rows independently
+from canonical lifecycle review state. Canonical lifecycle state prefers linked or
+merge-unit-attached reviews and uses legacy unlinked rows only as fallback for older task
+history when that evidence is absent. If historical implementations reuse the same
+semantic slug, dated legacy review slugs stay tied to the matching dated implementation
+identity and prompt-only legacy review rows are bounded to one implementation epoch.
 
 When iterate stops on a shared human-required outcome, it also prints the same `Needs attention: <task> ... reason=...` line used by `gza advance`, including the same single-line shortened prompt formatting, so operators can see the exact policy boundary that stopped automation.
 

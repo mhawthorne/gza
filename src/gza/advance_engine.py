@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -64,6 +64,7 @@ from gza.project_discovery import (
 )
 from gza.query import (
     get_code_changing_descendants_for_root,
+    get_implementation_review_cycle_accounting_evidence,
     get_implementation_review_evidence,
     resolve_lineage_owner_task,
     resolve_lineage_root,
@@ -71,8 +72,10 @@ from gza.query import (
 )
 from gza.rebase_diff import (
     parse_rebase_diff_provenance,
+    rebase_changed_diff_boundary_proof_is_valid,
     resolution_delta_provenance_is_complete,
 )
+from gza.rebase_publish import REBASE_SUPERSEDED_COMPLETION_REASON
 from gza.recovery_engine import (
     FailedRecoveryDecision,
     _resolve_merged_target_task,
@@ -553,6 +556,15 @@ class ReviewCycleBoundary:
     boundary_time: datetime | None = None
     boundary_task_id: str | None = None
     boundary_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewCycleAccounting:
+    """Review-iteration counts under the currently active progress boundary."""
+
+    completed_since_boundary: int = 0
+    lifetime_completed: int = 0
+    boundary: ReviewCycleBoundary = field(default_factory=ReviewCycleBoundary)
 
 
 @dataclass(frozen=True)
@@ -1418,73 +1430,30 @@ def is_resumable_failed_task(task: Any) -> bool:
 
 
 def count_completed_review_cycles(store: SqliteTaskStore, impl_task_id: str) -> int:
-    improve_tasks = store.get_improve_tasks_by_root(impl_task_id)
-    return sum(1 for t in improve_tasks if t.status == "completed")
+    impl_task = store.get(impl_task_id)
+    if impl_task is None:
+        return 0
+    review_tasks = get_implementation_review_cycle_accounting_evidence(store, impl_task)
+    return sum(1 for task in review_tasks if task.status == "completed")
 
 
 def resolve_review_cycle_boundary(
     *,
-    completed_reviews: list[DbTask],
     latest_completed_review: DbTask | None,
     latest_completed_rebase: DbTask | None = None,
-    latest_completed_code_change: DbTask | None = None,
-    latest_reviewed_head_sha: str | None = None,
-    current_review_head_sha: str | None = None,
 ) -> ReviewCycleBoundary:
-    """Resolve the durable progress boundary for review-iteration accounting."""
+    """Resolve the deliberate review-scope boundary for review-iteration accounting."""
     if latest_completed_review is None:
         return ReviewCycleBoundary()
 
-    latest_review_time = _task_event_time(latest_completed_review)
-    reviewed_head_sha = latest_reviewed_head_sha or latest_completed_review.review_verify_head_sha
-    if not reviewed_head_sha:
-        return ReviewCycleBoundary()
+    if latest_completed_rebase is not None and _rebase_has_proven_changed_diff_boundary(latest_completed_rebase):
+        return ReviewCycleBoundary(
+            boundary_time=_task_event_time(latest_completed_rebase),
+            boundary_task_id=latest_completed_rebase.id,
+            boundary_reason="rebase_changed_diff",
+        )
 
-    if current_review_head_sha and current_review_head_sha != reviewed_head_sha:
-        progress_candidates: list[tuple[datetime, DbTask, str]] = []
-        if (
-            latest_completed_rebase is not None
-            and latest_completed_rebase.changed_diff is not False
-            and _task_event_time(latest_completed_rebase) > latest_review_time
-        ):
-            progress_candidates.append(
-                (
-                    _task_event_time(latest_completed_rebase),
-                    latest_completed_rebase,
-                    "rebase_changed_diff",
-                )
-            )
-        if (
-            latest_completed_code_change is not None
-            and latest_completed_code_change.id != latest_completed_review.id
-            and _task_event_time(latest_completed_code_change) > latest_review_time
-        ):
-            progress_candidates.append(
-                (
-                    _task_event_time(latest_completed_code_change),
-                    latest_completed_code_change,
-                    "code_change_after_review",
-                )
-            )
-        if progress_candidates:
-            boundary_time, boundary_task, boundary_reason = max(progress_candidates, key=lambda item: item[0])
-            return ReviewCycleBoundary(
-                boundary_time=boundary_time,
-                boundary_task_id=boundary_task.id,
-                boundary_reason=boundary_reason,
-            )
-
-    boundary_review = latest_completed_review
-    for review in completed_reviews[1:]:
-        if review.review_verify_head_sha != reviewed_head_sha:
-            break
-        boundary_review = review
-
-    return ReviewCycleBoundary(
-        boundary_time=_task_event_time(boundary_review),
-        boundary_task_id=boundary_review.id,
-        boundary_reason="reviewed_head_epoch",
-    )
+    return ReviewCycleBoundary()
 
 
 def count_completed_review_cycles_since_boundary(
@@ -1493,14 +1462,81 @@ def count_completed_review_cycles_since_boundary(
     *,
     boundary: ReviewCycleBoundary,
 ) -> int:
-    """Count completed improves after a durable progress boundary."""
+    """Count completed review rounds after a deliberate scope/base boundary."""
     if boundary.boundary_time is None:
         return count_completed_review_cycles(store, impl_task_id)
 
-    improve_tasks = store.get_improve_tasks_by_root(impl_task_id)
+    impl_task = store.get(impl_task_id)
+    if impl_task is None:
+        return 0
+    review_tasks = get_implementation_review_cycle_accounting_evidence(store, impl_task)
     return sum(
-        1 for task in improve_tasks if task.status == "completed" and _task_event_time(task) > boundary.boundary_time
+        1
+        for task in review_tasks
+        if completed_review_cycle_belongs_to_boundary(task, boundary=boundary)
     )
+
+
+def completed_review_cycle_belongs_to_boundary(
+    task: DbTask,
+    *,
+    boundary: ReviewCycleBoundary,
+) -> bool:
+    """Return whether a completed review round belongs to the active review-cycle boundary."""
+    if task.status != "completed":
+        return False
+    if boundary.boundary_time is None:
+        return True
+    return _review_cycle_membership_time(task) > _normalize_time(boundary.boundary_time)
+
+
+def resolve_review_cycle_accounting(
+    store: SqliteTaskStore,
+    impl_task_id: str,
+    *,
+    latest_completed_review: DbTask | None,
+    latest_completed_rebase: DbTask | None = None,
+) -> ReviewCycleAccounting:
+    """Return the shared accounting lifecycle uses for max-review-cycle decisions."""
+    boundary = resolve_review_cycle_boundary(
+        latest_completed_review=latest_completed_review,
+        latest_completed_rebase=latest_completed_rebase,
+    )
+    lifetime_completed = count_completed_review_cycles(store, impl_task_id)
+    if boundary.boundary_time is None:
+        completed_since_boundary = lifetime_completed
+    else:
+        completed_since_boundary = count_completed_review_cycles_since_boundary(
+            store,
+            impl_task_id,
+            boundary=boundary,
+        )
+    return ReviewCycleAccounting(
+        completed_since_boundary=completed_since_boundary,
+        lifetime_completed=lifetime_completed,
+        boundary=boundary,
+    )
+
+
+def _rebase_has_proven_changed_diff_boundary(task: DbTask) -> bool:
+    """Return True only for rebases with durable affirmative changed-diff proof."""
+    if task.status != "completed" or task.completed_at is None or task.changed_diff is not True:
+        return False
+    if task.completion_reason == REBASE_SUPERSEDED_COMPLETION_REASON:
+        return False
+    provenance = parse_rebase_diff_provenance(task.review_scope)
+    return rebase_changed_diff_boundary_proof_is_valid(provenance)
+
+
+def _latest_completed_changed_diff_rebase(rebase_tasks: list[DbTask]) -> DbTask | None:
+    proven = [
+        task
+        for task in rebase_tasks
+        if _rebase_has_proven_changed_diff_boundary(task)
+    ]
+    if not proven:
+        return None
+    return max(proven, key=_task_event_time)
 
 
 def _has_tag(task: DbTask | None, tag: str) -> bool:
@@ -4209,6 +4245,11 @@ def _task_event_time(task: DbTask) -> datetime:
     return _normalize_time(task.completed_at or task.created_at)
 
 
+def _review_cycle_membership_time(task: DbTask) -> datetime:
+    """Return the durable review-attempt timestamp used for boundary membership."""
+    return _normalize_time(task.created_at)
+
+
 def _resolve_latest_plan_source(store: SqliteTaskStore, task: DbTask) -> DbTask:
     """Resolve the latest non-dropped plan source in a plan revision chain."""
     latest = task
@@ -5616,16 +5657,31 @@ def _review_max_cycles_needs_attention_action(ctx: AdvanceContext) -> dict[str, 
     return with_needs_attention(
         {
             "type": "max_cycles_reached",
-            "description": (f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"),
+            "description": (
+                f"SKIP: max review cycles ({ctx.max_review_cycles}) reached, needs manual intervention"
+            ),
+            "completed_review_cycles": ctx.completed_review_cycles,
+            "max_review_cycles": ctx.max_review_cycles,
+            "review_cycle_boundary_task_id": getattr(ctx, "review_cycle_boundary_task_id", None),
+            "review_cycle_boundary_reason": getattr(ctx, "review_cycle_boundary_reason", None),
         },
         reason=PARK_REASON_REVIEW_MAX_CYCLES_REACHED,
         subject_task_id=ctx.task.id,
     )
 
 
-def _review_max_cycles_action(ctx: AdvanceContext) -> dict[str, Any]:
+def _review_max_cycles_action(
+    ctx: AdvanceContext,
+    *,
+    trigger_review: DbTask | None = None,
+    trigger_review_mode: str | None = None,
+) -> dict[str, Any]:
     config = getattr(ctx, "config", None)
     if getattr(config, "on_max_cycles", "park") != "merge_and_defer":
+        return _review_max_cycles_needs_attention_action(ctx)
+    resolved_trigger_review = trigger_review if trigger_review is not None else ctx.latest_completed_review
+    resolved_trigger_mode = trigger_review_mode or _review_mode(resolved_trigger_review)
+    if resolved_trigger_mode == "spec_coherence":
         return _review_max_cycles_needs_attention_action(ctx)
 
     if _merge_source_unavailable_requires_manual_resolution(ctx):
@@ -6923,6 +6979,7 @@ def _resolve_pre_closing_review_git_context(
     completed_rebases = [c for c in rebase_children if c.status == "completed" and c.completed_at is not None]
     if completed_rebases:
         latest_completed_rebase = max(completed_rebases, key=lambda t: t.completed_at or datetime.min)
+    latest_completed_changed_diff_rebase = _latest_completed_changed_diff_rebase(completed_rebases)
 
     rebase_invalidates_review = False
     review_invalidated_by_progress = False
@@ -7129,26 +7186,23 @@ def _resolve_pre_closing_review_git_context(
     if (
         (
             ctx.review_verdict == "CHANGES_REQUESTED"
+            or (
+                spec_coherence_review_current
+                and spec_coherence_review_verdict == "CHANGES_REQUESTED"
+            )
             or ctx.capped_review_content_error_reason == PARK_REASON_REVIEW_MAX_CYCLES_REVIEW_CONTENT_UNAVAILABLE
         )
         and review_root_task.id is not None
-        and ctx.latest_completed_review is not None
+        and (ctx.latest_completed_review is not None or spec_coherence_latest_completed_review is not None)
     ):
-        completed_reviews = [review for review in (ctx.reviews or []) if review.status == "completed"]
-        review_cycle_boundary = resolve_review_cycle_boundary(
-            completed_reviews=completed_reviews,
-            latest_completed_review=ctx.latest_completed_review,
-            latest_completed_rebase=latest_completed_rebase,
-            latest_completed_code_change=ctx.latest_completed_code_change,
-            latest_reviewed_head_sha=latest_reviewed_head_sha,
-            current_review_head_sha=current_review_head_sha,
-        )
-        completed_review_cycles = count_completed_review_cycles_since_boundary(
+        review_cycle_accounting = resolve_review_cycle_accounting(
             store,
             review_root_task.id,
-            boundary=review_cycle_boundary,
+            latest_completed_review=ctx.latest_completed_review or spec_coherence_latest_completed_review,
+            latest_completed_rebase=latest_completed_changed_diff_rebase,
         )
-
+        review_cycle_boundary = review_cycle_accounting.boundary
+        completed_review_cycles = review_cycle_accounting.completed_since_boundary
     rebase_failure_streak = _count_rebase_failure_streak(
         task=task,
         rebase_children=rebase_children,
@@ -8259,6 +8313,18 @@ ADVANCE_RULES: list[AdvanceRule] = [
         },
     ),
     AdvanceRule(
+        name="spec_coherence_review_max_cycles",
+        matches=lambda ctx: _spec_coherence_gate_required(ctx)
+        and ctx.spec_coherence_review_current
+        and ctx.spec_coherence_review_verdict == "CHANGES_REQUESTED"
+        and ctx.completed_review_cycles >= ctx.max_review_cycles,
+        action=lambda ctx: _review_max_cycles_action(
+            ctx,
+            trigger_review=ctx.spec_coherence_latest_completed_review,
+            trigger_review_mode="spec_coherence",
+        ),
+    ),
+    AdvanceRule(
         name="spec_coherence_create_improve",
         matches=lambda ctx: (
             _spec_coherence_gate_required(ctx)
@@ -8818,12 +8884,15 @@ ADVANCE_RULES: list[AdvanceRule] = [
     ),
     AdvanceRule(
         name="review_max_cycles",
-        matches=lambda ctx: (
-            (not ctx.review_cleared)
-            and (ctx.review_verdict == "CHANGES_REQUESTED" or _review_max_cycles_content_unavailable_candidate(ctx))
-            and ctx.completed_review_cycles >= ctx.max_review_cycles
-            and not ctx.review_blockers_revalidated
-        ),
+        matches=lambda ctx: (not ctx.review_cleared)
+        and (
+            (
+                ctx.review_verdict == "CHANGES_REQUESTED"
+                and _review_mode(ctx.latest_completed_review) != "spec_coherence"
+            )
+            or _review_max_cycles_content_unavailable_candidate(ctx)
+        )
+        and ctx.completed_review_cycles >= ctx.max_review_cycles,
         action=_review_max_cycles_action,
     ),
     AdvanceRule(

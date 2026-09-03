@@ -19,10 +19,12 @@ from ..advance_engine import (
     ADVANCE_RULES,
     PARK_REASON_VERIFY_FIX_FAILED,
     AdvanceContext,
+    ReviewCycleBoundary,
     _pre_review_verify_fix_action,
     _resolve_and_persist_post_merge_rebase_state,
     _resolve_current_merge_source,
     _resolve_latest_plan_source,
+    completed_review_cycle_belongs_to_boundary,
     count_completed_review_cycles,
     require_needs_attention_subject,
     resolve_advance_context,
@@ -85,6 +87,7 @@ from ..prompts import PromptBuilder
 from ..query import (
     get_base_task_slug as _get_base_task_slug,
     get_code_changing_descendants_for_root,
+    get_implementation_review_cycle_accounting_evidence,
     resolve_lineage_owner_task,
 )
 from ..recovery_engine import (
@@ -675,6 +678,115 @@ def _format_iterate_terminal_merge_state_message(
             f"{iterate_task.id}."
         )
     return f"No remaining iterate action: implementation {iterate_task.id} is already merged."
+
+
+def _coerce_optional_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _task_event_time_for_iterate_accounting(task: DbTask) -> datetime:
+    return task.completed_at or task.created_at or datetime.min.replace(tzinfo=UTC)
+
+
+def _completion_time_for_review_invocation_accounting(task: DbTask) -> datetime | None:
+    if task.completed_at is None:
+        return None
+    completed_at = task.completed_at
+    if completed_at.tzinfo is None:
+        return completed_at.replace(tzinfo=UTC)
+    return completed_at.astimezone(UTC)
+
+
+def _review_cycle_boundary_from_action(
+    store: SqliteTaskStore,
+    action: dict[str, Any],
+) -> ReviewCycleBoundary:
+    boundary_task_id = action.get("review_cycle_boundary_task_id")
+    if not isinstance(boundary_task_id, str) or not boundary_task_id:
+        return ReviewCycleBoundary()
+    boundary_task = store.get(boundary_task_id)
+    if boundary_task is None:
+        return ReviewCycleBoundary(boundary_task_id=boundary_task_id)
+    boundary_reason = action.get("review_cycle_boundary_reason")
+    return ReviewCycleBoundary(
+        boundary_time=_task_event_time_for_iterate_accounting(boundary_task),
+        boundary_task_id=boundary_task_id,
+        boundary_reason=boundary_reason if isinstance(boundary_reason, str) and boundary_reason else None,
+    )
+
+
+def _count_completed_review_cycles_during_invocation_since_boundary(
+    store: SqliteTaskStore,
+    impl_task_id: str,
+    *,
+    boundary: ReviewCycleBoundary,
+    invocation_started_at: datetime,
+) -> int:
+    impl_task = store.get(impl_task_id)
+    if impl_task is None:
+        return 0
+    cutoff = invocation_started_at
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=UTC)
+    return sum(
+        1
+        for task in get_implementation_review_cycle_accounting_evidence(store, impl_task)
+        if completed_review_cycle_belongs_to_boundary(task, boundary=boundary)
+        and (completed_at := _completion_time_for_review_invocation_accounting(task)) is not None
+        and completed_at > cutoff
+    )
+
+
+def _review_cycle_boundary_label(action: dict[str, Any]) -> str:
+    boundary_task_id = action.get("review_cycle_boundary_task_id")
+    boundary_reason = action.get("review_cycle_boundary_reason")
+    if isinstance(boundary_task_id, str) and boundary_task_id:
+        if isinstance(boundary_reason, str) and boundary_reason:
+            return f"{boundary_reason}:{boundary_task_id}"
+        return boundary_task_id
+    return "none"
+
+
+def _print_review_iteration_accounting(
+    *,
+    store: SqliteTaskStore,
+    impl_task_id: str,
+    action: dict[str, Any],
+    max_review_cycles: int,
+    starting_lifetime_completed: int,
+    invocation_started_at: datetime | None,
+) -> None:
+    lifetime_completed = count_completed_review_cycles(store, impl_task_id)
+    completed_since_boundary = _coerce_optional_int(action.get("completed_review_cycles"))
+    if completed_since_boundary is None:
+        completed_since_boundary = lifetime_completed
+
+    consumed_lifetime = max(0, lifetime_completed - starting_lifetime_completed)
+    consumed_since_boundary = 0
+    if invocation_started_at is not None:
+        boundary = _review_cycle_boundary_from_action(store, action)
+        consumed_since_boundary = _count_completed_review_cycles_during_invocation_since_boundary(
+            store,
+            impl_task_id,
+            boundary=boundary,
+            invocation_started_at=invocation_started_at,
+        )
+
+    action_max = _coerce_optional_int(action.get("max_review_cycles"))
+    configured_max = action_max if action_max is not None else max_review_cycles
+    print(
+        "Review-iteration accounting: "
+        f"completed_since_boundary={completed_since_boundary}, "
+        f"max_review_cycles={configured_max}, "
+        f"boundary={_review_cycle_boundary_label(action)}, "
+        f"lifetime_completed={lifetime_completed}, "
+        f"consumed_this_invocation_since_boundary={consumed_since_boundary}, "
+        f"consumed_this_invocation_lifetime={consumed_lifetime}"
+    )
 
 
 def _reconcile_iterate_already_merged(
@@ -5208,12 +5320,13 @@ def _cmd_iterate_impl(
                 f"{format_needs_attention_entry_for_display(subject_task, action=initial_action, prefix=len(subject_task.id or '') + 4)}"
             )
             assert iterate_task.id is not None
-            completed_review_cycles = count_completed_review_cycles(store, iterate_task.id)
-            print(
-                "Review-iteration accounting: "
-                f"completed={completed_review_cycles}, "
-                f"max_review_cycles={engine_config.max_review_cycles}, "
-                "consumed_this_invocation=0"
+            _print_review_iteration_accounting(
+                store=store,
+                impl_task_id=iterate_task.id,
+                action=initial_action,
+                max_review_cycles=engine_config.max_review_cycles,
+                starting_lifetime_completed=count_completed_review_cycles(store, iterate_task.id),
+                invocation_started_at=None,
             )
             next_step = needs_attention_recommended_next_step(store, subject_task, initial_action)
             if next_step is not None:
@@ -6321,7 +6434,8 @@ def _cmd_iterate_impl(
     final_attention_task: DbTask | None = None
     final_non_attention_stop_message: str | None = None
     iteration = 0
-    starting_completed_review_cycles = count_completed_review_cycles(store, impl_task_key)
+    iterate_invocation_started_at = datetime.now(UTC)
+    starting_lifetime_completed_review_cycles = count_completed_review_cycles(store, impl_task_key)
     max_resume_attempts = _int_config(
         getattr(config, "max_resume_attempts", None),
         DEFAULT_MAX_RESUME_ATTEMPTS,
@@ -7587,8 +7701,6 @@ def _cmd_iterate_impl(
         print(f"Iterate waiting: {final_stop_reason}. Existing task is already in progress.")
         return 3
     if final_stop_reason == "max_cycles_reached":
-        completed_review_cycles = count_completed_review_cycles(store, impl_task_key)
-        consumed_this_invocation = max(0, completed_review_cycles - starting_completed_review_cycles)
         if final_attention_action is not None and final_attention_task is not None:
             print(
                 f"{NEEDS_ATTENTION_LABEL}: "
@@ -7596,11 +7708,13 @@ def _cmd_iterate_impl(
             )
         else:
             print(f"Iterate blocked: {final_stop_reason}.")
-        print(
-            "Review-iteration accounting: "
-            f"completed={completed_review_cycles}, "
-            f"max_review_cycles={engine_config.max_review_cycles}, "
-            f"consumed_this_invocation={consumed_this_invocation}"
+        _print_review_iteration_accounting(
+            store=store,
+            impl_task_id=impl_task_key,
+            action=final_attention_action or {},
+            max_review_cycles=engine_config.max_review_cycles,
+            starting_lifetime_completed=starting_lifetime_completed_review_cycles,
+            invocation_started_at=iterate_invocation_started_at,
         )
         if final_attention_action is not None and final_attention_task is not None:
             next_step = needs_attention_recommended_next_step(store, final_attention_task, final_attention_action)

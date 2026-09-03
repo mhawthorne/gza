@@ -90,6 +90,47 @@ def test_invoke_provider_resolve_uses_worktree_mode_without_continue(tmp_path: P
     assert mock_provider.run.call_args.args[3] == worktree
 
 
+def test_invoke_provider_resolve_names_immutable_target_ref_and_sha(tmp_path: Path) -> None:
+    from gza.cli import invoke_provider_resolve
+
+    config = _new_config(tmp_path, provider="claude")
+    task = _new_task()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    log_file = _new_log_file(tmp_path)
+    target_sha = "a" * 40
+    target_ref = "refs/gza/rebase-target/aaaaaaaaaaaa"
+
+    with (
+        patch("gza.cli.ensure_skill", return_value=True),
+        patch("gza.providers.get_provider") as mock_get_provider,
+        patch("gza.cli.git_ops._is_rebase_in_progress", return_value=False),
+        patch("gza.skills_utils.copy_skill", return_value=(True, "installed")),
+    ):
+        mock_provider = Mock()
+        mock_provider.run.return_value = RunResult(exit_code=0)
+        mock_get_provider.return_value = mock_provider
+
+        result = invoke_provider_resolve(
+            task,
+            "feature",
+            target_sha,
+            config,
+            log_file=log_file,
+            worktree_path=worktree,
+            provider_target_ref=target_ref,
+            provider_target_sha=target_sha,
+        )
+
+    assert result is True
+    provider_prompt = mock_provider.run.call_args.args[1]
+    assert provider_prompt.startswith("/gza-rebase --auto\n")
+    assert f"Rebase onto `{target_ref}`" in provider_prompt
+    assert f"resolves to `{target_sha}`" in provider_prompt
+    assert "Do not choose a default branch" in provider_prompt
+    assert mock_provider.run.call_args.args[3] == worktree
+
+
 def test_invoke_provider_resolve_fails_fast_when_skill_missing(tmp_path: Path, capsys) -> None:
     from gza.cli import invoke_provider_resolve
 

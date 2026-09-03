@@ -133,6 +133,50 @@ def test_create_isolated_rebase_checkout_uses_private_git_dir_and_local_fetch(mo
     assert not checkout.path.exists()
 
 
+def test_create_isolated_rebase_checkout_imports_immutable_target_sha(monkeypatch, tmp_path: Path) -> None:
+    _FakeGit.instances = []
+    _FakeGit.existing_refs = {"refs/remotes/origin/feature/private-rebase"}
+    _FakeGit.config_values = {}
+    _FakeGit.rev_parse_values = {}
+    _FakeGit.update_ref_error = None
+    _FakeGit.run_error_command = None
+    _FakeGit.run_error = None
+    monkeypatch.setattr("gza.rebase_checkout.Git", _FakeGit)
+
+    source_repo = tmp_path / "repo"
+    source_repo.mkdir()
+    source_git = _FakeGit(source_repo)
+    config = Config(
+        project_dir=source_repo,
+        project_name="repo",
+        worktree_dir=str(tmp_path / "managed-worktrees"),
+    )
+    target_sha = "a" * 40
+
+    checkout = create_isolated_rebase_checkout(
+        config=config,
+        source_git=source_git,
+        branch="feature/private-rebase",
+        target_ref=target_sha,
+        checkout_name="gza-9545-target-sha",
+    )
+
+    assert checkout.target_ref == target_sha
+    assert checkout.imported_refs == (
+        "+refs/heads/feature/private-rebase:refs/heads/feature/private-rebase",
+        f"+{target_sha}:refs/gza/rebase-target/{target_sha[:12]}",
+    )
+    assert (
+        "fetch",
+        "--no-tags",
+        str(source_repo.resolve()),
+        *checkout.imported_refs,
+    ) in checkout.git.commands
+
+    cleanup_isolated_rebase_checkout(checkout)
+    assert not checkout.path.exists()
+
+
 def test_create_isolated_rebase_checkout_removes_temp_dir_when_fetch_fails(monkeypatch, tmp_path: Path) -> None:
     _FakeGit.instances = []
     _FakeGit.existing_refs = set()

@@ -129,11 +129,17 @@ from ..pickup import (
 )
 from ..pr_ops import build_task_pr_content, ensure_task_pr
 from ..providers.base import provider_home_from_env
-from ..rebase_checkout import StaleRebaseImportError, import_isolated_rebase_tip, isolated_rebase_checkout
+from ..rebase_checkout import (
+    StaleRebaseImportError,
+    build_immutable_rebase_provider_prompt,
+    import_isolated_rebase_tip,
+    isolated_rebase_checkout,
+)
 from ..rebase_diff import (
     build_rebase_diff_provenance,
     capture_rebase_diff_baseline,
     compute_rebase_changed_diff,
+    prove_rebase_changed_diff_boundary,
 )
 from ..rebase_publish import (
     REBASE_SUPERSEDED_COMPLETION_REASON,
@@ -784,8 +790,9 @@ def _reconcile_diverged_branch_with_origin(
             branch=branch,
             target=rebase_target,
         )
+        rebase_target_for_execution = baseline.target_at_start or rebase_target
         try:
-            worktree_git.rebase(rebase_target)
+            worktree_git.rebase(rebase_target_for_execution)
         except GitError as rebase_error:
             try:
                 worktree_git.rebase_abort()
@@ -2288,6 +2295,8 @@ def invoke_provider_resolve(
     logger: TaskExecutionLogger | None = None,
     worktree_path: Path | None = None,
     runtime_context: RuntimeExecutionContext | None = None,
+    provider_target_ref: str | None = None,
+    provider_target_sha: str | None = None,
 ) -> bool:
     """Invoke active provider runtime to resolve rebase conflicts via /gza-rebase.
 
@@ -2346,7 +2355,13 @@ def invoke_provider_resolve(
     provider = get_provider(resolve_config)
     work_dir = worktree_path if worktree_path is not None else config.project_dir
 
-    if worktree_path is not None:
+    if provider_target_ref is not None and provider_target_sha is not None:
+        skill_cmd = build_immutable_rebase_provider_prompt(
+            auto_continue=worktree_path is None,
+            target_ref=provider_target_ref,
+            target_sha=provider_target_sha,
+        )
+    elif worktree_path is not None:
         skill_cmd = "/gza-rebase --auto"
     else:
         skill_cmd = "/gza-rebase --auto --continue"
@@ -2480,6 +2495,7 @@ def _run_task_backed_rebase(
         branch=branch,
         target=rebase_target,
     )
+    rebase_target_for_execution = rebase_diff_baseline.target_at_start or rebase_target
     rebase_exec_git = worktree_git
 
     try:
@@ -2488,7 +2504,7 @@ def _run_task_backed_rebase(
         superseded_by_concurrent_rebase = False
         supersession_proof_target: str | None = None
         try:
-            rebase_exec_git.rebase(rebase_target)
+            rebase_exec_git.rebase(rebase_target_for_execution)
         except GitError as e:
             logger.warning(f"Conflicts detected: {e}")
             try:
@@ -2502,18 +2518,20 @@ def _run_task_backed_rebase(
                 config=config,
                 source_git=git,
                 branch=branch,
-                target_ref=target_branch,
+                target_ref=rebase_target_for_execution,
                 checkout_name=str(rebase_task.slug or rebase_task.id or branch),
             ) as checkout:
                 resolved = invoke_provider_resolve(
                     rebase_task,
                     branch,
-                    rebase_target,
+                    rebase_target_for_execution,
                     config,
                     log_file=log_file,
                     logger=logger,
                     worktree_path=checkout.path,
                     runtime_context=runtime_context,
+                    provider_target_ref=getattr(checkout, "provider_target_ref", None),
+                    provider_target_sha=rebase_diff_baseline.target_at_start,
                 )
                 if resolved:
                     try:
@@ -2602,7 +2620,7 @@ def _run_task_backed_rebase(
         publish_result_local_sha = getattr(publish_result, "local_sha", None)
         if isinstance(publish_result_local_sha, str) and publish_result_local_sha:
             head_ref = ResolvedGitRef(publish_result_local_sha, head_ref.warning)
-        base_ref = resolve_ref_if_possible(rebase_exec_git, rebase_target)
+        base_ref = resolve_ref_if_possible(rebase_exec_git, rebase_target_for_execution)
         for warning in (head_ref.warning, base_ref.warning):
             if warning:
                 logger.warning(warning)
@@ -2610,14 +2628,38 @@ def _run_task_backed_rebase(
             rebase_exec_git,
             baseline=rebase_diff_baseline,
             branch=head_ref.sha or branch,
-            target=rebase_target,
+            target=rebase_target_for_execution,
         )
         if comparison.warning:
             logger.warning(comparison.warning)
+        compared_head_sha = getattr(comparison, "compared_head_sha", None) or head_ref.sha
+        compared_target_sha = getattr(comparison, "compared_target_sha", None) or base_ref.sha
+        comparison_boundary_proven = bool(getattr(comparison, "changed_diff_boundary_proven", False))
+        should_probe_changed_diff_boundary = comparison_boundary_proven and not superseded_by_concurrent_rebase
+        changed_diff_boundary_proof = (
+            prove_rebase_changed_diff_boundary(
+                rebase_exec_git,
+                baseline=rebase_diff_baseline,
+                resolved_head_sha=compared_head_sha,
+                resolved_target_sha=compared_target_sha,
+            )
+            if should_probe_changed_diff_boundary
+            else None
+        )
+        changed_diff_boundary_warning = (
+            changed_diff_boundary_proof.warning if changed_diff_boundary_proof is not None else None
+        )
+        if changed_diff_boundary_warning:
+            logger.warning(changed_diff_boundary_warning)
         rebase_task.review_scope = build_rebase_diff_provenance(
             baseline=rebase_diff_baseline,
-            resolved_head_sha=head_ref.sha,
-            resolved_target_sha=base_ref.sha,
+            resolved_head_sha=compared_head_sha,
+            resolved_target_sha=compared_target_sha,
+            changed_diff_boundary_proven=(
+                False
+                if not should_probe_changed_diff_boundary or changed_diff_boundary_proof is None
+                else changed_diff_boundary_proof.proven
+            ),
         )
         store.mark_completed(
             rebase_task,
@@ -2626,8 +2668,8 @@ def _run_task_backed_rebase(
             output_content=output_content,
             has_commits=has_commits,
             changed_diff=comparison.changed_diff,
-            head_sha=head_ref.sha if head_ref.sha is not None else DB_UNSET,
-            base_sha=base_ref.sha if base_ref.sha is not None else DB_UNSET,
+            head_sha=compared_head_sha if compared_head_sha is not None else DB_UNSET,
+            base_sha=compared_target_sha if compared_target_sha is not None else DB_UNSET,
             completion_reason=(REBASE_SUPERSEDED_COMPLETION_REASON if superseded_by_concurrent_rebase else None),
         )
         if outcome_callback is not None:

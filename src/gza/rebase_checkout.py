@@ -25,6 +25,7 @@ class IsolatedRebaseCheckout:
     target_ref: str
     imported_refs: tuple[str, ...]
     source_repo: Path
+    provider_target_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,10 @@ def _build_import_refspecs(source_git: Git, *, branch: str, target_ref: str) -> 
     refspecs: list[str] = [
         f"+refs/heads/{branch}:refs/heads/{branch}",
     ]
+    if re.fullmatch(r"[0-9a-fA-F]{40}", target_ref):
+        refspecs.append(f"+{target_ref}:refs/gza/rebase-target/{target_ref[:12]}")
+        return tuple(dict.fromkeys(refspecs))
+
     if target_ref != branch:
         refspecs.append(f"+refs/heads/{target_ref}:refs/heads/{target_ref}")
 
@@ -85,6 +90,46 @@ def _build_import_refspecs(source_git: Git, *, branch: str, target_ref: str) -> 
         refspecs.append(f"+{remote_tracking_target}:{remote_tracking_target}")
 
     return tuple(dict.fromkeys(refspecs))
+
+
+def stable_rebase_target_ref(target_ref: str) -> str:
+    """Return the stable local ref/SHA providers must use for a captured target."""
+    if re.fullmatch(r"[0-9a-fA-F]{40}", target_ref):
+        return f"refs/gza/rebase-target/{target_ref[:12]}"
+    return target_ref
+
+
+def build_immutable_rebase_provider_prompt(
+    *,
+    auto_continue: bool,
+    target_ref: str,
+    target_sha: str,
+) -> str:
+    """Build the provider request for a rebase bound to an immutable target."""
+    continue_flag = " --continue" if auto_continue else ""
+    return (
+        f"/gza-rebase --auto{continue_flag}\n\n"
+        "Immutable rebase target supplied by gza:\n"
+        f"- Rebase onto `{target_ref}`.\n"
+        f"- Before rebasing, verify `{target_ref}` resolves to `{target_sha}`.\n"
+        "- If the ref is missing or resolves to any other SHA, stop and report the mismatch.\n"
+        "- Do not choose a default branch, remote branch, or similarly named mutable branch.\n"
+    )
+
+
+def append_immutable_rebase_target_instructions(
+    prompt: str,
+    *,
+    target_ref: str,
+    target_sha: str,
+) -> str:
+    """Append immutable target instructions to a task prompt."""
+    target_block = build_immutable_rebase_provider_prompt(
+        auto_continue=False,
+        target_ref=target_ref,
+        target_sha=target_sha,
+    )
+    return f"{prompt.rstrip()}\n\n{target_block}"
 
 
 def create_isolated_rebase_checkout(
@@ -119,6 +164,7 @@ def create_isolated_rebase_checkout(
 
         source_repo = source_git.toplevel()
         imported_refs = _build_import_refspecs(source_git, branch=branch, target_ref=target_ref)
+        provider_target_ref = stable_rebase_target_ref(target_ref)
         checkout_git._run(
             "fetch",
             "--no-tags",
@@ -141,6 +187,7 @@ def create_isolated_rebase_checkout(
         git=checkout_git,
         branch=branch,
         target_ref=target_ref,
+        provider_target_ref=provider_target_ref,
         imported_refs=imported_refs,
         source_repo=source_repo,
     )

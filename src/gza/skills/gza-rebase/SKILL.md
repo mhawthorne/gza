@@ -47,6 +47,11 @@ When not running in Docker and `/workspace` is not the current checkout, set `GZ
 
 ### Step 2: Choose rebase target
 
+0. If the caller supplies an immutable rebase target block with a target ref/SHA:
+   - Use that exact target ref as `<chosen-target>`.
+   - Run `git -C "$GZA_WORKTREE_ROOT" rev-parse <chosen-target>` and verify it resolves to the supplied SHA.
+   - If the ref is missing or resolves to a different SHA, stop and report the mismatch.
+   - Do not substitute a default branch, remote branch, or similarly named mutable branch.
 1. Determine whether the caller already named the target branch in the prompt or request.
    - If the caller named a target branch (for example `master`), use that exact branch name. Do not substitute `main` or any other default.
 2. If the caller did not name a target branch, resolve the repo's primary branch:

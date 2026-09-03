@@ -56,7 +56,8 @@ from gza.db import (
     task_owns_merge_status,
     task_updated_at,
 )
-from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance
+from gza.advance_engine import resolve_review_cycle_boundary
+from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance, parse_rebase_diff_provenance
 from gza.review_tasks import build_auto_review_prompt
 from gza.runner import _compute_slug_override
 from gza.sync_ops import BranchCohort, sync_branch_cohorts
@@ -170,6 +171,227 @@ def test_update_preserves_complete_changed_rebase_provenance_against_stale_parti
     persisted = store.get(rebase.id)
     assert persisted is not None
     assert persisted.review_scope == complete_scope
+
+
+def test_update_preserves_complete_changed_rebase_boundary_proof_against_stale_unproven_scope(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    rebase = store.add(
+        "Rebase feature",
+        task_type="rebase",
+        review_scope="custom review scope from stale object",
+    )
+    proven_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip="a" * 40,
+            target_at_start="b" * 40,
+            merge_base_at_start="c" * 40,
+            recovered=False,
+        ),
+        resolved_head_sha="d" * 40,
+        resolved_target_sha="b" * 40,
+        changed_diff_boundary_proven=True,
+    )
+    rebase.review_scope = proven_scope
+    store.mark_completed(
+        rebase,
+        has_commits=False,
+        changed_diff=True,
+    )
+
+    stale_rebase = Task(**rebase.__dict__)
+    stale_rebase.review_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip="a" * 40,
+            target_at_start="b" * 40,
+            merge_base_at_start="c" * 40,
+            recovered=False,
+        ),
+        resolved_head_sha="d" * 40,
+        resolved_target_sha="b" * 40,
+        changed_diff_boundary_proven=False,
+    )
+    store.update(stale_rebase)
+
+    persisted = store.get(rebase.id)
+    assert persisted is not None
+    persisted_provenance = parse_rebase_diff_provenance(persisted.review_scope)
+    assert persisted_provenance is not None
+    assert persisted_provenance.changed_diff_boundary_proven is True
+
+
+@pytest.mark.parametrize("stale_changed_diff", [None, False])
+def test_update_preserves_changed_rebase_boundary_classification_against_stale_whole_row_update(
+    tmp_path: Path,
+    stale_changed_diff: bool | None,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    rebase = store.add(
+        "Rebase feature",
+        task_type="rebase",
+        review_scope="custom review scope from stale object",
+    )
+    assert rebase.id is not None
+    proven_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip="a" * 40,
+            target_at_start="b" * 40,
+            merge_base_at_start="c" * 40,
+            recovered=False,
+        ),
+        resolved_head_sha="d" * 40,
+        resolved_target_sha="b" * 40,
+        changed_diff_boundary_proven=True,
+    )
+    rebase.review_scope = proven_scope
+    store.mark_completed(
+        rebase,
+        has_commits=False,
+        changed_diff=True,
+    )
+
+    stale_rebase = Task(**rebase.__dict__)
+    stale_rebase.changed_diff = stale_changed_diff
+    stale_rebase.review_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip="a" * 40,
+            target_at_start="b" * 40,
+            merge_base_at_start="c" * 40,
+            recovered=False,
+        ),
+        resolved_head_sha="d" * 40,
+        resolved_target_sha="b" * 40,
+        changed_diff_boundary_proven=False,
+    )
+    store.update(stale_rebase)
+
+    persisted = store.get(rebase.id)
+    assert persisted is not None
+    assert persisted.changed_diff is True
+    assert stale_rebase.changed_diff is True
+    persisted_provenance = parse_rebase_diff_provenance(persisted.review_scope)
+    assert persisted_provenance is not None
+    assert persisted_provenance.changed_diff_boundary_proven is True
+    boundary = resolve_review_cycle_boundary(
+        latest_completed_review=Task(
+            id="review-1",
+            prompt="Review feature",
+            task_type="review",
+            status="completed",
+            completed_at=datetime.now(UTC),
+        ),
+        latest_completed_rebase=persisted,
+    )
+    assert boundary.boundary_task_id == rebase.id
+    assert boundary.boundary_reason == "rebase_changed_diff"
+
+
+def test_update_downgrades_changed_rebase_boundary_proof_when_stale_backfill_target_mismatches(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    rebase = store.add(
+        "Rebase feature",
+        task_type="rebase",
+        review_scope="custom review scope from stale object",
+    )
+    proven_incomplete_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip="a" * 40,
+            target_at_start="b" * 40,
+            merge_base_at_start="c" * 40,
+            recovered=False,
+        ),
+        resolved_head_sha=None,
+        resolved_target_sha=None,
+        changed_diff_boundary_proven=True,
+    )
+    rebase.review_scope = proven_incomplete_scope
+    store.mark_completed(
+        rebase,
+        has_commits=False,
+        changed_diff=True,
+    )
+
+    stale_rebase = Task(**rebase.__dict__)
+    stale_rebase.review_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip="a" * 40,
+            target_at_start="b" * 40,
+            merge_base_at_start="c" * 40,
+            recovered=False,
+        ),
+        resolved_head_sha="d" * 40,
+        resolved_target_sha="e" * 40,
+        changed_diff_boundary_proven=False,
+    )
+    store.update(stale_rebase)
+
+    persisted = store.get(rebase.id)
+    assert persisted is not None
+    persisted_provenance = parse_rebase_diff_provenance(persisted.review_scope)
+    assert persisted_provenance is not None
+    assert persisted_provenance.old_tip == "a" * 40
+    assert persisted_provenance.target_at_start == "b" * 40
+    assert persisted_provenance.merge_base_at_start == "c" * 40
+    assert persisted_provenance.resolved_head_sha == "d" * 40
+    assert persisted_provenance.resolved_target_sha == "e" * 40
+    assert persisted_provenance.changed_diff_boundary_proven is False
+
+
+def test_update_does_not_upgrade_incomplete_changed_rebase_boundary_proof_when_stale_backfill_target_matches(
+    tmp_path: Path,
+) -> None:
+    store = SqliteTaskStore(tmp_path / "test.db")
+    rebase = store.add(
+        "Rebase feature",
+        task_type="rebase",
+        review_scope="custom review scope from stale object",
+    )
+    proven_incomplete_scope = "\n".join(
+        (
+            "Rebase diff provenance: yes",
+            f"Pre-rebase head SHA: {'a' * 40}",
+            f"Pre-rebase target SHA: {'b' * 40}",
+            f"Pre-rebase merge-base SHA: {'c' * 40}",
+            "Resolved head SHA:",
+            "Resolved target SHA:",
+            "Recovered baseline: no",
+            "Changed-diff boundary proven: yes",
+        )
+    )
+    rebase.review_scope = proven_incomplete_scope
+    store.mark_completed(
+        rebase,
+        has_commits=False,
+        changed_diff=True,
+    )
+
+    stale_rebase = Task(**rebase.__dict__)
+    stale_rebase.review_scope = build_rebase_diff_provenance(
+        baseline=RebaseDiffBaseline(
+            old_tip="a" * 40,
+            target_at_start="b" * 40,
+            merge_base_at_start="c" * 40,
+            recovered=False,
+        ),
+        resolved_head_sha="d" * 40,
+        resolved_target_sha="b" * 40,
+        changed_diff_boundary_proven=False,
+    )
+    store.update(stale_rebase)
+
+    persisted = store.get(rebase.id)
+    assert persisted is not None
+    persisted_provenance = parse_rebase_diff_provenance(persisted.review_scope)
+    assert persisted_provenance is not None
+    assert persisted_provenance.old_tip == "a" * 40
+    assert persisted_provenance.target_at_start == "b" * 40
+    assert persisted_provenance.merge_base_at_start == "c" * 40
+    assert persisted_provenance.resolved_head_sha == "d" * 40
+    assert persisted_provenance.resolved_target_sha == "b" * 40
+    assert persisted_provenance.changed_diff_boundary_proven is False
 
 
 def test_behavior_check_fingerprint_ignores_line_number_churn() -> None:

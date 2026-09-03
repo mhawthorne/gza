@@ -59,6 +59,10 @@ Rebase tasks go through the **code task path** in `runner.py:_run_inner` (not th
   - `0` means the normalized implementation patch before and after the rebase is identical, so prior review evidence may be preserved
   - `1` means the patch changed or equivalence could not be proven, so prior review evidence must be refreshed
   - legacy `NULL` values are treated conservatively as changed
+- Affirmative changed-diff boundary proof is only persisted when the post-rebase
+  comparison used the same target SHA captured for the rebase attempt. If the target
+  moves before comparison, the rebase may still be recorded as `changed_diff = 1` for
+  conservative review invalidation, but it is not a review-cycle reset boundary.
 - Foreground task-backed rebase execution also persists a generic
   `rebase_execution_outcome` task artifact. That artifact is schema-versioned and keyed
   by the parent task, rebase task, branch, target ref, source/target heads, completion

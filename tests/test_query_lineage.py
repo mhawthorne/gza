@@ -12,6 +12,7 @@ from gza.query import (
     build_lineage_tree,
     filter_lineage_tree,
     get_base_task_slug,
+    get_implementation_review_cycle_accounting_evidence,
     get_improves_for_root,
     get_reviews_for_root,
     get_task_slug,
@@ -227,6 +228,71 @@ class TestGetReviewsForRoot:
             failed_recovery.id,
             linked_review.id,
         ]
+
+    def test_numeric_dated_review_slug_belongs_to_only_owning_epoch(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        impl = store.add("Implement foo", task_type="implement")
+        assert impl.id is not None
+        impl.slug = "20260212-foo"
+        impl.status = "completed"
+        impl.created_at = datetime(2026, 2, 12, 9, 0, tzinfo=UTC)
+        impl.completed_at = datetime(2026, 2, 12, 9, 30, tzinfo=UTC)
+        store.update(impl)
+
+        numeric_impl = store.add("Implement foo 2", task_type="implement")
+        assert numeric_impl.id is not None
+        numeric_impl.slug = "20260212-foo-2"
+        numeric_impl.status = "completed"
+        numeric_impl.created_at = datetime(2026, 2, 12, 10, 0, tzinfo=UTC)
+        numeric_impl.completed_at = datetime(2026, 2, 12, 10, 30, tzinfo=UTC)
+        store.update(numeric_impl)
+
+        review = store.add("review foo-2", task_type="review")
+        assert review.id is not None
+        review.slug = "20260212-review-foo-2"
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        store.update(review)
+
+        assert get_reviews_for_root(store, impl) == []
+        assert [task.id for task in get_reviews_for_root(store, numeric_impl)] == [review.id]
+        assert get_implementation_review_cycle_accounting_evidence(store, impl) == []
+        assert [task.id for task in get_implementation_review_cycle_accounting_evidence(store, numeric_impl)] == [
+            review.id
+        ]
+
+    def test_based_on_linked_review_is_excluded_from_legacy_review_pool(self, tmp_path: Path):
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        wrong_impl = store.add("Implement foo", task_type="implement")
+        assert wrong_impl.id is not None
+        wrong_impl.slug = "20260212-foo"
+        wrong_impl.status = "completed"
+        wrong_impl.created_at = datetime(2026, 2, 12, 9, 0, tzinfo=UTC)
+        wrong_impl.completed_at = datetime(2026, 2, 12, 9, 30, tzinfo=UTC)
+        store.update(wrong_impl)
+
+        owning_impl = store.add("Implement owner", task_type="implement")
+        assert owning_impl.id is not None
+        owning_impl.slug = "20260212-owner"
+        owning_impl.status = "completed"
+        owning_impl.created_at = datetime(2026, 2, 12, 8, 0, tzinfo=UTC)
+        owning_impl.completed_at = datetime(2026, 2, 12, 8, 30, tzinfo=UTC)
+        store.update(owning_impl)
+
+        review = store.add("review foo", task_type="review", based_on=owning_impl.id)
+        assert review.id is not None
+        review.slug = "20260212-review-foo"
+        review.status = "completed"
+        review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        review.completed_at = datetime(2026, 2, 12, 11, 0, tzinfo=UTC)
+        store.update(review)
+
+        assert review.depends_on is None
+        assert get_reviews_for_root(store, wrong_impl) == []
+        assert get_implementation_review_cycle_accounting_evidence(store, wrong_impl) == []
 
 
 # ---------------------------------------------------------------------------

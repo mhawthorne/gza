@@ -27,6 +27,7 @@ import gza.metrics as metrics
 from gza.artifact_paths import normalize_artifact_path
 from gza.rebase_identity import rebase_persisted_branch_is_authoritative
 from gza.resume_policy import RESUMABLE_FAILURE_REASONS, is_resumable_failure_reason
+from gza.task_slug import get_task_slug
 
 logger = logging.getLogger(__name__)
 
@@ -3007,9 +3008,15 @@ def _preserve_completed_rebase_provenance_scope(
     project_id: str,
     task_id: str,
     candidate_scope: str | None,
-) -> str | None:
+) -> tuple[str | None, bool | None]:
     """Keep persisted rebase provenance authoritative across stale whole-row updates."""
-    from .rebase_diff import parse_rebase_diff_provenance, rebase_diff_provenance_quality
+    from .rebase_diff import (
+        combine_rebase_diff_provenance_preserving_boundary,
+        parse_rebase_diff_provenance,
+        rebase_changed_diff_boundary_proof_is_valid,
+        rebase_diff_provenance_quality,
+        serialize_rebase_diff_provenance,
+    )
 
     candidate_provenance = parse_rebase_diff_provenance(candidate_scope)
     row = conn.execute(
@@ -3017,14 +3024,27 @@ def _preserve_completed_rebase_provenance_scope(
         (project_id, task_id),
     ).fetchone()
     if row is None:
-        return candidate_scope
+        return candidate_scope, None
     if row["status"] != "completed" or row["changed_diff"] != 1:
-        return candidate_scope
+        return candidate_scope, None
     persisted_scope = row["review_scope"]
     persisted_provenance = parse_rebase_diff_provenance(persisted_scope)
+    persisted_boundary_valid = rebase_changed_diff_boundary_proof_is_valid(persisted_provenance)
+    if (
+        persisted_provenance is not None
+        and persisted_provenance.changed_diff_boundary_proven
+        and candidate_provenance is not None
+        and not candidate_provenance.changed_diff_boundary_proven
+    ):
+        return serialize_rebase_diff_provenance(
+            combine_rebase_diff_provenance_preserving_boundary(
+                persisted=persisted_provenance,
+                candidate=candidate_provenance,
+            )
+        ), True
     if rebase_diff_provenance_quality(candidate_provenance) < rebase_diff_provenance_quality(persisted_provenance):
-        return persisted_scope
-    return candidate_scope
+        return persisted_scope, True
+    return candidate_scope, True if persisted_boundary_valid else None
 
 
 def _table_has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
@@ -8324,13 +8344,15 @@ class SqliteTaskStore:
         with self._write_transaction() as conn:
             review_scope_to_persist = task.review_scope
             if task.id is not None and task.task_type == "rebase":
-                review_scope_to_persist = _preserve_completed_rebase_provenance_scope(
+                review_scope_to_persist, preserved_changed_diff = _preserve_completed_rebase_provenance_scope(
                     conn,
                     project_id=self._project_id,
                     task_id=task.id,
                     candidate_scope=task.review_scope,
                 )
                 task.review_scope = review_scope_to_persist
+                if preserved_changed_diff is True:
+                    task.changed_diff = True
             conn.execute(
                 """
                 UPDATE tasks SET
@@ -14427,11 +14449,203 @@ class SqliteTaskStore:
             )
             return self._rows_to_tasks(conn, cur.fetchall())
 
-    def get_unlinked_reviews_for_slug(self, slug: str) -> list[Task]:
-        """Get completed review tasks not linked via depends_on, matched by slug.
+    @staticmethod
+    def _legacy_review_slug_for_task_slug(full_slug: str | None, semantic_slug: str) -> str | None:
+        if not full_slug:
+            return None
+        match = re.match(r"^(\d{8})-(.+)$", full_slug)
+        if not match:
+            return None
+        date_prefix, slug_body = match.groups()
+        if slug_body != semantic_slug:
+            return None
+        return f"{date_prefix}-review-{semantic_slug}"
+
+    @staticmethod
+    def _review_time_for_epoch(review: Task) -> datetime | None:
+        return review.created_at
+
+    @staticmethod
+    def _review_is_inside_legacy_epoch(
+        review: Task,
+        *,
+        prompt_not_before: datetime | None = None,
+        prompt_before: datetime | None = None,
+    ) -> bool:
+        review_time = SqliteTaskStore._review_time_for_epoch(review)
+        if prompt_not_before is not None and (review_time is None or review_time < prompt_not_before):
+            return False
+        if prompt_before is not None and review_time is not None and review_time >= prompt_before:
+            return False
+        return True
+
+    @classmethod
+    def _exact_dated_legacy_review_owner_task_id(
+        cls,
+        review: Task,
+        *,
+        implementation_candidates: list[Task],
+    ) -> str | None:
+        """Resolve a duplicate full-slug exact review to one implementation epoch."""
+        review_time = cls._review_time_for_epoch(review)
+        if review_time is None:
+            return None
+
+        ordered_candidates = sorted(
+            implementation_candidates,
+            key=lambda task: (
+                cls._task_time_for_legacy_review_epoch(task) or datetime.max.replace(tzinfo=UTC),
+                task.id or "",
+            ),
+        )
+        candidate_starts = [
+            cls._task_time_for_legacy_review_epoch(candidate)
+            for candidate in ordered_candidates
+        ]
+        known_starts = [start for start in candidate_starts if start is not None]
+        if len(known_starts) != len(ordered_candidates) or len(set(known_starts)) != len(known_starts):
+            return None
+
+        matching_ids: list[str] = []
+        for index, candidate in enumerate(ordered_candidates):
+            if candidate.id is None:
+                continue
+            start = candidate_starts[index]
+            if start is None or review_time < start:
+                continue
+            end: datetime | None = None
+            for next_candidate in ordered_candidates[index + 1 :]:
+                end = cls._task_time_for_legacy_review_epoch(next_candidate)
+                if end is not None:
+                    break
+            if end is not None and review_time >= end:
+                continue
+            matching_ids.append(candidate.id)
+        if len(matching_ids) != 1:
+            return None
+        return matching_ids[0]
+
+    @staticmethod
+    def _implementation_slug_starts_new_legacy_review_epoch(candidate_slug: str, slug: str) -> bool:
+        return candidate_slug == slug or re.match(rf"^{re.escape(slug)}-\d+$", candidate_slug) is not None
+
+    @classmethod
+    def _unlinked_review_matches_slug(
+        cls,
+        review: Task,
+        slug: str,
+        *,
+        full_slug: str | None = None,
+        implementation_task_id: str | None = None,
+        implementation_full_slugs: set[str] | None = None,
+        exact_dated_review_owner_task_id: str | None = None,
+        prompt_not_before: datetime | None = None,
+        prompt_before: datetime | None = None,
+    ) -> bool:
+        expected_review_slug = cls._legacy_review_slug_for_task_slug(full_slug, slug)
+        if expected_review_slug is not None and review.slug is not None:
+            if review.slug == expected_review_slug:
+                if exact_dated_review_owner_task_id is not None:
+                    return exact_dated_review_owner_task_id == implementation_task_id
+                return True
+            match = re.match(rf"^{re.escape(expected_review_slug)}-(\d+)$", review.slug)
+            if not match:
+                return False
+            date_prefix, _review_sep, review_slug_body = review.slug.partition("-review-")
+            candidate_implementation_slug = f"{date_prefix}-{review_slug_body}"
+            return candidate_implementation_slug not in (implementation_full_slugs or set())
+
+        review_slug = get_task_slug(review.slug)
+        if full_slug is None and review_slug == f"review-{slug}":
+            return cls._review_is_inside_legacy_epoch(
+                review,
+                prompt_not_before=prompt_not_before,
+                prompt_before=prompt_before,
+            )
+        if review_slug is not None:
+            return False
+
+        prompt = review.prompt.strip()
+        prefix = f"review {slug}"
+        if not prompt.startswith(prefix):
+            return False
+        if len(prompt) != len(prefix) and not prompt[len(prefix)].isspace():
+            return False
+
+        return cls._review_is_inside_legacy_epoch(
+            review,
+            prompt_not_before=prompt_not_before,
+            prompt_before=prompt_before,
+        )
+
+    @staticmethod
+    def _task_time_for_legacy_review_epoch(task: Task) -> datetime | None:
+        return task.completed_at or task.created_at
+
+    def get_next_implementation_epoch_start_for_slug(
+        self,
+        *,
+        task_id: str,
+        slug: str,
+        after: datetime | None,
+    ) -> datetime | None:
+        """Return the next same-semantic-slug implementation epoch after ``task_id``.
+
+        Legacy prompt-only review rows contain no durable implementation identity.
+        When a semantic slug is reused, the next implementation with that slug is
+        the upper bound for prompt-only evidence belonging to the current unit.
+        """
+        if after is None:
+            return None
+
+        with self._connect() as conn:
+            cur = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE project_id = ?
+                  AND task_type = 'implement'
+                  AND id != ?
+                  AND slug IS NOT NULL
+                ORDER BY completed_at ASC NULLS LAST, created_at ASC
+                """,
+                (self._project_id, task_id),
+            )
+            candidates = self._rows_to_tasks(conn, cur.fetchall())
+
+        next_start: datetime | None = None
+        for candidate in candidates:
+            candidate_slug = get_task_slug(candidate.slug)
+            if candidate_slug is None or not self._implementation_slug_starts_new_legacy_review_epoch(
+                candidate_slug,
+                slug,
+            ):
+                continue
+            candidate_start = self._task_time_for_legacy_review_epoch(candidate)
+            if candidate_start is None or candidate_start <= after:
+                continue
+            if next_start is None or candidate_start < next_start:
+                next_start = candidate_start
+        return next_start
+
+    def get_unlinked_reviews_for_slug(
+        self,
+        slug: str,
+        *,
+        full_slug: str | None = None,
+        task_id: str | None = None,
+        prompt_not_before: datetime | None = None,
+        prompt_before: datetime | None = None,
+    ) -> list[Task]:
+        """Get completed unlinked review tasks with exact legacy slug identity.
 
         This is a fallback for review tasks created manually (e.g., prompt starts
-        with "review <slug>") without an explicit depends_on relationship.
+        with "review <slug>") without an explicit depends_on relationship. The
+        match is deliberately exact so overlapping slugs such as ``foo`` and
+        ``foo-bar`` do not share review evidence. When the implementation's full
+        dated slug is available, dated review slugs must match that identity;
+        prompt-only rows are bounded by the implementation epoch because their
+        prompt does not distinguish separate merge units that reused the same
+        semantic slug.
         """
         with self._connect() as conn:
             cur = conn.execute(
@@ -14441,15 +14655,67 @@ class SqliteTaskStore:
                   AND task_type = 'review'
                   AND status = 'completed'
                   AND depends_on IS NULL
-                  AND (
-                    slug LIKE ?
-                    OR prompt LIKE ?
-                  )
+                  AND based_on IS NULL
                 ORDER BY completed_at DESC NULLS LAST
                 """,
-                (self._project_id, f"%review-{slug}%", f"review {slug}%"),
+                (self._project_id,),
             )
-            return self._rows_to_tasks(conn, cur.fetchall())
+            reviews = self._rows_to_tasks(conn, cur.fetchall())
+            cur = conn.execute(
+                """
+                SELECT slug FROM tasks
+                WHERE project_id = ?
+                  AND task_type = 'implement'
+                  AND slug IS NOT NULL
+                """,
+                (self._project_id,),
+            )
+            implementation_full_slugs = {
+                str(row["slug"])
+                for row in cur.fetchall()
+                if row["slug"] is not None
+            }
+            duplicate_full_slug_candidates: list[Task] = []
+            if full_slug is not None and task_id is not None:
+                cur = conn.execute(
+                    """
+                    SELECT * FROM tasks
+                    WHERE project_id = ?
+                      AND task_type = 'implement'
+                      AND slug = ?
+                    ORDER BY completed_at ASC NULLS LAST, created_at ASC, id ASC
+                    """,
+                    (self._project_id, full_slug),
+                )
+                duplicate_full_slug_candidates = self._rows_to_tasks(conn, cur.fetchall())
+
+            matched_reviews: list[Task] = []
+            expected_review_slug = self._legacy_review_slug_for_task_slug(full_slug, slug)
+            for review in reviews:
+                exact_dated_review_owner_task_id: str | None = None
+                if (
+                    expected_review_slug is not None
+                    and review.slug == expected_review_slug
+                    and len(duplicate_full_slug_candidates) > 1
+                ):
+                    exact_dated_review_owner_task_id = self._exact_dated_legacy_review_owner_task_id(
+                        review,
+                        implementation_candidates=duplicate_full_slug_candidates,
+                    )
+                    if exact_dated_review_owner_task_id is None:
+                        continue
+                if self._unlinked_review_matches_slug(
+                    review,
+                    slug,
+                    full_slug=full_slug,
+                    implementation_task_id=task_id,
+                    implementation_full_slugs=implementation_full_slugs,
+                    exact_dated_review_owner_task_id=exact_dated_review_owner_task_id,
+                    prompt_not_before=prompt_not_before,
+                    prompt_before=prompt_before,
+                ):
+                    matched_reviews.append(review)
+            return matched_reviews
 
     def get_improve_tasks_for(self, impl_task_id: str, review_task_id: str) -> list[Task]:
         """Get improve tasks that match the given implementation and review task IDs."""

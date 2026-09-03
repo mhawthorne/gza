@@ -14,6 +14,7 @@ from gza.cli._common import _create_or_reuse_capped_review_blocker_tasks as comm
 from gza.config import Config, ConfigError
 from gza.db import SqliteTaskStore, Task
 from gza.git import Git
+from gza.advance_engine import resolve_review_cycle_accounting, resolve_review_cycle_boundary
 from gza.rebase_diff import RebaseDiffBaseline, build_rebase_diff_provenance, parse_rebase_diff_provenance
 from gza.review_scope import parse_resolution_review_scope, parse_spec_coherence_review_scope
 from gza.review_tasks import (
@@ -1340,6 +1341,7 @@ class TestCreateReviewTask:
     def test_persists_comment_derived_review_scope(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl_task = store.add("Implement feature", task_type="implement")
+        assert impl_task.id is not None
         impl_task.status = "completed"
         store.update(impl_task)
         assert impl_task.id is not None
@@ -1502,6 +1504,7 @@ class TestCreateReviewTask:
     def test_create_resolution_review_task_persists_structured_scope(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl_task = store.add("Implement feature", task_type="implement")
+        assert impl_task.id is not None
         impl_task.status = "completed"
         store.update(impl_task)
         rebase_task = store.add("Rebase feature", task_type="rebase", based_on=impl_task.id, same_branch=True)
@@ -1541,6 +1544,7 @@ class TestCreateReviewTask:
     def test_create_resolution_review_task_rejects_mismatched_provenance(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl_task = store.add("Implement feature", task_type="implement")
+        assert impl_task.id is not None
         impl_task.status = "completed"
         store.update(impl_task)
         rebase_task = store.add("Rebase feature", task_type="rebase", based_on=impl_task.id, same_branch=True)
@@ -1600,13 +1604,18 @@ class TestCreateReviewTask:
                 trigger_source="manual",
             )
 
-    def test_create_resolution_review_task_backfills_missing_resolved_shas(self, tmp_path: Path):
+    def test_create_resolution_review_task_backfill_with_moved_target_does_not_activate_boundary(
+        self, tmp_path: Path
+    ):
         store = SqliteTaskStore(tmp_path / "test.db")
         impl_task = store.add("Implement feature", task_type="implement")
+        assert impl_task.id is not None
         impl_task.status = "completed"
         store.update(impl_task)
         rebase_task = store.add("Rebase feature", task_type="rebase", based_on=impl_task.id, same_branch=True)
         rebase_task.status = "completed"
+        rebase_task.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+        rebase_task.changed_diff = True
         rebase_task.review_scope = (
             "Rebase diff provenance: yes\n"
             "Pre-rebase head SHA: old-head\n"
@@ -1614,7 +1623,8 @@ class TestCreateReviewTask:
             "Pre-rebase merge-base SHA: old-base\n"
             "Resolved head SHA: \n"
             "Resolved target SHA: \n"
-            "Recovered baseline: no"
+            "Recovered baseline: no\n"
+            "Changed-diff boundary proven: yes"
         )
         store.update(rebase_task)
 
@@ -1637,6 +1647,81 @@ class TestCreateReviewTask:
         assert persisted_rebase.review_scope is not None
         assert "Resolved head SHA: rebased-head" in persisted_rebase.review_scope
         assert "Resolved target SHA: target-at-review" in persisted_rebase.review_scope
+        assert "Changed-diff boundary proven: no" in persisted_rebase.review_scope
+        boundary = resolve_review_cycle_boundary(
+            latest_completed_review=persisted_review,
+            latest_completed_rebase=persisted_rebase,
+        )
+        assert boundary.boundary_task_id is None
+        assert boundary.boundary_reason is None
+
+    def test_create_resolution_review_task_backfill_with_returned_target_does_not_activate_boundary(
+        self, tmp_path: Path
+    ):
+        store = SqliteTaskStore(tmp_path / "test.db")
+        impl_task = store.add("Implement feature", task_type="implement")
+        assert impl_task.id is not None
+        impl_task.status = "completed"
+        store.update(impl_task)
+        review_one = store.add("Review one", task_type="review", depends_on=impl_task.id)
+        review_one.status = "completed"
+        review_one.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+        store.update(review_one)
+        review_two = store.add("Review two", task_type="review", depends_on=impl_task.id)
+        review_two.status = "completed"
+        review_two.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        store.update(review_two)
+        rebase_task = store.add("Rebase feature", task_type="rebase", based_on=impl_task.id, same_branch=True)
+        rebase_task.status = "completed"
+        rebase_task.completed_at = datetime(2026, 5, 10, 12, 0, tzinfo=UTC)
+        rebase_task.changed_diff = True
+        rebase_task.review_scope = (
+            "Rebase diff provenance: yes\n"
+            "Pre-rebase head SHA: old-head\n"
+            "Pre-rebase target SHA: target-before\n"
+            "Pre-rebase merge-base SHA: old-base\n"
+            "Resolved head SHA: \n"
+            "Resolved target SHA: \n"
+            "Recovered baseline: no\n"
+            "Changed-diff boundary proven: yes"
+        )
+        store.update(rebase_task)
+
+        review_task = create_resolution_review_task(
+            store,
+            impl_task,
+            rebase_task=rebase_task,
+            resolved_head_sha="rebased-head",
+            resolved_target_sha="target-before",
+            trigger_source="manual",
+        )
+        persisted_review = store.get(review_task.id)
+        persisted_rebase = store.get(rebase_task.id)
+
+        assert persisted_review is not None
+        persisted_review.status = "completed"
+        persisted_review.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
+        store.update(persisted_review)
+        assert persisted_rebase is not None
+        assert persisted_rebase.review_scope is not None
+        assert "Resolved head SHA: rebased-head" in persisted_rebase.review_scope
+        assert "Resolved target SHA: target-before" in persisted_rebase.review_scope
+        assert "Changed-diff boundary proven: no" in persisted_rebase.review_scope
+        boundary = resolve_review_cycle_boundary(
+            latest_completed_review=persisted_review,
+            latest_completed_rebase=persisted_rebase,
+        )
+        accounting = resolve_review_cycle_accounting(
+            store,
+            impl_task.id,
+            latest_completed_review=persisted_review,
+            latest_completed_rebase=persisted_rebase,
+        )
+        assert boundary.boundary_task_id is None
+        assert boundary.boundary_reason is None
+        assert accounting.lifetime_completed == 3
+        assert accounting.completed_since_boundary == 3
+        assert accounting.boundary.boundary_task_id is None
 
     def test_create_resolution_review_task_preserves_persisted_head_when_target_missing(self, tmp_path: Path):
         store = SqliteTaskStore(tmp_path / "test.db")
@@ -1815,6 +1900,104 @@ class TestCreateReviewTask:
         assert provenance_one.resolved_target_sha == "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
         assert provenance_two.resolved_head_sha == "3333333333333333333333333333333333333333"
         assert provenance_two.resolved_target_sha == "5555555555555555555555555555555555555555"
+
+    def test_reflog_repair_matching_shas_does_not_upgrade_incomplete_boundary_flag(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        store = SqliteTaskStore(tmp_path / "test.db")
+
+        impl = store.add("Implement feature", task_type="implement")
+        assert impl.id is not None
+        impl.status = "completed"
+        impl.branch = "feature/rebase-backfill-matching-boundary"
+        store.update(impl)
+
+        review_one = store.add("Review one", task_type="review", depends_on=impl.id)
+        assert review_one.id is not None
+        review_one.status = "completed"
+        review_one.completed_at = datetime(2026, 5, 10, 10, 0, tzinfo=UTC)
+        store.update(review_one)
+        review_two = store.add("Review two", task_type="review", depends_on=impl.id)
+        assert review_two.id is not None
+        review_two.status = "completed"
+        review_two.completed_at = datetime(2026, 5, 10, 11, 0, tzinfo=UTC)
+        store.update(review_two)
+
+        rebase = store.add("Rebase feature", task_type="rebase", based_on=impl.id, same_branch=True)
+        assert rebase.id is not None
+        rebase.status = "completed"
+        rebase.completed_at = datetime.fromtimestamp(2001, UTC)
+        rebase.branch = impl.branch
+        rebase.changed_diff = True
+        rebase.review_scope = "\n".join(
+            (
+                "Rebase diff provenance: yes",
+                "Pre-rebase head SHA: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "Pre-rebase target SHA: dddddddddddddddddddddddddddddddddddddddd",
+                "Pre-rebase merge-base SHA: ffffffffffffffffffffffffffffffffffffffff",
+                "Resolved head SHA:",
+                "Resolved target SHA:",
+                "Recovered baseline: no",
+                "Changed-diff boundary proven: yes",
+            )
+        )
+        store.update(rebase)
+
+        _write_reflog(
+            tmp_path,
+            "feature/rebase-backfill-matching-boundary",
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb user <u@example.com> 1000 +0000\tcommit: prior",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "
+                "cccccccccccccccccccccccccccccccccccccccc user <u@example.com> 2000 +0000\t"
+                "rebase (finish): refs/heads/feature/rebase-backfill-matching-boundary onto "
+                "dddddddddddddddddddddddddddddddddddddddd",
+            ),
+        )
+        _write_reflog(
+            tmp_path,
+            "main",
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+                "dddddddddddddddddddddddddddddddddddddddd user <u@example.com> 1999 +0000\tcommit: target returned",
+            ),
+        )
+
+        git = MagicMock(spec=Git)
+        git.repo_dir = tmp_path
+        git.merge_base.return_value = "ffffffffffffffffffffffffffffffffffffffff"
+
+        results = backfill_changed_diff_rebase_review_scope_provenance(
+            store,
+            git=git,
+            target_branch="main",
+        )
+
+        assert len(results) == 1
+        assert results[0].persisted is True
+        persisted_rebase = store.get(rebase.id)
+        assert persisted_rebase is not None
+        assert persisted_rebase.review_scope is not None
+        assert "Resolved head SHA: cccccccccccccccccccccccccccccccccccccccc" in persisted_rebase.review_scope
+        assert "Resolved target SHA: dddddddddddddddddddddddddddddddddddddddd" in persisted_rebase.review_scope
+        assert "Changed-diff boundary proven: no" in persisted_rebase.review_scope
+
+        latest_review = store.add("Review three", task_type="review", depends_on=impl.id)
+        assert latest_review.id is not None
+        latest_review.status = "completed"
+        latest_review.completed_at = datetime(2026, 5, 10, 13, 0, tzinfo=UTC)
+        store.update(latest_review)
+        accounting = resolve_review_cycle_accounting(
+            store,
+            impl.id,
+            latest_completed_review=latest_review,
+            latest_completed_rebase=persisted_rebase,
+        )
+        assert accounting.lifetime_completed == 3
+        assert accounting.completed_since_boundary == 3
+        assert accounting.boundary.boundary_task_id is None
 
     def test_backfill_resolution_review_scope_provenance_repairs_blank_pre_rebase_fields(
         self,

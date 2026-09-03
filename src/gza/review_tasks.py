@@ -22,6 +22,7 @@ from .rebase_diff import (
     RebaseDiffBaseline,
     build_rebase_diff_provenance,
     parse_rebase_diff_provenance,
+    rebase_changed_diff_boundary_proof_is_valid,
     recover_rebase_diff_provenance,
     resolution_delta_provenance_is_complete,
 )
@@ -1061,6 +1062,7 @@ def create_resolution_review_task(
             baseline=baseline,
             resolved_head_sha=persisted_head_sha or resolved_head_sha,
             resolved_target_sha=persisted_target_sha or resolved_target_sha,
+            changed_diff_boundary_proven=rebase_changed_diff_boundary_proof_is_valid(provenance),
         )
         store.update(rebase_task)
         provenance = parse_rebase_diff_provenance(rebase_task.review_scope)
@@ -1128,6 +1130,7 @@ def repair_rebase_review_scope_provenance(
         ),
         resolved_head_sha=recovered.resolved_head_sha,
         resolved_target_sha=recovered.resolved_target_sha,
+        changed_diff_boundary_proven=recovered.changed_diff_boundary_proven,
     )
     return persist_repaired_review_scope(
         store,

@@ -542,22 +542,7 @@ def _review_counts_as_implementation_evidence(store: SqliteTaskStore, review: Ta
     return review.task_type == "review" and _is_automatic_review_recovery_chain(store, review)
 
 
-def get_implementation_review_evidence(store: SqliteTaskStore, root_task: Task) -> list[Task]:
-    """Return implementation review evidence, including recovered review descendants."""
-    if root_task.id is None:
-        return []
-
-    reviews_by_id: dict[str, Task] = {}
-    for review in store.get_reviews_for_task(root_task.id):
-        if review.id is not None and _review_counts_as_implementation_evidence(store, review):
-            reviews_by_id.setdefault(review.id, review)
-
-    merge_unit = store.resolve_merge_unit_for_task(root_task.id)
-    if merge_unit is not None:
-        for task in store.list_tasks_for_merge_unit(merge_unit.id):
-            if task.id is not None and _review_counts_as_implementation_evidence(store, task):
-                reviews_by_id.setdefault(task.id, task)
-
+def _with_review_recovery_descendants(store: SqliteTaskStore, reviews_by_id: dict[str, Task]) -> list[Task]:
     if reviews_by_id:
         from gza.recovery_engine import classify_recovery_row
 
@@ -584,10 +569,89 @@ def get_implementation_review_evidence(store: SqliteTaskStore, root_task: Task) 
             reverse=True,
         )
 
-    slug = get_task_slug(root_task)
-    if not slug:
+    return []
+
+
+def get_implementation_review_evidence(store: SqliteTaskStore, root_task: Task) -> list[Task]:
+    """Return canonical implementation review evidence.
+
+    Evidence prefers direct linked and merge-unit reviews. Strict exact legacy
+    unlinked slug reviews are fallback lifecycle evidence only when no linked or
+    merge-unit evidence exists for the implementation's epoch.
+    """
+    if root_task.id is None:
         return []
-    return store.get_unlinked_reviews_for_slug(slug)
+
+    reviews_by_id: dict[str, Task] = {}
+    for review in store.get_reviews_for_task(root_task.id):
+        if review.id is not None and _review_counts_as_implementation_evidence(store, review):
+            reviews_by_id.setdefault(review.id, review)
+
+    merge_unit = store.resolve_merge_unit_for_task(root_task.id)
+    if merge_unit is not None:
+        for task in store.list_tasks_for_merge_unit(merge_unit.id):
+            if task.id is not None and _review_counts_as_implementation_evidence(store, task):
+                reviews_by_id.setdefault(task.id, task)
+
+    slug = get_task_slug(root_task)
+    if slug and not reviews_by_id:
+        epoch_start = task_time_for_lineage(root_task)
+        epoch_end = store.get_next_implementation_epoch_start_for_slug(
+            task_id=root_task.id,
+            slug=slug,
+            after=epoch_start,
+        )
+        for review in store.get_unlinked_reviews_for_slug(
+            slug,
+            full_slug=root_task.slug,
+            task_id=root_task.id,
+            prompt_not_before=epoch_start,
+            prompt_before=epoch_end,
+        ):
+            if review.id is not None and _review_counts_as_implementation_evidence(store, review):
+                reviews_by_id.setdefault(review.id, review)
+
+    return _with_review_recovery_descendants(store, reviews_by_id)
+
+
+def get_implementation_review_cycle_accounting_evidence(
+    store: SqliteTaskStore,
+    root_task: Task,
+) -> list[Task]:
+    """Return review evidence for review-cycle accounting.
+
+    Accounting includes canonical evidence plus exact legacy unlinked rounds so
+    old review history contributes to max-cycle counts without changing
+    latest-review, merge, finalization, or query behavior.
+    """
+    if root_task.id is None:
+        return []
+
+    reviews_by_id = {
+        review.id: review
+        for review in get_implementation_review_evidence(store, root_task)
+        if review.id is not None
+    }
+
+    slug = get_task_slug(root_task)
+    if slug:
+        epoch_start = task_time_for_lineage(root_task)
+        epoch_end = store.get_next_implementation_epoch_start_for_slug(
+            task_id=root_task.id,
+            slug=slug,
+            after=epoch_start,
+        )
+        for review in store.get_unlinked_reviews_for_slug(
+            slug,
+            full_slug=root_task.slug,
+            task_id=root_task.id,
+            prompt_not_before=epoch_start,
+            prompt_before=epoch_end,
+        ):
+            if review.id is not None and _review_counts_as_implementation_evidence(store, review):
+                reviews_by_id.setdefault(review.id, review)
+
+    return _with_review_recovery_descendants(store, reviews_by_id)
 
 
 def get_improves_for_root(store: SqliteTaskStore, root_task: Task) -> list[Task]:

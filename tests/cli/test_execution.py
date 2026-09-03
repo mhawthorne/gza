@@ -21573,22 +21573,41 @@ class TestIterateCommand:
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)
 
-        trigger_review = store.add("Trigger review", task_type="review", depends_on=impl.id)
+        old_review_1 = store.add("Old review 1", task_type="review", depends_on=impl.id)
+        old_review_1.status = "completed"
+        old_review_1.output_content = "**Verdict: CHANGES_REQUESTED**"
+        old_review_1.created_at = datetime(2026, 8, 1, 9, 55, tzinfo=UTC)
+        old_review_1.completed_at = datetime(2026, 8, 1, 10, 0, tzinfo=UTC)
+        store.update(old_review_1)
+        old_review_2 = store.add("Old review 2", task_type="review", depends_on=impl.id)
+        old_review_2.status = "completed"
+        old_review_2.output_content = "**Verdict: CHANGES_REQUESTED**"
+        old_review_2.created_at = datetime(2026, 8, 1, 10, 55, tzinfo=UTC)
+        old_review_2.completed_at = datetime(2026, 8, 1, 11, 0, tzinfo=UTC)
+        store.update(old_review_2)
+        boundary_rebase = store.add("Changed-diff rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+        boundary_rebase.status = "completed"
+        boundary_rebase.completed_at = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+        boundary_rebase.branch = impl.branch
+        boundary_rebase.changed_diff = True
+        boundary_rebase.review_scope = build_rebase_diff_provenance(
+            baseline=RebaseDiffBaseline(
+                old_tip="pre-rebase-head",
+                target_at_start="pre-rebase-target",
+                merge_base_at_start="pre-rebase-merge-base",
+            ),
+            resolved_head_sha="post-rebase-head",
+            resolved_target_sha="post-rebase-target",
+            changed_diff_boundary_proven=True,
+        )
+        store.update(boundary_rebase)
+
+        trigger_review = store.add("Post-boundary trigger review", task_type="review", depends_on=impl.id)
         trigger_review.status = "completed"
         trigger_review.output_content = "**Verdict: CHANGES_REQUESTED**"
-        trigger_review.completed_at = datetime.now(UTC)
+        trigger_review.created_at = datetime(2026, 8, 1, 12, 55, tzinfo=UTC)
+        trigger_review.completed_at = datetime(2026, 8, 1, 13, 0, tzinfo=UTC)
         store.update(trigger_review)
-
-        for idx in range(5):
-            done_improve = store.add(
-                f"Prior improve {idx + 1}",
-                task_type="improve",
-                based_on=impl.id,
-                depends_on=trigger_review.id,
-            )
-            done_improve.status = "completed"
-            done_improve.completed_at = datetime.now(UTC)
-            store.update(done_improve)
 
         improve_6 = store.add("Improve 6", task_type="improve", based_on=impl.id, depends_on=trigger_review.id)
         improve_7 = store.add("Improve 7", task_type="improve", based_on=impl.id, depends_on=trigger_review.id)
@@ -21609,7 +21628,7 @@ class TestIterateCommand:
             project_dir=tmp_path,
             use_docker=False,
             project_prefix="testproject",
-            max_review_cycles=7,
+            max_review_cycles=3,
             max_resume_attempts=1,
             require_review_before_merge=True,
             advance_create_reviews=True,
@@ -21641,7 +21660,14 @@ class TestIterateCommand:
                     {"type": "run_review", "description": "Run review 6", "review_task": review_6},
                     {"type": "run_improve", "description": "Run improve 7", "improve_task": improve_7},
                     {"type": "run_review", "description": "Run review 7", "review_task": review_7},
-                    {"type": "max_cycles_reached", "description": "Reached max review cycles"},
+                    {
+                        "type": "max_cycles_reached",
+                        "description": "Reached max review cycles",
+                        "completed_review_cycles": 3,
+                        "max_review_cycles": 3,
+                        "review_cycle_boundary_task_id": boundary_rebase.id,
+                        "review_cycle_boundary_reason": "rebase_changed_diff",
+                    },
                 ],
             ),
         ):
@@ -21649,13 +21675,121 @@ class TestIterateCommand:
         output = capsys.readouterr().out
 
         assert result == 3
+        final_action = {
+            "type": "max_cycles_reached",
+            "description": "Reached max review cycles",
+            "completed_review_cycles": 3,
+            "max_review_cycles": 3,
+            "review_cycle_boundary_task_id": boundary_rebase.id,
+            "review_cycle_boundary_reason": "rebase_changed_diff",
+        }
         expected_line = self._format_expected_attention_line(
             impl,
-            {"type": "max_cycles_reached", "description": "Reached max review cycles"},
+            final_action,
         )
         assert expected_line in output
-        assert "Review-iteration accounting: completed=7, max_review_cycles=7, consumed_this_invocation=2" in output
+        assert (
+            "Review-iteration accounting: "
+            f"completed_since_boundary=3, max_review_cycles=3, boundary=rebase_changed_diff:{boundary_rebase.id}, "
+            "lifetime_completed=5, consumed_this_invocation_since_boundary=2, "
+            "consumed_this_invocation_lifetime=2"
+        ) in output
         assert f"Recommended next step: uv run gza fix {impl.id}" in output
+
+    def test_iterate_review_accounting_excludes_stale_inflight_review_from_boundary_invocation(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli.execution import _print_review_iteration_accounting
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        invocation_started_at = datetime(2026, 8, 1, 14, 0, tzinfo=UTC)
+
+        def set_created_at(task, when: datetime) -> None:
+            task.created_at = when
+            with store._connect() as conn:
+                conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?", (when.isoformat(), task.id))
+
+        for index, hour in enumerate((10, 11), start=1):
+            old_review = store.add(f"Old review {index}", task_type="review", depends_on=impl.id)
+            old_review.status = "completed"
+            old_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+            set_created_at(old_review, datetime(2026, 8, 1, hour, 0, tzinfo=UTC))
+            old_review.completed_at = datetime(2026, 8, 1, hour, 5, tzinfo=UTC)
+            store.update(old_review)
+
+        boundary_rebase = store.add("Changed-diff rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+        boundary_rebase.status = "completed"
+        boundary_rebase.completed_at = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+        boundary_rebase.branch = impl.branch
+        boundary_rebase.changed_diff = True
+        boundary_rebase.review_scope = build_rebase_diff_provenance(
+            baseline=RebaseDiffBaseline(
+                old_tip="pre-rebase-head",
+                target_at_start="pre-rebase-target",
+                merge_base_at_start="pre-rebase-merge-base",
+            ),
+            resolved_head_sha="post-rebase-head",
+            resolved_target_sha="post-rebase-target",
+            changed_diff_boundary_proven=True,
+        )
+        store.update(boundary_rebase)
+
+        trigger_review = store.add("Post-boundary trigger review", task_type="review", depends_on=impl.id)
+        trigger_review.status = "completed"
+        trigger_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        set_created_at(trigger_review, datetime(2026, 8, 1, 12, 55, tzinfo=UTC))
+        trigger_review.completed_at = datetime(2026, 8, 1, 13, 0, tzinfo=UTC)
+        store.update(trigger_review)
+
+        stale_review = store.add("Stale in-flight review", task_type="review", depends_on=impl.id)
+        stale_review.status = "completed"
+        stale_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+        set_created_at(stale_review, datetime(2026, 8, 1, 11, 30, tzinfo=UTC))
+        stale_review.completed_at = invocation_started_at + timedelta(minutes=5)
+        store.update(stale_review)
+
+        for index, minute in enumerate((10, 11), start=1):
+            post_boundary_review = store.add(
+                f"Invocation post-boundary review {index}",
+                task_type="review",
+                depends_on=impl.id,
+            )
+            post_boundary_review.status = "completed"
+            post_boundary_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+            set_created_at(post_boundary_review, invocation_started_at + timedelta(minutes=index))
+            post_boundary_review.completed_at = invocation_started_at + timedelta(minutes=minute)
+            store.update(post_boundary_review)
+
+        _print_review_iteration_accounting(
+            store=store,
+            impl_task_id=impl.id,
+            action={
+                "completed_review_cycles": 3,
+                "max_review_cycles": 3,
+                "review_cycle_boundary_task_id": boundary_rebase.id,
+                "review_cycle_boundary_reason": "rebase_changed_diff",
+            },
+            max_review_cycles=3,
+            starting_lifetime_completed=3,
+            invocation_started_at=invocation_started_at,
+        )
+        output = capsys.readouterr().out
+
+        assert (
+            "Review-iteration accounting: "
+            f"completed_since_boundary=3, max_review_cycles=3, boundary=rebase_changed_diff:{boundary_rebase.id}, "
+            "lifetime_completed=6, consumed_this_invocation_since_boundary=2, "
+            "consumed_this_invocation_lifetime=3"
+        ) in output
+        accounting = re.search(
+            r"completed_since_boundary=(?P<completed>\d+).*"
+            r"consumed_this_invocation_since_boundary=(?P<consumed>\d+)",
+            output,
+        )
+        assert accounting is not None
+        assert int(accounting.group("consumed")) <= int(accounting.group("completed"))
 
     def test_iterate_max_cycles_attention_uses_shortened_single_line_prompt(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -21735,6 +21869,24 @@ class TestIterateCommand:
         setup_config(tmp_path)
         store = make_store(tmp_path)
         impl = self._make_completed_impl(store)
+        for idx, hour in enumerate((10, 11), start=1):
+            old_review = store.add(f"Old review {idx}", task_type="review", depends_on=impl.id)
+            old_review.status = "completed"
+            old_review.output_content = "**Verdict: CHANGES_REQUESTED**"
+            old_review.completed_at = datetime(2026, 8, 1, hour, 0, tzinfo=UTC)
+            store.update(old_review)
+        boundary_rebase = store.add("Changed-diff rebase", task_type="rebase", based_on=impl.id, same_branch=True)
+        boundary_rebase.status = "completed"
+        boundary_rebase.completed_at = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+        boundary_rebase.branch = impl.branch
+        boundary_rebase.changed_diff = True
+        store.update(boundary_rebase)
+        for idx, hour in enumerate((13, 14, 15), start=1):
+            review = store.add(f"Post-boundary review {idx}", task_type="review", depends_on=impl.id)
+            review.status = "completed"
+            review.output_content = "**Verdict: CHANGES_REQUESTED**"
+            review.completed_at = datetime(2026, 8, 1, hour, 0, tzinfo=UTC)
+            store.update(review)
         config = Config.load(tmp_path)
         config.max_review_cycles = 3
         config.max_resume_attempts = 1
@@ -21761,7 +21913,14 @@ class TestIterateCommand:
             patch("gza.cli.execution.Git", return_value=mock_git),
             patch(
                 "gza.cli.execution.determine_next_action",
-                return_value={"type": "max_cycles_reached", "description": "Reached max review cycles"},
+                return_value={
+                    "type": "max_cycles_reached",
+                    "description": "Reached max review cycles",
+                    "completed_review_cycles": 3,
+                    "max_review_cycles": 3,
+                    "review_cycle_boundary_task_id": boundary_rebase.id,
+                    "review_cycle_boundary_reason": "rebase_changed_diff",
+                },
             ),
             patch("gza.cli.execution._spawn_background_iterate", return_value=0) as spawn_background,
         ):
@@ -21771,7 +21930,12 @@ class TestIterateCommand:
         assert result == 3
         spawn_background.assert_not_called()
         assert "Next action: max_cycles_reached" in output
-        assert "Review-iteration accounting: completed=0, max_review_cycles=3, consumed_this_invocation=0" in output
+        assert (
+            "Review-iteration accounting: "
+            f"completed_since_boundary=3, max_review_cycles=3, boundary=rebase_changed_diff:{boundary_rebase.id}, "
+            "lifetime_completed=5, consumed_this_invocation_since_boundary=0, "
+            "consumed_this_invocation_lifetime=0"
+        ) in output
         assert f"Recommended next step: uv run gza fix {impl.id}" in output
         assert WorkerRegistry(config.workers_path).list_all(include_completed=True) == []
 

@@ -127,7 +127,12 @@ from .prompts import PromptBuilder
 from .providers import Provider, RunResult, get_provider
 from .providers.base import PreflightCheckResult
 from .providers.log_renderers import UnknownLogProviderError, get_log_renderer
-from .rebase_checkout import StaleRebaseImportError, import_isolated_rebase_tip, isolated_rebase_checkout
+from .rebase_checkout import (
+    StaleRebaseImportError,
+    append_immutable_rebase_target_instructions,
+    import_isolated_rebase_tip,
+    isolated_rebase_checkout,
+)
 from .rebase_diff import (
     RebaseDiffBaseline,
     RebaseDiffProvenance,
@@ -135,6 +140,7 @@ from .rebase_diff import (
     capture_rebase_diff_baseline,
     compute_rebase_changed_diff,
     compute_resolution_delta_context,
+    prove_rebase_changed_diff_boundary,
 )
 from .rebase_publish import (
     REBASE_SUPERSEDED_COMPLETION_REASON,
@@ -10329,6 +10335,7 @@ def _complete_code_task(
     seeded_paths: set[str] | None = None,
     improve_diff_baseline: ImproveDiffBaseline | None = None,
     rebase_diff_baseline: RebaseDiffBaseline | None = None,
+    rebase_provider_target_bound: bool = True,
     rebase_superseded_by_concurrent_rebase: bool = False,
     rebase_supersession_proof_target: str | None = None,
     error_type: str | None = None,
@@ -10761,6 +10768,7 @@ def _complete_code_task(
         fix_was_merged_before_run=fix_was_merged_before_run,
         improve_diff_baseline=improve_diff_baseline,
         rebase_diff_baseline=rebase_diff_baseline,
+        rebase_provider_target_bound=rebase_provider_target_bound,
     )
 
 
@@ -10779,6 +10787,7 @@ def _post_complete_code_task(
     fix_was_merged_before_run: bool = False,
     improve_diff_baseline: ImproveDiffBaseline | None = None,
     rebase_diff_baseline: RebaseDiffBaseline | None = None,
+    rebase_provider_target_bound: bool = True,
     rebase_supersession_proof_target: str | None = None,
     rebase_publish_results: list[RebasePublishResult] | None = None,
 ) -> int:
@@ -10896,19 +10905,48 @@ def _post_complete_code_task(
                 else RebaseDiffBaseline(old_tip=None, target_at_start=None, merge_base_at_start=None, recovered=True)
             ),
             branch=published_rebase_head_sha or branch_name,
-            target=target_branch if target_branch is not None else worktree_git.default_branch(),
+            target=(
+                rebase_diff_baseline.target_at_start
+                if rebase_diff_baseline is not None and rebase_diff_baseline.target_at_start is not None
+                else (target_branch if target_branch is not None else worktree_git.default_branch())
+            ),
         )
         rebase_changed_diff = rebase_comparison.changed_diff
         assert task.id is not None
         store.set_rebase_changed_diff(task.id, rebase_comparison.changed_diff)
         task.changed_diff = rebase_comparison.changed_diff
-        resolved_head_sha = (
+        compared_head_sha = getattr(rebase_comparison, "compared_head_sha", None)
+        compared_target_sha = getattr(rebase_comparison, "compared_target_sha", None)
+        resolved_head_sha = compared_head_sha or (
             published_rebase_head_sha
             if published_rebase_head_sha is not None
             else (worktree_git.rev_parse_if_exists(branch_name) if branch_name else None)
         )
         resolved_target_sha = target_branch if target_branch is not None else worktree_git.default_branch()
-        resolved_target_head_sha = worktree_git.rev_parse_if_exists(resolved_target_sha)
+        resolved_target_head_sha = compared_target_sha or worktree_git.rev_parse_if_exists(resolved_target_sha)
+        comparison_boundary_proven = bool(getattr(rebase_comparison, "changed_diff_boundary_proven", False))
+        should_probe_changed_diff_boundary = (
+            comparison_boundary_proven
+            and rebase_supersession_proof_target is None
+            and rebase_provider_target_bound
+        )
+        changed_diff_boundary_proof = (
+            prove_rebase_changed_diff_boundary(
+                worktree_git,
+                baseline=(
+                    rebase_diff_baseline
+                    if rebase_diff_baseline is not None
+                    else RebaseDiffBaseline(old_tip=None, target_at_start=None, merge_base_at_start=None, recovered=True)
+                ),
+                resolved_head_sha=resolved_head_sha,
+                resolved_target_sha=resolved_target_head_sha,
+            )
+            if should_probe_changed_diff_boundary
+            else None
+        )
+        changed_diff_boundary_warning = (
+            changed_diff_boundary_proof.warning if changed_diff_boundary_proof is not None else None
+        )
         task.review_scope = build_rebase_diff_provenance(
             baseline=(
                 rebase_diff_baseline
@@ -10917,11 +10955,19 @@ def _post_complete_code_task(
             ),
             resolved_head_sha=resolved_head_sha,
             resolved_target_sha=resolved_target_head_sha,
+            changed_diff_boundary_proven=(
+                False
+                if not should_probe_changed_diff_boundary or changed_diff_boundary_proof is None
+                else changed_diff_boundary_proof.proven
+            ),
         )
         store.update(task)
         if rebase_comparison.warning:
             logger.warning(rebase_comparison.warning)
             console.print(f"[yellow]Warning: {rebase_comparison.warning}[/yellow]")
+        if changed_diff_boundary_warning:
+            logger.warning(changed_diff_boundary_warning)
+            console.print(f"[yellow]Warning: {changed_diff_boundary_warning}[/yellow]")
         rebase_review_target_id = (
             impl_ancestor.id if impl_ancestor and impl_ancestor.id is not None else task.based_on
         )
@@ -11405,9 +11451,19 @@ def _run_inner(
     worktree_path = config.worktree_path / task.slug
     isolated_checkout_cm = None
     isolated_checkout = None
-    if _should_use_isolated_runner_rebase_checkout(task=task, config=config):
+    use_isolated_runner_rebase_checkout = _should_use_isolated_runner_rebase_checkout(task=task, config=config)
+    rebase_diff_baseline: RebaseDiffBaseline | None = None
+    rebase_provider_target_ref: str | None = None
+    rebase_provider_target_bound = False
+    if use_isolated_runner_rebase_checkout:
         assert rebase_execution_target is not None
-        rebase_target = rebase_execution_target
+        rebase_diff_baseline = capture_rebase_diff_baseline(
+            git,
+            branch=branch_name,
+            target=rebase_execution_target,
+            recovered=_is_recovered_rebase_lineage(task, resume=resume),
+        )
+        rebase_target = rebase_diff_baseline.target_at_start or rebase_execution_target
         try:
             isolated_checkout_cm = isolated_rebase_checkout(
                 config=config,
@@ -11436,6 +11492,7 @@ def _run_inner(
             return 1
         worktree_path = isolated_checkout.path
         worktree_git = isolated_checkout.git
+        rebase_provider_target_ref = getattr(isolated_checkout, "provider_target_ref", None)
     else:
         setup_result = _setup_code_task_worktree(
             task,
@@ -11750,15 +11807,24 @@ def _run_inner(
         },
     )
     improve_diff_baseline: ImproveDiffBaseline | None = None
-    rebase_diff_baseline: RebaseDiffBaseline | None = None
     if task.task_type == "rebase":
         assert rebase_execution_target is not None
-        rebase_diff_baseline = capture_rebase_diff_baseline(
-            worktree_git,
-            branch=branch_name,
-            target=rebase_execution_target,
-            recovered=_is_recovered_rebase_lineage(task, resume=resume),
-        )
+        if rebase_diff_baseline is None:
+            rebase_diff_baseline = capture_rebase_diff_baseline(
+                worktree_git,
+                branch=branch_name,
+                target=rebase_execution_target,
+                recovered=_is_recovered_rebase_lineage(task, resume=resume),
+            )
+        if rebase_provider_target_ref is None:
+            rebase_provider_target_ref = rebase_diff_baseline.target_at_start
+        if rebase_provider_target_ref is not None and rebase_diff_baseline.target_at_start is not None:
+            prompt = append_immutable_rebase_target_instructions(
+                prompt,
+                target_ref=rebase_provider_target_ref,
+                target_sha=rebase_diff_baseline.target_at_start,
+            )
+            rebase_provider_target_bound = True
     if task.task_type == "improve":
         improve_diff_baseline = capture_improve_diff_baseline(
             worktree_git,
@@ -11946,6 +12012,7 @@ def _run_inner(
             seeded_paths=seeded_paths,
             improve_diff_baseline=improve_diff_baseline,
             rebase_diff_baseline=rebase_diff_baseline,
+            rebase_provider_target_bound=rebase_provider_target_bound,
             rebase_superseded_by_concurrent_rebase=rebase_superseded_by_concurrent_rebase,
             rebase_supersession_proof_target=rebase_supersession_proof_target,
             error_type=result.error_type,

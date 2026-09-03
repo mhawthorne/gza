@@ -393,15 +393,40 @@ closed and be treated as changed.
   MUST win with `merge-source-needs-manual-resolution`. Missing or stale verify
   evidence MUST run the normal pre-merge verify path; red or unavailable
   evidence MUST remain on the existing verify-fix or attention path.
-- `max_review_cycles` MUST count only completed review/improve cycles inside the current
-  durable-progress epoch. The epoch resets only when persisted evidence shows a new
-  reviewed head or other durable branch progress boundary; historical pre-boundary churn
-  MUST NOT keep poisoning the lineage after that progress.
+- `max_review_cycles` MUST count completed review/improve cycles for the merge unit,
+  not just cycles since the last commit, and MUST apply to ordinary and
+  `spec_coherence` review modes through the same boundary-scoped count. Existing
+  pending or in-progress improves for a current `CHANGES_REQUESTED` review MUST be
+  allowed to run or finish before the cap parks the lineage, but lifecycle MUST NOT
+  create another improve after the count reaches the bound. Ordinary improve, fix,
+  or reviewed-head advancement MUST NOT reset the counter. The counter MAY reset
+  only at a deliberate scope/base boundary, currently persisted as a completed
+  rebase with affirmative changed-diff boundary proof over the exact immutable
+  target SHA consumed by the rebase operation and used for the post-rebase
+  comparison. Historical pre-boundary churn MUST NOT keep poisoning the lineage
+  after that boundary. Review rounds belong to a boundary epoch by durable
+  attempt-start time, so a review created before a changed-diff rebase MUST NOT
+  count as a post-boundary round merely because it completed afterward. Recovered,
+  missing-ref, moving-target, or comparison-error rebases MAY invalidate review
+  because equivalence is unproven, but MUST NOT reset cycle accounting or be
+  labeled as proven changed-diff boundaries.
 - Review evidence for an implementation lineage MUST include direct implementation-linked
   reviews, merge-unit-attached reviews, and review recovery descendants whose `based_on`
-  chain stays on the automatic review recovery path. A manual same-type follow-up on a
+  chain stays on the automatic review recovery path. Strict exact legacy unlinked
+  slug reviews MAY be fallback lifecycle evidence only when linked or
+  merge-unit-attached review evidence is absent. The review-cycle accounting
+  population MAY independently include those eligible legacy rows so historical
+  rounds contribute to the cap without changing authoritative latest-review,
+  merge, finalization, or query decisions. A manual same-type follow-up on a
   review MUST NOT silently count as review evidence for merge or closing-review
   invariants.
+- Legacy unlinked review rows MAY contribute to review evidence and review-cycle
+  accounting only when their prompt or task slug exactly names the implementation slug.
+  Overlapping slugs such as `foo` and `foo-bar` MUST remain isolated. When historical
+  implementations reuse the same semantic slug, dated review slugs MUST match the
+  implementation's dated slug identity when available; prompt-only rows MUST be scoped
+  by durable review attempt-start time to the matching implementation epoch and MUST NOT
+  be attributed to multiple merge units.
 
 ### §5a — Pre-review verify gate
 
@@ -579,9 +604,9 @@ When a current review exists for the implementation lineage:
 
 **Bounds (see [00-overview.md](00-overview.md#core-invariants-the-load-bearing-rules), invariant 2), each a policy knob:**
 
-- Review→improve cycles reach `max_review_cycles` within the current durable-progress
-  epoch → `max_cycles_reached` under current default `on_max_cycles=park`; under
-  opt-in `on_max_cycles=merge_and_defer`, eligible
+- Review→improve cycles reach `max_review_cycles` within the current merge-unit
+  scope/base boundary → `max_cycles_reached` under current default
+  `on_max_cycles=park`; under opt-in `on_max_cycles=merge_and_defer`, eligible
   ordinary current-head candidates first prove local merge source and readable
   deterministic blocker content, then traverse the pre-merge verify gate above,
   and emit the existing `merge` action annotated with max-cycle deferral metadata
@@ -589,10 +614,10 @@ When a current review exists for the implementation lineage:
   are available. Missing merge source or unavailable/invalid review content
   surfaces its own attention reason instead of falling through to the generic cap
   park; if both are present, missing merge source wins. Plan-review cap exhaustion
-  is separate: it accepts the latest plan revision
-  and moves to implementation, and it does not grant code-merge authority. Verify
-  exhaustion states, including red verify, unavailable verify, failed verify-fix, and
-  unavailable-after-fix, cannot satisfy the merge-and-defer precondition.
+  is separate: it accepts the latest plan revision and moves to implementation, and
+  it does not grant code-merge authority. Verify exhaustion states, including red
+  verify, unavailable verify, failed verify-fix, and unavailable-after-fix, cannot
+  satisfy the merge-and-defer precondition.
 - **A. Ordinary no-op improves do not bypass the two-gate model.** A no-op improve does
   not, by itself, authorize merge. If code changed, both the review gate and verify gate
   become stale and MUST be re-run in the normal order: verify first, then review.
@@ -1347,7 +1372,7 @@ is a spec change. The accompanying human message is free text.
 | `improve-no-op` | needs_discussion | §6 consecutive no-op improves ≥ bound after adjudication/compatibility handling is exhausted |
 | `review-blocker-adjudication-needed` | needs_discussion | §6 adjudication for a disputed non-verify CODE blocker returned `NEEDS_HUMAN`, failed, or could not be parsed safely |
 | `duplicate-blocker-no-progress` | needs_discussion | §6 same primary blocker repeats across cycles |
-| `review-max-cycles-reached` | max_cycles_reached | §6 current-head review→improve cycles ≥ `max_review_cycles` with no stale-review refresh available under current default `on_max_cycles=park`; opt-in `merge_and_defer` candidates first prove local merge source and readable deterministic blocker content, then traverse pre-merge verify gating and emit annotated `merge` only after green verify plus validated persisted blocker metadata |
+| `review-max-cycles-reached` | max_cycles_reached | §6 merge-unit review→improve cycles since the current scope/base boundary ≥ `max_review_cycles` with no stale-review refresh available under current default `on_max_cycles=park`; opt-in `merge_and_defer` candidates first prove local merge source and readable deterministic blocker content, then traverse pre-merge verify gating and emit annotated `merge` only after green verify plus validated persisted blocker metadata |
 | `review-max-cycles-review-content-unavailable` | needs_discussion | §6 `merge_and_defer` candidate review content is missing, blank, unreadable, or undecodable, so deferred blocker tasks cannot preserve authoritative review text |
 | `review-max-cycles-review-content-invalid` | needs_discussion | §6 `merge_and_defer` candidate review content is readable but parsed blocker identity, blocker summary, or capped-review validation is nondeterministic or unsafe |
 | `review-verdict-needs-manual-attention` | needs_discussion | §6 verdict unclassifiable, or `APPROVED_WITH_FOLLOWUPS` with zero parsed follow-ups |

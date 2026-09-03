@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from gza.git import Git
+from gza.git import Git, GitError
 from gza.rebase_diff import (
     RebaseDiffBaseline,
     RebaseDiffProvenance,
@@ -25,6 +25,7 @@ def _make_patch_id_git(*, pre_patch_id: str, post_patch_id: str) -> MagicMock:
         "feature": "feature-tip",
         "main": "main-tip",
     }.get(ref)
+    git.is_ancestor.return_value = True
 
     def _run(*args: str, **_kwargs: object) -> SimpleNamespace:
         if args == ("diff", "--binary", "--find-renames", "base-tip", "old-tip"):
@@ -47,7 +48,7 @@ def test_compute_rebase_changed_diff_preserves_clean_unchanged_rebase(tmp_path: 
     git = _make_patch_id_git(pre_patch_id="stable-patch", post_patch_id="stable-patch")
     baseline = RebaseDiffBaseline(
         old_tip="old-tip",
-        target_at_start="main-start",
+        target_at_start="main-tip",
         merge_base_at_start="base-tip",
     )
 
@@ -64,7 +65,7 @@ def test_compute_rebase_changed_diff_preserves_aggregate_patch_across_commit_top
     git = _make_patch_id_git(pre_patch_id="aggregate-patch", post_patch_id="aggregate-patch")
     baseline = RebaseDiffBaseline(
         old_tip="old-tip",
-        target_at_start="main-start",
+        target_at_start="main-tip",
         merge_base_at_start="base-tip",
     )
 
@@ -78,14 +79,79 @@ def test_compute_rebase_changed_diff_detects_content_change(tmp_path: Path) -> N
     git = _make_patch_id_git(pre_patch_id="original-patch", post_patch_id="changed-patch")
     baseline = RebaseDiffBaseline(
         old_tip="old-tip",
-        target_at_start="main-start",
+        target_at_start="main-tip",
         merge_base_at_start="base-tip",
     )
 
     comparison = compute_rebase_changed_diff(git, baseline=baseline, branch="feature", target="main")
 
     assert comparison.changed_diff is True
+    assert comparison.changed_diff_boundary_proven is True
+    assert comparison.compared_head_sha == "feature-tip"
+    assert comparison.compared_target_sha == "main-tip"
     assert comparison.detail == "yes (review must be refreshed)"
+
+
+def test_compute_rebase_changed_diff_keeps_uncontained_target_boundary_unproven() -> None:
+    git = _make_patch_id_git(pre_patch_id="original-patch", post_patch_id="changed-patch")
+    git.is_ancestor.return_value = False
+    baseline = RebaseDiffBaseline(
+        old_tip="old-tip",
+        target_at_start="main-tip",
+        merge_base_at_start="base-tip",
+    )
+
+    comparison = compute_rebase_changed_diff(git, baseline=baseline, branch="feature", target="main")
+
+    assert comparison.changed_diff is True
+    assert comparison.changed_diff_boundary_proven is False
+    assert comparison.compared_head_sha == "feature-tip"
+    assert comparison.compared_target_sha == "main-tip"
+    assert comparison.warning == (
+        "rebase changed-diff boundary proof unavailable: rebased head "
+        "feature-tip does not contain captured target main-tip"
+    )
+
+
+def test_compute_rebase_changed_diff_keeps_ancestry_probe_failure_boundary_unproven() -> None:
+    git = _make_patch_id_git(pre_patch_id="original-patch", post_patch_id="changed-patch")
+    git.is_ancestor.side_effect = GitError("merge-base failed")
+    baseline = RebaseDiffBaseline(
+        old_tip="old-tip",
+        target_at_start="main-tip",
+        merge_base_at_start="base-tip",
+    )
+
+    comparison = compute_rebase_changed_diff(git, baseline=baseline, branch="feature", target="main")
+
+    assert comparison.changed_diff is True
+    assert comparison.changed_diff_boundary_proven is False
+    assert comparison.compared_head_sha == "feature-tip"
+    assert comparison.compared_target_sha == "main-tip"
+    assert comparison.warning == (
+        "rebase changed-diff boundary proof failed: could not prove whether "
+        "feature-tip contains captured target main-tip: merge-base failed"
+    )
+
+
+def test_compute_rebase_changed_diff_keeps_target_movement_unproven() -> None:
+    git = _make_patch_id_git(pre_patch_id="implementation-patch", post_patch_id="target-moved-patch")
+    baseline = RebaseDiffBaseline(
+        old_tip="old-tip",
+        target_at_start="main-before-move",
+        merge_base_at_start="base-tip",
+    )
+
+    comparison = compute_rebase_changed_diff(git, baseline=baseline, branch="feature", target="main")
+
+    assert comparison.changed_diff is True
+    assert comparison.changed_diff_boundary_proven is False
+    assert comparison.compared_head_sha == "feature-tip"
+    assert comparison.compared_target_sha == "main-tip"
+    assert comparison.warning == (
+        "rebase diff comparison target moved after baseline capture; "
+        "changed-diff boundary proof unavailable"
+    )
 
 
 def test_compute_rebase_changed_diff_treats_recovered_baseline_as_changed(tmp_path: Path) -> None:
@@ -99,10 +165,42 @@ def test_compute_rebase_changed_diff_treats_recovered_baseline_as_changed(tmp_pa
     comparison = compute_rebase_changed_diff(git, baseline=baseline, branch="feature", target="main")
 
     assert comparison.changed_diff is True
+    assert comparison.changed_diff_boundary_proven is False
     assert comparison.detail == "yes (review must be refreshed)"
     assert comparison.warning == (
         "rebase diff comparison unavailable for recovered/resumed rebase; treating as changed"
     )
+
+
+def test_compute_rebase_changed_diff_treats_missing_refs_as_unproven_changed() -> None:
+    git = MagicMock(spec=Git)
+    baseline = RebaseDiffBaseline(
+        old_tip=None,
+        target_at_start="main-start",
+        merge_base_at_start=None,
+    )
+
+    comparison = compute_rebase_changed_diff(git, baseline=baseline, branch="feature", target="main")
+
+    assert comparison.changed_diff is True
+    assert comparison.changed_diff_boundary_proven is False
+    assert comparison.warning == "rebase diff comparison missing pre-rebase refs; treating as changed"
+
+
+def test_compute_rebase_changed_diff_treats_comparison_error_as_unproven_changed() -> None:
+    git = _make_patch_id_git(pre_patch_id="original-patch", post_patch_id="changed-patch")
+    git._run.side_effect = RuntimeError("patch-id failed")
+    baseline = RebaseDiffBaseline(
+        old_tip="old-tip",
+        target_at_start="main-start",
+        merge_base_at_start="base-tip",
+    )
+
+    comparison = compute_rebase_changed_diff(git, baseline=baseline, branch="feature", target="main")
+
+    assert comparison.changed_diff is True
+    assert comparison.changed_diff_boundary_proven is False
+    assert comparison.warning == "rebase diff comparison failed: patch-id failed; treating as changed"
 
 
 def test_compute_resolution_delta_context_returns_range_diff_for_changed_rebase() -> None:
@@ -191,6 +289,118 @@ def test_recover_rebase_diff_provenance_from_reflogs(tmp_path: Path) -> None:
     assert recovered.merge_base_at_start == "ffffffffffffffffffffffffffffffffffffffff"
     assert recovered.resolved_head_sha == "cccccccccccccccccccccccccccccccccccccccc"
     assert recovered.resolved_target_sha == "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+
+def test_recover_rebase_diff_provenance_downgrades_moved_target_boundary_proof(
+    tmp_path: Path,
+) -> None:
+    git_dir = tmp_path / ".git" / "logs" / "refs" / "heads"
+    git_dir.mkdir(parents=True)
+    branch = "feature/rebase-backfill"
+    target = "main"
+    (git_dir / "feature").mkdir(parents=True, exist_ok=True)
+    (git_dir / branch).write_text(
+        "\n".join(
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb user <u@example.com> 1000 +0000\tcommit: prior",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "
+                "cccccccccccccccccccccccccccccccccccccccc user <u@example.com> 2000 +0000\t"
+                "rebase (finish): refs/heads/feature/rebase-backfill onto "
+                "dddddddddddddddddddddddddddddddddddddddd",
+            )
+        )
+        + "\n"
+    )
+    (git_dir / target).write_text(
+        "dddddddddddddddddddddddddddddddddddddddd "
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee user <u@example.com> 1999 +0000\tcommit: target moved\n"
+    )
+
+    git = MagicMock(spec=Git)
+    git.repo_dir = tmp_path
+    git.merge_base.return_value = "ffffffffffffffffffffffffffffffffffffffff"
+    existing_scope = "\n".join(
+        (
+            "Rebase diff provenance: yes",
+            "Pre-rebase head SHA: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "Pre-rebase target SHA: dddddddddddddddddddddddddddddddddddddddd",
+            "Pre-rebase merge-base SHA: ffffffffffffffffffffffffffffffffffffffff",
+            "Resolved head SHA:",
+            "Resolved target SHA:",
+            "Recovered baseline: no",
+            "Changed-diff boundary proven: yes",
+        )
+    )
+
+    recovered = recover_rebase_diff_provenance(
+        git,
+        branch=branch,
+        target_branch=target,
+        completed_at=datetime.fromtimestamp(2001, UTC),
+        review_scope=existing_scope,
+    )
+
+    assert recovered is not None
+    assert recovered.resolved_head_sha == "cccccccccccccccccccccccccccccccccccccccc"
+    assert recovered.resolved_target_sha == "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    assert recovered.changed_diff_boundary_proven is False
+
+
+def test_recover_rebase_diff_provenance_does_not_upgrade_incomplete_matching_boundary_proof(
+    tmp_path: Path,
+) -> None:
+    git_dir = tmp_path / ".git" / "logs" / "refs" / "heads"
+    git_dir.mkdir(parents=True)
+    branch = "feature/rebase-backfill"
+    target = "main"
+    (git_dir / "feature").mkdir(parents=True, exist_ok=True)
+    (git_dir / branch).write_text(
+        "\n".join(
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb user <u@example.com> 1000 +0000\tcommit: prior",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb "
+                "cccccccccccccccccccccccccccccccccccccccc user <u@example.com> 2000 +0000\t"
+                "rebase (finish): refs/heads/feature/rebase-backfill onto "
+                "dddddddddddddddddddddddddddddddddddddddd",
+            )
+        )
+        + "\n"
+    )
+    (git_dir / target).write_text(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa "
+        "dddddddddddddddddddddddddddddddddddddddd user <u@example.com> 1999 +0000\tcommit: target stable\n"
+    )
+
+    git = MagicMock(spec=Git)
+    git.repo_dir = tmp_path
+    git.merge_base.return_value = "ffffffffffffffffffffffffffffffffffffffff"
+    existing_scope = "\n".join(
+        (
+            "Rebase diff provenance: yes",
+            "Pre-rebase head SHA: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "Pre-rebase target SHA: dddddddddddddddddddddddddddddddddddddddd",
+            "Pre-rebase merge-base SHA: ffffffffffffffffffffffffffffffffffffffff",
+            "Resolved head SHA:",
+            "Resolved target SHA:",
+            "Recovered baseline: no",
+            "Changed-diff boundary proven: yes",
+        )
+    )
+
+    recovered = recover_rebase_diff_provenance(
+        git,
+        branch=branch,
+        target_branch=target,
+        completed_at=datetime.fromtimestamp(2001, UTC),
+        review_scope=existing_scope,
+    )
+
+    assert recovered is not None
+    assert recovered.resolved_head_sha == "cccccccccccccccccccccccccccccccccccccccc"
+    assert recovered.resolved_target_sha == "dddddddddddddddddddddddddddddddddddddddd"
+    assert recovered.changed_diff_boundary_proven is False
 
 
 def test_recover_rebase_diff_provenance_uses_containing_worktree_root_for_nested_project(
