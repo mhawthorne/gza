@@ -9,7 +9,14 @@ from pathlib import Path
 
 import pytest
 
-_TEST_UNIT_SUBPROCESS_TIMEOUT_SECONDS = 15
+# The nested pytest runs below are bounded twice: this subprocess timeout fires
+# first and reports the child's captured output, and the per-test watchdog is the
+# backstop. Derive one from the other so the margin between them stays visible and
+# cannot silently shrink -- an absolute subprocess timeout was raised from 4s to
+# 15s across two earlier de-flakes and still failed at 11.1s of observed runtime
+# under full-suite xdist contention.
+_SUITE_WATCHDOG_SECONDS = 60
+_TEST_UNIT_SUBPROCESS_TIMEOUT_SECONDS = _SUITE_WATCHDOG_SECONDS - 10
 
 
 def _repo_env() -> dict[str, str]:
@@ -60,7 +67,7 @@ def _run_test_unit(
     )
 
 
-@pytest.mark.timeout(60, method="signal")
+@pytest.mark.timeout(_SUITE_WATCHDOG_SECONDS, method="signal")
 def test_parallel_only_watchdog_failure_passes_via_serial_rerun_and_preserves_unit_phase_line(tmp_path: Path) -> None:
     suite_dir = tmp_path / "parallel_only_watchdog"
     suite_dir.mkdir()
@@ -75,10 +82,8 @@ def test_parallel_only_watchdog_failure_passes_via_serial_rerun_and_preserves_un
         encoding="utf-8",
     )
 
-    # This subprocess performs two pytest invocations (parallel pass + serial rerun).
-    # Under full-suite xdist contention that can exceed a brittle 4s child timeout,
-    # so keep the subprocess bounded but give it headroom well below the test's
-    # explicit 60s watchdog.
+    # This subprocess performs two pytest invocations (parallel pass + serial rerun),
+    # which makes it the most expensive test in the functional suite.
     result = _run_test_unit(suite_dir, use_verify_phase=True)
 
     assert result.returncode == 0, result.stderr
@@ -87,7 +92,7 @@ def test_parallel_only_watchdog_failure_passes_via_serial_rerun_and_preserves_un
     assert "PARALLEL-ONLY FAILURE (passed serially):" in result.stderr
 
 
-@pytest.mark.timeout(60, method="signal")
+@pytest.mark.timeout(_SUITE_WATCHDOG_SECONDS, method="signal")
 def test_over_cap_failures_fail_without_serial_rerun(tmp_path: Path) -> None:
     suite_dir = tmp_path / "over_cap_suite"
     suite_dir.mkdir()
@@ -105,7 +110,7 @@ def test_over_cap_failures_fail_without_serial_rerun(tmp_path: Path) -> None:
     assert "re-running serially" not in result.stderr
 
 
-@pytest.mark.timeout(60, method="signal")
+@pytest.mark.timeout(_SUITE_WATCHDOG_SECONDS, method="signal")
 def test_genuinely_broken_test_still_fails_phase_and_logs_confirmed_failure(tmp_path: Path) -> None:
     suite_dir = tmp_path / "broken_suite"
     suite_dir.mkdir()
@@ -122,7 +127,7 @@ def test_genuinely_broken_test_still_fails_phase_and_logs_confirmed_failure(tmp_
     assert "CONFIRMED FAILURE (failed serially too):" in result.stderr
 
 
-@pytest.mark.timeout(60, method="signal")
+@pytest.mark.timeout(_SUITE_WATCHDOG_SECONDS, method="signal")
 def test_green_parallel_path_keeps_summary_and_skips_rerun(tmp_path: Path) -> None:
     suite_dir = tmp_path / "green_suite"
     suite_dir.mkdir()

@@ -9,7 +9,14 @@ from pathlib import Path
 
 import pytest
 
-_TEST_FUNCTIONAL_SUBPROCESS_TIMEOUT_SECONDS = 15
+# The nested pytest runs below are bounded twice: this subprocess timeout fires
+# first and reports the child's captured output, and the per-test watchdog is the
+# backstop. Derive one from the other so the margin between them stays visible and
+# cannot silently shrink -- an absolute subprocess timeout was raised from 4s to
+# 15s across two earlier de-flakes and still failed at 11.1s of observed runtime
+# under full-suite xdist contention.
+_SUITE_WATCHDOG_SECONDS = 60
+_TEST_FUNCTIONAL_SUBPROCESS_TIMEOUT_SECONDS = _SUITE_WATCHDOG_SECONDS - 10
 
 
 def _repo_env() -> dict[str, str]:
@@ -60,7 +67,7 @@ def _run_test_functional(
     )
 
 
-@pytest.mark.timeout(60, method="signal")
+@pytest.mark.timeout(_SUITE_WATCHDOG_SECONDS, method="signal")
 def test_parallel_only_watchdog_failure_passes_via_serial_rerun_and_preserves_functional_phase_line(
     tmp_path: Path,
 ) -> None:
@@ -85,7 +92,7 @@ def test_parallel_only_watchdog_failure_passes_via_serial_rerun_and_preserves_fu
     assert "functional-rerun: PARALLEL-ONLY FAILURE (passed serially):" in result.stderr
 
 
-@pytest.mark.timeout(60, method="signal")
+@pytest.mark.timeout(_SUITE_WATCHDOG_SECONDS, method="signal")
 def test_genuinely_broken_test_still_fails_phase_and_logs_confirmed_failure(tmp_path: Path) -> None:
     suite_dir = tmp_path / "broken_suite"
     suite_dir.mkdir()
