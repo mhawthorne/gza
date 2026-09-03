@@ -3300,6 +3300,7 @@ def test_recovery_engine_pending_match_does_not_override_completed_sibling(tmp_p
     assert decision.reason_code == "recovery_already_completed"
     assert decision.recovery_task_id == completed_sibling.id
     assert decision.reuse_existing is False
+    assert should_hide_failed_recovery_decision(decision) is True
 
 
 def test_recovery_engine_marks_multi_step_resume_chain_as_resolved(tmp_path: Path) -> None:

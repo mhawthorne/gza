@@ -152,6 +152,7 @@ def should_hide_failed_recovery_decision(decision: FailedRecoveryDecision) -> bo
         "merge_unit_empty",
         "merge_unit_redundant",
         "terminal_no_work_recovery_already_resolved",
+        "recovery_already_completed",
     }
 
 
