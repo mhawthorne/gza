@@ -19,6 +19,7 @@ from gza.advance_engine import (
     resolve_review_cycle_boundary,
 )
 from gza.cli._lifecycle_actions import should_execute_lifecycle_action as real_should_execute_lifecycle_action
+from gza.cli.advance_engine import determine_next_action
 from gza.cli.advance_executor import AdvanceActionExecutionResult
 from gza.cli.git_ops import (
     SquashBranchReconcileResult,
@@ -93,6 +94,7 @@ from gza.review_tasks import (
 )
 from gza.review_verdict import ParsedReviewReport, ReviewFinding, parse_review_report
 from gza.review_verify_state import VerifyEpoch, persist_verify_gate_artifact
+from gza.task_query import count_outstanding_deferred_review_blockers
 from gza.worktree_roots import managed_worktree_root_paths
 
 from .conftest import invoke_gza, make_store, setup_config
@@ -623,6 +625,28 @@ def _add_capped_merge_ready_impl(
     return task, review
 
 
+def _add_capped_merge_ready_impl_with_blockers(
+    store: Any,
+    config: Config,
+    tmp_path: Path,
+    *,
+    branch: str,
+    blocker_ids: tuple[str, ...],
+    tags: tuple[str, ...] = (),
+    head_sha: str = "same-sha",
+) -> tuple[Any, Any, str]:
+    config.on_max_cycles = "merge_and_defer"
+    config.max_review_cycles = 1
+    config.verify_command = "./bin/tests"
+    task = _completed_merge_task(store, "Capped merge full-path", branch, tags=tags)
+    review_output = _capped_review_output(*blocker_ids)
+    review = _completed_review(store, task, review_output)
+    _set_review_head(store, review, head_sha)
+    _persist_capped_authorization_verify(store, config, task, tmp_path=tmp_path, head_sha=head_sha)
+    assert store.get_or_create_merge_unit_for_task(task) is not None
+    return task, review, review_output
+
+
 def _add_mergeable_impl_with_failed_rebase(store, branch: str):
     task = store.add("Implement feature", task_type="implement")
     assert task.id is not None
@@ -716,6 +740,178 @@ def test_cmd_advance_dry_run_renders_capped_merge_and_defer_without_writes(
     refreshed = store.get(task.id)
     assert refreshed is not None
     assert refreshed.merge_status == "unmerged"
+
+
+def test_full_path_max_cycle_merge_and_defer_creates_debt_before_merge_success_and_clears_when_landed(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    task, review, review_output = _add_capped_merge_ready_impl_with_blockers(
+        store,
+        config,
+        tmp_path,
+        branch="feature/full-path-capped-one",
+        blocker_ids=("B1",),
+        tags=("release",),
+    )
+    assert task.id is not None
+    assert review.id is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    git = _merge_executor_git(tmp_path, task.branch)
+
+    action = determine_next_action(config, store, git, task, "main", selected_for_merge=True)
+
+    assert action["type"] == "merge"
+    assert action["max_cycles_merge_and_defer"] is True
+    assert action["review_task"].id == review.id
+    assert action["persisted_review_output"] == review_output
+    assert action["max_cycles_audit"]["verify_gate_state"] == "passed"
+    assert tuple(action["deferred_blocker_ids"]) == ("B1",)
+
+    order: list[str] = []
+
+    def _merge_side_effect(*_args: object, **kwargs: object) -> _MergeSingleTaskResult:
+        side_effect = kwargs.get("before_irreversible_side_effect")
+        assert side_effect is not None
+        assert side_effect() is None
+        order.append("deferred-created")
+        assert count_outstanding_deferred_review_blockers(store) == 0
+        refreshed_unit = store.get_merge_unit(unit.id)
+        assert refreshed_unit is not None
+        assert refreshed_unit.state == "unmerged"
+        assert refreshed_unit.merge_source is None
+        blocker_children = [
+            child
+            for child in store.get_based_on_children(task.id)
+            if child.task_type == "implement" and "deferred-review-blocker" in child.tags
+        ]
+        assert len(blocker_children) == 1
+        order.append("merge-success")
+        return _MergeSingleTaskResult(rc=0)
+
+    with (
+        patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
+        patch("gza.cli.git_ops._merge_single_task", side_effect=_merge_side_effect),
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            git,
+            task,
+            action,
+            target_branch="main",
+            current_branch="main",
+            merge_source=MERGE_SOURCE_ADVANCE,
+            active_scope_tags=("release",),
+        )
+
+    assert result.rc == 0
+    assert order == ["deferred-created", "merge-success"]
+    assert len(result.created_deferred_blockers) == 1
+    assert result.reused_deferred_blockers == []
+    blocker = result.created_deferred_blockers[0]
+    assert blocker.based_on == task.id
+    assert blocker.depends_on == task.id
+    assert {"release", "deferred-review-blocker"} <= set(blocker.tags)
+    assert review_output in blocker.prompt
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "merged"
+    assert refreshed_unit.merge_source == MERGE_SOURCE_MAX_CYCLES_DEFERRED
+    assert count_outstanding_deferred_review_blockers(store) == 1
+
+    store.mark_completed(blocker, has_commits=True, branch=f"feature/{blocker.id}-landed")
+    blocker_unit = store.resolve_merge_unit_for_task(blocker.id)
+    assert blocker_unit is not None
+    store.set_merge_unit_state(blocker_unit.id, "merged", merge_source=MERGE_SOURCE_ADVANCE)
+
+    assert count_outstanding_deferred_review_blockers(store) == 0
+
+
+def test_full_path_max_cycle_merge_and_defer_fans_out_multi_blocker_debt_and_clears_no_work(
+    tmp_path: Path,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    task, _review, review_output = _add_capped_merge_ready_impl_with_blockers(
+        store,
+        config,
+        tmp_path,
+        branch="feature/full-path-capped-multi",
+        blocker_ids=("B1", "B2", "B3"),
+        tags=("backend",),
+    )
+    assert task.id is not None
+    unit = store.resolve_merge_unit_for_task(task.id)
+    assert unit is not None
+    git = _merge_executor_git(tmp_path, task.branch)
+
+    action = determine_next_action(config, store, git, task, "main", selected_for_merge=True)
+
+    assert action["type"] == "merge"
+    assert action["max_cycles_merge_and_defer"] is True
+    assert tuple(action["deferred_blocker_ids"]) == ("B1", "B2", "B3")
+
+    with (
+        patch("gza.cli.git_ops._build_auto_merge_args", return_value=argparse.Namespace()),
+        patch("gza.cli.git_ops._merge_single_task", return_value=_MergeSingleTaskResult(rc=0)),
+    ):
+        result = _execute_merge_action(
+            config,
+            store,
+            git,
+            task,
+            action,
+            target_branch="main",
+            current_branch="main",
+            merge_source=MERGE_SOURCE_ADVANCE,
+            active_scope_tags=("release",),
+        )
+
+    assert result.rc == 0
+    assert len(result.created_deferred_blockers) == 3
+    assert result.reused_deferred_blockers == []
+    assert {child.based_on for child in result.created_deferred_blockers} == {task.id}
+    assert all(review_output in child.prompt for child in result.created_deferred_blockers)
+    assert all(
+        {"backend", "release", "deferred-review-blocker"} <= set(child.tags)
+        for child in result.created_deferred_blockers
+    )
+    refreshed_unit = store.get_merge_unit(unit.id)
+    assert refreshed_unit is not None
+    assert refreshed_unit.state == "merged"
+    assert refreshed_unit.merge_source == MERGE_SOURCE_MAX_CYCLES_DEFERRED
+    assert count_outstanding_deferred_review_blockers(store) == 3
+
+    first, second, third = result.created_deferred_blockers
+    store.mark_completed(first, has_commits=True, branch=f"feature/{first.id}-landed")
+    first_unit = store.resolve_merge_unit_for_task(first.id)
+    assert first_unit is not None
+    store.set_merge_unit_state(first_unit.id, "merged", merge_source=MERGE_SOURCE_ADVANCE)
+
+    store.mark_completed(second, has_commits=False)
+    second_unit = store.create_merge_unit(
+        source_branch=f"feature/{second.id}-empty",
+        target_branch="main",
+        owner_task_id=second.id,
+        state="empty",
+    )
+    store.attach_task_to_merge_unit(second.id, second_unit.id, "owner")
+
+    store.mark_completed(third, has_commits=False)
+    third_unit = store.create_merge_unit(
+        source_branch=f"feature/{third.id}-redundant",
+        target_branch="main",
+        owner_task_id=third.id,
+        state="redundant",
+    )
+    store.attach_task_to_merge_unit(third.id, third_unit.id, "owner")
+
+    assert count_outstanding_deferred_review_blockers(store) == 0
 
 
 def _add_completed_impl_with_approved_review(store, branch: str, *, when: datetime) -> tuple[Any, Any]:
