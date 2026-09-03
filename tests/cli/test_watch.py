@@ -84,8 +84,10 @@ from gza.cli.watch import (
     WatchProjectSelection,
     WatchRuntimeIdentity,
     WatchSlotAllocation,
+    WatchSupervisorFleetCycleResult,
     WatchSupervisorProjectSelector,
     WatchSupervisorRuntimeConstruction,
+    WatchSupervisorRuntimeState,
     WatchSupervisorSelection,
     _active_failure_backoff_owner_ids,
     _build_watch_cycle_plan,
@@ -101,6 +103,7 @@ from gza.cli.watch import (
     _emit_merge_result_follow_lines,
     _emit_transition_events,
     _evaluate_blind_parked_auto_rearm,
+    _ExpectedStart,
     _finalize_main_verify_attention,
     _finalize_watch_no_progress_after_execution,
     _find_open_main_verify_remediation_tasks,
@@ -157,6 +160,8 @@ from gza.cli.watch import (
     plan_watch_supervisor_dispatch_lanes,
     resolve_watch_supervisor_recovery_slot_limit,
     resolve_watch_supervisor_selection,
+    run_watch_supervisor_fleet_cycle,
+    watch_supervisor_fleet_cycle_is_idle,
 )
 from gza.concurrency import MaxConcurrentTasksError, _LiveRunningState, launch_permit, take_task_launch_permit
 from gza.config import Config, ConfigError
@@ -165,6 +170,8 @@ from gza.db import (
     MERGE_SOURCE_WATCH,
     SCHEMA_VERSION,
     DuplicateActiveChildError,
+    ExecutionProjectActivationError,
+    ManualMigrationRequired,
     SchemaIntegrityError,
     SqliteTaskStore,
     Task,
@@ -1070,6 +1077,7 @@ def _watch_args(tmp_path: Path, task_ids: list[str], **overrides: object) -> arg
         "watch_weights": None,
         "watch_strategy": None,
         "watch_config": None,
+        "watch_state_dir": None,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -1120,6 +1128,64 @@ def test_watch_supervisor_cli_selectors_preserve_order_and_keyed_associations(tm
         weight=1,
         source="cli",
     )
+
+
+def test_watch_supervisor_state_dir_cli_override_wins_over_manifest_and_anchor(tmp_path: Path) -> None:
+    setup_config(tmp_path)
+    manifest_dir = tmp_path / "manifest"
+    manifest_dir.mkdir()
+    manifest_state_dir = manifest_dir / "manifest-state"
+    cli_state_dir = tmp_path / "cli-state"
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    manifest_path = manifest_dir / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "aggregate_state_dir: manifest-state",
+                "projects:",
+                f"  - name: core\n    path: {project_dir}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    selection = resolve_watch_supervisor_selection(
+        _watch_args(
+            tmp_path,
+            [],
+            watch_config=str(manifest_path),
+            watch_state_dir=str(cli_state_dir),
+        )
+    )
+
+    assert selection.aggregate_state_dir == cli_state_dir.resolve()
+    assert watch_module._watch_supervisor_state_dir(Config.load(tmp_path), selection) == cli_state_dir.resolve()
+    assert selection.aggregate_state_dir != manifest_state_dir.resolve()
+
+
+def test_watch_supervisor_state_dir_manifest_relative_path_resolves_from_manifest(tmp_path: Path) -> None:
+    manifest_dir = tmp_path / "ops"
+    manifest_dir.mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    manifest_path = manifest_dir / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "aggregate_state_dir: state/fleet",
+                "projects:",
+                f"  - name: core\n    path: {project_dir}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    selection = resolve_watch_supervisor_selection(_watch_args(tmp_path, [], watch_config=str(manifest_path)))
+
+    assert selection.aggregate_state_dir == (manifest_dir / "state" / "fleet").resolve()
 
 
 def test_watch_supervisor_manifest_resolves_relative_paths_and_cli_overrides(tmp_path: Path) -> None:
@@ -2168,7 +2234,9 @@ def test_construct_watch_project_runtimes_builds_ordered_shared_db_runtimes_with
     anchor_store = SqliteTaskStore.from_config(anchor_config)
     selection = _watch_runtime_selection(
         (
-            WatchSupervisorProjectSelector(key="core", ref=str(root_dir), path=root_dir, tags=("release",), any_tag=True),
+            WatchSupervisorProjectSelector(
+                key="core", ref=str(root_dir), path=root_dir, tags=("release",), any_tag=True
+            ),
             WatchSupervisorProjectSelector(
                 key="api",
                 ref=str(server_dir),
@@ -2256,7 +2324,9 @@ def test_construct_watch_project_runtimes_builds_unrelated_db_runtimes_in_select
     constructed = construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
 
     assert constructed.disabled == ()
-    assert [(runtime.key, runtime.config.project_id, runtime.store.db_path.resolve()) for runtime in constructed.runtimes] == [
+    assert [
+        (runtime.key, runtime.config.project_id, runtime.store.db_path.resolve()) for runtime in constructed.runtimes
+    ] == [
         ("two", "second", second_db.resolve()),
         ("one", "first", first_db.resolve()),
     ]
@@ -2550,7 +2620,7 @@ def _assert_watch_supervisor_lease_can_be_acquired(store: SqliteTaskStore, token
     )
 
 
-def test_construct_watch_project_runtimes_defers_merge_unit_repairs_until_after_lease(
+def test_construct_watch_project_runtimes_defers_merge_unit_repairs_until_enabled_reconcile(
     tmp_path: Path,
 ) -> None:
     project_dir = tmp_path / "project"
@@ -2573,9 +2643,31 @@ def test_construct_watch_project_runtimes_defers_merge_unit_repairs_until_after_
 
     assert constructed.disabled == ()
     assert [runtime.key for runtime in constructed.runtimes] == ["project"]
-    assert _merge_unit_has_stale_merged_provenance(store, unit_id) is False
+    assert _merge_unit_has_stale_merged_provenance(store, unit_id) is True
     assert constructed.lease_set is not None
     constructed.lease_set.release()
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch.object(WatchProjectRuntime, "analyze_cycle", side_effect=AssertionError("analysis after repair")),
+    ):
+        with pytest.raises(AssertionError, match="analysis after repair"):
+            run_watch_supervisor_fleet_cycle(
+                anchor_store=store,
+                selection=selection,
+                quiet=True,
+                owner_token="repair-before-analysis",
+                existing_lease_set=None,
+                batch=1,
+                recovery_slots=0,
+                recovery_mode=None,
+                max_recovery_attempts=1,
+                max_iterations=1,
+                dry_run=False,
+                emit_summary=False,
+            )
+
+    assert _merge_unit_has_stale_merged_provenance(store, unit_id) is False
 
 
 def test_construct_watch_project_runtimes_lease_conflict_leaves_inconsistent_merge_unit_unrepaired(
@@ -2592,11 +2684,14 @@ def test_construct_watch_project_runtimes_lease_conflict_leaves_inconsistent_mer
     config = Config.load(project_dir)
     store = SqliteTaskStore.from_config(config)
     unit_id = _seed_inconsistent_unmerged_unit(store)
-    assert store.try_acquire_project_lease(
-        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-        owner_pid=os.getpid(),
-        owner_token="already-owned",
-    ) is not None
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="already-owned",
+        )
+        is not None
+    )
     selection = _watch_runtime_selection(
         (WatchSupervisorProjectSelector(key="project", ref=str(project_dir), path=project_dir),)
     )
@@ -2608,6 +2703,73 @@ def test_construct_watch_project_runtimes_lease_conflict_leaves_inconsistent_mer
         construct_watch_project_runtimes(anchor_store=store, selection=selection, quiet=True)
 
     assert _merge_unit_has_stale_merged_provenance(store, unit_id) is True
+
+
+def test_watch_supervisor_docker_held_runtime_preserves_occupancy_without_repair_or_sibling_dispatch(
+    tmp_path: Path,
+) -> None:
+    held_dir = tmp_path / "held"
+    healthy_dir = tmp_path / "healthy"
+    _write_watch_runtime_project_config(
+        held_dir,
+        project_name="Held",
+        project_id="held",
+        project_prefix="held",
+        db_path=tmp_path / "held.db",
+    )
+    _write_watch_runtime_project_config(
+        healthy_dir,
+        project_name="Healthy",
+        project_id="healthy",
+        project_prefix="healthy",
+        db_path=tmp_path / "healthy.db",
+    )
+    held_store = SqliteTaskStore.from_config(Config.load(held_dir))
+    healthy_store = SqliteTaskStore.from_config(Config.load(healthy_dir))
+    unit_id = _seed_inconsistent_unmerged_unit(held_store)
+    held_task = held_store.add("Held live worker occupies batch", task_type="plan")
+    healthy_task = healthy_store.add("Healthy pending must not exceed fleet batch", task_type="plan")
+    assert held_task.id is not None
+    assert healthy_task.id is not None
+    _register_live_worker_for_task(Config.load(held_dir), held_task.id)
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="held", ref=str(held_dir), path=held_dir),
+            WatchSupervisorProjectSelector(key="healthy", ref=str(healthy_dir), path=healthy_dir),
+        )
+    )
+
+    def system_can_run(config: Config, **_kwargs: object) -> bool:
+        return config.project_id != "held"
+
+    with (
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._system_can_run_tasks", side_effect=system_can_run),
+        patch("gza.cli.watch._spawn_background_worker", side_effect=AssertionError("healthy sibling dispatched")),
+    ):
+        result, lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=healthy_store,
+            selection=selection,
+            quiet=True,
+            owner_token="held-occupancy",
+            existing_lease_set=None,
+            batch=1,
+            recovery_slots=0,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=False,
+            emit_summary=False,
+        )
+
+    assert [(disabled.selector_key, disabled.reason) for disabled in result.disabled] == [("held", "docker-held")]
+    assert result.occupancy is not None
+    assert result.occupancy.running + result.occupancy.starting == 1
+    assert result.occupancy.slots == 0
+    assert healthy_store.get(healthy_task.id).status == "pending"
+    assert _merge_unit_has_stale_merged_provenance(held_store, unit_id) is True
+    assert lease_set is not None
+    lease_set.release()
 
 
 def test_construct_watch_project_runtimes_lease_conflict_does_not_mutate_schema_or_project_row(
@@ -2625,11 +2787,14 @@ def test_construct_watch_project_runtimes_lease_conflict_does_not_mutate_schema_
     store = SqliteTaskStore.from_config(config)
     before = _schema_version_and_project_row(store.db_path, "project")
     assert before[1] is not None
-    assert store.try_acquire_project_lease(
-        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-        owner_pid=os.getpid(),
-        owner_token="already-owned",
-    ) is not None
+    assert (
+        store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="already-owned",
+        )
+        is not None
+    )
     selection = _watch_runtime_selection(
         (WatchSupervisorProjectSelector(key="project", ref=str(project_dir), path=project_dir),)
     )
@@ -2684,7 +2849,7 @@ def test_construct_watch_project_runtimes_activation_invalid_utf8_disables_one_p
     constructed.lease_set.release()
 
 
-def test_cmd_watch_multi_project_refusal_acquires_and_releases_runtime_set_leases(
+def test_cmd_watch_multi_project_dry_run_acquires_runs_and_releases_runtime_set_leases(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2711,23 +2876,22 @@ def test_cmd_watch_multi_project_refusal_acquires_and_releases_runtime_set_lease
         [],
         watch_projects=[f"first={first_dir}", f"second={second_dir}"],
         watch_lease_token="fleet-token",
+        dry_run=True,
     )
 
-    with (
-        patch(
-            "gza.cli.watch.ExecutionProjectResolved.open_runtime_store",
-            side_effect=AssertionError("multi-project refusal must not activate runtimes"),
-        ) as open_runtime_store,
-        patch("gza.cli.watch.Git", side_effect=AssertionError("multi-project refusal must not open Git")),
-    ):
-        rc = cmd_watch(args)
+    rc = cmd_watch(args)
 
     captured = capsys.readouterr()
-    assert rc == 1
-    assert "multi-project watch supervisor dispatch is not enabled yet" in captured.out
-    open_runtime_store.assert_not_called()
+    assert rc == 0
+    assert "fleet summary:" not in captured.out
+    assert (first_dir / ".gza" / "watch.dry-run.log").exists()
+    assert (second_dir / ".gza" / "watch.dry-run.log").exists()
     assert not (first_dir / ".gza" / "watch.log").exists()
     assert not (second_dir / ".gza" / "watch.log").exists()
+    aggregate_log = first_dir / ".gza" / "watch-supervisor" / "watch-supervisor.log"
+    assert aggregate_log.exists()
+    assert "fleet summary:" in aggregate_log.read_text(encoding="utf-8")
+    assert not (first_dir / ".gza" / "watch-supervisor.log").exists()
     _assert_watch_supervisor_lease_can_be_acquired(
         SqliteTaskStore(first_db, prefix="first", project_id="first"),
         "after-first-refusal",
@@ -2736,6 +2900,189 @@ def test_cmd_watch_multi_project_refusal_acquires_and_releases_runtime_set_lease
         SqliteTaskStore(second_db, prefix="second", project_id="second"),
         "after-second-refusal",
     )
+
+
+def test_cmd_watch_multi_project_interactive_refusal_runs_only_preview_and_releases_lease(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    _write_watch_runtime_project_config(
+        first_dir,
+        project_name="First",
+        project_id="first",
+        project_prefix="first",
+        db_path=tmp_path / "first.db",
+    )
+    _write_watch_runtime_project_config(
+        second_dir,
+        project_name="Second",
+        project_id="second",
+        project_prefix="second",
+        db_path=tmp_path / "second.db",
+    )
+    lease = SimpleNamespace(owner_token="preview-token", release=MagicMock())
+    preview_result = WatchSupervisorFleetCycleResult(True, 0, 1, 0, 0)
+    args = _watch_args(
+        first_dir,
+        [],
+        watch_projects=[f"first={first_dir}", f"second={second_dir}"],
+        yes=False,
+        max_idle=1,
+    )
+
+    with (
+        patch("gza.cli.watch.run_watch_supervisor_fleet_cycle", return_value=(preview_result, lease)) as fleet_cycle,
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("gza.cli.watch.sys.stdout.flush"),
+        patch("builtins.input", return_value="n") as input_mock,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Aborted." in captured.out
+    assert fleet_cycle.call_count == 1
+    assert fleet_cycle.call_args.kwargs["dry_run"] is True
+    input_mock.assert_called_once_with("\nProceed? [y/N] ")
+    lease.release.assert_called_once_with()
+
+
+def test_cmd_watch_multi_project_eof_refusal_releases_preview_lease(tmp_path: Path) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    _write_watch_runtime_project_config(
+        first_dir,
+        project_name="First",
+        project_id="first",
+        project_prefix="first",
+        db_path=tmp_path / "first.db",
+    )
+    _write_watch_runtime_project_config(
+        second_dir,
+        project_name="Second",
+        project_id="second",
+        project_prefix="second",
+        db_path=tmp_path / "second.db",
+    )
+    lease = SimpleNamespace(owner_token="preview-token", release=MagicMock())
+    args = _watch_args(
+        first_dir,
+        [],
+        watch_projects=[f"first={first_dir}", f"second={second_dir}"],
+        yes=False,
+        max_idle=1,
+    )
+
+    with (
+        patch(
+            "gza.cli.watch.run_watch_supervisor_fleet_cycle",
+            return_value=(WatchSupervisorFleetCycleResult(True, 0, 1, 0, 0), lease),
+        ) as fleet_cycle,
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=True),
+        patch("gza.cli.watch.sys.stdout.flush"),
+        patch("builtins.input", side_effect=EOFError) as input_mock,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert fleet_cycle.call_count == 1
+    input_mock.assert_called_once_with("\nProceed? [y/N] ")
+    lease.release.assert_called_once_with()
+
+
+def test_cmd_watch_multi_project_non_tty_without_yes_refuses_before_fleet_cycle(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    _write_watch_runtime_project_config(
+        first_dir,
+        project_name="First",
+        project_id="first",
+        project_prefix="first",
+        db_path=tmp_path / "first.db",
+    )
+    _write_watch_runtime_project_config(
+        second_dir,
+        project_name="Second",
+        project_id="second",
+        project_prefix="second",
+        db_path=tmp_path / "second.db",
+    )
+    args = _watch_args(
+        first_dir,
+        [],
+        watch_projects=[f"first={first_dir}", f"second={second_dir}"],
+        yes=False,
+        max_idle=1,
+    )
+
+    with (
+        patch("gza.cli.watch.run_watch_supervisor_fleet_cycle") as fleet_cycle,
+        patch("gza.cli.watch.sys.stdout.isatty", return_value=False),
+        patch("builtins.input") as input_mock,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "stdout is not a terminal" in captured.err
+    assert "Re-run with -y to auto-confirm." in captured.err
+    fleet_cycle.assert_not_called()
+    input_mock.assert_not_called()
+
+
+@pytest.mark.parametrize(("yes", "resumed_reexec"), [(True, False), (False, True)])
+def test_cmd_watch_multi_project_yes_and_resumed_reexec_skip_confirmation(
+    tmp_path: Path,
+    yes: bool,
+    resumed_reexec: bool,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    _write_watch_runtime_project_config(
+        first_dir,
+        project_name="First",
+        project_id="first",
+        project_prefix="first",
+        db_path=tmp_path / "first.db",
+    )
+    _write_watch_runtime_project_config(
+        second_dir,
+        project_name="Second",
+        project_id="second",
+        project_prefix="second",
+        db_path=tmp_path / "second.db",
+    )
+    args = _watch_args(
+        first_dir,
+        [],
+        watch_projects=[f"first={first_dir}", f"second={second_dir}"],
+        yes=yes,
+        resumed_reexec=resumed_reexec,
+        max_idle=1,
+    )
+
+    with (
+        patch(
+            "gza.cli.watch.run_watch_supervisor_fleet_cycle",
+            return_value=(WatchSupervisorFleetCycleResult(False, 0, 0, 0, 0), None),
+        ) as fleet_cycle,
+        patch("builtins.input") as input_mock,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert fleet_cycle.call_count == 1
+    assert fleet_cycle.call_args.kwargs["dry_run"] is False
+    input_mock.assert_not_called()
 
 
 def test_cmd_watch_multi_project_lease_conflict_rolls_back_prior_selector(
@@ -2762,11 +3109,14 @@ def test_cmd_watch_multi_project_lease_conflict_rolls_back_prior_selector(
     )
     first_store = SqliteTaskStore(first_db, prefix="first", project_id="first")
     second_store = SqliteTaskStore(second_db, prefix="second", project_id="second")
-    assert second_store.try_acquire_project_lease(
-        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-        owner_pid=os.getpid(),
-        owner_token="blocking-watch",
-    ) is not None
+    assert (
+        second_store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="blocking-watch",
+        )
+        is not None
+    )
     args = _watch_args(
         first_dir,
         [],
@@ -2788,11 +3138,226 @@ def test_cmd_watch_multi_project_lease_conflict_rolls_back_prior_selector(
     assert "watch-supervisor lease" in captured.out
     open_runtime_store.assert_not_called()
     _assert_watch_supervisor_lease_can_be_acquired(first_store, "after-first-rollback")
-    assert second_store.try_acquire_project_lease(
-        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-        owner_pid=os.getpid(),
-        owner_token="after-second-conflict",
-    ) is None
+    assert (
+        second_store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="after-second-conflict",
+        )
+        is None
+    )
+
+
+def test_cmd_watch_multi_project_manifest_places_aggregate_log_under_manifest_state_dir(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    anchor_dir = tmp_path / "anchor"
+    manifest_dir = tmp_path / "manifest-owner"
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    _write_watch_runtime_project_config(
+        anchor_dir,
+        project_name="Anchor",
+        project_id="anchor",
+        project_prefix="anchor",
+        db_path=tmp_path / "anchor.db",
+    )
+    _write_watch_runtime_project_config(
+        first_dir,
+        project_name="First",
+        project_id="first",
+        project_prefix="first",
+        db_path=tmp_path / "first.db",
+    )
+    _write_watch_runtime_project_config(
+        second_dir,
+        project_name="Second",
+        project_id="second",
+        project_prefix="second",
+        db_path=tmp_path / "second.db",
+    )
+    manifest_dir.mkdir()
+    manifest_path = manifest_dir / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "projects:",
+                f"  - name: first\n    path: {first_dir}",
+                f"  - name: second\n    path: {second_dir}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = _watch_args(anchor_dir, [], watch_config=str(manifest_path), dry_run=True)
+
+    rc = cmd_watch(args)
+
+    assert rc == 0
+    capsys.readouterr()
+    aggregate_path = manifest_dir / ".gza" / "watch-supervisor" / "watch-supervisor.log"
+    assert aggregate_path.exists()
+    aggregate_text = aggregate_path.read_text()
+    assert "[first]" in aggregate_text
+    assert "[second]" in aggregate_text
+    assert not (anchor_dir / ".gza" / "watch-supervisor" / "watch-supervisor.log").exists()
+    assert not (anchor_dir / ".gza" / "watch-supervisor.log").exists()
+
+
+def test_cmd_watch_multi_project_cli_state_dir_places_aggregate_log_at_explicit_override(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    anchor_dir = tmp_path / "anchor"
+    manifest_dir = tmp_path / "manifest-owner"
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    state_dir = tmp_path / "fleet-state"
+    _write_watch_runtime_project_config(
+        anchor_dir,
+        project_name="Anchor",
+        project_id="anchor",
+        project_prefix="anchor",
+        db_path=tmp_path / "anchor.db",
+    )
+    _write_watch_runtime_project_config(
+        first_dir,
+        project_name="First",
+        project_id="first",
+        project_prefix="first",
+        db_path=tmp_path / "first.db",
+    )
+    _write_watch_runtime_project_config(
+        second_dir,
+        project_name="Second",
+        project_id="second",
+        project_prefix="second",
+        db_path=tmp_path / "second.db",
+    )
+    manifest_dir.mkdir()
+    manifest_path = manifest_dir / "watch.yaml"
+    manifest_path.write_text(
+        "\n".join(
+            [
+                "version: 1",
+                "aggregate_state_dir: manifest-state",
+                "projects:",
+                f"  - name: first\n    path: {first_dir}",
+                f"  - name: second\n    path: {second_dir}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    args = _watch_args(
+        anchor_dir,
+        [],
+        watch_config=str(manifest_path),
+        watch_state_dir=str(state_dir),
+        dry_run=True,
+    )
+
+    rc = cmd_watch(args)
+
+    assert rc == 0
+    capsys.readouterr()
+    aggregate_path = state_dir / "watch-supervisor.log"
+    assert aggregate_path.exists()
+    assert "fleet summary:" in aggregate_path.read_text(encoding="utf-8")
+    assert not (manifest_dir / ".gza" / "watch-supervisor" / "watch-supervisor.log").exists()
+    assert not (anchor_dir / ".gza" / "watch-supervisor" / "watch-supervisor.log").exists()
+
+
+@pytest.mark.parametrize(
+    ("strategy_name", "expect_warning"),
+    [
+        ("project-priority", True),
+        ("round-robin", False),
+        ("weighted-round-robin", False),
+    ],
+)
+def test_cmd_watch_multi_project_strategy_startup_warning_reaches_console_and_aggregate_log_once(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    strategy_name: str,
+    expect_warning: bool,
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    _write_watch_runtime_project_config(
+        first_dir,
+        project_name="First",
+        project_id="first",
+        project_prefix="first",
+        db_path=tmp_path / "first.db",
+    )
+    _write_watch_runtime_project_config(
+        second_dir,
+        project_name="Second",
+        project_id="second",
+        project_prefix="second",
+        db_path=tmp_path / "second.db",
+    )
+    args = _watch_args(
+        first_dir,
+        [],
+        watch_projects=[f"first={first_dir}", f"second={second_dir}"],
+        watch_strategy=strategy_name,
+        watch_weights=["first=2", "second=1"] if strategy_name == "weighted-round-robin" else None,
+        dry_run=True,
+        quiet=False,
+    )
+
+    rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    aggregate_log = first_dir / ".gza" / "watch-supervisor" / "watch-supervisor.log"
+    aggregate_text = aggregate_log.read_text(encoding="utf-8")
+    warning = "project-priority can indefinitely starve later projects"
+    assert rc == 0
+    assert captured.out.count(warning) == (1 if expect_warning else 0)
+    assert aggregate_text.count(warning) == (1 if expect_warning else 0)
+
+
+def test_cmd_watch_multi_project_resumed_reexec_does_not_repeat_strategy_startup_warning(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    _write_watch_runtime_project_config(
+        first_dir,
+        project_name="First",
+        project_id="first",
+        project_prefix="first",
+        db_path=tmp_path / "first.db",
+    )
+    _write_watch_runtime_project_config(
+        second_dir,
+        project_name="Second",
+        project_id="second",
+        project_prefix="second",
+        db_path=tmp_path / "second.db",
+    )
+    args = _watch_args(
+        first_dir,
+        [],
+        watch_projects=[f"first={first_dir}", f"second={second_dir}"],
+        watch_strategy="project-priority",
+        dry_run=True,
+        quiet=False,
+        resumed_reexec=True,
+    )
+
+    rc = cmd_watch(args)
+
+    captured = capsys.readouterr()
+    aggregate_log = first_dir / ".gza" / "watch-supervisor" / "watch-supervisor.log"
+    aggregate_text = aggregate_log.read_text(encoding="utf-8")
+    warning = "project-priority can indefinitely starve later projects"
+    assert rc == 0
+    assert warning not in captured.out
+    assert warning not in aggregate_text
 
 
 @pytest.mark.parametrize("invalid_position", ["before_conflict", "after_conflict"])
@@ -2831,11 +3396,14 @@ def test_cmd_watch_multi_project_lease_conflict_prints_preflight_disabled_projec
     )
     first_store = SqliteTaskStore(first_db, prefix="first", project_id="first")
     second_store = SqliteTaskStore(second_db, prefix="second", project_id="second")
-    assert second_store.try_acquire_project_lease(
-        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-        owner_pid=os.getpid(),
-        owner_token="blocking-watch",
-    ) is not None
+    assert (
+        second_store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="blocking-watch",
+        )
+        is not None
+    )
     if invalid_position == "before_conflict":
         watch_projects = [f"bad={bad_dir}", f"first={first_dir}", f"second={second_dir}"]
     else:
@@ -2916,18 +3484,20 @@ def test_cmd_watch_multi_project_path_resolution_conflict_does_not_mutate_anchor
         project_prefix="second",
         db_path=second_db,
     )
-    anchor_config = Config.load(anchor_dir)
-    anchor_store = SqliteTaskStore.from_config(anchor_config)
+    SqliteTaskStore.from_config(Config.load(anchor_dir))
     with sqlite3.connect(anchor_db) as conn:
         conn.execute("UPDATE schema_version SET version = ?", (SCHEMA_VERSION - 1,))
     before = _schema_version_and_project_row(anchor_db, "anchor")
     first_store = SqliteTaskStore(first_db, prefix="first", project_id="first")
     second_store = SqliteTaskStore(second_db, prefix="second", project_id="second")
-    assert second_store.try_acquire_project_lease(
-        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-        owner_pid=os.getpid(),
-        owner_token="blocking-watch",
-    ) is not None
+    assert (
+        second_store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="blocking-watch",
+        )
+        is not None
+    )
     args = _watch_args(
         anchor_dir,
         [],
@@ -2947,7 +3517,7 @@ def test_cmd_watch_multi_project_path_resolution_conflict_does_not_mutate_anchor
     )
 
 
-def test_cmd_watch_multi_project_refusal_prints_disabled_project_reason_and_releases_healthy(
+def test_cmd_watch_multi_project_dry_run_prints_disabled_project_reason_and_releases_healthy(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2975,16 +3545,20 @@ def test_cmd_watch_multi_project_refusal_prints_disabled_project_reason_and_rele
         [],
         watch_projects=[f"bad={bad_dir}", f"good={good_dir}"],
         watch_lease_token="fleet-token",
+        dry_run=True,
     )
 
     rc = cmd_watch(args)
 
     captured = capsys.readouterr()
-    assert rc == 1
-    assert "Disabled watch project" in captured.out
-    assert "selector='bad'" in captured.out
-    assert "reason=missing_config" in captured.out
-    assert "multi-project watch supervisor dispatch is not enabled yet" in captured.out
+    assert rc == 0
+    assert "Disabled watch project" not in captured.out
+    assert "fleet summary:" not in captured.out
+    aggregate_text = (anchor_dir / ".gza" / "watch-supervisor" / "watch-supervisor.log").read_text(encoding="utf-8")
+    assert "Disabled watch project" in aggregate_text
+    assert "selector='bad'" in aggregate_text
+    assert "reason=missing_config" in aggregate_text
+    assert "fleet summary:" in aggregate_text
     _assert_watch_supervisor_lease_can_be_acquired(
         SqliteTaskStore(good_db, prefix="good", project_id="good"),
         "after-disabled-diagnostic-refusal",
@@ -3115,7 +3689,10 @@ def test_construct_watch_project_runtimes_preserves_post_preflight_db_failure_re
 @pytest.mark.parametrize(
     ("error_factory", "expected_reason"),
     [
-        (lambda: watch_module.ExecutionProjectActivationError("config_invalid", "activation invalid"), "config_invalid"),
+        (
+            lambda: watch_module.ExecutionProjectActivationError("config_invalid", "activation invalid"),
+            "config_invalid",
+        ),
         (lambda: watch_module.ManualMigrationRequired([25]), "manual_migration_required"),
         (lambda: SchemaIntegrityError("worker registry unavailable"), "runtime_filesystem_unavailable"),
         (lambda: ConfigError("Legacy local DB detected at bad/.gza/gza.db"), "config_invalid"),
@@ -3172,14 +3749,54 @@ def test_construct_watch_project_runtimes_lease_store_construction_errors_disabl
     ):
         constructed = construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
 
-    assert [(disabled.selector_key, disabled.reason) for disabled in constructed.disabled] == [
-        ("bad", expected_reason)
-    ]
+    assert [(disabled.selector_key, disabled.reason) for disabled in constructed.disabled] == [("bad", expected_reason)]
     assert [runtime.key for runtime in constructed.runtimes] == ["good"]
     assert constructed.lease_set is not None
     assert [held.target.key for held in constructed.lease_set.held] == ["good"]
     assert not bad_db.exists()
     constructed.lease_set.release()
+
+
+@pytest.mark.parametrize(
+    ("error_factory", "expected_reason"),
+    [
+        (lambda: ExecutionProjectActivationError("project_id_mismatch", "activation mismatch"), "project_id_mismatch"),
+        (lambda: ManualMigrationRequired([25]), "manual_migration_required"),
+        (lambda: UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), "config_invalid"),
+        (lambda: ConfigError("invalid config"), "config_invalid"),
+        (lambda: SchemaIntegrityError("worker registry unavailable"), "runtime_filesystem_unavailable"),
+        (lambda: sqlite3.OperationalError("database is locked"), "db_unavailable"),
+    ],
+)
+def test_watch_supervisor_project_phase_classifier_preserves_typed_disabled_reasons(
+    tmp_path: Path,
+    error_factory,
+    expected_reason: str,
+) -> None:
+    bad_runtime = _make_aggregate_runtime(tmp_path / "bad", project_name="bad")
+    good_runtime = _make_aggregate_runtime(tmp_path / "good", project_name="good")
+
+    result, disabled = watch_module._watch_supervisor_try_project_phase(
+        bad_runtime,
+        phase="analyze",
+        operation=lambda: (_ for _ in ()).throw(error_factory()),
+    )
+    good_result, good_disabled = watch_module._watch_supervisor_try_project_phase(
+        good_runtime,
+        phase="analyze",
+        operation=lambda: "healthy",
+    )
+
+    assert result is None
+    assert disabled is not None
+    assert disabled.selector_key == "bad"
+    assert disabled.reason == expected_reason
+    assert disabled.project_id == bad_runtime.config.project_id
+    assert disabled.root_path == bad_runtime.config.project_dir
+    assert disabled.db_path == bad_runtime.config.db_path
+    assert "selector 'bad'" in disabled.message
+    assert good_result == "healthy"
+    assert good_disabled is None
 
 
 def test_construct_watch_project_runtimes_invalid_project_later_valid_acquires_before_enabling(
@@ -3229,11 +3846,14 @@ def test_construct_watch_project_runtimes_invalid_project_later_valid_acquires_b
         db_path=bad_db,
     )
     bad_store = SqliteTaskStore(bad_db, prefix="bad", project_id="bad")
-    assert bad_store.try_acquire_project_lease(
-        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-        owner_pid=os.getpid(),
-        owner_token="blocking-watch",
-    ) is not None
+    assert (
+        bad_store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="blocking-watch",
+        )
+        is not None
+    )
 
     real_open_runtime_store = watch_module.ExecutionProjectResolved.open_runtime_store
 
@@ -3259,9 +3879,7 @@ def test_construct_watch_project_runtimes_invalid_project_later_valid_acquires_b
         )
 
     assert [call.args[0].selector_key for call in open_runtime_store.call_args_list] == ["good"]
-    assert [(disabled.selector_key, disabled.reason) for disabled in conflicted.disabled] == [
-        ("bad", "lease-conflict")
-    ]
+    assert [(disabled.selector_key, disabled.reason) for disabled in conflicted.disabled] == [("bad", "lease-conflict")]
     assert [runtime.key for runtime in conflicted.runtimes] == ["good"]
     assert conflicted.lease_set is not None
     assert [held.target.key for held in conflicted.lease_set.held] == ["good"]
@@ -3351,9 +3969,7 @@ def test_construct_watch_project_runtimes_refresh_releases_one_config_invalid_pr
             existing_lease_set=first_constructed.lease_set,
         )
 
-    assert [(disabled.selector_key, disabled.reason) for disabled in refreshed.disabled] == [
-        ("bad", "config_invalid")
-    ]
+    assert [(disabled.selector_key, disabled.reason) for disabled in refreshed.disabled] == [("bad", "config_invalid")]
     assert [runtime.key for runtime in refreshed.runtimes] == ["good"]
     assert refreshed.lease_set is not None
     assert [held.target.key for held in refreshed.lease_set.held] == ["good"]
@@ -4079,7 +4695,7 @@ def test_construct_watch_project_runtimes_db_path_drift_is_typed_before_drifted_
     _assert_watch_supervisor_lease_can_be_acquired(anchor_store, f"after-{drift_case}")
 
 
-def test_construct_watch_project_runtimes_repair_failure_releases_disabled_project_lease(
+def test_watch_supervisor_repair_failure_disables_runtime_during_reconcile(
     tmp_path: Path,
 ) -> None:
     repair_fail_dir = tmp_path / "repair-fail"
@@ -4118,17 +4734,36 @@ def test_construct_watch_project_runtimes_repair_failure_releases_disabled_proje
     ):
         constructed = construct_watch_project_runtimes(anchor_store=anchor_store, selection=selection, quiet=True)
 
-    assert [(disabled.selector_key, disabled.reason) for disabled in constructed.disabled] == [
+    assert constructed.disabled == ()
+    assert [runtime.key for runtime in constructed.runtimes] == ["repair", "good"]
+    assert constructed.lease_set is not None
+    constructed.lease_set.release()
+
+    with (
+        patch.object(SqliteTaskStore, "repair_inconsistent_unmerged_merge_units", repair_factory),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+    ):
+        result, lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=anchor_store,
+            selection=selection,
+            quiet=True,
+            owner_token="repair-disable",
+            existing_lease_set=None,
+            batch=1,
+            recovery_slots=0,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=False,
+            emit_summary=False,
+        )
+
+    assert [(disabled.selector_key, disabled.reason) for disabled in result.disabled] == [
         ("repair", "schema_incompatible")
     ]
-    assert [runtime.key for runtime in constructed.runtimes] == ["good"]
-    assert constructed.lease_set is not None
-    assert [held.target.key for held in constructed.lease_set.held] == ["good"]
-    _assert_watch_supervisor_lease_can_be_acquired(
-        SqliteTaskStore(tmp_path / "repairfail.db", prefix="repair", project_id="repairfail"),
-        "after-repair-disable",
-    )
-    constructed.lease_set.release()
+    assert set(result.analyses) == {"good"}
+    assert lease_set is not None
+    lease_set.release()
 
 
 def test_construct_watch_project_runtimes_isolates_log_and_worker_registry_initialization_failures(
@@ -4170,10 +4805,23 @@ def test_construct_watch_project_runtimes_isolates_log_and_worker_registry_initi
     real_watch_log = watch_module._WATCH_LOG_TYPE
     real_worker_registry = WorkerRegistry
 
-    def watch_log_factory(path: Path, *, quiet: bool) -> object:
+    def watch_log_factory(
+        path: Path,
+        *,
+        quiet: bool,
+        console_prefix: str = "",
+        aggregate_path: Path | None = None,
+        rotate_existing: bool = False,
+    ) -> object:
         if path == log_fail_dir.resolve() / ".gza" / "watch.log":
             raise OSError("log path unavailable")
-        return real_watch_log(path, quiet=quiet)
+        return real_watch_log(
+            path,
+            quiet=quiet,
+            console_prefix=console_prefix,
+            aggregate_path=aggregate_path,
+            rotate_existing=rotate_existing,
+        )
 
     def worker_registry_factory(workers_dir: Path) -> WorkerRegistry:
         if workers_dir == worker_fail_dir.resolve() / ".gza" / "workers":
@@ -4247,16 +4895,22 @@ def test_construct_watch_project_runtimes_retains_leases_for_held_runtimes(
     active_store = SqliteTaskStore(active_db, prefix="active", project_id="active")
     assert constructed.lease_set is not None
     assert [held.target.key for held in constructed.lease_set.held] == ["held", "active"]
-    assert held_store.try_acquire_project_lease(
-        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-        owner_pid=os.getpid(),
-        owner_token="single-project-watch",
-    ) is None
-    assert active_store.try_acquire_project_lease(
-        lease_name=WATCH_SUPERVISOR_LEASE_NAME,
-        owner_pid=os.getpid(),
-        owner_token="other-watch",
-    ) is None
+    assert (
+        held_store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="single-project-watch",
+        )
+        is None
+    )
+    assert (
+        active_store.try_acquire_project_lease(
+            lease_name=WATCH_SUPERVISOR_LEASE_NAME,
+            owner_pid=os.getpid(),
+            owner_token="other-watch",
+        )
+        is None
+    )
 
     constructed.lease_set.release()
     _assert_watch_supervisor_lease_can_be_acquired(held_store, "after-held-release")
@@ -4295,6 +4949,7 @@ def test_construct_watch_project_runtimes_releases_all_leases_on_runtime_constru
     )
 
     if failure_site == "git":
+
         def git_factory(repo_dir: Path, *, env: Mapping[str, str] | None = None) -> Git:
             if repo_dir == second_dir.resolve():
                 raise RuntimeError("git unavailable")
@@ -4355,8 +5010,7 @@ def test_construct_watch_project_runtimes_groups_runtime_construction_and_releas
 
     assert "watch project runtime construction failed" in str(exc_info.value)
     assert any(
-        isinstance(exc, RuntimeError) and str(exc) == "git construction failed"
-        for exc in exc_info.value.exceptions
+        isinstance(exc, RuntimeError) and str(exc) == "git construction failed" for exc in exc_info.value.exceptions
     )
     assert any(isinstance(exc, WatchLeaseReleaseError) for exc in exc_info.value.exceptions)
 
@@ -5720,19 +6374,11 @@ def test_run_cycle_direct_phase_only_finishes_recovery_dispatch_before_finalize(
 
     lines = log_path.read_text().splitlines()
     done_recovery_dispatch = next(
-        index
-        for index, line in enumerate(lines)
-        if "DONE      recovery-dispatch cycle elapsed " in line
+        index for index, line in enumerate(lines) if "DONE      recovery-dispatch cycle elapsed " in line
     )
-    start_cycle_finalize = next(
-        index
-        for index, line in enumerate(lines)
-        if "START     cycle-finalize cycle" in line
-    )
+    start_cycle_finalize = next(index for index, line in enumerate(lines) if "START     cycle-finalize cycle" in line)
     done_cycle_finalize = next(
-        index
-        for index, line in enumerate(lines)
-        if "DONE      cycle-finalize cycle elapsed " in line
+        index for index, line in enumerate(lines) if "DONE      cycle-finalize cycle elapsed " in line
     )
 
     assert done_recovery_dispatch < start_cycle_finalize < done_cycle_finalize
@@ -5792,7 +6438,7 @@ def test_run_cycle_direct_phase_only_scoped_completion_reuses_runtime_context_an
             git=sentinel_git,
             runtime_context=runtime_context,
             precomputed_plan=plan,
-    )
+        )
 
     assert result.scoped_done is True
     assert scoped_activity.call_count == 1
@@ -5853,7 +6499,7 @@ def test_run_cycle_normal_scoped_completion_reuses_runtime_context_and_git(
             git=sentinel_git,
             runtime_context=runtime_context,
             precomputed_plan=plan,
-    )
+        )
 
     assert result.scoped_done is True
     assert scoped_activity.call_count == 1
@@ -8084,9 +8730,7 @@ def test_run_cycle_scoped_direct_completion_analysis_finishes_before_finalize(
     log_text = _run_empty_scoped_cycle_for_phase_order(tmp_path, direct_phase_only=True)
 
     events = _cycle_phase_events(log_text)
-    assert events.index(("START", "scoped-completion-analysis")) < events.index(
-        ("DONE", "scoped-completion-analysis")
-    )
+    assert events.index(("START", "scoped-completion-analysis")) < events.index(("DONE", "scoped-completion-analysis"))
     assert events.index(("DONE", "scoped-completion-analysis")) < events.index(("START", "cycle-finalize"))
     _assert_cycle_level_phases_do_not_overlap(log_text)
 
@@ -8097,9 +8741,7 @@ def test_run_cycle_scoped_normal_completion_analysis_finishes_before_finalize(
     log_text = _run_empty_scoped_cycle_for_phase_order(tmp_path, direct_phase_only=False)
 
     events = _cycle_phase_events(log_text)
-    assert events.index(("START", "scoped-completion-analysis")) < events.index(
-        ("DONE", "scoped-completion-analysis")
-    )
+    assert events.index(("START", "scoped-completion-analysis")) < events.index(("DONE", "scoped-completion-analysis"))
     assert events.index(("DONE", "scoped-completion-analysis")) < events.index(("START", "cycle-finalize"))
     _assert_cycle_level_phases_do_not_overlap(log_text)
 
@@ -10276,6 +10918,127 @@ def test_watch_supervisor_recovery_lane_reuses_slot_after_not_dispatchable_head(
     assert budget.occupancy.slots == 0
 
 
+@pytest.mark.parametrize("claim_kind", ["running", "starting"])
+def test_watch_supervisor_fleet_cycle_preserves_pre_direct_claim_when_budget_refresh_disables_runtime(
+    tmp_path: Path,
+    claim_kind: str,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / f"{claim_kind}-project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / f"{claim_kind}-project-b", project_name="b")
+    task_a = runtime_a.store.add(f"A has {claim_kind} worker before refresh failure", task_type="plan")
+    task_b = runtime_b.store.add("B should not consume phantom slot", task_type="plan")
+    assert task_a.id is not None
+    assert task_b.id is not None
+    candidate_b = _runtime_candidate(runtime_b, task_b, lane="pending")
+    if claim_kind == "running":
+        claimed_state = ProjectRuntimeReconcileResult(
+            runtime_key="a",
+            live_pids=frozenset(),
+            running_task_ids=(task_a.id,),
+            anonymous_worker_count=0,
+            starting_worker_count=0,
+            runtime_identity=runtime_a.runtime_identity,
+        )
+    else:
+        claimed_state = ProjectRuntimeReconcileResult(
+            runtime_key="a",
+            live_pids=frozenset(),
+            running_task_ids=(),
+            anonymous_worker_count=0,
+            starting_worker_count=1,
+            starting_task_ids=(task_a.id,),
+            starting_worker_ids=("worker-a-starting",),
+            runtime_identity=runtime_a.runtime_identity,
+        )
+    empty_b_state = ProjectRuntimeReconcileResult(
+        runtime_key="b",
+        live_pids=frozenset(),
+        running_task_ids=(),
+        anonymous_worker_count=0,
+        starting_worker_count=0,
+        runtime_identity=runtime_b.runtime_identity,
+    )
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(
+                key="a", ref=str(runtime_a.config.project_dir), path=runtime_a.config.project_dir
+            ),
+            WatchSupervisorProjectSelector(
+                key="b", ref=str(runtime_b.config.project_dir), path=runtime_b.config.project_dir
+            ),
+        )
+    )
+    disabled: list[watch_module.ExecutionProjectDisabled] = []
+
+    with (
+        patch(
+            "gza.cli.watch.construct_watch_project_runtimes",
+            return_value=WatchSupervisorRuntimeConstruction(runtimes=(runtime_a, runtime_b)),
+        ),
+        patch.object(WatchProjectRuntime, "initialize_baseline", autospec=True, return_value=None),
+        patch.object(
+            WatchProjectRuntime,
+            "analyze_cycle",
+            autospec=True,
+            side_effect=lambda runtime, **_kwargs: _runtime_analysis_with_pending_suppression(runtime),
+        ),
+        patch.object(
+            WatchProjectRuntime,
+            "run_direct_phase",
+            autospec=True,
+            side_effect=lambda runtime, **_kwargs: ProjectDirectResult(runtime_key=runtime.key, work_done=False),
+        ),
+        patch.object(
+            runtime_a,
+            "reconcile_runtime_state",
+            side_effect=[claimed_state, sqlite3.OperationalError("database is locked")],
+        ),
+        patch.object(runtime_b, "reconcile_runtime_state", return_value=empty_b_state),
+        patch.object(WatchProjectRuntime, "recovery_dispatch_head", autospec=True, return_value=None),
+        patch.object(
+            runtime_a,
+            "pending_dispatch_head",
+            side_effect=AssertionError("disabled runtime queried for pending dispatch"),
+        ),
+        patch.object(runtime_b, "pending_dispatch_head", return_value=candidate_b),
+        patch.object(
+            SupervisorLaunchBudget,
+            "dispatch_pending_candidate",
+            autospec=True,
+            side_effect=AssertionError("pending dispatch consumed a phantom slot"),
+        ),
+    ):
+        result, _lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=runtime_a.store,
+            selection=selection,
+            quiet=True,
+            owner_token=None,
+            existing_lease_set=None,
+            batch=1,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=True,
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            emit_summary=False,
+            runtime_state=WatchSupervisorRuntimeState(),
+        )
+
+    disabled.extend(item for item in result.disabled if item.selector_key == "a")
+    assert [(item.selector_key, item.reason) for item in disabled] == [("a", "db_unavailable")]
+    assert result.occupancy is not None
+    if claim_kind == "running":
+        assert result.occupancy.running == 1
+        assert result.occupancy.starting == 0
+    else:
+        assert result.occupancy.running == 0
+        assert result.occupancy.starting == 1
+    assert result.occupancy.slots == 0
+    assert result.dispatch_results.pending_results == ()
+
+
 def test_watch_supervisor_recovery_lane_refreshes_selected_runtime_head_after_success(
     tmp_path: Path,
 ) -> None:
@@ -10397,6 +11160,199 @@ def test_watch_supervisor_donates_recovery_capacity_to_pending_after_recovery_he
 
     assert [result.candidate.task.id for result in lane_results.recovery_results] == [recovery.task.id]
     assert [result.candidate.task.id for result in lane_results.pending_results] == [pending.task.id]
+
+
+@pytest.mark.parametrize("recovery_mode", [None, "recovery_only"])
+def test_watch_supervisor_deferred_recovery_head_withholds_pending_capacity(
+    tmp_path: Path,
+    recovery_mode: Any,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    recovery = _runtime_candidate(
+        runtime, runtime.store.add("Deferred recovery", task_type="implement"), lane="recovery"
+    )
+    pending = _runtime_candidate(runtime, runtime.store.add("Pending must wait", task_type="plan"), lane="pending")
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1)
+    pending_dispatches: list[str] = []
+
+    with (
+        patch.object(runtime, "recovery_dispatch_head", return_value=recovery),
+        patch.object(runtime, "pending_dispatch_head", return_value=pending),
+    ):
+        lane_results = dispatch_watch_supervisor_lanes_incrementally(
+            [runtime],
+            recovery_slots_config=1,
+            recovery_mode=recovery_mode,
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
+            pending_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
+            launch_budget=budget,
+            dispatch_recovery_candidate=watch_module._watch_supervisor_recovery_dispatch_not_enabled,
+            dispatch_pending_candidate=lambda selected_runtime, candidate, _budget: (
+                pending_dispatches.append(str(candidate.task.id))
+                or ProjectDispatchResult(
+                    runtime_key=selected_runtime.key,
+                    candidate=candidate,
+                    status="dry_run",
+                    slot_consuming=False,
+                    work_done=True,
+                    dispatch_budget_consuming=True,
+                    task=candidate.task,
+                )
+            ),
+        )
+
+    assert [result.candidate.task.id for result in lane_results.recovery_results] == [recovery.task.id]
+    assert lane_results.pending_results == ()
+    assert pending_dispatches == []
+    assert budget.virtual_dispatch_starts == 1
+    assert budget.occupancy.slots == 0
+
+
+def test_watch_supervisor_donates_recovery_capacity_when_no_recovery_head_exists(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    pending = _runtime_candidate(
+        runtime, runtime.store.add("Pending uses donated slot", task_type="plan"), lane="pending"
+    )
+    budget = SupervisorLaunchBudget([runtime], supervisor_batch=1)
+
+    with (
+        patch.object(runtime, "recovery_dispatch_head", return_value=None),
+        patch.object(runtime, "pending_dispatch_head", return_value=pending),
+    ):
+        lane_results = dispatch_watch_supervisor_lanes_incrementally(
+            [runtime],
+            recovery_slots_config=1,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            recovery_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
+            pending_strategy=create_watch_dispatch_strategy("project-priority", project_order=("a",)),
+            launch_budget=budget,
+            dispatch_recovery_candidate=watch_module._watch_supervisor_recovery_dispatch_not_enabled,
+            dispatch_pending_candidate=lambda selected_runtime, candidate, _budget: ProjectDispatchResult(
+                runtime_key=selected_runtime.key,
+                candidate=candidate,
+                status="dry_run",
+                slot_consuming=False,
+                work_done=True,
+                dispatch_budget_consuming=True,
+                task=candidate.task,
+            ),
+        )
+
+    assert lane_results.recovery_results == ()
+    assert [result.candidate.task.id for result in lane_results.pending_results] == [pending.task.id]
+
+
+@pytest.mark.parametrize(
+    ("occupancy", "pending", "runnable"),
+    [
+        (
+            AggregateWatchOccupancy(
+                supervisor_batch=1,
+                running=1,
+                starting=0,
+                slots=0,
+                running_pids=frozenset({101}),
+                starting_pids=frozenset(),
+                live_pids=frozenset({101}),
+                local=(),
+            ),
+            0,
+            0,
+        ),
+        (
+            AggregateWatchOccupancy(
+                supervisor_batch=1,
+                running=0,
+                starting=1,
+                slots=0,
+                running_pids=frozenset(),
+                starting_pids=frozenset({102}),
+                live_pids=frozenset({102}),
+                local=(),
+            ),
+            0,
+            0,
+        ),
+        (
+            AggregateWatchOccupancy(
+                supervisor_batch=1,
+                running=0,
+                starting=0,
+                slots=0,
+                running_pids=frozenset(),
+                starting_pids=frozenset(),
+                live_pids=frozenset(),
+                local=(),
+                provisional_reservations=1,
+                reservation_ids=("reservation",),
+            ),
+            0,
+            0,
+        ),
+        (
+            AggregateWatchOccupancy(
+                supervisor_batch=1,
+                running=1,
+                starting=0,
+                slots=0,
+                running_pids=frozenset({103}),
+                starting_pids=frozenset(),
+                live_pids=frozenset({103}),
+                local=(),
+            ),
+            1,
+            1,
+        ),
+    ],
+)
+def test_watch_supervisor_fleet_idle_predicate_treats_active_or_runnable_work_as_non_idle(
+    occupancy: AggregateWatchOccupancy,
+    pending: int,
+    runnable: int,
+) -> None:
+    result = WatchSupervisorFleetCycleResult(
+        work_done=False,
+        running=occupancy.running,
+        pending=pending,
+        anonymous_worker_count=0,
+        starting_worker_count=occupancy.starting,
+        occupancy=occupancy,
+        runnable_candidate_count=runnable,
+    )
+
+    assert watch_supervisor_fleet_cycle_is_idle(result) is False
+
+
+def test_watch_supervisor_fleet_idle_predicate_allows_disabled_only_without_claim_to_exit() -> None:
+    disabled = watch_module.ExecutionProjectDisabled(
+        selector_key="a",
+        reason="config_invalid",
+        message="invalid for test",
+    )
+    result = WatchSupervisorFleetCycleResult(
+        work_done=False,
+        running=0,
+        pending=0,
+        anonymous_worker_count=0,
+        starting_worker_count=0,
+        disabled=(disabled,),
+        occupancy=AggregateWatchOccupancy(
+            supervisor_batch=1,
+            running=0,
+            starting=0,
+            slots=1,
+            running_pids=frozenset(),
+            starting_pids=frozenset(),
+            live_pids=frozenset(),
+            local=(),
+        ),
+    )
+
+    assert watch_supervisor_fleet_cycle_is_idle(result) is True
 
 
 def test_watch_supervisor_virtual_recovery_start_reduces_pending_capacity(
@@ -10835,6 +11791,1504 @@ def test_watch_supervisor_default_pending_dispatch_preserves_analyzed_excluded_o
     assert budget.virtual_dispatch_starts == 1
     assert budget.virtual_dispatch_starts_for_runtime("a") == 1
     assert budget.occupancy.slots == 0
+
+
+def test_watch_supervisor_fleet_cycle_runs_all_direct_phases_before_worker_dispatch_and_replans(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    pending_a = runtime_a.store.add("A pending", task_type="plan")
+    pending_b = runtime_b.store.add("B pending", task_type="plan")
+    assert pending_a.id is not None
+    assert pending_b.id is not None
+    candidate_a = _runtime_candidate(runtime_a, pending_a, lane="pending")
+    candidate_b = _runtime_candidate(runtime_b, pending_b, lane="pending")
+    construction = WatchSupervisorRuntimeConstruction(runtimes=(runtime_a, runtime_b))
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(
+                key="a", ref=str(runtime_a.config.project_dir), path=runtime_a.config.project_dir
+            ),
+            WatchSupervisorProjectSelector(
+                key="b", ref=str(runtime_b.config.project_dir), path=runtime_b.config.project_dir
+            ),
+        )
+    )
+    events: list[str] = []
+
+    def reconcile(runtime: WatchProjectRuntime) -> ProjectRuntimeReconcileResult:
+        events.append(f"reconcile:{runtime.key}")
+        return ProjectRuntimeReconcileResult(
+            runtime_key=runtime.key,
+            live_pids=frozenset(),
+            running_task_ids=(),
+            anonymous_worker_count=0,
+            starting_worker_count=0,
+            runtime_identity=runtime.runtime_identity,
+        )
+
+    def analyze(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectCycleAnalysis:
+        events.append(f"analyze:{runtime.key}")
+        return _runtime_analysis_with_pending_suppression(runtime)
+
+    def direct(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectDirectResult:
+        events.append(f"direct:{runtime.key}")
+        return ProjectDirectResult(
+            runtime_key=runtime.key,
+            work_done=runtime.key == "a",
+            project_analysis_invalidated=runtime.key == "a",
+            needs_replan=runtime.key == "a",
+        )
+
+    def pending_head(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectDispatchCandidate | None:
+        events.append(f"head:{runtime.key}")
+        return candidate_a if runtime.key == "a" else candidate_b
+
+    def dispatch(
+        selected_runtime: WatchProjectRuntime,
+        candidate: ProjectDispatchCandidate,
+        _budget: SupervisorLaunchBudget,
+    ) -> ProjectDispatchResult:
+        events.append(f"dispatch:{selected_runtime.key}")
+        return ProjectDispatchResult(
+            runtime_key=selected_runtime.key,
+            candidate=candidate,
+            status="dry_run",
+            slot_consuming=False,
+            work_done=True,
+            dispatch_budget_consuming=True,
+            task=candidate.task,
+        )
+
+    with (
+        patch("gza.cli.watch.construct_watch_project_runtimes", return_value=construction),
+        patch.object(runtime_a, "reconcile_runtime_state", side_effect=lambda *, dry_run: reconcile(runtime_a)),
+        patch.object(runtime_b, "reconcile_runtime_state", side_effect=lambda *, dry_run: reconcile(runtime_b)),
+        patch.object(runtime_a, "analyze_cycle", side_effect=lambda **kwargs: analyze(runtime_a, **kwargs)),
+        patch.object(runtime_b, "analyze_cycle", side_effect=lambda **kwargs: analyze(runtime_b, **kwargs)),
+        patch.object(runtime_a, "run_direct_phase", side_effect=lambda **kwargs: direct(runtime_a, **kwargs)),
+        patch.object(runtime_b, "run_direct_phase", side_effect=lambda **kwargs: direct(runtime_b, **kwargs)),
+        patch.object(
+            runtime_a, "pending_dispatch_head", side_effect=lambda **kwargs: pending_head(runtime_a, **kwargs)
+        ),
+        patch.object(
+            runtime_b, "pending_dispatch_head", side_effect=lambda **kwargs: pending_head(runtime_b, **kwargs)
+        ),
+        patch.object(runtime_a, "recovery_dispatch_head", return_value=None),
+        patch.object(runtime_b, "recovery_dispatch_head", return_value=None),
+        patch.object(
+            SupervisorLaunchBudget,
+            "dispatch_pending_candidate",
+            autospec=True,
+            side_effect=lambda budget, runtime, candidate, **_kwargs: dispatch(runtime, candidate, budget),
+        ),
+    ):
+        result, _lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=runtime_a.store,
+            selection=selection,
+            quiet=True,
+            owner_token=None,
+            existing_lease_set=None,
+            batch=2,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=True,
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("a", "b")),
+            emit_summary=False,
+        )
+
+    assert result.work_done is True
+    assert events.index("direct:a") < events.index("dispatch:a")
+    assert events.index("direct:b") < events.index("dispatch:a")
+    assert events.index("direct:b") < events.index("dispatch:b")
+    assert events.count("analyze:a") == 2
+    assert events.count("analyze:b") == 1
+    assert [event for event in events if event.startswith("dispatch:")] == ["dispatch:a", "dispatch:b"]
+
+
+def test_watch_supervisor_fleet_cycle_health_hold_does_not_block_healthy_project(
+    tmp_path: Path,
+) -> None:
+    held_runtime = _make_aggregate_runtime(tmp_path / "held", project_name="held")
+    healthy_runtime = _make_aggregate_runtime(tmp_path / "healthy", project_name="healthy")
+    pending = healthy_runtime.store.add("Healthy pending", task_type="plan")
+    assert pending.id is not None
+    candidate = _runtime_candidate(healthy_runtime, pending, lane="pending")
+    held_disabled = watch_module.ExecutionProjectDisabled(
+        selector_key="held",
+        reason="git-health-held",
+        message="held for test",
+        project_id=held_runtime.config.project_id,
+        root_path=held_runtime.config.project_dir,
+        config_path=held_runtime.config.project_dir / "gza.yaml",
+        db_path=held_runtime.config.db_path,
+    )
+    construction = WatchSupervisorRuntimeConstruction(runtimes=(held_runtime, healthy_runtime))
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(
+                key="held", ref=str(held_runtime.config.project_dir), path=held_runtime.config.project_dir
+            ),
+            WatchSupervisorProjectSelector(
+                key="healthy", ref=str(healthy_runtime.config.project_dir), path=healthy_runtime.config.project_dir
+            ),
+        )
+    )
+    dispatches: list[str] = []
+
+    def enabled_for_cycle(runtime: WatchProjectRuntime, *, dry_run: bool) -> tuple[bool, object | None]:
+        if runtime.key == "held":
+            return False, held_disabled
+        return True, None
+
+    def dispatch(
+        selected_runtime: WatchProjectRuntime,
+        candidate: ProjectDispatchCandidate,
+        _budget: SupervisorLaunchBudget,
+    ) -> ProjectDispatchResult:
+        dispatches.append(selected_runtime.key)
+        return ProjectDispatchResult(
+            runtime_key=selected_runtime.key,
+            candidate=candidate,
+            status="dry_run",
+            slot_consuming=False,
+            work_done=True,
+            dispatch_budget_consuming=True,
+            task=candidate.task,
+        )
+
+    with (
+        patch("gza.cli.watch.construct_watch_project_runtimes", return_value=construction),
+        patch("gza.cli.watch._watch_supervisor_runtime_enabled_for_cycle", side_effect=enabled_for_cycle),
+        patch.object(held_runtime, "analyze_cycle", side_effect=AssertionError("held project analyzed")),
+        patch.object(held_runtime, "run_direct_phase", side_effect=AssertionError("held direct phase ran")),
+        patch.object(held_runtime, "pending_dispatch_head", side_effect=AssertionError("held project dispatched")),
+        patch.object(
+            healthy_runtime,
+            "analyze_cycle",
+            return_value=_runtime_analysis_with_pending_suppression(healthy_runtime),
+        ),
+        patch.object(
+            healthy_runtime,
+            "run_direct_phase",
+            return_value=ProjectDirectResult(runtime_key="healthy", work_done=False),
+        ),
+        patch.object(healthy_runtime, "recovery_dispatch_head", return_value=None),
+        patch.object(healthy_runtime, "pending_dispatch_head", return_value=candidate),
+        patch.object(
+            SupervisorLaunchBudget,
+            "dispatch_pending_candidate",
+            autospec=True,
+            side_effect=lambda budget, runtime, candidate, **_kwargs: dispatch(runtime, candidate, budget),
+        ),
+    ):
+        result, _lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=healthy_runtime.store,
+            selection=selection,
+            quiet=True,
+            owner_token=None,
+            existing_lease_set=None,
+            batch=1,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=True,
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("healthy",)),
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("healthy",)),
+            emit_summary=False,
+        )
+
+    assert [disabled.selector_key for disabled in result.disabled] == ["held"]
+    assert result.disabled[0].reason == "git-health-held"
+    assert dispatches == ["healthy"]
+    assert result.work_done is True
+
+
+def test_watch_supervisor_fleet_cycle_persists_runtime_observation_across_polls(
+    tmp_path: Path,
+) -> None:
+    runtime_a_first = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b_first = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    task_a = runtime_a_first.store.add("A fails between polls", task_type="plan")
+    task_b = runtime_b_first.store.add("B remains dispatchable", task_type="plan")
+    assert task_a.id is not None
+    assert task_b.id is not None
+    runtime_a_second = WatchProjectRuntime.create(
+        key="a",
+        config=runtime_a_first.config,
+        store=runtime_a_first.store,
+        log=_WatchLog(tmp_path / "project-a" / ".gza" / "watch-second.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+    runtime_b_second = WatchProjectRuntime.create(
+        key="b",
+        config=runtime_b_first.config,
+        store=runtime_b_first.store,
+        log=_WatchLog(tmp_path / "project-b" / ".gza" / "watch-second.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(
+                key="a", ref=str(runtime_a_first.config.project_dir), path=runtime_a_first.config.project_dir
+            ),
+            WatchSupervisorProjectSelector(
+                key="b", ref=str(runtime_b_first.config.project_dir), path=runtime_b_first.config.project_dir
+            ),
+        )
+    )
+    state = WatchSupervisorRuntimeState()
+    constructions = iter(
+        (
+            WatchSupervisorRuntimeConstruction(runtimes=(runtime_a_first, runtime_b_first)),
+            WatchSupervisorRuntimeConstruction(runtimes=(runtime_a_second, runtime_b_second)),
+        )
+    )
+    dispatches: list[str] = []
+
+    def construct_with_transfer(**kwargs: object) -> WatchSupervisorRuntimeConstruction:
+        construction = next(constructions)
+        runtime_state = kwargs.get("runtime_state")
+        assert isinstance(runtime_state, WatchSupervisorRuntimeState)
+        for runtime in construction.runtimes:
+            runtime_state.transfer_to(runtime)
+        return construction
+
+    def analyze(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectCycleAnalysis:
+        return _runtime_analysis_with_pending_suppression(runtime)
+
+    def direct(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectDirectResult:
+        return ProjectDirectResult(runtime_key=runtime.key, work_done=False)
+
+    def pending_head(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectDispatchCandidate | None:
+        if runtime.key != "b":
+            return None
+        refreshed = runtime.store.get(task_b.id)
+        assert refreshed is not None
+        return _runtime_candidate(runtime, refreshed, lane="pending")
+
+    def dispatch(
+        selected_runtime: WatchProjectRuntime,
+        candidate: ProjectDispatchCandidate,
+        _budget: SupervisorLaunchBudget,
+    ) -> ProjectDispatchResult:
+        dispatches.append(selected_runtime.key)
+        return ProjectDispatchResult(
+            runtime_key=selected_runtime.key,
+            candidate=candidate,
+            status="dry_run",
+            slot_consuming=False,
+            work_done=True,
+            dispatch_budget_consuming=True,
+            task=candidate.task,
+        )
+
+    with (
+        patch("gza.cli.watch.construct_watch_project_runtimes", side_effect=construct_with_transfer),
+        patch.object(WatchProjectRuntime, "analyze_cycle", autospec=True, side_effect=analyze),
+        patch.object(WatchProjectRuntime, "run_direct_phase", autospec=True, side_effect=direct),
+        patch.object(WatchProjectRuntime, "recovery_dispatch_head", autospec=True, return_value=None),
+        patch.object(WatchProjectRuntime, "pending_dispatch_head", autospec=True, side_effect=pending_head),
+        patch.object(
+            SupervisorLaunchBudget,
+            "dispatch_pending_candidate",
+            autospec=True,
+            side_effect=lambda budget, runtime, candidate, **_kwargs: dispatch(runtime, candidate, budget),
+        ),
+    ):
+        run_watch_supervisor_fleet_cycle(
+            anchor_store=runtime_a_first.store,
+            selection=selection,
+            quiet=True,
+            owner_token=None,
+            existing_lease_set=None,
+            batch=1,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=True,
+            runtime_state=state,
+            emit_summary=False,
+        )
+        failed_a = runtime_a_first.store.get(task_a.id)
+        assert failed_a is not None
+        failed_a.status = "failed"
+        failed_a.failure_reason = "TEST_FAILURE"
+        failed_a.completed_at = datetime.now(UTC)
+        runtime_a_first.store.update(failed_a)
+        run_watch_supervisor_fleet_cycle(
+            anchor_store=runtime_a_first.store,
+            selection=selection,
+            quiet=True,
+            owner_token=None,
+            existing_lease_set=None,
+            batch=1,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=True,
+            runtime_state=state,
+            emit_summary=False,
+        )
+
+    assert task_a.id in runtime_a_second.failure_backoffs
+    assert dispatches == ["b", "b"]
+
+
+def test_watch_supervisor_fleet_failure_halt_holds_runtime_across_polls_while_sibling_advances(
+    tmp_path: Path,
+) -> None:
+    held_first = _make_aggregate_runtime(tmp_path / "held", project_name="held")
+    healthy_first = _make_aggregate_runtime(tmp_path / "healthy", project_name="healthy")
+    held_first.config.watch.failure_halt_after = 1
+    healthy_first.config.watch.failure_halt_after = 1
+    failed_owner = held_first.store.add("Held owner fails", task_type="plan")
+    healthy_task = healthy_first.store.add("Healthy pending", task_type="plan")
+    assert failed_owner.id is not None
+    assert healthy_task.id is not None
+    held_second = WatchProjectRuntime.create(
+        key="held",
+        config=held_first.config,
+        store=held_first.store,
+        log=_WatchLog(tmp_path / "held" / ".gza" / "watch-second.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+    healthy_second = WatchProjectRuntime.create(
+        key="healthy",
+        config=healthy_first.config,
+        store=healthy_first.store,
+        log=_WatchLog(tmp_path / "healthy" / ".gza" / "watch-second.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(
+                key="held", ref=str(held_first.config.project_dir), path=held_first.config.project_dir
+            ),
+            WatchSupervisorProjectSelector(
+                key="healthy", ref=str(healthy_first.config.project_dir), path=healthy_first.config.project_dir
+            ),
+        )
+    )
+    state = WatchSupervisorRuntimeState()
+    constructions = iter(
+        (
+            WatchSupervisorRuntimeConstruction(runtimes=(held_first, healthy_first)),
+            WatchSupervisorRuntimeConstruction(runtimes=(held_first, healthy_first)),
+            WatchSupervisorRuntimeConstruction(runtimes=(held_second, healthy_second)),
+        )
+    )
+    dispatches: list[str] = []
+
+    def construct_with_transfer(**kwargs: object) -> WatchSupervisorRuntimeConstruction:
+        construction = next(constructions)
+        runtime_state = kwargs.get("runtime_state")
+        assert isinstance(runtime_state, WatchSupervisorRuntimeState)
+        for runtime in construction.runtimes:
+            runtime_state.transfer_to(runtime)
+        return construction
+
+    def pending_head(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectDispatchCandidate | None:
+        if runtime.key == "held":
+            if runtime.failure_halt_active:
+                raise AssertionError("failure-halted runtime must not expose dispatch work")
+            return None
+        refreshed = runtime.store.get(healthy_task.id)
+        assert refreshed is not None
+        return _runtime_candidate(runtime, refreshed, lane="pending")
+
+    def dispatch(
+        selected_runtime: WatchProjectRuntime,
+        candidate: ProjectDispatchCandidate,
+        _budget: SupervisorLaunchBudget,
+    ) -> ProjectDispatchResult:
+        dispatches.append(selected_runtime.key)
+        return ProjectDispatchResult(
+            runtime_key=selected_runtime.key,
+            candidate=candidate,
+            status="dry_run",
+            slot_consuming=False,
+            work_done=True,
+            dispatch_budget_consuming=True,
+            task=candidate.task,
+        )
+
+    with (
+        patch("gza.cli.watch.construct_watch_project_runtimes", side_effect=construct_with_transfer),
+        patch.object(
+            WatchProjectRuntime,
+            "analyze_cycle",
+            autospec=True,
+            side_effect=lambda runtime, **_kwargs: _runtime_analysis_with_pending_suppression(runtime),
+        ),
+        patch.object(
+            WatchProjectRuntime,
+            "run_direct_phase",
+            autospec=True,
+            side_effect=lambda runtime, **_kwargs: ProjectDirectResult(runtime_key=runtime.key, work_done=False),
+        ),
+        patch.object(WatchProjectRuntime, "recovery_dispatch_head", autospec=True, return_value=None),
+        patch.object(WatchProjectRuntime, "pending_dispatch_head", autospec=True, side_effect=pending_head),
+        patch.object(
+            SupervisorLaunchBudget,
+            "dispatch_pending_candidate",
+            autospec=True,
+            side_effect=lambda budget, runtime, candidate, **_kwargs: dispatch(runtime, candidate, budget),
+        ),
+    ):
+        run_watch_supervisor_fleet_cycle(
+            anchor_store=healthy_first.store,
+            selection=selection,
+            quiet=True,
+            owner_token=None,
+            existing_lease_set=None,
+            batch=1,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=True,
+            runtime_state=state,
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("healthy",)),
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("healthy",)),
+            emit_summary=False,
+        )
+        failed_owner.status = "failed"
+        failed_owner.failure_reason = "TEST_FAILURE"
+        failed_owner.completed_at = datetime.now(UTC)
+        held_first.store.update(failed_owner)
+        second_result, _lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=healthy_first.store,
+            selection=selection,
+            quiet=True,
+            owner_token=None,
+            existing_lease_set=None,
+            batch=1,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=True,
+            runtime_state=state,
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("healthy",)),
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("healthy",)),
+            emit_summary=False,
+        )
+        third_result, _lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=healthy_first.store,
+            selection=selection,
+            quiet=True,
+            owner_token=None,
+            existing_lease_set=None,
+            batch=1,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=True,
+            runtime_state=state,
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("healthy",)),
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("healthy",)),
+            emit_summary=False,
+        )
+
+    assert [(disabled.selector_key, disabled.reason) for disabled in second_result.disabled] == [
+        ("held", "failure-halt")
+    ]
+    assert [(disabled.selector_key, disabled.reason) for disabled in third_result.disabled] == [
+        ("held", "failure-halt")
+    ]
+    assert dispatches == ["healthy", "healthy", "healthy"]
+
+
+def test_watch_supervisor_fleet_cycle_disabled_refresh_retains_read_only_occupancy(
+    tmp_path: Path,
+) -> None:
+    disabled_runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a", max_concurrent=1)
+    healthy_runtime = _make_aggregate_runtime(tmp_path / "project-b", project_name="b", max_concurrent=1)
+    active_task = disabled_runtime.store.add("A active before invalid refresh", task_type="plan")
+    pending_b = healthy_runtime.store.add("B pending", task_type="plan")
+    assert active_task.id is not None
+    assert pending_b.id is not None
+    disabled_state = ProjectRuntimeReconcileResult(
+        runtime_key="a",
+        live_pids=frozenset({2222}),
+        running_pids=frozenset({2222}),
+        running_task_ids=(active_task.id,),
+        anonymous_worker_count=0,
+        starting_worker_count=0,
+        runtime_identity=disabled_runtime.runtime_identity,
+    )
+    state = WatchSupervisorRuntimeState()
+    state.remember_runtime(disabled_runtime)
+    state.remember_reconcile(disabled_state, local_limit=disabled_runtime.config.max_concurrent)
+    disabled = watch_module.ExecutionProjectDisabled(
+        selector_key="a",
+        reason="config_invalid",
+        message="A config invalid",
+        project_id=disabled_runtime.config.project_id,
+        root_path=disabled_runtime.config.project_dir,
+        config_path=disabled_runtime.config.project_dir / "gza.yaml",
+        db_path=disabled_runtime.config.db_path,
+    )
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(
+                key="a", ref=str(disabled_runtime.config.project_dir), path=disabled_runtime.config.project_dir
+            ),
+            WatchSupervisorProjectSelector(
+                key="b", ref=str(healthy_runtime.config.project_dir), path=healthy_runtime.config.project_dir
+            ),
+        )
+    )
+    dispatches: list[str] = []
+
+    with (
+        patch(
+            "gza.cli.watch.construct_watch_project_runtimes",
+            return_value=WatchSupervisorRuntimeConstruction(runtimes=(healthy_runtime,), disabled=(disabled,)),
+        ),
+        patch.object(
+            healthy_runtime,
+            "analyze_cycle",
+            return_value=_runtime_analysis_with_pending_suppression(healthy_runtime),
+        ),
+        patch.object(
+            healthy_runtime,
+            "run_direct_phase",
+            return_value=ProjectDirectResult(runtime_key="b", work_done=False),
+        ),
+        patch.object(healthy_runtime, "recovery_dispatch_head", return_value=None),
+        patch.object(
+            healthy_runtime,
+            "pending_dispatch_head",
+            return_value=_runtime_candidate(healthy_runtime, pending_b, lane="pending"),
+        ),
+        patch.object(
+            SupervisorLaunchBudget,
+            "dispatch_pending_candidate",
+            autospec=True,
+            side_effect=lambda budget, runtime, candidate, **_kwargs: (
+                dispatches.append(runtime.key)
+                or ProjectDispatchResult(
+                    runtime_key=runtime.key,
+                    candidate=candidate,
+                    status="dry_run",
+                    slot_consuming=False,
+                    work_done=True,
+                    dispatch_budget_consuming=True,
+                    task=candidate.task,
+                )
+            ),
+        ),
+    ):
+        result, _lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=healthy_runtime.store,
+            selection=selection,
+            quiet=True,
+            owner_token=None,
+            existing_lease_set=None,
+            batch=1,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=True,
+            runtime_state=state,
+            emit_summary=False,
+        )
+
+    assert result.occupancy is not None
+    assert result.occupancy.running == 1
+    assert result.occupancy.slots == 0
+    assert dispatches == []
+
+
+def test_watch_supervisor_fleet_cycle_uses_post_direct_occupancy_for_first_dispatch(
+    tmp_path: Path,
+) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "project-a", project_name="a", max_concurrent=2)
+    active_task = runtime.store.add("A appears live before budget", task_type="plan")
+    pending = runtime.store.add("A pending should wait behind fresh occupancy", task_type="plan")
+    assert active_task.id is not None
+    assert pending.id is not None
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(
+                key="a", ref=str(runtime.config.project_dir), path=runtime.config.project_dir
+            ),
+        )
+    )
+    reconcile_calls = 0
+
+    def reconcile(*, dry_run: bool) -> ProjectRuntimeReconcileResult:
+        nonlocal reconcile_calls
+        reconcile_calls += 1
+        if reconcile_calls == 1:
+            return ProjectRuntimeReconcileResult(
+                runtime_key="a",
+                live_pids=frozenset(),
+                running_pids=frozenset(),
+                running_task_ids=(),
+                anonymous_worker_count=0,
+                starting_worker_count=0,
+                runtime_identity=runtime.runtime_identity,
+            )
+        return ProjectRuntimeReconcileResult(
+            runtime_key="a",
+            live_pids=frozenset({5555}),
+            running_pids=frozenset({5555}),
+            running_task_ids=(active_task.id,),
+            anonymous_worker_count=0,
+            starting_worker_count=0,
+            runtime_identity=runtime.runtime_identity,
+        )
+
+    with (
+        patch(
+            "gza.cli.watch.construct_watch_project_runtimes",
+            return_value=WatchSupervisorRuntimeConstruction(runtimes=(runtime,)),
+        ),
+        patch.object(runtime, "reconcile_runtime_state", side_effect=reconcile),
+        patch.object(runtime, "analyze_cycle", return_value=_runtime_analysis_with_pending_suppression(runtime)),
+        patch.object(runtime, "run_direct_phase", return_value=ProjectDirectResult(runtime_key="a", work_done=False)),
+        patch.object(runtime, "recovery_dispatch_head", return_value=None),
+        patch.object(
+            runtime, "pending_dispatch_head", return_value=_runtime_candidate(runtime, pending, lane="pending")
+        ),
+        patch.object(
+            WatchProjectRuntime,
+            "dispatch_pending_candidate",
+            side_effect=AssertionError("stale pre-direct occupancy allowed a dispatch"),
+        ),
+    ):
+        result, _lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=runtime.store,
+            selection=selection,
+            quiet=True,
+            owner_token=None,
+            existing_lease_set=None,
+            batch=1,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=True,
+            emit_summary=False,
+        )
+
+    assert reconcile_calls == 2
+    assert result.occupancy is not None
+    assert result.occupancy.running == 1
+    assert result.occupancy.slots == 0
+    assert result.dispatch_results.results == ()
+
+
+@pytest.mark.parametrize("failing_phase", ["analyze", "direct", "replan"])
+def test_watch_supervisor_fleet_cycle_counts_disabled_post_reconcile_claim_during_healthy_settlement(
+    tmp_path: Path,
+    failing_phase: str,
+) -> None:
+    failed_runtime = _make_aggregate_runtime(tmp_path / f"project-a-{failing_phase}", project_name="a")
+    healthy_runtime = _make_aggregate_runtime(tmp_path / f"project-b-{failing_phase}", project_name="b")
+    active_task = failed_runtime.store.add("A owns a live slot before failure", task_type="plan")
+    pending_1 = healthy_runtime.store.add("B pending first", task_type="plan")
+    pending_2 = healthy_runtime.store.add("B pending second", task_type="plan")
+    assert active_task.id is not None
+    assert pending_1.id is not None
+    assert pending_2.id is not None
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(
+                key="a", ref=str(failed_runtime.config.project_dir), path=failed_runtime.config.project_dir
+            ),
+            WatchSupervisorProjectSelector(
+                key="b", ref=str(healthy_runtime.config.project_dir), path=healthy_runtime.config.project_dir
+            ),
+        )
+    )
+    dispatch_attempts: list[str] = []
+    pending_heads = iter((pending_1, pending_2))
+    analyze_calls_by_key: dict[str, int] = {}
+    healthy_reconcile = healthy_runtime.reconcile_runtime_state
+
+    def reconcile(runtime: WatchProjectRuntime, *, dry_run: bool) -> ProjectRuntimeReconcileResult:
+        if runtime.key == "a":
+            return ProjectRuntimeReconcileResult(
+                runtime_key="a",
+                live_pids=frozenset({6666}),
+                running_pids=frozenset({6666}),
+                running_task_ids=(active_task.id,),
+                anonymous_worker_count=0,
+                starting_worker_count=0,
+                runtime_identity=failed_runtime.runtime_identity,
+            )
+        return healthy_reconcile(dry_run=dry_run)
+
+    def analyze(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectCycleAnalysis:
+        analyze_calls_by_key[runtime.key] = analyze_calls_by_key.get(runtime.key, 0) + 1
+        if runtime.key == "a" and (
+            failing_phase == "analyze" or (failing_phase == "replan" and analyze_calls_by_key[runtime.key] == 2)
+        ):
+            raise ConfigError(f"A {failing_phase} failed")
+        return _runtime_analysis_with_pending_suppression(runtime)
+
+    def direct(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectDirectResult:
+        if runtime.key == "a" and failing_phase == "direct":
+            raise OSError("A direct failed")
+        return ProjectDirectResult(
+            runtime_key=runtime.key,
+            work_done=runtime.key == "a" and failing_phase == "replan",
+            needs_replan=runtime.key == "a" and failing_phase == "replan",
+        )
+
+    def pending_head(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectDispatchCandidate | None:
+        if runtime.key != "b":
+            return None
+        try:
+            task = next(pending_heads)
+        except StopIteration:
+            return None
+        refreshed = runtime.store.get(task.id)
+        assert refreshed is not None
+        return _runtime_candidate(runtime, refreshed, lane="pending")
+
+    def dispatch_candidate(
+        candidate: ProjectDispatchCandidate,
+        **_kwargs: object,
+    ) -> ProjectDispatchResult:
+        dispatch_attempts.append(candidate.runtime_key)
+        assert candidate.task.id is not None
+        running_task = healthy_runtime.store.get(candidate.task.id)
+        assert running_task is not None
+        running_task.status = "in_progress"
+        running_task.running_pid = os.getpid()
+        healthy_runtime.store.update(running_task)
+        _register_live_worker_for_task(healthy_runtime.config, candidate.task.id, worker_id=f"w-{candidate.task.id}")
+        return ProjectDispatchResult(
+            runtime_key=candidate.runtime_key,
+            candidate=candidate,
+            status="live",
+            slot_consuming=True,
+            work_done=True,
+            task=running_task,
+        )
+
+    with (
+        patch(
+            "gza.cli.watch.construct_watch_project_runtimes",
+            return_value=WatchSupervisorRuntimeConstruction(runtimes=(failed_runtime, healthy_runtime)),
+        ),
+        patch.object(WatchProjectRuntime, "reconcile_runtime_state", autospec=True, side_effect=reconcile),
+        patch.object(WatchProjectRuntime, "analyze_cycle", autospec=True, side_effect=analyze),
+        patch.object(WatchProjectRuntime, "run_direct_phase", autospec=True, side_effect=direct),
+        patch.object(WatchProjectRuntime, "recovery_dispatch_head", autospec=True, return_value=None),
+        patch.object(WatchProjectRuntime, "pending_dispatch_head", autospec=True, side_effect=pending_head),
+        patch.object(WatchProjectRuntime, "dispatch_pending_candidate", side_effect=dispatch_candidate),
+    ):
+        result, _lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=healthy_runtime.store,
+            selection=selection,
+            quiet=True,
+            owner_token=None,
+            existing_lease_set=None,
+            batch=2,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=False,
+            pending_strategy=create_watch_dispatch_strategy("round-robin", project_order=("b",)),
+            recovery_strategy=create_watch_dispatch_strategy("round-robin", project_order=("b",)),
+            emit_summary=False,
+        )
+
+    assert [disabled.selector_key for disabled in result.disabled] == ["a"]
+    assert dispatch_attempts == ["b"]
+    assert result.occupancy is not None
+    assert result.occupancy.running == 2
+    assert result.occupancy.slots == 0
+    assert result.occupancy.local_by_runtime_key["a"].running_task_ids == (active_task.id,)
+
+
+def test_watch_supervisor_runtime_state_transfer_resumes_held_project_once(tmp_path: Path) -> None:
+    previous_runtime = _make_aggregate_runtime(tmp_path / "project-held", project_name="held")
+    previous_runtime.system_hold_active = True
+    refreshed_runtime = WatchProjectRuntime.create(
+        key="held",
+        config=previous_runtime.config,
+        store=previous_runtime.store,
+        log=_WatchLog(tmp_path / "project-held" / ".gza" / "watch-refreshed.log", quiet=True),
+        tags=None,
+        any_tag=False,
+        git=_make_watch_git(),
+    )
+    state = WatchSupervisorRuntimeState()
+    state.remember_runtime(previous_runtime)
+    state.transfer_to(refreshed_runtime)
+
+    with (
+        patch("gza.cli.watch._system_can_run_tasks", return_value=True),
+        patch("gza.cli.watch._emit_git_health_hold", return_value=False),
+    ):
+        enabled, disabled = watch_module._watch_supervisor_runtime_enabled_for_cycle(refreshed_runtime, dry_run=True)
+        enabled_again, disabled_again = watch_module._watch_supervisor_runtime_enabled_for_cycle(
+            refreshed_runtime,
+            dry_run=True,
+        )
+
+    log_text = refreshed_runtime.log.path.read_text(encoding="utf-8")
+    assert enabled is True
+    assert disabled is None
+    assert enabled_again is True
+    assert disabled_again is None
+    assert refreshed_runtime.system_hold_active is False
+    assert log_text.count("RESUME") == 1
+
+
+def test_watch_supervisor_expected_start_boundary_settles_once(tmp_path: Path) -> None:
+    runtime = _make_aggregate_runtime(tmp_path / "project-start", project_name="start")
+    task = runtime.store.add("Expected start", task_type="plan")
+    assert task.id is not None
+    runtime.initialize_baseline()
+    runtime.expected_starts[task.id] = _ExpectedStart(
+        recovery_action="retry",
+        parent_failed_id="parent",
+        launch_mode="worker",
+    )
+    task.status = "in_progress"
+    task.started_at = datetime.now(UTC)
+    runtime.store.update(task)
+
+    first_confirmed, first_halted = runtime.observe_cycle_boundary(
+        restart_failed_mode=False,
+        max_recovery_attempts=1,
+    )
+    second_confirmed, second_halted = runtime.observe_cycle_boundary(
+        restart_failed_mode=False,
+        max_recovery_attempts=1,
+    )
+
+    log_text = runtime.log.path.read_text(encoding="utf-8")
+    assert first_confirmed == 1
+    assert first_halted is False
+    assert second_confirmed == 0
+    assert second_halted is False
+    assert runtime.expected_starts == {}
+    assert log_text.count("START") == 1
+
+
+def test_watch_supervisor_selector_aware_logs_and_summaries_remain_distinct(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    aggregate_log = tmp_path / ".gza" / "watch-supervisor.log"
+    project_a_log = _WatchLog(
+        tmp_path / "a" / ".gza" / "watch.log",
+        quiet=False,
+        console_prefix="[a] ",
+        aggregate_path=aggregate_log,
+    )
+    project_b_log = _WatchLog(
+        tmp_path / "b" / ".gza" / "watch.log",
+        quiet=False,
+        console_prefix="[b] ",
+        aggregate_path=aggregate_log,
+    )
+
+    project_a_log.emit("MERGE", "gza-1 merged")
+    project_b_log.emit("MERGE", "gza-1 merged")
+    project_a_log.emit_attention(attention_key="same-task", message="gza-1 needs attention")
+    project_b_log.emit_attention(attention_key="same-task", message="gza-1 needs attention")
+    project_a_log.emit("HOLD", "gza-1 held")
+    project_b_log.emit("HOLD", "gza-1 held")
+    watch_module._watch_supervisor_emit_aggregate_summary(
+        disabled=(),
+        direct_results=(),
+        dispatch_results=watch_module.WatchSupervisorDispatchResult((), ()),
+        occupancy=AggregateWatchOccupancy(
+            supervisor_batch=2,
+            running=0,
+            starting=0,
+            slots=2,
+            running_pids=frozenset(),
+            starting_pids=frozenset(),
+            live_pids=frozenset(),
+            local=(
+                ProjectLocalOccupancy(
+                    runtime_key="a",
+                    limit=1,
+                    running=0,
+                    starting=0,
+                    available=1,
+                    live_pids=frozenset(),
+                    running_pids=frozenset(),
+                    starting_pids=frozenset(),
+                    running_task_ids=(),
+                    anonymous_worker_count=0,
+                ),
+                ProjectLocalOccupancy(
+                    runtime_key="b",
+                    limit=1,
+                    running=0,
+                    starting=0,
+                    available=1,
+                    live_pids=frozenset(),
+                    running_pids=frozenset(),
+                    starting_pids=frozenset(),
+                    running_task_ids=(),
+                    anonymous_worker_count=0,
+                ),
+            ),
+        ),
+        aggregate_log_path=aggregate_log,
+    )
+
+    console_output = capsys.readouterr().out
+    aggregate_text = aggregate_log.read_text(encoding="utf-8")
+    assert "[a] gza-1 merged" in console_output
+    assert "[b] gza-1 merged" in console_output
+    assert "[a] gza-1 needs attention" in console_output
+    assert "[b] gza-1 needs attention" in console_output
+    assert "[a] state running=0 starting=0" in console_output
+    assert "[b] state running=0 starting=0" in console_output
+    assert "[a] gza-1 merged" in aggregate_text
+    assert "[b] gza-1 merged" in aggregate_text
+    assert "[a] state running=0 starting=0" in aggregate_text
+    assert "[b] state running=0 starting=0" in aggregate_text
+    assert "[a]" not in (tmp_path / "a" / ".gza" / "watch.log").read_text(encoding="utf-8")
+    assert "[b]" not in (tmp_path / "b" / ".gza" / "watch.log").read_text(encoding="utf-8")
+
+
+def test_watch_supervisor_log_sink_failures_warn_without_blocking_other_sinks(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    invalid_parent = tmp_path / "not-a-dir"
+    invalid_parent.write_text("file blocks aggregate directory", encoding="utf-8")
+    aggregate_log = invalid_parent / "watch-supervisor.log"
+    project_a_log = _WatchLog(
+        tmp_path / "a" / ".gza" / "watch.log",
+        quiet=False,
+        console_prefix="[a] ",
+        aggregate_path=aggregate_log,
+    )
+    project_b_log = _WatchLog(
+        tmp_path / "b" / ".gza" / "watch.log",
+        quiet=False,
+        console_prefix="[b] ",
+    )
+    fallback = watch_module._fallback_watch_log(
+        "bad",
+        invalid_parent / "watch.log",
+        OSError("project log unavailable"),
+        quiet=False,
+    )
+
+    project_a_log.emit("HOLD", "aggregate degraded")
+    project_b_log.emit("MERGE", "healthy sink continues")
+    fallback.emit("HOLD", "fallback sink continues")
+
+    console_output = capsys.readouterr().out
+    assert "aggregate watch log sink disabled" in console_output
+    assert "[bad] watch log sink disabled" in console_output
+    assert "[a] aggregate degraded" in console_output
+    assert "[b] healthy sink continues" in console_output
+    assert "[bad] fallback sink continues" in console_output
+    assert "healthy sink continues" in (tmp_path / "b" / ".gza" / "watch.log").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("dry_run", "filename", "archive_glob"),
+    [(False, "watch.log", "watch.*.log"), (True, "watch.dry-run.log", "watch.dry-run.*.log")],
+)
+def test_construct_watch_project_runtimes_rotates_each_selected_detail_log_once_per_invocation(
+    tmp_path: Path,
+    dry_run: bool,
+    filename: str,
+    archive_glob: str,
+) -> None:
+    project_dir = tmp_path / ("dry" if dry_run else "live")
+    db_path = tmp_path / ("dry.db" if dry_run else "live.db")
+    _write_watch_runtime_project_config(
+        project_dir,
+        project_name="Selected",
+        project_id="selected",
+        project_prefix="selected",
+        db_path=db_path,
+    )
+    log_path = project_dir / ".gza" / filename
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    original = b"pre-existing supervisor invocation detail log\n"
+    log_path.write_bytes(original)
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir))
+    selection = _watch_runtime_selection(
+        (WatchSupervisorProjectSelector(key="selected", ref=str(project_dir), path=project_dir),)
+    )
+    state = WatchSupervisorRuntimeState()
+
+    with patch("gza.cli.watch.Git", return_value=_make_watch_git()):
+        first = construct_watch_project_runtimes(
+            anchor_store=anchor_store,
+            selection=selection,
+            quiet=True,
+            dry_run=dry_run,
+            owner_token="fleet-token",
+            runtime_state=state,
+        )
+        first.runtimes[0].log.emit("INFO", "first poll writes replacement")
+        second = construct_watch_project_runtimes(
+            anchor_store=anchor_store,
+            selection=selection,
+            quiet=True,
+            dry_run=dry_run,
+            owner_token="fleet-token",
+            existing_lease_set=first.lease_set,
+            runtime_state=state,
+        )
+        second.runtimes[0].log.emit("INFO", "second poll appends replacement")
+
+    archives = list(log_path.parent.glob(archive_glob))
+    assert len(archives) == 1
+    assert archives[0].read_bytes() == original
+    replacement = log_path.read_text(encoding="utf-8")
+    assert "first poll writes replacement" in replacement
+    assert "second poll appends replacement" in replacement
+    assert len(list(log_path.parent.glob(archive_glob))) == 1
+    assert second.lease_set is not None
+    second.lease_set.release()
+
+
+def test_construct_watch_project_runtimes_project_log_failure_preserves_aggregate_sink(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bad_dir = tmp_path / "bad"
+    good_dir = tmp_path / "good"
+    bad_db = tmp_path / "bad.db"
+    good_db = tmp_path / "good.db"
+    _write_watch_runtime_project_config(
+        bad_dir,
+        project_name="Bad",
+        project_id="bad",
+        project_prefix="bad",
+        db_path=bad_db,
+    )
+    _write_watch_runtime_project_config(
+        good_dir,
+        project_name="Good",
+        project_id="good",
+        project_prefix="good",
+        db_path=good_db,
+    )
+    anchor_store = SqliteTaskStore.from_config(Config.load(good_dir))
+    aggregate_log = tmp_path / ".gza" / "watch-supervisor.log"
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
+            WatchSupervisorProjectSelector(key="good", ref=str(good_dir), path=good_dir),
+        )
+    )
+    real_watch_log = _WatchLog
+    bad_log_path = bad_dir.resolve() / ".gza" / "watch.log"
+
+    def watch_log_factory(
+        path: Path,
+        *,
+        quiet: bool = False,
+        rotate_existing: bool = False,
+        console_prefix: str = "",
+        aggregate_path: Path | None = None,
+    ) -> object:
+        if path == bad_log_path:
+            raise OSError("project detail path failed")
+        return real_watch_log(
+            path,
+            quiet=quiet,
+            rotate_existing=rotate_existing,
+            console_prefix=console_prefix,
+            aggregate_path=aggregate_path,
+        )
+
+    with (
+        patch("gza.cli.watch._WatchLog", side_effect=watch_log_factory),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+    ):
+        constructed = construct_watch_project_runtimes(
+            anchor_store=anchor_store,
+            selection=selection,
+            quiet=True,
+            aggregate_log_path=aggregate_log,
+            runtime_state=WatchSupervisorRuntimeState(),
+        )
+
+    bad_runtime = constructed.runtime_by_key["bad"]
+    good_runtime = constructed.runtime_by_key["good"]
+    bad_runtime.log.emit("HOLD", "bad aggregate event retained")
+    good_runtime.log.emit("INFO", "good detail and aggregate retained")
+
+    captured = capsys.readouterr()
+    aggregate_text = aggregate_log.read_text(encoding="utf-8")
+    good_detail = (good_dir / ".gza" / "watch.log").read_text(encoding="utf-8")
+    assert captured.out.count("[bad] watch log sink disabled") == 1
+    assert aggregate_text.count("[bad] watch log sink disabled") == 1
+    assert aggregate_text.count("[bad] bad aggregate event retained") == 1
+    assert aggregate_text.count("[good] good detail and aggregate retained") == 1
+    assert "good detail and aggregate retained" in good_detail
+    assert constructed.lease_set is not None
+    constructed.lease_set.release()
+
+
+def test_construct_watch_project_runtimes_log_path_resolution_failure_keeps_sibling_dispatchable(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    bad_dir = tmp_path / "bad"
+    good_dir = tmp_path / "good"
+    _write_watch_runtime_project_config(
+        bad_dir,
+        project_name="Bad",
+        project_id="bad",
+        project_prefix="bad",
+        db_path=tmp_path / "bad.db",
+    )
+    _write_watch_runtime_project_config(
+        good_dir,
+        project_name="Good",
+        project_id="good",
+        project_prefix="good",
+        db_path=tmp_path / "good.db",
+    )
+    good_config = Config.load(good_dir)
+    good_store = SqliteTaskStore.from_config(good_config)
+    good_task = good_store.add("Good sibling stays dispatchable", task_type="plan")
+    assert good_task.id is not None
+    selection = _watch_runtime_selection(
+        (
+            WatchSupervisorProjectSelector(key="bad", ref=str(bad_dir), path=bad_dir),
+            WatchSupervisorProjectSelector(key="good", ref=str(good_dir), path=good_dir),
+        )
+    )
+    bad_log_path = bad_dir / ".gza" / "watch.log"
+    real_resolve = Path.resolve
+
+    def resolve_spy(path: Path, *args: object, **kwargs: object) -> Path:
+        if path == bad_log_path:
+            raise OSError("detail log symlink loop")
+        return real_resolve(path, *args, **kwargs)
+
+    with (
+        patch("pathlib.Path.resolve", autospec=True, side_effect=resolve_spy),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+    ):
+        constructed = construct_watch_project_runtimes(
+            anchor_store=good_store,
+            selection=selection,
+            quiet=False,
+            runtime_state=WatchSupervisorRuntimeState(),
+            aggregate_log_path=tmp_path / ".gza" / "watch-supervisor.log",
+        )
+
+    captured = capsys.readouterr()
+    assert "[bad] watch log sink disabled" in captured.out
+    assert {runtime.key for runtime in constructed.runtimes} == {"bad", "good"}
+    good_head = constructed.runtime_by_key["good"].pending_dispatch_head(max_recovery_attempts=1)
+    assert good_head is not None
+    assert good_head.task.id == good_task.id
+    assert constructed.lease_set is not None
+    constructed.lease_set.release()
+
+
+def test_construct_watch_project_runtimes_retries_log_rotation_after_transient_initialization_failure(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    db_path = tmp_path / "project.db"
+    _write_watch_runtime_project_config(
+        project_dir,
+        project_name="Selected",
+        project_id="selected",
+        project_prefix="selected",
+        db_path=db_path,
+    )
+    log_path = project_dir / ".gza" / "watch.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    original = b"old invocation bytes\n"
+    log_path.write_bytes(original)
+    anchor_store = SqliteTaskStore.from_config(Config.load(project_dir))
+    selection = _watch_runtime_selection(
+        (WatchSupervisorProjectSelector(key="selected", ref=str(project_dir), path=project_dir),)
+    )
+    state = WatchSupervisorRuntimeState()
+    real_watch_log = _WatchLog
+    open_attempts = 0
+
+    def watch_log_factory(
+        path: Path,
+        *,
+        quiet: bool = False,
+        rotate_existing: bool = False,
+        console_prefix: str = "",
+        aggregate_path: Path | None = None,
+    ) -> object:
+        nonlocal open_attempts
+        if path == log_path:
+            open_attempts += 1
+            if open_attempts == 1:
+                raise OSError("transient detail open failure")
+        return real_watch_log(
+            path,
+            quiet=quiet,
+            rotate_existing=rotate_existing,
+            console_prefix=console_prefix,
+            aggregate_path=aggregate_path,
+        )
+
+    with (
+        patch("gza.cli.watch._WatchLog", side_effect=watch_log_factory),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+    ):
+        first = construct_watch_project_runtimes(
+            anchor_store=anchor_store,
+            selection=selection,
+            quiet=True,
+            owner_token="fleet-token",
+            runtime_state=state,
+        )
+        first.runtimes[0].log.emit("INFO", "fallback-only current event")
+        second = construct_watch_project_runtimes(
+            anchor_store=anchor_store,
+            selection=selection,
+            quiet=True,
+            owner_token="fleet-token",
+            existing_lease_set=first.lease_set,
+            runtime_state=state,
+        )
+        second.runtimes[0].log.emit("INFO", "recovered current event")
+
+    archives = list(log_path.parent.glob("watch.*.log"))
+    assert open_attempts == 2
+    assert len(archives) == 1
+    assert archives[0].read_bytes() == original
+    current = log_path.read_text(encoding="utf-8")
+    assert "recovered current event" in current
+    assert "old invocation bytes" not in current
+    assert "fallback-only current event" not in current
+    assert second.lease_set is not None
+    second.lease_set.release()
+
+
+def test_watch_supervisor_quiet_suppresses_stdout_but_keeps_durable_summaries(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(
+                key="a", ref=str(runtime_a.config.project_dir), path=runtime_a.config.project_dir
+            ),
+            WatchSupervisorProjectSelector(
+                key="b", ref=str(runtime_b.config.project_dir), path=runtime_b.config.project_dir
+            ),
+        )
+    )
+    aggregate_log = tmp_path / ".gza" / "watch-supervisor.log"
+
+    with (
+        patch(
+            "gza.cli.watch.construct_watch_project_runtimes",
+            return_value=WatchSupervisorRuntimeConstruction(runtimes=(runtime_a, runtime_b)),
+        ),
+        patch.object(
+            WatchProjectRuntime,
+            "analyze_cycle",
+            autospec=True,
+            side_effect=lambda runtime, **_kwargs: _runtime_analysis_with_pending_suppression(runtime),
+        ),
+        patch.object(
+            WatchProjectRuntime,
+            "run_direct_phase",
+            autospec=True,
+            side_effect=lambda runtime, **_kwargs: ProjectDirectResult(runtime_key=runtime.key, work_done=False),
+        ),
+        patch.object(WatchProjectRuntime, "recovery_dispatch_head", autospec=True, return_value=None),
+        patch.object(WatchProjectRuntime, "pending_dispatch_head", autospec=True, return_value=None),
+    ):
+        result, _lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=runtime_a.store,
+            selection=selection,
+            quiet=True,
+            owner_token=None,
+            existing_lease_set=None,
+            batch=2,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=True,
+            emit_summary=True,
+            aggregate_log_path=aggregate_log,
+        )
+
+    captured = capsys.readouterr()
+    aggregate_text = aggregate_log.read_text(encoding="utf-8")
+    assert result.occupancy is not None
+    assert "state running=" not in captured.out
+    assert "fleet summary:" not in captured.out
+    assert "[a] state running=0 starting=0" in aggregate_text
+    assert "[b] state running=0 starting=0" in aggregate_text
+    assert "fleet summary: running=0 starting=0" in aggregate_text
+
+
+@pytest.mark.parametrize("failing_phase", ["reconcile", "analyze", "direct", "dispatch"])
+def test_watch_supervisor_typed_project_phase_failure_disables_only_that_project(
+    tmp_path: Path,
+    failing_phase: str,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / f"project-a-{failing_phase}", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / f"project-b-{failing_phase}", project_name="b")
+    pending_a = runtime_a.store.add("A pending", task_type="plan")
+    pending_b = runtime_b.store.add("B pending", task_type="plan")
+    assert pending_a.id is not None
+    assert pending_b.id is not None
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(
+                key="a", ref=str(runtime_a.config.project_dir), path=runtime_a.config.project_dir
+            ),
+            WatchSupervisorProjectSelector(
+                key="b", ref=str(runtime_b.config.project_dir), path=runtime_b.config.project_dir
+            ),
+        )
+    )
+    dispatches: list[str] = []
+
+    def analyze(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectCycleAnalysis:
+        if runtime.key == "a" and failing_phase == "analyze":
+            raise ConfigError("A analyze failed")
+        return _runtime_analysis_with_pending_suppression(runtime)
+
+    def direct(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectDirectResult:
+        if runtime.key == "a" and failing_phase == "direct":
+            raise OSError("A direct failed")
+        return ProjectDirectResult(runtime_key=runtime.key, work_done=False)
+
+    def pending_head(runtime: WatchProjectRuntime, **_kwargs: object) -> ProjectDispatchCandidate | None:
+        task = pending_a if runtime.key == "a" else pending_b
+        return _runtime_candidate(runtime, task, lane="pending")
+
+    def dispatch(
+        selected_runtime: WatchProjectRuntime,
+        candidate: ProjectDispatchCandidate,
+        _budget: SupervisorLaunchBudget,
+    ) -> ProjectDispatchResult:
+        if selected_runtime.key == "a" and failing_phase == "dispatch":
+            raise OSError("A dispatch failed")
+        dispatches.append(selected_runtime.key)
+        return ProjectDispatchResult(
+            runtime_key=selected_runtime.key,
+            candidate=candidate,
+            status="dry_run",
+            slot_consuming=False,
+            work_done=True,
+            dispatch_budget_consuming=True,
+            task=candidate.task,
+        )
+
+    with (
+        patch(
+            "gza.cli.watch.construct_watch_project_runtimes",
+            return_value=WatchSupervisorRuntimeConstruction(runtimes=(runtime_a, runtime_b)),
+        ),
+        patch.object(
+            runtime_a,
+            "reconcile_runtime_state",
+            side_effect=OSError("A reconcile failed") if failing_phase == "reconcile" else None,
+            wraps=runtime_a.reconcile_runtime_state if failing_phase != "reconcile" else None,
+        ),
+        patch.object(runtime_b, "reconcile_runtime_state", wraps=runtime_b.reconcile_runtime_state),
+        patch.object(WatchProjectRuntime, "analyze_cycle", autospec=True, side_effect=analyze),
+        patch.object(WatchProjectRuntime, "run_direct_phase", autospec=True, side_effect=direct),
+        patch.object(WatchProjectRuntime, "recovery_dispatch_head", autospec=True, return_value=None),
+        patch.object(WatchProjectRuntime, "pending_dispatch_head", autospec=True, side_effect=pending_head),
+        patch.object(
+            SupervisorLaunchBudget,
+            "dispatch_pending_candidate",
+            autospec=True,
+            side_effect=lambda budget, runtime, candidate, **_kwargs: dispatch(runtime, candidate, budget),
+        ),
+    ):
+        result, _lease_set = run_watch_supervisor_fleet_cycle(
+            anchor_store=runtime_b.store,
+            selection=selection,
+            quiet=True,
+            owner_token=None,
+            existing_lease_set=None,
+            batch=2,
+            recovery_slots=0,
+            recovery_mode="pending_only",
+            max_recovery_attempts=1,
+            max_iterations=1,
+            dry_run=True,
+            emit_summary=False,
+        )
+
+    assert any(disabled.selector_key == "a" for disabled in result.disabled)
+    assert dispatches
+    assert set(dispatches) == {"b"}
+
+
+def test_watch_supervisor_programming_error_is_not_converted_to_project_hold(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a-programming", project_name="a")
+    selection = WatchSupervisorSelection(
+        projects=(
+            WatchSupervisorProjectSelector(
+                key="a", ref=str(runtime_a.config.project_dir), path=runtime_a.config.project_dir
+            ),
+        )
+    )
+
+    with (
+        patch(
+            "gza.cli.watch.construct_watch_project_runtimes",
+            return_value=WatchSupervisorRuntimeConstruction(runtimes=(runtime_a,)),
+        ),
+        patch.object(runtime_a, "analyze_cycle", side_effect=RuntimeError("programming failure")),
+    ):
+        with pytest.raises(RuntimeError, match="programming failure"):
+            run_watch_supervisor_fleet_cycle(
+                anchor_store=runtime_a.store,
+                selection=selection,
+                quiet=True,
+                owner_token=None,
+                existing_lease_set=None,
+                batch=1,
+                recovery_slots=0,
+                recovery_mode="pending_only",
+                max_recovery_attempts=1,
+                max_iterations=1,
+                dry_run=True,
+                emit_summary=False,
+            )
 
 
 def test_watch_supervisor_weighted_strategy_records_actual_incremental_selections(
@@ -45638,6 +48092,83 @@ def test_supervisor_launch_budget_releases_local_cap_rejection_so_another_projec
     assert permit_b.released is True
 
 
+def test_supervisor_dispatch_refresh_disables_failing_runtime_without_losing_successful_result(
+    tmp_path: Path,
+) -> None:
+    runtime_a = _make_aggregate_runtime(tmp_path / "project-a", project_name="a")
+    runtime_b = _make_aggregate_runtime(tmp_path / "project-b", project_name="b")
+    runtime_c = _make_aggregate_runtime(tmp_path / "project-c", project_name="c")
+    task_a = runtime_a.store.add("Pending A launches before B refresh fails", task_type="plan")
+    task_b = runtime_b.store.add("Pending B fails refresh", task_type="plan")
+    task_c = runtime_c.store.add("Pending C stays eligible", task_type="plan")
+    assert task_a.id is not None
+    assert task_b.id is not None
+    assert task_c.id is not None
+    candidate_a = _candidate_for_runtime_head(runtime_a)
+    _candidate_b = _candidate_for_runtime_head(runtime_b)
+    candidate_c = _candidate_for_runtime_head(runtime_c)
+    disabled: list[watch_module.ExecutionProjectDisabled] = []
+    budget = SupervisorLaunchBudget(
+        [runtime_a, runtime_b, runtime_c],
+        supervisor_batch=2,
+        operational_disabled_callback=disabled.append,
+    )
+    real_reconcile_b = runtime_b.reconcile_runtime_state
+    reconcile_b_calls = 0
+    dispatch_attempts: list[str] = []
+
+    def reconcile_b(*, dry_run: bool) -> ProjectRuntimeReconcileResult:
+        nonlocal reconcile_b_calls
+        reconcile_b_calls += 1
+        if reconcile_b_calls >= 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_reconcile_b(dry_run=dry_run)
+
+    def dispatch_candidate(
+        candidate: ProjectDispatchCandidate,
+        **_kwargs: object,
+    ) -> ProjectDispatchResult:
+        runtime = {"a": runtime_a, "b": runtime_b, "c": runtime_c}[candidate.runtime_key]
+        dispatch_attempts.append(runtime.key)
+        _register_live_worker_for_task(runtime.config, str(candidate.task.id), worker_id=f"w-{runtime.key}")
+        return ProjectDispatchResult(
+            runtime_key=runtime.key,
+            candidate=candidate,
+            status="live",
+            slot_consuming=True,
+            work_done=True,
+            task=candidate.task,
+        )
+
+    with (
+        patch.object(runtime_b, "reconcile_runtime_state", side_effect=reconcile_b),
+        patch.object(WatchProjectRuntime, "dispatch_pending_candidate", side_effect=dispatch_candidate),
+    ):
+        results = dispatch_watch_supervisor_lane_incrementally(
+            [runtime_a, runtime_b, runtime_c],
+            lane="pending",
+            limit=2,
+            recovery_mode=None,
+            max_recovery_attempts=1,
+            strategy=watch_module.create_watch_dispatch_strategy(
+                "round-robin",
+                project_order=("a", "b", "c"),
+                weights={},
+            ),
+            launch_budget=budget,
+        )
+
+    assert [result.runtime_key for result in results] == [runtime_a.key, runtime_c.key]
+    assert [result.status for result in results] == ["live", "live"]
+    assert dispatch_attempts == [runtime_a.key, runtime_c.key]
+    assert [(item.selector_key, item.reason) for item in disabled] == [(runtime_b.key, "db_unavailable")]
+    assert runtime_b.key in budget.disabled_runtime_keys
+    assert runtime_b.key not in {result.runtime_key for result in results}
+    assert budget.occupancy.running + budget.occupancy.starting >= 1
+    assert candidate_a.task.id is not None
+    assert candidate_c.task.id is not None
+
+
 def test_supervisor_launch_budget_capacity_blocks_while_provisional_reservation_is_unsettled(
     tmp_path: Path,
 ) -> None:
@@ -46095,7 +48626,7 @@ def test_supervisor_launch_budget_retains_after_failed_refresh_then_resolves_on_
 
     with (
         patch.object(WatchProjectRuntime, "dispatch_pending_candidate", side_effect=fake_runtime_dispatch),
-        patch("gza.cli.watch.aggregate_watch_project_occupancy", side_effect=RuntimeError("refresh failed")),
+        patch.object(runtime_a, "reconcile_runtime_state", side_effect=RuntimeError("refresh failed")),
     ):
         with pytest.raises(RuntimeError, match="dispatch failed before refresh"):
             budget.dispatch_pending_candidate(runtime_a, candidate_a, max_iterations=1)
@@ -53083,6 +55614,80 @@ def test_watch_log_inserts_blank_line_between_cycles(tmp_path: Path, capsys: pyt
     )
 
 
+def test_watch_log_dynamic_project_emit_failure_degrades_sink_once(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    log_path = tmp_path / "project" / ".gza" / "watch.log"
+    aggregate_path = tmp_path / "supervisor" / ".gza" / "watch-supervisor" / "watch-supervisor.log"
+    log = _WatchLog(log_path, quiet=True, console_prefix="[a] ", aggregate_path=aggregate_path)
+    real_open = open
+
+    def fail_project_open(path: object, *args: object, **kwargs: object):
+        if Path(path) == log_path:
+            raise OSError("project log disappeared")
+        return real_open(path, *args, **kwargs)
+
+    with patch("builtins.open", side_effect=fail_project_open):
+        log.emit("INFO", "first visible event")
+        log.emit("INFO", "second visible event")
+
+    aggregate_text = aggregate_path.read_text()
+    captured = capsys.readouterr()
+    assert aggregate_text.count("[a] watch log sink disabled") == 1
+    assert aggregate_text.count("[a] first visible event") == 1
+    assert aggregate_text.count("[a] second visible event") == 1
+    assert captured.out.count("[a] watch log sink disabled") == 1
+
+
+def test_watch_log_dynamic_project_begin_cycle_failure_degrades_sink_once(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    log_path = tmp_path / "project" / ".gza" / "watch.log"
+    aggregate_path = tmp_path / "supervisor" / ".gza" / "watch-supervisor" / "watch-supervisor.log"
+    log = _WatchLog(log_path, quiet=True, console_prefix="[a] ", aggregate_path=aggregate_path)
+    log.begin_cycle()
+    log.emit("INFO", "initial cycle")
+    log.end_cycle()
+    real_open = open
+
+    def fail_project_open(path: object, *args: object, **kwargs: object):
+        if Path(path) == log_path:
+            raise OSError("project log unavailable at separator")
+        return real_open(path, *args, **kwargs)
+
+    with patch("builtins.open", side_effect=fail_project_open):
+        log.begin_cycle()
+        log.emit("INFO", "next cycle")
+        log.end_cycle()
+
+    aggregate_text = aggregate_path.read_text()
+    captured = capsys.readouterr()
+    assert aggregate_text.count("[a] watch log sink disabled") == 1
+    assert aggregate_text.count("[a] next cycle") == 1
+    assert captured.out.count("[a] watch log sink disabled") == 1
+
+
+def test_watch_log_transfer_preserves_dedupe_state_across_runtime_refresh(tmp_path: Path) -> None:
+    previous = _WatchLog(tmp_path / "previous" / ".gza" / "watch.log", quiet=True, console_prefix="[a] ")
+    previous.begin_cycle()
+    previous.emit("SKIP", "unchanged skip", dedupe_key="same-skip")
+    previous.emit_attention(attention_key="same-attention", message="same attention")
+    previous.end_cycle()
+    current = _WatchLog(tmp_path / "current" / ".gza" / "watch.log", quiet=True, console_prefix="[a] ")
+
+    current.transfer_state_from(previous)
+    current.begin_cycle()
+    current.emit("SKIP", "unchanged skip", dedupe_key="same-skip")
+    current.emit_attention(attention_key="same-attention", message="same attention")
+    current.end_cycle()
+
+    current_text = (tmp_path / "current" / ".gza" / "watch.log").read_text()
+    assert "unchanged skip" not in current_text
+    assert "same attention" not in current_text
+
+
 def test_watch_cycle_emits_one_lifecycle_summary_line_per_cycle(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -55266,6 +57871,7 @@ def test_watch_reexec_argv_preserves_requested_watch_flags(tmp_path: Path) -> No
         auto_restart_on_drift=False,
         task_ids=["gza-1", "gza-2"],
         watch_lease_token="lease-token",
+        watch_state_dir=str(tmp_path / "fleet-state"),
     )
 
     argv = _watch_reexec_argv(args)
@@ -55277,6 +57883,8 @@ def test_watch_reexec_argv_preserves_requested_watch_flags(tmp_path: Path) -> No
         "watch",
         "--project",
         str(tmp_path),
+        "--watch-state-dir",
+        str(tmp_path / "fleet-state"),
         "--batch",
         "3",
         "--poll",
@@ -55444,6 +58052,103 @@ def test_watch_reexec_argv_preserves_keyed_selector_inputs_for_reparse(tmp_path:
     assert reparsed_selection.projects[0].tags == ("release", "urgent")
     assert reparsed_selection.projects[0].any_tag is False
     assert reparsed_selection.projects[0].weight == 2
+
+
+@pytest.mark.parametrize(
+    ("strategy_name", "weights"),
+    [
+        ("round-robin", None),
+        ("weighted-round-robin", {"a": 2, "b": 1, "c": 1}),
+    ],
+)
+def test_watch_reexec_argv_preserves_distinct_recovery_and_pending_strategy_state(
+    tmp_path: Path,
+    strategy_name: str,
+    weights: dict[str, int] | None,
+) -> None:
+    project_dirs = {key: tmp_path / key for key in ("a", "b", "c")}
+    for project_dir in project_dirs.values():
+        project_dir.mkdir()
+    project_order = tuple(project_dirs)
+    recovery_strategy = create_watch_dispatch_strategy(
+        strategy_name,
+        project_order=project_order,
+        weights=weights,
+    )
+    pending_strategy = create_watch_dispatch_strategy(
+        strategy_name,
+        project_order=project_order,
+        weights=weights,
+    )
+    heads = {key: f"{key}-candidate" for key in project_order}
+    assert recovery_strategy.select_next(heads) is not None
+    assert pending_strategy.select_next(heads) is not None
+    assert pending_strategy.select_next(heads) is not None
+    recovery_state = recovery_strategy.serialize_state()
+    pending_state = pending_strategy.serialize_state()
+    assert recovery_state != pending_state
+    expected_recovery_next = recovery_strategy.clone().select_next(heads)
+    expected_pending_next = pending_strategy.clone().select_next(heads)
+    assert expected_recovery_next is not None
+    assert expected_pending_next is not None
+
+    args = _watch_args(
+        tmp_path,
+        [],
+        watch_projects=[f"{key}={project_dirs[key]}" for key in project_order],
+        watch_strategy=strategy_name,
+        watch_weights=[f"{key}={weight}" for key, weight in (weights or {}).items()] or None,
+    )
+    args.watch_reexec_invocation = watch_module._capture_watch_reexec_invocation(args)
+    args.watch_strategy_state = watch_module._serialize_watch_reexec_strategy_state(
+        recovery_strategy=recovery_strategy,
+        pending_strategy=pending_strategy,
+    )
+
+    reparsed_args = _reparse_watch_reexec_argv_through_main(_watch_reexec_argv(args))
+    reparsed_selection = resolve_watch_supervisor_selection(reparsed_args)
+    restored_recovery_state, restored_pending_state = watch_module._watch_reexec_strategy_states_from_args(
+        reparsed_args
+    )
+    restored_recovery = create_watch_dispatch_strategy(
+        strategy_name,
+        project_order=tuple(project.key for project in reparsed_selection.projects),
+        weights={project.key: project.weight for project in reparsed_selection.projects},
+        state=restored_recovery_state,
+    )
+    restored_pending = create_watch_dispatch_strategy(
+        strategy_name,
+        project_order=tuple(project.key for project in reparsed_selection.projects),
+        weights={project.key: project.weight for project in reparsed_selection.projects},
+        state=restored_pending_state,
+    )
+
+    assert restored_recovery.serialize_state() == recovery_state
+    assert restored_pending.serialize_state() == pending_state
+    assert restored_recovery.select_next(heads).project_key == expected_recovery_next.project_key
+    assert restored_pending.select_next(heads).project_key == expected_pending_next.project_key
+
+
+def test_watch_reexec_strategy_state_rejects_malformed_and_selection_mismatched_payload(
+    tmp_path: Path,
+) -> None:
+    args = _watch_args(tmp_path, [], watch_strategy_state="not json")
+    with pytest.raises(ValueError, match="not valid JSON"):
+        watch_module._watch_reexec_strategy_states_from_args(args)
+
+    strategy = create_watch_dispatch_strategy("round-robin", project_order=("a", "b"))
+    state = watch_module._serialize_watch_reexec_strategy_state(
+        recovery_strategy=strategy,
+        pending_strategy=strategy.clone(),
+    )
+    args = _watch_args(tmp_path, [], watch_strategy_state=state)
+    recovery_state, _pending_state = watch_module._watch_reexec_strategy_states_from_args(args)
+    with pytest.raises(ValueError, match="project order does not match"):
+        create_watch_dispatch_strategy(
+            "round-robin",
+            project_order=("b", "a"),
+            state=recovery_state,
+        )
 
 
 def _reparse_watch_reexec_argv_through_main(argv: list[str]) -> argparse.Namespace:
@@ -61657,7 +64362,7 @@ def test_cmd_watch_multi_project_body_failure_groups_lease_release_failure(
     ):
         cmd_watch(args)
 
-    assert "multi-project watch failed and cleanup also failed" in str(exc_info.value)
+    assert "fleet watch cycle failed and watch-supervisor lease release also failed" in str(exc_info.value)
     assert any(isinstance(exc, RuntimeError) and str(exc) == "body failed" for exc in exc_info.value.exceptions)
     assert any(isinstance(exc, WatchLeaseReleaseError) for exc in exc_info.value.exceptions)
 

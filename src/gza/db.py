@@ -128,6 +128,10 @@ ExecutionProjectDisableReason = Literal[
     "manual_migration_required",
     "schema_incompatible",
     "lease-conflict",
+    "docker-held",
+    "git-health-held",
+    "failure-halt",
+    "main-red",
 ]
 
 TASK_COMMENT_KIND_FEEDBACK = "feedback"
@@ -355,7 +359,7 @@ class ExecutionProjectResolved:
         if current_db_path != self.db_path:
             raise ExecutionProjectActivationError(
                 "db_path_mismatch",
-                f"Execution project DB path changed at activation: {current_db_path}, expected {self.db_path}."
+                f"Execution project DB path changed at activation: {current_db_path}, expected {self.db_path}.",
             )
         current_db_incompatibility = _classify_existing_execution_db(current_db_path)
         if current_db_incompatibility is not None:
@@ -383,18 +387,18 @@ class ExecutionProjectResolved:
         if current_config_path != self.config_path:
             raise ExecutionProjectActivationError(
                 "config_invalid",
-                f"Execution project config resolved to {current_config_path} at activation, expected {self.config_path}."
+                f"Execution project config resolved to {current_config_path} at activation, expected {self.config_path}.",
             )
         if current_config.project_id != self.project_id:
             raise ExecutionProjectActivationError(
                 "project_id_mismatch",
-                f"Execution project project_id changed at activation: {current_config.project_id}, expected {self.project_id}."
+                f"Execution project project_id changed at activation: {current_config.project_id}, expected {self.project_id}.",
             )
         if current_config.project_prefix != self.project_prefix:
             raise ExecutionProjectActivationError(
                 "config_invalid",
                 "Execution project project_prefix changed at activation: "
-                f"{current_config.project_prefix}, expected {self.project_prefix}."
+                f"{current_config.project_prefix}, expected {self.project_prefix}.",
             )
         db_incompatibility = _classify_existing_execution_db(self.db_path)
         if db_incompatibility is not None:
@@ -406,16 +410,15 @@ class ExecutionProjectResolved:
                     if _is_execution_db_availability_sqlite_error(exc):
                         raise ExecutionProjectActivationError(
                             "db_unavailable",
-                            f"Execution project DB became unavailable while rereading manual migration state: {exc}"
+                            f"Execution project DB became unavailable while rereading manual migration state: {exc}",
                         ) from exc
                     raise ExecutionProjectActivationError(
                         "schema_incompatible",
-                        f"Execution project DB schema changed while rereading manual migration state: {exc}"
+                        f"Execution project DB schema changed while rereading manual migration state: {exc}",
                     ) from exc
                 except (OSError, RuntimeError, ValueError) as exc:
                     raise ExecutionProjectActivationError(
-                        "db_unavailable",
-                        f"Execution project DB changed while rereading manual migration state: {exc}"
+                        "db_unavailable", f"Execution project DB changed while rereading manual migration state: {exc}"
                     ) from exc
                 raise ManualMigrationRequired(pending_versions or sorted(_MANUAL_MIGRATION_VERSIONS))
             raise ExecutionProjectActivationError(reason, message)
@@ -1197,7 +1200,11 @@ def _preflight_execution_project(
             anchor_db_path = anchor_store.db_path.resolve()
             local_db_path = _legacy_local_db_path(root_path).resolve()
             configured_db_source = getattr(config, "source_map", {}).get("db_path")
-            if config.db_path.resolve() == local_db_path and anchor_db_path != local_db_path and not configured_db_source:
+            if (
+                config.db_path.resolve() == local_db_path
+                and anchor_db_path != local_db_path
+                and not configured_db_source
+            ):
                 db_path_override = anchor_db_path
                 config = Config.load_execution(root_path, db_path_override=db_path_override)
     except (RuntimeError, ValueError) as exc:
@@ -6017,9 +6024,7 @@ class SqliteTaskStore:
             self._prune_provider_usage(conn, usage.provider, retention_days=retention_days)
         return fetch_id
 
-    def _prune_provider_usage(
-        self, conn: sqlite3.Connection, provider: str, *, retention_days: int
-    ) -> None:
+    def _prune_provider_usage(self, conn: sqlite3.Connection, provider: str, *, retention_days: int) -> None:
         """Drop fetches older than the retention window (samples cascade)."""
         if retention_days <= 0:
             return
@@ -6116,9 +6121,7 @@ class SqliteTaskStore:
             ),
             rate_limit_reached_type=fetch["rate_limit_reached_type"],
             credits_has=None if fetch["credits_has"] is None else bool(fetch["credits_has"]),
-            credits_unlimited=(
-                None if fetch["credits_unlimited"] is None else bool(fetch["credits_unlimited"])
-            ),
+            credits_unlimited=(None if fetch["credits_unlimited"] is None else bool(fetch["credits_unlimited"])),
             credits_balance=fetch["credits_balance"],
             reset_credits_available=int(fetch["reset_credits_available"] or 0),
             raw_json=fetch["raw_json"] or "",
@@ -8018,11 +8021,7 @@ class SqliteTaskStore:
             """,
             (self._project_id, review_task_id),
         ).fetchall()
-        matches = [
-            child
-            for child in self._rows_to_tasks(conn, rows)
-            if child.prompt.strip().startswith(prompt_prefix)
-        ]
+        matches = [child for child in self._rows_to_tasks(conn, rows) if child.prompt.strip().startswith(prompt_prefix)]
         if not matches:
             return None
         if len(matches) > 1:
@@ -8077,11 +8076,7 @@ class SqliteTaskStore:
             """,
             (self._project_id, impl_task_id),
         ).fetchall()
-        matches = [
-            child
-            for child in self._rows_to_tasks(conn, rows)
-            if child.prompt.strip().startswith(prompt_prefix)
-        ]
+        matches = [child for child in self._rows_to_tasks(conn, rows) if child.prompt.strip().startswith(prompt_prefix)]
         if not matches:
             return None
         if len(matches) > 1:
@@ -8137,15 +8132,10 @@ class SqliteTaskStore:
                 """,
                 (self._project_id, existing.id),
             ).fetchall()
-            active_units = [
-                unit for row in active_rows if (unit := self._row_to_merge_unit(row)) is not None
-            ]
+            active_units = [unit for row in active_rows if (unit := self._row_to_merge_unit(row)) is not None]
             if active_units:
                 active_unit = active_units[0]
-                return (
-                    active_unit.state in MERGE_UNIT_ACTIONABLE_STATES
-                    and active_unit.superseded_by_unit_id is None
-                )
+                return active_unit.state in MERGE_UNIT_ACTIONABLE_STATES and active_unit.superseded_by_unit_id is None
             historical_row = conn.execute(
                 """
                 SELECT 1
@@ -9369,7 +9359,11 @@ class SqliteTaskStore:
         parent_type_pairs: Iterable[tuple[str, str]],
     ) -> list[Task]:
         """Return same-parent children for many ``(based_on, task_type)`` pairs."""
-        ordered_pairs = tuple(dict.fromkeys((parent_id, task_type) for parent_id, task_type in parent_type_pairs if parent_id and task_type))
+        ordered_pairs = tuple(
+            dict.fromkeys(
+                (parent_id, task_type) for parent_id, task_type in parent_type_pairs if parent_id and task_type
+            )
+        )
         if not ordered_pairs:
             return []
         children: list[Task] = []
@@ -9777,16 +9771,31 @@ class SqliteTaskStore:
         if not ordered_ids:
             return []
 
-        from .review_scope import resolve_implement_slice_identity
+        from .review_scope import normalize_review_scope_identity_text, resolve_implement_slice_identity
+
+        normalized_scope_cache: dict[str | None, str | None] = {}
+        slice_identity_cache: dict[tuple[str | None, str | None], str | None] = {}
+
+        def review_scope_identity_text(review_scope: str | None) -> str | None:
+            if review_scope not in normalized_scope_cache:
+                normalized_scope_cache[review_scope] = normalize_review_scope_identity_text(review_scope)
+            return normalized_scope_cache[review_scope]
 
         def implement_slice_identity_key(prompt: str | None, review_scope: str | None) -> str | None:
+            cache_key = (prompt, review_scope)
+            if cache_key in slice_identity_cache:
+                return slice_identity_cache[cache_key]
             identity = resolve_implement_slice_identity(prompt=prompt, review_scope=review_scope)
             if identity is None:
+                slice_identity_cache[cache_key] = None
                 return None
-            return json.dumps(identity.__dict__, sort_keys=True, separators=(",", ":"))
+            value = json.dumps(identity.__dict__, sort_keys=True, separators=(",", ":"))
+            slice_identity_cache[cache_key] = value
+            return value
 
         candidates: list[Task] = []
         with self._connect() as conn:
+            conn.create_function("_gza_review_scope_identity_text", 1, review_scope_identity_text)
             conn.create_function("_gza_implement_slice_identity_key", 2, implement_slice_identity_key)
             for start in range(0, len(ordered_ids), _SQL_VARIABLE_CHUNK):
                 chunk = ordered_ids[start : start + _SQL_VARIABLE_CHUNK]
@@ -9868,6 +9877,8 @@ class SqliteTaskStore:
                         OR (
                           f.task_type = 'implement'
                           AND c.status != 'dropped'
+                          AND _gza_review_scope_identity_text(c.review_scope)
+                              IS _gza_review_scope_identity_text(f.review_scope)
                           AND _gza_implement_slice_identity_key(c.prompt, c.review_scope)
                               IS _gza_implement_slice_identity_key(f.prompt, f.review_scope)
                           AND _gza_implement_slice_identity_key(f.prompt, f.review_scope) IS NOT NULL
@@ -12602,10 +12613,7 @@ class SqliteTaskStore:
                 plan=None,
                 diagnostic=MergeUnitResolutionDiagnostic(
                     reason="lineage_cycle",
-                    message=(
-                        "lineage cycle while resolving merge-unit plan: "
-                        + " -> ".join(cycle_path)
-                    ),
+                    message=("lineage cycle while resolving merge-unit plan: " + " -> ".join(cycle_path)),
                     task_ids=cycle_path,
                 ),
             )
@@ -12650,7 +12658,9 @@ class SqliteTaskStore:
         related_branch_tasks = self._related_branch_tasks_for_merge_unit(task, same_branch_tasks)
         active_unit = self._resolve_related_merge_unit(related_branch_tasks)
         if active_unit is None:
-            owner = next((branch_task for branch_task in related_branch_tasks if task_owns_merge_status(branch_task)), task)
+            owner = next(
+                (branch_task for branch_task in related_branch_tasks if task_owns_merge_status(branch_task)), task
+            )
             preview_unit = MergeUnit(
                 id="",
                 source_branch=task.branch,
@@ -13268,17 +13278,10 @@ class SqliteTaskStore:
                        AND mu.id = mut.merge_unit_id
                       WHERE mut.project_id = t.project_id
                         AND mut.task_id = t.id
-                        AND {active_merge_unit_where_sql("mu")}
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM merge_unit_tasks mut
-                      JOIN merge_units mu
-                        ON mu.project_id = mut.project_id
-                       AND mu.id = mut.merge_unit_id
-                      WHERE mut.project_id = t.project_id
-                        AND mut.task_id = t.id
-                        AND {inactive_tombstone_merge_unit_where_sql("mu")}
+                        AND (
+                          {active_merge_unit_where_sql("mu")}
+                          OR {inactive_tombstone_merge_unit_where_sql("mu")}
+                        )
                   )
                   {tag_filter}
                 ORDER BY t.created_at ASC, t.id ASC

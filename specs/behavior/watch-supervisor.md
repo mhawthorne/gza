@@ -381,12 +381,16 @@ boundaries in this state model:
   detached workers and owned leases before new dispatch.
 - Detailed project-owned logs belong in each project's configured `.gza` area. Aggregate
   supervisor state and the aggregate supervisor log MUST resolve to one supervisor-owned
-  state directory in this order: an explicit aggregate state/log directory override wins;
-  otherwise a manifest invocation defaults to `<manifest directory>/.gza/watch-supervisor`;
-  otherwise the fallback is `<anchor project root>/.gza/watch-supervisor`. The aggregate
-  supervisor log is written under that resolved directory. Console and aggregate events
-  MUST be prefixed by selector name. A log-path failure in one project degrades that sink
-  and surfaces a warning without losing other projects' events.
+  state directory in this order: the explicit CLI `--watch-state-dir` override wins;
+  otherwise manifest `aggregate_state_dir` wins; otherwise a manifest invocation defaults
+  to `<manifest directory>/.gza/watch-supervisor`; otherwise the fallback is
+  `<anchor project root>/.gza/watch-supervisor`. The aggregate supervisor log is appended
+  as `watch-supervisor.log` under that resolved directory.
+  Project detail logs rotate per invocation through the normal live/dry-run watch log
+  lifecycle; the aggregate supervisor log is pass history and is not rotated with each
+  project detail log. Console and aggregate events MUST be prefixed by selector name. A
+  log-path failure in one project degrades that sink and surfaces a warning without
+  losing other projects' events.
 
 ### Supervisor policy versus project-local execution settings
 

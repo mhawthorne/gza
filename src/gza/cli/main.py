@@ -232,17 +232,20 @@ def add_execution_mode_args(parser: argparse.ArgumentParser) -> None:
     """Add the shared queue/run/background execution mode flags."""
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
-        "--queue", "-q",
+        "--queue",
+        "-q",
         action="store_true",
         help="Queue the task without running it (default)",
     )
     mode_group.add_argument(
-        "--run", "-r",
+        "--run",
+        "-r",
         action="store_true",
         help="Run the task immediately in the foreground",
     )
     mode_group.add_argument(
-        "--background", "-b",
+        "--background",
+        "-b",
         action="store_true",
         help="Run the task in a detached background worker",
     )
@@ -317,13 +320,15 @@ def main() -> int:
         help="Run Claude directly instead of in Docker",
     )
     work_parser.add_argument(
-        "--count", "-c",
+        "--count",
+        "-c",
         type=int,
         metavar="N",
         help="Number of tasks to run before stopping (overrides config default)",
     )
     work_parser.add_argument(
-        "--background", "-b",
+        "--background",
+        "-b",
         action="store_true",
         help="Run worker in background (detached mode)",
     )
@@ -1120,7 +1125,7 @@ def main() -> int:
         action="append",
         dest="watch_projects",
         metavar="NAME=PATH",
-        help="Select a named watch project path or registry project_id; one selected path can run now, multiple projects acquire watch leases but are refused before dispatch",
+        help="Select a named watch project path or registry project_id for multi-project supervisor mode",
     )
     watch_parser.add_argument(
         "--watch-tag",
@@ -1153,7 +1158,13 @@ def main() -> int:
         "--watch-config",
         metavar="PATH",
         dest="watch_config",
-        help="Load a version 1 watch supervisor manifest; one path-backed project can run now, multiple projects acquire watch leases but are refused before dispatch",
+        help="Load a version 1 watch supervisor manifest for multi-project supervisor mode",
+    )
+    watch_parser.add_argument(
+        "--watch-state-dir",
+        metavar="PATH",
+        dest="watch_state_dir",
+        help="Write multi-project supervisor state and aggregate log under PATH",
     )
     watch_parser.add_argument(
         "--max-iterations",
@@ -1237,7 +1248,8 @@ def main() -> int:
         help="Re-exec watch at the next cycle boundary when the installed gza code changes (default: enabled)",
     )
     watch_parser.add_argument(
-        "-y", "--yes",
+        "-y",
+        "--yes",
         action="store_true",
         help="Skip confirmation prompt before the first watch pass; required when stdout is not a terminal",
     )
@@ -1252,6 +1264,12 @@ def main() -> int:
         "--watch-lease-token",
         default=None,
         dest="watch_lease_token",
+        help=argparse.SUPPRESS,
+    )
+    watch_parser.add_argument(
+        "--watch-strategy-state",
+        default=None,
+        dest="watch_strategy_state",
         help=argparse.SUPPRESS,
     )
     watch_parser.add_argument(
@@ -1657,7 +1675,8 @@ def main() -> int:
         help="Fetch from origin and rebase against origin/<target-branch>",
     )
     rebase_parser.add_argument(
-        "--force", "-f",
+        "--force",
+        "-f",
         action="store_true",
         help="Force remove worktree even if it has uncommitted changes",
     )
@@ -1670,13 +1689,16 @@ def main() -> int:
     add_common_args(rebase_parser)
 
     # checkout command
-    checkout_parser = subparsers.add_parser("checkout", help="Checkout a task's branch, removing stale worktree if needed")
+    checkout_parser = subparsers.add_parser(
+        "checkout", help="Checkout a task's branch, removing stale worktree if needed"
+    )
     checkout_parser.add_argument(
         "task_id_or_branch",
         help="Full prefixed task ID or branch name to checkout",
     )
     checkout_parser.add_argument(
-        "--force", "-f",
+        "--force",
+        "-f",
         action="store_true",
         help="Force removal of worktree even if it has uncommitted changes",
     )
@@ -1747,9 +1769,7 @@ def main() -> int:
     stats_parser.set_defaults(_stats_parser=stats_parser)
 
     # stats reviews subcommand
-    stats_reviews_parser = stats_subs.add_parser(
-        "reviews", help="Show review count stats per implementation task"
-    )
+    stats_reviews_parser = stats_subs.add_parser("reviews", help="Show review count stats per implementation task")
     add_common_args(stats_reviews_parser)
     stats_reviews_parser.add_argument(
         "--issues",
@@ -2042,12 +2062,14 @@ def main() -> int:
         help="Full prefixed task ID, slug, or worker ID",
     )
     log_parser.add_argument(
-        "--slug", "-s",
+        "--slug",
+        "-s",
         action="store_true",
         help="Look up by task slug (supports partial match)",
     )
     log_parser.add_argument(
-        "--worker", "-w",
+        "--worker",
+        "-w",
         action="store_true",
         help="Look up by worker ID",
     )
@@ -2074,7 +2096,8 @@ def main() -> int:
         help="Deprecated alias for --steps-verbose",
     )
     log_parser.add_argument(
-        "--follow", "-f",
+        "--follow",
+        "-f",
         action="store_true",
         help="Follow log in real-time when the requested task or worker is actively running",
     )
@@ -2106,7 +2129,8 @@ def main() -> int:
         help="Expand generic unknown events with pretty JSON while keeping normal curated rendering",
     )
     log_parser.add_argument(
-        "--failure", "-F",
+        "--failure",
+        "-F",
         action="store_true",
         help="Show failure-focused diagnostics (failed tasks only): reason, summary, agent explanation, and last verify/result context",
     )
@@ -2125,7 +2149,8 @@ def main() -> int:
         help="Task IDs to watch (default: auto-select running tasks)",
     )
     tv_parser.add_argument(
-        "--number", "-n",
+        "--number",
+        "-n",
         type=int,
         metavar="N",
         help="Fixed slot count (equivalent to --min N --max N)",
@@ -2154,7 +2179,8 @@ def main() -> int:
         help="Task prompt (opens $EDITOR if not provided)",
     )
     add_parser.add_argument(
-        "--edit", "-e",
+        "--edit",
+        "-e",
         action="store_true",
         help="Open $EDITOR to write the prompt",
     )
@@ -2438,7 +2464,8 @@ def main() -> int:
         help="Atomically replace OLD with NEW on matched tasks that currently carry OLD",
     )
     retag_parser.add_argument(
-        "--yes", "-y",
+        "--yes",
+        "-y",
         action="store_true",
         help="Skip the confirmation prompt",
     )
@@ -2506,12 +2533,14 @@ def main() -> int:
         help="Full prefixed task ID to delete",
     )
     delete_parser.add_argument(
-        "--force", "-f",
+        "--force",
+        "-f",
         action="store_true",
         help="Skip confirmation prompt (deprecated, use --yes/-y)",
     )
     delete_parser.add_argument(
-        "--yes", "-y",
+        "--yes",
+        "-y",
         action="store_true",
         help="Skip confirmation prompt",
     )
@@ -2676,7 +2705,8 @@ def main() -> int:
             help="Full prefixed implementation task ID to iterate, or a plan task ID (e.g. 'gza-1234')",
         )
         iterate_parser.add_argument(
-            "-i", "--max-iterations",
+            "-i",
+            "--max-iterations",
             type=int,
             default=None,
             dest="max_iterations",
@@ -2745,7 +2775,8 @@ def main() -> int:
             help=argparse.SUPPRESS,
         )
         iterate_parser.add_argument(
-            "--background", "-b",
+            "--background",
+            "-b",
             action="store_true",
             help="Run the entire iterate loop in the background",
         )
@@ -3252,12 +3283,14 @@ def main() -> int:
         help="List active workers and startup failures",
     )
     ps_parser.add_argument(
-        "--all", "-a",
+        "--all",
+        "-a",
         action="store_true",
         help="Include all completed/failed workers (not just startup failures)",
     )
     ps_parser.add_argument(
-        "--quiet", "-q",
+        "--quiet",
+        "-q",
         action="store_true",
         help="Only show worker IDs",
     )
@@ -3309,7 +3342,8 @@ def main() -> int:
         help="Kill all running tasks",
     )
     kill_parser.add_argument(
-        "--force", "-9",
+        "--force",
+        "-9",
         action="store_true",
         help="Skip SIGTERM and send SIGKILL immediately",
     )
@@ -3396,7 +3430,8 @@ def main() -> int:
         help="Show migration status without running any migrations",
     )
     migrate_parser.add_argument(
-        "--yes", "-y",
+        "--yes",
+        "-y",
         action="store_true",
         help="Skip confirmation prompt",
     )
@@ -3412,9 +3447,7 @@ def main() -> int:
     )
     add_common_args(migrate_parser)
 
-    visible_commands = sorted(
-        command for command in subparsers.choices if command not in HIDDEN_COMMANDS
-    )
+    visible_commands = sorted(command for command in subparsers.choices if command not in HIDDEN_COMMANDS)
     subparsers.metavar = "{" + ",".join(visible_commands) + "}"
 
     args = parser.parse_args()
@@ -3455,8 +3488,14 @@ def main() -> int:
 
     # Commands where reconciling orphaned in-progress tasks is useful.
     _RECONCILE_COMMANDS = {
-        "work", "kill", "advance", "retry",
-        "mark-completed", "run-inline", "set-status", "unstick",
+        "work",
+        "kill",
+        "advance",
+        "retry",
+        "mark-completed",
+        "run-inline",
+        "set-status",
+        "unstick",
     }
 
     try:
@@ -3643,9 +3682,7 @@ def main() -> int:
 def _cmd_migrate(args: "argparse.Namespace") -> int:
     """Handle the 'migrate' subcommand."""
     if args.import_local_db and not args.yes and not args.dry_run:
-        answer = input(
-            "Import legacy local DB into active shared DB now? [y/N]: "
-        ).strip().lower()
+        answer = input("Import legacy local DB into active shared DB now? [y/N]: ").strip().lower()
         if answer not in {"y", "yes"}:
             print("Import cancelled.")
             return 1
@@ -3673,10 +3710,7 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
                     f"as '{bootstrapped_project_id}' before import."
                 )
             elif updated:
-                print(
-                    f"Persisted project_id '{bootstrapped_project_id}' "
-                    f"to {Config.config_path(args.project_dir)}"
-                )
+                print(f"Persisted project_id '{bootstrapped_project_id}' to {Config.config_path(args.project_dir)}")
 
     try:
         config = Config.load(
@@ -3786,18 +3820,14 @@ def _cmd_migrate(args: "argparse.Namespace") -> int:
                     # DB is pre-v25; synthesize v26 preview from v25 preview rows.
                     task_count_v26 = v25_task_count_cache
                     samples_v26 = [
-                        (old_v25, f"{config.project_prefix}-{old_int}")
-                        for old_int, old_v25 in v25_samples_cache
+                        (old_v25, f"{config.project_prefix}-{old_int}") for old_int, old_v25 in v25_samples_cache
                     ]
                     random_samples_v26 = [
-                        (old_v25, f"{config.project_prefix}-{old_int}")
-                        for old_int, old_v25 in v25_random_samples_cache
+                        (old_v25, f"{config.project_prefix}-{old_int}") for old_int, old_v25 in v25_random_samples_cache
                     ]
                 print("\nMigration v26 preview (TEXT base36 IDs → TEXT decimal IDs):")
                 print(f"  Tasks to convert: {task_count_v26}")
-                old_ids_v26 = [old for old, _ in samples_v26] + [
-                    old for old, _ in random_samples_v26
-                ]
+                old_ids_v26 = [old for old, _ in samples_v26] + [old for old, _ in random_samples_v26]
                 id_width = max((len(old) for old in old_ids_v26), default=0)
                 if samples_v26:
                     print(f"  Sample ID conversions (first {len(samples_v26)}):")

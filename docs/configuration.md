@@ -2137,12 +2137,13 @@ need to break out promptly from a long or blocked watch pass.
 | failure backoff | After each newly observed non-auto-resumable failure, `gza watch` logs an exponential cooldown for the failing owner unit using `watch.failure_backoff_initial` and `watch.failure_backoff_max`; repeated failures from one owner only advance that owner's streak/backoff; unrelated units remain dispatchable, and `watch.failure_halt_after` applies when the retained distinct failing-owner count for the project reaches the configured threshold; an owner leaves that count when owner-scoped work completes and the failure-backoff state resets |
 | `--poll SECS` | Poll interval in seconds (default: `watch.poll` or `300`) |
 | `--max-idle SECS` | Exit after consecutive idle watch-loop time (default: `watch.max_idle`, no limit when unset) |
-| `--watch-config PATH` | Load a version 1 watch supervisor manifest. One path-backed selected project can execute today; more than one selected project and registry-ID-only selectors are validated and then refused before execution |
-| `--watch-project NAME=PATH_OR_PROJECT_ID` | Replace any manifest project list with an ordered CLI project list. Path selectors can execute when exactly one project is selected; registry-ID-only selectors are a validated future surface and are refused before execution |
+| `--watch-config PATH` | Load a version 1 watch supervisor manifest for multi-project supervisor mode |
+| `--watch-project NAME=PATH_OR_PROJECT_ID` | Replace any manifest project list with an ordered CLI project list for multi-project supervisor mode |
 | `--watch-tag NAME=TAG` | Apply a keyed tag filter to a named watch project (repeatable). Explicit unkeyed `--tag` overrides keyed or manifest tags only when the resolved selection contains exactly one project |
 | `--watch-all-tags NAME` | Require all keyed `--watch-tag` values for the named project instead of the default any-tag matching |
 | `--watch-weight NAME=N` | Set a positive integer project weight; valid only with `--strategy weighted-round-robin` |
 | `--strategy STRATEGY` | Select the cross-project dispatch strategy for supervisor selections: `round-robin`, `weighted-round-robin`, or `project-priority` |
+| `--watch-state-dir PATH` | Write multi-project supervisor state and the aggregate watch log under PATH instead of the manifest or anchor fallback |
 | `--max-iterations N` | Iterate loop cap for implement tasks launched by watch (default: `watch.max_iterations` or `10`) |
 | `--recovery-slots N` | Slots per watch pass reserved for worker-consuming failed-task recovery before pending pickup (default: `watch.recovery_slots` or `1`) |
 | `--recovery-only` | Send the full batch to failed-task recovery, or all free supervisor dispatch slots in multi-project mode; pending pickup waits until recovery drains |
@@ -2183,6 +2184,7 @@ poll: 30              # optional supervisor-global value
 max_idle: null        # optional; null disables the idle-exit limit
 recovery_slots: 1     # optional non-negative integer
 strategy: round-robin # optional: round-robin, weighted-round-robin, or project-priority
+aggregate_state_dir: .gza/fleet # optional; relative to this manifest file
 projects:
   - name: core
     path: ../gza      # relative paths resolve from the manifest file directory
@@ -2192,7 +2194,7 @@ projects:
     weight: 2         # optional positive integer for weighted-round-robin
 ```
 
-`projects` is ordered. The order is the tie-breaker for `round-robin` and the priority order for `project-priority`. Each project entry must have a unique `name` and either `path` or `project_id`; if both are present, `project_id` is an assertion on the config loaded from `path`. Relative manifest paths resolve against the manifest file, not the current shell directory.
+`projects` is ordered. The order is the tie-breaker for `round-robin` and the priority order for `project-priority`. With `project-priority`, a continuously runnable earlier project can indefinitely starve later projects; use it only when that strict priority is intentional. Each project entry must have a unique `name` and either `path` or `project_id`; if both are present, `project_id` is an assertion on the config loaded from `path`. Relative manifest paths and `aggregate_state_dir` resolve against the manifest file, not the current shell directory.
 
 CLI project selectors replace the manifest project list instead of merging into it:
 
@@ -2202,7 +2204,7 @@ gza watch --watch-config ops/watch.yaml --watch-project core=/work/gza
 
 Keyed CLI tags, all-tags mode, weights, and strategy override the selected manifest values for matching project names. When the final resolved selection contains exactly one project, explicit unkeyed `--tag` values and `--all-tags` override any manifest or keyed tag policy for that one project, and drift re-exec preserves that explicit unkeyed scope. When the selection contains more than one project, unkeyed `--tag`, unkeyed `--all-tags`, and positional task IDs are rejected because their project ownership is ambiguous.
 
-The current execution surface is intentionally narrower than the version 1 schema: a single path-backed selected project can run through the existing watch runtime. A manifest or CLI selection with more than one project is validated, acquires the selected runtime-set leases, then releases them while refusing dispatch with `multi-project watch supervisor dispatch is not enabled yet`; runtimes are not activated. A selector that only names a registry `project_id` exits with a registry-ID limitation message; use `NAME=PATH` for the currently executable form.
+Multi-project watch resolves the selected runtime set, acquires watch-supervisor leases for every currently healthy path-backed project in selector order, revalidates disabled projects at poll boundaries, and runs one fleet cycle across the enabled set. Each fleet cycle reconciles and analyzes enabled projects, runs all project-local direct lifecycle work in selector order before any worker start, re-plans projects invalidated by direct work, and then dispatches pending worker candidates through the aggregate supervisor batch. Worker-consuming recovery dispatch remains narrower than the schema for now: recovery heads are analyzed and preserve the lane barrier, but fleet recovery worker starts are deferred until the full dispatch integration lands. Invalid or held projects are reported with their selector, typed reason, and available project/root identity; healthy projects continue to advance. A selector that only names a registry `project_id` still exits with a registry-ID limitation message; use `NAME=PATH` for the executable form.
 
 `watch.no_progress_cycles` sets the restart-safe no-progress backstop threshold for `gza watch`. When watch selects the same unchanged worker-launch or recovery action for the same merge unit or lineage across that many cycles without durable progress, it parks the subject with `watch-no-progress-backstop` instead of respawning the no-op forever. Direct verify-evidence reconciliation counts as durable progress when it updates the canonical owner's verify state, even if the recredited evidence is non-green and the next lifecycle action remains remedial. Parks are cleared automatically once that exact executed-action basis no longer holds, including never-started pending launches and stale resolved merge-unit residue.
 
@@ -2228,6 +2230,15 @@ archive such as `.gza/watch.2026-08-26T14-05-06.log` or
 `.gza/watch.dry-run.2026-08-26T14-05-06.log`. Watch never overwrites an existing
 archive; if a rapid restart has already used the current whole-second timestamp, it
 waits for a distinct timestamp before rotating the selected log.
+
+Multi-project watch keeps each project's detail log in that same project-owned
+location, using `.gza/watch.log` for live runs and `.gza/watch.dry-run.log` for
+dry-run detail output. The selector-prefixed aggregate supervisor log is appended at
+`watch-supervisor.log` under `--watch-state-dir` when provided, then under manifest
+`aggregate_state_dir` when configured, then under `.gza/watch-supervisor/` beside the
+manifest for `--watch-config` runs, or under the anchor project root when no manifest
+is used. The aggregate log is supervisor-owned pass history and is not rotated with
+each project detail log invocation.
 
 You can scope watch to explicit merge units with `gza watch <task_id> [<task_id> ...]`.
 Each supplied task ID is first paired with its canonical lineage / merge-unit owner, and watch keeps
