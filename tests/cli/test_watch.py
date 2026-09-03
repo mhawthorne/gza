@@ -2168,6 +2168,70 @@ def test_cmd_watch_single_registry_id_selector_exits_without_traceback(
     load_config.assert_not_called()
 
 
+def test_cmd_watch_multi_project_registry_id_selector_reaches_runtime_construction(
+    tmp_path: Path,
+) -> None:
+    anchor_dir = tmp_path / "anchor"
+    registry_dir = tmp_path / "registry"
+    shared_db = tmp_path / "shared.db"
+    _write_watch_runtime_project_config(
+        anchor_dir,
+        project_name="Anchor",
+        project_id="anchor",
+        project_prefix="anchor",
+        db_path=shared_db,
+    )
+    _write_watch_runtime_project_config(
+        registry_dir,
+        project_name="Registry",
+        project_id="registry",
+        project_prefix="registry",
+        db_path=shared_db,
+    )
+    SqliteTaskStore.from_config(Config.load(anchor_dir))
+    SqliteTaskStore.from_config(Config.load(registry_dir))
+    args = _watch_args(
+        anchor_dir,
+        [],
+        watch_projects=[f"anchor={anchor_dir}", "registry=registry"],
+        max_idle=1,
+    )
+    constructed: WatchSupervisorRuntimeConstruction | None = None
+
+    def fleet_cycle_with_real_construction(**kwargs: Any) -> tuple[WatchSupervisorFleetCycleResult, object | None]:
+        nonlocal constructed
+        constructed = construct_watch_project_runtimes(
+            anchor_store=kwargs["anchor_store"],
+            selection=kwargs["selection"],
+            quiet=kwargs["quiet"],
+            dry_run=kwargs["dry_run"],
+            owner_token=kwargs["owner_token"],
+            existing_lease_set=kwargs["existing_lease_set"],
+            runtime_state=kwargs["runtime_state"],
+            aggregate_log_path=kwargs["aggregate_log_path"],
+        )
+        return WatchSupervisorFleetCycleResult(False, 0, 0, 0, 0), constructed.lease_set
+
+    with (
+        patch("gza.db._is_canonical_project_checkout", return_value=True),
+        patch("gza.cli.watch.Git", side_effect=lambda *_args, **_kwargs: _make_watch_git()),
+        patch("gza.cli.watch.run_watch_supervisor_fleet_cycle", side_effect=fleet_cycle_with_real_construction)
+        as fleet_cycle,
+        patch("gza.cli.watch.signal.signal", side_effect=lambda *_args: object()),
+    ):
+        rc = cmd_watch(args)
+
+    assert rc == 0
+    assert fleet_cycle.call_count == 1
+    assert constructed is not None
+    assert constructed.disabled == ()
+    assert [(runtime.key, runtime.config.project_id) for runtime in constructed.runtimes] == [
+        ("anchor", "anchor"),
+        ("registry", "registry"),
+    ]
+    assert fleet_cycle.call_args.kwargs["selection"].projects[1].project_id == "registry"
+
+
 def _write_watch_runtime_project_config(
     project_dir: Path,
     *,
