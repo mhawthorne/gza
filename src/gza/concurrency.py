@@ -204,12 +204,14 @@ def _collect_live_running_state(config: Config, store: SqliteTaskStore) -> tuple
     )
 
 
-def _best_effort_stale_cleanup(config: Config) -> None:
+def _best_effort_stale_cleanup(config: Config, store: SqliteTaskStore | None = None) -> None:
     # Import lazily to avoid a module dependency loop with cli._common importing us.
     from .cli._common import prune_terminal_dead_workers, reconcile_in_progress_tasks
 
-    reconcile_in_progress_tasks(config)
-    prune_terminal_dead_workers(config)
+    # Both helpers open their own store when one is not supplied, and every readwrite
+    # construction re-runs the merge-unit repairs. The caller already holds a store.
+    reconcile_in_progress_tasks(config, store=store)
+    prune_terminal_dead_workers(config, store=store)
 
 
 def get_concurrency_snapshot(
@@ -220,7 +222,7 @@ def get_concurrency_snapshot(
     cleanup_stale: bool = True,
 ) -> ConcurrencySnapshot:
     if cleanup_stale:
-        _best_effort_stale_cleanup(config)
+        _best_effort_stale_cleanup(config, store)
     live_state = _collect_live_running_state_details(config, store)
     limit = config.max_concurrent
     running = len(live_state.live_active_task_pids)
@@ -275,7 +277,7 @@ def launch_permit(
         if owns_flock:
             assert lock_file is not None
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        _best_effort_stale_cleanup(config)
+        _best_effort_stale_cleanup(config, store)
         snapshot = get_concurrency_snapshot(
             config,
             store,

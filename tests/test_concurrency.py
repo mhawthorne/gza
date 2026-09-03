@@ -256,3 +256,21 @@ def test_launch_permit_blocks_other_threads_until_owner_releases(tmp_path) -> No
         "second-acquired",
         "second-released",
     ]
+
+
+def test_get_concurrency_snapshot_stale_cleanup_reuses_the_caller_store(tmp_path) -> None:
+    """Cleanup must not open its own stores: each readwrite one re-runs the merge-unit repairs."""
+    setup_config(tmp_path)
+    config = Config.load(tmp_path)
+    store = make_store(tmp_path)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks") as reconcile,
+        patch("gza.cli._common.prune_terminal_dead_workers") as prune,
+        patch("gza.cli._common.get_store") as opened,
+    ):
+        get_concurrency_snapshot(config, store, cleanup_stale=True)
+
+    assert reconcile.call_args.kwargs["store"] is store
+    assert prune.call_args.kwargs["store"] is store
+    opened.assert_not_called()

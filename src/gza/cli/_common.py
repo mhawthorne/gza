@@ -1389,10 +1389,10 @@ def reconcile_dead_pending_recovery_tasks(
             )
 
 
-def prune_terminal_dead_workers(config: Config) -> None:
+def prune_terminal_dead_workers(config: Config, *, store: SqliteTaskStore | None = None) -> None:
     """Remove worker registry entries for terminal tasks once the worker PID is dead."""
     try:
-        store = get_store(config, open_mode="query_only")
+        store = store or get_store(config, open_mode="query_only")
         registry = WorkerRegistry(config.workers_path)
     except (sqlite3.Error, OSError, ValueError) as exc:
         print(f"Warning: Skipping worker prune due to setup error: {exc}", file=sys.stderr)
