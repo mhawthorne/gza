@@ -159,8 +159,13 @@ def discover_parked_tasks(
         query_task_ids = tuple(dict.fromkeys(expanded))
 
     reconcile_scopes: tuple[WatchProgressScope, ...] | None = None
-    if scoped_task_ids and selector_kinds is not None:
-        reconcile_scopes = tuple((selector_kind_by_task_id[task_id], task_id) for task_id in scoped_task_ids)
+    if scoped_task_ids:
+        # A caller that names task IDs is asking about those tasks only; the stale-park
+        # reconcile must not mutate unrelated rows. Callers that omit selector kinds get
+        # the wider "canonical_owner" reading, which still covers the named id itself.
+        reconcile_scopes = tuple(
+            (selector_kind_by_task_id.get(task_id, "canonical_owner"), task_id) for task_id in scoped_task_ids
+        )
     stale_backstop_cleared = reconcile_stale_watch_no_progress_parks(store, scopes=reconcile_scopes)
     owner_rows, _read_context = query_lineage_owner_rows_in_read_session(
         store,
@@ -170,7 +175,11 @@ def discover_parked_tasks(
             include_skipped=True,
             exclude_dropped_from_planning=True,
             max_recovery_attempts=config.max_resume_attempts,
-            task_ids=query_task_ids,
+            # Bare task IDs narrow the scan only. Promoting them to ``task_ids`` would
+            # also narrow failed-leaf selection, which moves the park subject off the
+            # owner and rearms the wrong row.
+            task_ids=query_task_ids if selector_kinds is not None else None,
+            scan_task_ids=query_task_ids if selector_kinds is None else None,
         ),
         config=config,
         git=git,
@@ -267,11 +276,15 @@ def select_and_clear_parked_tasks(
     select_all: bool = False,
 ) -> UnstickSelectionResult:
     """Select parked owners from the shared park service and clear eligible ones."""
+    # Selection short-circuits on explicit task IDs, so when they are present discovery
+    # only ever needs their owner rows. Forwarding the selector keeps the fleet-wide
+    # lineage scan -- and the stale-park reconcile it runs -- off unrelated tasks.
     candidates, stale_backstop_cleared = discover_parked_tasks(
         store,
         config=config,
         git=git,
         target_branch=target_branch,
+        task_ids=task_ids,
     )
     normalized_tags = normalize_tag_filters(tags)
     reason_filter = frozenset(reason_classes)

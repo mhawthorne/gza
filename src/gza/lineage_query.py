@@ -124,6 +124,10 @@ class LineageOwnerQuery:
     max_recovery_attempts: int | None = None
     owner_task_ids: tuple[str, ...] | None = None
     task_ids: tuple[str, ...] | None = None
+    # Restricts which owner rows are computed without reinterpreting the query as a
+    # question about those tasks. Unlike ``task_ids`` it never narrows failed-leaf
+    # selection, so a scoped scan yields the same rows a fleet-wide scan would.
+    scan_task_ids: tuple[str, ...] | None = None
     selector_filter_mode: Literal["intersection", "union"] = "intersection"
     recovery_unit_scope: bool = False
 
@@ -683,6 +687,7 @@ def _query_can_use_recovery_unit_indexes(query: LineageOwnerQuery) -> bool:
         and query.max_recovery_attempts is not None
         and query.owner_task_ids is None
         and query.task_ids is None
+        and query.scan_task_ids is None
         and query.selector_filter_mode == "intersection"
         and query.exclude_tags is None
     )
@@ -1717,7 +1722,8 @@ def _build_recovery_scope(
     tag_matcher,
 ) -> frozenset[str] | None:
     tag_scope = _build_tag_recovery_scope(indexes, query, tag_matcher=tag_matcher)
-    task_scope = _build_task_id_recovery_scope(indexes, set(query.task_ids)) if query.task_ids is not None else None
+    scope_seed_ids = query.task_ids if query.task_ids is not None else query.scan_task_ids
+    task_scope = _build_task_id_recovery_scope(indexes, set(scope_seed_ids)) if scope_seed_ids is not None else None
     if tag_scope is None:
         return task_scope
     if task_scope is None:
@@ -1851,6 +1857,8 @@ def _query_lineage_owner_rows_with_context(
             read_context.merge_context = build_merge_context_from_git(git, target_branch)
         owner_ids_filter = set(query.owner_task_ids) if query.owner_task_ids is not None else None
         task_ids_filter = set(query.task_ids) if query.task_ids is not None else None
+        if task_ids_filter is None and query.scan_task_ids is not None:
+            task_ids_filter = set(query.scan_task_ids)
         candidate_owner_rows = _candidate_owner_rows(
             indexes,
             query,

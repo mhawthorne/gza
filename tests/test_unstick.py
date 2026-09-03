@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -1121,3 +1122,43 @@ def test_resolve_owner_task_for_selection_unrelated_id_is_not_adopted() -> None:
     resolved = _resolve_owner_task_for_selection(store, candidates=[candidate], task_id="gza-stranger")
 
     assert resolved is stranger
+
+
+def _park_with_stale_action_task(store, impl) -> tuple[str, str]:
+    """Park ``impl`` on a backstop whose action task never started, so it reads as stale."""
+    stale_action = store.add(f"Never-started action for {impl.id}", task_type="improve", depends_on=impl.id)
+    assert stale_action.id is not None
+    observation = store.list_watch_progress_observations(
+        subject_kind="merge_unit",
+        subject_id=str(store.get_or_create_merge_unit_for_task(impl).id),
+    )[0]
+    store.upsert_watch_progress_observation(
+        replace(observation, action_task_id=stale_action.id, action_task_status="pending")
+    )
+    return observation.subject_kind, observation.subject_id
+
+
+def test_select_and_clear_parked_tasks_scopes_stale_reconcile_to_named_task_ids(tmp_path: Path) -> None:
+    config, store = _config_and_store(tmp_path)
+    git = _GitDouble()
+
+    named, _named_row = _make_backstop_owner(store, prompt="Named backstop", branch="feature/named-backstop")
+    unrelated, _unrelated_row = _make_backstop_owner(
+        store,
+        prompt="Unrelated backstop",
+        branch="feature/unrelated-backstop",
+    )
+    _park_with_stale_action_task(store, named)
+    unrelated_kind, unrelated_id = _park_with_stale_action_task(store, unrelated)
+
+    with patch("gza.unstick.query_lineage_owner_rows_in_read_session", return_value=((), object())):
+        result = select_and_clear_parked_tasks(
+            store,
+            config=config,
+            git=git,
+            target_branch="main",
+            task_ids=(named.id,),
+        )
+
+    assert result.stale_backstop_cleared == 1
+    assert store.list_watch_progress_observations(subject_kind=unrelated_kind, subject_id=unrelated_id) != []
