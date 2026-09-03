@@ -4951,6 +4951,76 @@ class TestMergeStatus:
         filtered_units = reopened.list_merged_units(source=MERGE_SOURCE_MAX_CYCLES_DEFERRED)
         assert [unit.id for unit in filtered_units] == [impl_unit.id]
 
+    def test_drop_active_merge_units_owned_by_tombstones_owned_actionable_unit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/drop-owner")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+        assert impl_unit.state == "unmerged"
+        assert [unit.id for unit in store.get_unmerged_merge_units()] == [impl_unit.id]
+
+        dropped = store.drop_active_merge_units_owned_by(impl.id)
+
+        assert [unit.id for unit in dropped] == [impl_unit.id]
+        tombstoned = store.get_merge_unit(impl_unit.id)
+        assert tombstoned is not None
+        assert tombstoned.state == "dropped"
+        assert tombstoned.merged_at is None
+        assert tombstoned.merged_by_task_id is None
+        assert store.get_unmerged_merge_units() == []
+
+    def test_drop_active_merge_units_owned_by_ignores_units_task_does_not_own(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        owner = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(owner, has_commits=True, branch="feature/drop-member")
+        assert owner.id is not None
+        unit = store.resolve_merge_unit_for_task(owner.id)
+        assert unit is not None
+        improve = store.add(prompt="Improve feature", task_type="improve")
+        assert improve.id is not None
+        store.attach_task_to_merge_unit(improve.id, unit.id, "contributor")
+
+        dropped = store.drop_active_merge_units_owned_by(improve.id)
+
+        assert dropped == []
+        untouched = store.get_merge_unit(unit.id)
+        assert untouched is not None
+        assert untouched.state == "unmerged"
+        assert [u.id for u in store.get_unmerged_merge_units()] == [unit.id]
+
+    def test_drop_active_merge_units_owned_by_leaves_landed_units_alone(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        db_path = tmp_path / "test.db"
+        store = SqliteTaskStore(db_path)
+
+        impl = store.add(prompt="Implement feature", task_type="implement")
+        store.mark_completed(impl, has_commits=True, branch="feature/drop-landed")
+        assert impl.id is not None
+        impl_unit = store.resolve_merge_unit_for_task(impl.id)
+        assert impl_unit is not None
+        store.set_merge_unit_state(impl_unit.id, "merged", merge_source="manual")
+
+        dropped = store.drop_active_merge_units_owned_by(impl.id)
+
+        assert dropped == []
+        landed = store.get_merge_unit(impl_unit.id)
+        assert landed is not None
+        assert landed.state == "merged"
+
     def test_set_merge_unit_state_clears_max_cycles_deferred_source_for_non_merged_state(
         self,
         tmp_path: Path,

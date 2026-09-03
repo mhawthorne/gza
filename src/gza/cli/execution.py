@@ -1654,6 +1654,7 @@ def _drop_new_tasks(store: SqliteTaskStore, tasks: list[DbTask]) -> None:
             continue
         fresh.status = "dropped"
         store.update(fresh)
+        store.drop_active_merge_units_owned_by(task.id)
 
 
 def _emit_plan_slice_materialization(

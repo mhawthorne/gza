@@ -5,9 +5,14 @@
 # ///
 """Graph gza ``watch`` queue depth over time from ``.gza/watch.log`` archives.
 
-Parses the selected watch log family and plots four series — tasks **running**,
-**pending** (runnable), **blocked**, and **need attention** — against time,
-saving a PNG and printing a text table of the same numbers. Live watch logs
+Parses the selected watch log family and plots six disjoint series — tasks
+**running**, **pending** (runnable), **blocked**, **parked** (needs attention),
+**recovery** (failed, awaiting automatic retry/resume), and **other**
+(classification residual; should stay at zero) — against time, saving a PNG and
+printing a text table of the same numbers. Newer logs carry a per-cycle
+``cycle accounting:`` line with the full breakdown; older logs only have the
+WAKE counts plus attention lines, which are mapped onto parked (recovery and
+other are unknown there). Live watch logs
 (``.gza/watch.log`` plus ``watch.<timestamp>.log`` archives) and dry-run watch
 logs (``.gza/watch.dry-run.log`` plus ``watch.dry-run.<timestamp>.log``
 archives) are read separately because they describe different runs.
@@ -40,6 +45,7 @@ Log line shapes it understands::
     HH:MM:SS WAKE      checking... (5 running, 0 slots)          # older, running only
     HH:MM:SS INFO      12 tasks still need attention (unchanged)
     HH:MM:SS INFO      Needs attention (13 tasks):
+    HH:MM:SS INFO      cycle accounting: running=2 pending=3 blocked=1 parked=4 recovery=2 other=0
 """
 
 from __future__ import annotations
@@ -74,6 +80,14 @@ _WAKE_MID_RE = re.compile(r"WAKE\s+checking\.\.\. \((\d+) running, (\d+) pending
 _WAKE_OLD_RE = re.compile(r"WAKE\s+checking\.\.\. \((\d+) running, (\d+) slots\)")
 _ATTN_UNCHANGED_RE = re.compile(r"(\d+) tasks? still need attention")
 _ATTN_HEADER_RE = re.compile(r"Needs attention \((\d+) tasks?\)")
+# Newest accounting line (emitted once per cycle after the WAKE line): a disjoint,
+# exhaustive classification of in-scope non-terminal tasks. When present it is the
+# source of truth for all six series; older logs fall back to the WAKE counts plus
+# the attention lines (mapped onto "parked").
+_ACCOUNTING_RE = re.compile(
+    r"cycle accounting: running=(\d+) pending=(\d+) blocked=(\d+) "
+    r"parked=(\d+) recovery=(\d+) other=(\d+)"
+)
 # Real merge events: "MERGE     gza-7957 -> main" (dry-run variants excluded below).
 _MERGE_RE = re.compile(r"MERGE\s+(gza-\d+)\s*->")
 _ARCHIVE_TIMESTAMP_FORMAT = "%Y-%m-%dT%H-%M-%S"
@@ -94,16 +108,18 @@ class WatchLogFile:
 
 
 class Point:
-    """One WAKE cycle's counts, plus the carried-forward attention count."""
+    """One WAKE cycle's counts: running/pending/blocked plus parked/recovery/other."""
 
-    __slots__ = ("when", "running", "pending", "blocked", "attention")
+    __slots__ = ("when", "running", "pending", "blocked", "parked", "recovery", "other")
 
-    def __init__(self, when, running, pending, blocked, attention):
+    def __init__(self, when, running, pending, blocked, parked, recovery=None, other=None):
         self.when = when
         self.running = running  # int
         self.pending = pending  # int | None (None for old-format WAKE)
         self.blocked = blocked  # int | None
-        self.attention = attention  # int | None
+        self.parked = parked  # int | None
+        self.recovery = recovery  # int | None (only from accounting lines)
+        self.other = other  # int | None (only from accounting lines)
 
 
 def _parse_clock(line):
@@ -170,6 +186,10 @@ def parse_log(path, base_date, *, use_anchor_time=False):
                 # attach to a marker so ordering with WAKE lines is preserved
                 raw.append((full_dt, hms, "attn", attention))
                 continue
+            m = _ACCOUNTING_RE.search(line)
+            if m:
+                raw.append((full_dt, hms, "acct", tuple(int(g) for g in m.groups())))
+                continue
             m = _MERGE_RE.search(line)
             if m and "[dry-run]" not in line:
                 raw.append((full_dt, hms, "merge", m.group(1)))
@@ -182,36 +202,49 @@ def parse_log(path, base_date, *, use_anchor_time=False):
     have_full = any(r[0] is not None for r in raw)
     times = _assign_datetimes(raw, base_date, have_full, use_anchor_time=use_anchor_time)
 
-    # Second pass: build Points from WAKE rows, resolving each cycle's attention.
+    # Second pass: build Points from WAKE rows, resolving each cycle's counts.
     #
-    # While the count is > 0 the watch emits exactly one attention line per cycle
-    # (a "Needs attention (N)" header or an "N still need attention (unchanged)"
-    # line); when the count is zero it emits nothing. So we can't just carry the
-    # last value forward — that would pin the curve at the last non-zero count
-    # forever. Instead, for each WAKE we look ahead within its own cycle (up to
-    # the next WAKE) for an attention line: found -> that count; absent -> zero.
-    # We only infer zero once the log has started reporting attention at all, so
-    # older logs that never emit attention lines keep attention=None as before.
+    # While the attention count is > 0 the watch emits exactly one attention line
+    # per cycle (a "Needs attention (N)" header or an "N still need attention
+    # (unchanged)" line); when the count is zero it emits nothing. So we can't
+    # just carry the last value forward — that would pin the curve at the last
+    # non-zero count forever. Instead, for each WAKE we look ahead within its own
+    # cycle (up to the next WAKE) for an attention line: found -> that count;
+    # absent -> zero. We only infer zero once the log has started reporting
+    # attention at all, so older logs that never emit attention lines keep
+    # parked=None as before. Newer logs emit a "cycle accounting" line per cycle
+    # with the full disjoint breakdown (running/pending/blocked/parked/recovery/
+    # other); when a cycle has one it is the source of truth for all six series.
     first_attn_idx = next((i for i, r in enumerate(raw) if r[2] == "attn"), None)
     points = []
     merges = []  # (datetime, task_id)
     attention = None
     for i, (row, when) in enumerate(zip(raw, times)):
         kind = row[2]
-        if kind == "attn":
+        if kind in ("attn", "acct"):
             continue
         if kind == "merge":
             merges.append((when, row[3]))
             continue
-        # WAKE: find this cycle's attention line, if any, before the next WAKE.
+        # WAKE: find this cycle's accounting/attention lines, if any, before the
+        # next WAKE.
         cycle_attn = None
+        cycle_acct = None
         for j in range(i + 1, len(raw)):
             nxt = raw[j][2]
             if nxt == "wake":
                 break
             if nxt == "attn":
                 cycle_attn = raw[j][3]
-                break
+            elif nxt == "acct":
+                cycle_acct = raw[j][3]
+                break  # accounting comes after attention lines within a cycle
+        if cycle_acct is not None:
+            acct_running, acct_pending, acct_blocked, acct_parked, acct_recovery, acct_other = cycle_acct
+            points.append(Point(when, acct_running, acct_pending, acct_blocked,
+                                acct_parked, acct_recovery, acct_other))
+            attention = acct_parked
+            continue
         if cycle_attn is not None:
             attention = cycle_attn
         elif first_attn_idx is not None and i > first_attn_idx:
@@ -271,7 +304,9 @@ _SERIES = [
     ("running", "running"),
     ("pending", "pending"),
     ("blocked", "blocked"),
-    ("attention", "need attention"),
+    ("parked", "parked"),
+    ("recovery", "recovery"),
+    ("other", "other"),
 ]
 
 # Semantic line color per series (name of a color constant in scripts/palette.py).
@@ -279,7 +314,9 @@ _SERIES_COLORS = {
     "running": "GREEN",
     "pending": "BLUE",
     "blocked": "ORANGE",
-    "attention": "RED",
+    "parked": "RED",
+    "recovery": "YELLOW",
+    "other": "PURPLE",
 }
 
 # Row-unit word per resolution, for table/plot/summary captions.
@@ -607,10 +644,11 @@ def print_table(points, max_rows, tail=False, unit="cycles"):
         sampled = points
         note = f"({len(points)} {unit})"
 
-    header = ("datetime", "running", "pending", "blocked", "attention")
+    header = ("datetime", "running", "pending", "blocked", "parked", "recovery", "other")
     rows = [
         (p.when.strftime("%Y-%m-%d %H:%M:%S"),
-         _fmt(p.running), _fmt(p.pending), _fmt(p.blocked), _fmt(p.attention))
+         _fmt(p.running), _fmt(p.pending), _fmt(p.blocked), _fmt(p.parked),
+         _fmt(p.recovery), _fmt(p.other))
         for p in sampled
     ]
     widths = [max(len(header[c]), *(len(r[c]) for r in rows)) for c in range(len(header))]
@@ -628,7 +666,8 @@ def print_current(points):
     now = datetime.now().strftime("%H:%M:%S")
     print(f"[{now}]  latest cycle {p.when:%Y-%m-%d %H:%M:%S}  |  "
           f"running={_fmt(p.running)}  pending={_fmt(p.pending)}  "
-          f"blocked={_fmt(p.blocked)}  attention={_fmt(p.attention)}")
+          f"blocked={_fmt(p.blocked)}  parked={_fmt(p.parked)}  "
+          f"recovery={_fmt(p.recovery)}  other={_fmt(p.other)}")
 
 
 def _series_range(points, attr):
@@ -925,7 +964,9 @@ def rollup(points, resolution, agg):
             _aggregate(col["running"], agg),
             _aggregate(col["pending"], agg),
             _aggregate(col["blocked"], agg),
-            _aggregate(col["attention"], agg),
+            _aggregate(col["parked"], agg),
+            _aggregate(col["recovery"], agg),
+            _aggregate(col["other"], agg),
         ))
     return out
 

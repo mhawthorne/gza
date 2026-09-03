@@ -851,6 +851,7 @@ def _retire_duplicate_main_verify_remediation_tasks(
         fresh.urgent = False
         fresh.queue_position = None
         store.update(fresh)
+        store.drop_active_merge_units_owned_by(duplicate_id)
         retired_ids.append(duplicate_id)
     return _MainVerifyRemediationDuplicateRetireResult(
         merged_tags=merged_tags,
@@ -925,6 +926,7 @@ def _drop_main_verify_remediation_task(
     fresh.urgent = False
     fresh.queue_position = None
     store.update(fresh)
+    store.drop_active_merge_units_owned_by(task_id)
     return True
 
 
@@ -6540,6 +6542,86 @@ def _format_wake_message(
     return message
 
 
+@dataclass(frozen=True)
+class _CycleTaskAccounting:
+    """Disjoint per-cycle classification of every in-scope, non-terminal task.
+
+    Buckets are mutually exclusive and (modulo the documented exclusions)
+    exhaustive: every tag-matching task whose status is not ``completed`` or
+    ``dropped`` and whose task_type is not ``internal`` lands in exactly one
+    bucket. Failed tasks the recovery engine treats as substantively resolved
+    (``should_hide_failed_recovery_decision`` — e.g. unit merged elsewhere)
+    are excluded from the accounting entirely rather than counted. ``other``
+    is the residual bucket: a nonzero value means the classification missed
+    something and should be investigated, not that a new normal state exists.
+    """
+
+    running: int
+    pending: int
+    blocked: int
+    parked: int
+    recovery: int
+    other: int
+
+    @property
+    def total(self) -> int:
+        return self.running + self.pending + self.blocked + self.parked + self.recovery + self.other
+
+
+def _compute_cycle_task_accounting(
+    *,
+    store: SqliteTaskStore,
+    analysis: "_WatchCycleAnalysis",
+    tags: tuple[str, ...] | None,
+    any_tag: bool,
+    max_recovery_attempts: int,
+) -> _CycleTaskAccounting:
+    running = pending = blocked = parked = recovery = other = 0
+    for task in store.get_all():
+        if task.status in {"completed", "dropped"} or task.task_type == "internal":
+            continue
+        if not task_matches_tag_filters(task_tags=task.tags, tag_filters=tags, any_tag=any_tag):
+            continue
+        if task.status == "in_progress":
+            running += 1
+        elif task.status == "pending":
+            if store.is_task_blocked(task)[0]:
+                blocked += 1
+            else:
+                pending += 1
+        elif task.status == "failed":
+            decision = decide_failed_task_recovery(
+                store,
+                task,
+                max_recovery_attempts=max_recovery_attempts,
+                read_context=analysis.watch_read_context,
+            )
+            if should_hide_failed_recovery_decision(decision):
+                continue
+            if decision.action in {"resume", "retry", "reconcile"}:
+                recovery += 1
+            else:
+                parked += 1
+        else:
+            other += 1
+    return _CycleTaskAccounting(
+        running=running,
+        pending=pending,
+        blocked=blocked,
+        parked=parked,
+        recovery=recovery,
+        other=other,
+    )
+
+
+def _format_cycle_accounting_message(accounting: _CycleTaskAccounting) -> str:
+    return (
+        f"cycle accounting: running={accounting.running} pending={accounting.pending} "
+        f"blocked={accounting.blocked} parked={accounting.parked} "
+        f"recovery={accounting.recovery} other={accounting.other}"
+    )
+
+
 def _pending_runnable_tasks(
     store: SqliteTaskStore,
     *,
@@ -7804,6 +7886,7 @@ class _WatchCyclePlan:
     slots: int
     analysis: "_WatchCycleAnalysis"
     starting_worker_count: int = 0
+    task_accounting: "_CycleTaskAccounting | None" = None
 
 
 @dataclass(frozen=True)
@@ -15212,6 +15295,17 @@ def _build_watch_cycle_plan(
         known_effective_scoped_owner_ids=known_effective_scoped_owner_ids,
         excluded_owner_ids=excluded_owner_ids,
     )
+    task_accounting = (
+        None
+        if scoped_owner_ids is not None
+        else _compute_cycle_task_accounting(
+            store=store,
+            analysis=analysis,
+            tags=tags,
+            any_tag=any_tag,
+            max_recovery_attempts=max_recovery_attempts,
+        )
+    )
     return _WatchCyclePlan(
         running_task_ids=running_task_ids,
         anonymous_worker_count=anonymous_worker_count,
@@ -15222,6 +15316,7 @@ def _build_watch_cycle_plan(
         effective_batch=effective_batch,
         slots=slots,
         analysis=analysis,
+        task_accounting=task_accounting,
     )
 
 
@@ -15546,6 +15641,8 @@ def _run_cycle(
                     starting_worker_count=starting_worker_count,
                 ),
             )
+            if plan.task_accounting is not None:
+                log.emit("INFO", _format_cycle_accounting_message(plan.task_accounting))
             scope_message = _format_scope_message(tags, any_tag=any_tag, scoped_owner_ids=effective_scoped_owner_ids)
             if scope_message is not None:
                 log.emit("INFO", scope_message)

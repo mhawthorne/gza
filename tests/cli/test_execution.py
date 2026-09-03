@@ -27883,6 +27883,37 @@ class TestSetStatusCommand:
         assert updated.completion_reason is None
         assert updated.drop_reason == "Superseded by follow-up fix"
 
+    def test_set_status_dropped_tombstones_owned_merge_unit(self, tmp_path: Path):
+        """Dropping a task should tombstone its owned actionable merge unit."""
+        setup_db_with_tasks(tmp_path, [
+            {"prompt": "A task", "status": "pending"},
+        ])
+
+        store = make_store(tmp_path)
+        task = store.get_all()[0]
+        store.mark_completed(task, has_commits=True, branch="feature/drop-owner")
+        assert task.id is not None
+        unit = store.resolve_merge_unit_for_task(task.id)
+        assert unit is not None
+        assert unit.state == "unmerged"
+
+        result = invoke_gza(
+            "set-status",
+            str(task.id),
+            "dropped",
+            "--reason",
+            "Abandoned",
+            "--project",
+            str(tmp_path),
+        )
+
+        assert result.returncode == 0
+        check = make_store(tmp_path)
+        tombstoned = check.get_merge_unit(unit.id)
+        assert tombstoned is not None
+        assert tombstoned.state == "dropped"
+        assert check.get_unmerged_merge_units() == []
+
     def test_set_status_dropped_without_reason_leaves_drop_reason_null(self, tmp_path: Path) -> None:
         """set-status dropped without --reason should leave drop_reason unset."""
         setup_db_with_tasks(tmp_path, [

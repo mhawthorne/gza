@@ -7224,12 +7224,16 @@ def _resolve_pre_closing_review_git_context(
                         active_review.status = "dropped"
                         active_review.drop_reason = "invalid resolution-review metadata superseded by full review"
                         store.update(active_review)
+                        if active_review.id is not None:
+                            store.drop_active_merge_units_owned_by(active_review.id)
                     ctx = replace(ctx, active_review=None)
                 elif active_review.status == "pending" and active_review_mode == "plain_full" and ctx.create_reviews:
                     if ctx.persist_derived_state:
                         active_review.status = "dropped"
                         active_review.drop_reason = "stale full review superseded by live-head fallback"
                         store.update(active_review)
+                        if active_review.id is not None:
+                            store.drop_active_merge_units_owned_by(active_review.id)
                     ctx = replace(ctx, active_review=None)
                 elif active_review_mode == "spec_coherence":
                     resolution_review_metadata_invalid = False

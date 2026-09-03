@@ -12475,6 +12475,32 @@ class SqliteTaskStore:
             changed=True,
         )
 
+    def drop_active_merge_units_owned_by(self, task_id: str) -> list[MergeUnit]:
+        """Tombstone actionable merge units owned by a dropped task.
+
+        Keeps ``merge_units.state`` self-consistent with ``tasks.status``: once
+        the owner task is dropped, actionable units it owns are no longer
+        mergeable work, so they leave the actionable listing
+        (``get_unmerged_merge_units``) at drop time rather than each reader
+        applying its own owner-status filter. Units in landed/no-work states
+        (``merged``/``empty``/``redundant``) record merge truth and are left
+        untouched, as are active units the task belongs to but does not own.
+        """
+        if not self.supports_merge_units():
+            return []
+        dropped: list[MergeUnit] = []
+        for unit in self.list_merge_units_for_task(task_id, active_only=True):
+            if unit.state not in MERGE_UNIT_ACTIONABLE_STATES:
+                continue
+            owner = self.resolve_merge_unit_owner_task(unit)
+            if owner is None or owner.id != task_id:
+                continue
+            self.set_merge_unit_state(unit.id, "dropped")
+            tombstoned = self.get_merge_unit(unit.id)
+            if tombstoned is not None:
+                dropped.append(tombstoned)
+        return dropped
+
     def _legacy_merge_status_owner_for_unit(self, unit: MergeUnit) -> Task | None:
         owner_task: Task | None = self.get(unit.owner_task_id) if unit.owner_task_id is not None else None
         if owner_task is not None:
