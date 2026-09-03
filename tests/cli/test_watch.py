@@ -5428,7 +5428,7 @@ def test_watch_project_runtime_reconcile_runtime_state_preserves_legacy_order(tm
         ) as reconcile_in_progress,
         patch(
             "gza.cli._common.prune_terminal_dead_workers",
-            side_effect=lambda cfg: calls.append("prune"),
+            side_effect=lambda cfg, **kwargs: calls.append("prune"),
         ) as prune_dead,
         patch(
             "gza.cli._common.reconcile_dead_pending_recovery_tasks",
@@ -5465,7 +5465,7 @@ def test_watch_project_runtime_reconcile_runtime_state_preserves_legacy_order(tm
     assert result.starting_pids == frozenset({654})
     assert result.starting_task_ids == ()
     reconcile_in_progress.assert_called_once_with(config, store=store, runtime_context=runtime.runtime_context)
-    prune_dead.assert_called_once_with(config)
+    prune_dead.assert_called_once_with(config, store=store)
     reconcile_recovery.assert_called_once_with(config, store=store, runtime_context=runtime.runtime_context)
     collect_live.assert_called_once_with(config, store)
 

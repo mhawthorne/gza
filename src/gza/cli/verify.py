@@ -8,7 +8,13 @@ from typing import Any, Literal
 from gza.cli._common import get_store, resolve_id
 from gza.cli.advance_engine import plan_manual_verify_gate_action
 from gza.cli.advance_executor import AdvanceActionExecutionContext, execute_advance_action
-from gza.cli.git_ops import _merge_execution_status_error, _resolve_merge_subject, _resolve_merge_subject_query_only
+from gza.cli.git_ops import (
+    _advance_progress_console,
+    _CliVerifyProgressHeartbeat,
+    _merge_execution_status_error,
+    _resolve_merge_subject,
+    _resolve_merge_subject_query_only,
+)
 from gza.config import Config
 from gza.git import Git
 from gza.review_verify_state import (
@@ -160,6 +166,10 @@ def _make_verify_context(*, config: Config, store: Any, git: Git) -> AdvanceActi
         spawn_iterate_worker=_unused_direct_worker,
         config=config,
         git=git,
+        heartbeat_for_lifecycle_phase=lambda phase, _task: _CliVerifyProgressHeartbeat(
+            _advance_progress_console,
+            "Verify gate" if phase == "verify" else f"Verify gate ({phase})",
+        ),
     )
 
 

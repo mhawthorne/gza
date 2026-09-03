@@ -4575,6 +4575,20 @@ class TestMergeStatus:
         assert attached_roles[first.id] == "contributor"
         assert attached_roles[second.id] == "owner"
 
+    def test_stale_unmerged_owner_repair_loads_members_in_one_pass(self, tmp_path: Path) -> None:
+        """The repair runs on every store open, so it must not scale queries with unit count."""
+        store = SqliteTaskStore(tmp_path / "test.db")
+        for index in range(5):
+            task = store.add(prompt=f"Slice {index}", task_type="implement")
+            store.mark_completed(task, has_commits=True, branch=f"feature/unit-{index}")
+
+        with patch.object(
+            SqliteTaskStore,
+            "list_tasks_for_merge_unit",
+            side_effect=AssertionError("per-unit member query in the startup repair"),
+        ):
+            assert store.repair_stale_unmerged_merge_unit_owners() == 0
+
     @pytest.mark.parametrize("lineage_link_field", ["based_on", "depends_on"])
     def test_store_open_repairs_stale_unmerged_multi_implement_owner_only_once(
         self,

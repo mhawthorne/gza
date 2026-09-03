@@ -6434,7 +6434,7 @@ def _reconcile_watch_runtime_state(
 
     if not dry_run:
         reconcile_in_progress_tasks(config, store=store, runtime_context=runtime_context)
-        prune_terminal_dead_workers(config)
+        prune_terminal_dead_workers(config, store=store)
         reconcile_dead_pending_recovery_tasks(config, store=store, runtime_context=runtime_context)
     live_state = _shared_collect_live_running_state_details(config, store)
     live_pids, running_task_ids, anonymous_worker_count, starting_worker_count = (
