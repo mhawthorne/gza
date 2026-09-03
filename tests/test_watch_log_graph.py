@@ -66,7 +66,7 @@ def test_parse_log_infers_zero_attention_from_silent_cycles(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    points, _merges = module.parse_log(str(log), datetime(2026, 7, 8))
+    points, _merges = module.parse_log(str(log), datetime(2026, 7, 8), legacy_attention=True)
 
     assert [p.parked for p in points] == [None, 2, 2, 0, 0]
 
@@ -95,7 +95,7 @@ def test_parse_log_accounting_line_overrides_all_series(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    points, _merges = module.parse_log(str(log), datetime(2026, 7, 8))
+    points, _merges = module.parse_log(str(log), datetime(2026, 7, 8), legacy_attention=True)
 
     assert len(points) == 3
     legacy, acct, acct_zero = points
@@ -106,6 +106,36 @@ def test_parse_log_accounting_line_overrides_all_series(tmp_path: Path) -> None:
     assert (acct.running, acct.pending, acct.blocked) == (1, 2, 3)
     assert (acct.parked, acct.recovery, acct.other) == (4, 5, 6)
     assert (acct_zero.parked, acct_zero.recovery, acct_zero.other) == (0, 1, 0)
+
+
+def test_parse_log_leaves_legacy_parked_unknown_by_default(tmp_path: Path) -> None:
+    """Without --legacy-attention, pre-accounting-line cycles report parked=None.
+
+    The old "Needs attention" lines count a broader, differently-scoped set of
+    conditions than the modern parked bucket; conflating them under one series
+    name is misleading, so the default leaves them unknown rather than guessing.
+    """
+    module = _load_module()
+    log = tmp_path / "watch.log"
+    log.write_text(
+        "\n".join(
+            [
+                "10:00:00 WAKE      checking... (1 running, pending=2 runnable, blocked=3, 4 slots)",
+                "10:00:05 INFO      Needs attention (4 tasks):",
+                "                     gza-1 ...",
+                "10:01:00 WAKE      checking... (9 running, pending=9 runnable, blocked=9, 0 slots)",
+                "10:01:05 INFO      cycle accounting: running=1 pending=2 blocked=3 parked=4 recovery=5 other=6",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    points, _merges = module.parse_log(str(log), datetime(2026, 7, 8))
+
+    legacy, acct = points
+    assert legacy.parked is None
+    assert acct.parked == 4
 
 
 def test_parse_watch_logs_all_spans_archives_and_live_chronologically(
@@ -235,7 +265,9 @@ def test_parse_watch_logs_attention_does_not_cross_file_boundary(tmp_path: Path)
     )
     _write_log(log_dir / "watch.log", [_wake_line("10:05:00", 2)])
 
-    points, _merges = module.parse_watch_logs(log_dir / "watch.log", datetime(2026, 8, 25))
+    points, _merges = module.parse_watch_logs(
+        log_dir / "watch.log", datetime(2026, 8, 25), legacy_attention=True
+    )
 
     assert [p.parked for p in points] == [2, None]
 
@@ -360,6 +392,7 @@ def test_watch_loop_bounded_end_stops_after_family_advances_past_window(
             date=datetime(2026, 8, 25),
             end=end,
             hours=24.0,
+            legacy_attention=False,
             markers=True,
             merge_band=module.MERGE_BAND_DEFAULT,
             merge_bucket="auto",
