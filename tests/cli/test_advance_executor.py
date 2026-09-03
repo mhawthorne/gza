@@ -77,6 +77,7 @@ from gza.review_verify_state import (
 )
 from gza.runner import (
     CROSS_PROJECT_TAG,
+    LifecycleVerifyBudgetError,
     LifecycleVerifyExecution,
     _format_review_verify_result,
     _make_review_verify_result,
@@ -5271,6 +5272,257 @@ def test_verify_gate_cached_pass_with_mismatched_subject_head_runs_verify(tmp_pa
     run_verify.assert_called_once()
     assert added_refs == ["subject-head"]
     assert store.list_artifacts(followup.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+
+
+def _write_verify_gate_cross_project_configs(root: Path, worktree: Path) -> Config:
+    root_config_text = (
+        "project_name: root\n"
+        "project_id: root\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
+        "verify_command: ./bin/tests\n"
+        "autonomous_verify_timeout_seconds: 120\n"
+        "review_verify_timeout_grace_seconds: 5\n"
+        "autonomous_verify_min_margin_seconds: 60\n"
+        "autonomous_verify_bootstrap_timeout_seconds: 600\n"
+    )
+    child_config_text = (
+        "project_name: bar\n"
+        "project_id: bar\n"
+        "provider: codex\n"
+        "model: gpt-5.5\n"
+        "verify_command: ./bin/child-verify\n"
+        "autonomous_verify_timeout_seconds: 405\n"
+        "review_verify_timeout_grace_seconds: 9\n"
+        "autonomous_verify_min_margin_seconds: 60\n"
+        "autonomous_verify_bootstrap_timeout_seconds: 600\n"
+    )
+    (root / "libs" / "bar").mkdir(parents=True, exist_ok=True)
+    (worktree / "libs" / "bar").mkdir(parents=True, exist_ok=True)
+    (root / "gza.yaml").write_text(root_config_text)
+    (worktree / "gza.yaml").write_text(root_config_text)
+    (root / "libs" / "bar" / "gza.yaml").write_text(child_config_text)
+    (worktree / "libs" / "bar" / "gza.yaml").write_text(child_config_text)
+    return Config.load(root)
+
+
+def _persist_root_full_suite_runtime_observation(
+    *,
+    store: SqliteTaskStore,
+    config: Config,
+    owner_task: DbTask,
+    duration_seconds: float,
+) -> None:
+    source = store.add("Root full-suite runtime source", task_type="review", depends_on=owner_task.id)
+    assert source.id is not None
+    phase_durations = (10.0, 10.0, 10.0, 10.0, 10.0, duration_seconds - 50.0)
+    output_lines: list[str] = []
+    for phase, duration in zip(
+        ("ruff", "ty", "mypy", "checks", "unit", "functional"),
+        phase_durations,
+        strict=True,
+    ):
+        output_lines.append(f"gza-verify phase=start name={phase}")
+        output_lines.append(f"gza-verify phase=passed name={phase} duration_seconds={duration:.1f}")
+    persist_verify_gate_artifact(
+        store,
+        config,
+        owner_task=owner_task,
+        source_task=source,
+        result=_make_review_verify_result(
+            "./bin/tests",
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 0, tzinfo=UTC),
+            reviewed_branch="feature/old-root-runtime",
+            reviewed_head_sha="old-root-head",
+            reviewed_base_sha="base-1",
+            working_directory=str(config.project_dir),
+            output="\n".join(output_lines),
+            duration_seconds=duration_seconds,
+        ),
+        verify_timeout_seconds=120,
+        verify_timeout_grace_seconds=5.0,
+        producer="test",
+    )
+
+
+def _execute_cross_project_verify_gate_with_child_command(
+    *,
+    tmp_path: Path,
+    config: Config,
+    store: SqliteTaskStore,
+    owner_task: DbTask,
+):
+    heads = {
+        owner_task.branch: "head-1",
+        "main": "base-1",
+        "origin/main": "base-1",
+    }
+
+    def populate_worktree(path: Path, _ref: str, *, detach: bool = False) -> Path:
+        _write_verify_gate_cross_project_configs(config.project_dir, path)
+        return path
+
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda ref: heads.get(ref),
+        worktree_add_existing=populate_worktree,
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+
+    def build_worktree_git(path: Path, **_kwargs: Any):
+        return SimpleNamespace(
+            repo_dir=Path(path),
+            default_branch=lambda: "main",
+            rev_parse_if_exists=lambda ref: heads.get(ref),
+            get_diff_name_status=lambda *_args, **_kwargs: "M\tlibs/bar/app.py\n",
+        )
+
+    context = _base_executor_context(
+        store=store,
+        config=config,
+        git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
+    )
+
+    def child_verify_result(command: str, *, cwd: Path, **_kwargs: Any):
+        return _make_review_verify_result(
+            command,
+            status="passed",
+            exit_status="0",
+            captured_at=datetime(2026, 8, 17, 10, 5, tzinfo=UTC),
+            reviewed_branch=owner_task.branch,
+            reviewed_head_sha="head-1",
+            reviewed_base_sha="base-1",
+            working_directory=str(cwd),
+            output=(
+                "gza-verify phase=start name=unit\n"
+                "gza-verify phase=passed name=unit duration_seconds=12.0\n"
+            ),
+            duration_seconds=12.0,
+        )
+
+    with (
+        patch("gza.cli.advance_executor.Git", side_effect=build_worktree_git),
+        patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-1"),
+        patch("gza.runner._run_review_verify_command", side_effect=child_verify_result) as run_child_verify,
+    ):
+        result = execute_advance_action(
+            task=owner_task,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_owner_task": owner_task,
+            },
+            context=context,
+        )
+
+    return result, run_child_verify
+
+
+def _assert_child_cross_project_verify_persisted(
+    *,
+    store: SqliteTaskStore,
+    owner_task: DbTask,
+    result: AdvanceActionExecutionResult,
+    run_child_verify: MagicMock,
+) -> None:
+    assert result.status == "success"
+    run_child_verify.assert_called_once()
+    assert run_child_verify.call_args.args == ("./bin/child-verify",)
+    assert run_child_verify.call_args.kwargs["timeout_seconds"] == 405
+    assert run_child_verify.call_args.kwargs["timeout_grace_seconds"] == 9.0
+
+    refreshed = store.get(owner_task.id)
+    assert refreshed is not None
+    assert refreshed.review_verify_status == "passed"
+    assert refreshed.review_verify_cwd == "(per-project; see artifact)"
+
+    artifacts = store.list_artifacts(owner_task.id, kind=VERIFY_GATE_ARTIFACT_KIND)
+    assert artifacts
+    metadata = next(
+        (
+            artifact.metadata
+            for artifact in artifacts
+            if isinstance(artifact.metadata, dict)
+            and isinstance(artifact.metadata.get("aggregate_details"), dict)
+            and isinstance(artifact.metadata["aggregate_details"].get("scopes"), list)
+        ),
+        None,
+    )
+    assert isinstance(metadata, dict)
+    aggregate_details = metadata.get("aggregate_details")
+    assert isinstance(aggregate_details, dict)
+    assert aggregate_details["affected_scope_count"] == 1
+    assert aggregate_details["passed_count"] == 1
+    assert aggregate_details["unavailable_count"] == 0
+    scopes = aggregate_details["scopes"]
+    assert len(scopes) == 1
+    assert scopes[0]["scope"] == "libs/bar"
+    assert scopes[0]["command_identity"] == "./bin/child-verify"
+    assert scopes[0]["verify_timeout_seconds"] == 405
+    assert scopes[0]["verify_timeout_grace_seconds"] == 9.0
+    assert scopes[0]["phase_diagnostics"]["completed_phase_names"] == ["unit"]
+
+
+def test_cross_project_verify_gate_bypasses_unaffected_root_margin_failure(tmp_path: Path) -> None:
+    worktree_seed = tmp_path / "worktree-seed"
+    config = _write_verify_gate_cross_project_configs(tmp_path, worktree_seed)
+    store = make_store(tmp_path)
+    owner = store.add("Implement cross-project gate", task_type="implement", tags=(CROSS_PROJECT_TAG,))
+    assert owner.id is not None
+    _mark_completed(owner, branch="feature/cross-project-gate")
+    store.update(owner)
+    _persist_root_full_suite_runtime_observation(
+        store=store,
+        config=config,
+        owner_task=owner,
+        duration_seconds=70.0,
+    )
+
+    result, run_child_verify = _execute_cross_project_verify_gate_with_child_command(
+        tmp_path=tmp_path,
+        config=config,
+        store=store,
+        owner_task=owner,
+    )
+
+    _assert_child_cross_project_verify_persisted(
+        store=store,
+        owner_task=owner,
+        result=result,
+        run_child_verify=run_child_verify,
+    )
+
+
+def test_cross_project_verify_gate_bypasses_unaffected_root_budget_read_failure(tmp_path: Path) -> None:
+    worktree_seed = tmp_path / "worktree-seed"
+    config = _write_verify_gate_cross_project_configs(tmp_path, worktree_seed)
+    store = make_store(tmp_path)
+    owner = store.add("Implement cross-project gate", task_type="implement", tags=(CROSS_PROJECT_TAG,))
+    assert owner.id is not None
+    _mark_completed(owner, branch="feature/cross-project-gate")
+    store.update(owner)
+
+    with patch(
+        "gza.cli.advance_executor.resolve_lifecycle_verify_timeout_settings",
+        side_effect=LifecycleVerifyBudgetError("root artifact inspection failed"),
+    ):
+        result, run_child_verify = _execute_cross_project_verify_gate_with_child_command(
+            tmp_path=tmp_path,
+            config=config,
+            store=store,
+            owner_task=owner,
+        )
+
+    _assert_child_cross_project_verify_persisted(
+        store=store,
+        owner_task=owner,
+        result=result,
+        run_child_verify=run_child_verify,
+    )
 
 
 def test_verify_gate_explicit_refresh_reruns_even_when_current_decision_already_passed(tmp_path: Path) -> None:

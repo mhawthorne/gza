@@ -68,6 +68,7 @@ from ..runner import (
     _persist_review_verify_result,
     _project_boundary,
     _resolve_review_verify_base_sha,
+    _resolve_review_verify_timeout_settings,
     _run_lifecycle_verify,
     _run_review_verify_command,
     _run_review_verify_commands_for_projects,
@@ -1342,27 +1343,33 @@ def _execute_verify_gate(
         )
 
     try:
-        timeout_seconds, timeout_grace_seconds = resolve_lifecycle_verify_timeout_settings(
-            context.config,
-            context.store,
-        )
+        is_cross_project_verify = task_is_cross_project(subject_task, context.config)
+        if is_cross_project_verify:
+            timeout_seconds, timeout_grace_seconds = _resolve_review_verify_timeout_settings(context.config)
+        else:
+            timeout_seconds, timeout_grace_seconds = resolve_lifecycle_verify_timeout_settings(
+                context.config,
+                context.store,
+            )
         provider_cwd = _worktree_execution_dir(worktree_git.repo_dir, _project_boundary(context.config))
         reviewed_base_sha = _resolve_review_verify_base_sha(worktree_git, worktree_git.default_branch())
         heartbeat_for_phase = context.heartbeat_for_lifecycle_phase
         if heartbeat_for_phase is not None:
             _verify_command_label = str(getattr(context.config, "verify_command", "")).strip() or "verify"
             print(f"Running verify gate ({_verify_command_label}) before {phase_label}...", flush=True)
-        budget_margin_failure = _lifecycle_verify_budget_margin_failure(
-            config=context.config,
-            store=context.store,
-            owner_task=owner_task,
-            command=context.config.verify_command,
-            timeout_seconds=timeout_seconds,
-            reviewed_branch=current_epoch.reviewed_branch,
-            reviewed_head_sha=current_epoch.reviewed_head_sha,
-            reviewed_base_sha=reviewed_base_sha,
-            working_directory=provider_cwd,
-        )
+        budget_margin_failure = None
+        if not is_cross_project_verify:
+            budget_margin_failure = _lifecycle_verify_budget_margin_failure(
+                config=context.config,
+                store=context.store,
+                owner_task=owner_task,
+                command=context.config.verify_command,
+                timeout_seconds=timeout_seconds,
+                reviewed_branch=current_epoch.reviewed_branch,
+                reviewed_head_sha=current_epoch.reviewed_head_sha,
+                reviewed_base_sha=reviewed_base_sha,
+                working_directory=provider_cwd,
+            )
         if budget_margin_failure is None:
             execution = _run_lifecycle_verify(
                 config=context.config,
