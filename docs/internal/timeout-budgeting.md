@@ -89,7 +89,8 @@ parallel failures:
   failure (`--maxfail=GZA_UNIT_RERUN_CAP+1` for the unit lane, or
   `--maxfail=GZA_FUNCTIONAL_RERUN_CAP+1` for the functional lane), so the
   harness can see the whole bounded failure set instead of stopping at the
-  first failure;
+  first failure; the unit lane uses regular xdist load scheduling to keep
+  large module-level files balanced across the fixed worker count;
 - if that pass fails only because a bounded set of per-test node IDs failed,
   the harness reruns just those node IDs serially with the normal per-test
   timeout and logs each `PARALLEL-ONLY FAILURE (passed serially)` line;

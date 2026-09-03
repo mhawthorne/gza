@@ -115,7 +115,7 @@ run_resolved_phase ruff resolve_tool_cmd ruff check "${RUFF_TARGETS[@]}"
 run_resolved_phase ty resolve_tool_cmd ty check src/gza/
 run_resolved_phase mypy resolve_tool_cmd mypy src/gza/
 run_resolved_phase checks resolve_python_module_cmd checks
-run_phase unit ./bin/test-unit --summary -- tests/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
+run_phase unit ./bin/test-unit --summary -- tests/ -n "$PYTEST_XDIST_WORKERS" --dist load --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
 run_resolved_phase functional resolve_python_module_cmd gza.test_functional_rerun --summary -- tests_functional/ -n "$PYTEST_XDIST_WORKERS" --dist loadscope --durations=25 -o "faulthandler_timeout=${PYTEST_FAULTHANDLER_TIMEOUT}"
 
 if [[ "$RUN_INTEGRATION" -eq 1 ]]; then
