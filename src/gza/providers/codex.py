@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import threading
 import time
+import traceback
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1409,6 +1410,50 @@ class CodexProvider(Provider):
                 if line == data.get("_startup_line"):
                     return
                 formatter.print_error(line)
+            except Exception as exc:
+                event_type = None
+                item_type = None
+                live_handler = None
+                item_handler = None
+                try:
+                    parsed = json.loads(line)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    event_type = parsed.get("type")
+                    if isinstance(event_type, str):
+                        live_handler = CODEX_LIVE_EVENT_HANDLERS.get(event_type)
+                    item = parsed.get("item")
+                    if isinstance(item, dict):
+                        item_type = item.get("type")
+                        if isinstance(item_type, str):
+                            item_handler = CODEX_LIVE_ITEM_HANDLERS.get(item_type)
+                traceback_text = traceback.format_exc()
+                write_ops_event(
+                    ops_log_file,
+                    subtype="provider_parse_error",
+                    source="provider",
+                    message=(
+                        "Internal gza error while handling Codex live event; "
+                        f"continuing provider run: {exc}"
+                    ),
+                    provider="codex",
+                    event_type=event_type,
+                    item_type=item_type,
+                    live_handler=live_handler,
+                    item_handler=item_handler,
+                    raw_line=line,
+                    traceback=traceback_text,
+                )
+                logger.error(
+                    "Internal gza error while handling Codex live event: %s",
+                    line,
+                    exc_info=True,
+                )
+                formatter.print_error(
+                    "Internal gza error while handling Codex live event; "
+                    "continuing provider run. See ops log for traceback and raw event."
+                )
 
         result = self.run_with_logging(
             cmd,

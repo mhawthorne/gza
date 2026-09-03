@@ -409,6 +409,15 @@ def test_codex_provider_error_type_classifies_turn_failed_capacity_as_provider_u
     assert _codex_provider_error_type(event) == "provider_unavailable"
 
 
+def test_codex_provider_error_type_ignores_plain_string_error_payload() -> None:
+    event = {
+        "type": "turn.failed",
+        "error": "verification failed: Failed to find expected lines in tests/test_runner.py",
+    }
+
+    assert _codex_provider_error_type(event) is None
+
+
 def test_looks_like_docker_crash_matches_empty_turn_launcher_exit(tmp_path: Path) -> None:
     conversation_log = tmp_path / "task.log"
     ops_log = tmp_path / "task.ops.jsonl"
@@ -6966,6 +6975,150 @@ class TestCodexFullConversationSimulation:
             )
 
         assert result._accumulated_data["patched_turn_started"] is True
+
+    def test_string_patch_verification_payload_is_handled_without_attribute_error(
+        self,
+        tmp_path,
+    ) -> None:
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+        failure_text = "verification failed: Failed to find expected lines in tests/test_runner.py"
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "codex",
+                        "tool": "apply_patch",
+                        "arguments": {"patch": "*** Begin Patch\n*** End Patch"},
+                        "error": failure_text,
+                    },
+                }
+            )
+            + "\n",
+            json.dumps(
+                {
+                    "type": "turn.failed",
+                    "error": failure_text,
+                }
+            )
+            + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 1
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result.exit_code == 1
+        assert result.error_type is None
+        assert "AttributeError" not in (log_file.with_name("test.ops.jsonl").read_text())
+        tool_events = [
+            substep
+            for step in result._accumulated_data["run_step_events"]
+            for substep in step["substeps"]
+        ]
+        assert any(
+            substep["type"] == "tool_error" and failure_text in substep["payload"]["error"]
+            for substep in tool_events
+        )
+
+    def test_live_handler_exception_logs_traceback_and_raw_line_then_continues(
+        self,
+        tmp_path,
+        capsys,
+    ) -> None:
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+        bad_event = {
+            "type": "item.completed",
+            "item": {"type": "mcp_tool_call", "server": "codex", "tool": "apply_patch"},
+        }
+        json_lines = [
+            json.dumps(bad_event) + "\n",
+            json.dumps({"type": "thread.started", "thread_id": "thread_after_error"}) + "\n",
+        ]
+
+        with (
+            patch.object(
+                provider,
+                "_handle_live_item_mcp_tool_call",
+                side_effect=AttributeError("'str' object has no attribute 'get'"),
+            ),
+            patch("gza.providers.base.subprocess.Popen") as mock_popen,
+        ):
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        assert result.exit_code == 0
+        assert result.session_id == "thread_after_error"
+        ops_text = log_file.with_name("test.ops.jsonl").read_text()
+        ops_events = [json.loads(line) for line in ops_text.splitlines()]
+        parse_error = next(event for event in ops_events if event.get("subtype") == "provider_parse_error")
+        assert "Internal gza error while handling Codex live event" in ops_text
+        assert json.loads(parse_error["raw_line"]) == bad_event
+        assert "Traceback (most recent call last)" in ops_text
+        assert "_handle_live_item_mcp_tool_call" in ops_text
+        captured = capsys.readouterr()
+        assert "continuing provider run" in (captured.out + captured.err)
+
+    def test_well_formed_structured_mcp_payload_still_records_tool_output(self, tmp_path) -> None:
+        provider = CodexProvider()
+        log_file = tmp_path / "test.log"
+        json_lines = [
+            json.dumps({"type": "turn.started"}) + "\n",
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "mcp_tool_call",
+                        "server": "filesystem",
+                        "tool": "read_file",
+                        "arguments": {"path": "src/gza/providers/codex.py"},
+                        "result": {"ok": True, "bytes": 1024},
+                    },
+                }
+            )
+            + "\n",
+        ]
+
+        with patch("gza.providers.base.subprocess.Popen") as mock_popen:
+            mock_process = MagicMock()
+            mock_process.stdout = iter(json_lines)
+            mock_process.wait.return_value = None
+            mock_process.returncode = 0
+            mock_popen.return_value = mock_process
+
+            result = provider._run_with_output_parsing(
+                cmd=["codex", "exec", "--json", "-"],
+                log_file=log_file,
+                timeout_minutes=30,
+            )
+
+        substeps = result._accumulated_data["run_step_events"][0]["substeps"]
+        assert substeps[0]["type"] == "tool_call"
+        assert substeps[0]["payload"]["tool_name"] == "mcp:filesystem/read_file"
+        assert substeps[1]["type"] == "tool_output"
+        assert '"ok": true' in substeps[1]["payload"]["output"]
 
     def _build_json_lines(self):
         """3-step conversation across 2 API turns."""

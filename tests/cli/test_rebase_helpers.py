@@ -188,7 +188,12 @@ def test_invoke_provider_resolve_returns_false_on_provider_exception(tmp_path: P
 
     assert result is False
     log_text = ops_log_path_for(log_file).read_text()
-    assert "Provider resolve failed with exception: provider failure" in log_text
+    assert "Internal gza error during provider resolve" in log_text
+    assert "provider=codex" in log_text
+    assert "command=/gza-rebase --auto --continue" in log_text
+    assert "exception=provider failure" in log_text
+    assert "\"exception_type\": \"RuntimeError\"" in log_text
+    assert "Traceback (most recent call last)" in log_text
 
 
 def test_invoke_provider_resolve_returns_false_if_rebase_still_in_progress(tmp_path: Path) -> None:

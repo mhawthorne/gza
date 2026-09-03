@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import traceback
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
@@ -2385,7 +2386,23 @@ def invoke_provider_resolve(
             runtime_env=runtime_context.env,
         )
     except Exception as exc:
-        task_logger.error(f"Provider resolve failed with exception: {exc}")
+        traceback_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        task_logger.error(
+            (
+                "Internal gza error during provider resolve: "
+                f"provider={effective_provider}, model={effective_model or 'default'}, "
+                f"command={skill_cmd}, work_dir={work_dir}, exception={exc}"
+            ),
+            extra={
+                "provider": effective_provider,
+                "model": effective_model or "default",
+                "command": skill_cmd,
+                "work_dir": str(work_dir),
+                "exception_type": type(exc).__name__,
+                "exception_message": str(exc),
+                "traceback": traceback_text,
+            },
+        )
         return False
 
     if run_result.exit_code != 0:
