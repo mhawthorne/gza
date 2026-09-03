@@ -6049,8 +6049,15 @@ def _verify_gate_is_budget_only_timeout(decision: VerifyGateDecision) -> bool:
     )
 
 
-def _verify_budget_exceeded_action(ctx: AdvanceContext, *, phase: str, owner_task: DbTask) -> dict[str, Any]:
-    decision = ctx.verify_gate_decision
+def build_verify_budget_exceeded_action(
+    decision: VerifyGateDecision | None,
+    *,
+    phase: str,
+    owner_task: DbTask,
+) -> dict[str, Any] | None:
+    """Build the shared operator projection for validated budget-only verify timeouts."""
+    if decision is None or owner_task.id is None or not _verify_gate_is_budget_only_timeout(decision):
+        return None
     summary = _verify_gate_phase_budget_summary(decision) if decision is not None else {}
     completed_names = summary.get("completed_phase_names", ())
     not_started_names = summary.get("not_started_phase_names", ())
@@ -6077,25 +6084,39 @@ def _verify_budget_exceeded_action(ctx: AdvanceContext, *, phase: str, owner_tas
         if entries:
             scope_text = f" Scope details: {'; '.join(entries)}."
     description_suffix = "review" if phase == "pre_review" else "merge"
-    return _with_red_verify_gate_metadata(
-        ctx,
-        with_needs_attention(
-            {
-                "type": "needs_discussion",
-                "description": (
-                    f"SKIP: verify gate exceeded its wall-clock budget before {description_suffix}; "
-                    f"{phase_progress_text}. "
-                    "No executed phase reported a failure, so no verify_fix task was created."
-                    f"{scope_text}"
-                ),
-                "verify_epoch": None if decision is None else decision.current_epoch,
-                "verify_phase_summary": summary,
-            },
-            reason=PARK_REASON_VERIFY_BUDGET_EXCEEDED,
-            subject_task_id=owner_task.id,
-        ),
-        phase=phase,
+    return with_needs_attention(
+        {
+            "type": "needs_discussion",
+            "description": (
+                f"SKIP: verify gate exceeded its wall-clock budget before {description_suffix}; "
+                f"{phase_progress_text}. "
+                "No executed phase reported a failure, so no verify_fix task was created."
+                f"{scope_text}"
+            ),
+            "verify_epoch": decision.current_epoch,
+            "verify_phase_summary": summary,
+        },
+        reason=PARK_REASON_VERIFY_BUDGET_EXCEEDED,
+        subject_task_id=owner_task.id,
     )
+
+
+def _verify_budget_exceeded_action(ctx: AdvanceContext, *, phase: str, owner_task: DbTask) -> dict[str, Any]:
+    action = build_verify_budget_exceeded_action(ctx.verify_gate_decision, phase=phase, owner_task=owner_task)
+    if action is None:
+        return _with_red_verify_gate_metadata(
+            ctx,
+            with_needs_attention(
+                {
+                    "type": "needs_discussion",
+                    "description": "SKIP: verify budget timeout routing is unavailable",
+                },
+                reason=PARK_REASON_VERIFY_FAILED_NEEDS_FIX,
+                subject_task_id=owner_task.id,
+            ),
+            phase=phase,
+        )
+    return _with_red_verify_gate_metadata(ctx, action, phase=phase)
 
 
 def _pre_review_verify_fix_action(ctx: AdvanceContext, *, phase: str = "pre_review") -> dict[str, Any]:

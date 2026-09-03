@@ -6923,7 +6923,9 @@ def _cmd_iterate_impl(
                         raise ValueError(f"implementation task disappeared during {action_type} execution")
                 continue
             final_status = "blocked"
-            final_stop_reason = "verify_gate_blocked" if action_type == "verify_gate" else action_type
+            final_stop_reason = exec_result.attention_reason or (
+                "verify_gate_blocked" if action_type == "verify_gate" else action_type
+            )
             break
 
         if action_type == "recover_verify_only_noop_review":

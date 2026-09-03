@@ -12562,6 +12562,7 @@ class TestIterateCommand:
         head_sha: str,
         status: str,
         failure: str | None = None,
+        output: str | None = None,
     ):
         from gza.concurrency import ConcurrencySnapshot
         from gza.runner import _make_review_verify_result
@@ -12596,6 +12597,7 @@ class TestIterateCommand:
                 reviewed_base_sha="base-head",
                 working_directory=str(config.project_dir),
                 failure=failure,
+                output=output,
             )
 
         stack.enter_context(patch("gza.cli.Config.load", return_value=config))
@@ -18167,9 +18169,78 @@ class TestIterateCommand:
         assert result == 3
         assert len(verify_calls) == 1
         assert mock_git.worktree_add_existing.call_count == 1
-        assert "Iterate complete: BLOCKED (verify_gate_blocked)" in output
+        assert "Iterate complete: BLOCKED (verify-gate-blocked)" in output
         assert "verify gate remained failed" in output
         assert "merge_ready" not in output
+
+        decision = resolve_verify_gate_decision(store, impl, config=config, git=mock_git)
+        assert decision.state == "failed"
+
+    def test_iterate_force_stops_on_fresh_verify_budget_timeout_without_verify_fix(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from gza.cli import cmd_iterate
+        from gza.review_verify_state import resolve_verify_gate_decision
+
+        setup_config(tmp_path)
+        store = make_store(tmp_path)
+        impl = self._make_completed_impl(store)
+        impl.branch = "feature/iterate-force-verify-budget-timeout"
+        store.update(impl)
+        config, _verify_fix = self._persist_current_failed_verify_with_completed_verify_fix(
+            store,
+            tmp_path,
+            impl,
+            head_sha="budget-timeout-head",
+        )
+
+        args = argparse.Namespace(
+            impl_task_id=impl.id,
+            max_iterations=1,
+            dry_run=False,
+            project_dir=tmp_path,
+            no_docker=True,
+            resume=False,
+            retry=False,
+            background=False,
+            force=True,
+        )
+        mock_git = MagicMock()
+        with ExitStack() as stack:
+            verify_calls = self._patch_fresh_verify_gate(
+                stack,
+                config=config,
+                store=store,
+                mock_git=mock_git,
+                impl=impl,
+                head_sha="budget-timeout-head",
+                status="failed",
+                failure="verify_command timed out after 120s",
+                output=(
+                    "gza-verify phase=start name=ruff\n"
+                    "gza-verify phase=passed name=ruff duration_seconds=1.0"
+                ),
+            )
+            stack.enter_context(
+                patch(
+                    "gza.cli.execution._run_foreground",
+                    side_effect=AssertionError("budget timeout must not run review/improve"),
+                )
+            )
+            result = cmd_iterate(args)
+        output = capsys.readouterr().out
+
+        assert result == 3
+        assert len(verify_calls) == 1
+        assert "Iterate complete: BLOCKED (verify-budget-exceeded)" in output
+        assert "completed phases: ruff" in output
+        assert "never-started phases: ty, mypy, checks, unit, functional" in output
+        assert "verify gate remained failed" not in output
+        assert not [
+            task
+            for task in store.get_verify_fix_tasks_by_root(impl.id)
+            if task.based_on == impl.id and task.created_at > _verify_fix.created_at
+        ]
 
         decision = resolve_verify_gate_decision(store, impl, config=config, git=mock_git)
         assert decision.state == "failed"
@@ -18238,7 +18309,7 @@ class TestIterateCommand:
         assert len(verify_calls) == 1
         assert mock_git.worktree_add_existing.call_count == 1
         assert mock_git.worktree_remove.call_count == 1
-        assert "Iterate complete: BLOCKED (verify_gate_blocked)" in output
+        assert "Iterate complete: BLOCKED (verify-gate-blocked)" in output
         assert "verify persistence exploded" in output
         assert "create_review" not in output
         assert "run_review" not in output
@@ -18302,7 +18373,7 @@ class TestIterateCommand:
         assert len(verify_calls) == 1
         assert root_decision.state == "failed"
         assert head_decision.state == "failed"
-        assert "Iterate complete: BLOCKED (verify_gate_blocked)" in output
+        assert "Iterate complete: BLOCKED (verify-gate-blocked)" in output
         assert "Iteration 1/1: create_review" not in output
         assert "merge_ready" not in output
 
@@ -18332,6 +18403,7 @@ class TestIterateCommand:
         review.review_verify_head_sha = "reviewed-head"
         review.output_content = "## Verdict\n\nVerdict: CHANGES_REQUESTED\n"
         store.update(review)
+        first_cycle_review = review
 
         improve = store.add(
             "Improve feature",

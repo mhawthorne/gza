@@ -75,7 +75,12 @@ from gza.review_verify_state import (
     persist_recredited_verify_gate_artifact,
     persist_verify_gate_artifact,
 )
-from gza.runner import CROSS_PROJECT_TAG, _make_review_verify_result
+from gza.runner import (
+    CROSS_PROJECT_TAG,
+    LifecycleVerifyExecution,
+    _format_review_verify_result,
+    _make_review_verify_result,
+)
 from gza.runtime_context import RuntimeExecutionContext
 from gza.verify_fix_outcome import effective_verify_fix_completion_outcome
 
@@ -4605,6 +4610,122 @@ def test_verify_gate_recredits_failed_holder_evidence_without_rewriting_source_o
     )
     assert did_create is True
     assert created.based_on == live_child.id
+
+
+@pytest.mark.parametrize(
+    ("output", "expected_reason", "expected_message"),
+    [
+        (
+            "gza-verify phase=start name=ruff\n"
+            "gza-verify phase=passed name=ruff duration_seconds=1.0",
+            "verify-budget-exceeded",
+            "completed phases: ruff; never-started phases: ty, mypy, checks, unit, functional",
+        ),
+        (
+            "gza-verify phase=start name=ruff\n"
+            "gza-verify phase=failed name=ruff duration_seconds=1.0",
+            "verify-gate-blocked",
+            "verify gate remained failed",
+        ),
+    ],
+)
+def test_verify_gate_projects_persisted_timeout_budget_classification(
+    tmp_path: Path,
+    output: str,
+    expected_reason: str,
+    expected_message: str,
+) -> None:
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+    config = Config.load(tmp_path)
+    config.verify_command = "./bin/tests"
+    config.autonomous_verify_timeout_seconds = 120
+    config.review_verify_timeout_grace_seconds = 5.0
+
+    impl = store.add("Implement timeout verify gate", task_type="implement")
+    assert impl.id is not None
+    _mark_completed(impl, branch="feature/timeout-verify-gate")
+    impl.has_commits = True
+    store.update(impl)
+
+    head_sha = "timeout-head"
+    git = SimpleNamespace(
+        repo_dir=tmp_path,
+        rev_parse_if_exists=lambda ref: {
+            impl.branch: head_sha,
+            "main": "base-1",
+            "origin/main": "base-1",
+        }.get(ref),
+        worktree_add_existing=lambda path, *_args, **_kwargs: Path(path).mkdir(parents=True, exist_ok=True),
+        worktree_remove=lambda *_args, **_kwargs: None,
+    )
+
+    def _git_for_path(path: Path) -> SimpleNamespace:
+        return SimpleNamespace(
+            repo_dir=Path(path),
+            default_branch=lambda: "main",
+            rev_parse_if_exists=lambda ref: head_sha if ref == "HEAD" else None,
+        )
+
+    result_payload = _make_review_verify_result(
+        "./bin/tests",
+        status="failed",
+        exit_status="timed out",
+        captured_at=datetime(2026, 8, 18, 10, 0, tzinfo=UTC),
+        reviewed_branch=impl.branch,
+        reviewed_head_sha=head_sha,
+        reviewed_base_sha="base-1",
+        working_directory=str(tmp_path),
+        failure="verify_command timed out after 120s",
+        output=output,
+        duration_seconds=120.0,
+    )
+    execution = LifecycleVerifyExecution(
+        markdown=_format_review_verify_result(result_payload),
+        aggregate_result=result_payload,
+        project_results=(),
+    )
+    context = AdvanceActionExecutionContext(
+        store=store,
+        trigger_source="manual",
+        dry_run=False,
+        max_resume_attempts=1,
+        use_iterate_for_create_implement=False,
+        use_iterate_for_needs_rebase=False,
+        prepare_task_for_background_start=lambda task, _rollback: task,
+        prepare_create_review=lambda _task: pytest.fail("unused"),
+        create_resume_task=lambda _task: pytest.fail("unused"),
+        create_rebase_task=lambda _task: pytest.fail("unused"),
+        create_implement_task=lambda _task: pytest.fail("unused"),
+        spawn_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_resume_worker=lambda _task, _kind: pytest.fail("unused"),
+        spawn_iterate_worker=lambda _task, _kind: pytest.fail("unused"),
+        config=config,
+        git=git,
+        runtime_context=RuntimeExecutionContext.from_config(config),
+    )
+
+    with (
+        patch("gza.cli.advance_executor.Git", side_effect=_git_for_path),
+        patch("gza.cli.advance_executor._resolve_review_verify_base_sha", return_value="base-1"),
+        patch("gza.cli.advance_executor._run_lifecycle_verify", return_value=execution),
+    ):
+        result = execute_advance_action(
+            task=impl,
+            action={
+                "type": "verify_gate",
+                "description": "Run verify gate before review",
+                "verify_gate_phase": "pre_review",
+                "verify_owner_task": impl,
+            },
+            context=context,
+        )
+
+    assert result.status == "skip"
+    assert result.attention_reason == expected_reason
+    assert result.message is not None
+    assert expected_message in result.message
+    assert result.handled_task_id == impl.id
 
 
 def test_verify_gate_no_merge_unit_compat_copy_preserves_source_and_epoch(

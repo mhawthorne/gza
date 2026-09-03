@@ -30,6 +30,7 @@ import gza.colors as colors
 import gza.recovery_engine as recovery_engine
 from gza.advance_engine import (
     NOOP_IMPROVE_KIND_VERIFY_ONLY,
+    PARK_REASON_VERIFY_BUDGET_EXCEEDED,
     classify_advance_action,
     failed_recovery_decision_to_action,
     pending_merge_finalization_action,
@@ -44737,6 +44738,89 @@ def test_watch_cycle_execution_attention_uses_impl_owner_for_plan_owned_rebase_r
     assert len(attention_lines) == 1
     assert str(impl.id) in attention_lines[0]
     assert str(plan.id) not in attention_lines[0]
+
+
+def test_watch_cycle_execution_attention_preserves_first_verify_budget_timeout(
+    tmp_path: Path,
+) -> None:
+    """Watch should render the executor's first-cycle zero-red verify timeout diagnosis."""
+    setup_config(tmp_path)
+    store = make_store(tmp_path)
+
+    impl = store.add("Implement first verify timeout projection", task_type="implement")
+    assert impl.id is not None
+    impl.status = "completed"
+    impl.completed_at = datetime.now(UTC)
+    impl.branch = "feature/watch-first-verify-budget-timeout"
+    impl.has_commits = True
+    store.update(impl)
+    store.set_merge_status(impl.id, "unmerged")
+
+    row = LineageOwnerRow(
+        owner_task=impl,
+        members=(impl,),
+        tree=None,
+        lineage_status="actionable",
+        next_action=None,
+        next_action_reason="test",
+        unresolved_tasks=(),
+        unresolved_leaf_summary=(),
+        lifecycle_action_task=impl,
+    )
+    action = {
+        "type": "verify_gate",
+        "description": "Run verify gate before review",
+        "verify_gate_phase": "pre_review",
+        "verify_owner_task": impl,
+    }
+    timeout_message = (
+        "verify_command timed out after 120s; "
+        "completed phases: ruff; "
+        "never-started phases: ty, mypy, checks, unit, functional"
+    )
+    exec_result = AdvanceActionExecutionResult(
+        action_type="verify_gate",
+        status="skip",
+        execution_phase="direct",
+        message=timeout_message,
+        handled_task_id=impl.id,
+        attention_reason=PARK_REASON_VERIFY_BUDGET_EXCEEDED,
+    )
+
+    config = Config.load(tmp_path)
+    log_path = tmp_path / ".gza" / "watch.log"
+    log = _WatchLog(log_path, quiet=True)
+
+    with (
+        patch("gza.cli._common.reconcile_in_progress_tasks"),
+        patch("gza.cli._common.prune_terminal_dead_workers"),
+        patch("gza.cli.watch.Git", return_value=_make_watch_git()),
+        patch("gza.cli.watch._query_owner_rows_with_context", return_value=([row], RecoveryReadContext())),
+        patch("gza.cli.watch.determine_next_action", return_value=action) as determine_action,
+        patch("gza.cli.watch.execute_advance_action", return_value=exec_result) as execute_action,
+        patch(
+            "gza.cli.watch.resolve_execution_needs_attention",
+            wraps=watch_module.resolve_execution_needs_attention,
+        ) as resolve_attention,
+    ):
+        _run_cycle(
+            config=config,
+            store=store,
+            batch=1,
+            max_iterations=10,
+            dry_run=False,
+            log=log,
+        )
+
+    determine_action.assert_called_once()
+    execute_action.assert_called_once()
+    resolve_attention.assert_called_once()
+    attention_lines = [line for line in log_path.read_text().splitlines() if "ATTENTION" in line]
+    assert len(attention_lines) == 1
+    assert f"reason={PARK_REASON_VERIFY_BUDGET_EXCEEDED}" in attention_lines[0]
+    assert "completed phases: ruff" in attention_lines[0]
+    assert "never-started phases: ty, mypy, checks, unit, functional" in attention_lines[0]
+    assert store.get_verify_fix_tasks_by_root(impl.id) == []
 
 
 def test_watch_cycle_dedupes_non_human_execution_skip_across_cycles(tmp_path: Path) -> None:

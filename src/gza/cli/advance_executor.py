@@ -19,6 +19,7 @@ from ..advance_engine import (
     VERIFY_ONLY_NOOP_RECOVERY_ATTENTION_STATUS,
     VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_KIND,
     VERIFY_ONLY_NOOP_REVIEW_CLEARANCE_STATUS,
+    build_verify_budget_exceeded_action,
 )
 from ..artifacts import store_command_output_artifact
 from ..concurrency import (
@@ -99,6 +100,7 @@ from ._common import (
 from .advance_engine import (
     classify_advance_action,
     failed_recovery_decision_to_attention_action,
+    get_needs_attention_reason,
 )
 
 
@@ -1455,6 +1457,20 @@ def _execute_verify_gate(
                 work_done=True,
                 handled_task_id=owner_task.id,
                 created_task=refreshed_owner_task or owner_task,
+            )
+        budget_action = build_verify_budget_exceeded_action(
+            refreshed_decision,
+            phase=phase,
+            owner_task=owner_task,
+        )
+        if budget_action is not None:
+            return AdvanceActionExecutionResult(
+                action_type=action_type,
+                status="skip",
+                message=str(budget_action["description"]),
+                attention_type="needs_discussion",
+                attention_reason=get_needs_attention_reason(budget_action),
+                handled_task_id=owner_task.id,
             )
         return AdvanceActionExecutionResult(
             action_type=action_type,
