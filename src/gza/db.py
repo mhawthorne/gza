@@ -13796,6 +13796,122 @@ class SqliteTaskStore:
             ).fetchall()
         return [unit for row in rows if (unit := self._row_to_merge_unit(row)) is not None]
 
+    def count_outstanding_deferred_review_blockers(
+        self,
+        *,
+        deferred_tag: str,
+        merge_source: str,
+        tags: Iterable[str] | None = None,
+        any_tag: bool = True,
+    ) -> int:
+        """Count unresolved deferred blocker tasks for max-cycle-deferred sources.
+
+        The source implementation's merged merge unit is the audit authority for
+        whether a deferred child belongs to the max-cycle path. The child task's
+        own merge unit, when present, owns landed/no-work terminality.
+        """
+        if not self.supports_merge_units():
+            return 0
+        if self._open_mode == "query_only" and not self._query_only_has_column("merge_units", "merge_source"):
+            return 0
+        if not self._query_only_supports_tags():
+            return 0
+
+        try:
+            normalized_deferred_tag = _normalize_tag(deferred_tag)
+        except ValueError:
+            return 0
+        normalized_tags = _normalize_tags(tags)
+
+        params: list[object] = [
+            normalized_deferred_tag,
+            self._project_id,
+            merge_source,
+        ]
+        tag_filter = ""
+        if normalized_tags:
+            tag_placeholders = ",".join("?" for _ in normalized_tags)
+            if any_tag:
+                tag_filter = f"""
+                  AND EXISTS (
+                      SELECT 1
+                      FROM task_tags tt_scope
+                      WHERE tt_scope.project_id = t.project_id
+                        AND tt_scope.task_id = t.id
+                        AND tt_scope.tag IN ({tag_placeholders})
+                  )
+                """
+                params.extend(normalized_tags)
+            else:
+                tag_filter = f"""
+                  AND (
+                      SELECT COUNT(DISTINCT tt_scope.tag)
+                      FROM task_tags tt_scope
+                      WHERE tt_scope.project_id = t.project_id
+                        AND tt_scope.task_id = t.id
+                        AND tt_scope.tag IN ({tag_placeholders})
+                  ) = ?
+                """
+                params.extend(normalized_tags)
+                params.append(len(normalized_tags))
+
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT COUNT(DISTINCT t.id) AS outstanding_count
+                FROM tasks t
+                JOIN task_tags tt_deferred
+                  ON tt_deferred.project_id = t.project_id
+                 AND tt_deferred.task_id = t.id
+                 AND tt_deferred.tag = ?
+                JOIN tasks source_task
+                  ON source_task.project_id = t.project_id
+                 AND source_task.id = t.based_on
+                JOIN merge_unit_tasks source_mut
+                  ON source_mut.project_id = source_task.project_id
+                 AND source_mut.task_id = source_task.id
+                JOIN merge_units source_mu
+                  ON source_mu.project_id = source_mut.project_id
+                 AND source_mu.id = source_mut.merge_unit_id
+                WHERE t.project_id = ?
+                  AND source_mu.state = 'merged'
+                  AND source_mu.superseded_by_unit_id IS NULL
+                  AND source_mu.merge_source = ?
+                  AND t.status NOT IN ('dropped', 'superseded')
+                  AND COALESCE(
+                      (
+                          SELECT CASE
+                              WHEN own_active_mu.state IN ('unmerged', 'blocked', 'stale') THEN 1
+                              ELSE 0
+                          END
+                          FROM merge_unit_tasks own_active_mut
+                          JOIN merge_units own_active_mu
+                            ON own_active_mu.project_id = own_active_mut.project_id
+                           AND own_active_mu.id = own_active_mut.merge_unit_id
+                          WHERE own_active_mut.project_id = t.project_id
+                            AND own_active_mut.task_id = t.id
+                            AND {active_merge_unit_where_sql("own_active_mu")}
+                          ORDER BY own_active_mu.updated_at DESC, own_active_mu.id DESC
+                          LIMIT 1
+                      ),
+                      CASE
+                          WHEN NOT EXISTS (
+                              SELECT 1
+                              FROM merge_unit_tasks own_any_mut
+                              WHERE own_any_mut.project_id = t.project_id
+                                AND own_any_mut.task_id = t.id
+                          )
+                          AND (t.merge_status IS NULL OR t.merge_status != 'merged')
+                          THEN 1
+                          ELSE 0
+                      END
+                  ) = 1
+                  {tag_filter}
+                """,
+                tuple(params),
+            ).fetchone()
+        return int(row["outstanding_count"] or 0) if row is not None else 0
+
     def _get_unmerged_merge_units_with_legacy_fallback(self) -> list[MergeUnit]:
         """Return actionable merge units, lazily backfilling legacy rows when needed."""
         units_by_id: dict[str, MergeUnit] = {unit.id: unit for unit in self.get_unmerged_merge_units()}

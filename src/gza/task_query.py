@@ -10,6 +10,7 @@ from typing import Any, Literal, TypeVar
 
 from . import lineage, metrics
 from .db import (
+    MERGE_SOURCE_MAX_CYCLES_DEFERRED,
     SqliteTaskStore,
     Task as DbTask,
     _normalize_tags,
@@ -21,6 +22,7 @@ from .lineage_query import LineageOwnerQuery, LineageOwnerRow, query_lineage_own
 from .operator_state import blocked_by_empty_prereq_label, effective_no_work_merge_state
 from .pickup import effective_edit_time, is_in_quiet_period, projected_advance_action_type
 from .recovery_read_context import RecoveryReadContext
+from .review_tasks import DEFERRED_REVIEW_BLOCKER_TAG
 from .review_verify_state import (
     owner_task_verify_epoch,
     resolve_verify_owner_task,
@@ -34,6 +36,21 @@ BranchOwnerMode = Literal["generic", "unmerged_same_branch"]
 _T = TypeVar("_T")
 _TASK_QUERY_METHOD_LATENCY_METRIC = "gza_task_query_method_latency_seconds"
 _TASK_QUERY_RUN_LABELS = {"method": "run"}
+
+
+def count_outstanding_deferred_review_blockers(
+    store: SqliteTaskStore,
+    *,
+    tags: tuple[str, ...] | None = None,
+    any_tag: bool = True,
+) -> int:
+    """Count open max-cycle deferred review-blocker tasks in canonical query code."""
+    return store.count_outstanding_deferred_review_blockers(
+        deferred_tag=DEFERRED_REVIEW_BLOCKER_TAG,
+        merge_source=MERGE_SOURCE_MAX_CYCLES_DEFERRED,
+        tags=normalize_tag_filters(tags),
+        any_tag=any_tag,
+    )
 
 
 @dataclass(frozen=True)

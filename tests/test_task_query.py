@@ -16,7 +16,7 @@ import gza.task_query as task_query
 from gza.cli._queue_render import partition_queue_rows
 from gza.cli.advance_engine import determine_next_action
 from gza.config import Config
-from gza.db import SqliteTaskStore
+from gza.db import MERGE_SOURCE_MAX_CYCLES_DEFERRED, SqliteTaskStore
 from gza.git import GitError
 from gza.lineage_query import LineageOwnerQuery, query_lineage_owner_rows, query_lineage_owner_rows_in_read_session
 from gza.main_integration_verify import MAIN_INTEGRATION_VERIFY_FRESHNESS_UNAVAILABLE_EXIT_STATUS
@@ -33,6 +33,7 @@ from gza.task_query import (
     TaskQueryService,
     TaskRow,
     collect_scoped_tag_scope_gaps,
+    count_outstanding_deferred_review_blockers,
     task_matches_tag_filters,
 )
 
@@ -70,6 +71,352 @@ def _persist_current_green_verify(
         verify_timeout_grace_seconds=config.review_verify_timeout_grace_seconds,
         producer="review_verify",
     )
+
+
+def _max_cycles_merged_source(
+    store: SqliteTaskStore,
+    prompt: str = "source implementation",
+    *,
+    branch: str = "feature/source",
+    tags: tuple[str, ...] = (),
+):
+    source = store.add(prompt, task_type="implement", tags=tags)
+    store.mark_completed(source, has_commits=True, branch=branch)
+    assert source.id is not None
+    unit = store.resolve_merge_unit_for_task(source.id)
+    assert unit is not None
+    store.set_merge_unit_state(unit.id, "merged", merge_source=MERGE_SOURCE_MAX_CYCLES_DEFERRED)
+    return source
+
+
+def _deferred_blocker(
+    store: SqliteTaskStore,
+    source_id: str,
+    prompt: str = "deferred blocker",
+    *,
+    tags: tuple[str, ...] = ("deferred-review-blocker",),
+):
+    task = store.add(prompt, task_type="implement", based_on=source_id, depends_on=source_id, tags=tags)
+    assert task.id is not None
+    return task
+
+
+def _attach_child_merge_unit(
+    store: SqliteTaskStore,
+    task_id: str,
+    state: str,
+    *,
+    branch_suffix: str,
+    superseded_by_unit_id: str | None = None,
+) -> str:
+    unit = store.create_merge_unit(
+        source_branch=f"feature/deferred-{branch_suffix}",
+        target_branch="main",
+        owner_task_id=task_id,
+        state=state,
+    )
+    store.attach_task_to_merge_unit(task_id, unit.id, "owner")
+    if superseded_by_unit_id is not None:
+        with store._connect() as conn:  # noqa: SLF001 - fixture-only supersession setup
+            conn.execute(
+                """
+                UPDATE merge_units
+                SET superseded_by_unit_id = ?
+                WHERE project_id = ?
+                  AND id = ?
+                """,
+                (superseded_by_unit_id, store._project_id, unit.id),
+            )
+    return unit.id
+
+
+@pytest.mark.parametrize("status", ["pending", "in_progress", "failed", "completed_unmerged"])
+def test_outstanding_deferred_review_blocker_count_includes_open_lifecycles(
+    tmp_path: Path,
+    status: str,
+) -> None:
+    store = _store(tmp_path)
+    source = _max_cycles_merged_source(store)
+    assert source.id is not None
+    blocker = _deferred_blocker(store, source.id)
+
+    if status == "in_progress":
+        store.mark_in_progress(blocker)
+    elif status == "failed":
+        store.mark_failed(blocker, failure_reason="TEST_FAILURE")
+    elif status == "completed_unmerged":
+        store.mark_completed(blocker, has_commits=True, branch="feature/deferred-open")
+
+    assert count_outstanding_deferred_review_blockers(store) == 1
+
+
+@pytest.mark.parametrize("terminal_state", ["merged", "empty", "redundant", "dropped", "superseded"])
+def test_outstanding_deferred_review_blocker_count_excludes_terminal_child_merge_units(
+    tmp_path: Path,
+    terminal_state: str,
+) -> None:
+    store = _store(tmp_path)
+    source = _max_cycles_merged_source(store)
+    assert source.id is not None
+    blocker = _deferred_blocker(store, source.id)
+    store.mark_completed(blocker, has_commits=True, branch=f"feature/deferred-{terminal_state}")
+    assert blocker.id is not None
+    blocker_unit = store.resolve_merge_unit_for_task(blocker.id)
+    assert blocker_unit is not None
+    if terminal_state == "merged":
+        store.set_merge_unit_state(blocker_unit.id, terminal_state, merge_source="advance")
+    else:
+        store.set_merge_unit_state(blocker_unit.id, terminal_state)
+
+    assert count_outstanding_deferred_review_blockers(store) == 0
+
+
+def test_outstanding_deferred_review_blocker_count_excludes_dropped_task_without_unit(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    source = _max_cycles_merged_source(store)
+    assert source.id is not None
+    blocker = _deferred_blocker(store, source.id)
+    blocker.status = "dropped"
+    blocker.completed_at = datetime.now(UTC)
+    store.update(blocker)
+
+    assert count_outstanding_deferred_review_blockers(store) == 0
+
+
+def test_outstanding_deferred_review_blocker_count_excludes_legacy_merged_task_without_unit(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    source = _max_cycles_merged_source(store)
+    assert source.id is not None
+    blocker = _deferred_blocker(store, source.id)
+    blocker.status = "completed"
+    blocker.completed_at = datetime.now(UTC)
+    blocker.merge_status = "merged"
+    store.update(blocker)
+
+    assert count_outstanding_deferred_review_blockers(store) == 0
+
+
+def test_outstanding_deferred_review_blocker_count_prefers_child_merge_unit_over_stale_legacy_status(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    source = _max_cycles_merged_source(store)
+    assert source.id is not None
+    blocker = _deferred_blocker(store, source.id)
+    store.mark_completed(blocker, has_commits=True, branch="feature/deferred-stale-legacy")
+    blocker.merge_status = "merged"
+    store.update(blocker)
+
+    assert count_outstanding_deferred_review_blockers(store) == 1
+
+
+@pytest.mark.parametrize("active_state", ["unmerged", "blocked", "stale"])
+def test_outstanding_deferred_review_blocker_count_prefers_current_actionable_unit_over_historical_drop(
+    tmp_path: Path,
+    active_state: str,
+) -> None:
+    store = _store(tmp_path)
+    source = _max_cycles_merged_source(store)
+    assert source.id is not None
+    blocker = _deferred_blocker(store, source.id)
+    assert blocker.id is not None
+    _attach_child_merge_unit(
+        store,
+        blocker.id,
+        "dropped",
+        branch_suffix=f"historical-dropped-{active_state}",
+    )
+    _attach_child_merge_unit(
+        store,
+        blocker.id,
+        active_state,
+        branch_suffix=f"current-{active_state}",
+    )
+
+    assert count_outstanding_deferred_review_blockers(store) == 1
+
+
+@pytest.mark.parametrize("active_state", ["unmerged", "blocked", "stale"])
+def test_outstanding_deferred_review_blocker_count_prefers_current_actionable_unit_over_historical_supersession(
+    tmp_path: Path,
+    active_state: str,
+) -> None:
+    store = _store(tmp_path)
+    source = _max_cycles_merged_source(store)
+    assert source.id is not None
+    blocker = _deferred_blocker(store, source.id)
+    assert blocker.id is not None
+    _attach_child_merge_unit(
+        store,
+        blocker.id,
+        "superseded",
+        branch_suffix=f"historical-superseded-{active_state}",
+        superseded_by_unit_id="replacement-unit",
+    )
+    _attach_child_merge_unit(
+        store,
+        blocker.id,
+        active_state,
+        branch_suffix=f"current-{active_state}",
+    )
+
+    assert count_outstanding_deferred_review_blockers(store) == 1
+
+
+@pytest.mark.parametrize("terminal_state", ["merged", "empty", "redundant"])
+def test_outstanding_deferred_review_blocker_count_excludes_current_terminal_unit_despite_historical_membership(
+    tmp_path: Path,
+    terminal_state: str,
+) -> None:
+    store = _store(tmp_path)
+    source = _max_cycles_merged_source(store)
+    assert source.id is not None
+    blocker = _deferred_blocker(store, source.id)
+    assert blocker.id is not None
+    _attach_child_merge_unit(
+        store,
+        blocker.id,
+        "dropped",
+        branch_suffix=f"historical-dropped-{terminal_state}",
+    )
+    current_unit_id = _attach_child_merge_unit(
+        store,
+        blocker.id,
+        "unmerged",
+        branch_suffix=f"current-{terminal_state}",
+    )
+    store.set_merge_unit_state(
+        current_unit_id,
+        terminal_state,
+        merge_source="advance" if terminal_state == "merged" else None,
+    )
+
+    assert count_outstanding_deferred_review_blockers(store) == 0
+
+
+def test_outstanding_deferred_review_blocker_count_excludes_historical_only_membership(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    source = _max_cycles_merged_source(store)
+    assert source.id is not None
+    blocker = _deferred_blocker(store, source.id)
+    assert blocker.id is not None
+    _attach_child_merge_unit(
+        store,
+        blocker.id,
+        "dropped",
+        branch_suffix="historical-only-dropped",
+    )
+
+    assert count_outstanding_deferred_review_blockers(store) == 0
+
+
+def test_outstanding_deferred_review_blocker_count_requires_tag_and_max_cycle_source(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    source = _max_cycles_merged_source(store)
+    assert source.id is not None
+    _deferred_blocker(store, source.id, "untagged child", tags=())
+
+    manual_source = store.add("manual source", task_type="implement")
+    store.mark_completed(manual_source, has_commits=True, branch="feature/manual-source")
+    assert manual_source.id is not None
+    manual_unit = store.resolve_merge_unit_for_task(manual_source.id)
+    assert manual_unit is not None
+    store.set_merge_unit_state(manual_unit.id, "merged", merge_source="advance")
+    _deferred_blocker(store, manual_source.id, "manual-source child")
+
+    unmerged_source = store.add("unmerged source", task_type="implement")
+    store.mark_completed(unmerged_source, has_commits=True, branch="feature/unmerged-source")
+    assert unmerged_source.id is not None
+    _deferred_blocker(store, unmerged_source.id, "unmerged-source child")
+
+    assert count_outstanding_deferred_review_blockers(store) == 0
+
+
+def test_outstanding_deferred_review_blocker_count_is_zero_when_empty(tmp_path: Path) -> None:
+    assert count_outstanding_deferred_review_blockers(_store(tmp_path)) == 0
+
+
+def test_outstanding_deferred_review_blocker_count_deduplicates_reused_task_membership(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    source = _max_cycles_merged_source(store)
+    assert source.id is not None
+    blocker = _deferred_blocker(store, source.id)
+    duplicate_source_unit = store.create_merge_unit(
+        source_branch="feature/duplicate-source",
+        target_branch="main",
+        owner_task_id=source.id,
+        state="merged",
+        merged_at=datetime.now(UTC),
+    )
+    store.attach_task_to_merge_unit(source.id, duplicate_source_unit.id, "owner")
+    store.set_merge_unit_state(
+        duplicate_source_unit.id,
+        "merged",
+        merge_source=MERGE_SOURCE_MAX_CYCLES_DEFERRED,
+    )
+
+    assert blocker.id is not None
+    assert count_outstanding_deferred_review_blockers(store) == 1
+
+
+def test_outstanding_deferred_review_blocker_count_applies_positive_tag_scope(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    source = _max_cycles_merged_source(store)
+    assert source.id is not None
+    _deferred_blocker(
+        store,
+        source.id,
+        tags=("backend", "deferred-review-blocker", "release"),
+    )
+
+    assert count_outstanding_deferred_review_blockers(store, tags=("release",), any_tag=True) == 1
+    assert count_outstanding_deferred_review_blockers(store, tags=("frontend",), any_tag=True) == 0
+    assert count_outstanding_deferred_review_blockers(store, tags=("release", "backend"), any_tag=False) == 1
+    assert count_outstanding_deferred_review_blockers(store, tags=("release", "frontend"), any_tag=False) == 0
+    assert count_outstanding_deferred_review_blockers(store, tags=("release", "frontend"), any_tag=True) == 1
+
+
+def test_outstanding_deferred_review_blocker_count_avoids_per_task_merge_unit_queries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path)
+    source = _max_cycles_merged_source(store)
+    assert source.id is not None
+    for index in range(50):
+        _deferred_blocker(store, source.id, f"deferred blocker {index}")
+
+    monkeypatch.setattr(
+        store,
+        "resolve_merge_unit_for_task",
+        lambda task_id: (_ for _ in ()).throw(AssertionError("per-task merge-unit query")),
+    )
+    monkeypatch.setattr(
+        store,
+        "list_merge_units_for_tasks",
+        lambda task_ids, *, active_only=False: (_ for _ in ()).throw(
+            AssertionError("bulk merge-unit hydration should not be needed")
+        ),
+    )
+    monkeypatch.setattr(
+        store,
+        "get_all",
+        lambda: (_ for _ in ()).throw(AssertionError("task-table hydration should not be needed")),
+    )
+
+    assert count_outstanding_deferred_review_blockers(store) == 50
 
 
 def test_search_default_matches_pending_and_internal(tmp_path: Path) -> None:
